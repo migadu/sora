@@ -52,50 +52,45 @@ func ExtractPart(msg *message.Entity, partNum int) (*message.Entity, error) {
 	}
 }
 
-func ExtractBodyStructure(msg *message.Entity, buf *bytes.Buffer, extended bool) (imap.BodyStructure, *string, error) {
+func ExtractPlaintextBody(msg *message.Entity, buf *bytes.Buffer, extended bool) (*string, error) {
 	if msg == nil {
-		return nil, nil, fmt.Errorf("nil message entity")
+		return nil, fmt.Errorf("nil message entity")
 	}
 	if buf == nil {
-		return nil, nil, fmt.Errorf("nil buffer")
+		return nil, fmt.Errorf("nil buffer")
 	}
 	var plaintextBody *string
 	var htmlBody *string
-	var bodyStructure imap.BodyStructure
 
-	var extractContent func(*message.Entity) ([]imap.BodyStructure, error)
-	extractContent = func(entity *message.Entity) ([]imap.BodyStructure, error) {
-		mediaType, params, err := entity.Header.ContentType()
+	var extractContent func(*message.Entity) error
+	extractContent = func(entity *message.Entity) error {
+		mediaType, _, err := entity.Header.ContentType()
 		if err != nil {
-			return nil, fmt.Errorf("error getting content type: %v", err)
+			return fmt.Errorf("error getting content type: %v", err)
 		}
 
 		if strings.HasPrefix(mediaType, "multipart/") {
 			mr := entity.MultipartReader()
 			if mr == nil {
-				return nil, fmt.Errorf("nil multipart reader for multipart content type")
+				return fmt.Errorf("nil multipart reader for multipart content type")
 			}
 
-			var children []imap.BodyStructure
 			for {
 				part, err := mr.NextPart()
 				if err == io.EOF {
 					break
 				}
 				if err != nil {
-					return nil, fmt.Errorf("error reading multipart: %v", err)
+					return fmt.Errorf("error reading multipart: %v", err)
 				}
-				childStructures, err := extractContent(part)
-				if err != nil {
-					return nil, err
+				if err := extractContent(part); err != nil {
+					return err
 				}
-				children = append(children, childStructures...)
 			}
-			return children, nil
 		} else {
 			content, err := io.ReadAll(entity.Body)
 			if err != nil {
-				return nil, fmt.Errorf("error reading entity body: %v", err)
+				return fmt.Errorf("error reading entity body: %v", err)
 			}
 
 			switch mediaType {
@@ -110,53 +105,13 @@ func ExtractBodyStructure(msg *message.Entity, buf *bytes.Buffer, extended bool)
 					htmlBody = &s
 				}
 			}
-
-			singlePart := &imap.BodyStructureSinglePart{
-				Type:     strings.Split(mediaType, "/")[0],
-				Subtype:  strings.Split(mediaType, "/")[1],
-				Params:   params,
-				Size:     uint32(len(content)),
-				Encoding: entity.Header.Get("Content-Transfer-Encoding"),
-			}
-			if extended {
-				singlePart.Extended = &imap.BodyStructureSinglePartExt{
-					Disposition: extractDisposition(entity),
-					Language:    strings.Split(entity.Header.Get("Content-Language"), ","),
-					Location:    entity.Header.Get("Content-Location"),
-				}
-			}
-			return []imap.BodyStructure{singlePart}, nil
 		}
+
+		return nil
 	}
 
-	children, err := extractContent(msg)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Construct the body structure
-	mediaType, params, _ := msg.Header.ContentType()
-	if strings.HasPrefix(mediaType, "multipart/") {
-		multipart := &imap.BodyStructureMultiPart{
-			Subtype:  strings.TrimPrefix(mediaType, "multipart/"),
-			Children: children,
-		}
-		if extended {
-			multipart.Extended = &imap.BodyStructureMultiPartExt{
-				Params:      params,
-				Disposition: extractDisposition(msg),
-				Language:    strings.Split(msg.Header.Get("Content-Language"), ","),
-				Location:    msg.Header.Get("Content-Location"),
-			}
-		}
-		bodyStructure = multipart
-	} else {
-		// If it's not multipart, we should have exactly one child
-		if len(children) == 1 {
-			bodyStructure = children[0]
-		} else {
-			return nil, nil, fmt.Errorf("expected 1 child for non-multipart message, got %d", len(children))
-		}
+	if err := extractContent(msg); err != nil {
+		return nil, err
 	}
 
 	// If we don't have a plaintext body but we have an HTML body, convert it to plaintext
@@ -165,7 +120,7 @@ func ExtractBodyStructure(msg *message.Entity, buf *bytes.Buffer, extended bool)
 		plaintextBody = &plaintext
 	}
 
-	return bodyStructure, plaintextBody, nil
+	return plaintextBody, nil
 }
 
 // Helper function to extract content disposition

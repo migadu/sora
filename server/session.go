@@ -174,9 +174,11 @@ func (s *SoraSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messag
 		sentDate = options.Time
 	}
 
-	bodyStructure, plaintextBody, err := helpers.ExtractBodyStructure(messageContent, buf, true)
+	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
+
+	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent, buf, true)
 	if err != nil {
-		log.Printf("Failed to extract body structure: %v", err)
+		log.Printf("Failed to extract plaintext body: %v", err)
 		return nil, consts.ErrMalformedMessage
 	}
 
@@ -1022,198 +1024,17 @@ func (s *SoraSession) handleBinarySectionSize(m *imapserver.FetchResponseWriter,
 }
 
 // Fetch helper to handle BODY sections for a message
-func (s *SoraSession) handleBodySections(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
+func (s *SoraSession) handleBodySections(w *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
 	for _, section := range options.BodySection {
-		parsedMessage, err := getMessageReader(messageID, bodyData)
-		if err != nil {
-			return err
+		buf := imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
+		wc := w.WriteBodySection(section, int64(len(buf)))
+		_, writeErr := wc.Write(buf)
+		closeErr := wc.Close()
+		if writeErr != nil {
+			return writeErr
 		}
-
-		if len(section.Part) > 0 {
-			partNum := section.Part[0]
-			part, err := helpers.ExtractPart(parsedMessage, partNum)
-			if err != nil {
-				// Instead of returning an error, we'll write an empty section
-				bodyWriter := m.WriteBodySection(section, 0)
-				if bodyWriter != nil {
-					bodyWriter.Close()
-				}
-				continue
-			}
-
-			switch section.Specifier {
-			case imap.PartSpecifierMIME:
-				// Handle MIME headers -----
-				var mimeHeaderBuilder strings.Builder
-				for field := part.Header.Fields(); field.Next(); {
-					k := field.Key()
-					v := field.Value()
-					fmt.Fprintf(&mimeHeaderBuilder, "%s: %s\r\n", k, v)
-				}
-				mimeHeaders := mimeHeaderBuilder.String() + "\r\n"
-				mimeHeadersSize := int64(len(mimeHeaders))
-
-				bodyWriter := m.WriteBodySection(section, mimeHeadersSize)
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing body section (MIME) for UID %d", messageID)
-				}
-
-				if _, err := bodyWriter.Write([]byte(mimeHeaders)); err != nil {
-					return newInternalServerError("failed to write MIME headers for UID %d: %v", messageID, err)
-				}
-
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close body section writer (MIME) for UID %d: %v", messageID, err)
-				}
-
-			case imap.PartSpecifierHeader:
-				var mimeHeaderBuilder strings.Builder
-				for field := part.Header.Fields(); field.Next(); {
-					k := field.Key()
-					v := field.Value()
-					fmt.Fprintf(&mimeHeaderBuilder, "%s: %s\r\n", k, v)
-				}
-				mimeHeaders := mimeHeaderBuilder.String() + "\r\n"
-				mimeHeadersSize := int64(len(mimeHeaders))
-
-				bodyWriter := m.WriteBodySection(&imap.FetchItemBodySection{
-					Specifier:    imap.PartSpecifierHeader,
-					HeaderFields: section.HeaderFields,
-				}, mimeHeadersSize)
-
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing headers for UID %d", messageID)
-				}
-
-				if _, err := bodyWriter.Write([]byte(mimeHeaders)); err != nil {
-					return newInternalServerError("failed to write headers for UID %d: %v", messageID, err)
-				}
-
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close header writer for UID %d: %v", messageID, err)
-				}
-
-			case imap.PartSpecifierText:
-				// Handle TEXT request (extract and write the text body part)
-				textBodyPart, err := helpers.ExtractPart(parsedMessage, 1) // Assuming the main text body is part 1
-				if err != nil {
-					return newInternalServerError("failed to extract text body part for UID %d: %v", messageID, err)
-				}
-
-				var textBodyBuf bytes.Buffer
-				if _, err := io.Copy(&textBodyBuf, textBodyPart.Body); err != nil {
-					return newInternalServerError("failed to buffer text body for UID %d: %v", messageID, err)
-				}
-
-				textBody := textBodyBuf.Bytes() // Get the byte slice from the buffer
-				textBodySize := int64(textBodyBuf.Len())
-
-				bodyWriter := m.WriteBodySection(section, textBodySize)
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing body section (TEXT) for UID %d", messageID)
-				}
-
-				textBodyReader := bytes.NewReader(textBody)
-				if _, err := io.Copy(bodyWriter, textBodyReader); err != nil {
-					return newInternalServerError("failed to write text body for UID %d: %v", messageID, err)
-				}
-
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close body section writer (TEXT) for UID %d: %v", messageID, err)
-				}
-
-			default:
-				// UID FETCH <uid> BODY[<section>]
-				// Create a new TeeReader to calculate the size and keep a copy for writing
-				var partBuf bytes.Buffer
-				partTee := io.TeeReader(part.Body, &partBuf)
-
-				// Calculate the size of the body part
-				bodySize, err := io.Copy(io.Discard, partTee)
-				if err != nil {
-					return newInternalServerError("failed to calculate size of part for UID %d: %v", messageID, err)
-				}
-
-				// Create a FetchItemBodySection for WriteBodySection
-				fetchSection := &imap.FetchItemBodySection{
-					Part:            section.Part,            // Part number
-					HeaderFields:    section.HeaderFields,    // Requested header fields
-					HeaderFieldsNot: section.HeaderFieldsNot, // Excluded header fields
-					Partial:         section.Partial,         // Partial fetching details (Offset, Size)
-					Peek:            section.Peek,            // Whether to peek (no change in \Seen flag)
-				}
-
-				// Now, write the body section using the buffered data in partBuf
-				bodyWriter := m.WriteBodySection(fetchSection, bodySize)
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing body section for UID %d", messageID)
-				}
-				// Write the actual body data
-				if _, err := bodyWriter.Write(partBuf.Bytes()); err != nil {
-					return newInternalServerError("failed to write body section data for UID %d: %v", messageID, err)
-				}
-
-				// Close the writer
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close body section writer for UID %d: %v", messageID, err)
-				}
-			}
-		} else {
-			if section.Specifier == imap.PartSpecifierHeader {
-				var headers bytes.Buffer
-				if section.HeaderFields != nil {
-					// Specific headers requested
-					for _, reqField := range section.HeaderFields {
-						for field := parsedMessage.Header.Fields(); field.Next(); {
-							k := field.Key()
-							if strings.EqualFold(reqField, k) {
-								v := field.Value()
-								fmt.Fprintf(&headers, "%s: %s\r\n", k, v)
-							}
-						}
-					}
-				} else {
-					// Full headers requested
-					for field := parsedMessage.Header.Fields(); field.Next(); {
-						k := field.Key()
-						v := field.Value()
-						fmt.Fprintf(&headers, "%s: %s\r\n", k, v)
-					}
-				}
-				headersData := headers.Bytes()
-				headersSize := int64(len(headersData))
-
-				bodyWriter := m.WriteBodySection(section, headersSize)
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing headers for UID %d", messageID)
-				}
-
-				if _, err := bodyWriter.Write(headersData); err != nil {
-					return newInternalServerError("failed to write headers for UID %d: %v", messageID, err)
-				}
-
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close header writer for UID %d: %v", messageID, err)
-				}
-			} else {
-				// ? UID FETCH <uid> BODY[]
-				//
-				// Write the entire body if no part is specified (and it's not a HEADER request)
-				bodyWriter := m.WriteBodySection(&imap.FetchItemBodySection{}, int64(len(bodyData)))
-				if bodyWriter == nil {
-					return newInternalServerError("failed to begin writing body section for UID %d", messageID)
-				}
-				// Write the actual body data
-				if _, err := bodyWriter.Write(bodyData); err != nil {
-					return newInternalServerError("failed to write body section data for UID %d: %v", messageID, err)
-				}
-
-				// Close the writer
-				if err := bodyWriter.Close(); err != nil {
-					return newInternalServerError("failed to close body section writer for UID %d: %v", messageID, err)
-				}
-			}
-			continue
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	return nil
