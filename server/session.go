@@ -56,6 +56,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
 	_ "github.com/emersion/go-message/charset"
+	"github.com/emersion/go-message/mail"
 	"github.com/google/uuid"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -163,23 +164,13 @@ func (s *SoraSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messag
 	s3UploadBuf := bytes.NewBuffer(buf.Bytes())
 
 	// Parse message headers (this does not consume the body)
-	subject := messageContent.Header.Get("Subject")
-	messageID := messageContent.Header.Get("Message-ID")
-	sentDateStr := messageContent.Header.Get("Date")
-	inReplyToRaw := messageContent.Header.Get("In-Reply-To")
+	mailHeader := mail.Header{messageContent.Header}
+	subject, _ := mailHeader.Subject()
+	messageID, _ := mailHeader.MessageID()
+	sentDate, _ := mailHeader.Date()
+	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 
-	// Separate the In-Reply-To header into individual message IDs
-	inReplyToSplit := strings.Split(inReplyToRaw, " ")
-	var inReplyTo []string
-	for _, id := range inReplyToSplit {
-		trimmedID := strings.Trim(id, "<>") // Remove angle brackets
-		if trimmedID != "" {                // Filter out empty values
-			inReplyTo = append(inReplyTo, trimmedID)
-		}
-	}
-
-	sentDate, err := time.Parse(time.RFC1123Z, sentDateStr)
-	if err != nil {
+	if sentDate.IsZero() {
 		sentDate = options.Time
 	}
 
