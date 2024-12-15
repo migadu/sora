@@ -890,27 +890,20 @@ func (s *SoraSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 			return newInternalServerError("failed to read message body for UID %d: %v", msg.ID, err)
 		}
 
-		parsedMessage, err := message.Read(bytes.NewReader(bodyData))
-		if message.IsUnknownCharset(err) {
-			log.Println("Unknown encoding:", err)
-		} else if err != nil {
-			return newInternalServerError("failed to parse message UID %d: %v", msg.ID, err)
-		}
-
 		if len(options.BodySection) > 0 {
-			if err := s.handleBodySections(m, msg.ID, bodyData, parsedMessage, options); err != nil {
+			if err := s.handleBodySections(m, msg.ID, bodyData, options); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySection) > 0 {
-			if err := s.handleBinarySections(m, msg.ID, parsedMessage, options); err != nil {
+			if err := s.handleBinarySections(m, msg.ID, bodyData, options); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if err := s.handleBinarySectionSize(m, msg.ID, parsedMessage, options); err != nil {
+			if err := s.handleBinarySectionSize(m, msg.ID, bodyData, options); err != nil {
 				return err
 			}
 		}
@@ -964,9 +957,24 @@ func (s *SoraSession) writeBodyStructure(m *imapserver.FetchResponseWriter, mess
 	return nil
 }
 
+func getMessageReader(messageID int, bodyData []byte) (*message.Entity, error) {
+	mr, err := message.Read(bytes.NewReader(bodyData))
+	if message.IsUnknownCharset(err) {
+		log.Println("Unknown encoding:", err)
+	} else if err != nil {
+		return nil, newInternalServerError("failed to parse message UID %d: %v", messageID, err)
+	}
+	return mr, nil
+}
+
 // Fetch helper to handle BINARY sections for a message
-func (s *SoraSession) handleBinarySections(m *imapserver.FetchResponseWriter, messageID int, parsedMessage *message.Entity, options *imap.FetchOptions) error {
+func (s *SoraSession) handleBinarySections(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
 	for _, binarySection := range options.BinarySection {
+		parsedMessage, err := getMessageReader(messageID, bodyData)
+		if err != nil {
+			return err
+		}
+
 		part, err := helpers.ExtractPart(parsedMessage, binarySection.Part[0]) // Only pass a single part
 		if err != nil {
 			return newInternalServerError("failed to extract binary part for UID %d: %v", messageID, err)
@@ -994,8 +1002,13 @@ func (s *SoraSession) handleBinarySections(m *imapserver.FetchResponseWriter, me
 }
 
 // Fetch helper to handle BINARY.SIZE sections for a message
-func (s *SoraSession) handleBinarySectionSize(m *imapserver.FetchResponseWriter, messageID int, parsedMessage *message.Entity, options *imap.FetchOptions) error {
+func (s *SoraSession) handleBinarySectionSize(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
 	for _, binarySectionSize := range options.BinarySectionSize {
+		parsedMessage, err := getMessageReader(messageID, bodyData)
+		if err != nil {
+			return err
+		}
+
 		part, err := helpers.ExtractPart(parsedMessage, binarySectionSize.Part[0]) // Extract the part
 		if err != nil {
 			return newInternalServerError("failed to extract binary section size for UID %d: %v", messageID, err)
@@ -1018,8 +1031,13 @@ func (s *SoraSession) handleBinarySectionSize(m *imapserver.FetchResponseWriter,
 }
 
 // Fetch helper to handle BODY sections for a message
-func (s *SoraSession) handleBodySections(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, parsedMessage *message.Entity, options *imap.FetchOptions) error {
+func (s *SoraSession) handleBodySections(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
 	for _, section := range options.BodySection {
+		parsedMessage, err := getMessageReader(messageID, bodyData)
+		if err != nil {
+			return err
+		}
+
 		if len(section.Part) > 0 {
 			partNum := section.Part[0]
 			part, err := helpers.ExtractPart(parsedMessage, partNum)
