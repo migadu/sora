@@ -110,23 +110,23 @@ func (db *Database) migrate(ctx context.Context) error {
 }
 
 // Authenticate verifies the provided username and password, and returns the user ID if successful
-func (db *Database) Authenticate(ctx context.Context, username, password string) (int, error) {
+func (db *Database) Authenticate(ctx context.Context, userID int, password string) error {
 	var hashedPassword string
-	var id int
 
-	err := db.Pool.QueryRow(ctx, "SELECT id, password FROM users WHERE username = $1", username).Scan(&id, &hashedPassword)
+	err := db.Pool.QueryRow(ctx, "SELECT password FROM users WHERE id = $1", userID).Scan(&hashedPassword)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return -1, errors.New("user not found")
+			return errors.New("user not found")
 		}
-		return -1, fmt.Errorf("database error: %v", err)
+		log.Printf("FATAL Failed to fetch user %d: %v", userID, err)
+		return err
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)); err != nil {
-		return -1, errors.New("invalid password")
+		return errors.New("invalid password")
 	}
 
-	return id, nil
+	return nil
 }
 
 func (db *Database) InsertUser(ctx context.Context, username, password string) error {
@@ -580,13 +580,14 @@ func (db *Database) updateParentPathOnMailboxChildren(ctx context.Context, tx pg
 
 // -- Messages --
 
-func (d *Database) GetMessageCount(ctx context.Context, mailboxID int) (int, error) {
+func (d *Database) GetMessageCount(ctx context.Context, mailboxID int) (int, int64, error) {
 	var count int
-	err := d.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL", mailboxID).Scan(&count)
+	var size int64
+	err := d.Pool.QueryRow(ctx, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL", mailboxID).Scan(&count, &size)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return count, nil
+	return count, size, nil
 }
 
 func (d *Database) GetRecentMessageCount(ctx context.Context, mailboxID int) (int, error) {
@@ -994,7 +995,8 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID int) (*imap.Enve
 			return nil, fmt.Errorf("error scanning recipient row: %w", err)
 		}
 
-		mailboxPart, hostNamePart := helpers.SplitEmailAddress(emailAddress)
+		parts := strings.Split(emailAddress, "@")
+		mailboxPart, hostNamePart := parts[0], parts[1]
 
 		address := imap.Address{
 			Name:    name,
@@ -1243,4 +1245,47 @@ func (db *Database) GetMailboxUpdates(ctx context.Context, mailboxID int, since 
 	}
 
 	return updates, numMessages, nil
+}
+
+func (db *Database) GetUserIDByAddress(ctx context.Context, username string) (int, error) {
+	var userId int
+	username = strings.ToLower(username)
+	err := db.Pool.QueryRow(ctx, "SELECT id FROM users WHERE username = $1", username).Scan(&userId)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return -1, consts.ErrUserNotFound
+		}
+		return -1, err
+	}
+	return userId, nil
+}
+
+func (db *Database) ListMessages(ctx context.Context, mailboxID int) ([]Message, error) {
+	var messages []Message
+
+	query := `
+			SELECT id, size, s3_uuid
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY id
+	`
+	rows, err := db.Pool.Query(ctx, query, mailboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var msg Message
+		if err := rows.Scan(&msg.ID, &msg.Size, &msg.S3UUID); err != nil {
+			return nil, fmt.Errorf("failed to scan message: %v", err)
+		}
+		messages = append(messages, msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error fetching messages: %v", err)
+	}
+
+	return messages, nil
 }

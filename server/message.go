@@ -52,5 +52,5 @@ func ExtractParts(m *message.Entity) error {
 
 // Helper function to generate an S3 key for a user and message
 func S3Key(user *SoraUser, s3id uuid.UUID) string {
-	return fmt.Sprintf("%s/%s/%s", user.domain, user.localPart, s3id.String())
+	return fmt.Sprintf("%s/%s/%s", user.Domain(), user.LocalPart(), s3id.String())
 }
