@@ -848,27 +848,21 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 		}
 
 	case imap.UIDSet:
-		uidNums, _ := set.Nums()
-		if len(uidNums) == 0 {
-			// Handle 1:* (all UIDs) case
-			query = `
-							SELECT id, s3_uuid, flags, internal_date, size, body_structure
-							FROM messages
-							WHERE mailbox_id = $1 AND expunged_at IS NULL
-					`
-			args = []interface{}{mailboxID}
-		} else {
-			// Convert UID slice to uint32 slice for the query
-			nums := make([]uint32, len(uidNums))
-			for i, uid := range uidNums {
-				nums[i] = uint32(uid)
+		query = `
+			SELECT id, s3_uuid, flags, internal_date, size, body_structure
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		`
+		args = []interface{}{mailboxID}
+		for _, uidRange := range set {
+			if uidRange.Start != 0 {
+				args = append(args, uint32(uidRange.Start))
+				query += fmt.Sprintf(" AND id >= $%d", len(args))
 			}
-			query = `
-							SELECT id, s3_uuid, flags, internal_date, size, body_structure
-							FROM messages
-							WHERE mailbox_id = $1 AND id = ANY($2) AND expunged_at IS NULL
-					`
-			args = []interface{}{mailboxID, nums}
+			if uidRange.Stop != 0 {
+				args = append(args, uint32(uidRange.Stop))
+				query += fmt.Sprintf(" AND id <= $%d", len(args))
+			}
 		}
 
 	default:
