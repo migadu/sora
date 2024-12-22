@@ -14,7 +14,7 @@ type Message struct {
 	ID             int       // Unique ID of the message
 	S3UUID         string    // UUID of the message in S3
 	MailboxID      int       // ID of the mailbox the message belongs to
-	Seq            int       // Sequence number of the message in the mailbox
+	Seq            uint32    // Sequence number of the message in the mailbox
 	BitwiseFlags   int       // Bitwise flags for the message (e.g., \Seen, \Flagged)
 	FlagsChangedAt time.Time // Time when the flags were last changed
 	Subject        string    // Subject of the message

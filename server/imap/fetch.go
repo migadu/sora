@@ -34,7 +34,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, seqSet imap.NumSet, optio
 }
 
 func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions) error {
-	m := w.CreateMessage(uint32(msg.ID))
+	m := w.CreateMessage(msg.Seq)
 	if m == nil {
 		return s.internalError("failed to begin message for UID %d", msg.ID)
 	}

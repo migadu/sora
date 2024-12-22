@@ -39,7 +39,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, seqSet imap.NumSet, flags
 			return s.internalError("failed to update flags for message: %v", err)
 		}
 
-		m := w.CreateMessage(uint32(msg.ID))
+		m := w.CreateMessage(msg.Seq)
 		if !flags.Silent {
 			m.WriteFlags(*newFlags)
 		}
