@@ -825,16 +825,17 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 	var messages []Message
 
 	query := `
-		SELECT id, s3_uuid, flags, internal_date, size, body_structure,
-			row_number() OVER (ORDER BY id) AS seqnum
-		FROM messages
-		WHERE mailbox_id = $1 AND expunged_at IS NULL
+		SELECT * FROM (
+			SELECT id, s3_uuid, flags, internal_date, size, body_structure,
+				row_number() OVER (ORDER BY id) AS seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		) WHERE true
 	`
 	args := []interface{}{mailboxID}
 
 	switch set := numSet.(type) {
 	case imap.SeqSet:
-		query = "SELECT * FROM (" + query + ") WHERE true"
 		for _, seqRange := range set {
 			if seqRange.Start != 0 {
 				args = append(args, seqRange.Start)
@@ -871,7 +872,7 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 	for rows.Next() {
 		var msg Message
 		var bodyStructureBytes []byte
-		if err := rows.Scan(&msg.ID, &msg.S3UUID, &msg.BitwiseFlags, &msg.InternalDate, &msg.Size, &bodyStructureBytes); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.S3UUID, &msg.BitwiseFlags, &msg.InternalDate, &msg.Size, &bodyStructureBytes, &msg.Seq); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %v", err)
 		}
 		bodyStructure, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes)
