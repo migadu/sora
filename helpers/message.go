@@ -13,45 +13,6 @@ import (
 	"github.com/k3a/html2text"
 )
 
-// extractPart traverses the MIME structure of the message and extracts the requested part.
-func ExtractPart(msg *message.Entity, partNum int) (*message.Entity, error) {
-	// If partNum is 0 or 1 for a non-multipart message, return the whole message
-	if partNum <= 1 {
-		mediaType, _, _ := msg.Header.ContentType()
-		if !strings.HasPrefix(mediaType, "multipart/") {
-			return msg, nil
-		}
-	}
-
-	mr := msg.MultipartReader()
-	if mr == nil {
-		return nil, fmt.Errorf("message is not multipart")
-	}
-
-	for i := 1; ; i++ {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			return nil, fmt.Errorf("part %d not found", partNum)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		if i == partNum {
-			return p, nil
-		}
-
-		// If this part is also multipart, recurse into it
-		if mediaType, _, _ := p.Header.ContentType(); strings.HasPrefix(mediaType, "multipart/") {
-			nestedPart, err := ExtractPart(p, 1)
-			if err == nil {
-				return nestedPart, nil
-			}
-			// If we couldn't extract a nested part, continue to the next part
-		}
-	}
-}
-
 func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil message entity")
