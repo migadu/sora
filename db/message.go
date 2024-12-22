@@ -111,8 +111,7 @@ func BitwiseToFlags(bitwiseFlags int) []imap.Flag {
 	return flags
 }
 
-func ExtractRecipients(msg *message.Entity) []Recipient {
-	header := msg.Header
+func ExtractRecipients(header message.Header) []Recipient {
 	recipients := make([]Recipient, 0)
 	uniquePairs := make(map[string]struct{})
 

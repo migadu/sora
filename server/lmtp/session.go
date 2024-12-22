@@ -107,7 +107,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		}
 	}
 
-	recipients := db.ExtractRecipients(messageContent)
+	recipients := db.ExtractRecipients(messageContent.Header)
 	uuidKey := uuid.New()
 
 	// TODO: SIEVE filtering
