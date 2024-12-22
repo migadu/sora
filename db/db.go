@@ -824,36 +824,28 @@ func (db *Database) GetMessageBodyStructure(ctx context.Context, messageID int) 
 func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numSet imap.NumSet) ([]Message, error) {
 	var messages []Message
 
-	var query string
-	var args []interface{}
+	query := `
+		SELECT id, s3_uuid, flags, internal_date, size, body_structure,
+			row_number() OVER (ORDER BY id) AS seqnum
+		FROM messages
+		WHERE mailbox_id = $1 AND expunged_at IS NULL
+	`
+	args := []interface{}{mailboxID}
 
 	switch set := numSet.(type) {
 	case imap.SeqSet:
-		nums, _ := set.Nums()
-		if len(nums) == 0 {
-			// Handle empty SeqSet as requesting all messages
-			query = `
-            SELECT id, s3_uuid, flags, internal_date, size, body_structure
-            FROM messages
-            WHERE mailbox_id = $1 AND expunged_at IS NULL
-        `
-			args = []interface{}{mailboxID}
-		} else {
-			query = `
-						SELECT id, s3_uuid, flags, internal_date, size, body_structure
-						FROM messages
-						WHERE mailbox_id = $1 AND id = ANY($2) AND expunged_at IS NULL
-				`
-			args = []interface{}{mailboxID, nums}
+		query = "SELECT * FROM (" + query + ") WHERE true"
+		for _, seqRange := range set {
+			if seqRange.Start != 0 {
+				args = append(args, seqRange.Start)
+				query += fmt.Sprintf(" AND seqnum >= $%d", len(args))
+			}
+			if seqRange.Stop != 0 {
+				args = append(args, seqRange.Stop)
+				query += fmt.Sprintf(" AND seqnum <= $%d", len(args))
+			}
 		}
-
 	case imap.UIDSet:
-		query = `
-			SELECT id, s3_uuid, flags, internal_date, size, body_structure
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-		`
-		args = []interface{}{mailboxID}
 		for _, uidRange := range set {
 			if uidRange.Start != 0 {
 				args = append(args, uint32(uidRange.Start))
@@ -864,7 +856,6 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 				query += fmt.Sprintf(" AND id <= $%d", len(args))
 			}
 		}
-
 	default:
 		return nil, fmt.Errorf("unsupported NumSet type")
 	}
