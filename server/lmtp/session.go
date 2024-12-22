@@ -97,7 +97,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
 
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent, &buf, true)
+	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent)
 	if err != nil {
 		log.Printf("Failed to extract plaintext body: %v", err)
 		return &smtp.SMTPError{
