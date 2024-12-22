@@ -12,7 +12,6 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
 )
 
@@ -153,64 +152,27 @@ func (s *IMAPSession) getMessageReader(messageID int, bodyData []byte) (*message
 }
 
 // Fetch helper to handle BINARY sections for a message
-func (s *IMAPSession) handleBinarySections(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
-	for _, binarySection := range options.BinarySection {
-		parsedMessage, err := s.getMessageReader(messageID, bodyData)
-		if err != nil {
-			return err
+func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
+	for _, section := range options.BinarySection {
+		buf := imapserver.ExtractBinarySection(bytes.NewReader(bodyData), section)
+		wc := w.WriteBinarySection(section, int64(len(buf)))
+		_, writeErr := wc.Write(buf)
+		closeErr := wc.Close()
+		if writeErr != nil {
+			return writeErr
 		}
-
-		part, err := helpers.ExtractPart(parsedMessage, binarySection.Part[0]) // Only pass a single part
-		if err != nil {
-			return s.internalError("failed to extract binary part for UID %d: %v", messageID, err)
-		}
-
-		var binaryBuf bytes.Buffer
-		tee := io.TeeReader(part.Body, &binaryBuf)
-
-		binarySize, err := io.Copy(io.Discard, tee)
-		if err != nil {
-			return s.internalError("failed to calculate size of binary section for UID %d: %v", messageID, err)
-		}
-
-		fetchBinarySection := &imap.FetchItemBinarySection{
-			Part:    binarySection.Part,    // Pass the part number
-			Partial: binarySection.Partial, // Handle partial fetch
-			Peek:    binarySection.Peek,    // Peek flag
-		}
-
-		if err := m.WriteBinarySection(fetchBinarySection, binarySize); err != nil {
-			return s.internalError("failed to write binary section for UID %d: %v", messageID, err)
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	return nil
 }
 
 // Fetch helper to handle BINARY.SIZE sections for a message
-func (s *IMAPSession) handleBinarySectionSize(m *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
-	for _, binarySectionSize := range options.BinarySectionSize {
-		parsedMessage, err := s.getMessageReader(messageID, bodyData)
-		if err != nil {
-			return err
-		}
-
-		part, err := helpers.ExtractPart(parsedMessage, binarySectionSize.Part[0]) // Extract the part
-		if err != nil {
-			return s.internalError("failed to extract binary section size for UID %d: %v", messageID, err)
-		}
-
-		var partBuf bytes.Buffer
-		if _, err := io.Copy(&partBuf, part.Body); err != nil {
-			return s.internalError("failed to calculate size of binary section for UID %d: %v", messageID, err)
-		}
-
-		size := uint32(partBuf.Len())
-
-		fetchBinarySection := &imap.FetchItemBinarySection{
-			Part: binarySectionSize.Part,
-		}
-
-		m.WriteBinarySectionSize(fetchBinarySection, size)
+func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
+	for _, section := range options.BinarySectionSize {
+		n := imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
+		w.WriteBinarySectionSize(section, n)
 	}
 	return nil
 }
