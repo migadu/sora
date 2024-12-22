@@ -59,7 +59,7 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 		if err != nil {
 			return s.internalError("failed to parse message UUID: %v", err)
 		}
-		s3Key := server.S3Key(s.user, s3UUIDKey)
+		s3Key := server.S3Key(s.Domain(), s.LocalPart(), s3UUIDKey)
 
 		log.Printf("Fetching message body for UID %d", msg.ID)
 		bodyReader, err := s.server.s3.GetMessage(s3Key)

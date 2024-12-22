@@ -17,15 +17,20 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+type (
+	user = server.User
+	// mailbox = MailboxView
+)
+
 type POP3Session struct {
 	server.Session
 	server        *POP3Server
-	conn          *net.Conn        // Connection to the client
-	user          *server.SoraUser // User associated with the session
-	authenticated bool             // Flag to indicate if the user has been authenticated
-	messages      []db.Message     // List of messages in the mailbox as returned by the LIST command
-	deleted       map[int]bool     // Map of message IDs marked for deletion
-	errorsCount   int              // Number of errors encountered during the session
+	conn          *net.Conn    // Connection to the client
+	*user                      // User associated with the session
+	authenticated bool         // Flag to indicate if the user has been authenticated
+	messages      []db.Message // List of messages in the mailbox as returned by the LIST command
+	deleted       map[int]bool // Map of message IDs marked for deletion
+	errorsCount   int          // Number of errors encountered during the session
 }
 
 func (s *POP3Session) handleConnection() {
@@ -80,7 +85,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			userID, err := s.server.db.GetUserIDByAddress(context.Background(), address.Address)
+			userID, err := s.server.db.GetUserIDByAddress(context.Background(), address.FullAddress())
 			if err != nil {
 				if err == consts.ErrUserNotFound {
 					if s.handleClientError(writer, fmt.Sprintf("-ERR %s\r\n", err.Error())) {
@@ -95,7 +100,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			s.user = server.NewSoraUser(address, userID)
+			s.user = server.NewUser(address, userID)
 			writer.WriteString("+OK User accepted\r\n")
 
 		// --------------------------------------------------------------------------------------------
@@ -109,7 +114,7 @@ func (s *POP3Session) handleConnection() {
 			s.Log("authentication attempt")
 			ctx := context.Background()
 
-			err := s.server.db.Authenticate(ctx, s.user.UserID(), parts[1])
+			err := s.server.db.Authenticate(ctx, s.UserID(), parts[1])
 			if err != nil {
 				if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
 					s.Log("authentication failed")
@@ -124,7 +129,7 @@ func (s *POP3Session) handleConnection() {
 
 		// --------------------------------------------------------------------------------------------
 		case "STAT":
-			messagesCount, size, err := s.server.db.GetMessageCount(context.Background(), s.user.UserID())
+			messagesCount, size, err := s.server.db.GetMailboxMessageCountAndSizeSum(context.Background(), s.UserID())
 			if err != nil {
 				s.Log("STAT error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -143,7 +148,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			s.messages, err = s.server.db.ListMessages(context.Background(), s.user.UserID())
+			s.messages, err = s.server.db.ListMessages(context.Background(), s.UserID())
 			if err != nil {
 				s.Log("LIST error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -192,7 +197,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if s.messages == nil {
-				s.messages, err = s.server.db.ListMessages(context.Background(), s.user.UserID())
+				s.messages, err = s.server.db.ListMessages(context.Background(), s.UserID())
 				if err != nil {
 					s.Log("RETR error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -225,7 +230,7 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				return
 			}
-			s3Key := server.S3Key(s.user, s3UUIDKey)
+			s3Key := server.S3Key(s.Domain(), s.LocalPart(), s3UUIDKey)
 
 			log.Printf("Fetching message body for UID %d", msg.ID)
 			bodyReader, err := s.server.s3.GetMessage(s3Key)
@@ -288,7 +293,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if s.messages == nil {
-				s.messages, err = s.server.db.ListMessages(context.Background(), s.user.UserID())
+				s.messages, err = s.server.db.ListMessages(context.Background(), s.UserID())
 				if err != nil {
 					s.Log("DELE error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -327,7 +332,7 @@ func (s *POP3Session) handleConnection() {
 				if deleted {
 					s.Log("expunging message %d", i)
 					msg := s.messages[i]
-					err := s.server.db.ExpungeMessagesByUIDs(context.Background(), s.user.UserID(), []uint32{uint32(msg.ID)})
+					err := s.server.db.ExpungeMessagesByUIDs(context.Background(), s.UserID(), []uint32{uint32(msg.ID)})
 					if err != nil {
 						s.Log("error expunging message %d: %v", i, err)
 					}

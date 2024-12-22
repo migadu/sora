@@ -21,7 +21,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	userID, err := s.server.db.GetUserIDByAddress(context.Background(), addressSt.Address)
+	userID, err := s.server.db.GetUserIDByAddress(context.Background(), addressSt.FullAddress())
 	if err != nil {
 		if err == consts.ErrUserNotFound {
 			s.Log("Unknown user: %s", address)
@@ -49,13 +49,23 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	// Ensure default mailboxes exist
+	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
 	err = s.server.db.CreateDefaultMailboxes(ctx, userID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
-	s.user = server.NewSoraUser(addressSt, userID)
+	// Fetch mailboxes, converting them to IMAP mailboxes
+	mboxes, err := s.server.db.GetMailboxes(ctx, userID)
+	if err != nil {
+		return s.internalError("failed to fetch mailboxes: %v", err)
+	}
+	mailboxes := make(map[string]*Mailbox)
+	for _, mbox := range mboxes {
+		mailboxes[mbox.Name] = NewMailbox(mbox)
+	}
+
+	s.IMAPUser = NewIMAPUser(addressSt, userID, mailboxes)
 
 	s.Log("User %s successfully authenticated", address)
 	return nil

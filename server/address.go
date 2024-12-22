@@ -10,9 +10,9 @@ const LocalPartRegex = `^(?i)(?:[a-z0-9])+$|^(?:[a-z0-9])(?:[a-z0-9\.\-_])*(?:[a
 const DomainNameRegex = `^(?i)(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9]|[a-z0-9][a-z0-9\-]+[a-z0-9])+.?$`
 
 type Address struct {
-	Address   string
-	LocalPart string
-	Domain    string
+	fullAddress string
+	localPart   string
+	domain      string
 }
 
 func NewAddress(address string) (Address, error) {
@@ -29,8 +29,19 @@ func NewAddress(address string) (Address, error) {
 	}
 
 	return Address{
-		Address:   address,
-		LocalPart: parts[0],
-		Domain:    parts[1],
+		fullAddress: address,
+		localPart:   parts[0],
+		domain:      parts[1],
 	}, nil
+}
+
+func (a Address) FullAddress() string {
+	return a.fullAddress
+}
+
+func (a Address) LocalPart() string {
+	return a.localPart
+}
+func (a Address) Domain() string {
+	return a.domain
 }

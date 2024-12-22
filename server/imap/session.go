@@ -11,10 +11,10 @@ import (
 
 type IMAPSession struct {
 	server.Session
+	*IMAPUser
 	server  *IMAPServer
 	conn    *imapserver.Conn
-	user    *server.SoraUser
-	mailbox *SoraMailbox
+	mailbox *Mailbox
 }
 
 func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error {
@@ -24,4 +24,13 @@ func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error
 		Code: imap.ResponseCodeServerBug,
 		Text: fmt.Sprintf(format, a...),
 	}
+}
+
+func (s *IMAPSession) Close() error {
+	if s.IMAPUser != nil {
+		s.Log("Closing session for user: %v", s.FullAddress())
+		s.IMAPUser = nil
+	}
+	s.mailbox = nil
+	return nil
 }

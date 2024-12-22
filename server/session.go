@@ -9,17 +9,16 @@ import (
 type Session struct {
 	Id       string
 	RemoteIP string
-	User     *SoraUser
+	*User
 	HostName string
 	Protocol string
 }
 
-// The Log method uses fields directly from BaseSession
 func (s *Session) Log(format string, args ...interface{}) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	user := "unknown"
 	if s.User != nil {
-		user = fmt.Sprintf("%s/%d", s.User.Address(), s.User.UserID())
+		user = fmt.Sprintf("%s/%d", s.FullAddress(), s.UserID())
 	}
 	log.Printf("%s %s remote=%s user=%s session=%s %s: %s",
 		now,

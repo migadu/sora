@@ -1,31 +1,33 @@
 package imap
 
 import (
+	"fmt"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
-type SoraMailbox struct {
-	name        string
-	ID          int
-	uidValidity uint32
-	subscribed  bool
-	uidNext     int
-	readOnly    bool
-	lastPollAt  time.Time
-	numMessages int
+type Mailbox struct {
+	*db.DBMailbox
+
+	tracker *imapserver.MailboxTracker
+	mutex   sync.Mutex
 }
 
-func (m *SoraMailbox) Name() string {
-	return m.name
+func NewMailbox(dbmbx *db.DBMailbox) *Mailbox {
+	return &Mailbox{
+		tracker:   imapserver.NewMailboxTracker(0),
+		DBMailbox: dbmbx,
+	}
 }
 
-func (m *SoraMailbox) PermittedFlags() []imap.Flag {
+func (m *Mailbox) PermittedFlags() []imap.Flag {
 	var permFlags []imap.Flag
-	switch strings.ToUpper(m.name) {
+	switch strings.ToUpper(m.Name) {
 	case "DRAFTS":
 		// Special case for the Drafts folder
 		permFlags = []imap.Flag{
@@ -58,4 +60,24 @@ func (m *SoraMailbox) PermittedFlags() []imap.Flag {
 // JoinMailboxPath joins the parent path components with the mailbox delimiter
 func JoinMailboxPath(parentPathComponents []string) string {
 	return strings.Join(parentPathComponents, string(consts.MailboxDelimiter))
+}
+
+func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
+	mbox.mutex.Lock()
+	defer mbox.mutex.Unlock()
+	fmt.Println("mbox.Name", mbox.Name)
+	fmt.Println(options.SelectSubscribed)
+	fmt.Println("mbox subscribed", mbox.Subscribed)
+	if options.SelectSubscribed && !mbox.Subscribed {
+		return nil
+	}
+
+	data := imap.ListData{
+		Mailbox: mbox.Name,
+		Delim:   consts.MailboxDelimiter,
+	}
+	if mbox.Subscribed {
+		data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
+	}
+	return &data
 }

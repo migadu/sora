@@ -25,7 +25,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	pathComponents := strings.Split(mailboxName, string(consts.MailboxDelimiter))
 
 	// Fetch the mailbox by its full path
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' does not exist", mailboxName)
@@ -39,7 +39,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	}
 
 	// Set subscription status
-	err = s.server.db.SetSubscribed(ctx, mailbox.ID, subscribe)
+	err = s.server.db.SetMailboxSubscribed(ctx, mailbox.ID, subscribe)
 	if err != nil {
 		return s.internalError("failed to set subscription status for mailbox '%s': %v", mailboxName, err)
 	}

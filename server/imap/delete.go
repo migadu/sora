@@ -11,6 +11,8 @@ import (
 
 // Delete a mailbox
 func (s *IMAPSession) Delete(mboxName string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	ctx := context.Background()
 
 	for _, specialMailbox := range consts.DefaultMailboxes {
@@ -27,7 +29,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
 
 	// Fetch the mailbox from the database using the full path
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' not found", mboxName)

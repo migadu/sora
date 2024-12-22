@@ -38,7 +38,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 		}
 	}
 	s.sender = &fromAddress
-	s.Log("Mail from=%s", fromAddress.Address)
+	s.Log("Mail from=%s", fromAddress.FullAddress())
 	return nil
 }
 
@@ -52,7 +52,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Message:      "Invalid recipient",
 		}
 	}
-	userId, err := s.backend.db.GetUserIDByAddress(context.Background(), toAddress.Address)
+	userId, err := s.backend.db.GetUserIDByAddress(context.Background(), toAddress.FullAddress())
 	if err != nil {
 		s.Log("Failed to get user ID by address: %v", err)
 		return &smtp.SMTPError{
@@ -61,8 +61,8 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Message:      "No such user here",
 		}
 	}
-	s.User = server.NewSoraUser(toAddress, userId)
-	s.Log("Rcpt to=%s", toAddress.Address)
+	s.User = server.NewUser(toAddress, userId)
+	s.Log("Rcpt to=%s", toAddress.FullAddress())
 	return nil
 }
 
@@ -112,7 +112,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// TODO: SIEVE filtering
 	// Assume the message goes always to the INBOX
-	mbox, err := s.backend.db.GetMailboxByFullPath(context.Background(), s.User.UserID(), []string{"INBOX"})
+	mbox, err := s.backend.db.GetMailboxByFullPath(context.Background(), s.UserID(), []string{"INBOX"})
 	if err != nil {
 		return s.internalError("failed to get mailbox: %v", err)
 	}
@@ -120,7 +120,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// Save the message to the database
 	messageUID, err := s.backend.db.InsertMessage(context.Background(), mbox.ID, uuidKey, messageID, []imap.Flag{}, time.Now(), bufSize, subject, plaintextBody, sentDate, inReplyTo, s3UploadBuf, &bodyStructure, &recipients, func(uid uuid.UUID, s3Buf *bytes.Buffer, s3BufSize int64) error {
 		// Save the message to S3
-		s3DestKey := server.S3Key(s.User, uid)
+		s3DestKey := server.S3Key(s.Domain(), s.LocalPart(), uid)
 		return s.backend.s3.SaveMessage(s3DestKey, s3Buf, s3BufSize)
 	})
 	if err != nil {

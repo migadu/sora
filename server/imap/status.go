@@ -12,7 +12,7 @@ import (
 func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	ctx := context.Background()
 	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			return nil, &imap.Error{
@@ -29,7 +29,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	}
 
 	if options.NumMessages {
-		messageCount, _, err := s.server.db.GetMessageCount(ctx, mailbox.ID)
+		messageCount, _, err := s.server.db.GetMailboxMessageCountAndSizeSum(ctx, mailbox.ID)
 		if err != nil {
 			return nil, s.internalError("failed to get message count for mailbox '%s': %v", mboxName, err)
 		}

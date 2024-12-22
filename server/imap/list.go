@@ -1,37 +1,29 @@
 package imap
 
 import (
-	"context"
-	"strings"
+	"sort"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/db"
 )
 
 func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
-	ctx := context.Background()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
-	// Determine whether to list subscribed mailboxes
-	subscribed := options != nil && options.SelectSubscribed
-
-	// Fetch mailboxes from the database
-	var mailboxes []db.Mailbox
-	var err error
-	if subscribed {
-		mailboxes, err = s.server.db.GetSubscribedMailboxes(ctx, s.user.UserID())
-	} else {
-		mailboxes, err = s.server.db.GetMailboxes(ctx, s.user.UserID())
-	}
-	if err != nil {
-		return s.internalError("failed to list mailboxes: %v", err)
+	if len(patterns) == 0 {
+		return w.WriteList(&imap.ListData{
+			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
+			Delim: consts.MailboxDelimiter,
+		})
 	}
 
-	for _, mbox := range mailboxes {
+	var l []imap.ListData
+	for name, mbox := range s.Mailboxes {
 		match := false
 		for _, pattern := range patterns {
-			match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
+			match = imapserver.MatchList(name, consts.MailboxDelimiter, ref, pattern)
 			if match {
 				break
 			}
@@ -40,50 +32,20 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 			continue
 		}
 
-		// Prepare attributes
-		attributes := []imap.MailboxAttr{}
-
-		// Check if the mailbox has children
-		hasChildren, err := s.server.db.MailboxHasChildren(ctx, mbox.ID)
-		if err != nil {
-			return s.internalError("failed to check mailbox children: %v", err)
-		}
-
-		if hasChildren {
-			attributes = append(attributes, imap.MailboxAttrHasChildren)
-		} else {
-			attributes = append(attributes, imap.MailboxAttrHasNoChildren)
-		}
-
-		// Add special attributes
-		switch strings.ToUpper(mbox.Name) {
-		case "SENT":
-			attributes = append(attributes, imap.MailboxAttrSent)
-		case "TRASH":
-			attributes = append(attributes, imap.MailboxAttrTrash)
-		case "DRAFTS":
-			attributes = append(attributes, imap.MailboxAttrDrafts)
-		case "ARCHIVE":
-			attributes = append(attributes, imap.MailboxAttrArchive)
-		case "JUNK":
-			attributes = append(attributes, imap.MailboxAttrJunk)
-		}
-
-		fullMailboxPath := mbox.Name
-		if mbox.ParentID != nil {
-			fullMailboxPath = *mbox.ParentPath + string(consts.MailboxDelimiter) + mbox.Name
-		}
-
-		listData := &imap.ListData{
-			Mailbox: fullMailboxPath,
-			Delim:   consts.MailboxDelimiter,
-			Attrs:   attributes,
-		}
-
-		if err := w.WriteList(listData); err != nil {
-			return s.internalError("failed to write mailbox data: %v", err)
+		data := mbox.list(options)
+		if data != nil {
+			l = append(l, *data)
 		}
 	}
 
+	sort.Slice(l, func(i, j int) bool {
+		return l[i].Mailbox < l[j].Mailbox
+	})
+
+	for _, data := range l {
+		if err := w.WriteList(&data); err != nil {
+			return err
+		}
+	}
 	return nil
 }

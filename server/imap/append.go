@@ -29,7 +29,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	ctx := context.Background()
 
 	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			return nil, &imap.Error{
@@ -95,15 +95,15 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to append message: %v", err)
 	}
 
-	// Update the last poll time for the mailbox
-	s.mailbox.lastPollAt = time.Now()
+	// TODO: Update the mailbox's last poll time
+	// s.mailbox.lastPollAt = time.Now()
 
 	// If successful, return the AppendData
 	return result, nil
 }
 
 // Actual logic for appending a single message to the mailbox
-func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messageContent *message.Entity, buf *bytes.Buffer, options *imap.AppendOptions) (*imap.AppendData, error) {
+func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.DBMailbox, messageContent *message.Entity, buf *bytes.Buffer, options *imap.AppendOptions) (*imap.AppendData, error) {
 	bufSize := int64(buf.Len())
 	s3UploadBuf := bytes.NewBuffer(buf.Bytes())
 
@@ -132,7 +132,7 @@ func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messag
 	uuidKey := uuid.New()
 
 	messageUID, err := s.server.db.InsertMessage(ctx, mbox.ID, uuidKey, messageID, options.Flags, options.Time, bufSize, subject, plaintextBody, sentDate, inReplyTo, s3UploadBuf, &bodyStructure, &recipients, func(uid uuid.UUID, s3Buf *bytes.Buffer, s3BufSize int64) error {
-		s3DestKey := server.S3Key(s.user, uid)
+		s3DestKey := server.S3Key(s.Domain(), s.LocalPart(), uid)
 		return s.server.s3.SaveMessage(s3DestKey, s3Buf, s3BufSize)
 	})
 	if err != nil {

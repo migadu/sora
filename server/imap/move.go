@@ -23,7 +23,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	ctx := context.Background()
 
 	// Find the destination mailbox by its name
-	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), strings.Split(dest, string(consts.MailboxDelimiter)))
+	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), strings.Split(dest, string(consts.MailboxDelimiter)))
 	if err != nil {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -62,7 +62,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Prepare CopyData (UID data for the COPYUID response)
 	copyData := &imap.CopyData{
-		UIDValidity: s.mailbox.uidValidity,         // UIDVALIDITY of the source mailbox
+		UIDValidity: s.mailbox.UIDValidity,         // UIDVALIDITY of the source mailbox
 		SourceUIDs:  imap.UIDSetNum(sourceUIDs...), // Original UIDs (source mailbox)
 		DestUIDs:    imap.UIDSetNum(destUIDs...),   // New UIDs in the destination mailbox
 	}

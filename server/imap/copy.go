@@ -24,7 +24,7 @@ func (s *IMAPSession) Copy(seqSet imap.NumSet, mboxName string) (*imap.CopyData,
 	ctx := context.Background()
 
 	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), pathComponents)
+	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Copy failed: destination mailbox '%s' does not exist", mboxName)
@@ -53,8 +53,8 @@ func (s *IMAPSession) Copy(seqSet imap.NumSet, mboxName string) (*imap.CopyData,
 				return s.internalError("failed to parse message UUID: %v", err)
 			}
 			destUUID := uuid.New()
-			sourceS3Key := server.S3Key(s.user, srcUUIDKey)
-			destS3Key := server.S3Key(s.user, destUUID)
+			sourceS3Key := server.S3Key(s.Domain(), s.LocalPart(), srcUUIDKey)
+			destS3Key := server.S3Key(s.Domain(), s.LocalPart(), destUUID)
 			err = s.server.s3.CopyMessage(sourceS3Key, destS3Key)
 			if err != nil {
 				return s.internalError("failed to copy message body in S3: %v", err)
@@ -73,7 +73,7 @@ func (s *IMAPSession) Copy(seqSet imap.NumSet, mboxName string) (*imap.CopyData,
 		DestUIDs:    destUIDs,
 	}
 
-	s.Log("Messages copied from %s to %s", s.mailbox.Name(), mboxName)
+	s.Log("Messages copied from %s to %s", s.mailbox.Name, mboxName)
 
 	return copyData, nil
 }

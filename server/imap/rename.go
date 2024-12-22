@@ -22,7 +22,7 @@ func (s *IMAPSession) Rename(existingName, newName string) error {
 	ctx := context.Background()
 	// Fetch the old mailbox based on its current name
 	oldMailboxPathComponents := strings.Split(existingName, string(consts.MailboxDelimiter))
-	oldMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), oldMailboxPathComponents)
+	oldMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), oldMailboxPathComponents)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' does not exist", existingName)
@@ -45,7 +45,7 @@ func (s *IMAPSession) Rename(existingName, newName string) error {
 		newName = newMailboxPathComponents[len(newMailboxPathComponents)-1]
 
 		// Check if the parent mailbox of the new name exists
-		_, err = s.server.db.GetMailboxByFullPath(ctx, s.user.UserID(), parentMailboxComponents)
+		_, err = s.server.db.GetMailboxByFullPath(ctx, s.UserID(), parentMailboxComponents)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
 				s.Log("Parent mailbox for '%s' does not exist", newName)
