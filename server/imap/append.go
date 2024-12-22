@@ -120,7 +120,7 @@ func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messag
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
 
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent, buf, true)
+	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent)
 	if err != nil {
 		log.Printf("Failed to extract plaintext body: %v", err)
 		return nil, consts.ErrMalformedMessage

@@ -1,7 +1,6 @@
 package helpers
 
 import (
-	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
 )
 
@@ -52,66 +52,51 @@ func ExtractPart(msg *message.Entity, partNum int) (*message.Entity, error) {
 	}
 }
 
-func ExtractPlaintextBody(msg *message.Entity, buf *bytes.Buffer, extended bool) (*string, error) {
+func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil message entity")
 	}
-	if buf == nil {
-		return nil, fmt.Errorf("nil buffer")
-	}
-	var plaintextBody *string
-	var htmlBody *string
 
-	var extractContent func(*message.Entity) error
-	extractContent = func(entity *message.Entity) error {
-		mediaType, _, err := entity.Header.ContentType()
+	mr := mail.NewReader(msg)
+	defer mr.Close()
+
+	var plaintextBody, htmlBody *string
+	for plaintextBody == nil {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("failed to get next mail part: %v", err)
+		}
+
+		header, ok := part.Header.(*mail.InlineHeader)
+		if !ok {
+			continue
+		}
+
+		mediaType, _, err := header.ContentType()
 		if err != nil {
-			return fmt.Errorf("error getting content type: %v", err)
+			return nil, fmt.Errorf("failed to get mail part Content-Type: %v", err)
+		} else if mediaType != "text/plain" && mediaType != "text/html" {
+			continue
 		}
 
-		if strings.HasPrefix(mediaType, "multipart/") {
-			mr := entity.MultipartReader()
-			if mr == nil {
-				return fmt.Errorf("nil multipart reader for multipart content type")
-			}
+		b, err := io.ReadAll(part.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read inline part: %v", err)
+		}
+		s := string(b)
 
-			for {
-				part, err := mr.NextPart()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					return fmt.Errorf("error reading multipart: %v", err)
-				}
-				if err := extractContent(part); err != nil {
-					return err
-				}
+		switch mediaType {
+		case "text/plain":
+			if plaintextBody == nil {
+				plaintextBody = &s
 			}
-		} else {
-			content, err := io.ReadAll(entity.Body)
-			if err != nil {
-				return fmt.Errorf("error reading entity body: %v", err)
-			}
-
-			switch mediaType {
-			case "text/plain":
-				if plaintextBody == nil {
-					s := string(content)
-					plaintextBody = &s
-				}
-			case "text/html":
-				if htmlBody == nil {
-					s := string(content)
-					htmlBody = &s
-				}
+		case "text/html":
+			if htmlBody == nil {
+				htmlBody = &s
 			}
 		}
-
-		return nil
-	}
-
-	if err := extractContent(msg); err != nil {
-		return nil, err
 	}
 
 	// If we don't have a plaintext body but we have an HTML body, convert it to plaintext
