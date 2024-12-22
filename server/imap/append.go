@@ -127,7 +127,7 @@ func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.Mailbox, messag
 	}
 
 	// log.Println("Plaintext body:", *plaintextBody)
-	recipients := db.ExtractRecipients(messageContent)
+	recipients := db.ExtractRecipients(messageContent.Header)
 	// Generate a new UUID for the message
 	uuidKey := uuid.New()
 
