@@ -21,6 +21,9 @@ func (s *IMAPSession) Unsubscribe(mailboxName string) error {
 
 // Helper function to handle both subscribe and unsubscribe logic
 func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe bool) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	ctx := context.Background()
 	pathComponents := strings.Split(mailboxName, string(consts.MailboxDelimiter))
 

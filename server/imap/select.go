@@ -10,6 +10,9 @@ import (
 )
 
 func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	ctx := context.Background()
 
 	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))

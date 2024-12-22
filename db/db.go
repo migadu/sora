@@ -414,7 +414,7 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 				row_number() OVER (ORDER BY id) AS seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
-		) WHERE true
+		) AS sub WHERE true
 	`
 	args := []interface{}{mailboxID}
 

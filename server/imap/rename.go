@@ -10,6 +10,9 @@ import (
 )
 
 func (s *IMAPSession) Rename(existingName, newName string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	if existingName == newName {
 		s.Log("The new mailbox name is the same as the current one.")
 		return &imap.Error{

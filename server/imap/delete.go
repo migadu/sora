@@ -13,6 +13,7 @@ import (
 func (s *IMAPSession) Delete(mboxName string) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
 	ctx := context.Background()
 
 	for _, specialMailbox := range consts.DefaultMailboxes {

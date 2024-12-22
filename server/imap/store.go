@@ -9,6 +9,9 @@ import (
 
 // Update flags for messages in the selected mailbox
 func (s *IMAPSession) Store(w *imapserver.FetchWriter, seqSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	if s.mailbox == nil {
 		s.Log("Store failed: no mailbox selected")
 		return &imap.Error{

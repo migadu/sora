@@ -9,7 +9,6 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/emersion/go-message"
 	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
@@ -81,13 +80,13 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 		}
 
 		if len(options.BinarySection) > 0 {
-			if err := s.handleBinarySections(m, msg.ID, bodyData, options); err != nil {
+			if err := s.handleBinarySections(m, bodyData, options); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if err := s.handleBinarySectionSize(m, msg.ID, bodyData, options); err != nil {
+			if err := s.handleBinarySectionSize(m, bodyData, options); err != nil {
 				return err
 			}
 		}
@@ -141,18 +140,8 @@ func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, mess
 	return nil
 }
 
-func (s *IMAPSession) getMessageReader(messageID int, bodyData []byte) (*message.Entity, error) {
-	mr, err := message.Read(bytes.NewReader(bodyData))
-	if message.IsUnknownCharset(err) {
-		s.Log("Unknown encoding for message UID %d: %v", messageID, err)
-	} else if err != nil {
-		return nil, s.internalError("failed to parse message UID %d: %v", messageID, err)
-	}
-	return mr, nil
-}
-
 // Fetch helper to handle BINARY sections for a message
-func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
+func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bodyData []byte, options *imap.FetchOptions) error {
 	for _, section := range options.BinarySection {
 		buf := imapserver.ExtractBinarySection(bytes.NewReader(bodyData), section)
 		wc := w.WriteBinarySection(section, int64(len(buf)))
@@ -169,7 +158,7 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, me
 }
 
 // Fetch helper to handle BINARY.SIZE sections for a message
-func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, messageID int, bodyData []byte, options *imap.FetchOptions) error {
+func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, bodyData []byte, options *imap.FetchOptions) error {
 	for _, section := range options.BinarySectionSize {
 		n := imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 		w.WriteBinarySectionSize(section, n)

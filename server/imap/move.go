@@ -11,6 +11,9 @@ import (
 )
 
 func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
 	// Ensure a mailbox is selected
 	if s.mailbox == nil {
 		return &imap.Error{

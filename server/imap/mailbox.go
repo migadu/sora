@@ -1,7 +1,6 @@
 package imap
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -65,9 +64,7 @@ func JoinMailboxPath(parentPathComponents []string) string {
 func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
 	mbox.mutex.Lock()
 	defer mbox.mutex.Unlock()
-	fmt.Println("mbox.Name", mbox.Name)
-	fmt.Println(options.SelectSubscribed)
-	fmt.Println("mbox subscribed", mbox.Subscribed)
+
 	if options.SelectSubscribed && !mbox.Subscribed {
 		return nil
 	}
