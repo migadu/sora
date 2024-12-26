@@ -315,10 +315,8 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int, sub
 	}
 
 	_, err = db.Pool.Exec(ctx, `
-		UPDATE mailboxes SET subscribed = $1 
-		WHERE id = $2 AND (parent_id IS NOT NULL OR $1 = TRUE)
+		UPDATE mailboxes SET subscribed = $1 WHERE id = $2
 	`, subscribed, mailboxID)
-
 	if err != nil {
 		return fmt.Errorf("failed to update subscription status for mailbox %d: %v", mailboxID, err)
 	}
