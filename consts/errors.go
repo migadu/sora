@@ -3,12 +3,14 @@ package consts
 import "errors"
 
 var (
-	ErrMailboxNotFound  = errors.New("mailbox not found")
-	ErrUserNotFound     = errors.New("user not found")
-	ErrInternalError    = errors.New("internal error")
-	ErrNotPermitted     = errors.New("operation not permitted")
-	ErrMessageExists    = errors.New("message already exists")
-	ErrMalformedMessage = errors.New("malformed message")
+	ErrMailboxNotFound      = errors.New("mailbox not found")
+	ErrMailboxInvalidName   = errors.New("invalid mailbox name")
+	ErrMailboxAlreadyExists = errors.New("mailbox already exists")
+	ErrUserNotFound         = errors.New("user not found")
+	ErrInternalError        = errors.New("internal error")
+	ErrNotPermitted         = errors.New("operation not permitted")
+	ErrMessageExists        = errors.New("message already exists")
+	ErrMalformedMessage     = errors.New("malformed message")
 
 	ErrDBNotFound                = errors.New("not found")
 	ErrDBUniqueViolation         = errors.New("unique violation")

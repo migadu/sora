@@ -7,8 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS mailboxes (
 	id SERIAL PRIMARY KEY,
 	user_id INTEGER REFERENCES users(id),
-	name TEXT NOT NULL,
-	parent_path TEXT,  -- Store the full parent path of the mailbox
+	name TEXT NOT NULL,	
 	uid_validity BIGINT NOT NULL,  -- Include uid_validity column for IMAP
 	parent_id INTEGER REFERENCES mailboxes(id) ON DELETE CASCADE,  -- Self-referencing for parent mailbox
 	subscribed BOOLEAN DEFAULT TRUE,  -- New field to track mailbox subscription status
@@ -17,9 +16,6 @@ CREATE TABLE IF NOT EXISTS mailboxes (
 
 -- Index for faster mailbox lookups by user_id and case insensitive name
 CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name_parent_id ON mailboxes (user_id, LOWER(name), parent_id);
-
--- Index for faster mailbox lookups by user_id and case insensitive name
-CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name_parent_path ON mailboxes (user_id, LOWER(name), LOWER(parent_path));
 
 -- Partial unique index for top-level mailboxes
 CREATE UNIQUE INDEX IF NOT EXISTS unique_top_level_mailbox_name ON mailboxes (user_id, name)
@@ -57,7 +53,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	--
 	-- Information for restoring messages from S3
 	--
-	mailbox_path TEXT,			   -- Store the mailbox path for restoring messages
+	mailbox_name TEXT,			   -- Store the mailbox path for restoring messages
 
 	deleted_at TIMESTAMP,			-- Soft delete column
 	flags_changed_at TIMESTAMP,			 -- Track the last time flags were changed

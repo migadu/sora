@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -28,8 +27,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	ctx := context.Background()
 
-	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			return nil, &imap.Error{

@@ -27,10 +27,8 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		}
 	}
 
-	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-
 	// Fetch the mailbox from the database using the full path
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' not found", mboxName)
@@ -44,7 +42,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Delete the mailbox; the database will automatically delete any child mailboxes due to ON DELETE CASCADE
-	err = s.server.db.DeleteMailbox(ctx, mailbox.ID, mboxName)
+	err = s.server.db.DeleteMailbox(ctx, mailbox.ID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}

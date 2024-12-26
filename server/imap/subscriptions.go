@@ -2,10 +2,7 @@ package imap
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 )
 
@@ -25,18 +22,13 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	defer s.mutex.Unlock()
 
 	ctx := context.Background()
-	pathComponents := strings.Split(mailboxName, string(consts.MailboxDelimiter))
 
 	// Fetch the mailbox by its full path
-	mailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
+	mailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' does not exist", mailboxName)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
-				Text: fmt.Sprintf("mailbox '%s' does not exist", mailboxName),
-			}
+			return nil
 		}
 		return s.internalError("failed to fetch mailbox '%s': %v", mailboxName, err)
 	}

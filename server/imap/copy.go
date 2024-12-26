@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/google/uuid"
@@ -23,8 +22,7 @@ func (s *IMAPSession) Copy(seqSet imap.NumSet, mboxName string) (*imap.CopyData,
 
 	ctx := context.Background()
 
-	pathComponents := strings.Split(mboxName, string(consts.MailboxDelimiter))
-	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), pathComponents)
+	destMailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Copy failed: destination mailbox '%s' does not exist", mboxName)

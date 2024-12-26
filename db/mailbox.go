@@ -16,42 +16,47 @@ import (
 // DBMailbox represents the database structure of a mailbox
 type DBMailbox struct {
 	ID          int
-	Name        string
+	Name        string // Full path
 	UIDValidity uint32
 	Subscribed  bool
 	// Messages int
 	// Recent        int
 	// Unseen        int
 	HasChildren bool
-	ParentID    *int    // Nullable parent ID for top-level mailboxes
-	ParentPath  *string // Nullable parent path for top-level mailboxes
+	ParentID    *int // Nullable parent ID for top-level mailboxes
 }
 
-func NewDBMailbox(mboxId int, name string, uidValidity uint32, parentID *int, parentPath *string, subscribed, hasChildren bool) DBMailbox {
+func NewDBMailbox(mboxId int, name string, uidValidity uint32, parentID *int, subscribed, hasChildren bool) DBMailbox {
 	return DBMailbox{
 		ID:          mboxId,
 		Name:        name,
 		UIDValidity: uidValidity,
 		ParentID:    parentID,
-		ParentPath:  parentPath,
 		HasChildren: hasChildren,
 		Subscribed:  subscribed,
 	}
 }
 
-func (db *Database) GetMailboxes(ctx context.Context, userID int) ([]*DBMailbox, error) {
-	// Prepare the query to fetch all mailboxes for the given user
-	rows, err := db.Pool.Query(ctx, `
+func (db *Database) GetMailboxes(ctx context.Context, userID int, subscribed bool) ([]*DBMailbox, error) {
+	query := `
 		SELECT 
-			id, name, uid_validity, parent_id, parent_path, subscribed,
-			EXISTS (
-        SELECT 1 
-        FROM mailboxes AS child 
-        WHERE child.parent_id = m.id
-    	) AS has_children
-		FROM mailboxes m
-		WHERE user_id = $1
-	`, userID)
+			id, 
+			name, 
+			uid_validity, 
+			parent_id, 
+			subscribed, 
+			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.parent_id = m.id) AS has_children 
+		FROM 
+			mailboxes m 
+		WHERE 
+			user_id = $1`
+
+	if subscribed {
+		query += " AND m.subscribed = TRUE"
+	}
+
+	// Prepare the query to fetch all mailboxes for the given user
+	rows, err := db.Pool.Query(ctx, query, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -64,8 +69,6 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int) ([]*DBMailbox,
 		var parentID *int
 
 		var dbParentID sql.NullInt64
-		var dbParentPath sql.NullString
-		var parentPath *string
 
 		var mailboxName string
 		var hasChildren bool
@@ -73,7 +76,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int) ([]*DBMailbox,
 
 		var subscribed bool
 
-		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidity, &dbParentID, &dbParentPath, &subscribed, &hasChildren); err != nil {
+		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidity, &dbParentID, &subscribed, &hasChildren); err != nil {
 			return nil, err
 		}
 
@@ -81,11 +84,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int) ([]*DBMailbox,
 			i := int(dbParentID.Int64)
 			parentID = &i
 		}
-		if dbParentPath.Valid {
-			s := dbParentPath.String
-			parentPath = &s
-		}
-		mailbox := NewDBMailbox(mailboxID, mailboxName, uidValidity, parentID, parentPath, subscribed, hasChildren)
+		mailbox := NewDBMailbox(mailboxID, mailboxName, uidValidity, parentID, subscribed, hasChildren)
 		mailboxes = append(mailboxes, &mailbox)
 	}
 
@@ -99,24 +98,23 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int) ([]*DBMailbox,
 
 // GetMailbox fetches the mailbox
 func (db *Database) GetMailbox(ctx context.Context, mailboxID int) (*DBMailbox, error) {
-	var parentID int
-	var mailboxName, parentPath string
+	var dbParentID sql.NullInt32
+	var mailboxName string
 	var hasChildren bool
 	var uidValidity uint32
 	var subscribed bool
 
 	err := db.Pool.QueryRow(ctx, `
 		SELECT 
-			id, name, uid_validity, parent_id, parent_path, subscribed 
-		FROM mailboxes,
+			id, name, uid_validity, parent_id, subscribed,
 			EXISTS (
 				SELECT 1
 				FROM mailboxes AS child
 				WHERE child.parent_id = m.id
 			) AS has_children
-		FROM mailboxes
+		FROM mailboxes m
 		WHERE id = $1
-	`, mailboxID).Scan(&mailboxID, &mailboxName, &uidValidity, &parentID, &parentPath, &subscribed, &hasChildren)
+	`, mailboxID).Scan(&mailboxID, &mailboxName, &uidValidity, &dbParentID, &subscribed, &hasChildren)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -125,56 +123,45 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int) (*DBMailbox, 
 		return nil, err
 	}
 
-	mailbox := NewDBMailbox(mailboxID, mailboxName, uidValidity, &parentID, &parentPath, subscribed, hasChildren)
+	var parentID *int
+	if dbParentID.Valid {
+		i := int(dbParentID.Int32)
+		parentID = &i
+	}
+
+	mailbox := NewDBMailbox(mailboxID, mailboxName, uidValidity, parentID, subscribed, hasChildren)
 	return &mailbox, nil
 }
 
 // GetMailboxByFullPath fetches the mailbox for a specific user by full path, working recursively
-func (db *Database) GetMailboxByFullPath(ctx context.Context, userID int, pathComponents []string) (*DBMailbox, error) {
+func (db *Database) GetMailboxByName(ctx context.Context, userID int, name string) (*DBMailbox, error) {
 	var mailbox DBMailbox
-	var err error
 
-	if len(pathComponents) == 0 {
-		return nil, consts.ErrMailboxNotFound
-	}
-
-	fullPath := strings.Join(pathComponents, string(consts.MailboxDelimiter))
-	if len(pathComponents) == 1 {
-		mailboxName := strings.ToLower(pathComponents[0])
-		err = db.Pool.QueryRow(ctx, `
-				SELECT id, name, uid_validity, parent_id, parent_path
-				FROM mailboxes 
-				WHERE user_id = $1 AND LOWER(name) = $2 AND parent_id IS NULL
-			`, userID, mailboxName).Scan(&mailbox.ID, &mailbox.Name, &mailbox.UIDValidity, &mailbox.ParentID, &mailbox.ParentPath)
-	} else {
-		name := strings.ToLower(pathComponents[len(pathComponents)-1])
-		parentPath := strings.ToLower(strings.Join(pathComponents[:len(pathComponents)-1], string(consts.MailboxDelimiter)))
-		err = db.Pool.QueryRow(ctx, `
-				SELECT id, name, uid_validity, parent_id, parent_path
-				FROM mailboxes 
-				WHERE user_id = $1 AND LOWER(name) = $2 AND LOWER(parent_path) = $3
-			`, userID, name, parentPath).Scan(&mailbox.ID, &mailbox.Name, &mailbox.UIDValidity, &mailbox.ParentID, &mailbox.ParentPath)
-	}
+	err := db.Pool.QueryRow(ctx, `
+		SELECT id, name, uid_validity, parent_id
+		FROM mailboxes 
+		WHERE user_id = $1 AND LOWER(name) = $2 
+	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &mailbox.UIDValidity, &mailbox.ParentID)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, consts.ErrMailboxNotFound
 		}
-		log.Printf("Failed to find mailbox '%s': %v", fullPath, err)
+		log.Printf("Failed to find mailbox '%s': %v", name, err)
 		return nil, consts.ErrInternalError
 	}
 
 	return &mailbox, nil
 }
 
-func (db *Database) CreateChildMailbox(ctx context.Context, userID int, name string, parentID int, parentPath string) error {
+func (db *Database) CreateMailbox(ctx context.Context, userID int, name string, parentID *int) error {
 	uidValidity := generateUIDValidity()
 
 	// Try to insert the mailbox into the database
 	_, err := db.Pool.Exec(ctx, `
-        INSERT INTO mailboxes (user_id, name, parent_id, parent_path, uid_validity, subscribed) 
-        VALUES ($1, $2, $3, $4, $5, $6)
-    `, userID, name, parentID, parentPath, uidValidity, true)
+        INSERT INTO mailboxes (user_id, name, parent_id, uid_validity, subscribed) 
+        VALUES ($1, $2, $3, $4, $5)
+    `, userID, name, parentID, uidValidity, true)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -196,49 +183,16 @@ func (db *Database) CreateChildMailbox(ctx context.Context, userID int, name str
 		}
 		return fmt.Errorf("failed to create mailbox: %v", err)
 	}
-	return nil
-}
-
-// CreateMailbox creates a new mailbox for the specified user with the given name
-func (db *Database) CreateMailbox(ctx context.Context, userID int, name string) error {
-	uidValidity := generateUIDValidity()
-	// Try to insert the mailbox into the database
-	_, err := db.Pool.Exec(ctx, `
-				INSERT INTO mailboxes (user_id, name, uid_validity, subscribed) 
-				VALUES ($1, $2, $3, $4)
-		`, userID, name, uidValidity, true)
-
-	// Handle errors, including unique constraint and foreign key violations
-	if err != nil {
-		// Use pgx/v5's pgconn.PgError for error handling
-		if pgErr, ok := err.(*pgconn.PgError); ok {
-			switch pgErr.Code {
-			case "23505": // Unique constraint violation
-				log.Printf("A mailbox named '%s' already exists for user %d", name, userID)
-				return consts.ErrDBUniqueViolation
-			case "23503": // Foreign key violation
-				if pgErr.ConstraintName == "mailboxes_user_id_fkey" {
-					log.Printf("User with ID %d does not exist", userID)
-					return consts.ErrDBNotFound
-				} else if pgErr.ConstraintName == "mailboxes_parent_id_fkey" {
-					log.Printf("Parent mailbox does not exist")
-					return consts.ErrDBNotFound
-				}
-			}
-		}
-		return fmt.Errorf("failed to create mailbox: %v", err)
-	}
-
 	return nil
 }
 
 // DeleteMailbox deletes a mailbox for a specific user by id
-func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int, mailboxPath string) error {
+func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int) error {
 	//
 	// TODO: Implement delayed S3 deletion of messages
 	//
 
-	_, err := db.GetMailbox(ctx, mailboxID)
+	mbox, err := db.GetMailbox(ctx, mailboxID)
 	if err != nil {
 		log.Printf("Failed to fetch mailbox %d: %v", mailboxID, err)
 		return consts.ErrMailboxNotFound
@@ -251,13 +205,13 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int, mailboxPat
 	}
 	defer tx.Rollback(ctx) // Ensure the transaction is rolled back if an error occurs
 
-	// Soft delete messages of the mailbox
+	// Soft delete messages of the mailbox and set mailbox_name (path) for possible restoration
 	now := time.Now()
 	_, err = tx.Exec(ctx, `
 		UPDATE messages SET 
-			mailbox_path = $1, 
+			mailbox_name = $1, 
 			deleted_at = $2 
-		WHERE mailbox_id = $3`, mailboxPath, now, mailboxID)
+		WHERE mailbox_id = $3`, mbox.Name, now, mailboxID)
 	if err != nil {
 		log.Printf("Failed to soft delete messages of folder %d : %v", mailboxID, err)
 		return consts.ErrInternalError
@@ -286,12 +240,10 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int, mailboxPat
 
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, userId int) error {
 	for _, mailboxName := range consts.DefaultMailboxes {
-		pathComponents := []string{mailboxName}
-
-		_, err := db.GetMailboxByFullPath(ctx, userId, pathComponents)
+		_, err := db.GetMailboxByName(ctx, userId, mailboxName)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
-				err := db.CreateMailbox(ctx, userId, mailboxName)
+				err := db.CreateMailbox(ctx, userId, mailboxName, nil)
 				if err != nil {
 					log.Printf("Failed to create mailbox %s for user %d: %v\n", mailboxName, userId, err)
 					return consts.ErrInternalError
@@ -374,7 +326,11 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int, sub
 	return nil
 }
 
-func (db *Database) RenameMailbox(ctx context.Context, mailboxID int, newName string, newParentPath *string) error {
+func (db *Database) RenameMailbox(ctx context.Context, mailboxID int, userID int, newName string) error {
+	if newName == "" {
+		return consts.ErrMailboxInvalidName
+	}
+
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		log.Printf("Failed to begin transaction: %v", err)
@@ -382,25 +338,64 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int, newName st
 	}
 	defer tx.Rollback(ctx)
 
-	var newChildParentPath string
-	if newParentPath == nil {
-		_, err = tx.Exec(ctx, `
-		UPDATE mailboxes SET name = $1, parent_path = NULL WHERE id = $2
-	`, newName, mailboxID)
-		newChildParentPath = newName
-	} else {
-		_, err = tx.Exec(ctx, `
-		UPDATE mailboxes SET name = $1, parent_path = $2 WHERE id = $3
-	`, newName, *newParentPath, mailboxID)
-		newChildParentPath = *newParentPath + string(consts.MailboxDelimiter) + newName
+	// Fetch the mailbox to rename
+	mailbox, err := db.GetMailbox(ctx, mailboxID)
+	if err != nil {
+		return consts.ErrMailboxNotFound
 	}
+
+	// Check if the new name already exists
+	_, err = db.GetMailboxByName(ctx, userID, newName)
+	if err == nil {
+		return consts.ErrMailboxAlreadyExists
+	} else if err != consts.ErrMailboxNotFound {
+		log.Printf("Failed to fetch mailbox %s: %v", newName, err)
+		return consts.ErrInternalError
+	}
+
+	// Find common name to determine parent between mailbox.name and newName
+	parentPath := findCommonPath(mailbox.Name, newName, string(consts.MailboxDelimiter))
+
+	// No common path
+	if parentPath == "" {
+
+		parentPathComponents := strings.Split(newName, string(consts.MailboxDelimiter))
+		parentPath = strings.Join(parentPathComponents[:len(parentPathComponents)-1], string(consts.MailboxDelimiter))
+	}
+
+	// Get the parent mailbox ID
+	var parentMailboxID *int
+
+	if parentPath != "" {
+		parentMailbox, err := db.GetMailboxByName(ctx, userID, parentPath)
+		if err != nil {
+			log.Printf("Failed to fetch parent mailbox %s: %v", parentPath, err)
+			return consts.ErrInternalError
+		}
+		parentMailboxID = &parentMailbox.ID
+	}
+
+	var parentVal interface{}
+	if parentMailboxID == nil {
+		// This will become SQL NULL
+		parentVal = nil
+	} else {
+		// Dereference the pointer, store as an int
+		parentVal = *parentMailboxID
+	}
+
+	// Update the mailbox name and parent ID
+	_, err = tx.Exec(ctx, `UPDATE mailboxes SET name = $1, parent_id = $2 WHERE id = $3`,
+		newName, parentVal, mailboxID)
 	if err != nil {
 		return fmt.Errorf("failed to rename mailbox %d: %v", mailboxID, err)
 	}
 
 	// Recursively update child mailboxes' parent paths
-	if err := db.updateParentPathOnMailboxChildren(ctx, tx, mailboxID, newChildParentPath); err != nil {
-		return err
+	if mailbox.HasChildren {
+		if err := db.updateParentPathOnMailboxChildren(ctx, tx, mailboxID, newName); err != nil {
+			return err
+		}
 	}
 
 	committed := false
@@ -419,61 +414,120 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int, newName st
 	return nil
 }
 
-func (db *Database) updateParentPathOnMailboxChildren(ctx context.Context, tx pgx.Tx, mailboxID int, newParentPath string) error {
-	// Update the parent path of direct children
-	ct, err := tx.Exec(ctx, `
-			UPDATE mailboxes SET parent_path = $1 WHERE parent_id = $2
-	`, newParentPath, mailboxID)
+func (db *Database) updateParentPathOnMailboxChildren(
+	ctx context.Context,
+	tx pgx.Tx,
+	parentMailboxID int,
+	newParentPath string,
+) error {
+	rows, err := tx.Query(ctx, `
+			SELECT 
+					id,
+					name,
+					EXISTS (
+							SELECT 1
+							FROM mailboxes AS child
+							WHERE child.parent_id = m.id
+					) AS has_children
+			FROM mailboxes m
+			WHERE parent_id = $1
+	`, parentMailboxID)
 	if err != nil {
-		return fmt.Errorf("failed to update child mailboxes of %d: %v", mailboxID, err)
+		return err
+	}
+	defer rows.Close()
+
+	// First, gather all child info in-memory
+	var children []struct {
+		id          int
+		name        string
+		hasChildren bool
 	}
 
-	// If there are children, process them
-	if ct.RowsAffected() > 0 {
-		rows, err := tx.Query(ctx, `
-					SELECT id, name FROM mailboxes WHERE parent_id = $1
-			`, mailboxID)
+	for rows.Next() {
+		var childMailboxID int
+		var childMailboxName string
+		var hasChildren bool
+		if err := rows.Scan(&childMailboxID, &childMailboxName, &hasChildren); err != nil {
+			return err
+		}
+
+		children = append(children, struct {
+			id          int
+			name        string
+			hasChildren bool
+		}{
+			id:          childMailboxID,
+			name:        childMailboxName,
+			hasChildren: hasChildren,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, child := range children {
+		// Build new path for the child
+		oldNameComponents := strings.Split(child.name, string(consts.MailboxDelimiter))
+		newName := strings.Join([]string{
+			newParentPath,
+			oldNameComponents[len(oldNameComponents)-1],
+		}, string(consts.MailboxDelimiter))
+
+		ct, err := tx.Exec(ctx, `
+					UPDATE mailboxes
+					SET name = $1
+					WHERE id = $2
+						AND parent_id = $3
+			`, newName, child.id, parentMailboxID)
 		if err != nil {
-			return err
-		}
-		defer rows.Close() // Ensure rows are closed after processing
-
-		// Create a list of child mailboxes to process after closing the rows
-		var children []struct {
-			id   int
-			name string
+			return fmt.Errorf("failed to update child mailbox %d: %v", child.id, err)
 		}
 
-		// Collect all children before proceeding with further queries
-		for rows.Next() {
-			var childMailboxID int
-			var childName string
-			if err := rows.Scan(&childMailboxID, &childName); err != nil {
-				return err
-			}
-
-			// Add the child to the list for later processing
-			children = append(children, struct {
-				id   int
-				name string
-			}{childMailboxID, childName})
+		if ct.RowsAffected() == 0 {
+			log.Printf("Child mailbox %d not found for update", child.id)
+			continue
 		}
 
-		// Check for errors during row iteration
-		if err := rows.Err(); err != nil {
-			return err
-		}
-
-		// Process the child mailboxes after rows have been fully consumed
-		for _, child := range children {
-			newChildParentPath := newParentPath + string(consts.MailboxDelimiter) + child.name
-
-			// Recursive call to update child mailboxes, using the same transaction
-			if err := db.updateParentPathOnMailboxChildren(ctx, tx, child.id, newChildParentPath); err != nil {
+		// If the child itself has children, recurse AFTER closing the parent's rows
+		if child.hasChildren {
+			if err := db.updateParentPathOnMailboxChildren(ctx, tx, child.id, newName); err != nil {
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// findCommonPath finds the common path between two mailbox names based on the delimiter.
+func findCommonPath(oldName, newName, delimiter string) string {
+	// Split the mailbox names into components
+	oldParts := strings.Split(oldName, delimiter)
+	newParts := strings.Split(newName, delimiter)
+
+	// Determine the shorter length to prevent out-of-range errors
+	minLen := len(oldParts)
+	if len(newParts) < minLen {
+		minLen = len(newParts)
+	}
+
+	// Iterate to find the common prefix
+	commonParts := []string{}
+	for i := 0; i < minLen; i++ {
+		if oldParts[i] == newParts[i] {
+			commonParts = append(commonParts, oldParts[i])
+		} else {
+			break
+		}
+	}
+
+	// If there's no common path, return an empty string
+	if len(commonParts) == 0 {
+		return ""
+	}
+
+	// Reconstruct the common path
+	commonPath := strings.Join(commonParts, delimiter)
+	return commonPath
 }

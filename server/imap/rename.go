@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
@@ -23,9 +22,8 @@ func (s *IMAPSession) Rename(existingName, newName string) error {
 	}
 
 	ctx := context.Background()
-	// Fetch the old mailbox based on its current name
-	oldMailboxPathComponents := strings.Split(existingName, string(consts.MailboxDelimiter))
-	oldMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), oldMailboxPathComponents)
+
+	oldMailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), existingName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' does not exist", existingName)
@@ -38,34 +36,23 @@ func (s *IMAPSession) Rename(existingName, newName string) error {
 		return s.internalError("failed to fetch mailbox '%s': %v", existingName, err)
 	}
 
-	// Parse new mailbox path components
-	newMailboxPathComponents := strings.Split(newName, string(consts.MailboxDelimiter))
-	var newParentPath *string
-
-	// Check if the new mailbox name has a parent
-	if len(newMailboxPathComponents) > 1 {
-		parentMailboxComponents := newMailboxPathComponents[:len(newMailboxPathComponents)-1]
-		newName = newMailboxPathComponents[len(newMailboxPathComponents)-1]
-
-		// Check if the parent mailbox of the new name exists
-		_, err = s.server.db.GetMailboxByFullPath(ctx, s.UserID(), parentMailboxComponents)
-		if err != nil {
-			if err == consts.ErrMailboxNotFound {
-				s.Log("Parent mailbox for '%s' does not exist", newName)
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeNonExistent,
-					Text: fmt.Sprintf("parent mailbox for '%s' does not exist", newName),
-				}
-			}
-			return s.internalError("failed to check parent mailbox for '%s': %v", newName, err)
+	// Check if the new mailbox name already exists
+	_, err = s.server.db.GetMailboxByName(ctx, s.UserID(), newName)
+	if err == nil {
+		s.Log("Mailbox '%s' already exists", newName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAlreadyExists,
+			Text: fmt.Sprintf("mailbox '%s' already exists", newName),
 		}
-		newParentPathStr := JoinMailboxPath(parentMailboxComponents)
-		newParentPath = &newParentPathStr
+	} else {
+		if err != consts.ErrMailboxNotFound {
+			return s.internalError("failed to check if mailbox '%s' already exists: %v", newName, err)
+		}
 	}
 
 	// Perform the rename operation
-	err = s.server.db.RenameMailbox(ctx, oldMailbox.ID, newName, newParentPath)
+	err = s.server.db.RenameMailbox(ctx, oldMailbox.ID, s.UserID(), newName)
 	if err != nil {
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}

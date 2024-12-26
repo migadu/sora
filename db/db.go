@@ -144,45 +144,6 @@ func (db *Database) InsertUser(ctx context.Context, username, password string) e
 	return nil
 }
 
-// // GetSubscribedMailboxes retrieves only subscribed mailboxes for a user
-// func (db *Database) GetSubscribedMailboxes(ctx context.Context, userID int) ([]DBMailbox, error) {
-// 	rows, err := db.Pool.Query(ctx, `
-// 		SELECT id, name, parent_id, parent_path, subscribed FROM mailboxes WHERE user_id = $1 AND subscribed = true
-// 	`, userID)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	defer rows.Close()
-
-// 	var mailboxes []DBMailbox
-// 	for rows.Next() {
-// 		var mailboxID, parentID int
-// 		var mailboxName, parentPath string
-// 		var hasChildren bool
-// 		var uidValidity uint32
-
-// 		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidity, &parentID, &parentPath, &hasChildren); err != nil {
-// 			return nil, err
-// 		}
-
-// 		mailboxes = append(mailboxes, NewDBMailbox())
-// 	}
-
-// 	return mailboxes, nil
-// }
-
-// HasChildren checks if the given mailbox ID has any children (subfolders).
-// func (db *Database) MailboxHasChildren(ctx context.Context, mailboxID int) (bool, error) {
-// 	var count int
-// 	err := db.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM mailboxes WHERE parent_id = $1", mailboxID).Scan(&count)
-// 	if err != nil {
-// 		return false, err
-// 	}
-// 	return count > 0, nil
-// }
-
-// -- Messages --
-
 func (d *Database) InsertMessageCopy(ctx context.Context, destMailboxID int, srcMessageUID imap.UID, s3UploadFunc func(imap.UID) error) (int, error) {
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
@@ -510,10 +471,7 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageID int, newFl
 }
 
 func (db *Database) ExpungeMessagesByUIDs(ctx context.Context, mailboxID int, uids []uint32) error {
-	_, err := db.Pool.Exec(ctx, `
-			UPDATE messages SET expunged_at = NOW() WHERE mailbox_id = $1 AND id = ANY($3)
-			UPDATE messages SET expunged_at = NOW() WHERE 
-	`, mailboxID, uids)
+	_, err := db.Pool.Exec(ctx, `UPDATE messages SET expunged_at = NOW() WHERE mailbox_id = $1 AND id = ANY($2)`, mailboxID, uids)
 	if err != nil {
 		return err
 	}

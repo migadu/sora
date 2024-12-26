@@ -112,7 +112,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// TODO: SIEVE filtering
 	// Assume the message goes always to the INBOX
-	mbox, err := s.backend.db.GetMailboxByFullPath(context.Background(), s.UserID(), []string{"INBOX"})
+	mbox, err := s.backend.db.GetMailboxByName(context.Background(), s.UserID(), consts.MAILBOX_INBOX)
 	if err != nil {
 		return s.internalError("failed to get mailbox: %v", err)
 	}

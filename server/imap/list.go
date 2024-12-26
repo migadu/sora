@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"sort"
 
 	"github.com/emersion/go-imap/v2"
@@ -19,11 +20,18 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		})
 	}
 
+	// Fetch mailboxes, converting them to IMAP mailboxes
+	mboxes, err := s.server.db.GetMailboxes(context.Background(), s.UserID(), options.SelectSubscribed)
+	if err != nil {
+		return s.internalError("failed to fetch mailboxes: %v", err)
+	}
+
 	var l []imap.ListData
-	for name, mbox := range s.Mailboxes {
+	for _, dbmbox := range mboxes {
+		mbox := NewMailbox(dbmbox)
 		match := false
 		for _, pattern := range patterns {
-			match = imapserver.MatchList(name, consts.MailboxDelimiter, ref, pattern)
+			match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
 			if match {
 				break
 			}

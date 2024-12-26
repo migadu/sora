@@ -8,15 +8,13 @@ import (
 
 type IMAPUser struct {
 	server.User
-	mutex     sync.Mutex
-	Mailboxes map[string]*Mailbox
+	mutex sync.Mutex
 	// prevUidValidity uint32
 }
 
-func NewIMAPUser(address server.Address, userID int, mboxes map[string]*Mailbox) *IMAPUser {
+func NewIMAPUser(address server.Address, userID int) *IMAPUser {
 	return &IMAPUser{
-		Mailboxes: mboxes,
-		User:      *server.NewUser(address, userID),
+		User: *server.NewUser(address, userID),
 	}
 }
 

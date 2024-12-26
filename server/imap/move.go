@@ -3,11 +3,9 @@ package imap
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/migadu/sora/consts"
 )
 
 func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
@@ -26,7 +24,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	ctx := context.Background()
 
 	// Find the destination mailbox by its name
-	destMailbox, err := s.server.db.GetMailboxByFullPath(ctx, s.UserID(), strings.Split(dest, string(consts.MailboxDelimiter)))
+	destMailbox, err := s.server.db.GetMailboxByName(ctx, s.UserID(), dest)
 	if err != nil {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,

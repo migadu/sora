@@ -17,16 +17,11 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-type (
-	user = server.User
-	// mailbox = MailboxView
-)
-
 type POP3Session struct {
 	server.Session
 	server        *POP3Server
 	conn          *net.Conn    // Connection to the client
-	*user                      // User associated with the session
+	*server.User               // User associated with the session
 	authenticated bool         // Flag to indicate if the user has been authenticated
 	messages      []db.Message // List of messages in the mailbox as returned by the LIST command
 	deleted       map[int]bool // Map of message IDs marked for deletion
@@ -34,7 +29,7 @@ type POP3Session struct {
 }
 
 func (s *POP3Session) handleConnection() {
-	defer (*s).Close()
+	defer s.Close()
 	reader := bufio.NewReader(*s.conn)
 	writer := bufio.NewWriter(*s.conn)
 
@@ -100,7 +95,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			s.user = server.NewUser(address, userID)
+			s.User = server.NewUser(address, userID)
 			writer.WriteString("+OK User accepted\r\n")
 
 		// --------------------------------------------------------------------------------------------
@@ -367,9 +362,9 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 
 func (s *POP3Session) Close() error {
 	(*s.conn).Close()
-	if s.user != nil {
+	if s.User != nil {
 		s.Log("closed")
-		s.user = nil
+		s.User = nil
 		s.Id = ""
 		s.messages = nil
 		s.deleted = nil
