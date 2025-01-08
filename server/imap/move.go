@@ -45,7 +45,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	var destUIDs []imap.UID
 
 	for _, msg := range messages {
-		sourceUIDs = append(sourceUIDs, imap.UID(msg.ID))
+		sourceUIDs = append(sourceUIDs, msg.UID)
 		seqNums = append(seqNums, uint32(msg.Seq))
 	}
 

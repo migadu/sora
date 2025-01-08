@@ -16,7 +16,9 @@ var (
 	ErrDBUniqueViolation         = errors.New("unique violation")
 	ErrDBCommitTransactionFailed = errors.New("commit failed")
 	ErrDBBeginTransactionFailed  = errors.New("start transaction failed")
+	ErrDBQueryFailed             = errors.New("query failed")
 	ErrDBInsertFailed            = errors.New("insert failed")
+	ErrDBUpdateFailed            = errors.New("update failed")
 
 	ErrS3UploadFailed = errors.New("s3 upload failed")
 

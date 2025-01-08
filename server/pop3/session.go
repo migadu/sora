@@ -218,7 +218,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			s3UUIDKey, err := uuid.Parse(msg.S3UUID)
+			s3UUIDKey, err := uuid.Parse(msg.StorageUUID)
 			if err != nil {
 				s.Log("RETR error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -227,7 +227,7 @@ func (s *POP3Session) handleConnection() {
 			}
 			s3Key := server.S3Key(s.Domain(), s.LocalPart(), s3UUIDKey)
 
-			log.Printf("Fetching message body for UID %d", msg.ID)
+			log.Printf("Fetching message body for UID %d", msg.UID)
 			bodyReader, err := s.server.s3.GetMessage(s3Key)
 			if err != nil {
 				s.Log("RETR error: %v", err)
@@ -236,7 +236,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 			defer bodyReader.Close()
-			s.Log("retrieved message body for UID %d", msg.ID)
+			s.Log("retrieved message body for UID %d", msg.UID)
 
 			bodyData, err := io.ReadAll(bodyReader)
 			if err != nil {
@@ -249,7 +249,7 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
 			writer.WriteString(string(bodyData))
 			writer.WriteString("\r\n.\r\n")
-			s.Log("retrieved message %d", msg.ID)
+			s.Log("retrieved message %d", msg.UID)
 		// --------------------------------------------------------------------------------------------
 		case "NOOP":
 			writer.WriteString("+OK\r\n")
@@ -318,7 +318,7 @@ func (s *POP3Session) handleConnection() {
 
 			s.deleted[msgNumber-1] = true
 			writer.WriteString("+OK Message deleted\r\n")
-			s.Log("marked message %d for deletion", msg.ID)
+			s.Log("marked message %d for deletion", msg.UID)
 
 		// --------------------------------------------------------------------------------------------
 		case "QUIT":
@@ -327,7 +327,7 @@ func (s *POP3Session) handleConnection() {
 				if deleted {
 					s.Log("expunging message %d", i)
 					msg := s.messages[i]
-					err := s.server.db.ExpungeMessagesByUIDs(context.Background(), s.UserID(), []uint32{uint32(msg.ID)})
+					err := s.server.db.ExpungeMessageUIDs(context.Background(), s.UserID(), msg.UID)
 					if err != nil {
 						s.Log("error expunging message %d: %v", i, err)
 					}
