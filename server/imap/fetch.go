@@ -34,7 +34,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, seqSet imap.NumSet, optio
 func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions) error {
 	m := w.CreateMessage(msg.Seq)
 	if m == nil {
-		return s.internalError("failed to begin message for UID %d", msg.ID)
+		return s.internalError("failed to begin message for UID %d", msg.UID)
 	}
 
 	if err := s.writeBasicMessageData(m, msg, options); err != nil {
@@ -42,35 +42,35 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 	}
 
 	if options.Envelope {
-		if err := s.writeEnvelope(m, msg.ID); err != nil {
+		if err := s.writeEnvelope(m, msg.UID, msg.MailboxID); err != nil {
 			return err
 		}
 	}
 
 	if options.BodyStructure != nil {
-		if err := s.writeBodyStructure(m, msg.ID); err != nil {
+		if err := s.writeBodyStructure(m, msg.UID, msg.MailboxID); err != nil {
 			return err
 		}
 	}
 
 	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
-		s3UUIDKey, err := uuid.Parse(msg.S3UUID)
+		s3UUIDKey, err := uuid.Parse(msg.StorageUUID)
 		if err != nil {
 			return s.internalError("failed to parse message UUID: %v", err)
 		}
 		s3Key := server.S3Key(s.Domain(), s.LocalPart(), s3UUIDKey)
 
-		log.Printf("Fetching message body for UID %d", msg.ID)
+		log.Printf("Fetching message body for UID %d", msg.UID)
 		bodyReader, err := s.server.s3.GetMessage(s3Key)
 		if err != nil {
-			return s.internalError("failed to retrieve message body for UID %d from S3: %v", msg.ID, err)
+			return s.internalError("failed to retrieve message body for UID %d from S3: %v", msg.UID, err)
 		}
 		defer bodyReader.Close()
-		log.Printf("Retrieved message body for UID %d", msg.ID)
+		log.Printf("Retrieved message body for UID %d", msg.UID)
 
 		bodyData, err := io.ReadAll(bodyReader)
 		if err != nil {
-			return s.internalError("failed to read message body for UID %d: %v", msg.ID, err)
+			return s.internalError("failed to read message body for UID %d: %v", msg.UID, err)
 		}
 
 		if len(options.BodySection) > 0 {
@@ -95,7 +95,7 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 	// TODO: Fetch ModSeq (if CONDSTORE is supported)
 
 	if err := m.Close(); err != nil {
-		return fmt.Errorf("failed to end message for UID %d: %v", msg.ID, err)
+		return fmt.Errorf("failed to end message for UID %d: %v", msg.UID, err)
 	}
 
 	return nil
@@ -107,7 +107,7 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 		m.WriteFlags(db.BitwiseToFlags(msg.BitwiseFlags))
 	}
 	if options.UID {
-		m.WriteUID(imap.UID(msg.ID))
+		m.WriteUID(msg.UID)
 	}
 	if options.InternalDate {
 		m.WriteInternalDate(msg.InternalDate)
@@ -119,22 +119,22 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 }
 
 // Fetch helper to write the envelope for a message
-func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageID int) error {
+func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUID imap.UID, mailboxID int) error {
 	ctx := context.Background()
-	envelope, err := s.server.db.GetMessageEnvelope(ctx, messageID)
+	envelope, err := s.server.db.GetMessageEnvelope(ctx, messageUID, mailboxID)
 	if err != nil {
-		return s.internalError("failed to retrieve envelope for message UID %d: %v", messageID, err)
+		return s.internalError("failed to retrieve envelope for message UID %d: %v", messageUID, err)
 	}
 	m.WriteEnvelope(envelope)
 	return nil
 }
 
 // Fetch helper to write the body structure for a message
-func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, messageID int) error {
+func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, messageUID imap.UID, mailboxID int) error {
 	ctx := context.Background()
-	bodyStructure, err := s.server.db.GetMessageBodyStructure(ctx, messageID)
+	bodyStructure, err := s.server.db.GetMessageBodyStructure(ctx, messageUID, mailboxID)
 	if err != nil {
-		return s.internalError("failed to retrieve body structure for message UID %d: %v", messageID, err)
+		return s.internalError("failed to retrieve body structure for message UID %d: %v", messageUID, err)
 	}
 	m.WriteBodyStructure(*bodyStructure)
 	return nil

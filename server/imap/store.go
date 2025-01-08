@@ -31,11 +31,11 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, seqSet imap.NumSet, flags
 		var newFlags *[]imap.Flag
 		switch flags.Op {
 		case imap.StoreFlagsAdd:
-			newFlags, err = s.server.db.AddMessageFlags(ctx, msg.ID, flags.Flags)
+			newFlags, err = s.server.db.AddMessageFlags(ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsDel:
-			newFlags, err = s.server.db.RemoveMessageFlags(ctx, msg.ID, flags.Flags)
+			newFlags, err = s.server.db.RemoveMessageFlags(ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsSet:
-			newFlags, err = s.server.db.SetMessageFlags(ctx, msg.ID, flags.Flags)
+			newFlags, err = s.server.db.SetMessageFlags(ctx, msg.UID, msg.MailboxID, flags.Flags)
 		}
 
 		if err != nil {

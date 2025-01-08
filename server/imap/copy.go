@@ -43,10 +43,10 @@ func (s *IMAPSession) Copy(seqSet imap.NumSet, mboxName string) (*imap.CopyData,
 	var sourceUIDs imap.UIDSet
 	var destUIDs imap.UIDSet
 	for _, msg := range messages {
-		sourceUIDs.AddNum(imap.UID(msg.ID))
-		copiedUID, err := s.server.db.InsertMessageCopy(ctx, destMailbox.ID, imap.UID(msg.ID), func(destUID imap.UID) error {
+		sourceUIDs.AddNum(msg.UID)
+		copiedUID, err := s.server.db.InsertMessageCopy(ctx, msg.UID, msg.MailboxID, destMailbox.ID, func(destUID imap.UID) error {
 			// Copy message body from source mailbox to destination mailbox in S3
-			srcUUIDKey, err := uuid.Parse(msg.S3UUID)
+			srcUUIDKey, err := uuid.Parse(msg.StorageUUID)
 			if err != nil {
 				return s.internalError("failed to parse message UUID: %v", err)
 			}

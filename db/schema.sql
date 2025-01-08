@@ -7,11 +7,12 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS mailboxes (
 	id SERIAL PRIMARY KEY,
 	user_id INTEGER REFERENCES users(id),
+	highest_uid INTEGER DEFAULT 0 NOT NULL,                         -- The highest UID in the mailbox
 	name TEXT NOT NULL,	
-	uid_validity BIGINT NOT NULL,  -- Include uid_validity column for IMAP
+	uid_validity BIGINT NOT NULL,                                  -- Include uid_validity column for IMAP
 	parent_id INTEGER REFERENCES mailboxes(id) ON DELETE CASCADE,  -- Self-referencing for parent mailbox
-	subscribed BOOLEAN DEFAULT TRUE,  -- New field to track mailbox subscription status
-	UNIQUE (user_id, name, parent_id)  -- Enforce unique mailbox names per user and parent mailbox
+	subscribed BOOLEAN DEFAULT TRUE,  														 -- New field to track mailbox subscription status
+	UNIQUE (user_id, name, parent_id)  														 -- Enforce unique mailbox names per user and parent mailbox
 );
 
 -- Index for faster mailbox lookups by user_id and case insensitive name
@@ -32,7 +33,9 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_parent_id ON mailboxes (parent_id);
 
 CREATE TABLE IF NOT EXISTS messages (
 	id SERIAL PRIMARY KEY, 					-- Unique message ID, also the UID of messages in a mailbox
-	s3_uuid TEXT NOT NULL,					-- Unique S3 object key for the message
+	
+	uid INTEGER NOT NULL,            -- The message UID in its mailbox
+	storage_uuid TEXT NOT NULL,			-- Unique object key for the message
 
 	message_id TEXT NOT NULL, 			-- The Message-ID from the message headers
 	in_reply_to TEXT,								-- The In-Reply-To header from the message
@@ -62,7 +65,13 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Index to speed up message lookups by mailbox_id (for listing, searching)
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages (mailbox_id);
-CREATE INDEX IF NOT EXISTS idx_messages_s3_uuid ON messages (s3_uuid);
+CREATE INDEX IF NOT EXISTS idx_messages_storage_uuid ON messages (storage_uuid);
+
+-- Index to speed up message lookups by message_id
+CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (message_id);
+
+-- Index to speed up message lookups by mailbox_id and uid
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mailbox_id_uid ON messages (mailbox_id, uid);
 
 -- Index to quickly search messages by internal_date (for date-based queries)
 CREATE INDEX IF NOT EXISTS idx_messages_internal_date ON messages (internal_date);

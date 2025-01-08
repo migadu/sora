@@ -11,8 +11,8 @@ import (
 
 // Message struct to represent an email message
 type Message struct {
-	ID             int       // Unique ID of the message
-	S3UUID         string    // UUID of the message in S3
+	UID            imap.UID
+	StorageUUID    string    // UUID of the message in S3
 	MailboxID      int       // ID of the mailbox the message belongs to
 	Seq            uint32    // Sequence number of the message in the mailbox
 	BitwiseFlags   int       // Bitwise flags for the message (e.g., \Seen, \Flagged)

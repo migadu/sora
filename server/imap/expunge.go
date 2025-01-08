@@ -17,27 +17,21 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// If an UIDSet is provided, filter the messages to match the UIDs
-	var expungeIDs []uint32
+	var expungeIDs []imap.UID
 	if uidSet != nil {
 		for _, msg := range messages {
-			if uidSet.Contains(imap.UID(msg.ID)) {
-				expungeIDs = append(expungeIDs, uint32(msg.ID))
+			if uidSet.Contains(msg.UID) {
+				expungeIDs = append(expungeIDs, msg.UID)
 			}
 		}
 	} else {
 		for _, msg := range messages {
-			expungeIDs = append(expungeIDs, uint32(msg.ID))
-		}
-	}
-
-	for _, uid := range expungeIDs {
-		if err := w.WriteExpunge(uid); err != nil {
-			return s.internalError("failed to write expunge response for UID %d: %v", uid, err)
+			expungeIDs = append(expungeIDs, msg.UID)
 		}
 	}
 
 	// Perform the actual expunge operation
-	err = s.server.db.ExpungeMessagesByUIDs(ctx, s.mailbox.ID, expungeIDs)
+	err = s.server.db.ExpungeMessageUIDs(ctx, s.mailbox.ID, expungeIDs...)
 	if err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}
