@@ -4,7 +4,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
-func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, b bool) error {
+func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	if s.mailbox == nil {
 		// TODO: Why is poll called if no mailbox is selected? E.g. LIST will call poll, why?
 		return nil
@@ -36,5 +36,5 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, b bool) error {
 
 	// s.mailbox.lastPollAt = time.Now()
 
-	return nil
+	return s.mailbox.sessionTracker.Poll(w, allowExpunge)
 }

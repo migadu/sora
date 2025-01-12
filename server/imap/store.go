@@ -21,6 +21,8 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, seqSet imap.NumSet, flags
 		}
 	}
 
+	seqSet = s.mailbox.decodeNumSet(seqSet)
+
 	ctx := context.Background()
 	messages, err := s.server.db.GetMessagesBySeqSet(ctx, s.mailbox.ID, seqSet)
 	if err != nil {
@@ -42,7 +44,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, seqSet imap.NumSet, flags
 			return s.internalError("failed to update flags for message: %v", err)
 		}
 
-		m := w.CreateMessage(msg.Seq)
+		m := w.CreateMessage(s.mailbox.sessionTracker.EncodeSeqNum(msg.Seq))
 		if !flags.Silent {
 			m.WriteFlags(*newFlags)
 		}

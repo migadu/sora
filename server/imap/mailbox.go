@@ -12,13 +12,19 @@ import (
 type Mailbox struct {
 	*db.DBMailbox
 
-	tracker *imapserver.MailboxTracker
+	mboxTracker    *imapserver.MailboxTracker
+	sessionTracker *imapserver.SessionTracker
+	numMessages    uint32
 }
 
-func NewMailbox(dbmbx *db.DBMailbox) *Mailbox {
+func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32) *Mailbox {
+	mboxTracker := imapserver.NewMailboxTracker(numMessages)
+	sessionTracker := mboxTracker.NewSession()
 	return &Mailbox{
-		tracker:   imapserver.NewMailboxTracker(0),
-		DBMailbox: dbmbx,
+		DBMailbox:      dbmbx,
+		mboxTracker:    mboxTracker,
+		sessionTracker: sessionTracker,
+		numMessages:    numMessages,
 	}
 }
 
@@ -52,4 +58,24 @@ func (m *Mailbox) PermittedFlags() []imap.Flag {
 		}
 	}
 	return permFlags
+}
+
+func (m *Mailbox) decodeNumSet(numSet imap.NumSet) imap.NumSet {
+	seqSet, ok := numSet.(imap.SeqSet)
+	if !ok {
+		return numSet
+	}
+
+	// TODO: lift up to a go-imap helper
+	var out imap.SeqSet
+	for _, seqRange := range seqSet {
+		start := m.sessionTracker.DecodeSeqNum(seqRange.Start)
+		stop := m.sessionTracker.DecodeSeqNum(seqRange.Stop)
+		// TODO: don't skip range if bound is expunged
+		if start != 0 && stop != 0 {
+			out = append(out, imap.SeqRange{Start: start, Stop: stop})
+		}
+	}
+
+	return out
 }
