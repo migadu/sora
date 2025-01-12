@@ -38,7 +38,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to get next UID for mailbox '%s': %v", mboxName, err)
 	}
 
-	s.mailbox = NewMailbox(mailbox)
+	s.mailbox = NewMailbox(mailbox, uint32(messagesCount))
 
 	selectData := &imap.SelectData{
 		Flags:       s.mailbox.PermittedFlags(),

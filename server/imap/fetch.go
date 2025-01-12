@@ -17,6 +17,8 @@ import (
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, seqSet imap.NumSet, options *imap.FetchOptions) error {
 	ctx := context.Background()
 
+	seqSet = s.mailbox.decodeNumSet(seqSet)
+
 	messages, err := s.server.db.GetMessagesBySeqSet(ctx, s.mailbox.ID, seqSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
@@ -32,7 +34,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, seqSet imap.NumSet, optio
 }
 
 func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions) error {
-	m := w.CreateMessage(msg.Seq)
+	m := w.CreateMessage(s.mailbox.sessionTracker.EncodeSeqNum(msg.Seq))
 	if m == nil {
 		return s.internalError("failed to begin message for UID %d", msg.UID)
 	}

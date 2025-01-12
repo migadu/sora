@@ -2,7 +2,6 @@ package imap
 
 import (
 	"strings"
-	"sync"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -13,14 +12,19 @@ import (
 type Mailbox struct {
 	*db.DBMailbox
 
-	tracker *imapserver.MailboxTracker
-	mutex   sync.Mutex
+	mboxTracker    *imapserver.MailboxTracker
+	sessionTracker *imapserver.SessionTracker
+	numMessages    uint32
 }
 
-func NewMailbox(dbmbx *db.DBMailbox) *Mailbox {
+func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32) *Mailbox {
+	mboxTracker := imapserver.NewMailboxTracker(numMessages)
+	sessionTracker := mboxTracker.NewSession()
 	return &Mailbox{
-		tracker:   imapserver.NewMailboxTracker(0),
-		DBMailbox: dbmbx,
+		DBMailbox:      dbmbx,
+		mboxTracker:    mboxTracker,
+		sessionTracker: sessionTracker,
+		numMessages:    numMessages,
 	}
 }
 
@@ -56,50 +60,22 @@ func (m *Mailbox) PermittedFlags() []imap.Flag {
 	return permFlags
 }
 
-// // JoinMailboxPath joins the parent path components with the mailbox delimiter
-// func JoinMailboxPath(parentPathComponents []string) string {
-// 	return strings.Join(parentPathComponents, string(consts.MailboxDelimiter))
-// }
-
-func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
-	mbox.mutex.Lock()
-	defer mbox.mutex.Unlock()
-
-	// Check if the mailbox should be listed
-	if options.SelectSubscribed && !mbox.Subscribed {
-		return nil
+func (m *Mailbox) decodeNumSet(numSet imap.NumSet) imap.NumSet {
+	seqSet, ok := numSet.(imap.SeqSet)
+	if !ok {
+		return numSet
 	}
 
-	// Prepare attributes
-	attributes := []imap.MailboxAttr{}
-
-	if mbox.HasChildren {
-		attributes = append(attributes, imap.MailboxAttrHasChildren)
-	} else {
-		attributes = append(attributes, imap.MailboxAttrHasNoChildren)
+	// TODO: lift up to a go-imap helper
+	var out imap.SeqSet
+	for _, seqRange := range seqSet {
+		start := m.sessionTracker.DecodeSeqNum(seqRange.Start)
+		stop := m.sessionTracker.DecodeSeqNum(seqRange.Stop)
+		// TODO: don't skip range if bound is expunged
+		if start != 0 && stop != 0 {
+			out = append(out, imap.SeqRange{Start: start, Stop: stop})
+		}
 	}
 
-	// Add special attributes
-	switch strings.ToUpper(mbox.Name) {
-	case "SENT":
-		attributes = append(attributes, imap.MailboxAttrSent)
-	case "TRASH":
-		attributes = append(attributes, imap.MailboxAttrTrash)
-	case "DRAFTS":
-		attributes = append(attributes, imap.MailboxAttrDrafts)
-	case "ARCHIVE":
-		attributes = append(attributes, imap.MailboxAttrArchive)
-	case "JUNK":
-		attributes = append(attributes, imap.MailboxAttrJunk)
-	}
-
-	data := imap.ListData{
-		Mailbox: mbox.Name,
-		Delim:   consts.MailboxDelimiter,
-		Attrs:   attributes,
-	}
-	if mbox.Subscribed {
-		data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
-	}
-	return &data
+	return out
 }
