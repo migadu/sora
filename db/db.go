@@ -242,8 +242,25 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 	return newMsgUID, nil
 }
 
-func (d *Database) InsertMessage(ctx context.Context, mailboxID int, uuidKey uuid.UUID, messageID string, flags []imap.Flag, internalDate time.Time, size int64, subject string, plaintextBody *string, sentDate time.Time, inReplyTo []string, s3Buffer *bytes.Buffer, bodyStructure *imap.BodyStructure, recipients *[]Recipient, s3UploadFunc func(uuid.UUID, *bytes.Buffer, int64) error) (int, error) {
-	bodyStructureData, err := helpers.SerializeBodyStructureGob(bodyStructure)
+type InsertMessageOptions struct {
+	MailboxID     int
+	UUIDKey       uuid.UUID
+	MessageID     string
+	Flags         []imap.Flag
+	InternalDate  time.Time
+	Size          int64
+	Subject       string
+	PlaintextBody *string
+	SentDate      time.Time
+	InReplyTo     []string
+	S3Buffer      *bytes.Buffer
+	BodyStructure *imap.BodyStructure
+	Recipients    []Recipient
+	S3UploadFunc  func(uuid.UUID, *bytes.Buffer, int64) error
+}
+
+func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions) (int, error) {
+	bodyStructureData, err := helpers.SerializeBodyStructureGob(options.BodyStructure)
 	if err != nil {
 		log.Printf("Failed to serialize BodyStructure: %v", err)
 		return 0, consts.ErrSerializationFailed
@@ -258,35 +275,48 @@ func (d *Database) InsertMessage(ctx context.Context, mailboxID int, uuidKey uui
 
 	var highestUID int
 	// Lock the mailbox row for update
-	err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, mailboxID).Scan(&highestUID)
+	err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
 	if err != nil {
 		log.Printf("Failed to fetch highest UID: %v", err)
 		return 0, consts.ErrDBQueryFailed
 	}
 
 	// Update the highest UID
-	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, mailboxID).Scan(&highestUID)
+	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 	if err != nil {
 		log.Printf("Failed to update highest UID: %v", err)
 		return 0, consts.ErrDBUpdateFailed
 	}
 
 	// Convert the inReplyTo slice to a space-separated string
-	inReplyToStr := strings.Join(inReplyTo, " ")
-	bitwiseFlags := FlagsToBitwise(flags)
+	inReplyToStr := strings.Join(options.InReplyTo, " ")
+	bitwiseFlags := FlagsToBitwise(options.Flags)
 	var id int
 	err = tx.QueryRow(ctx, `
-			INSERT INTO messages 
-				(mailbox_id, uid, message_id, storage_uuid, flags, internal_date, size, text_body, text_body_tsv, subject, sent_date, in_reply_to, body_structure) 
-			VALUES 
-				($1, $2, $3, $4, $5, $6, $7, $8, to_tsvector('simple', $9), $10, $11, $12, $13) 
-			RETURNING id
-	`, mailboxID, highestUID, messageID, uuidKey, bitwiseFlags, internalDate, size, *plaintextBody, *plaintextBody, subject, sentDate, inReplyToStr, bodyStructureData).Scan(&id)
+		INSERT INTO messages
+			(mailbox_id, uid, message_id, storage_uuid, flags, internal_date, size, text_body, text_body_tsv, subject, sent_date, in_reply_to, body_structure)
+		VALUES
+			(@mailbox_id, @uid, @message_id, @storage_uuid, @flags, @internal_date, @size, @text_body, to_tsvector('simple', @text_body), @subject, @sent_date, @in_reply_to, @body_structure)
+		RETURNING id
+	`, pgx.NamedArgs{
+		"mailbox_id":     options.MailboxID,
+		"uid":            highestUID,
+		"message_id":     options.MessageID,
+		"storage_uuid":   options.UUIDKey,
+		"flags":          bitwiseFlags,
+		"internal_date":  options.InternalDate,
+		"size":           options.Size,
+		"text_body":      options.PlaintextBody,
+		"subject":        options.Subject,
+		"sent_date":      options.SentDate,
+		"in_reply_to":    inReplyToStr,
+		"body_structure": bodyStructureData,
+	}).Scan(&id)
 
 	if err != nil {
 		// If unique constraint violation, return an error
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
-			log.Printf("Message with ID %s already exists in mailbox %d", messageID, mailboxID)
+			log.Printf("Message with ID %s already exists in mailbox %d", options.MessageID, options.MailboxID)
 			return 0, consts.ErrDBUniqueViolation
 		}
 		log.Printf("Failed to insert message into database: %v", err)
@@ -294,7 +324,7 @@ func (d *Database) InsertMessage(ctx context.Context, mailboxID int, uuidKey uui
 	}
 
 	// Insert recipients into the database
-	for _, recipient := range *recipients {
+	for _, recipient := range options.Recipients {
 		_, err = tx.Exec(ctx, `
 				INSERT INTO recipients (message_id, address_type, name, email_address)
 				VALUES ($1, $2, $3, $4)
@@ -305,7 +335,7 @@ func (d *Database) InsertMessage(ctx context.Context, mailboxID int, uuidKey uui
 		}
 	}
 
-	err = s3UploadFunc(uuidKey, s3Buffer, size)
+	err = options.S3UploadFunc(options.UUIDKey, options.S3Buffer, options.Size)
 	if err != nil {
 		log.Printf("Failed to upload message %d to S3: %v", id, err)
 		return 0, consts.ErrS3UploadFailed
