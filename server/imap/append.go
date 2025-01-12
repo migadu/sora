@@ -129,9 +129,24 @@ func (s *IMAPSession) appendSingle(ctx context.Context, mbox *db.DBMailbox, mess
 	// Generate a new UUID for the message
 	uuidKey := uuid.New()
 
-	messageUID, err := s.server.db.InsertMessage(ctx, mbox.ID, uuidKey, messageID, options.Flags, options.Time, bufSize, subject, plaintextBody, sentDate, inReplyTo, s3UploadBuf, &bodyStructure, &recipients, func(uid uuid.UUID, s3Buf *bytes.Buffer, s3BufSize int64) error {
-		s3DestKey := server.S3Key(s.Domain(), s.LocalPart(), uid)
-		return s.server.s3.SaveMessage(s3DestKey, s3Buf, s3BufSize)
+	messageUID, err := s.server.db.InsertMessage(ctx, &db.InsertMessageOptions{
+		MailboxID:     mbox.ID,
+		UUIDKey:       uuidKey,
+		MessageID:     messageID,
+		Flags:         options.Flags,
+		InternalDate:  options.Time,
+		Size:          bufSize,
+		Subject:       subject,
+		PlaintextBody: plaintextBody,
+		SentDate:      sentDate,
+		InReplyTo:     inReplyTo,
+		S3Buffer:      s3UploadBuf,
+		BodyStructure: &bodyStructure,
+		Recipients:    recipients,
+		S3UploadFunc: func(uid uuid.UUID, s3Buf *bytes.Buffer, s3BufSize int64) error {
+			s3DestKey := server.S3Key(s.Domain(), s.LocalPart(), uid)
+			return s.server.s3.SaveMessage(s3DestKey, s3Buf, s3BufSize)
+		},
 	})
 	if err != nil {
 		if err == consts.ErrDBUniqueViolation {
