@@ -46,11 +46,16 @@ func (db *Database) containsFlag(flags []imap.Flag, flag imap.Flag) bool {
 // numMessages int
 
 type MessageUpdate struct {
-	ID           int
-	SeqNum       int
+	UID          imap.UID
+	SeqNum       uint32
 	BitwiseFlags int
 	IsExpunge    bool
-	FlagsChanged bool
+}
+
+type MailboxPoll struct {
+	Updates     []MessageUpdate
+	NumMessages uint32
+	ModSeq      uint64
 }
 
 // generateUidValidity generates a unique UIDVALIDITY value based on the current time in nanoseconds
@@ -206,15 +211,15 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 
 	var newMsgUID imap.UID
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages 
-			(mailbox_id, uid, storage_uuid, message_id, flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, text_body, text_body_tsv)
-		SELECT 
-			$1, $2, storage_uuid, message_id, flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, text_body, text_body_tsv	
-		FROM 
+		INSERT INTO messages
+			(mailbox_id, uid, storage_uuid, message_id, flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, text_body, text_body_tsv, created_modseq)
+		SELECT
+			$1, $2, storage_uuid, message_id, flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, text_body, text_body_tsv, nextval('messages_modseq')
+		FROM
 			messages
-		WHERE 
-			mailbox_id = $3 AND	
-			uid = $4			
+		WHERE
+			mailbox_id = $3 AND
+			uid = $4
 		RETURNING uid
 	`, destMailboxID, highestUID, srcMailboxID, srcMessageUID).Scan(&newMsgUID)
 
@@ -294,9 +299,9 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	var id int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(mailbox_id, uid, message_id, storage_uuid, flags, internal_date, size, text_body, text_body_tsv, subject, sent_date, in_reply_to, body_structure)
+			(mailbox_id, uid, message_id, storage_uuid, flags, internal_date, size, text_body, text_body_tsv, subject, sent_date, in_reply_to, body_structure, created_modseq)
 		VALUES
-			(@mailbox_id, @uid, @message_id, @storage_uuid, @flags, @internal_date, @size, @text_body, to_tsvector('simple', @text_body), @subject, @sent_date, @in_reply_to, @body_structure)
+			(@mailbox_id, @uid, @message_id, @storage_uuid, @flags, @internal_date, @size, @text_body, to_tsvector('simple', @text_body), @subject, @sent_date, @in_reply_to, @body_structure, nextval('messages_modseq'))
 		RETURNING id
 	`, pgx.NamedArgs{
 		"mailbox_id":     options.MailboxID,
@@ -388,7 +393,8 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 					mailbox_id, 
 					mailbox_path, 
 					deleted_at, 
-					flags_changed_at
+					flags_changed_at,
+					created_modseq
 			)
 			SELECT
 					storage_uuid, 
@@ -405,7 +411,8 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 					$2 AS mailbox_id,  -- Assign to the new mailbox
 					mailbox_path, 
 					NULL AS deleted_at, 
-					NOW() AS flags_changed_at
+					NOW() AS flags_changed_at,
+					nextval('messages_modseq')
 			FROM messages
 			WHERE mailbox_id = $1 AND id = ANY($3)
 			RETURNING id
@@ -548,7 +555,12 @@ func (db *Database) SetMessageFlags(ctx context.Context, messageID imap.UID, mai
 	if db.containsFlag(newFlags, imap.FlagDeleted) {
 		deletedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	}
-	err := db.Pool.QueryRow(ctx, "UPDATE messages SET flags = $1, flags_changed_at = $2, deleted_at = $3 WHERE uid = $4 AND mailbox_id = $5 RETURNING flags", flags, time.Now(), deletedAt, messageID, mailboxID).Scan(&updatedFlagsBitwise)
+	err := db.Pool.QueryRow(ctx, `
+		UPDATE messages
+		SET flags = $1, flags_changed_at = $2, deleted_at = $3, updated_modseq = nextval('messages_modseq')
+		WHERE uid = $4 AND mailbox_id = $5
+		RETURNING flags
+	`, flags, time.Now(), deletedAt, messageID, mailboxID).Scan(&updatedFlagsBitwise)
 	if err != nil {
 		return nil, err
 	}
@@ -563,29 +575,31 @@ func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, ma
 	// Check if the deleted flag is being added
 	if db.containsFlag(newFlags, imap.FlagDeleted) {
 		err := db.Pool.QueryRow(ctx, `
-			UPDATE 
-				messages 
-			SET 
-				flags = flags | $1, 
+			UPDATE
+				messages
+			SET
+				flags = flags | $1,
 				flags_changed_at = $2,
-				deleted_at = $3
-			WHERE 
-				uid = $4 AND 
-				mailbox_id = $5 
+				deleted_at = $3,
+				updated_modseq = nextval('messages_modseq')
+			WHERE
+				uid = $4 AND
+				mailbox_id = $5
 			RETURNING flags`, flags, time.Now(), time.Now(), messageUID, mailboxID).Scan(&updatedFlagsBitwise)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		err := db.Pool.QueryRow(ctx, `
-			UPDATE 
-				messages 
-			SET 
-				flags = flags | $1, 
-				flags_changed_at = $2 
-			WHERE 
-				uid = $3 AND 
-				mailbox_id = $4 
+			UPDATE
+				messages
+			SET
+				flags = flags | $1,
+				flags_changed_at = $2,
+				updated_modseq = nextval('messages_modseq')
+			WHERE
+				uid = $3 AND
+				mailbox_id = $4
 			RETURNING flags`, flags, time.Now(), messageUID, mailboxID).Scan(&updatedFlagsBitwise)
 		if err != nil {
 			return nil, err
@@ -603,29 +617,31 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageID imap.UID, 
 
 	if db.containsFlag(newFlags, imap.FlagDeleted) {
 		err := db.Pool.QueryRow(ctx, `
-		UPDATE 
-			messages 
-		SET 
-			flags = flags & $1, 
+		UPDATE
+			messages
+		SET
+			flags = flags & $1,
 			flags_changed_at = $2,
 			deleted_at = NULL,
+			updated_modseq = nextval('messages_modseq')
 		WHERE 
-			uid = $3 AND 
-			mailbox_id = $4 
+			uid = $3 AND
+			mailbox_id = $4
 		RETURNING flags`, negatedFlags, time.Now(), messageID, mailboxID).Scan(&updatedFlagsBitwise)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		err := db.Pool.QueryRow(ctx, `
-		UPDATE 
-			messages 
-		SET 
-			flags = flags & $1, 
-			flags_changed_at = $2 
-		WHERE 
-			uid = $3 AND 
-			mailbox_id = $4 
+		UPDATE
+			messages
+		SET
+			flags = flags & $1,
+			flags_changed_at = $2,
+			updated_modseq = nextval('messages_modseq')
+		WHERE
+			uid = $3 AND
+			mailbox_id = $4
 		RETURNING flags`, negatedFlags, time.Now(), messageID, mailboxID).Scan(&updatedFlagsBitwise)
 		if err != nil {
 			return nil, err
@@ -636,7 +652,11 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageID imap.UID, 
 }
 
 func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int, uids ...imap.UID) error {
-	_, err := db.Pool.Exec(ctx, `UPDATE messages SET expunged_at = NOW() WHERE mailbox_id = $1 AND uid = ANY($2)`, mailboxID, uids)
+	_, err := db.Pool.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+		WHERE mailbox_id = $1 AND uid = ANY($2)
+	`, mailboxID, uids)
 	if err != nil {
 		return err
 	}
@@ -889,66 +909,77 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int, flag i
 	return messages, nil
 }
 
-func (db *Database) GetMailboxUpdates(ctx context.Context, mailboxID int, since time.Time) ([]MessageUpdate, int, error) {
-	// Define a slice to hold the message updates
-	var updates []MessageUpdate
-
-	// Fetch messages added, flagged, or expunged since the last poll
-	rows, err := db.Pool.Query(ctx, `
-		SELECT id, ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num, flags, deleted_at, flags_changed_at 
-		FROM messages 
-		WHERE 
-			mailbox_id = $1 AND 
-			(internal_date > $2 OR flags_changed_at > $2 OR deleted_at > $2) AND 
-			expunged_at IS NULL
-		ORDER BY 
-			seq_num ASC
-	`, mailboxID, since)
+func (db *Database) PollMailbox(ctx context.Context, mailboxID int, sinceModSeq uint64) (*MailboxPoll, error) {
+	// Use a transaction to ensure we have a consistent view of the mailbox
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to query mailbox updates: %w", err)
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Fetch messages updated or expunged since last poll
+	rows, err := tx.Query(ctx, `
+		SELECT id, ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num, flags, expunged_modseq
+		FROM messages
+		WHERE
+			mailbox_id = $1 AND (
+				(created_modseq <= $2 AND updated_modseq > $2 AND expunged_modseq IS NULL) OR
+				(created_modseq <= $2 AND expunged_modseq > $2)
+			)
+		ORDER BY
+			seq_num DESC
+	`, mailboxID, sinceModSeq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query mailbox updates: %w", err)
 	}
 	defer rows.Close()
 
+	var updates []MessageUpdate
 	for rows.Next() {
-		var update MessageUpdate
-		var deletedAt sql.NullTime
-		var flagsChangedAt sql.NullTime
+		var (
+			update         MessageUpdate
+			expungedModSeq *int64
+		)
 
-		// Scan the row values
-		if err := rows.Scan(&update.ID, &update.SeqNum, &update.BitwiseFlags, &deletedAt, &flagsChangedAt); err != nil {
-			return nil, 0, fmt.Errorf("failed to scan mailbox updates: %w", err)
+		if err := rows.Scan(&update.UID, &update.SeqNum, &update.BitwiseFlags, &expungedModSeq); err != nil {
+			return nil, fmt.Errorf("failed to scan mailbox updates: %w", err)
 		}
 
-		// Determine if the message is expunged
-		update.IsExpunge = deletedAt.Valid
+		update.IsExpunge = expungedModSeq != nil
 
-		// Determine if the flags have changed
-		update.FlagsChanged = flagsChangedAt.Valid && flagsChangedAt.Time.After(since)
-
-		// Append the update to the list
 		updates = append(updates, update)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating through mailbox updates: %w", err)
+		return nil, fmt.Errorf("error iterating through mailbox updates: %w", err)
 	}
 
 	// Fetch the current number of non-expunged messages in the mailbox
-	var numMessages int
-	err = db.Pool.QueryRow(ctx, `
-		SELECT 
-			COUNT(*) 
-		FROM 
-			messages 
-		WHERE 
-			mailbox_id = $1 AND 
+	var numMessages uint32
+	err = tx.QueryRow(ctx, `
+		SELECT
+			COUNT(*)
+		FROM
+			messages
+		WHERE
+			mailbox_id = $1 AND
 			expunged_at IS NULL
 	`, mailboxID).Scan(&numMessages)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to count messages in mailbox: %w", err)
+		return nil, fmt.Errorf("failed to count messages in mailbox: %w", err)
 	}
 
-	return updates, numMessages, nil
+	var currentModSeq uint64
+	err = tx.QueryRow(ctx, `SELECT last_value FROM messages_modseq`).Scan(&currentModSeq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch current modseq: %w", err)
+	}
+
+	return &MailboxPoll{
+		Updates:     updates,
+		NumMessages: numMessages,
+		ModSeq:      currentModSeq,
+	}, nil
 }
 
 func (db *Database) GetUserIDByAddress(ctx context.Context, username string) (int, error) {

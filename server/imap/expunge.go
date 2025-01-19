@@ -2,7 +2,6 @@ package imap
 
 import (
 	"context"
-	"sort"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -41,15 +40,6 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	if err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}
-
-	// Send highest seqnums first so that lower ones are not invalidated
-	sort.Slice(expungeSeqNums, func(i, j int) bool {
-		return expungeSeqNums[i] > expungeSeqNums[j]
-	})
-	for _, seqNum := range expungeSeqNums {
-		s.mailbox.mboxTracker.QueueExpunge(seqNum)
-	}
-	s.mailbox.numMessages -= uint32(len(expungeSeqNums))
 
 	s.Log("Expunged %d messages", len(expungeIDs))
 	return nil

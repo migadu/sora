@@ -297,6 +297,19 @@ func (d *Database) GetMailboxNextUID(ctx context.Context, mailboxID int) (int, e
 	return uidNext + 1, nil
 }
 
+func (d *Database) GetMailboxHighestModSeq(ctx context.Context, mailboxID int) (uint64, error) {
+	var highestModSeq uint64
+	err := d.Pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(GREATEST(created_modseq, updated_modseq, expunged_modseq)), 0)
+		FROM messages
+		WHERE mailbox_id = $1
+	`, mailboxID).Scan(&highestModSeq)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch highest modseq: %v", err)
+	}
+	return highestModSeq, nil
+}
+
 // SetSubscribed updates the subscription status of a mailbox, but ignores unsubscribing for root folders.
 func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int, subscribed bool) error {
 	// Update the subscription status only if the mailbox is not a root folder

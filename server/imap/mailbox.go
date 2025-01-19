@@ -15,9 +15,10 @@ type Mailbox struct {
 	mboxTracker    *imapserver.MailboxTracker
 	sessionTracker *imapserver.SessionTracker
 	numMessages    uint32
+	highestModSeq  uint64
 }
 
-func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32) *Mailbox {
+func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32, highestModSeq uint64) *Mailbox {
 	mboxTracker := imapserver.NewMailboxTracker(numMessages)
 	sessionTracker := mboxTracker.NewSession()
 	return &Mailbox{
@@ -25,6 +26,7 @@ func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32) *Mailbox {
 		mboxTracker:    mboxTracker,
 		sessionTracker: sessionTracker,
 		numMessages:    numMessages,
+		highestModSeq:  highestModSeq,
 	}
 }
 

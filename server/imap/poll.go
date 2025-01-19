@@ -1,7 +1,10 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/db"
 )
 
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
@@ -10,31 +13,29 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return nil
 	}
 
-	// ctx := context.Background()
-	// updates, numMessages, err := s.server.db.GetMailboxUpdates(ctx, s.mailbox.ID, s.mailbox.lastPollAt)
-	// if err != nil {
-	// 	return s.internalError("failed to get mailbox updates: %v", err)
-	// }
+	ctx := context.Background()
+	poll, err := s.server.db.PollMailbox(ctx, s.mailbox.ID, s.mailbox.highestModSeq)
+	if err != nil {
+		return s.internalError("failed to poll mailbox: %v", err)
+	}
 
-	// s.mailbox.numMessages = numMessages
+	var numExpunged uint32
+	for _, update := range poll.Updates {
+		if update.IsExpunge {
+			s.mailbox.mboxTracker.QueueExpunge(update.SeqNum)
+			numExpunged++
+		} else {
+			flags := db.BitwiseToFlags(update.BitwiseFlags)
+			s.mailbox.mboxTracker.QueueMessageFlags(update.SeqNum, update.UID, flags, nil)
+		}
+	}
 
-	// for _, update := range updates {
-	// 	if update.IsExpunge {
-	// 		if err := w.WriteExpunge(uint32(update.SeqNum)); err != nil {
-	// 			return s.internalError("failed to write expunge update: %v", err)
-	// 		}
-	// 	} else if update.FlagsChanged {
-	// 		if err := w.WriteMessageFlags(uint32(update.SeqNum), imap.UID(update.ID), db.BitwiseToFlags(update.BitwiseFlags)); err != nil {
-	// 			return s.internalError("failed to write flag update: %v", err)
-	// 		}
-	// 	}
-	// }
+	if s.mailbox.numMessages-numExpunged != poll.NumMessages {
+		s.mailbox.mboxTracker.QueueNumMessages(uint32(poll.NumMessages))
+	}
 
-	// if err := w.WriteNumMessages(uint32(numMessages)); err != nil {
-	// 	return s.internalError("failed to write number of messages: %v", err)
-	// }
-
-	// s.mailbox.lastPollAt = time.Now()
+	s.mailbox.numMessages = poll.NumMessages
+	s.mailbox.highestModSeq = poll.ModSeq
 
 	return s.mailbox.sessionTracker.Poll(w, allowExpunge)
 }
