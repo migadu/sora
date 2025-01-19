@@ -754,7 +754,7 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 		WITH message_seqs AS (
 			SELECT 
 				uid,
-				ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num
+				ROW_NUMBER() OVER (ORDER BY id) AS seq_num
 			FROM 
 				messages
 			WHERE 
