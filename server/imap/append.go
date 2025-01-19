@@ -93,14 +93,6 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to append message: %v", err)
 	}
 
-	// TODO: Update the mailbox's last poll time
-	// s.mailbox.lastPollAt = time.Now()
-
-	if s.mailbox != nil && s.mailbox.ID == mailbox.ID {
-		s.mailbox.numMessages++
-		s.mailbox.mboxTracker.QueueNumMessages(s.mailbox.numMessages)
-	}
-
 	// If successful, return the AppendData
 	return result, nil
 }

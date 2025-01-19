@@ -38,7 +38,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to get next UID for mailbox '%s': %v", mboxName, err)
 	}
 
-	s.mailbox = NewMailbox(mailbox, uint32(messagesCount))
+	highestModSeq, err := s.server.db.GetMailboxHighestModSeq(ctx, mailbox.ID)
+	if err != nil {
+		return nil, s.internalError("failed to get highest modseq for mailbox '%s': %v", mboxName, err)
+	}
+
+	s.mailbox = NewMailbox(mailbox, uint32(messagesCount), highestModSeq)
 
 	selectData := &imap.SelectData{
 		Flags:       s.mailbox.PermittedFlags(),
