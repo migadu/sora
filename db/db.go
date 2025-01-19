@@ -485,13 +485,12 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 			SELECT uid, mailbox_id, storage_uuid, flags, internal_date, size, body_structure,
 				row_number() OVER (ORDER BY id) AS seqnum
 			FROM messages
-			WHERE 
-				mailbox_id = $1 AND 
-				expunged_at IS NULL AND
-				(flags & $2) = 0 -- Ignore messages with \Deleted flag
+			WHERE
+				mailbox_id = $1 AND
+				expunged_at IS NULL
 		) AS sub WHERE true
 	`
-	args := []interface{}{mailboxID, FlagDeleted}
+	args := []interface{}{mailboxID}
 
 	switch set := numSet.(type) {
 	case imap.SeqSet:
@@ -754,7 +753,7 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 		WITH message_seqs AS (
 			SELECT 
 				uid,
-				ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num
+				ROW_NUMBER() OVER (ORDER BY id) AS seq_num
 			FROM 
 				messages
 			WHERE 
@@ -919,13 +918,14 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int, sinceModSeq 
 
 	// Fetch messages updated or expunged since last poll
 	rows, err := tx.Query(ctx, `
-		SELECT id, ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num, flags, expunged_modseq
-		FROM messages
+		SELECT id, seq_num, flags, expunged_modseq FROM (
+			SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS seq_num, flags, created_modseq, updated_modseq, expunged_modseq
+			FROM messages
+			WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
+		)
 		WHERE
-			mailbox_id = $1 AND (
-				(created_modseq <= $2 AND updated_modseq > $2 AND expunged_modseq IS NULL) OR
-				(created_modseq <= $2 AND expunged_modseq > $2)
-			)
+			(created_modseq <= $2 AND updated_modseq > $2 AND expunged_modseq IS NULL) OR
+			(created_modseq <= $2 AND expunged_modseq > $2)
 		ORDER BY
 			seq_num DESC
 	`, mailboxID, sinceModSeq)
