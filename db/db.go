@@ -919,13 +919,14 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int, sinceModSeq 
 
 	// Fetch messages updated or expunged since last poll
 	rows, err := tx.Query(ctx, `
-		SELECT id, ROW_NUMBER() OVER (ORDER BY internal_date ASC) AS seq_num, flags, expunged_modseq
-		FROM messages
+		SELECT id, seq_num, flags, expunged_modseq FROM (
+			SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS seq_num, flags, created_modseq, updated_modseq, expunged_modseq
+			FROM messages
+			WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
+		)
 		WHERE
-			mailbox_id = $1 AND (
-				(created_modseq <= $2 AND updated_modseq > $2 AND expunged_modseq IS NULL) OR
-				(created_modseq <= $2 AND expunged_modseq > $2)
-			)
+			(created_modseq <= $2 AND updated_modseq > $2 AND expunged_modseq IS NULL) OR
+			(created_modseq <= $2 AND expunged_modseq > $2)
 		ORDER BY
 			seq_num DESC
 	`, mailboxID, sinceModSeq)
