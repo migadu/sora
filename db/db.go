@@ -485,13 +485,12 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 			SELECT uid, mailbox_id, storage_uuid, flags, internal_date, size, body_structure,
 				row_number() OVER (ORDER BY id) AS seqnum
 			FROM messages
-			WHERE 
-				mailbox_id = $1 AND 
-				expunged_at IS NULL AND
-				(flags & $2) = 0 -- Ignore messages with \Deleted flag
+			WHERE
+				mailbox_id = $1 AND
+				expunged_at IS NULL
 		) AS sub WHERE true
 	`
-	args := []interface{}{mailboxID, FlagDeleted}
+	args := []interface{}{mailboxID}
 
 	switch set := numSet.(type) {
 	case imap.SeqSet:
