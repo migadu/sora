@@ -155,13 +155,11 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int, name strin
 }
 
 func (db *Database) CreateMailbox(ctx context.Context, userID int, name string, parentID *int) error {
-	uidValidity := generateUIDValidity()
-
 	// Try to insert the mailbox into the database
 	_, err := db.Pool.Exec(ctx, `
-        INSERT INTO mailboxes (user_id, name, parent_id, uid_validity, subscribed) 
-        VALUES ($1, $2, $3, $4, $5)
-    `, userID, name, parentID, uidValidity, true)
+		INSERT INTO mailboxes (user_id, name, parent_id, uid_validity, subscribed)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, name, parentID, 1, true)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {

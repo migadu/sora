@@ -58,11 +58,6 @@ type MailboxPoll struct {
 	ModSeq      uint64
 }
 
-// generateUidValidity generates a unique UIDVALIDITY value based on the current time in nanoseconds
-func generateUIDValidity() uint32 {
-	return uint32(time.Now().Unix()) // Unix timestamp in seconds, which fits in uint32
-}
-
 // NewDatabase initializes a new SQL database connection
 func NewDatabase(ctx context.Context, host, port, user, password, dbname string) (*Database, error) {
 	// Construct the connection string
