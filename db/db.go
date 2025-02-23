@@ -488,13 +488,14 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 			WHERE
 				mailbox_id = $1 AND
 				expunged_at IS NULL
-		) AS sub WHERE true
+		) AS sub WHERE false
 	`
 	args := []interface{}{mailboxID}
 
 	switch set := numSet.(type) {
 	case imap.SeqSet:
 		for _, seqRange := range set {
+			query += " OR (true"
 			if seqRange.Start != 0 {
 				args = append(args, seqRange.Start)
 				query += fmt.Sprintf(" AND seqnum >= $%d", len(args))
@@ -503,9 +504,11 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 				args = append(args, seqRange.Stop)
 				query += fmt.Sprintf(" AND seqnum <= $%d", len(args))
 			}
+			query += ")"
 		}
 	case imap.UIDSet:
 		for _, uidRange := range set {
+			query += " OR (true"
 			if uidRange.Start != 0 {
 				args = append(args, uint32(uidRange.Start))
 				query += fmt.Sprintf(" AND uid >= $%d", len(args))
@@ -514,6 +517,7 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 				args = append(args, uint32(uidRange.Stop))
 				query += fmt.Sprintf(" AND uid <= $%d", len(args))
 			}
+			query += ")"
 		}
 	default:
 		return nil, fmt.Errorf("unsupported NumSet type")
