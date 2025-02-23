@@ -138,10 +138,12 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int, name strin
 	var mailbox DBMailbox
 
 	err := db.Pool.QueryRow(ctx, `
-		SELECT id, name, uid_validity, parent_id
-		FROM mailboxes 
-		WHERE user_id = $1 AND LOWER(name) = $2 
-	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &mailbox.UIDValidity, &mailbox.ParentID)
+		SELECT
+			id, name, uid_validity, parent_id, subscribed,
+			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.parent_id = m.id) AS has_children
+		FROM mailboxes m
+		WHERE user_id = $1 AND LOWER(name) = $2
+	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &mailbox.UIDValidity, &mailbox.ParentID, &mailbox.Subscribed, &mailbox.HasChildren)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
