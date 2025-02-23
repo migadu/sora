@@ -17,21 +17,16 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// If an UIDSet is provided, filter the messages to match the UIDs
-	var (
-		expungeIDs     []imap.UID
-		expungeSeqNums []uint32
-	)
+	var expungeIDs []imap.UID
 	if uidSet != nil {
 		for _, msg := range messages {
 			if uidSet.Contains(msg.UID) {
 				expungeIDs = append(expungeIDs, msg.UID)
-				expungeSeqNums = append(expungeSeqNums, msg.Seq)
 			}
 		}
 	} else {
 		for _, msg := range messages {
 			expungeIDs = append(expungeIDs, msg.UID)
-			expungeSeqNums = append(expungeSeqNums, msg.Seq)
 		}
 	}
 
