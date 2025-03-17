@@ -750,19 +750,19 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 	// Start building the query using a common table expression (CTE) to calculate sequence numbers
 	baseQuery := `
 		WITH message_seqs AS (
-			SELECT 
+			SELECT
 				uid,
 				ROW_NUMBER() OVER (ORDER BY id) AS seq_num
-			FROM 
+			FROM
 				messages
-			WHERE 
-				mailbox_id = $1 AND 
+			WHERE
+				mailbox_id = $1 AND
 				expunged_at IS NULL
 		)`
 	args := []interface{}{mailboxID}
 
 	// Start building the main query based on the CTE
-	query := "SELECT id FROM message_seqs WHERE 1=1"
+	query := "SELECT uid FROM message_seqs WHERE 1=1"
 	pos := 2 // Start from 2 since mailbox_id is $1
 
 	// Handle sequence number or UID search
@@ -857,7 +857,7 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 	}
 
 	// Finalize the query
-	query += " ORDER BY id"
+	query += " ORDER BY uid"
 
 	rows, err := db.Pool.Query(ctx, baseQuery+query, args...)
 	if err != nil {
