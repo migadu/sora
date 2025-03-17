@@ -818,25 +818,19 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 		}
 	}
 
-	if criteria.Body != nil {
-		for _, bodyCriteria := range criteria.Body {
-			args = append(args, bodyCriteria)
-			query += fmt.Sprintf(" AND text_body_tsv @@ plainto_tsquery($%d)", len(args))
-		}
+	for _, bodyCriteria := range criteria.Body {
+		args = append(args, bodyCriteria)
+		query += fmt.Sprintf(" AND text_body_tsv @@ plainto_tsquery($%d)", len(args))
 	}
 
 	// Handle flags
-	if len(criteria.Flag) > 0 {
-		for _, flag := range criteria.Flag {
-			args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
-			query += fmt.Sprintf(" AND (flags & $%d) != 0", len(args))
-		}
+	for _, flag := range criteria.Flag {
+		args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
+		query += fmt.Sprintf(" AND (flags & $%d) != 0", len(args))
 	}
-	if len(criteria.NotFlag) > 0 {
-		for _, flag := range criteria.NotFlag {
-			args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
-			query += fmt.Sprintf(" AND (flags & $%d) = 0", len(args))
-		}
+	for _, flag := range criteria.NotFlag {
+		args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
+		query += fmt.Sprintf(" AND (flags & $%d) = 0", len(args))
 	}
 
 	// Handle message size
