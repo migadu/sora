@@ -763,50 +763,42 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 
 	// Start building the main query based on the CTE
 	query := "SELECT uid FROM message_seqs WHERE 1=1"
-	pos := 2 // Start from 2 since mailbox_id is $1
 
 	// Handle sequence number or UID search
 	if numKind == imapserver.NumKindSeq && len(criteria.SeqNum) > 0 {
 		seqNums, _ := criteria.SeqNum[0].Nums()
-		query += fmt.Sprintf(" AND seq_num = ANY($%d)", pos)
 		args = append(args, seqNums)
-		pos++
+		query += fmt.Sprintf(" AND seq_num = ANY($%d)", len(args))
 	} else if numKind == imapserver.NumKindUID && len(criteria.UID) > 0 {
 		uids, _ := criteria.UID[0].Nums()
-		query += fmt.Sprintf(" AND id = ANY($%d)", pos)
 		args = append(args, uids)
-		pos++
+		query += fmt.Sprintf(" AND id = ANY($%d)", len(args))
 	}
 
 	// Handle date filters
 	if !criteria.Since.IsZero() {
-		query += fmt.Sprintf(" AND internal_date >= $%d", pos)
 		args = append(args, criteria.Since)
-		pos++
+		query += fmt.Sprintf(" AND internal_date >= $%d", len(args))
 	}
 	if !criteria.Before.IsZero() {
-		query += fmt.Sprintf(" AND internal_date <= $%d", pos)
 		args = append(args, criteria.Before)
-		pos++
+		query += fmt.Sprintf(" AND internal_date <= $%d", len(args))
 	}
 	if !criteria.SentSince.IsZero() {
-		query += fmt.Sprintf(" AND sent_date >= $%d", pos)
 		args = append(args, criteria.SentSince)
-		pos++
+		query += fmt.Sprintf(" AND sent_date >= $%d", len(args))
 	}
 	if !criteria.SentBefore.IsZero() {
-		query += fmt.Sprintf(" AND sent_date <= $%d", pos)
 		args = append(args, criteria.SentBefore)
-		pos++
+		query += fmt.Sprintf(" AND sent_date <= $%d", len(args))
 	}
 
 	// Handle subject search from the `messages` table
 	for _, header := range criteria.Header {
 		switch strings.ToLower(header.Key) {
 		case "subject":
-			query += fmt.Sprintf(" AND LOWER(subject) LIKE $%d", pos)
 			args = append(args, "%"+strings.ToLower(header.Value)+"%")
-			pos++
+			query += fmt.Sprintf(" AND LOWER(subject) LIKE $%d", len(args))
 		}
 	}
 
@@ -814,46 +806,40 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 	for _, header := range criteria.Header {
 		switch strings.ToLower(header.Key) {
 		case "to", "cc", "bcc", "reply-to":
-			query += fmt.Sprintf(" AND id IN (SELECT message_id FROM recipients WHERE LOWER(address_type) = $%d AND LOWER(email_address) LIKE $%d)", pos, pos+1)
 			args = append(args, strings.ToLower(header.Key), "%"+strings.ToLower(header.Value)+"%")
-			pos += 2
+			query += fmt.Sprintf(" AND id IN (SELECT message_id FROM recipients WHERE LOWER(address_type) = $%d AND LOWER(email_address) LIKE $%d)", len(args)-1, len(args))
 		}
 	}
 
 	if criteria.Body != nil {
 		for _, bodyCriteria := range criteria.Body {
-			query += fmt.Sprintf(" AND text_body_tsv @@ plainto_tsquery($%d)", pos)
 			args = append(args, bodyCriteria)
-			pos++
+			query += fmt.Sprintf(" AND text_body_tsv @@ plainto_tsquery($%d)", len(args))
 		}
 	}
 
 	// Handle flags
 	if len(criteria.Flag) > 0 {
 		for _, flag := range criteria.Flag {
-			query += fmt.Sprintf(" AND (flags & $%d) != 0", pos)
 			args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
-			pos++
+			query += fmt.Sprintf(" AND (flags & $%d) != 0", len(args))
 		}
 	}
 	if len(criteria.NotFlag) > 0 {
 		for _, flag := range criteria.NotFlag {
-			query += fmt.Sprintf(" AND (flags & $%d) = 0", pos)
 			args = append(args, FlagToBitwise(flag)) // Convert the flag to its bitwise value
-			pos++
+			query += fmt.Sprintf(" AND (flags & $%d) = 0", len(args))
 		}
 	}
 
 	// Handle message size
 	if criteria.Larger > 0 {
-		query += fmt.Sprintf(" AND size > $%d", pos)
 		args = append(args, criteria.Larger)
-		pos++
+		query += fmt.Sprintf(" AND size > $%d", len(args))
 	}
 	if criteria.Smaller > 0 {
-		query += fmt.Sprintf(" AND size < $%d", pos)
 		args = append(args, criteria.Smaller)
-		pos++
+		query += fmt.Sprintf(" AND size < $%d", len(args))
 	}
 
 	// Finalize the query
