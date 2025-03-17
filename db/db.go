@@ -470,23 +470,8 @@ func (db *Database) GetMessageBodyStructure(ctx context.Context, messageUID imap
 	return helpers.DeserializeBodyStructureGob(bodyStructureBytes)
 }
 
-// GetMessagesBySeqSet fetches messages from the database based on the NumSet and mailbox ID.
-// This works for both sequence numbers (SeqSet) and UIDs (UIDSet).
-func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numSet imap.NumSet) ([]Message, error) {
-	var messages []Message
-
-	query := `
-		SELECT * FROM (
-			SELECT uid, mailbox_id, storage_uuid, flags, internal_date, size, body_structure,
-				row_number() OVER (ORDER BY id) AS seqnum
-			FROM messages
-			WHERE
-				mailbox_id = $1 AND
-				expunged_at IS NULL
-		) AS sub WHERE false
-	`
-	args := []interface{}{mailboxID}
-
+func selectNumSet(numSet imap.NumSet, query string, args []interface{}) (string, []interface{}) {
+	query += "(false"
 	switch set := numSet.(type) {
 	case imap.SeqSet:
 		for _, seqRange := range set {
@@ -515,8 +500,30 @@ func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numS
 			query += ")"
 		}
 	default:
-		return nil, fmt.Errorf("unsupported NumSet type")
+		panic("unsupported NumSet type") // unreachable
 	}
+	query += ")"
+	return query, args
+}
+
+// GetMessagesBySeqSet fetches messages from the database based on the NumSet and mailbox ID.
+// This works for both sequence numbers (SeqSet) and UIDs (UIDSet).
+func (db *Database) GetMessagesBySeqSet(ctx context.Context, mailboxID int, numSet imap.NumSet) ([]Message, error) {
+	var messages []Message
+
+	query := `
+		SELECT * FROM (
+			SELECT uid, mailbox_id, storage_uuid, flags, internal_date, size, body_structure,
+				row_number() OVER (ORDER BY id) AS seqnum
+			FROM messages
+			WHERE
+				mailbox_id = $1 AND
+				expunged_at IS NULL
+		) AS sub WHERE
+	`
+	args := []interface{}{mailboxID}
+
+	query, args = selectNumSet(numSet, query, args)
 
 	// Execute the query
 	rows, err := db.Pool.Query(ctx, query, args...)
@@ -752,27 +759,27 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int, 
 		WITH message_seqs AS (
 			SELECT
 				uid,
-				ROW_NUMBER() OVER (ORDER BY id) AS seq_num
+				ROW_NUMBER() OVER (ORDER BY id) AS seqnum
 			FROM
 				messages
 			WHERE
 				mailbox_id = $1 AND
 				expunged_at IS NULL
-		)`
+		)
+	`
 	args := []interface{}{mailboxID}
 
 	// Start building the main query based on the CTE
 	query := "SELECT uid FROM message_seqs WHERE 1=1"
 
 	// Handle sequence number or UID search
-	if numKind == imapserver.NumKindSeq && len(criteria.SeqNum) > 0 {
-		seqNums, _ := criteria.SeqNum[0].Nums()
-		args = append(args, seqNums)
-		query += fmt.Sprintf(" AND seq_num = ANY($%d)", len(args))
-	} else if numKind == imapserver.NumKindUID && len(criteria.UID) > 0 {
-		uids, _ := criteria.UID[0].Nums()
-		args = append(args, uids)
-		query += fmt.Sprintf(" AND id = ANY($%d)", len(args))
+	for _, seqSet := range criteria.SeqNum {
+		query += " AND "
+		query, args = selectNumSet(seqSet, query, args)
+	}
+	for _, uidSet := range criteria.UID {
+		query += " AND "
+		query, args = selectNumSet(uidSet, query, args)
 	}
 
 	// Handle date filters
