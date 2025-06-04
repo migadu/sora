@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/emersion/go-imap/v2"
@@ -13,35 +14,49 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 		return nil
 	}
 
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for ExpungeMessageUIDs: %w", err)
+	}
+	// Defer rollback in case of errors. Commit will be called explicitly on success.
+	defer tx.Rollback(ctx)
+
 	log.Printf("[EXPUNGE] expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
 
-	result, err := db.Pool.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE messages
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
 	`, mailboxID, uids)
 
 	if err != nil {
-		log.Printf("[EXPUNGE] error expunging messages: %v", err)
+		log.Printf("[EXPUNGE] error executing expunge update: %v", err)
 		return err
 	}
 
 	rowsAffected := result.RowsAffected()
 	log.Printf("[EXPUNGE] successfully expunged %d messages from mailbox %d", rowsAffected, mailboxID)
 
-	// Double-check that the messages were actually expunged
+	// Double-check that the messages were actually expunged within the transaction
 	var count int
-	err = db.Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT COUNT(*) 
 		FROM messages 
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
 	`, mailboxID, uids).Scan(&count)
 
 	if err != nil {
-		log.Printf("[EXPUNGE] error checking if messages were expunged: %v", err)
+		// If the check itself fails, it's an issue, but the primary update might have succeeded.
+		// Depending on policy, you might still want to commit or force a rollback.
+		// For now, log it and proceed to commit if the UPDATE was successful.
+		log.Printf("[EXPUNGE] error checking if messages were expunged within transaction: %v", err)
 	} else if count > 0 {
 		log.Printf("[EXPUNGE] WARNING: %d messages were not expunged", count)
 	}
 
-	return nil
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction for ExpungeMessageUIDs: %w", err)
+	}
+
+	return nil // Return nil if commit succeeds
 }
