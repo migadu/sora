@@ -62,9 +62,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        cms.expunged_modseq,
 			        true AS is_message_update
 			    FROM current_mailbox_state cms
-			    WHERE
-			        (cms.created_modseq <= $2 AND cms.updated_modseq > $2 AND cms.expunged_modseq IS NULL) OR
-			        (cms.created_modseq <= $2 AND cms.expunged_modseq > $2)
+				WHERE GREATEST(cms.created_modseq, COALESCE(cms.updated_modseq, 0), COALESCE(cms.expunged_modseq, 0)) > $2 -- $2 is sinceModSeq
 			  )
 			SELECT
 			    cm.uid,

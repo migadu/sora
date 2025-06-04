@@ -300,11 +300,9 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 	const query = `
 		SELECT
 			COALESCE(MAX(uid), 0) + 1 AS uid_next,
-			COUNT(*) AS num_messages,
+			COUNT(*) FILTER (WHERE expunged_at IS NULL) AS num_messages, -- Ensure we only count non-expunged
 			COALESCE(SUM(size), 0) AS total_size,
-			COALESCE(MAX(GREATEST(created_modseq, 
-				COALESCE(updated_modseq, 0), 
-				COALESCE(expunged_modseq, 0))), 0) AS highest_modseq,
+			(SELECT lv.last_value FROM messages_modseq lv) AS highest_modseq, -- Use global sequence value
 			COUNT(*) FILTER (WHERE (flags & $2) = 0) AS recent_count,
 			COUNT(*) FILTER (WHERE (flags & $3) = 0) AS unseen_count
 		FROM messages
