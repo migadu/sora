@@ -76,7 +76,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		s.Log("[MOVE] automatically marking %d moved messages as seen in Trash folder", len(mappedDestUIDs))
 
 		for _, uid := range mappedDestUIDs {
-			_, err := s.server.db.AddMessageFlags(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
+			_, _, err := s.server.db.AddMessageFlags(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
 			if err != nil {
 				s.Log("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
 				// Continue with other messages even if one fails

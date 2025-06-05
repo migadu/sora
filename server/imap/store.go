@@ -54,46 +54,26 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		// 	}
 		// }
 
-		var newFlags *[]imap.Flag
+		var newFlags []imap.Flag
+		var newModSeq int64
 		switch flags.Op {
 		case imap.StoreFlagsAdd:
-			newFlags, err = s.server.db.AddMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.db.AddMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsDel:
-			newFlags, err = s.server.db.RemoveMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.db.RemoveMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsSet:
-			newFlags, err = s.server.db.SetMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.db.SetMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		}
 
 		if err != nil {
 			return s.internalError("failed to update flags for message: %v", err)
 		}
 
-		uidSet := imap.UIDSet{{Start: msg.UID, Stop: msg.UID}}
-		updatedMsgs, err := s.server.db.GetMessagesByNumSet(s.ctx, s.selectedMailbox.ID, uidSet)
-		if err != nil {
-			s.Log("[STORE] WARNING: failed to get updated message MODSEQ: %v", err)
-			continue
+		if newModSeq == 0 { // Should not happen if DB functions are correct
+			s.Log("[STORE] WARNING: message UID %d received zero MODSEQ after flag update", msg.UID)
 		}
 
-		if len(updatedMsgs) == 0 {
-			s.Log("[STORE] WARNING: message UID %d not found after flag update", msg.UID)
-			continue
-		}
-
-		updatedMsg := updatedMsgs[0]
-
-		var highestModSeq int64
-		highestModSeq = updatedMsg.CreatedModSeq
-
-		if updatedMsg.UpdatedModSeq != nil && *updatedMsg.UpdatedModSeq > highestModSeq {
-			highestModSeq = *updatedMsg.UpdatedModSeq
-		}
-
-		if updatedMsg.ExpungedModSeq != nil && *updatedMsg.ExpungedModSeq > highestModSeq {
-			highestModSeq = *updatedMsg.ExpungedModSeq
-		}
-
-		s.Log("[STORE] operation updated message UID %d, new MODSEQ: %d", msg.UID, highestModSeq)
+		s.Log("[STORE] operation updated message UID %d, new MODSEQ: %d", msg.UID, newModSeq)
 
 		modifiedMessages = append(modifiedMessages, struct {
 			seq    uint32
@@ -103,8 +83,8 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}{
 			seq:    msg.Seq,
 			uid:    msg.UID,
-			flags:  *newFlags,
-			modSeq: highestModSeq,
+			flags:  newFlags,
+			modSeq: newModSeq,
 		})
 	}
 

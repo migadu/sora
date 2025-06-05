@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ const FlagsMaxKeywordLength = 100
 
 // splitFlags separates a list of IMAP flags into system flags (starting with '\')
 // and custom keyword flags.
-func splitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []string) {
+func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []string) {
 	for _, f := range flags {
 		flagStr := string(f)
 		if strings.HasPrefix(flagStr, "\\") {
@@ -74,48 +75,50 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	return allFlags, nil
 }
 
-func (db *Database) SetMessageFlags(ctx context.Context, messageID imap.UID, mailboxID int64, newFlags []imap.Flag) (*[]imap.Flag, error) {
+func (db *Database) SetMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction for SetMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to begin transaction for SetMessageFlags: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	// Ensure modSeq is initialized in case of early error returns before it's set.
 
-	systemFlagsToSet, customKeywordsToSet := splitFlags(newFlags)
+	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
 	customKeywordsJSON, err := json.Marshal(customKeywordsToSet)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal custom keywords for SetMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to marshal custom keywords for SetMessageFlags: %w", err)
 	}
-
-	_, err = tx.Exec(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE messages
 		SET flags = $1, custom_flags = $2, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
 		WHERE uid = $4 AND mailbox_id = $5 AND expunged_at IS NULL
-	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageID, mailboxID)
+		RETURNING COALESCE(updated_modseq, created_modseq)
+	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageUID, mailboxID).Scan(&modSeq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute set message flags for UID %d in mailbox %d: %w", messageID, mailboxID, err)
+		return nil, 0, fmt.Errorf("failed to execute set message flags for UID %d in mailbox %d: %w", messageUID, mailboxID, err)
 	}
 
-	updatedFlags, err := db.getAllFlagsForMessage(ctx, tx, messageID, mailboxID)
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction for SetMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to commit transaction for SetMessageFlags: %w", err)
 	}
-	return &updatedFlags, nil
+	return currentFlags, modSeq, nil
 }
 
-func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (*[]imap.Flag, error) {
+func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction for AddMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to begin transaction for AddMessageFlags: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	systemFlagsToAdd, customKeywordsToAdd := splitFlags(newFlags)
+	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
+	var currentModSeq sql.NullInt64 // Use sql.NullInt64 to handle potential NULL from RETURNING if no rows updated
 
 	if len(systemFlagsToAdd) > 0 {
 		bitwiseSystemFlagsToAdd := FlagsToBitwise(systemFlagsToAdd)
@@ -125,8 +128,8 @@ func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, ma
 			WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
 		`, bitwiseSystemFlagsToAdd, time.Now(), messageUID, mailboxID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to add system flags for UID %d: %w", messageUID, err)
-		}
+			return nil, 0, fmt.Errorf("failed to add system flags for UID %d: %w", messageUID, err)
+		} // modSeq will be updated by the custom flags part or a final fetch if only system flags changed
 	}
 
 	if len(customKeywordsToAdd) > 0 {
@@ -143,29 +146,40 @@ func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, ma
 			WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
 		`, messageUID, mailboxID, customKeywordsToAdd, time.Now())
 		if err != nil {
-			return nil, fmt.Errorf("failed to add custom keywords for UID %d: %w", messageUID, err)
+			return nil, 0, fmt.Errorf("failed to add custom keywords for UID %d: %w", messageUID, err)
 		}
 	}
 
-	updatedFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	// Fetch the final modSeq after all potential updates
+	err = tx.QueryRow(ctx, `SELECT COALESCE(updated_modseq, created_modseq) FROM messages WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL`, messageUID, mailboxID).Scan(&currentModSeq)
 	if err != nil {
-		return nil, err
+		return nil, 0, fmt.Errorf("failed to retrieve final modseq for UID %d: %w", messageUID, err)
+	}
+	if !currentModSeq.Valid { // Should not happen if message exists
+		return nil, 0, fmt.Errorf("modseq not found for UID %d after update", messageUID)
+	}
+	modSeq = currentModSeq.Int64
+
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction for AddMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to commit transaction for AddMessageFlags: %w", err)
 	}
-	return &updatedFlags, nil
+	return currentFlags, modSeq, nil
 }
 
-func (db *Database) RemoveMessageFlags(ctx context.Context, messageID imap.UID, mailboxID int64, newFlags []imap.Flag) (*[]imap.Flag, error) {
+func (db *Database) RemoveMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction for RemoveMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to begin transaction for RemoveMessageFlags: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	systemFlagsToRemove, customKeywordsToRemove := splitFlags(newFlags)
+	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
+	var currentModSeq sql.NullInt64
 
 	if len(systemFlagsToRemove) > 0 {
 		bitwiseSystemFlagsToRemove := FlagsToBitwise(systemFlagsToRemove)
@@ -174,10 +188,10 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageID imap.UID, 
 			UPDATE messages
 			SET flags = flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
 			WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
-		`, negatedSystemFlags, time.Now(), messageID, mailboxID)
+		`, negatedSystemFlags, time.Now(), messageUID, mailboxID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to remove system flags for UID %d: %w", messageID, err)
-		}
+			return nil, 0, fmt.Errorf("failed to remove system flags for UID %d: %w", messageUID, err)
+		} // modSeq will be updated by the custom flags part or a final fetch
 	}
 
 	if len(customKeywordsToRemove) > 0 {
@@ -187,21 +201,31 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageID imap.UID, 
 			SET custom_flags = custom_flags - $3::text[],
 			    flags_changed_at = $4, updated_modseq = nextval('messages_modseq')
 			WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
-		`, messageID, mailboxID, customKeywordsToRemove, time.Now())
+		`, messageUID, mailboxID, customKeywordsToRemove, time.Now())
 		if err != nil {
-			return nil, fmt.Errorf("failed to remove custom keywords for UID %d: %w", messageID, err)
+			return nil, 0, fmt.Errorf("failed to remove custom keywords for UID %d: %w", messageUID, err)
 		}
 	}
 
-	updatedFlags, err := db.getAllFlagsForMessage(ctx, tx, messageID, mailboxID)
+	// Fetch the final modSeq after all potential updates
+	err = tx.QueryRow(ctx, `SELECT COALESCE(updated_modseq, created_modseq) FROM messages WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL`, messageUID, mailboxID).Scan(&currentModSeq)
 	if err != nil {
-		return nil, err
+		return nil, 0, fmt.Errorf("failed to retrieve final modseq for UID %d: %w", messageUID, err)
+	}
+	if !currentModSeq.Valid { // Should not happen if message exists
+		return nil, 0, fmt.Errorf("modseq not found for UID %d after update", messageUID)
+	}
+	modSeq = currentModSeq.Int64
+
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction for RemoveMessageFlags: %w", err)
+		return nil, 0, fmt.Errorf("failed to commit transaction for RemoveMessageFlags: %w", err)
 	}
-	return &updatedFlags, nil
+	return currentFlags, modSeq, nil
 }
 
 // GetUniqueCustomFlagsForMailbox retrieves a list of unique custom flags

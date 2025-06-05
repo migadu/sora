@@ -97,14 +97,13 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 		}
 	}
 	if markSeen {
-		// This DB call doesn't need s.mutex
-		_, err := s.server.db.AddMessageFlags(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+		newFlagsComplete, _, err := s.server.db.AddMessageFlags(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 		if err != nil {
 			s.Log("[FETCH] failed to set \\Seen flag for message UID %d: %v", msg.UID, err)
 		} else {
-			// Update the local copy of msg.BitwiseFlags so the current FETCH response reflects it.
-			// The Poll mechanism will handle propagating this to the sharedMailboxTracker for other sessions.
-			msg.BitwiseFlags |= db.FlagSeen
+			systemFlags, customKeywords := db.SplitFlags(newFlagsComplete)
+			msg.BitwiseFlags = db.FlagsToBitwise(systemFlags)
+			msg.CustomFlags = customKeywords
 		}
 	}
 

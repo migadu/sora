@@ -187,7 +187,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 
 	inReplyToStr := strings.Join(options.InReplyTo, " ")
 
-	systemFlagsToSet, customKeywordsToSet := splitFlags(options.Flags)
+	systemFlagsToSet, customKeywordsToSet := SplitFlags(options.Flags)
 	bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
 
 	var customKeywordsJSON []byte
