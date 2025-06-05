@@ -12,11 +12,12 @@ import (
 )
 
 type MessageUpdate struct {
-	UID          imap.UID
-	SeqNum       uint32
-	BitwiseFlags int // Matches the 'flags' column type in messages table (INTEGER)
-	IsExpunge    bool
-	CustomFlags  []string
+	UID             imap.UID
+	SeqNum          uint32
+	BitwiseFlags    int // Matches the 'flags' column type in messages table (INTEGER)
+	IsExpunge       bool
+	CustomFlags     []string
+	EffectiveModSeq uint64 // The modseq that triggered this update
 }
 
 type MailboxPoll struct {
@@ -38,7 +39,11 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  global_stats AS (
 			    SELECT
 			      (SELECT COUNT(m_count.uid) FROM messages m_count WHERE m_count.mailbox_id = $1 AND m_count.expunged_at IS NULL) AS total_messages,
-			      (SELECT lv.last_value FROM messages_modseq lv) AS current_modseq
+			      (
+			        SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 0)
+			        FROM messages m_mod
+			        WHERE m_mod.mailbox_id = $1
+			      ) AS highest_mailbox_modseq
 			  ),
 			  current_mailbox_state AS (
 			    SELECT
@@ -47,7 +52,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        m.flags,
 			        m.custom_flags,
 			        m.created_modseq,
-			        m.updated_modseq,
+			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val, -- Use COALESCE for GREATEST
 			        m.expunged_modseq
 			    FROM messages m
 			    WHERE m.mailbox_id = $1 AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2) -- $2 is sinceModSeq
@@ -59,11 +64,10 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        cms.flags,
 			        cms.custom_flags,
 			        cms.expunged_modseq,
+			        GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) AS effective_modseq,
 			        true AS is_message_update
 			    FROM current_mailbox_state cms
-			    WHERE
-			        (cms.created_modseq <= $2 AND cms.updated_modseq > $2 AND cms.expunged_modseq IS NULL) OR
-			        (cms.created_modseq <= $2 AND cms.expunged_modseq > $2) -- $2 is sinceModSeq
+			    WHERE GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) > $2 -- $2 is sinceModSeq
 			  )
 			SELECT
 			    cm.uid,
@@ -71,9 +75,10 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			    cm.flags,
 			    cm.custom_flags,
 			    cm.expunged_modseq,
+			    cm.effective_modseq,
 			    cm.is_message_update,
 			    gs.total_messages,
-			    gs.current_modseq
+			    gs.highest_mailbox_modseq AS current_modseq
 			FROM changed_messages cm, global_stats gs
 			UNION ALL
 			SELECT
@@ -82,9 +87,10 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			    NULL AS flags,
 			    NULL AS custom_flags,
 			    NULL AS expunged_modseq,
+			    NULL AS effective_modseq,
 			    false AS is_message_update,
 			    gs.total_messages,
-			    gs.current_modseq
+			    gs.highest_mailbox_modseq AS current_modseq
 			FROM global_stats gs
 			WHERE NOT EXISTS (SELECT 1 FROM changed_messages)
 		) AS combined_results
@@ -104,14 +110,15 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 
 	for rows.Next() {
 		var (
-			uidScannable          sql.NullInt32 // imap.UID is uint32
-			seqNumScannable       sql.NullInt32 // uint32
-			bitwiseFlagsScannable sql.NullInt32 // INTEGER in DB
-			expungedModSeqPtr     *int64
-			customFlagsJSON       []byte
-			isMessageUpdate       bool
-			rowTotalMessages      uint32
-			rowCurrentModSeq      uint64
+			uidScannable             sql.NullInt32 // imap.UID is uint32
+			seqNumScannable          sql.NullInt32 // uint32
+			bitwiseFlagsScannable    sql.NullInt32 // INTEGER in DB
+			expungedModSeqPtr        *int64
+			customFlagsJSON          []byte
+			effectiveModSeqScannable sql.NullInt64
+			isMessageUpdate          bool
+			rowTotalMessages         uint32
+			rowCurrentModSeq         uint64
 		)
 
 		err := rows.Scan(
@@ -120,6 +127,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			&bitwiseFlagsScannable,
 			&customFlagsJSON,
 			&expungedModSeqPtr,
+			&effectiveModSeqScannable,
 			&isMessageUpdate,
 			&rowTotalMessages,
 			&rowCurrentModSeq,
@@ -135,8 +143,8 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}
 
 		if isMessageUpdate {
-			if !uidScannable.Valid || !seqNumScannable.Valid || !bitwiseFlagsScannable.Valid {
-				return nil, fmt.Errorf("unexpected NULL value in message update row: uid_valid=%v, seq_valid=%v, flags_valid=%v", uidScannable.Valid, seqNumScannable.Valid, bitwiseFlagsScannable.Valid)
+			if !uidScannable.Valid || !seqNumScannable.Valid || !bitwiseFlagsScannable.Valid || !effectiveModSeqScannable.Valid {
+				return nil, fmt.Errorf("unexpected NULL value in message update row: uid_valid=%v, seq_valid=%v, flags_valid=%v, effective_modseq_valid=%v", uidScannable.Valid, seqNumScannable.Valid, bitwiseFlagsScannable.Valid, effectiveModSeqScannable.Valid)
 			}
 			var customFlags []string
 			if customFlagsJSON != nil { // Will be []byte("[]") if empty, or []byte("null")
@@ -144,12 +152,16 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 					return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w, json: %s", err, string(customFlagsJSON))
 				}
 			}
+			if !effectiveModSeqScannable.Valid { // Should always be valid if isMessageUpdate is true
+				return nil, fmt.Errorf("unexpected NULL effective_modseq in message update row for UID %d", uidScannable.Int32)
+			}
 			updates = append(updates, MessageUpdate{
-				UID:          imap.UID(uidScannable.Int32),
-				SeqNum:       uint32(seqNumScannable.Int32),
-				BitwiseFlags: int(bitwiseFlagsScannable.Int32),
-				IsExpunge:    expungedModSeqPtr != nil,
-				CustomFlags:  customFlags,
+				UID:             imap.UID(uidScannable.Int32),
+				SeqNum:          uint32(seqNumScannable.Int32),
+				BitwiseFlags:    int(bitwiseFlagsScannable.Int32),
+				IsExpunge:       expungedModSeqPtr != nil,
+				CustomFlags:     customFlags,
+				EffectiveModSeq: uint64(effectiveModSeqScannable.Int64),
 			})
 		}
 	}

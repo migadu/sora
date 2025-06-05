@@ -28,7 +28,21 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return nil
 	}
 
-	s.currentHighestModSeq = poll.ModSeq
+	// Determine the highest MODSEQ from the updates processed in this poll.
+	// Start with the MODSEQ we polled from, in case no updates are found.
+	maxModSeqInThisPoll := highestModSeqToPollFrom
+	if len(poll.Updates) > 0 {
+		for _, update := range poll.Updates {
+			if update.EffectiveModSeq > maxModSeqInThisPoll {
+				maxModSeqInThisPoll = update.EffectiveModSeq
+			}
+		}
+		s.currentHighestModSeq = maxModSeqInThisPoll
+	} else {
+		// If there were no specific message updates, update to the global current_modseq
+		// to ensure the session eventually catches up if the mailbox is truly idle.
+		s.currentHighestModSeq = poll.ModSeq
+	}
 
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
