@@ -44,7 +44,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  current_mailbox_state AS (
 			    SELECT
 			        m.uid,
-			        ROW_NUMBER() OVER (ORDER BY m.id) AS seq_num,
+			        ROW_NUMBER() OVER (ORDER BY m.uid) AS seq_num,
 			        m.flags,
 			        m.custom_flags,
 			        m.created_modseq,
