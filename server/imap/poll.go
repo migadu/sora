@@ -45,8 +45,8 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 	if poll.NumMessages > s.currentNumMessages {
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
+		s.currentNumMessages = poll.NumMessages
 	}
-	s.currentNumMessages = poll.NumMessages
 
 	return s.sessionTracker.Poll(w, allowExpunge)
 }
