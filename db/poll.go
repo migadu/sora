@@ -26,7 +26,6 @@ type MailboxPoll struct {
 }
 
 func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*MailboxPoll, error) {
-	// Use a transaction to ensure we have a consistent view of the mailbox
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
@@ -62,7 +61,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        cms.expunged_modseq,
 			        true AS is_message_update
 			    FROM current_mailbox_state cms
-				WHERE GREATEST(cms.created_modseq, COALESCE(cms.updated_modseq, 0), COALESCE(cms.expunged_modseq, 0)) > $2 -- $2 is sinceModSeq
+			    WHERE
+			        (cms.created_modseq <= $2 AND cms.updated_modseq > $2 AND cms.expunged_modseq IS NULL) OR
+			        (cms.created_modseq <= $2 AND cms.expunged_modseq > $2) -- $2 is sinceModSeq
 			  )
 			SELECT
 			    cm.uid,
