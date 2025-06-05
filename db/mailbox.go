@@ -299,19 +299,18 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 	const query = `
 		SELECT
-			COALESCE(MAX(uid), 0) + 1 AS uid_next,
-			COUNT(*) FILTER (WHERE expunged_at IS NULL) AS num_messages, -- Ensure we only count non-expunged
-			COALESCE(SUM(size), 0) AS total_size,
-			(SELECT lv.last_value FROM messages_modseq lv) AS highest_modseq, -- Use global sequence value
-			COUNT(*) FILTER (WHERE (flags & $2) = 0) AS recent_count,
-			COUNT(*) FILTER (WHERE (flags & $3) = 0) AS unseen_count
+			COALESCE(MAX(uid) FILTER (WHERE expunged_at IS NULL), 0) + 1 AS uid_next,
+			COUNT(*) FILTER (WHERE expunged_at IS NULL) AS num_messages,
+			COALESCE(SUM(size) FILTER (WHERE expunged_at IS NULL), 0) AS total_size,
+			(SELECT lv.last_value FROM messages_modseq lv) AS highest_modseq,
+			COUNT(*) FILTER (WHERE (flags & $2) = 0 AND expunged_at IS NULL) AS unseen_count -- $2 is FlagSeen
 		FROM messages
-		WHERE mailbox_id = $1 AND expunged_at IS NULL;
+		WHERE mailbox_id = $1;
 	`
-	row := tx.QueryRow(ctx, query, mailboxID, FlagRecent, FlagSeen)
+	row := tx.QueryRow(ctx, query, mailboxID, FlagSeen)
 
 	var s MailboxSummary
-	err = row.Scan(&s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.RecentCount, &s.UnseenCount)
+	err = row.Scan(&s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.UnseenCount)
 	if err != nil {
 		return nil, fmt.Errorf("GetMailboxSummary: %w", err)
 	}
