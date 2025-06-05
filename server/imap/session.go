@@ -27,6 +27,9 @@ type IMAPSession struct {
 
 	currentHighestModSeq uint64
 	currentNumMessages   uint32
+
+	lastSelectedMailboxID int64
+	lastHighestUID        imap.UID
 }
 
 func (s *IMAPSession) Context() context.Context {
