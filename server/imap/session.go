@@ -82,6 +82,18 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentNumMessages = 0
 }
 
+// SessionSort is an interface for IMAP sessions that support the SORT extension.
+// This matches the pattern used by go-imap/v2 for other extensions.
+type SessionSort interface {
+	imapserver.Session
+
+	// Selected state
+	Sort(kind imapserver.NumKind, criteria *imap.SearchCriteria, sortFields []SortField, order SortOrder) (*imap.SearchData, error)
+}
+
+// Ensure IMAPSession implements SessionSort
+var _ SessionSort = (*IMAPSession)(nil)
+
 func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	if s.sessionTracker == nil {
 		return numSet
