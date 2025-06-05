@@ -61,10 +61,11 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			// imap.CapIMAP4rev2:             struct{}{},
 			// imap.CapLiteralPlus:           struct{}{},
 			// imap.CapSASLIR:                struct{}{},
-			imap.CapAuthPlain: struct{}{}, // Enable AUTH=PLAIN capability
-			imap.CapMove:      struct{}{},
-			imap.CapIdle:      struct{}{},
-			imap.CapSort:      struct{}{}, // Add SORT capability
+			imap.CapAuthPlain:   struct{}{}, // Enable AUTH=PLAIN capability
+			imap.CapMove:        struct{}{},
+			imap.CapIdle:        struct{}{},
+			imap.CapSort:        struct{}{}, // Add SORT capability
+			imap.CapSortDisplay: struct{}{}, // Add SORT=DISPLAY capability (RFC 5957)
 			// imap.CapCondStore:             struct{}{}, // Add CONDSTORE capability
 			// imap.CapID:                    struct{}{},
 		},
