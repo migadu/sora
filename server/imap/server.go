@@ -19,18 +19,20 @@ import (
 )
 
 type IMAPServer struct {
-	addr           string
-	db             *db.Database
-	hostname       string
-	s3             *storage.S3Storage
-	server         *imapserver.Server
-	uploader       *uploader.UploadWorker
-	cache          *cache.Cache
-	appCtx         context.Context
-	caps           imap.CapSet
-	tlsConfig      *tls.Config
-	masterUsername string
-	masterPassword string
+	addr               string
+	db                 *db.Database
+	hostname           string
+	s3                 *storage.S3Storage
+	server             *imapserver.Server
+	uploader           *uploader.UploadWorker
+	cache              *cache.Cache
+	appCtx             context.Context
+	caps               imap.CapSet
+	tlsConfig          *tls.Config
+	masterUsername     string
+	masterPassword     string
+	masterSASLUsername string
+	masterSASLPassword string
 }
 
 type IMAPServerOptions struct {
@@ -41,6 +43,8 @@ type IMAPServerOptions struct {
 	InsecureSkipVerify bool
 	MasterUsername     string
 	MasterPassword     string
+	MasterSASLUsername string
+	MasterSASLPassword string
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -54,17 +58,19 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		cache:    cache,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1: struct{}{},
-			// imap.CapIMAP4rev2:   struct{}{},
-			// imap.CapLiteralPlus: struct{}{},
-			// imap.CapSASLIR:      struct{}{},
-			// imap.CapAuthPlain:   struct{}{},
-			imap.CapMove: struct{}{},
-			imap.CapIdle: struct{}{},
-			// imap.CapCondStore: struct{}{}, // Add CONDSTORE capability
-			// imap.CapID:          struct{}{},
+			// imap.CapIMAP4rev2:             struct{}{},
+			// imap.CapLiteralPlus:           struct{}{},
+			// imap.CapSASLIR:                struct{}{},
+			imap.CapAuthPlain: struct{}{}, // Enable AUTH=PLAIN capability
+			imap.CapMove:      struct{}{},
+			imap.CapIdle:      struct{}{},
+			// imap.CapCondStore:             struct{}{}, // Add CONDSTORE capability
+			// imap.CapID:                    struct{}{},
 		},
-		masterUsername: options.MasterUsername,
-		masterPassword: options.MasterPassword,
+		masterUsername:     options.MasterUsername,
+		masterPassword:     options.MasterPassword,
+		masterSASLUsername: options.MasterSASLUsername,
+		masterSASLPassword: options.MasterSASLPassword,
 	}
 
 	// Setup TLS if certificate and key files are provided

@@ -66,6 +66,8 @@ func main() {
 	fManagesieveAddr := flag.String("managesieveaddr", cfg.Servers.ManageSieveAddr, "ManageSieve server address (overrides config)")
 	fMasterUsername := flag.String("masterusername", cfg.Servers.MasterUsername, "Master username (overrides config)")
 	fMasterPassword := flag.String("masterpassword", cfg.Servers.MasterPassword, "Master password (overrides config)")
+	fMasterSASLUsername := flag.String("mastersaslusername", cfg.Servers.MasterSASLUsername, "Master SASL username (overrides config)")
+	fMasterSASLPassword := flag.String("mastersaslpassword", cfg.Servers.MasterSASLPassword, "Master SASL password (overrides config)")
 
 	// Uploader flags
 	fUploaderPath := flag.String("uploaderpath", cfg.Uploader.Path, "Directory for pending uploads (overrides config)")
@@ -247,6 +249,12 @@ func main() {
 	}
 	if isFlagSet("masterpassword") {
 		cfg.Servers.MasterPassword = *fMasterPassword
+	}
+	if isFlagSet("mastersaslusername") {
+		cfg.Servers.MasterSASLUsername = *fMasterSASLUsername
+	}
+	if isFlagSet("mastersaslpassword") {
+		cfg.Servers.MasterSASLPassword = *fMasterSASLPassword
 	}
 
 	// Upload worker
@@ -434,6 +442,8 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			InsecureSkipVerify: config.TLS.InsecureSkipVerify,
 			MasterUsername:     config.Servers.MasterUsername,
 			MasterPassword:     config.Servers.MasterPassword,
+			MasterSASLUsername: config.Servers.MasterSASLUsername,
+			MasterSASLPassword: config.Servers.MasterSASLPassword,
 		})
 	if err != nil {
 		errChan <- err

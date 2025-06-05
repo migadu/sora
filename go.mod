@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.5.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.5.0.20250605085616-231f7ff5a407
 	github.com/emersion/go-message v0.18.2
+	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.21.3
 	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
 	github.com/google/uuid v1.6.0
@@ -22,7 +23,6 @@ replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20240130
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

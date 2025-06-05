@@ -47,6 +47,8 @@ start_managesieve = true
 managesieve_addr = ":4190"
 master_username = ""
 master_password = ""
+master_sasl_username = ""
+master_sasl_password = ""
 
 [lmtp]
 ## The external relay is used in SIEVE redirect and vacation auto responses.

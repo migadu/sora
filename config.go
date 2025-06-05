@@ -41,16 +41,18 @@ type LocalCacheConfig struct {
 
 // ServersConfig holds server configuration.
 type ServersConfig struct {
-	StartImap        bool   `toml:"start_imap"`
-	ImapAddr         string `toml:"imap_addr"`
-	StartLmtp        bool   `toml:"start_lmtp"`
-	LmtpAddr         string `toml:"lmtp_addr"`
-	StartPop3        bool   `toml:"start_pop3"`
-	Pop3Addr         string `toml:"pop3_addr"`
-	StartManageSieve bool   `toml:"start_managesieve"`
-	ManageSieveAddr  string `toml:"managesieve_addr"`
-	MasterUsername   string `toml:"master_username"`
-	MasterPassword   string `toml:"master_password"`
+	StartImap          bool   `toml:"start_imap"`
+	ImapAddr           string `toml:"imap_addr"`
+	StartLmtp          bool   `toml:"start_lmtp"`
+	LmtpAddr           string `toml:"lmtp_addr"`
+	StartPop3          bool   `toml:"start_pop3"`
+	Pop3Addr           string `toml:"pop3_addr"`
+	StartManageSieve   bool   `toml:"start_managesieve"`
+	ManageSieveAddr    string `toml:"managesieve_addr"`
+	MasterUsername     string `toml:"master_username"`
+	MasterPassword     string `toml:"master_password"`
+	MasterSASLUsername string `toml:"master_sasl_username"`
+	MasterSASLPassword string `toml:"master_sasl_password"`
 }
 
 // UploaderConfig holds upload worker configuration.
