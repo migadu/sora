@@ -63,7 +63,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	rows, err := tx.Query(ctx, `
 		SELECT id, uid FROM messages 
 		WHERE mailbox_id = $1 AND uid = ANY($2)
-		ORDER BY id
+		ORDER BY uid
 	`, srcMailboxID, ids)
 	if err != nil {
 		log.Printf("Failed to query source messages: %v", err)

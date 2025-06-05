@@ -35,7 +35,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
 				internal_date, size, body_structure,
 				created_modseq, updated_modseq, expunged_modseq,
-				ROW_NUMBER() OVER (ORDER BY id) AS seqnum
+				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)

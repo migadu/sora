@@ -220,7 +220,7 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 	WITH message_seqs AS (
 		SELECT
 			uid,
-			ROW_NUMBER() OVER (ORDER BY id) AS seqnum, -- id is needed for ordering/seqnum
+			ROW_NUMBER() OVER (ORDER BY uid) AS seqnum, -- id is needed for ordering/seqnum
 			account_id, mailbox_id, content_hash, uploaded, flags, custom_flags,
 			internal_date, size, body_structure,
 			created_modseq, updated_modseq, expunged_modseq,
