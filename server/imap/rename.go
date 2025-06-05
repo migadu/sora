@@ -7,7 +7,7 @@ import (
 	"github.com/migadu/sora/consts"
 )
 
-func (s *IMAPSession) Rename(existingName, newName string) error {
+func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
