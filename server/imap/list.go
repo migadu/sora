@@ -41,6 +41,22 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 
 		data := listMailbox(mbox, options, s.server.caps)
 		if data != nil {
+			if options.ReturnStatus != nil && data.Mailbox != "" && s.server.caps.Has(imap.CapListStatus) {
+				statusData, err := s.Status(data.Mailbox, options.ReturnStatus)
+				if err == nil && statusData != nil {
+					data.Status = statusData
+					s.Log("[LIST-STATUS] Mailbox '%s': NumMessages=%v, UIDNext=%v, UIDValidity=%v, NumUnseen=%v, HighestModSeq=%v",
+						data.Mailbox,
+						statusData.NumMessages,
+						statusData.UIDNext,
+						statusData.UIDValidity,
+						statusData.NumUnseen,
+						statusData.HighestModSeq)
+				} else {
+					s.Log("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err)
+				}
+			}
+
 			l = append(l, *data)
 		}
 	}

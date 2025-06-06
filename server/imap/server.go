@@ -67,6 +67,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			imap.CapUIDPlus:     struct{}{},
 			imap.CapESearch:     struct{}{},
 			imap.CapSpecialUse:  struct{}{},
+			imap.CapListStatus:  struct{}{},
 			// imap.CapCondStore:             struct{}{}, // Add CONDSTORE capability
 			// imap.CapID:                    struct{}{},
 		},
