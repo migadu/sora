@@ -56,18 +56,18 @@ func main() {
 	fS3Trace := flag.Bool("s3trace", cfg.S3.Trace, "Trace S3 operations (overrides config)")
 
 	// Server enable/address flags
-	fStartImap := flag.Bool("imap", cfg.Servers.StartImap, "Start the IMAP server (overrides config)")
-	fImapAddr := flag.String("imapaddr", cfg.Servers.ImapAddr, "IMAP server address (overrides config)")
-	fStartLmtp := flag.Bool("lmtp", cfg.Servers.StartLmtp, "Start the LMTP server (overrides config)")
-	fLmtpAddr := flag.String("lmtpaddr", cfg.Servers.LmtpAddr, "LMTP server address (overrides config)")
-	fStartPop3 := flag.Bool("pop3", cfg.Servers.StartPop3, "Start the POP3 server (overrides config)")
-	fPop3Addr := flag.String("pop3addr", cfg.Servers.Pop3Addr, "POP3 server address (overrides config)")
-	fStartManageSieve := flag.Bool("managesieve", cfg.Servers.StartManageSieve, "Start the ManageSieve server (overrides config)")
-	fManagesieveAddr := flag.String("managesieveaddr", cfg.Servers.ManageSieveAddr, "ManageSieve server address (overrides config)")
-	fMasterUsername := flag.String("masterusername", cfg.Servers.MasterUsername, "Master username (overrides config)")
-	fMasterPassword := flag.String("masterpassword", cfg.Servers.MasterPassword, "Master password (overrides config)")
-	fMasterSASLUsername := flag.String("mastersaslusername", cfg.Servers.MasterSASLUsername, "Master SASL username (overrides config)")
-	fMasterSASLPassword := flag.String("mastersaslpassword", cfg.Servers.MasterSASLPassword, "Master SASL password (overrides config)")
+	fStartImap := flag.Bool("imap", cfg.Servers.IMAP.Start, "Start the IMAP server (overrides config)")
+	fImapAddr := flag.String("imapaddr", cfg.Servers.IMAP.Addr, "IMAP server address (overrides config)")
+	fStartLmtp := flag.Bool("lmtp", cfg.Servers.LMTP.Start, "Start the LMTP server (overrides config)")
+	fLmtpAddr := flag.String("lmtpaddr", cfg.Servers.LMTP.Addr, "LMTP server address (overrides config)")
+	fStartPop3 := flag.Bool("pop3", cfg.Servers.POP3.Start, "Start the POP3 server (overrides config)")
+	fPop3Addr := flag.String("pop3addr", cfg.Servers.POP3.Addr, "POP3 server address (overrides config)")
+	fStartManageSieve := flag.Bool("managesieve", cfg.Servers.ManageSieve.Start, "Start the ManageSieve server (overrides config)")
+	fManagesieveAddr := flag.String("managesieveaddr", cfg.Servers.ManageSieve.Addr, "ManageSieve server address (overrides config)")
+	fMasterUsername := flag.String("masterusername", cfg.Servers.IMAP.MasterUsername, "Master username (overrides config)")
+	fMasterPassword := flag.String("masterpassword", cfg.Servers.IMAP.MasterPassword, "Master password (overrides config)")
+	fMasterSASLUsername := flag.String("mastersaslusername", cfg.Servers.IMAP.MasterSASLUsername, "Master SASL username (overrides config)")
+	fMasterSASLPassword := flag.String("mastersaslpassword", cfg.Servers.IMAP.MasterSASLPassword, "Master SASL password (overrides config)")
 
 	// Uploader flags
 	fUploaderPath := flag.String("uploaderpath", cfg.Uploader.Path, "Directory for pending uploads (overrides config)")
@@ -220,41 +220,41 @@ func main() {
 	}
 
 	if isFlagSet("imap") {
-		cfg.Servers.StartImap = *fStartImap
+		cfg.Servers.IMAP.Start = *fStartImap
 	}
 	if isFlagSet("imapaddr") {
-		cfg.Servers.ImapAddr = *fImapAddr
+		cfg.Servers.IMAP.Addr = *fImapAddr
 	}
 	if isFlagSet("lmtp") {
-		cfg.Servers.StartLmtp = *fStartLmtp
+		cfg.Servers.LMTP.Start = *fStartLmtp
 	}
 	if isFlagSet("lmtpaddr") {
-		cfg.Servers.LmtpAddr = *fLmtpAddr
+		cfg.Servers.LMTP.Addr = *fLmtpAddr
 	}
 	if isFlagSet("pop3") {
-		cfg.Servers.StartPop3 = *fStartPop3
+		cfg.Servers.POP3.Start = *fStartPop3
 	}
 	if isFlagSet("pop3addr") {
-		cfg.Servers.Pop3Addr = *fPop3Addr
+		cfg.Servers.POP3.Addr = *fPop3Addr
 	}
 	if isFlagSet("managesieve") {
-		cfg.Servers.StartManageSieve = *fStartManageSieve
+		cfg.Servers.ManageSieve.Start = *fStartManageSieve
 	}
 	if isFlagSet("managesieveaddr") {
-		cfg.Servers.ManageSieveAddr = *fManagesieveAddr
+		cfg.Servers.ManageSieve.Addr = *fManagesieveAddr
 	}
 
 	if isFlagSet("masterusername") {
-		cfg.Servers.MasterUsername = *fMasterUsername
+		cfg.Servers.IMAP.MasterUsername = *fMasterUsername
 	}
 	if isFlagSet("masterpassword") {
-		cfg.Servers.MasterPassword = *fMasterPassword
+		cfg.Servers.IMAP.MasterPassword = *fMasterPassword
 	}
 	if isFlagSet("mastersaslusername") {
-		cfg.Servers.MasterSASLUsername = *fMasterSASLUsername
+		cfg.Servers.IMAP.MasterSASLUsername = *fMasterSASLUsername
 	}
 	if isFlagSet("mastersaslpassword") {
-		cfg.Servers.MasterSASLPassword = *fMasterSASLPassword
+		cfg.Servers.IMAP.MasterSASLPassword = *fMasterSASLPassword
 	}
 
 	// Upload worker
@@ -326,8 +326,11 @@ func main() {
 
 	// --- Application Logic using cfg ---
 
-	if !cfg.Servers.StartImap && !cfg.Servers.StartLmtp && !cfg.Servers.StartPop3 && !cfg.Servers.StartManageSieve {
-		log.Fatal("No servers enabled. Please enable at least one server (IMAP, LMTP, or POP3).")
+	// Handle compatibility between old and new configuration formats
+	migrateOldServerConfig(&cfg.Servers)
+
+	if !cfg.Servers.IMAP.Start && !cfg.Servers.LMTP.Start && !cfg.Servers.POP3.Start && !cfg.Servers.ManageSieve.Start {
+		log.Fatal("No servers enabled. Please enable at least one server (IMAP, LMTP, POP3, or ManageSieve).")
 	}
 
 	// Ensure required arguments are provided
@@ -411,17 +414,17 @@ func main() {
 	}
 	uploadWorker.Start(ctx)
 
-	if cfg.Servers.StartLmtp {
-		go startLMTPServer(ctx, hostname, cfg.Servers.LmtpAddr, s3storage, database, uploadWorker, errChan, cfg)
+	if cfg.Servers.LMTP.Start {
+		go startLMTPServer(ctx, hostname, cfg.Servers.LMTP.Addr, s3storage, database, uploadWorker, errChan, cfg)
 	}
-	if cfg.Servers.StartImap {
-		go startIMAPServer(ctx, hostname, cfg.Servers.ImapAddr, s3storage, database, uploadWorker, cacheInstance, errChan, cfg)
+	if cfg.Servers.IMAP.Start {
+		go startIMAPServer(ctx, hostname, cfg.Servers.IMAP.Addr, s3storage, database, uploadWorker, cacheInstance, errChan, cfg)
 	}
-	if cfg.Servers.StartPop3 {
-		go startPOP3Server(ctx, hostname, cfg.Servers.Pop3Addr, s3storage, database, uploadWorker, cacheInstance, errChan, cfg)
+	if cfg.Servers.POP3.Start {
+		go startPOP3Server(ctx, hostname, cfg.Servers.POP3.Addr, s3storage, database, uploadWorker, cacheInstance, errChan, cfg)
 	}
-	if cfg.Servers.StartManageSieve {
-		go startManageSieveServer(ctx, hostname, cfg.Servers.ManageSieveAddr, database, errChan, cfg)
+	if cfg.Servers.ManageSieve.Start {
+		go startManageSieveServer(ctx, hostname, cfg.Servers.ManageSieve.Addr, database, errChan, cfg)
 	}
 
 	select {
@@ -432,11 +435,17 @@ func main() {
 	}
 }
 
+// migrateOldServerConfig function is kept for API compatibility
+// but no longer needed since legacy fields have been removed
+func migrateOldServerConfig(servers *ServersConfig) {
+	// Legacy config migration removed - all configs now use the new format
+}
+
 func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
 
-	appendLimit, err := config.Servers.GetAppendLimit()
+	appendLimit, err := config.Servers.IMAP.GetAppendLimit()
 	if err != nil {
-		log.Printf("WARNING: Invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.AppendLimit, err, imap.DefaultAppendLimit)
+		log.Printf("WARNING: Invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.IMAP.AppendLimit, err, imap.DefaultAppendLimit)
 		appendLimit = imap.DefaultAppendLimit
 	}
 
@@ -447,10 +456,10 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			TLSCertFile:        config.TLS.IMAP.CertFile,
 			TLSKeyFile:         config.TLS.IMAP.KeyFile,
 			InsecureSkipVerify: config.TLS.InsecureSkipVerify,
-			MasterUsername:     config.Servers.MasterUsername,
-			MasterPassword:     config.Servers.MasterPassword,
-			MasterSASLUsername: config.Servers.MasterSASLUsername,
-			MasterSASLPassword: config.Servers.MasterSASLPassword,
+			MasterUsername:     config.Servers.IMAP.MasterUsername,
+			MasterPassword:     config.Servers.IMAP.MasterPassword,
+			MasterSASLUsername: config.Servers.IMAP.MasterSASLUsername,
+			MasterSASLPassword: config.Servers.IMAP.MasterSASLPassword,
 			AppendLimit:        appendLimit,
 		})
 	if err != nil {

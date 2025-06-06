@@ -39,21 +39,41 @@ type LocalCacheConfig struct {
 	Path          string `toml:"path"`
 }
 
-// ServersConfig holds server configuration.
-type ServersConfig struct {
-	StartImap          bool   `toml:"start_imap"`
-	ImapAddr           string `toml:"imap_addr"`
-	StartLmtp          bool   `toml:"start_lmtp"`
-	LmtpAddr           string `toml:"lmtp_addr"`
-	StartPop3          bool   `toml:"start_pop3"`
-	Pop3Addr           string `toml:"pop3_addr"`
-	StartManageSieve   bool   `toml:"start_managesieve"`
-	ManageSieveAddr    string `toml:"managesieve_addr"`
+// IMAPServerConfig holds IMAP server configuration.
+type IMAPServerConfig struct {
+	Start              bool   `toml:"start"`
+	Addr               string `toml:"addr"`
+	AppendLimit        string `toml:"append_limit"`
 	MasterUsername     string `toml:"master_username"`
 	MasterPassword     string `toml:"master_password"`
 	MasterSASLUsername string `toml:"master_sasl_username"`
 	MasterSASLPassword string `toml:"master_sasl_password"`
-	AppendLimit        string `toml:"append_limit"`
+}
+
+// LMTPServerConfig holds LMTP server configuration.
+type LMTPServerConfig struct {
+	Start bool   `toml:"start"`
+	Addr  string `toml:"addr"`
+}
+
+// POP3ServerConfig holds POP3 server configuration.
+type POP3ServerConfig struct {
+	Start bool   `toml:"start"`
+	Addr  string `toml:"addr"`
+}
+
+// ManageSieveServerConfig holds ManageSieve server configuration.
+type ManageSieveServerConfig struct {
+	Start bool   `toml:"start"`
+	Addr  string `toml:"addr"`
+}
+
+// ServersConfig holds all server configurations.
+type ServersConfig struct {
+	IMAP        IMAPServerConfig        `toml:"imap"`
+	LMTP        LMTPServerConfig        `toml:"lmtp"`
+	POP3        POP3ServerConfig        `toml:"pop3"`
+	ManageSieve ManageSieveServerConfig `toml:"managesieve"`
 }
 
 // UploaderConfig holds upload worker configuration.
@@ -132,17 +152,25 @@ func newDefaultConfig() Config {
 			Path:          "/tmp/sora/cache",
 		},
 		Servers: ServersConfig{
-			StartImap:        true,
-			ImapAddr:         ":143",
-			StartLmtp:        true,
-			LmtpAddr:         ":24",
-			StartPop3:        true,
-			Pop3Addr:         ":110",
-			StartManageSieve: true,
-			ManageSieveAddr:  ":4190",
-			MasterUsername:   "",
-			MasterPassword:   "",
-			AppendLimit:      "25mb",
+			IMAP: IMAPServerConfig{
+				Start:          true,
+				Addr:           ":143",
+				AppendLimit:    "25mb",
+				MasterUsername: "",
+				MasterPassword: "",
+			},
+			LMTP: LMTPServerConfig{
+				Start: true,
+				Addr:  ":24",
+			},
+			POP3: POP3ServerConfig{
+				Start: true,
+				Addr:  ":110",
+			},
+			ManageSieve: ManageSieveServerConfig{
+				Start: true,
+				Addr:  ":4190",
+			},
 		},
 		Uploader: UploaderConfig{
 			Path:          "/tmp/sora/uploads",
@@ -216,7 +244,7 @@ func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {
 	return helpers.ParseDuration(c.RetryInterval)
 }
 
-func (c *ServersConfig) GetAppendLimit() (int64, error) {
+func (c *IMAPServerConfig) GetAppendLimit() (int64, error) {
 	if c.AppendLimit == "" {
 		c.AppendLimit = "25mb"
 	}

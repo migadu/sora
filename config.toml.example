@@ -36,20 +36,29 @@ retry_interval = "30s"
 grace_period = "14d"
 wake_interval = "1h"
 
+# Server configurations
 [servers]
-start_imap = true
-imap_addr = ":143" # Use ":993" for IMAPS default
-start_lmtp = true
-lmtp_addr = ":24"
-start_pop3 = true
-pop3_addr = ":110" # Use ":995" for POP3S default
-start_managesieve = true
-managesieve_addr = ":4190"
+
+[servers.imap]
+start = true
+addr = ":143" # Use ":993" for IMAPS default
+append_limit = "25mb" # Maximum message size for IMAP APPEND command, unlimited if not defined
 master_username = ""
 master_password = ""
 master_sasl_username = ""
 master_sasl_password = ""
-append_limit = "25mb" # Maximum message size for IMAP APPEND command
+
+[servers.lmtp]
+start = true
+addr = ":24"
+
+[servers.pop3]
+start = true
+addr = ":110" # Use ":995" for POP3S default
+
+[servers.managesieve]
+start = true
+addr = ":4190"
 
 [lmtp]
 ## The external relay is used in SIEVE redirect and vacation auto responses.
