@@ -39,7 +39,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 			continue
 		}
 
-		data := listMailbox(mbox, options)
+		data := listMailbox(mbox, options, s.server.caps)
 		if data != nil {
 			l = append(l, *data)
 		}
@@ -57,7 +57,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	return nil
 }
 
-func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions) *imap.ListData {
+func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet) *imap.ListData {
 	if options.SelectSubscribed && !mbox.Subscribed {
 		return nil
 	}
@@ -70,17 +70,42 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions) *imap.ListData {
 		attributes = append(attributes, imap.MailboxAttrHasNoChildren)
 	}
 
+	isStandardSpecialMailbox := false
+	var specialUseAttributeIfApplicable imap.MailboxAttr
 	switch strings.ToUpper(mbox.Name) {
 	case "SENT":
-		attributes = append(attributes, imap.MailboxAttrSent)
+		isStandardSpecialMailbox = true
+		specialUseAttributeIfApplicable = imap.MailboxAttrSent
 	case "TRASH":
-		attributes = append(attributes, imap.MailboxAttrTrash)
+		isStandardSpecialMailbox = true
+		specialUseAttributeIfApplicable = imap.MailboxAttrTrash
 	case "DRAFTS":
-		attributes = append(attributes, imap.MailboxAttrDrafts)
+		isStandardSpecialMailbox = true
+		specialUseAttributeIfApplicable = imap.MailboxAttrDrafts
 	case "ARCHIVE":
-		attributes = append(attributes, imap.MailboxAttrArchive)
+		isStandardSpecialMailbox = true
+		specialUseAttributeIfApplicable = imap.MailboxAttrArchive
 	case "JUNK":
-		attributes = append(attributes, imap.MailboxAttrJunk)
+		isStandardSpecialMailbox = true
+		specialUseAttributeIfApplicable = imap.MailboxAttrJunk
+	}
+
+	if options.SelectSpecialUse && !isStandardSpecialMailbox {
+		return nil
+	}
+
+	if isStandardSpecialMailbox {
+		addTheAttribute := false
+		if serverCaps.Has(imap.CapSpecialUse) {
+			addTheAttribute = true
+		} else {
+			if options.ReturnSpecialUse || options.SelectSpecialUse {
+				addTheAttribute = true
+			}
+		}
+		if addTheAttribute {
+			attributes = append(attributes, specialUseAttributeIfApplicable)
+		}
 	}
 
 	data := imap.ListData{

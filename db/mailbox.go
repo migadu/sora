@@ -20,9 +20,6 @@ type DBMailbox struct {
 	Name        string // Full path
 	UIDValidity uint32
 	Subscribed  bool
-	// Messages int
-	// Recent        int
-	// Unseen        int
 	HasChildren bool
 	ParentID    *int64 // Nullable parent ID for top-level mailboxes
 }
