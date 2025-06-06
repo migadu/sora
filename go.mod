@@ -10,11 +10,12 @@ require (
 	github.com/emersion/go-smtp v0.21.3
 	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.7.4
+	github.com/jackc/pgx/v5 v5.7.5
 	github.com/k3a/html2text v1.2.1
 	github.com/mattn/go-sqlite3 v1.14.27
 	github.com/minio/minio-go/v7 v7.0.89
-	golang.org/x/crypto v0.36.0
+	github.com/yugabyte/pgx/v5 v5.5.3-yb-5
+	golang.org/x/crypto v0.37.0
 	lukechampine.com/blake3 v1.4.1
 )
 
@@ -34,8 +35,8 @@ require (
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
-	golang.org/x/sync v0.12.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
+	golang.org/x/sync v0.13.0 // indirect
+	golang.org/x/sys v0.32.0 // indirect
+	golang.org/x/text v0.24.0 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect
 )

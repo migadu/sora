@@ -7,8 +7,8 @@ import (
 	"log"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/yugabyte/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 

@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/jackc/pgx/v5"
+	"github.com/yugabyte/pgx/v5"
 )
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
