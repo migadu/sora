@@ -21,26 +21,56 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		return nil, s.internalError("failed to search messages: %v", err)
 	}
 
-	var (
-		uids    imap.UIDSet
-		seqNums imap.SeqSet
-	)
-	for _, msg := range messages {
-		uids.AddNum(msg.UID)
-		seqNums.AddNum(s.sessionTracker.EncodeSeqNum(msg.Seq))
-	}
+	searchData := &imap.SearchData{}
+	searchData.Count = uint32(len(messages))
 
-	var all imap.NumSet
-	switch numKind {
-	case imapserver.NumKindUID:
-		all = uids
-	case imapserver.NumKindSeq:
-		all = seqNums
-	}
+	if options != nil {
+		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
+			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 
-	searchData := &imap.SearchData{
-		All:   all,
-		Count: uint32(len(uids)),
+		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
+			if len(messages) > 0 {
+				if options.ReturnMin {
+					searchData.Min = uint32(messages[0].UID)
+				}
+				if options.ReturnMax {
+					searchData.Max = uint32(messages[len(messages)-1].UID)
+				}
+			}
+
+			if options.ReturnAll {
+				var uids imap.UIDSet
+				var seqNums imap.SeqSet
+				for _, msg := range messages {
+					uids.AddNum(msg.UID)
+					seqNums.AddNum(s.sessionTracker.EncodeSeqNum(msg.Seq))
+				}
+				if numKind == imapserver.NumKindUID {
+					searchData.All = uids
+				} else {
+					searchData.All = seqNums
+				}
+			}
+		} else {
+			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
+			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
+			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
+			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
+		}
+	} else { // Standard SEARCH command (options == nil)
+		s.Log("[SEARCH] Standard SEARCH, returning ALL and COUNT.")
+		var uids imap.UIDSet
+		var seqNums imap.SeqSet
+		for _, msg := range messages {
+			uids.AddNum(msg.UID)
+			seqNums.AddNum(s.sessionTracker.EncodeSeqNum(msg.Seq))
+		}
+
+		if numKind == imapserver.NumKindUID {
+			searchData.All = uids
+		} else {
+			searchData.All = seqNums
+		}
 	}
 
 	// hasModSeqCriteria := criteria.ModSeq != nil
@@ -69,8 +99,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// 		searchData.ModSeq = highestModSeq
 	// 	}
 	// }
-
-	searchData.Count = uint32(len(messages))
 
 	return searchData, nil
 }
