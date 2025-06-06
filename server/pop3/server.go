@@ -79,7 +79,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("POP3 listening with TLS on %s", s.addr)
+		log.Printf("* POP3 listening with TLS on %s", s.addr)
 	} else {
 		// Start regular TCP listener if no TLS
 		listener, err = net.Listen("tcp", s.addr)
@@ -87,7 +87,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("POP3 listening on %s", s.addr)
+		log.Printf("* POP3 listening on %s", s.addr)
 	}
 	defer listener.Close()
 

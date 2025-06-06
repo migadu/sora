@@ -52,8 +52,9 @@ type IMAPServerConfig struct {
 
 // LMTPServerConfig holds LMTP server configuration.
 type LMTPServerConfig struct {
-	Start bool   `toml:"start"`
-	Addr  string `toml:"addr"`
+	Start         bool   `toml:"start"`
+	Addr          string `toml:"addr"`
+	ExternalRelay string `toml:"external_relay"`
 }
 
 // POP3ServerConfig holds POP3 server configuration.
@@ -85,10 +86,6 @@ type UploaderConfig struct {
 	RetryInterval string `toml:"retry_interval"`
 }
 
-// LMTPConfig holds LMTP configuration.
-type LMTPConfig struct {
-	ExternalRelay string `toml:"external_relay"`
-}
 
 // TLSSubConfig holds TLS sub-configuration for each protocol.
 type TLSSubConfig struct {
@@ -117,7 +114,6 @@ type Config struct {
 	Cleanup      CleanupConfig    `toml:"cleanup"`
 	Servers      ServersConfig    `toml:"servers"`
 	Uploader     UploaderConfig   `toml:"uploader"`
-	LMTP         LMTPConfig       `toml:"lmtp"`
 	TLS          TLSConfig        `toml:"tls"`
 }
 
@@ -160,8 +156,9 @@ func newDefaultConfig() Config {
 				MasterPassword: "",
 			},
 			LMTP: LMTPServerConfig{
-				Start: true,
-				Addr:  ":24",
+				Start:         true,
+				Addr:          ":24",
+				ExternalRelay: "",
 			},
 			POP3: POP3ServerConfig{
 				Start: true,
@@ -180,9 +177,6 @@ func newDefaultConfig() Config {
 			RetryInterval: "30s",
 		},
 
-		LMTP: LMTPConfig{
-			ExternalRelay: "",
-		},
 		TLS: TLSConfig{
 			InsecureSkipVerify: false,
 			IMAP: TLSSubConfig{
@@ -249,4 +243,9 @@ func (c *IMAPServerConfig) GetAppendLimit() (int64, error) {
 		c.AppendLimit = "25mb"
 	}
 	return helpers.ParseSize(c.AppendLimit)
+}
+
+// GetAppendLimit gets the append limit
+func (c *ServersConfig) GetAppendLimit() (int64, error) {
+	return c.IMAP.GetAppendLimit()
 }

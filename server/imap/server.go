@@ -160,13 +160,13 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
-		log.Printf("IMAP listening with TLS on %s", imapAddr)
+		log.Printf("* IMAP listening with TLS on %s", imapAddr)
 	} else {
 		listener, err = net.Listen("tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("IMAP listening on %s", imapAddr)
+		log.Printf("* IMAP listening on %s", imapAddr)
 	}
 	defer listener.Close()
 
@@ -174,7 +174,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 }
 
 func (s *IMAPServer) Close() {
-	log.Println("[IMAP] Closing IMAP server...")
+	log.Println("Shutting down IMAP server...")
 	if s.server != nil {
 		// This will close the listener and cause s.server.Serve(listener) to return.
 		// It will also start closing active client connections.

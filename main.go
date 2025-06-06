@@ -82,7 +82,7 @@ func main() {
 	fCacheMaxObjectSize := flag.String("cachemaxobject", cfg.LocalCache.MaxObjectSize, "Maximum object size accepted in cache (overrides config)")
 
 	// LMTP specific
-	fExternalRelay := flag.String("externalrelay", cfg.LMTP.ExternalRelay, "External relay for LMTP (overrides config)")
+	fExternalRelay := flag.String("externalrelay", cfg.Servers.LMTP.ExternalRelay, "External relay for LMTP (overrides config)")
 
 	// TLS general
 	fTlsInsecureSkipVerify := flag.Bool("tlsinsecureskipverify", cfg.TLS.InsecureSkipVerify, "Skip TLS cert verification (overrides config)")
@@ -276,7 +276,7 @@ func main() {
 
 	// LMTP
 	if isFlagSet("externalrelay") {
-		cfg.LMTP.ExternalRelay = *fExternalRelay
+		cfg.Servers.LMTP.ExternalRelay = *fExternalRelay
 	}
 
 	// TLS Setup
@@ -480,7 +480,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, errChan chan error, config Config) {
 	lmtpServer, err := lmtp.New(ctx, hostname, addr, s3storage, database, uploadWorker, lmtp.LMTPServerOptions{
-		ExternalRelay:      config.LMTP.ExternalRelay,
+		ExternalRelay:      config.Servers.LMTP.ExternalRelay,
 		InsecureSkipVerify: config.TLS.InsecureSkipVerify,
 		TLSCertFile:        config.TLS.LMTP.CertFile,
 		TLSKeyFile:         config.TLS.LMTP.KeyFile,

@@ -68,14 +68,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("ManageSieve listening with TLS on %s", s.addr)
+		log.Printf("* ManageSieve listening with TLS on %s", s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("ManageSieve listening on %s", s.addr)
+		log.Printf("* ManageSieve listening on %s", s.addr)
 	}
 	defer listener.Close()
 

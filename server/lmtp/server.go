@@ -105,7 +105,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
-	log.Printf("[LMTP] listening on %s", b.server.Addr)
+	log.Printf("* LMTP listening on %s", b.server.Addr)
 	if err := b.server.ListenAndServe(); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		// b.appCtx.Err() will be non-nil if the context was canceled.

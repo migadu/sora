@@ -51,6 +51,7 @@ master_sasl_password = ""
 [servers.lmtp]
 start = true
 addr = ":24"
+external_relay = "" # e.g. "smtp.your-relay.com:25"
 
 [servers.pop3]
 start = true
@@ -60,9 +61,6 @@ addr = ":110" # Use ":995" for POP3S default
 start = true
 addr = ":4190"
 
-[lmtp]
-## The external relay is used in SIEVE redirect and vacation auto responses.
-# external_relay = "smtp.your-relay.com:25"
 
 [tls]
 insecure_skip_verify = false # Set to true for self-signed certs in dev
