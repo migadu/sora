@@ -48,29 +48,50 @@ type IMAPServerConfig struct {
 	MasterPassword     string `toml:"master_password"`
 	MasterSASLUsername string `toml:"master_sasl_username"`
 	MasterSASLPassword string `toml:"master_sasl_password"`
+	TLS                bool   `toml:"tls"`
+	TLSCertFile        string `toml:"tls_cert_file"`
+	TLSKeyFile         string `toml:"tls_key_file"`
+	TLSVerify          bool   `toml:"tls_verify"`
 }
 
 // LMTPServerConfig holds LMTP server configuration.
 type LMTPServerConfig struct {
-	Start         bool   `toml:"start"`
-	Addr          string `toml:"addr"`
-	ExternalRelay string `toml:"external_relay"`
+	Start          bool   `toml:"start"`
+	Addr           string `toml:"addr"`
+	ExternalRelay  string `toml:"external_relay"`
+	TLS            bool   `toml:"tls"`
+	TLSUseStartTLS bool   `toml:"tls_use_starttls"`
+	TLSCertFile    string `toml:"tls_cert_file"`
+	TLSKeyFile     string `toml:"tls_key_file"`
+	TLSVerify      bool   `toml:"tls_verify"`
 }
 
 // POP3ServerConfig holds POP3 server configuration.
 type POP3ServerConfig struct {
-	Start bool   `toml:"start"`
-	Addr  string `toml:"addr"`
+	Start       bool   `toml:"start"`
+	Addr        string `toml:"addr"`
+	TLS         bool   `toml:"tls"`
+	TLSCertFile string `toml:"tls_cert_file"`
+	TLSKeyFile  string `toml:"tls_key_file"`
+	TLSVerify   bool   `toml:"tls_verify"`
 }
 
 // ManageSieveServerConfig holds ManageSieve server configuration.
 type ManageSieveServerConfig struct {
-	Start bool   `toml:"start"`
-	Addr  string `toml:"addr"`
+	Start          bool   `toml:"start"`
+	Addr           string `toml:"addr"`
+	MaxScriptSize  string `toml:"max_script_size"`
+	InsecureAuth   bool   `toml:"insecure_auth"`
+	TLS            bool   `toml:"tls"`
+	TLSUseStartTLS bool   `toml:"tls_use_starttls"`
+	TLSCertFile    string `toml:"tls_cert_file"`
+	TLSKeyFile     string `toml:"tls_key_file"`
+	TLSVerify      bool   `toml:"tls_verify"`
 }
 
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
+	Debug       bool                    `toml:"debug"`
 	IMAP        IMAPServerConfig        `toml:"imap"`
 	LMTP        LMTPServerConfig        `toml:"lmtp"`
 	POP3        POP3ServerConfig        `toml:"pop3"`
@@ -86,43 +107,21 @@ type UploaderConfig struct {
 	RetryInterval string `toml:"retry_interval"`
 }
 
-
-// TLSSubConfig holds TLS sub-configuration for each protocol.
-type TLSSubConfig struct {
-	Enable   bool   `toml:"enable"`
-	CertFile string `toml:"cert_file"`
-	KeyFile  string `toml:"key_file"`
-}
-
-// TLSConfig holds TLS configuration.
-type TLSConfig struct {
-	InsecureSkipVerify bool         `toml:"insecure_skip_verify"`
-	IMAP               TLSSubConfig `toml:"imap"`
-	POP3               TLSSubConfig `toml:"pop3"`
-	LMTP               TLSSubConfig `toml:"lmtp"`
-	ManageSieve        TLSSubConfig `toml:"managesieve"`
-}
-
 // Config holds all configuration for the application.
 type Config struct {
-	LogOutput    string           `toml:"log_output"`
-	InsecureAuth bool             `toml:"insecure_auth"`
-	Debug        bool             `toml:"debug"`
-	Database     DatabaseConfig   `toml:"database"`
-	S3           S3Config         `toml:"s3"`
-	LocalCache   LocalCacheConfig `toml:"local_cache"`
-	Cleanup      CleanupConfig    `toml:"cleanup"`
-	Servers      ServersConfig    `toml:"servers"`
-	Uploader     UploaderConfig   `toml:"uploader"`
-	TLS          TLSConfig        `toml:"tls"`
+	LogOutput  string           `toml:"log_output"`
+	Database   DatabaseConfig   `toml:"database"`
+	S3         S3Config         `toml:"s3"`
+	LocalCache LocalCacheConfig `toml:"local_cache"`
+	Cleanup    CleanupConfig    `toml:"cleanup"`
+	Servers    ServersConfig    `toml:"servers"`
+	Uploader   UploaderConfig   `toml:"uploader"`
 }
 
 // newDefaultConfig creates a Config struct with default values.
 func newDefaultConfig() Config {
 	return Config{
-		LogOutput:    "syslog",
-		InsecureAuth: false,
-		Debug:        false,
+		LogOutput: "syslog",
 		Database: DatabaseConfig{
 			Host:       "localhost",
 			Port:       "5432",
@@ -148,25 +147,46 @@ func newDefaultConfig() Config {
 			Path:          "/tmp/sora/cache",
 		},
 		Servers: ServersConfig{
+			Debug: false,
 			IMAP: IMAPServerConfig{
 				Start:          true,
 				Addr:           ":143",
 				AppendLimit:    "25mb",
 				MasterUsername: "",
 				MasterPassword: "",
+				TLS:            false,
+				TLSCertFile:    "",
+				TLSKeyFile:     "",
+				TLSVerify:      true,
 			},
 			LMTP: LMTPServerConfig{
-				Start:         true,
-				Addr:          ":24",
-				ExternalRelay: "",
+				Start:          true,
+				Addr:           ":24",
+				ExternalRelay:  "",
+				TLS:            false,
+				TLSUseStartTLS: false,
+				TLSCertFile:    "",
+				TLSKeyFile:     "",
+				TLSVerify:      true,
 			},
 			POP3: POP3ServerConfig{
-				Start: true,
-				Addr:  ":110",
+				Start:       true,
+				Addr:        ":110",
+				TLS:         false,
+				TLSCertFile: "",
+				TLSKeyFile:  "",
+				TLSVerify:   true,
 			},
 			ManageSieve: ManageSieveServerConfig{
-				Start: true,
-				Addr:  ":4190",
+				Start:          true,
+				Addr:           ":4190",
+				MaxScriptSize:  "16kb",
+				InsecureAuth:   false,
+				TLS:            false,
+				TLSUseStartTLS: false,
+				TLSCertFile:    "",
+				TLSKeyFile:     "",
+				TLSVerify:      true,
 			},
 		},
 		Uploader: UploaderConfig{
@@ -175,30 +195,6 @@ func newDefaultConfig() Config {
 			Concurrency:   20,
 			MaxAttempts:   5,
 			RetryInterval: "30s",
-		},
-
-		TLS: TLSConfig{
-			InsecureSkipVerify: false,
-			IMAP: TLSSubConfig{
-				Enable:   false,
-				CertFile: "",
-				KeyFile:  "",
-			},
-			POP3: TLSSubConfig{
-				Enable:   false,
-				CertFile: "",
-				KeyFile:  "",
-			},
-			LMTP: TLSSubConfig{
-				Enable:   false,
-				CertFile: "",
-				KeyFile:  "",
-			},
-			ManageSieve: TLSSubConfig{
-				Enable:   false,
-				CertFile: "",
-				KeyFile:  "",
-			},
 		},
 	}
 }
@@ -243,6 +239,13 @@ func (c *IMAPServerConfig) GetAppendLimit() (int64, error) {
 		c.AppendLimit = "25mb"
 	}
 	return helpers.ParseSize(c.AppendLimit)
+}
+
+func (c *ManageSieveServerConfig) GetMaxScriptSize() (int64, error) {
+	if c.MaxScriptSize == "" {
+		c.MaxScriptSize = "16kb"
+	}
+	return helpers.ParseSize(c.MaxScriptSize)
 }
 
 // GetAppendLimit gets the append limit

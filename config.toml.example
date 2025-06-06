@@ -1,7 +1,4 @@
 # Sora Mail Server Configuration
-
-insecure_auth = false
-debug = false
 log_output = "stderr"
 
 [database]
@@ -38,6 +35,7 @@ wake_interval = "1h"
 
 # Server configurations
 [servers]
+debug = false
 
 [servers.imap]
 start = true
@@ -47,40 +45,35 @@ master_username = ""
 master_password = ""
 master_sasl_username = ""
 master_sasl_password = ""
+tls = false # instead of enable = false
+tls_cert_file = "/path/to/your/imap.crt"
+tls_key_file = "/path/to/your/imap.key"
+tls_verify = true
 
 [servers.lmtp]
 start = true
 addr = ":24"
 external_relay = "" # e.g. "smtp.your-relay.com:25"
+tls = false
+tls_use_starttls = false
+tls_cert_file = "/path/to/your/lmtp.crt"
+tls_key_file = "/path/to/your/lmtp.key"
+tls_verify = true
 
 [servers.pop3]
 start = true
-addr = ":110" # Use ":995" for POP3S default
+addr = ":110" 
+tls = false
+tls_cert_file = "/path/to/your/pop3.crt"
+tls_key_file = "/path/to/your/pop3.key"
+tls_verify = false
 
 [servers.managesieve]
 start = true
 addr = ":4190"
-
-
-[tls]
-insecure_skip_verify = false # Set to true for self-signed certs in dev
-
-  [tls.imap]
-  enable = false # Set to true to enable IMAPS
-  # cert_file = "/path/to/your/imap.crt"
-  # key_file = "/path/to/your/imap.key"
-
-  [tls.pop3]
-  enable = false # Set to true to enable POP3S
-  # cert_file = "/path/to/your/pop3.crt"
-  # key_file = "/path/to/your/pop3.key"
-
-  [tls.lmtp]
-  enable = false # Set to true to enable LMTPS (STARTTLS)
-  # cert_file = "/path/to/your/lmtp.crt"
-  # key_file = "/path/to/your/lmtp.key"
-
-  [tls.managesieve]
-  enable = false # Set to true to enable ManageSieve over TLS (STARTTLS)
-  # cert_file = "/path/to/your/managesieve.crt"
-  # key_file = "/path/to/your/managesieve.key"
+insecure_auth = false
+tls = false
+tls_use_starttls = false
+tls_cert_file = "/path/to/your/managesieve.crt"
+tls_key_file = "/path/to/your/managesieve.key"
+tls_verify = true

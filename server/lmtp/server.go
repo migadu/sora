@@ -29,12 +29,13 @@ type LMTPServerBackend struct {
 }
 
 type LMTPServerOptions struct {
-	ExternalRelay      string
-	InsecureAuth       bool
-	Debug              bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	InsecureSkipVerify bool
+	ExternalRelay  string
+	Debug          bool
+	TLS            bool
+	TLSCertFile    string
+	TLSKeyFile     string
+	TLSVerify      bool
+	TLSUseStartTLS bool
 }
 
 func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, db *db.Database, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -48,7 +49,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 		externalRelay: options.ExternalRelay,
 	}
 
-	if options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -61,7 +62,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 			PreferServerCipherSuites: true,
 		}
 
-		if options.InsecureSkipVerify {
+		if !options.TLSVerify {
 			backend.tlsConfig.InsecureSkipVerify = true
 			log.Printf("[LMTP] WARNING: TLS certificate verification disabled for LMTP server")
 		}
@@ -72,8 +73,16 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	s.Domain = hostname
 	s.AllowInsecureAuth = true
 	s.LMTP = true
-	// We don't set TLSConfig here for implicit TLS
-	// because we'll use a TLS listener instead
+
+	// Configure StartTLS if enabled and TLS config is available
+	if options.TLSUseStartTLS && backend.tlsConfig != nil {
+		s.TLSConfig = backend.tlsConfig
+		log.Printf("[LMTP] StartTLS is enabled")
+		// Force AllowInsecureAuth to true when StartTLS is enabled
+		// This is necessary because with StartTLS, initial connections are unencrypted
+		s.AllowInsecureAuth = true
+	}
+	// We only use a TLS listener for implicit TLS, not for StartTLS
 
 	backend.server = s
 
@@ -110,13 +119,15 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	var listener net.Listener
 	var err error
 
-	if b.tlsConfig != nil {
+	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
+	if b.tlsConfig != nil && b.server.TLSConfig == nil {
+		// Implicit TLS - use TLS listener
 		listener, err = tls.Listen("tcp", b.server.Addr, b.tlsConfig)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* LMTP listening with TLS on %s", b.server.Addr)
+		log.Printf("* LMTP listening with implicit TLS on %s", b.server.Addr)
 	} else {
 		listener, err = net.Listen("tcp", b.server.Addr)
 		if err != nil {

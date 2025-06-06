@@ -35,10 +35,6 @@ func main() {
 
 	configPath := flag.String("config", "config.toml", "Path to TOML configuration file")
 
-	// General flags
-	fInsecureAuth := flag.Bool("insecure-auth", cfg.InsecureAuth, "Allow authentication without TLS (overrides config)")
-	fDebug := flag.Bool("debug", cfg.Debug, "Print all commands and responses (overrides config)")
-
 	// Database flags
 	fDbHost := flag.String("dbhost", cfg.Database.Host, "Database host (overrides config)")
 	fDbPort := flag.String("dbport", cfg.Database.Port, "Database port (overrides config)")
@@ -56,6 +52,7 @@ func main() {
 	fS3Trace := flag.Bool("s3trace", cfg.S3.Trace, "Trace S3 operations (overrides config)")
 
 	// Server enable/address flags
+	fDebug := flag.Bool("debug", cfg.Servers.Debug, "Print all commands and responses (overrides config)")
 	fStartImap := flag.Bool("imap", cfg.Servers.IMAP.Start, "Start the IMAP server (overrides config)")
 	fImapAddr := flag.String("imapaddr", cfg.Servers.IMAP.Addr, "IMAP server address (overrides config)")
 	fStartLmtp := flag.Bool("lmtp", cfg.Servers.LMTP.Start, "Start the LMTP server (overrides config)")
@@ -64,6 +61,9 @@ func main() {
 	fPop3Addr := flag.String("pop3addr", cfg.Servers.POP3.Addr, "POP3 server address (overrides config)")
 	fStartManageSieve := flag.Bool("managesieve", cfg.Servers.ManageSieve.Start, "Start the ManageSieve server (overrides config)")
 	fManagesieveAddr := flag.String("managesieveaddr", cfg.Servers.ManageSieve.Addr, "ManageSieve server address (overrides config)")
+	fManagesieveInsecureAuth := flag.Bool("managesieveinsecureauth", cfg.Servers.ManageSieve.InsecureAuth, "Allow authentication without TLS (overrides config)")
+	fManagesieveMaxScriptSize := flag.String("managesievescriptsize", cfg.Servers.ManageSieve.MaxScriptSize, "Maximum script size (overrides config)")
+
 	fMasterUsername := flag.String("masterusername", cfg.Servers.IMAP.MasterUsername, "Master username (overrides config)")
 	fMasterPassword := flag.String("masterpassword", cfg.Servers.IMAP.MasterPassword, "Master password (overrides config)")
 	fMasterSASLUsername := flag.String("mastersaslusername", cfg.Servers.IMAP.MasterSASLUsername, "Master SASL username (overrides config)")
@@ -84,25 +84,31 @@ func main() {
 	// LMTP specific
 	fExternalRelay := flag.String("externalrelay", cfg.Servers.LMTP.ExternalRelay, "External relay for LMTP (overrides config)")
 
-	// TLS general
-	fTlsInsecureSkipVerify := flag.Bool("tlsinsecureskipverify", cfg.TLS.InsecureSkipVerify, "Skip TLS cert verification (overrides config)")
+	// TLS flags for IMAP
+	fImapTLS := flag.Bool("imaptls", cfg.Servers.IMAP.TLS, "Enable TLS for IMAP (overrides config)")
+	fImapTLSCert := flag.String("imaptlscert", cfg.Servers.IMAP.TLSCertFile, "TLS cert for IMAP (overrides config)")
+	fImapTLSKey := flag.String("imaptlskey", cfg.Servers.IMAP.TLSKeyFile, "TLS key for IMAP (overrides config)")
+	fImapTLSVerify := flag.Bool("imaptlsverify", cfg.Servers.IMAP.TLSVerify, "Verify TLS certificates for IMAP (overrides config)")
 
-	// TLS specific flags (enable, cert, key for each service)
-	fImapTLS := flag.Bool("imaptls", cfg.TLS.IMAP.Enable, "Enable TLS for IMAP (overrides config)")
-	fImapTLSCert := flag.String("imaptlscert", cfg.TLS.IMAP.CertFile, "TLS cert for IMAP (overrides config)")
-	fImapTLSKey := flag.String("imaptlskey", cfg.TLS.IMAP.KeyFile, "TLS key for IMAP (overrides config)")
+	// TLS flags for POP3
+	fPop3TLS := flag.Bool("pop3tls", cfg.Servers.POP3.TLS, "Enable TLS for POP3 (overrides config)")
+	fPop3TLSCert := flag.String("pop3tlscert", cfg.Servers.POP3.TLSCertFile, "TLS cert for POP3 (overrides config)")
+	fPop3TLSKey := flag.String("pop3tlskey", cfg.Servers.POP3.TLSKeyFile, "TLS key for POP3 (overrides config)")
+	fPop3TLSVerify := flag.Bool("pop3tlsverify", cfg.Servers.POP3.TLSVerify, "Verify TLS certificates for POP3 (overrides config)")
 
-	fPop3TLS := flag.Bool("pop3tls", cfg.TLS.POP3.Enable, "Enable TLS for POP3 (overrides config)")
-	fPop3TLSCert := flag.String("pop3tlscert", cfg.TLS.POP3.CertFile, "TLS cert for POP3 (overrides config)")
-	fPop3TLSKey := flag.String("pop3tlskey", cfg.TLS.POP3.KeyFile, "TLS key for POP3 (overrides config)")
+	// TLS flags for LMTP
+	fLmtpTLS := flag.Bool("lmtptls", cfg.Servers.LMTP.TLS, "Enable TLS for LMTP (overrides config)")
+	fLmtpTLSUseStartTLS := flag.Bool("lmtpstarttls", cfg.Servers.LMTP.TLSUseStartTLS, "Enable StartTLS for LMTP (overrides config)")
+	fLmtpTLSCert := flag.String("lmtptlscert", cfg.Servers.LMTP.TLSCertFile, "TLS cert for LMTP (overrides config)")
+	fLmtpTLSKey := flag.String("lmtptlskey", cfg.Servers.LMTP.TLSKeyFile, "TLS key for LMTP (overrides config)")
+	fLmtpTLSVerify := flag.Bool("lmtptlsverify", cfg.Servers.LMTP.TLSVerify, "Verify TLS certificates for LMTP (overrides config)")
 
-	fLmtpTLS := flag.Bool("lmtptls", cfg.TLS.LMTP.Enable, "Enable TLS for LMTP (overrides config)")
-	fLmtpTLSCert := flag.String("lmtptlscert", cfg.TLS.LMTP.CertFile, "TLS cert for LMTP (overrides config)")
-	fLmtpTLSKey := flag.String("lmtptlskey", cfg.TLS.LMTP.KeyFile, "TLS key for LMTP (overrides config)")
-
-	fManageSieveTLS := flag.Bool("managesievetls", cfg.TLS.ManageSieve.Enable, "Enable TLS for ManageSieve (overrides config)")
-	fManageSieveTLSCert := flag.String("managesievetlscert", cfg.TLS.ManageSieve.CertFile, "TLS cert for ManageSieve (overrides config)")
-	fManageSieveTLSKey := flag.String("managesievetlskey", cfg.TLS.ManageSieve.KeyFile, "TLS key for ManageSieve (overrides config)")
+	// TLS flags for ManageSieve
+	fManageSieveTLS := flag.Bool("managesievetls", cfg.Servers.ManageSieve.TLS, "Enable TLS for ManageSieve (overrides config)")
+	fManageSieveTLSUseStartTLS := flag.Bool("managesievestarttls", cfg.Servers.ManageSieve.TLSUseStartTLS, "Enable StartTLS for ManageSieve (overrides config)")
+	fManageSieveTLSCert := flag.String("managesievetlscert", cfg.Servers.ManageSieve.TLSCertFile, "TLS cert for ManageSieve (overrides config)")
+	fManageSieveTLSKey := flag.String("managesievetlskey", cfg.Servers.ManageSieve.TLSKeyFile, "TLS key for ManageSieve (overrides config)")
+	fManageSieveTLSVerify := flag.Bool("managesievetlsverify", cfg.Servers.ManageSieve.TLSVerify, "Verify TLS certificates for ManageSieve (overrides config)")
 
 	flag.Parse()
 
@@ -162,12 +168,6 @@ func main() {
 	// --- Apply Command-Line Flag Overrides ---
 	// If a flag was explicitly set on the command line, its value overrides both
 	// application defaults and values from the TOML file.
-	if isFlagSet("insecure-auth") {
-		cfg.InsecureAuth = *fInsecureAuth
-	}
-	if isFlagSet("debug") {
-		cfg.Debug = *fDebug
-	}
 
 	if isFlagSet("dbhost") {
 		cfg.Database.Host = *fDbHost
@@ -219,6 +219,11 @@ func main() {
 		cfg.S3.Trace = *fS3Trace
 	}
 
+	// Servers
+	if isFlagSet("debug") {
+		cfg.Servers.Debug = *fDebug
+	}
+
 	if isFlagSet("imap") {
 		cfg.Servers.IMAP.Start = *fStartImap
 	}
@@ -240,8 +245,14 @@ func main() {
 	if isFlagSet("managesieve") {
 		cfg.Servers.ManageSieve.Start = *fStartManageSieve
 	}
+	if isFlagSet("managesievescriptsize") {
+		cfg.Servers.ManageSieve.MaxScriptSize = *fManagesieveMaxScriptSize
+	}
 	if isFlagSet("managesieveaddr") {
 		cfg.Servers.ManageSieve.Addr = *fManagesieveAddr
+	}
+	if isFlagSet("managesieveinnsecureauth") {
+		cfg.Servers.ManageSieve.InsecureAuth = *fManagesieveInsecureAuth
 	}
 
 	if isFlagSet("masterusername") {
@@ -279,55 +290,69 @@ func main() {
 		cfg.Servers.LMTP.ExternalRelay = *fExternalRelay
 	}
 
-	// TLS Setup
-	if isFlagSet("tlsinsecureskipverify") {
-		cfg.TLS.InsecureSkipVerify = *fTlsInsecureSkipVerify
-	}
-
+	// IMAP TLS settings
 	if isFlagSet("imaptls") {
-		cfg.TLS.IMAP.Enable = *fImapTLS
+		cfg.Servers.IMAP.TLS = *fImapTLS
 	}
 	if isFlagSet("imaptlscert") {
-		cfg.TLS.IMAP.CertFile = *fImapTLSCert
+		cfg.Servers.IMAP.TLSCertFile = *fImapTLSCert
 	}
 	if isFlagSet("imaptlskey") {
-		cfg.TLS.IMAP.KeyFile = *fImapTLSKey
+		cfg.Servers.IMAP.TLSKeyFile = *fImapTLSKey
+	}
+	if isFlagSet("imaptlsverify") {
+		cfg.Servers.IMAP.TLSVerify = *fImapTLSVerify
 	}
 
+	// POP3 TLS settings
 	if isFlagSet("pop3tls") {
-		cfg.TLS.POP3.Enable = *fPop3TLS
+		cfg.Servers.POP3.TLS = *fPop3TLS
 	}
 	if isFlagSet("pop3tlscert") {
-		cfg.TLS.POP3.CertFile = *fPop3TLSCert
+		cfg.Servers.POP3.TLSCertFile = *fPop3TLSCert
 	}
 	if isFlagSet("pop3tlskey") {
-		cfg.TLS.POP3.KeyFile = *fPop3TLSKey
+		cfg.Servers.POP3.TLSKeyFile = *fPop3TLSKey
+	}
+	if isFlagSet("pop3tlsverify") {
+		cfg.Servers.POP3.TLSVerify = *fPop3TLSVerify
 	}
 
+	// LMTP TLS settings
 	if isFlagSet("lmtptls") {
-		cfg.TLS.LMTP.Enable = *fLmtpTLS
+		cfg.Servers.LMTP.TLS = *fLmtpTLS
+	}
+	if isFlagSet("lmtpstarttls") {
+		cfg.Servers.LMTP.TLSUseStartTLS = *fLmtpTLSUseStartTLS
 	}
 	if isFlagSet("lmtptlscert") {
-		cfg.TLS.LMTP.CertFile = *fLmtpTLSCert
+		cfg.Servers.LMTP.TLSCertFile = *fLmtpTLSCert
 	}
 	if isFlagSet("lmtptlskey") {
-		cfg.TLS.LMTP.KeyFile = *fLmtpTLSKey
+		cfg.Servers.LMTP.TLSKeyFile = *fLmtpTLSKey
+	}
+	if isFlagSet("lmtptlsverify") {
+		cfg.Servers.LMTP.TLSVerify = *fLmtpTLSVerify
 	}
 
+	// ManageSieve TLS settings
 	if isFlagSet("managesievetls") {
-		cfg.TLS.ManageSieve.Enable = *fManageSieveTLS
+		cfg.Servers.ManageSieve.TLS = *fManageSieveTLS
+	}
+	if isFlagSet("managesievestarttls") {
+		cfg.Servers.ManageSieve.TLSUseStartTLS = *fManageSieveTLSUseStartTLS
 	}
 	if isFlagSet("managesievetlscert") {
-		cfg.TLS.ManageSieve.CertFile = *fManageSieveTLSCert
+		cfg.Servers.ManageSieve.TLSCertFile = *fManageSieveTLSCert
 	}
 	if isFlagSet("managesievetlskey") {
-		cfg.TLS.ManageSieve.KeyFile = *fManageSieveTLSKey
+		cfg.Servers.ManageSieve.TLSKeyFile = *fManageSieveTLSKey
+	}
+	if isFlagSet("managesievetlsverify") {
+		cfg.Servers.ManageSieve.TLSVerify = *fManageSieveTLSVerify
 	}
 
 	// --- Application Logic using cfg ---
-
-	// Handle compatibility between old and new configuration formats
-	migrateOldServerConfig(&cfg.Servers)
 
 	if !cfg.Servers.IMAP.Start && !cfg.Servers.LMTP.Start && !cfg.Servers.POP3.Start && !cfg.Servers.ManageSieve.Start {
 		log.Fatal("No servers enabled. Please enable at least one server (IMAP, LMTP, POP3, or ManageSieve).")
@@ -435,12 +460,6 @@ func main() {
 	}
 }
 
-// migrateOldServerConfig function is kept for API compatibility
-// but no longer needed since legacy fields have been removed
-func migrateOldServerConfig(servers *ServersConfig) {
-	// Legacy config migration removed - all configs now use the new format
-}
-
 func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
 
 	appendLimit, err := config.Servers.IMAP.GetAppendLimit()
@@ -451,11 +470,11 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 	s, err := imap.New(ctx, hostname, addr, s3storage, database, uploadWorker, cacheInstance,
 		imap.IMAPServerOptions{
-			InsecureAuth:       config.InsecureAuth,
-			Debug:              config.Debug,
-			TLSCertFile:        config.TLS.IMAP.CertFile,
-			TLSKeyFile:         config.TLS.IMAP.KeyFile,
-			InsecureSkipVerify: config.TLS.InsecureSkipVerify,
+			Debug:              config.Servers.Debug,
+			TLS:                config.Servers.IMAP.TLS,
+			TLSCertFile:        config.Servers.IMAP.TLSCertFile,
+			TLSKeyFile:         config.Servers.IMAP.TLSKeyFile,
+			TLSVerify:          config.Servers.IMAP.TLSVerify,
 			MasterUsername:     config.Servers.IMAP.MasterUsername,
 			MasterPassword:     config.Servers.IMAP.MasterPassword,
 			MasterSASLUsername: config.Servers.IMAP.MasterSASLUsername,
@@ -480,11 +499,13 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, errChan chan error, config Config) {
 	lmtpServer, err := lmtp.New(ctx, hostname, addr, s3storage, database, uploadWorker, lmtp.LMTPServerOptions{
-		ExternalRelay:      config.Servers.LMTP.ExternalRelay,
-		InsecureSkipVerify: config.TLS.InsecureSkipVerify,
-		TLSCertFile:        config.TLS.LMTP.CertFile,
-		TLSKeyFile:         config.TLS.LMTP.KeyFile,
-		Debug:              config.Debug,
+		ExternalRelay:  config.Servers.LMTP.ExternalRelay,
+		TLSVerify:      config.Servers.LMTP.TLSVerify,
+		TLS:            config.Servers.LMTP.TLS,
+		TLSCertFile:    config.Servers.LMTP.TLSCertFile,
+		TLSKeyFile:     config.Servers.LMTP.TLSKeyFile,
+		TLSUseStartTLS: config.Servers.LMTP.TLSUseStartTLS,
+		Debug:          config.Servers.Debug,
 	})
 
 	if err != nil {
@@ -505,11 +526,11 @@ func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 func startPOP3Server(ctx context.Context, hostname string, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
 	s, err := pop3.New(ctx, hostname, addr, s3storage, database, uploadWorker, cacheInstance, pop3.POP3ServerOptions{
-		InsecureAuth:       config.InsecureAuth,
-		Debug:              config.Debug,
-		TLSCertFile:        config.TLS.POP3.CertFile,
-		TLSKeyFile:         config.TLS.POP3.KeyFile,
-		InsecureSkipVerify: config.TLS.InsecureSkipVerify,
+		Debug:       config.Servers.Debug,
+		TLS:         config.Servers.POP3.TLS,
+		TLSCertFile: config.Servers.POP3.TLSCertFile,
+		TLSKeyFile:  config.Servers.POP3.TLSKeyFile,
+		TLSVerify:   config.Servers.POP3.TLSVerify,
 	})
 
 	if err != nil {
@@ -527,11 +548,20 @@ func startPOP3Server(ctx context.Context, hostname string, addr string, s3storag
 }
 
 func startManageSieveServer(ctx context.Context, hostname string, addr string, database *db.Database, errChan chan error, config Config) {
+	maxSize, err := config.Servers.ManageSieve.GetMaxScriptSize()
+	if err != nil {
+		log.Printf("WARNING: Invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
+		maxSize = managesieve.DefaultMaxScriptSize
+	}
 	s, err := managesieve.New(ctx, hostname, addr, database, managesieve.ManageSieveServerOptions{
-		InsecureSkipVerify: config.TLS.InsecureSkipVerify,
-		TLSCertFile:        config.TLS.ManageSieve.CertFile,
-		TLSKeyFile:         config.TLS.ManageSieve.KeyFile,
-		Debug:              config.Debug,
+		InsecureAuth:   config.Servers.ManageSieve.InsecureAuth,
+		TLSVerify:      config.Servers.ManageSieve.TLSVerify,
+		TLS:            config.Servers.ManageSieve.TLS,
+		TLSCertFile:    config.Servers.ManageSieve.TLSCertFile,
+		TLSKeyFile:     config.Servers.ManageSieve.TLSKeyFile,
+		TLSUseStartTLS: config.Servers.ManageSieve.TLSUseStartTLS,
+		Debug:          config.Servers.Debug,
+		MaxScriptSize:  maxSize,
 	})
 
 	if err != nil {

@@ -12,31 +12,43 @@ import (
 	"github.com/migadu/sora/db"
 )
 
+const DefaultMaxScriptSize = 16 * 1024 // 16 KB
+
 type ManageSieveServer struct {
-	addr      string
-	hostname  string
-	db        *db.Database
-	appCtx    context.Context
-	tlsConfig *tls.Config
+	addr          string
+	hostname      string
+	db            *db.Database
+	appCtx        context.Context
+	tlsConfig     *tls.Config
+	useStartTLS   bool
+	insecureAuth  bool
+	maxScriptSize int64
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth       bool
-	Debug              bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	InsecureSkipVerify bool
+	InsecureAuth   bool
+	Debug          bool
+	TLS            bool
+	TLSCertFile    string
+	TLSKeyFile     string
+	TLSVerify      bool
+	TLSUseStartTLS bool
+	MaxScriptSize  int64
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options ManageSieveServerOptions) (*ManageSieveServer, error) {
 	server := &ManageSieveServer{
-		hostname: hostname,
-		addr:     addr,
-		db:       database,
-		appCtx:   appCtx,
+		hostname:      hostname,
+		addr:          addr,
+		db:            database,
+		appCtx:        appCtx,
+		useStartTLS:   options.TLSUseStartTLS,
+		insecureAuth:  options.InsecureAuth,
+		maxScriptSize: options.MaxScriptSize,
 	}
 
-	if options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Set up TLS config if TLS is enabled and certificates are provided
+	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -49,7 +61,7 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 			PreferServerCipherSuites: true,
 		}
 
-		if options.InsecureSkipVerify {
+		if !options.TLSVerify {
 			server.tlsConfig.InsecureSkipVerify = true
 			log.Printf("WARNING: TLS certificate verification disabled for ManageSieve server")
 		}
@@ -62,13 +74,16 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	var listener net.Listener
 	var err error
 
-	if s.tlsConfig != nil {
+	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS
+	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
+	if isImplicitTLS {
+		// Implicit TLS - use TLS listener
 		listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* ManageSieve listening with TLS on %s", s.addr)
+		log.Printf("* ManageSieve listening with implicit TLS on %s", s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
@@ -95,6 +110,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			writer: bufio.NewWriter(conn),
 			ctx:    sessionCtx,
 			cancel: sessionCancel,
+			isTLS:  isImplicitTLS, // Initialize isTLS based on the listener type
 		}
 
 		session.RemoteIP = (*session.conn).RemoteAddr().String()

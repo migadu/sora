@@ -39,11 +39,11 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
-	InsecureAuth       bool
 	Debug              bool
+	TLS                bool
 	TLSCertFile        string
 	TLSKeyFile         string
-	InsecureSkipVerify bool
+	TLSVerify          bool
 	MasterUsername     string
 	MasterPassword     string
 	MasterSASLUsername string
@@ -89,8 +89,8 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		s.caps.Has(imap.CapAppendLimit)
 	}
 
-	// Setup TLS if certificate and key files are provided
-	if options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS if TLS is enabled and certificate and key files are provided
+	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -103,8 +103,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
 		}
 
-		// Set InsecureSkipVerify if requested (for self-signed certificates)
-		if options.InsecureSkipVerify {
+		if !options.TLSVerify {
 			s.tlsConfig.InsecureSkipVerify = true
 			log.Printf("WARNING TLS certificate verification disabled for IMAP server")
 		}
@@ -118,7 +117,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 	s.server = imapserver.New(&imapserver.Options{
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
-		InsecureAuth: options.InsecureAuth,
+		InsecureAuth: !options.TLS,
 		DebugWriter:  debugWriter,
 		Caps:         s.caps,
 		TLSConfig:    s.tlsConfig,

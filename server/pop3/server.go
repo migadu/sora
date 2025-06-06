@@ -26,11 +26,11 @@ type POP3Server struct {
 }
 
 type POP3ServerOptions struct {
-	InsecureAuth       bool
-	Debug              bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	InsecureSkipVerify bool
+	Debug       bool
+	TLS         bool
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSVerify   bool
 }
 
 func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -44,8 +44,8 @@ func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3St
 		cache:    cache,
 	}
 
-	// Setup TLS if certificate and key files are provided
-	if options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS if TLS is enabled and certificate and key files are provided
+	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -59,7 +59,7 @@ func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3St
 		}
 
 		// Set InsecureSkipVerify if requested (for self-signed certificates)
-		if options.InsecureSkipVerify {
+		if !options.TLSVerify {
 			server.tlsConfig.InsecureSkipVerify = true
 			log.Printf("WARNING: TLS certificate verification disabled for POP3 server")
 		}
@@ -73,7 +73,6 @@ func (s *POP3Server) Start(errChan chan error) {
 	var err error
 
 	if s.tlsConfig != nil {
-		// Start TLS listener if TLS is configured
 		listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
@@ -81,7 +80,6 @@ func (s *POP3Server) Start(errChan chan error) {
 		}
 		log.Printf("* POP3 listening with TLS on %s", s.addr)
 	} else {
-		// Start regular TCP listener if no TLS
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
