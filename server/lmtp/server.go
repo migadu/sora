@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 
 	"github.com/emersion/go-smtp"
@@ -71,7 +72,8 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	s.Domain = hostname
 	s.AllowInsecureAuth = true
 	s.LMTP = true
-	s.TLSConfig = backend.tlsConfig
+	// We don't set TLSConfig here for implicit TLS
+	// because we'll use a TLS listener instead
 
 	backend.server = s
 
@@ -105,10 +107,28 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 func (b *LMTPServerBackend) Start(errChan chan error) {
-	log.Printf("* LMTP listening on %s", b.server.Addr)
-	if err := b.server.ListenAndServe(); err != nil {
+	var listener net.Listener
+	var err error
+
+	if b.tlsConfig != nil {
+		listener, err = tls.Listen("tcp", b.server.Addr, b.tlsConfig)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
+			return
+		}
+		log.Printf("* LMTP listening with TLS on %s", b.server.Addr)
+	} else {
+		listener, err = net.Listen("tcp", b.server.Addr)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to create listener: %w", err)
+			return
+		}
+		log.Printf("* LMTP listening on %s", b.server.Addr)
+	}
+	defer listener.Close()
+
+	if err := b.server.Serve(listener); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
-		// b.appCtx.Err() will be non-nil if the context was canceled.
 		if b.appCtx.Err() == nil {
 			errChan <- fmt.Errorf("LMTP server error: %w", err)
 		}

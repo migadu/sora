@@ -110,5 +110,4 @@ func (s *ManageSieveServer) Close() {
 	// The shared database connection pool is closed by main.go's defer.
 	// If ManageSieveServer had its own specific resources to close (e.g., a listener, which it doesn't),
 	// they would be closed here. For now, this can be a no-op or just log.
-	log.Println("[ManageSieve] Server Close method called.")
 }

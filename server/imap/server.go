@@ -174,7 +174,6 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 }
 
 func (s *IMAPServer) Close() {
-	log.Println("Shutting down IMAP server...")
 	if s.server != nil {
 		// This will close the listener and cause s.server.Serve(listener) to return.
 		// It will also start closing active client connections.
