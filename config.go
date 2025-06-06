@@ -53,6 +53,7 @@ type ServersConfig struct {
 	MasterPassword     string `toml:"master_password"`
 	MasterSASLUsername string `toml:"master_sasl_username"`
 	MasterSASLPassword string `toml:"master_sasl_password"`
+	AppendLimit        string `toml:"append_limit"`
 }
 
 // UploaderConfig holds upload worker configuration.
@@ -141,6 +142,7 @@ func newDefaultConfig() Config {
 			ManageSieveAddr:  ":4190",
 			MasterUsername:   "",
 			MasterPassword:   "",
+			AppendLimit:      "25mb",
 		},
 		Uploader: UploaderConfig{
 			Path:          "/tmp/sora/uploads",
@@ -212,4 +214,11 @@ func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {
 		c.RetryInterval = "30s"
 	}
 	return helpers.ParseDuration(c.RetryInterval)
+}
+
+func (c *ServersConfig) GetAppendLimit() (int64, error) {
+	if c.AppendLimit == "" {
+		c.AppendLimit = "25mb"
+	}
+	return helpers.ParseSize(c.AppendLimit)
 }

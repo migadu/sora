@@ -18,6 +18,8 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
+
 type IMAPServer struct {
 	addr               string
 	db                 *db.Database
@@ -33,6 +35,7 @@ type IMAPServer struct {
 	masterPassword     string
 	masterSASLUsername string
 	masterSASLPassword string
+	appendLimit        int64
 }
 
 type IMAPServerOptions struct {
@@ -45,17 +48,19 @@ type IMAPServerOptions struct {
 	MasterPassword     string
 	MasterSASLUsername string
 	MasterSASLPassword string
+	AppendLimit        int64
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
 	s := &IMAPServer{
-		hostname: hostname,
-		appCtx:   appCtx, // Store the passed-in application context
-		addr:     imapAddr,
-		db:       database,
-		s3:       storage,
-		uploader: uploadWorker,
-		cache:    cache,
+		hostname:    hostname,
+		appCtx:      appCtx,
+		addr:        imapAddr,
+		db:          database,
+		s3:          storage,
+		uploader:    uploadWorker,
+		cache:       cache,
+		appendLimit: options.AppendLimit,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1: struct{}{},
 			// imap.CapIMAP4rev2:             struct{}{},
@@ -68,13 +73,20 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			imap.CapESearch:     struct{}{},
 			imap.CapSpecialUse:  struct{}{},
 			imap.CapListStatus:  struct{}{},
-			// imap.CapCondStore:             struct{}{}, // Add CONDSTORE capability
-			// imap.CapID:                    struct{}{},
+			imap.CapBinary:      struct{}{},
+			imap.CapCondStore:   struct{}{},
+			imap.CapID:          struct{}{},
 		},
 		masterUsername:     options.MasterUsername,
 		masterPassword:     options.MasterPassword,
 		masterSASLUsername: options.MasterSASLUsername,
 		masterSASLPassword: options.MasterSASLPassword,
+	}
+
+	if s.appendLimit > 0 {
+		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
+		s.caps[appendLimitCapName] = struct{}{}
+		s.caps.Has(imap.CapAppendLimit)
 	}
 
 	// Setup TLS if certificate and key files are provided
@@ -116,8 +128,6 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-	// Create a new cancellable context for this session, derived from the server's application context.
-	// This ensures the session context is cancelled when the main application context is cancelled.
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	session := &IMAPSession{
@@ -146,14 +156,12 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	var err error
 
 	if s.tlsConfig != nil {
-		// Use TLS listener if TLS is configured
 		listener, err = tls.Listen("tcp", imapAddr, s.tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
 		log.Printf("IMAP listening with TLS on %s", imapAddr)
 	} else {
-		// Use regular TCP listener if no TLS
 		listener, err = net.Listen("tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)

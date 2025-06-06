@@ -41,6 +41,16 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Use the full message bytes as received for hashing, size, and header extraction.
 	fullMessageBytes := buf.Bytes()
 
+	// Check if the message exceeds the configured APPENDLIMIT
+	if s.server.appendLimit > 0 && int64(len(fullMessageBytes)) > s.server.appendLimit {
+		s.Log("[APPEND] message size %d bytes exceeds APPENDLIMIT of %d bytes", len(fullMessageBytes), s.server.appendLimit)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeTooBig,
+			Text: fmt.Sprintf("message size %d bytes exceeds maximum allowed size of %d bytes", len(fullMessageBytes), s.server.appendLimit),
+		}
+	}
+
 	// Extract raw headers string.
 	// Headers are typically terminated by a double CRLF (\r\n\r\n).
 	var rawHeadersText string

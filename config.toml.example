@@ -49,6 +49,7 @@ master_username = ""
 master_password = ""
 master_sasl_username = ""
 master_sasl_password = ""
+append_limit = "25mb" # Maximum message size for IMAP APPEND command
 
 [lmtp]
 ## The external relay is used in SIEVE redirect and vacation auto responses.

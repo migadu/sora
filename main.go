@@ -433,6 +433,13 @@ func main() {
 }
 
 func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
+
+	appendLimit, err := config.Servers.GetAppendLimit()
+	if err != nil {
+		log.Printf("WARNING: Invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.AppendLimit, err, imap.DefaultAppendLimit)
+		appendLimit = imap.DefaultAppendLimit
+	}
+
 	s, err := imap.New(ctx, hostname, addr, s3storage, database, uploadWorker, cacheInstance,
 		imap.IMAPServerOptions{
 			InsecureAuth:       config.InsecureAuth,
@@ -444,6 +451,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			MasterPassword:     config.Servers.MasterPassword,
 			MasterSASLUsername: config.Servers.MasterSASLUsername,
 			MasterSASLPassword: config.Servers.MasterSASLPassword,
+			AppendLimit:        appendLimit,
 		})
 	if err != nil {
 		errChan <- err
