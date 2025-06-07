@@ -22,6 +22,8 @@ require (
 // Use the fork at github.com/migadu/go-sieve instead of the original repository
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20240130002450-72d6b002882a
 
+replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250607132233-6d9e359e8498
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
