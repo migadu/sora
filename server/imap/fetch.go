@@ -1,13 +1,17 @@
 package imap
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/emersion/go-message/textproto"
 	"github.com/migadu/sora/db"
+
+	tp "net/textproto"
 )
 
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
@@ -74,14 +78,16 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		}
 		s.mutex.Unlock()
 
-		if err := s.fetchMessage(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
+		// Pass pointers for bodyData and bodyDataFetched to be shared across handlers for a single message
+		if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, sessionTracker *imapserver.SessionTracker) error {
+// writeMessageFetchData handles writing all FETCH data items for a single message.
+func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, sessionTracker *imapserver.SessionTracker) error {
 	s.Log("[FETCH] fetching message UID %d SEQNUM %d", msg.UID, msg.Seq)
 	encodedSeqNum := sessionTracker.EncodeSeqNum(msg.Seq)
 
@@ -123,75 +129,65 @@ func (s *IMAPSession) fetchMessage(w *imapserver.FetchWriter, msg *db.Message, o
 		return err
 	}
 
-	if !msg.IsUploaded {
-		s.Log("[FETCH] UID %d is not yet uploaded, returning flags only", msg.UID)
-		return nil
-	}
-
 	if options.Envelope {
 		if err := s.writeEnvelope(m, msg.UID, selectedMailboxID); err != nil {
 			return err
 		}
 	}
-
 	if options.BodyStructure != nil {
 		if err := s.writeBodyStructure(m, &msg.BodyStructure); err != nil {
 			return err
 		}
 	}
 
-	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
-		var bodyData []byte
-		var err error
-		bodyData, err = s.getMessageBody(msg)
-		if err != nil {
-			s.Log("[FETCH] Failed to get message body for UID %d: %v", msg.UID, err)
-		}
+	// Declare bodyData and a flag to track if it has been fetched.
+	// These will be passed by pointer to handlers so they can lazily load it once if needed.
+	var bodyData []byte
+	var bodyDataFetched bool
 
+	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		if len(options.BodySection) > 0 {
-			if err := s.handleBodySections(m, bodyData, options, msg, selectedMailboxID); err != nil {
+			if err := s.handleBodySections(m, &bodyData, &bodyDataFetched, options, msg, selectedMailboxID); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySection) > 0 {
-			if err := s.handleBinarySections(m, bodyData, options); err != nil {
+			if err := s.handleBinarySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if err := s.handleBinarySectionSize(m, bodyData, options); err != nil {
+			if err := s.handleBinarySectionSize(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 				return err
 			}
 		}
 	}
 
-	// if options.ModSeq {
-	// 	var highestModSeq int64
-	// 	highestModSeq = msg.CreatedModSeq
+	if options.ModSeq {
+		var highestModSeq int64
+		highestModSeq = msg.CreatedModSeq
 
-	// 	if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
-	// 		highestModSeq = *msg.UpdatedModSeq
-	// 	}
+		if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
+			highestModSeq = *msg.UpdatedModSeq
+		}
 
-	// 	if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
-	// 		highestModSeq = *msg.ExpungedModSeq
-	// 	}
+		if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
+			highestModSeq = *msg.ExpungedModSeq
+		}
 
-	// 	s.Log("[FETCH] writing MODSEQ %d for message UID %d", highestModSeq, msg.UID)
+		s.Log("[FETCH] writing MODSEQ %d for message UID %d", highestModSeq, msg.UID)
 
-	// 	m.WriteModSeq(uint64(highestModSeq))
-	// }
+		m.WriteModSeq(uint64(highestModSeq))
+	}
 
 	return nil
 }
 
-// Fetch helper to write basic message data (FLAGS, UID, INTERNALDATE, RFC822.SIZE)
 func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, msg *db.Message, options *imap.FetchOptions) error {
 	if options.Flags {
 		allFlags := db.BitwiseToFlags(msg.BitwiseFlags) // System flags
-
 		for _, customFlag := range msg.CustomFlags {
 			allFlags = append(allFlags, imap.Flag(customFlag))
 		}
@@ -209,7 +205,6 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 	return nil
 }
 
-// Fetch helper to write the envelope for a message
 func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUID imap.UID, mailboxID int64) error {
 	envelope, err := s.server.db.GetMessageEnvelope(s.ctx, messageUID, mailboxID)
 	if err != nil {
@@ -219,16 +214,34 @@ func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUI
 	return nil
 }
 
-// Fetch helper to write the body structure for a message
 func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, bodyStructure *imap.BodyStructure) error {
 	m.WriteBodyStructure(*bodyStructure) // Use the already deserialized BodyStructure
 	return nil
 }
 
-// Fetch helper to handle BINARY sections for a message
-func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bodyData []byte, options *imap.FetchOptions) error {
+func (s *IMAPSession) ensureBodyDataLoaded(msg *db.Message, bodyData *[]byte, bodyDataFetched *bool) error {
+	if !*bodyDataFetched {
+		var fetchErr error
+		*bodyData, fetchErr = s.getMessageBody(msg)
+		*bodyDataFetched = true // Mark as fetched even if error or nil data, to prevent re-fetching.
+		if fetchErr != nil {
+			s.Log("[FETCH] UID %d: Failed to get message body: %v", msg.UID, fetchErr)
+			return fetchErr // Propagate error to allow handlers to decide how to proceed (e.g., return NIL)
+		}
+	}
+	return nil
+}
+
+func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+		// Logged in ensureBodyDataLoaded. If bodyData is nil or error occurred, subsequent ops will handle it.
+	}
+
 	for _, section := range options.BinarySection {
-		buf := imapserver.ExtractBinarySection(bytes.NewReader(bodyData), section)
+		var buf []byte
+		if *bodyData != nil { // Only extract if bodyData was successfully loaded
+			buf = imapserver.ExtractBinarySection(bytes.NewReader(*bodyData), section)
+		}
 		wc := w.WriteBinarySection(section, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
 		closeErr := wc.Close()
@@ -242,73 +255,105 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bo
 	return nil
 }
 
-// Fetch helper to handle BINARY.SIZE sections for a message
-func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, bodyData []byte, options *imap.FetchOptions) error {
+func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+		// Logged in ensureBodyDataLoaded.
+	}
+
 	for _, section := range options.BinarySectionSize {
-		n := imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
+		var n uint32
+		if *bodyData != nil { // Only extract if bodyData was successfully loaded
+			n = imapserver.ExtractBinarySectionSize(bytes.NewReader(*bodyData), section)
+
+		}
 		w.WriteBinarySectionSize(section, n)
 	}
 	return nil
 }
 
-// Fetch helper to handle BODY sections for a message
-func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData []byte, options *imap.FetchOptions, msg *db.Message, selectedMailboxID int64) error {
+func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, selectedMailboxID int64) error {
 	for _, section := range options.BodySection {
 		var sectionContent []byte
+		var extractionErr error // For errors from imapserver.Extract... functions
+		satisfiedFromDB := false
 
-		// Check if this is a request for the main BODY[HEADER] (i.e., section specifier is HEADER and part is empty)
-		isMainHeaderRequest := section.Specifier == imap.PartSpecifierHeader && (len(section.Part) == 0)
+		// Is this a request for specific header fields of the main message? (e.g., BODY[HEADER.FIELDS (SUBJECT FROM)])
+		isHeaderFieldsRequest := section.Specifier == imap.PartSpecifierHeader && len(section.HeaderFields) > 0 && len(section.Part) == 0
 
-		// Check if this is a request for the main BODY[TEXT] (i.e., section specifier is TEXT and part is empty)
+		// Is this a request for all headers of the main message? (e.g., BODY[HEADER])
+		isAllHeadersRequest := section.Specifier == imap.PartSpecifierHeader && len(section.HeaderFields) == 0 && len(section.HeaderFieldsNot) == 0 && len(section.Part) == 0
+
+		// Is this a request for the main body text? (e.g., BODY[TEXT])
 		isMainBodyTextRequest := section.Specifier == imap.PartSpecifierText && (len(section.Part) == 0)
 
-		if isMainHeaderRequest {
-			// Attempt to use the pre-extracted headers from message_contents
+		if isHeaderFieldsRequest {
+			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
+			if dbErr == nil && headersText != "" {
+				// parsedDBHeader is textproto.Header from "github.com/emersion/go-message/textproto"
+				parsedDBHeader, parseErr := textproto.ReadHeader(bufio.NewReader(bytes.NewReader([]byte(headersText))))
+				if parseErr == nil {
+					sectionContent, extractionErr = extractRequestedHeaders(parsedDBHeader, section)
+					satisfiedFromDB = true
+					s.Log("[FETCH] UID %d: Served BODY[HEADER.FIELDS (...)] from message_contents.headers", msg.UID)
+				} else {
+					s.Log("[FETCH] UID %d: Error parsing DB headers for HEADER.FIELDS: %v. Falling back.", msg.UID, parseErr)
+					extractionErr = parseErr // Signal to fallback to full body parsing
+				}
+			} else {
+				if dbErr != nil {
+					s.Log("[FETCH] UID %d: Failed to get headers from DB for BODY[HEADER.FIELDS] ('%v'). Falling back.", msg.UID, dbErr)
+					extractionErr = dbErr // Signal to fallback
+				} else {
+					s.Log("[FETCH] UID %d: Headers from DB for BODY[HEADER.FIELDS] are empty. Falling back.", msg.UID)
+					// extractionErr remains nil, fallback will happen due to !satisfiedFromDB
+				}
+			}
+		} else if isAllHeadersRequest {
 			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
 				sectionContent = []byte(headersText)
+				satisfiedFromDB = true
 				s.Log("[FETCH] UID %d: Served BODY[HEADER] from message_contents.headers", msg.UID)
 			} else {
 				if dbErr != nil {
-					s.Log("[FETCH] UID %d: Failed to get headers from DB for BODY[HEADER] ('%v'). Falling back to raw extraction.", msg.UID, dbErr)
+					s.Log("[FETCH] UID %d: Failed to get headers from DB for BODY[HEADER] ('%v'). Falling back.", msg.UID, dbErr)
 				} else {
-					s.Log("[FETCH] UID %d: Headers from DB for BODY[HEADER] are empty. Falling back to raw extraction.", msg.UID)
-				}
-				if bodyData != nil {
-					sectionContent = imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
-				} else {
-					s.Log("[FETCH] UID %d: Cannot fall back to raw extraction for BODY[HEADER] because raw bodyData is nil.", msg.UID)
-					sectionContent = []byte{} // IMAP expects NIL or empty literal for missing part
+					s.Log("[FETCH] UID %d: Headers from DB for BODY[HEADER] are empty. Falling back.", msg.UID)
 				}
 			}
 		} else if isMainBodyTextRequest {
-			// Attempt to use the pre-extracted text_body from message_contents
 			textBody, dbErr := s.server.db.GetMessageTextBody(s.ctx, msg.UID, selectedMailboxID)
-			if dbErr == nil {
+			if dbErr == nil { // textBody can be "" if the message has no text part or it's empty
 				sectionContent = []byte(textBody)
+				satisfiedFromDB = true
 				s.Log("[FETCH] UID %d: Served BODY[TEXT] from message_contents.text_body", msg.UID)
 			} else {
-				// Log the error and fall back to extracting from the raw message body (bodyData)
-				s.Log("[FETCH] UID %d: Failed to get text_body from DB for BODY[TEXT] ('%v'). Falling back to raw extraction.", msg.UID, dbErr)
-				if bodyData != nil {
-					sectionContent = imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
-				} else {
-					s.Log("[FETCH] UID %d: Cannot fall back to raw extraction for BODY[TEXT] because raw bodyData is nil.", msg.UID)
-					sectionContent = []byte{} // IMAP expects NIL or empty literal for missing part
-				}
-			}
-		} else {
-			// For all other body sections (e.g., BODY[HEADER], BODY[1.MIME], BODY[<n>.TEXT])
-			// use the raw message data and the library's extraction logic.
-			if bodyData != nil {
-				sectionContent = imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
-			} else {
-				s.Log("[FETCH] UID %d: Cannot extract body section %v because raw bodyData is nil.", msg.UID, section)
-				sectionContent = []byte{} // IMAP expects NIL or empty literal for missing part
+				s.Log("[FETCH] UID %d: Failed to get text_body from DB for BODY[TEXT] ('%v'). Falling back.", msg.UID, dbErr)
 			}
 		}
 
-		wc := w.WriteBodySection(section, int64(len(sectionContent)))
+		// Fallback or other section types
+		// If not satisfied from DB, or if there was an error extracting from DB-sourced content (extractionErr != nil),
+		// or if it's a complex section type that always requires full body.
+		if !satisfiedFromDB || extractionErr != nil {
+			if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
+				s.Log("[FETCH] UID %d: Error ensuring body data loaded for section %v: %v", msg.UID, section, loadErr)
+				// sectionContent will be nil, handled below
+			}
+
+			if *bodyData != nil { // Only extract if bodyData was successfully loaded
+				sectionContent = imapserver.ExtractBodySection(bytes.NewReader(*bodyData), section) // section is *FetchItemBodySection
+			} else {
+				s.Log("[FETCH] UID %d: Body data is nil for section %v. Returning empty.", msg.UID, section)
+				// sectionContent remains nil, will be set to []byte{} below
+			}
+		}
+
+		if sectionContent == nil { // Ensure not nil for WriteBodySection
+			sectionContent = []byte{}
+		}
+
+		wc := w.WriteBodySection(section, int64(len(sectionContent))) // section is *FetchItemBodySection
 		_, writeErr := wc.Write(sectionContent)
 		closeErr := wc.Close()
 		if writeErr != nil {
@@ -355,4 +400,77 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		return nil, fmt.Errorf("message UID %d not found on disk", msg.UID)
 	}
 	return data, nil
+}
+
+// extractRequestedHeaders filters headers from a parsedDBHeader based on the section criteria.
+// It constructs a new textproto.Header containing only the desired fields and then writes it.
+// This approach preserves the original raw formatting of the selected header lines.
+func extractRequestedHeaders(parsedDBHeader textproto.Header, section *imap.FetchItemBodySection) ([]byte, error) {
+	var rawLinesToOutput [][]byte // Collect raw lines in the desired output order
+
+	// Create a set of fields to exclude for quick lookup (canonical keys)
+	excludeSet := make(map[string]struct{})
+	for _, notField := range section.HeaderFieldsNot {
+		excludeSet[tp.CanonicalMIMEHeaderKey(notField)] = struct{}{}
+	}
+
+	if len(section.HeaderFields) > 0 {
+		// Specific fields requested. Output in the order requested by the client.
+		// Keep track of canonical keys already processed to handle cases like ("Subject", "subject") in request.
+		processedCanonicalRequestKeys := make(map[string]struct{})
+
+		for _, reqKey := range section.HeaderFields {
+			canonicalReqKey := tp.CanonicalMIMEHeaderKey(reqKey)
+
+			if _, alreadyProcessed := processedCanonicalRequestKeys[canonicalReqKey]; alreadyProcessed {
+				continue // Already handled all instances of this canonical key due to a previous request (e.g., "SUBJECT" after "Subject")
+			}
+			if _, exclude := excludeSet[canonicalReqKey]; exclude {
+				processedCanonicalRequestKeys[canonicalReqKey] = struct{}{} // Mark as skipped
+				continue
+			}
+
+			// FieldsByKey iterates over all occurrences of a header with the given canonical key.
+			// These occurrences are iterated in their original relative order from the message.
+			fieldsIterator := parsedDBHeader.FieldsByKey(canonicalReqKey)
+			for fieldsIterator.Next() {
+				// The key from fieldsIterator.Key() is already canonical.
+				rawLine, err := fieldsIterator.Raw()
+				if err != nil {
+					return nil, fmt.Errorf("error getting raw header line for %s: %w", fieldsIterator.Key(), err)
+				}
+				rawLinesToOutput = append(rawLinesToOutput, rawLine)
+			}
+			processedCanonicalRequestKeys[canonicalReqKey] = struct{}{}
+		}
+	} else {
+		// All fields requested (e.g., BODY[HEADER.FIELDS ()] or BODY[HEADER]).
+		// textproto.Header.Fields() iterates in the original message order.
+		fieldsIterator := parsedDBHeader.Fields()
+		for fieldsIterator.Next() {
+			canonicalKey := fieldsIterator.Key() // Key() from iterator is already canonical
+			if _, exclude := excludeSet[canonicalKey]; exclude {
+				continue
+			}
+			rawLine, err := fieldsIterator.Raw()
+			if err != nil {
+				return nil, fmt.Errorf("error getting raw header line for %s: %w", canonicalKey, err)
+			}
+			rawLinesToOutput = append(rawLinesToOutput, rawLine)
+		}
+	}
+
+	// Construct the new Header object by adding raw lines in reverse order
+	// so that WriteHeader outputs them in the correct (original/requested) order.
+	var newHdr textproto.Header
+	for i := len(rawLinesToOutput) - 1; i >= 0; i-- {
+		newHdr.AddRaw(rawLinesToOutput[i]) // AddRaw prepends effectively due to WriteHeader's behavior
+	}
+
+	var buf bytes.Buffer
+	if err := textproto.WriteHeader(&buf, newHdr); err != nil {
+		return nil, fmt.Errorf("failed to write filtered header: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
