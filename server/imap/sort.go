@@ -5,16 +5,15 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
-// Sort implements the SORT extension (RFC 5256) and SORT=DISPLAY extension (RFC 5957)
-// It returns a list of message numbers sorted according to the provided criteria.
-func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) (*imapserver.SortData, error) {
+// Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
+// and ESORT extension (RFC 5267). It returns a list of message numbers sorted
+// according to the provided criteria.
+func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]uint32, error) {
 	criteria = s.decodeSearchCriteria(criteria)
 
 	if s.currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
 		s.Log("[SORT] skipping SORT because mailbox is empty")
-		return &imapserver.SortData{
-			Nums: []uint32{},
-		}, nil
+		return []uint32{}, nil
 	}
 
 	// Pass both search criteria and sort criteria to the database layer
@@ -33,7 +32,5 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 		}
 	}
 
-	return &imapserver.SortData{
-		Nums: nums,
-	}, nil
+	return nums, nil
 }

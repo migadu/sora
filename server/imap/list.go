@@ -80,10 +80,12 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 
 	attributes := []imap.MailboxAttr{}
 
-	if mbox.HasChildren {
-		attributes = append(attributes, imap.MailboxAttrHasChildren)
-	} else {
-		attributes = append(attributes, imap.MailboxAttrHasNoChildren)
+	if serverCaps.Has(imap.CapChildren) {
+		if mbox.HasChildren {
+			attributes = append(attributes, imap.MailboxAttrHasChildren)
+		} else {
+			attributes = append(attributes, imap.MailboxAttrHasNoChildren)
+		}
 	}
 
 	isStandardSpecialMailbox := false
