@@ -33,36 +33,36 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		return nil
 	}
 
-	// // CONDSTORE filtering - does not require s.mutex
-	// _, hasCondStore := s.server.caps[imap.CapCondStore]
-	// if hasCondStore && options.ChangedSince > 0 {
-	// 	s.Log("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
-	// 	var filteredMessages []db.Message
+	// CONDSTORE filtering
+	_, hasCondStore := s.server.caps[imap.CapCondStore]
+	if hasCondStore && options.ChangedSince > 0 {
+		s.Log("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
+		var filteredMessages []db.Message
 
-	// 	for _, msg := range messages {
-	// 		var highestModSeq int64
-	// 		highestModSeq = msg.CreatedModSeq
+		for _, msg := range messages {
+			var highestModSeq int64
+			highestModSeq = msg.CreatedModSeq
 
-	// 		if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
-	// 			highestModSeq = *msg.UpdatedModSeq
-	// 		}
+			if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
+				highestModSeq = *msg.UpdatedModSeq
+			}
 
-	// 		if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
-	// 			highestModSeq = *msg.ExpungedModSeq
-	// 		}
+			if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
+				highestModSeq = *msg.ExpungedModSeq
+			}
 
-	// 		if uint64(highestModSeq) > options.ChangedSince {
-	// 			s.Log("[FETCH] CONDSTORE: Including message UID %d with MODSEQ %d > CHANGEDSINCE %d",
-	// 				msg.UID, highestModSeq, options.ChangedSince)
-	// 			filteredMessages = append(filteredMessages, msg)
-	// 		} else {
-	// 			s.Log("[FETCH] CONDSTORE: Skipping message UID %d with MODSEQ %d <= CHANGEDSINCE %d",
-	// 				msg.UID, highestModSeq, options.ChangedSince)
-	// 		}
-	// 	}
+			if uint64(highestModSeq) > options.ChangedSince {
+				s.Log("[FETCH] CONDSTORE: Including message UID %d with MODSEQ %d > CHANGEDSINCE %d",
+					msg.UID, highestModSeq, options.ChangedSince)
+				filteredMessages = append(filteredMessages, msg)
+			} else {
+				s.Log("[FETCH] CONDSTORE: Skipping message UID %d with MODSEQ %d <= CHANGEDSINCE %d",
+					msg.UID, highestModSeq, options.ChangedSince)
+			}
+		}
 
-	// 	messages = filteredMessages
-	// }
+		messages = filteredMessages
+	}
 
 	for _, msg := range messages {
 		s.mutex.Lock()

@@ -33,26 +33,26 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	for _, msg := range messages {
-		// // CONDSTORE: Skip messages whose mod-sequence is greater than the UNCHANGEDSINCE value
-		// _, hasCondStore := s.server.caps[imap.CapCondStore]
-		// if hasCondStore && options != nil && options.UnchangedSince > 0 {
-		// 	var currentModSeq int64
-		// 	currentModSeq = msg.CreatedModSeq
+		// CONDSTORE: Skip messages whose mod-sequence is greater than the UNCHANGEDSINCE value
+		_, hasCondStore := s.server.caps[imap.CapCondStore]
+		if hasCondStore && options != nil && options.UnchangedSince > 0 {
+			var currentModSeq int64
+			currentModSeq = msg.CreatedModSeq
 
-		// 	if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > currentModSeq {
-		// 		currentModSeq = *msg.UpdatedModSeq
-		// 	}
+			if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > currentModSeq {
+				currentModSeq = *msg.UpdatedModSeq
+			}
 
-		// 	if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > currentModSeq {
-		// 		currentModSeq = *msg.ExpungedModSeq
-		// 	}
+			if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > currentModSeq {
+				currentModSeq = *msg.ExpungedModSeq
+			}
 
-		// 	if uint64(currentModSeq) > options.UnchangedSince {
-		// 		s.Log("[STORE] CONDSTORE: Skipping message UID %d with MODSEQ %d > UNCHANGEDSINCE %d",
-		// 			msg.UID, currentModSeq, options.UnchangedSince)
-		// 		continue
-		// 	}
-		// }
+			if uint64(currentModSeq) > options.UnchangedSince {
+				s.Log("[STORE] CONDSTORE: Skipping message UID %d with MODSEQ %d > UNCHANGEDSINCE %d",
+					msg.UID, currentModSeq, options.UnchangedSince)
+				continue
+			}
+		}
 
 		var newFlags []imap.Flag
 		var newModSeq int64

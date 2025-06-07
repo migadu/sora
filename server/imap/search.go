@@ -73,32 +73,32 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
-	// hasModSeqCriteria := criteria.ModSeq != nil
-	// _, hasCondStore := s.server.caps[imap.CapCondStore]
+	hasModSeqCriteria := criteria.ModSeq != nil
+	_, hasCondStore := s.server.caps[imap.CapCondStore]
 
-	// if hasCondStore && hasModSeqCriteria {
-	// 	var highestModSeq uint64
-	// 	for _, msg := range messages {
-	// 		var msgModSeq int64
-	// 		msgModSeq = msg.CreatedModSeq
+	if hasCondStore && hasModSeqCriteria {
+		var highestModSeq uint64
+		for _, msg := range messages {
+			var msgModSeq int64
+			msgModSeq = msg.CreatedModSeq
 
-	// 		if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > msgModSeq {
-	// 			msgModSeq = *msg.UpdatedModSeq
-	// 		}
+			if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > msgModSeq {
+				msgModSeq = *msg.UpdatedModSeq
+			}
 
-	// 		if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > msgModSeq {
-	// 			msgModSeq = *msg.ExpungedModSeq
-	// 		}
+			if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > msgModSeq {
+				msgModSeq = *msg.ExpungedModSeq
+			}
 
-	// 		if uint64(msgModSeq) > highestModSeq {
-	// 			highestModSeq = uint64(msgModSeq)
-	// 		}
-	// 	}
+			if uint64(msgModSeq) > highestModSeq {
+				highestModSeq = uint64(msgModSeq)
+			}
+		}
 
-	// 	if highestModSeq > 0 {
-	// 		searchData.ModSeq = highestModSeq
-	// 	}
-	// }
+		if highestModSeq > 0 {
+			searchData.ModSeq = highestModSeq
+		}
+	}
 
 	return searchData, nil
 }
