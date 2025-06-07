@@ -165,6 +165,59 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 	return finalCondition, args, nil
 }
 
+// buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
+func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) string {
+	if len(sortCriteria) == 0 {
+		return "ORDER BY uid"
+	}
+
+	var orderClauses []string
+
+	for _, criterion := range sortCriteria {
+		var direction string
+		if criterion.Reverse {
+			direction = "DESC"
+		} else {
+			direction = "ASC"
+		}
+
+		var orderField string
+		switch criterion.Key {
+		case imap.SortKeyArrival:
+			orderField = "internal_date"
+		case imap.SortKeyDate:
+			orderField = "sent_date"
+		case imap.SortKeySubject:
+			// RFC 5256: normalized subject, converted to uppercase.
+			orderField = "UPPER(subject)"
+		case imap.SortKeySize:
+			orderField = "size"
+		case imap.SortKeyDisplay:
+			// RFC 5957 (updates RFC 5256): Sort by the display name of the first 'from' address,
+			// fallback to email, then empty string. Case-insensitive.
+			orderField = "COALESCE((SELECT COALESCE(LOWER(r.value->>'name'), LOWER(r.value->>'email')) FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'from' LIMIT 1), '')"
+		case imap.SortKeyFrom:
+			// RFC 5256: Sort by the mailbox of the first 'from' address. Case-insensitive.
+			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'from' LIMIT 1), '')"
+		case imap.SortKeyTo:
+			// RFC 5256: Sort by the mailbox of the first 'to' address. Case-insensitive.
+			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'to' LIMIT 1), '')"
+		case imap.SortKeyCc:
+			// RFC 5256: Sort by the mailbox of the first 'cc' address. Case-insensitive.
+			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'cc' LIMIT 1), '')"
+		default:
+			// If the sort key is not supported, default to uid
+			orderField = "uid"
+		}
+
+		orderClauses = append(orderClauses, fmt.Sprintf("%s %s", orderField, direction))
+	}
+	// Always include uid as the final sort criterion to ensure consistent ordering
+	orderClauses = append(orderClauses, "uid ASC")
+
+	return "ORDER BY " + strings.Join(orderClauses, ", ")
+}
+
 func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs) {
 	args := pgx.NamedArgs{}
 	var conditions []string
@@ -215,8 +268,10 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 	return finalCondition, args
 }
 
-func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]Message, error) {
-	baseQuery := `
+// getMessagesQueryExecutor is a helper function to execute the message retrieval query,
+// handling both default and custom sorting.
+func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string) ([]Message, error) {
+	const baseQuery = `
 	WITH message_seqs AS (
 		SELECT
 			uid,
@@ -247,19 +302,43 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 	}
 	whereArgs["mailboxID"] = mailboxID
 
-	finalQueryString := baseQuery + fmt.Sprintf(" WHERE %s ORDER BY uid", whereCondition)
+	if orderByClause == "" {
+		orderByClause = "ORDER BY uid" // Default sort order
+	}
+
+	finalQueryString := baseQuery + fmt.Sprintf(" WHERE %s %s", whereCondition, orderByClause)
 
 	rows, err := db.Pool.Query(ctx, finalQueryString, whereArgs)
 	if err != nil {
-		// It's helpful to log the query and arguments when an error occurs for easier debugging.
 		log.Printf("Error executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
-		return nil, err
+		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
 
 	messages, err := scanMessages(rows)
 	if err != nil {
 		return nil, fmt.Errorf("GetMessagesWithCriteria: failed to scan messages: %w", err)
+	}
+	return messages, nil
+}
+
+func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]Message, error) {
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "ORDER BY uid") // Default sort
+	if err != nil {
+		return nil, fmt.Errorf("GetMessagesWithCriteria: %w", err)
+	}
+	return messages, nil
+}
+
+// GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
+func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]Message, error) {
+	// Construct the ORDER BY clause based on the sort criteria
+	orderBy := db.buildSortOrderClause(sortCriteria)
+
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy)
+	if err != nil {
+		// The error from getMessagesQueryExecutor will be wrapped here
+		return nil, fmt.Errorf("GetMessagesSorted: %w", err)
 	}
 	return messages, nil
 }
