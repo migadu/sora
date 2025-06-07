@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -82,7 +83,11 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	if sentDate.IsZero() {
-		sentDate = options.Time
+		if !options.Time.IsZero() {
+			sentDate = options.Time
+		} else {
+			sentDate = time.Now()
+		}
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
@@ -114,7 +119,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			ContentHash:   contentHash,
 			MessageID:     messageID,
 			Flags:         options.Flags,
-			InternalDate:  options.Time,
+			InternalDate:  sentDate, // Best we can is set to message's sent date
 			Size:          size,
 			Subject:       subject,
 			PlaintextBody: actualPlaintextBody,
