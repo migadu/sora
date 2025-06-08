@@ -11,7 +11,7 @@ import (
 func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]uint32, error) {
 	criteria = s.decodeSearchCriteria(criteria)
 
-	if s.currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
+	if s.currentNumMessages.Load() == 0 && len(criteria.SeqNum) > 0 {
 		s.Log("[SORT] skipping SORT because mailbox is empty")
 		return []uint32{}, nil
 	}

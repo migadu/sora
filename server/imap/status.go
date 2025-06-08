@@ -40,10 +40,8 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	if options.NumMessages {
 		num := uint32(summary.NumMessages)
 
-		// Need write lock to update currentNumMessages
-		s.mutex.Lock()
-		s.currentNumMessages = num
-		s.mutex.Unlock()
+		// Update currentNumMessages using atomic operation, no lock needed
+		s.currentNumMessages.Store(num)
 
 		statusData.NumMessages = &num
 	}

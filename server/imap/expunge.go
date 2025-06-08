@@ -71,8 +71,8 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		return nil
 	}
 
-	// Update our count
-	s.currentNumMessages = s.currentNumMessages - uint32(len(messagesToExpunge))
+	// Update our count using atomic operation
+	s.currentNumMessages.Add(^uint32(len(messagesToExpunge) - 1)) // Subtract len(messagesToExpunge)
 	s.mutex.Unlock()
 
 	// Send notifications using snapshot

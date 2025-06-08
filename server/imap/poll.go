@@ -14,7 +14,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return nil
 	}
 	mailboxID := s.selectedMailbox.ID
-	highestModSeqToPollFrom := s.currentHighestModSeq
+	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	s.mutex.RUnlock()
 
 	poll, err := s.server.db.PollMailbox(s.ctx, mailboxID, highestModSeqToPollFrom)
@@ -38,17 +38,18 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 				maxModSeqInThisPoll = update.EffectiveModSeq
 			}
 		}
-		s.currentHighestModSeq = maxModSeqInThisPoll
+		s.currentHighestModSeq.Store(maxModSeqInThisPoll)
 	} else {
 		// If there were no specific message updates, update to the global current_modseq
 		// to ensure the session eventually catches up if the mailbox is truly idle.
-		s.currentHighestModSeq = poll.ModSeq
+		s.currentHighestModSeq.Store(poll.ModSeq)
 	}
 
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
 			s.mailboxTracker.QueueExpunge(update.SeqNum)
-			s.currentNumMessages = s.currentNumMessages - 1
+			// Atomically decrement the current number of messages
+			s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
 		} else {
 			allFlags := db.BitwiseToFlags(update.BitwiseFlags)
 			for _, customFlag := range update.CustomFlags {
@@ -58,9 +59,11 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		}
 	}
 
-	if poll.NumMessages > s.currentNumMessages {
+	// Lock-free comparison and update of message count
+	currentCount := s.currentNumMessages.Load()
+	if poll.NumMessages > currentCount {
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
-		s.currentNumMessages = poll.NumMessages
+		s.currentNumMessages.Store(poll.NumMessages)
 	}
 
 	return s.sessionTracker.Poll(w, allowExpunge)

@@ -90,26 +90,26 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		s.lastHighestUID = 0
 	}
 
-	s.currentNumMessages = uint32(currentSummary.NumMessages)
-	s.currentHighestModSeq = currentSummary.HighestModSeq
+	s.currentNumMessages.Store(uint32(currentSummary.NumMessages))
+	s.currentHighestModSeq.Store(currentSummary.HighestModSeq)
 
 	s.selectedMailbox = mailbox
-	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages)
+	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 
 	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d",
-		mboxName, mailbox.ID, s.currentNumMessages, s.currentHighestModSeq, currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent)
+		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent)
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
 		Flags: getDisplayFlags(s.ctx, s.server.db, mailbox),
 		// Flags that can be changed, including \* for custom
 		PermanentFlags: getPermanentFlags(),
-		NumMessages:    s.currentNumMessages,
+		NumMessages:    s.currentNumMessages.Load(),
 		UIDNext:        imap.UID(currentSummary.UIDNext),
 		UIDValidity:    s.selectedMailbox.UIDValidity,
 		NumRecent:      numRecent, // Use the calculated numRecent
-		HighestModSeq:  s.currentHighestModSeq,
+		HighestModSeq:  s.currentHighestModSeq.Load(),
 	}
 
 	return selectData, nil

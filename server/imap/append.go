@@ -172,9 +172,10 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// Update session state if this message was appended to the currently selected mailbox
 	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailbox.ID {
-		s.currentNumMessages++ // Increment the count for the selected mailbox
+		// Atomically increment the count for the selected mailbox
+		newCount := s.currentNumMessages.Add(1)
 		if s.mailboxTracker != nil {
-			s.mailboxTracker.QueueNumMessages(s.currentNumMessages)
+			s.mailboxTracker.QueueNumMessages(newCount)
 		} else {
 			// This would indicate an inconsistent state if a mailbox is selected but has no tracker.
 			s.Log("[APPEND] Inconsistent state: selectedMailbox ID %d is set, but mailboxTracker is nil.", s.selectedMailbox.ID)

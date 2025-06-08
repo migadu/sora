@@ -47,9 +47,8 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		return nil
 	}
 
-	// CONDSTORE filtering
-	hasCondStore := s.hasServerCapability(imap.CapCondStore)
-	if hasCondStore && options.ChangedSince > 0 {
+	// Always enable CONDSTORE functionality when ChangedSince option is provided
+	if options.ChangedSince > 0 {
 		s.Log("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
 		var filteredMessages []db.Message
 

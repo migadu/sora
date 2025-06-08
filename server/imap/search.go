@@ -23,7 +23,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 	selectedMailboxID = s.selectedMailbox.ID
-	currentNumMessages = s.currentNumMessages
+	currentNumMessages = s.currentNumMessages.Load()
 	sessionTrackerSnapshot = s.sessionTracker
 	s.mutex.RUnlock()
 
@@ -108,10 +108,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
-	hasModSeqCriteria := criteria.ModSeq != nil
-	hasCondStore := s.hasServerCapability(imap.CapCondStore)
-
-	if hasCondStore && hasModSeqCriteria {
+	// Always enable CONDSTORE functionality when ModSeq criteria is provided
+	if criteria.ModSeq != nil {
 		var highestModSeq uint64
 		for _, msg := range messages {
 			var msgModSeq int64

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -25,8 +26,9 @@ type IMAPSession struct {
 	mailboxTracker  *imapserver.MailboxTracker
 	sessionTracker  *imapserver.SessionTracker
 
-	currentHighestModSeq uint64
-	currentNumMessages   uint32
+	// Atomic counters for lock-free access
+	currentHighestModSeq atomic.Uint64
+	currentNumMessages   atomic.Uint32
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
@@ -78,8 +80,8 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.selectedMailbox = nil
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
-	s.currentHighestModSeq = 0
-	s.currentNumMessages = 0
+	s.currentHighestModSeq.Store(0)
+	s.currentNumMessages.Store(0)
 }
 
 // decodeNumSetLocked translates client sequence numbers to server sequence numbers.
@@ -98,7 +100,7 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 	// to resolve '*' (represented by 0 in imap.SeqRange Start/Stop).
 	// This count (s.currentNumMessages) is maintained by SELECT, APPEND (for this session),
 	// and POLL, reflecting this session's potentially slightly delayed view of the mailbox.
-	currentTotalMessagesInMailbox := s.currentNumMessages
+	currentTotalMessagesInMailbox := s.currentNumMessages.Load()
 
 	var out imap.SeqSet
 	for _, seqRange := range seqSet {
@@ -154,13 +156,4 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 
 	// Use the helper method that assumes the caller holds the lock
 	return s.decodeNumSetLocked(numSet)
-}
-
-// hasServerCapability safely checks if the server has a specific capability.
-// It acquires a read lock to protect access to server capabilities.
-func (s *IMAPSession) hasServerCapability(cap imap.Cap) bool {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	_, has := s.server.caps[cap]
-	return has
 }
