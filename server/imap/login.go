@@ -8,13 +8,14 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-const ProxyUsernameSeparator = "\x00"
+// Tilde is default separator for master password
+const MasterUsernameSeparator = "~"
 
 func (s *IMAPSession) Login(address, password string) error {
-	authAddress, proxyUser := parseDovecotProxyLogin(address)
+	authAddress, proxyUser := parseMasterLogin(address)
 
-	isProxy := (s.server.masterUsername != "") && (proxyUser != "")
-	if isProxy {
+	// Master password login
+	if s.server.masterUsername != "" && proxyUser != "" {
 		address, err := server.NewAddress(authAddress)
 		if err != nil {
 			s.Log("[LOGIN] failed to parse address: %v", err)
@@ -75,11 +76,11 @@ func (s *IMAPSession) Login(address, password string) error {
 	return nil
 }
 
-func parseDovecotProxyLogin(username string) (realuser, authuser string) {
-	parts := strings.SplitN(username, ProxyUsernameSeparator, 2)
+func parseMasterLogin(username string) (realuser, authuser string) {
+	parts := strings.SplitN(username, MasterUsernameSeparator, 2)
 	fmt.Println(parts)
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
-	return username, "" // not a proxy login
+	return username, ""
 }
