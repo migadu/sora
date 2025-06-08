@@ -62,9 +62,14 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		statusData.HighestModSeq = summary.HighestModSeq
 	}
 
-	s.Log("[STATUS] mailbox '%s': NumMessages=%v, UIDNext=%v, HighestModSeq=%v",
+	numMessagesStr := "n/a"
+	if statusData.NumMessages != nil {
+		numMessagesStr = fmt.Sprint(*statusData.NumMessages)
+	}
+
+	s.Log("[STATUS] mailbox '%s': NumMessages=%s, UIDNext=%v, HighestModSeq=%v",
 		mboxName,
-		statusData.NumMessages,
+		numMessagesStr,
 		statusData.UIDNext,
 		statusData.HighestModSeq)
 

@@ -97,7 +97,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages)
 	s.sessionTracker = s.mailboxTracker.NewSession()
 
-	s.Log("[SELECT] mailbox '%s' (ID: %d)  NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d",
+	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d",
 		mboxName, mailbox.ID, s.currentNumMessages, s.currentHighestModSeq, currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent)
 
 	selectData := &imap.SelectData{
