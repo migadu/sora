@@ -20,6 +20,7 @@ type POP3Server struct {
 	db        *db.Database
 	s3        *storage.S3Storage
 	appCtx    context.Context
+	cancel    context.CancelFunc // Cancel function for the app context
 	uploader  *uploader.UploadWorker
 	cache     *cache.Cache
 	tlsConfig *tls.Config
@@ -34,12 +35,16 @@ type POP3ServerOptions struct {
 }
 
 func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
+	// Create a new context with a cancel function for clean shutdown
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+
 	server := &POP3Server{
 		hostname: hostname,
 		addr:     popAddr,
 		db:       database,
 		s3:       storage,
-		appCtx:   appCtx,
+		appCtx:   serverCtx,
+		cancel:   serverCancel,
 		uploader: uploadWorker,
 		cache:    cache,
 	}
@@ -89,16 +94,29 @@ func (s *POP3Server) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// Use a goroutine to monitor application context cancellation
+	go func() {
+		<-s.appCtx.Done()
+		log.Printf("* POP3 server shutting down due to context cancellation")
+		listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// Check if the error is due to the listener being closed
+			if s.appCtx.Err() != nil {
+				log.Printf("* POP3 server closed: %v", s.appCtx.Err())
+				return
+			}
 			errChan <- err
 			return
 		}
 
+		// Create a new context for this session that inherits from app context
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
-		s := &POP3Session{
+		session := &POP3Session{
 			server:  s,
 			conn:    &conn,
 			deleted: make(map[int]bool),
@@ -106,15 +124,23 @@ func (s *POP3Server) Start(errChan chan error) {
 			cancel:  sessionCancel,
 		}
 
-		s.RemoteIP = (*s.conn).RemoteAddr().String()
-		s.Protocol = "POP3"
-		s.Id = uuid.New().String()
-		s.HostName = s.server.hostname
+		session.RemoteIP = (*session.conn).RemoteAddr().String()
+		session.Protocol = "POP3"
+		session.Id = uuid.New().String()
+		session.HostName = s.hostname
 
-		go s.handleConnection()
+		go session.handleConnection()
 	}
 }
 
 func (s *POP3Server) Close() {
-	s.db.Close()
+	log.Printf("* POP3 server closing")
+	// Cancel the app context if it's still active
+	// This will propagate to all session contexts
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.db != nil {
+		s.db.Close()
+	}
 }
