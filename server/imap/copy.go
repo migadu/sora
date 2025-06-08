@@ -8,7 +8,10 @@ import (
 )
 
 func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
+	// First phase: Read session state with read lock
+	s.mutex.RLock()
 	if s.selectedMailbox == nil {
+		s.mutex.RUnlock()
 		s.Log("[COPY] copy failed: no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -16,10 +19,16 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 			Text: "no mailbox selected",
 		}
 	}
+	selectedMailboxID := s.selectedMailbox.ID
+	selectedMailboxName := s.selectedMailbox.Name
+	userID := s.UserID()
+	s.mutex.RUnlock()
 
-	numSet = s.decodeNumSet(numSet)
+	// Use decoded numSet - this safely acquires its own read lock
+	decodedNumSet := s.decodeNumSet(numSet)
 
-	destMailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), mboxName)
+	// Middle phase: Database operations outside lock
+	destMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
@@ -32,7 +41,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to fetch destination mailbox '%s': %v", mboxName, err)
 	}
 
-	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, s.selectedMailbox.ID, numSet)
+	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return nil, s.internalError("failed to retrieve messages for copy: %v", err)
 	}
@@ -63,7 +72,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		DestUIDs:    destUIDs,
 	}
 
-	s.Log("[COPY] messages copied from %s to %s", s.selectedMailbox.Name, mboxName)
+	s.Log("[COPY] messages copied from %s to %s", selectedMailboxName, mboxName)
 
 	return copyData, nil
 }

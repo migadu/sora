@@ -11,7 +11,13 @@ import (
 func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
 	s.Log("[SELECT] attempting to select mailbox: %s", mboxName)
 
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), mboxName)
+	// Phase 1: Read session state with read lock
+	s.mutex.RLock()
+	userID := s.UserID()
+	s.mutex.RUnlock()
+
+	// Phase 2: Database operations outside lock
+	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[SELECT] mailbox '%s' does not exist for user %d", mboxName, s.UserID())

@@ -6,11 +6,22 @@ import (
 )
 
 func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	// First phase: Read session state with read lock
+	s.mutex.RLock()
+	if s.selectedMailbox == nil {
+		s.mutex.RUnlock()
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNonExistent,
+			Text: "No mailbox selected",
+		}
+	}
+	mailboxID := s.selectedMailbox.ID
+	sessionTrackerSnapshot := s.sessionTracker
+	s.mutex.RUnlock()
 
-	messages, err := s.server.db.GetMessagesByFlag(s.ctx, s.selectedMailbox.ID, imap.FlagDeleted)
-
+	// Middle phase: Get messages to expunge (outside lock)
+	messages, err := s.server.db.GetMessagesByFlag(s.ctx, mailboxID, imap.FlagDeleted)
 	if err != nil {
 		return s.internalError("failed to fetch deleted messages: %v", err)
 	}
@@ -47,16 +58,32 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		uidsToDelete = append(uidsToDelete, m.uid)
 	}
 
-	if err := s.server.db.ExpungeMessageUIDs(s.ctx, s.selectedMailbox.ID, uidsToDelete...); err != nil {
+	// Database operation - no lock needed
+	if err := s.server.db.ExpungeMessageUIDs(s.ctx, mailboxID, uidsToDelete...); err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}
 
+	// Final phase: Update session state - write lock needed
+	s.mutex.Lock()
+	// Verify mailbox still selected and tracker still valid
+	if s.selectedMailbox == nil || s.selectedMailbox.ID != mailboxID || s.mailboxTracker == nil {
+		s.mutex.Unlock()
+		return nil
+	}
+
+	// Update our count
+	s.currentNumMessages = s.currentNumMessages - uint32(len(messagesToExpunge))
+	s.mutex.Unlock()
+
+	// Send notifications using snapshot
 	for _, m := range messagesToExpunge {
-		sessionSeqNum := s.sessionTracker.EncodeSeqNum(m.seq)
-		if sessionSeqNum > 0 {
-			if err := w.WriteExpunge(sessionSeqNum); err != nil {
-				s.Log("[EXPUNGE] Error writing expunge for sessionSeqNum %d (UID %d, dbSeq %d): %v", sessionSeqNum, m.uid, m.seq, err)
-				return s.internalError("failed to write expunge notification: %v", err)
+		if sessionTrackerSnapshot != nil {
+			sessionSeqNum := sessionTrackerSnapshot.EncodeSeqNum(m.seq)
+			if sessionSeqNum > 0 {
+				if err := w.WriteExpunge(sessionSeqNum); err != nil {
+					s.Log("[EXPUNGE] Error writing expunge for sessionSeqNum %d (UID %d, dbSeq %d): %v", sessionSeqNum, m.uid, m.seq, err)
+					return s.internalError("failed to write expunge notification: %v", err)
+				}
 			}
 		}
 	}

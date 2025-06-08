@@ -52,7 +52,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	for _, msg := range messages {
 		// CONDSTORE: Skip messages whose mod-sequence is greater than the UNCHANGEDSINCE value
-		_, hasCondStore := s.server.caps[imap.CapCondStore]
+		hasCondStore := s.hasServerCapability(imap.CapCondStore)
 		if hasCondStore && options != nil && options.UnchangedSince > 0 {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq

@@ -9,9 +9,12 @@ import (
 )
 
 func (s *IMAPSession) Delete(mboxName string) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	// First phase: Read-only validation with read lock
+	s.mutex.RLock()
+	userID := s.UserID()
+	s.mutex.RUnlock()
 
+	// Check if special mailbox - no lock needed
 	for _, specialMailbox := range consts.DefaultMailboxes {
 		if strings.EqualFold(mboxName, specialMailbox) {
 			s.Log("[DELETE] attempt to delete special mailbox '%s'", mboxName)
@@ -23,7 +26,8 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		}
 	}
 
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), mboxName)
+	// Middle phase: Database operations outside lock
+	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[DELETE] mailbox '%s' not found", mboxName)
@@ -36,8 +40,8 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		return s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
-	// Delete the mailbox; the database will automatically delete any child mailboxes due to ON DELETE CASCADE
-	err = s.server.db.DeleteMailbox(s.ctx, mailbox.ID, s.UserID())
+	// Final phase: actual deletion - no locks needed as it's a DB operation
+	err = s.server.db.DeleteMailbox(s.ctx, mailbox.ID, userID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}

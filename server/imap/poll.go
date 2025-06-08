@@ -7,14 +7,15 @@ import (
 )
 
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	// First phase: Read state with read lock
+	s.mutex.RLock()
 	if s.selectedMailbox == nil || s.mailboxTracker == nil || s.sessionTracker == nil {
+		s.mutex.RUnlock()
 		return nil
 	}
-
-	s.mutex.Lock()
 	mailboxID := s.selectedMailbox.ID
 	highestModSeqToPollFrom := s.currentHighestModSeq
-	s.mutex.Unlock()
+	s.mutex.RUnlock()
 
 	poll, err := s.server.db.PollMailbox(s.ctx, mailboxID, highestModSeqToPollFrom)
 	if err != nil {

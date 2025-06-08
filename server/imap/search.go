@@ -109,7 +109,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	hasModSeqCriteria := criteria.ModSeq != nil
-	_, hasCondStore := s.server.caps[imap.CapCondStore]
+	hasCondStore := s.hasServerCapability(imap.CapCondStore)
 
 	if hasCondStore && hasModSeqCriteria {
 		var highestModSeq uint64

@@ -10,8 +10,10 @@ import (
 
 // Create a new mailbox
 func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	// First phase: validation and mailbox lookup using read lock
+	s.mutex.RLock()
+	userID := s.UserID()
+	s.mutex.RUnlock()
 
 	// Split the mailbox name by the delimiter to check if it's nested
 	parts := strings.Split(name, string(consts.MailboxDelimiter))
@@ -20,7 +22,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 
 	// Check if this is a nested mailbox (i.e., it has a parent)
 	if len(parts) > 1 {
-		_, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), name)
+		_, err := s.server.db.GetMailboxByName(s.ctx, userID, name)
 		if err == nil {
 			s.Log("[CREATE] mailbox '%s' already exists", name)
 			return &imap.Error{
@@ -34,7 +36,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		parentPathComponents := parts[:len(parts)-1]
 		parentPath := strings.Join(parentPathComponents, string(consts.MailboxDelimiter))
 
-		parentMailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), parentPath)
+		parentMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, parentPath)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
 				s.Log("[CREATE] parent mailbox '%s' does not exist", parentPath)
@@ -51,7 +53,8 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
-	err := s.server.db.CreateMailbox(s.ctx, s.UserID(), name, parentMailboxID)
+	// Final phase: actual creation - no locks needed as it's a DB operation
+	err := s.server.db.CreateMailbox(s.ctx, userID, name, parentMailboxID)
 	if err != nil {
 		return s.internalError("failed to create mailbox '%s': %v", name, err)
 	}

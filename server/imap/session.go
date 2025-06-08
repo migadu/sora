@@ -155,3 +155,12 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	// Use the helper method that assumes the caller holds the lock
 	return s.decodeNumSetLocked(numSet)
 }
+
+// hasServerCapability safely checks if the server has a specific capability.
+// It acquires a read lock to protect access to server capabilities.
+func (s *IMAPSession) hasServerCapability(cap imap.Cap) bool {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	_, has := s.server.caps[cap]
+	return has
+}

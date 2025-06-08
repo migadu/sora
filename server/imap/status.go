@@ -8,7 +8,13 @@ import (
 )
 
 func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), mboxName)
+	// First phase: Read validation with read lock
+	s.mutex.RLock()
+	userID := s.UserID()
+	s.mutex.RUnlock()
+
+	// Middle phase: Database operations outside lock
+	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[STATUS] mailbox '%s' does not exist", mboxName)
