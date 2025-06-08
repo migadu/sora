@@ -300,7 +300,7 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 			COUNT(*) FILTER (WHERE expunged_at IS NULL) AS num_messages,
 			COALESCE(SUM(size) FILTER (WHERE expunged_at IS NULL), 0) AS total_size,
 			(
-				SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 0)
+				SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 1)
 				FROM messages m_mod
 				WHERE m_mod.mailbox_id = $1
 			) AS highest_modseq,
