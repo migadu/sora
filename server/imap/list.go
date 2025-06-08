@@ -11,9 +11,7 @@ import (
 )
 
 func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-
+	// If no patterns, just return a simple response without any database operations
 	if len(patterns) == 0 {
 		return w.WriteList(&imap.ListData{
 			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
@@ -21,6 +19,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		})
 	}
 
+	// Database operations should be done outside of lock
 	mboxes, err := s.server.db.GetMailboxes(s.ctx, s.UserID(), options.SelectSubscribed)
 	if err != nil {
 		return s.internalError("failed to fetch mailboxes: %v", err)
@@ -41,7 +40,26 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 
 		data := listMailbox(mbox, options, s.server.caps)
 		if data != nil {
-			if options.ReturnStatus != nil && data.Mailbox != "" && s.server.caps.Has(imap.CapListStatus) {
+			l = append(l, *data)
+		}
+	}
+
+	sort.Slice(l, func(i, j int) bool {
+		return l[i].Mailbox < l[j].Mailbox
+	})
+
+	// We only need read locks when accessing server capabilities
+	s.mutex.RLock()
+	hasListStatusCap := s.server.caps.Has(imap.CapListStatus)
+	s.mutex.RUnlock()
+
+	// Now handle STATUS returns if needed - after we've processed all mailboxes
+	// This avoids the deadlock when Status() tries to acquire a write lock
+	if options.ReturnStatus != nil && hasListStatusCap {
+		// Process STATUS returns in a separate loop to avoid lock contention
+		for i := range l {
+			data := &l[i]
+			if data.Mailbox != "" {
 				statusData, err := s.Status(data.Mailbox, options.ReturnStatus)
 				if err == nil && statusData != nil {
 					data.Status = statusData
@@ -56,15 +74,10 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 					s.Log("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err)
 				}
 			}
-
-			l = append(l, *data)
 		}
 	}
 
-	sort.Slice(l, func(i, j int) bool {
-		return l[i].Mailbox < l[j].Mailbox
-	})
-
+	// Write all responses
 	for _, data := range l {
 		if err := w.WriteList(&data); err != nil {
 			return err
