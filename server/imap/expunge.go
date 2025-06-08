@@ -7,9 +7,19 @@ import (
 
 func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
 	// First phase: Read session state with read lock
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[EXPUNGE] Failed to acquire read lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
+		cancel()
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -19,6 +29,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	mailboxID := s.selectedMailbox.ID
 	sessionTrackerSnapshot := s.sessionTracker
 	s.mutex.RUnlock()
+	cancel()
 
 	// Middle phase: Get messages to expunge (outside lock)
 	messages, err := s.server.db.GetMessagesByFlag(s.ctx, mailboxID, imap.FlagDeleted)
@@ -64,16 +75,27 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// Final phase: Update session state - write lock needed
-	s.mutex.Lock()
+	acquired, cancel = s.acquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("[EXPUNGE] Failed to acquire write lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	// Verify mailbox still selected and tracker still valid
 	if s.selectedMailbox == nil || s.selectedMailbox.ID != mailboxID || s.mailboxTracker == nil {
 		s.mutex.Unlock()
+		cancel()
 		return nil
 	}
 
 	// Update our count using atomic operation
 	s.currentNumMessages.Add(^uint32(len(messagesToExpunge) - 1)) // Subtract len(messagesToExpunge)
 	s.mutex.Unlock()
+	cancel()
 
 	// Send notifications using snapshot
 	for _, m := range messagesToExpunge {

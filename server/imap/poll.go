@@ -8,22 +8,44 @@ import (
 
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	// First phase: Read state with read lock
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[POLL] Failed to acquire read lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	if s.selectedMailbox == nil || s.mailboxTracker == nil || s.sessionTracker == nil {
 		s.mutex.RUnlock()
+		cancel()
 		return nil
 	}
 	mailboxID := s.selectedMailbox.ID
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	s.mutex.RUnlock()
+	cancel()
 
 	poll, err := s.server.db.PollMailbox(s.ctx, mailboxID, highestModSeqToPollFrom)
 	if err != nil {
 		return s.internalError("failed to poll mailbox: %v", err)
 	}
 
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	acquired, cancel = s.acquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("[POLL] Failed to acquire write lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+	defer func() {
+		s.mutex.Unlock()
+		cancel()
+	}()
 
 	if s.selectedMailbox == nil || s.selectedMailbox.ID != mailboxID || s.mailboxTracker == nil || s.sessionTracker == nil {
 		return nil

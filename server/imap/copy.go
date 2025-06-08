@@ -9,9 +9,19 @@ import (
 
 func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
 	// First phase: Read session state with read lock
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[COPY] Failed to acquire read lock within timeout")
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
+		cancel()
 		s.Log("[COPY] copy failed: no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -23,6 +33,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	selectedMailboxName := s.selectedMailbox.Name
 	userID := s.UserID()
 	s.mutex.RUnlock()
+	cancel()
 
 	// Use decoded numSet - this safely acquires its own read lock
 	decodedNumSet := s.decodeNumSet(numSet)

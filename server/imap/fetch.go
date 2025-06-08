@@ -21,7 +21,17 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read all session state in one go
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[FETCH] Failed to acquire read lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+	defer cancel()
+
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
 		s.Log("[FETCH] no mailbox selected")

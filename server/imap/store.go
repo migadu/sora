@@ -11,9 +11,19 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[STORE] Failed to acquire read lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
+		cancel()
 		s.Log("[STORE] store failed: no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -27,6 +37,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	s.mutex.RUnlock()
+	cancel()
 
 	// Perform database operations outside of lock
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
@@ -112,9 +123,14 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
-	s.mutex.RLock()
+	acquired, cancel = s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[STORE] Failed to acquire second read lock within timeout")
+		return nil // Continue without sending responses since we already updated the flags
+	}
 	currentSessionTracker := s.sessionTracker // Get the current session tracker
 	s.mutex.RUnlock()
+	cancel()
 
 	if !flags.Silent && currentSessionTracker != nil {
 		for _, modified := range modifiedMessages {

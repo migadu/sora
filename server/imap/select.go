@@ -12,9 +12,18 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.Log("[SELECT] attempting to select mailbox: %s", mboxName)
 
 	// Phase 1: Read session state with read lock
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SELECT] Failed to acquire read lock within timeout")
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
 	userID := s.UserID()
 	s.mutex.RUnlock()
+	cancel()
 
 	// Phase 2: Database operations outside lock
 	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
@@ -37,7 +46,16 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// First, acquire the read lock once to read necessary session state
-	s.mutex.RLock()
+	acquired, cancel = s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SELECT] Failed to acquire second read lock within timeout")
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	// Check if this is a reselection of the previously selected mailbox
 	isReselectOfPrevious := (s.lastSelectedMailboxID == mailbox.ID)
 	// Store the highest UID from previous selection to calculate recent messages
@@ -45,10 +63,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Check if the context is already cancelled before proceeding with DB operations
 	if s.ctx.Err() != nil {
 		s.mutex.RUnlock()
+		cancel()
 		s.Log("[SELECT] context already cancelled before selecting mailbox '%s'", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 	s.mutex.RUnlock()
+	cancel()
 
 	// Now perform all database operations outside the lock
 	var numRecent uint32
@@ -71,8 +91,19 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Acquire the lock once after all DB operations to update session state
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	acquired, cancel = s.acquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("[SELECT] Failed to acquire write lock within timeout")
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+	defer func() {
+		s.mutex.Unlock()
+		cancel()
+	}()
 
 	// Check again if the context was cancelled during DB operations
 	if s.ctx.Err() != nil {
@@ -116,8 +147,19 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 }
 
 func (s *IMAPSession) Unselect() error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	acquired, cancel := s.acquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("[UNSELECT] Failed to acquire write lock within timeout")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+	defer func() {
+		s.mutex.Unlock()
+		cancel()
+	}()
 
 	if s.selectedMailbox != nil {
 		s.Log("[UNSELECT] mailbox %s (ID: %d) cleared from session state.", s.selectedMailbox.Name, s.selectedMailbox.ID)

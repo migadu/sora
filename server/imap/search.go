@@ -12,9 +12,19 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 
 	// Acquire read mutex to safely read session state
-	s.mutex.RLock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SEARCH] Failed to acquire read lock within timeout")
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: "Server busy, please try again",
+		}
+	}
+
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
+		cancel()
 		s.Log("[SEARCH] no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -26,6 +36,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	currentNumMessages = s.currentNumMessages.Load()
 	sessionTrackerSnapshot = s.sessionTracker
 	s.mutex.RUnlock()
+	cancel()
 
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
@@ -162,8 +173,16 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 
 // decodeSearchCriteria safely acquires the read mutex and translates sequence numbers in search criteria.
 func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SEARCH] Failed to acquire read lock for decodeSearchCriteria within timeout")
+		// Return unmodified criteria if we can't acquire the lock
+		return criteria
+	}
+	defer func() {
+		s.mutex.RUnlock()
+		cancel()
+	}()
 
 	return s.decodeSearchCriteriaLocked(criteria)
 }
