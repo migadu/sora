@@ -1,79 +1,154 @@
 # Sora Mail Server Configuration
+
+# Specifies where log output should be directed.
+# "stderr": Log to standard error.
+# "stdout": Log to standard output.
+# "syslog": Log to syslog (Unix-like systems only).
+# "/path/to/logfile.log": Log to a specified file.
 log_output = "stderr"
 
+# --- Database Configuration ---
 [database]
+# Hostname or IP address of the PostgreSQL server.
 host = "localhost"
+# Port number the PostgreSQL server is listening on.
 port = "5432"
+# Username for connecting to the PostgreSQL database.
 user = "postgres"
+# Password for the PostgreSQL user. Leave empty if no password is set.
 password = ""
+# Name of the PostgreSQL database to use.
 name = "sora_mail_db"
+# Whether to use TLS (SSL) for the connection to the PostgreSQL server.
 tls = false
+# If true, all SQL queries executed by Sora will be logged. Useful for debugging.
 log_queries = false
 
+# --- S3-Compatible Object Storage Configuration ---
 [s3]
+# S3-compatible storage endpoint URL. For AWS S3, this is typically "s3.amazonaws.com".
 endpoint = "s3.amazonaws.com"
+# Your S3 access key ID.
 access_key = "YOUR_S3_ACCESS_KEY_HERE"
+# Your S3 secret access key.
 secret_key = "YOUR_S3_SECRET_KEY_HERE"
+# The name of the S3 bucket where mail data will be stored.
 bucket = "your-sora-mail-bucket"
+# If true, enables detailed S3 client request tracing. Useful for debugging S3 communication.
 trace = false
 
+# --- Local Cache Configuration ---
 [local_cache]
+# Filesystem path where local cache data will be stored.
 path = "/tmp/sora/cache"
+# Maximum total size of the local cache (e.g., "1gb", "500mb").
 capacity = "1gb"
+# Maximum size of a single object that can be stored in the local cache (e.g., "5mb", "100kb").
 max_object_size = "5mb"
 
+# --- Uploader Configuration (for staging and uploading to S3) ---
 [uploader]
+# Filesystem path used for temporarily staging files before they are uploaded to S3.
 path = "/tmp/sora/uploads"
+# Number of mail items to batch together for a single upload operation.
 batch_size = 20
+# Number of concurrent upload operations.
 concurrency = 10
+# Maximum number of times to attempt uploading a batch if an error occurs.
 max_attempts = 5
+# Time duration to wait before retrying a failed upload (e.g., "30s", "1m").
 retry_interval = "30s"
 
+# --- Cleanup Process Configuration (for removing old/deleted items) ---
 [cleanup]
+# Time duration for which deleted items are kept before being permanently removed (e.g., "14d", "30d").
 grace_period = "14d"
+# How often the cleanup process should run to remove old items (e.g., "1h", "24h").
 wake_interval = "1h"
 
-# Server configurations
+# --- General Server Configurations ---
 [servers]
+# Global debug flag for all server components. If true, enables more verbose logging for server operations.
 debug = false
 
+# --- IMAP Server Configuration ---
 [servers.imap]
+# Whether to start the IMAP server.
 start = true
-addr = ":143" # Use ":993" for IMAPS default
+# Address and port for the IMAP server to listen on (e.g., ":143" for IMAP, ":993" for IMAPS).
+addr = ":143"
+# Maximum message size allowed for the IMAP APPEND command.
+# If not defined or set to an empty string, there is no limit. (e.g., "25mb").
 append_limit = "25mb" # Maximum message size for IMAP APPEND command, unlimited if not defined
+# Master username for IMAP administrative access (e.g., for proxying).
 master_username = ""
+# Password for the IMAP master username.
 master_password = ""
+# SASL username for IMAP master user (alternative to master_username/master_password, often used with specific SASL mechanisms).
 master_sasl_username = ""
+# SASL password for the IMAP master SASL username.
 master_sasl_password = ""
-tls = false # instead of enable = false
+# Whether to enable TLS for the IMAP server (IMAPS). If true, addr should typically be ":993".
+tls = false
+# Path to the TLS certificate file for IMAPS.
 tls_cert_file = "/path/to/your/imap.crt"
+# Path to the TLS private key file for IMAPS.
 tls_key_file = "/path/to/your/imap.key"
+# Whether to verify client certificates (if client presents one). Not commonly used for standard IMAP.
 tls_verify = true
 
+# --- LMTP Server Configuration ---
 [servers.lmtp]
+# Whether to start the LMTP server.
 start = true
+# Address and port for the LMTP server to listen on (e.g., ":24").
 addr = ":24"
+# Optional external SMTP relay to forward mail through if Sora is not the final delivery agent.
+# Format: "hostname:port" (e.g., "smtp.your-relay.com:25").
 external_relay = "" # e.g. "smtp.your-relay.com:25"
+# Whether to enable TLS for the LMTP server.
 tls = false
+# If true, LMTP will use STARTTLS to upgrade an insecure connection to TLS.
+# If 'tls' is true, this is usually false as the connection starts as TLS.
 tls_use_starttls = false
+# Path to the TLS certificate file for LMTP.
 tls_cert_file = "/path/to/your/lmtp.crt"
+# Path to the TLS private key file for LMTP.
 tls_key_file = "/path/to/your/lmtp.key"
+# Whether to verify client certificates during TLS handshake.
 tls_verify = true
 
+# --- POP3 Server Configuration ---
 [servers.pop3]
+# Whether to start the POP3 server.
 start = true
+# Address and port for the POP3 server to listen on (e.g., ":110" for POP3, ":995" for POP3S).
 addr = ":110" 
+# Whether to enable TLS for the POP3 server (POP3S). If true, addr should typically be ":995".
 tls = false
+# Path to the TLS certificate file for POP3S.
 tls_cert_file = "/path/to/your/pop3.crt"
+# Path to the TLS private key file for POP3S.
 tls_key_file = "/path/to/your/pop3.key"
+# Whether to verify client certificates. Not commonly used for standard POP3.
 tls_verify = false
 
+# --- ManageSieve Server Configuration ---
 [servers.managesieve]
+# Whether to start the ManageSieve server (for Sieve script management).
 start = true
+# Address and port for the ManageSieve server to listen on (e.g., ":4190").
 addr = ":4190"
+# If true, allows authentication over unencrypted connections. Not recommended for production.
 insecure_auth = false
+# Whether to enable TLS for the ManageSieve server.
 tls = false
+# If true, ManageSieve will use STARTTLS to upgrade an insecure connection to TLS.
+# If 'tls' is true, this is usually false as the connection starts as TLS.
 tls_use_starttls = false
+# Path to the TLS certificate file for ManageSieve.
 tls_cert_file = "/path/to/your/managesieve.crt"
+# Path to the TLS private key file for ManageSieve.
 tls_key_file = "/path/to/your/managesieve.key"
+# Whether to verify client certificates during TLS handshake.
 tls_verify = true

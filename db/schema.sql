@@ -1,6 +1,5 @@
--- This file contains the SQL schema for the mail server database.
---
--- Ensure your database has the necessary extensions installed, such as pg_trgm for full-text search.
+-- PostgreSQL schema for managing email accounts, credentials, mailboxes, messages, and SIEVE scripts
+-- Ensure the database has the necessary extensions installed, such as pg_trgm for full-text search.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -84,8 +83,8 @@ CREATE TABLE IF NOT EXISTS messages (
 	--
 	mailbox_path TEXT,			    -- Store the mailbox path for restoring messages
 
-	flags_changed_at TIMESTAMPTZ,     -- Track the last time flags were changed
-	expunged_at TIMESTAMPTZ,			-- Track the last time the message was expunged
+	flags_changed_at TIMESTAMPTZ,   -- Track the last time flags were changed
+	expunged_at TIMESTAMPTZ,		-- Track the last time the message was expunged
 
 	created_modseq BIGINT NOT NULL,
 	updated_modseq BIGINT,

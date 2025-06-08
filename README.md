@@ -24,7 +24,7 @@ It serves as a lightweight building block for larger infrastructure systems, wit
 
 ## Use Cases
 
-Sora is ideal for:
+Sora is for:
 
 - Custom cloud-native email infrastructure
 - Research and experimentation
@@ -45,18 +45,29 @@ Use in test environments only. Patches and pull requests are welcome.
 ## Requirements
 
 - Go 1.20+
-- PostgreSQL
+- PostgreSQL compatible database
 - S3-compatible object storage (e.g. MinIO, AWS S3)
 
 ---
 
 ## Getting Started
 
+1.  **Clone the repository:**
 ```bash
 git clone https://github.com/yourname/sora.git
 cd sora
-go run main.go -insecure-auth -debug -seed \
-  -imap -lmtp -pop3 \
-  -s3accesskey YOUR_S3_ACCESS_KEY -s3bucket YOUR_S3_BUCKET -s3secretkey YOUR_S3_SECRET_KEY -s3endpoint YOUR_S3_ENDPOINT \
-  -dbhost DB_HOST \
-  -debug     
+```
+
+2.  **Create and edit your configuration file:**
+Copy the example configuration and then edit `config.toml` with your specific settings (database credentials, S3 details, server preferences, etc.).
+```bash
+cp config.toml.example config.toml
+nano config.toml # Or your preferred editor
+```
+Refer to the comments within `config.toml.example` for guidance on each option.
+
+3.  **Run Sora:**
+Point to your configuration file when running the application:
+```bash
+go run main.go -config config.toml
+```

@@ -5,9 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"log/syslog" // Added for syslog logging
+	"log/syslog"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/BurntSushi/toml"
@@ -23,7 +24,6 @@ import (
 )
 
 func main() {
-	// Initialize with application defaults
 	cfg := newDefaultConfig()
 
 	// --- Define Command-Line Flags ---
@@ -139,27 +139,67 @@ func main() {
 
 	// --- Initialize Logging ---
 	// This must be done *after* flags are parsed and config is loaded.
+	var logFile *os.File // Declare here to manage its scope for deferred closing
 	var initialLogMessage string
 
 	switch finalLogOutput {
+	case "stdout":
+		log.SetOutput(os.Stdout)
+		initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to standard output (selected by '%s').", finalLogOutput)
 	case "syslog":
-		syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "sora")
-		if err != nil {
-			log.Printf("WARNING: Failed to connect to syslog (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, err)
-			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog connection failed, selected by '%s').", finalLogOutput)
+		if runtime.GOOS != "windows" {
+			syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "sora")
+			if err != nil {
+				log.Printf("WARNING: Failed to connect to syslog (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, err)
+				initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog connection failed, selected by '%s').", finalLogOutput)
+			} else {
+				log.SetOutput(syslogWriter)
+				log.SetFlags(0) // syslog handles timestamps
+				defer syslogWriter.Close()
+				initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to syslog (selected by '%s').", finalLogOutput)
+			}
 		} else {
-			log.SetOutput(syslogWriter)
-			log.SetFlags(0)
-			defer syslogWriter.Close()
-			initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to syslog (selected by '%s').", finalLogOutput)
+			log.Printf("WARNING: Syslog logging is not supported on Windows (specified by '%s'). Logging will fall back to standard error.", finalLogOutput)
+			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog not supported on this OS, selected by '%s').", finalLogOutput)
 		}
 	case "stderr":
 		initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to standard error (selected by '%s').", finalLogOutput)
 	default:
-		log.Printf("WARNING: Invalid logoutput value '%s' (from config or flag). Application will log to standard error.", finalLogOutput)
-		initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (invalid logoutput '%s').", finalLogOutput)
+		// Assume it's a file path
+		var openErr error
+		logFile, openErr = os.OpenFile(finalLogOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if openErr != nil {
+			// At this point, log output might still be stderr or the default.
+			log.Printf("WARNING: Failed to open log file '%s' (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, finalLogOutput, openErr)
+			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (failed to open log file '%s', selected by '%s').", finalLogOutput, finalLogOutput)
+			logFile = nil // Ensure logFile is nil if open failed
+		} else {
+			log.SetOutput(logFile)
+			// Keep standard log flags (date, time) for file logging
+			initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to file '%s' (selected by '%s').", finalLogOutput, finalLogOutput)
+		}
 	}
 	log.Println(initialLogMessage)
+
+	// If logFile was successfully opened, defer its closure.
+	if logFile != nil {
+		defer func(f *os.File) {
+			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
+			}
+		}(logFile)
+	}
+
+	log.Println("")
+	log.Println(" ░▒▓███████▓▒░░▒▓██████▓▒░░▒▓███████▓▒░ ░▒▓██████▓▒░ ")
+	log.Println("░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ")
+	log.Println("░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ")
+	log.Println(" ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░ ")
+	log.Println("       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ")
+	log.Println("       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ")
+	log.Println("░▒▓███████▓▒░ ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ")
+	log.Println("")
 
 	// --- Apply Command-Line Flag Overrides (for flags other than logoutput) ---
 	// If a flag was explicitly set on the command line, its value overrides both
