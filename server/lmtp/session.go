@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -78,6 +79,7 @@ type LMTPSession struct {
 	conn    *smtp.Conn
 	cancel  context.CancelFunc
 	ctx     context.Context
+	mutex   sync.RWMutex
 }
 
 func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
@@ -91,7 +93,22 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 			Message:      "Invalid sender",
 		}
 	}
+
+	// Acquire write lock to update sender
+	acquired, cancel := s.acquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[LMTP] failed to acquire write lock for Mail command")
+		return &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+			Message:      "Server busy, try again later",
+		}
+	}
+
 	s.sender = &fromAddress
+	s.mutex.Unlock()
+
 	s.Log("[LMTP] mail from=%s accepted", fromAddress.FullAddress())
 	return nil
 }
@@ -118,7 +135,21 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Message:      "No such user here",
 		}
 	}
+
+	// Acquire write lock to update User
+	acquired, cancel := s.acquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[LMTP] failed to acquire write lock for Rcpt command")
+		return &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+			Message:      "Server busy, try again later",
+		}
+	}
+
 	s.User = server.NewUser(toAddress, userId)
+	s.mutex.Unlock()
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
 	err = s.backend.db.CreateDefaultMailboxes(s.ctx, userId)
@@ -131,6 +162,29 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 }
 
 func (s *LMTPSession) Data(r io.Reader) error {
+	// Acquire read lock for accessing session state during message processing
+	acquired, cancel := s.acquireReadLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[LMTP] failed to acquire read lock for Data command")
+		return &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+			Message:      "Server busy, try again later",
+		}
+	}
+	defer s.mutex.RUnlock()
+
+	// Check if we have a valid sender and recipient
+	if s.sender == nil || s.User == nil {
+		s.Log("[LMTP] DATA command received without valid sender or recipient")
+		return &smtp.SMTPError{
+			Code:         503,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "Bad sequence of commands (missing MAIL FROM or RCPT TO)",
+		}
+	}
+
 	var buf bytes.Buffer
 	_, err := io.Copy(&buf, r)
 	if err != nil {
@@ -404,8 +458,18 @@ func (s *LMTPSession) Data(r io.Reader) error {
 }
 
 func (s *LMTPSession) Reset() {
+	// Acquire write lock to reset session state
+	acquired, cancel := s.acquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[LMTP] failed to acquire write lock for Reset command")
+		return
+	}
+
 	s.User = nil
 	s.sender = nil
+	s.mutex.Unlock()
+
 	s.Log("[LMTP] session reset")
 }
 
@@ -415,6 +479,17 @@ func (s *LMTPSession) Logout() error {
 		s.Log("[LMTP] session logout requested")
 	} else {
 		s.Log("[LMTP] client dropped connection")
+	}
+
+	// Acquire write lock for logout operations
+	acquired, cancel := s.acquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[LMTP] failed to acquire write lock for Logout command")
+		// Continue with logout even if we can't get the lock
+	} else {
+		// Clean up any session state if needed
+		s.mutex.Unlock()
 	}
 
 	if s.cancel != nil {
