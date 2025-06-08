@@ -1,7 +1,6 @@
 package imap
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -78,7 +77,6 @@ func (s *IMAPSession) Login(address, password string) error {
 
 func parseMasterLogin(username string) (realuser, authuser string) {
 	parts := strings.SplitN(username, MasterUsernameSeparator, 2)
-	fmt.Println(parts)
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
