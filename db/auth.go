@@ -221,8 +221,58 @@ func verifyPassword(hashedPassword, password string) error {
 	}
 }
 
+// needsRehash checks if a bcrypt hash needs to be rehashed with the current default cost
+func needsRehash(hash string) bool {
+	// Only check bcrypt hashes
+	hash = strings.TrimPrefix(hash, "{BLF-CRYPT}")
+
+	// Check if it's a bcrypt hash
+	if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") && !strings.HasPrefix(hash, "$2y$") {
+		return false
+	}
+
+	// Extract the cost
+	// bcrypt hash format: $2a$cost$...
+	parts := strings.Split(hash, "$")
+	if len(parts) < 3 {
+		return false
+	}
+
+	costStr := strings.TrimRight(parts[2], "0123456789")
+	if costStr != "" {
+		// Invalid format
+		return false
+	}
+
+	// Current cost should be between the $2a$ and the next $
+	currentCost := parts[2]
+	defaultCost := fmt.Sprintf("%02d", bcrypt.DefaultCost)
+
+	return currentCost != defaultCost
+}
+
+// UpdatePassword updates the stored password for a user
+func (db *Database) UpdatePassword(ctx context.Context, address string, newHashedPassword string) error {
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+	if normalizedAddress == "" {
+		return errors.New("address cannot be empty")
+	}
+
+	_, err := db.Pool.Exec(ctx,
+		"UPDATE credentials SET password = $1 WHERE address = $2",
+		newHashedPassword, normalizedAddress)
+
+	if err != nil {
+		log.Printf("error updating password for address %s: %v", normalizedAddress, err)
+		return fmt.Errorf("database error updating password: %w", err)
+	}
+
+	return nil
+}
+
 // Authenticate verifies the provided address and password against the records
 // in the `credentials` table. If successful, it returns the associated `account_id`.
+// If the password's hash cost is different from the default, it will be re-hashed and updated.
 func (db *Database) Authenticate(ctx context.Context, address string, password string) (int64, error) {
 	var hashedPassword string
 	var accountID int64
@@ -255,6 +305,34 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 	}
 
 	// Authentication successful
+
+	// Check if the password needs to be rehashed (bcrypt cost changed)
+	if needsRehash(hashedPassword) {
+		// Generate a new hash with the current default cost
+		newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("warning: failed to rehash password for address %s: %v", normalizedAddress, err)
+			// Continue even if rehashing fails
+		} else {
+			// If it's a BLF-CRYPT format, preserve the prefix
+			var newHashedPassword string
+			if strings.HasPrefix(hashedPassword, "{BLF-CRYPT}") {
+				newHashedPassword = "{BLF-CRYPT}" + string(newHash)
+			} else {
+				newHashedPassword = string(newHash)
+			}
+
+			// Update the stored password
+			err = db.UpdatePassword(ctx, normalizedAddress, newHashedPassword)
+			if err != nil {
+				log.Printf("warning: failed to update rehashed password for address %s: %v", normalizedAddress, err)
+				// Continue even if update fails
+			} else {
+				log.Printf("rehashed password with new cost for address %s", normalizedAddress)
+			}
+		}
+	}
+
 	return accountID, nil
 }
 
