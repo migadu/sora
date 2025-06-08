@@ -19,7 +19,7 @@ type IMAPSession struct {
 	conn   *imapserver.Conn
 	ctx    context.Context
 	cancel context.CancelFunc
-	mutex  sync.Mutex
+	mutex  sync.RWMutex
 
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
@@ -82,7 +82,9 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentNumMessages = 0
 }
 
-func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
+// decodeNumSetLocked translates client sequence numbers to server sequence numbers.
+// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
+func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 	if s.sessionTracker == nil {
 		return numSet
 	}
@@ -141,4 +143,15 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 		return imap.SeqSet{}
 	}
 	return out
+}
+
+// decodeNumSet translates client sequence numbers to server sequence numbers.
+// It safely acquires the read mutex to protect access to session state.
+func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
+	// Acquire read mutex to protect access to session state
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	// Use the helper method that assumes the caller holds the lock
+	return s.decodeNumSetLocked(numSet)
 }

@@ -146,10 +146,31 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to insert message metadata: %v", err)
 	}
 
-	// If the message was appended to the currently selected mailbox,
-	// update the session's message count and notify the tracker.
-	// This requires protecting access to session state like s.selectedMailbox.
+	// Before updating the session state, check if the context is still valid
+	// and then update the session state under mutex protection
+	if s.ctx.Err() != nil {
+		s.Log("[APPEND] context cancelled after message insertion, aborting session state update")
+		// We've already inserted the message successfully, so still return success
+		return &imap.AppendData{
+			UID:         imap.UID(messageUID),
+			UIDValidity: mailbox.UIDValidity,
+		}, nil
+	}
+
+	// Update the session's message count and notify the tracker if needed
 	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	// After re-acquiring the lock, check again if the context is still valid
+	if s.ctx.Err() != nil {
+		s.Log("[APPEND] context cancelled during mutex acquisition, aborting session state update")
+		return &imap.AppendData{
+			UID:         imap.UID(messageUID),
+			UIDValidity: mailbox.UIDValidity,
+		}, nil
+	}
+
+	// Update session state if this message was appended to the currently selected mailbox
 	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailbox.ID {
 		s.currentNumMessages++ // Increment the count for the selected mailbox
 		if s.mailboxTracker != nil {
@@ -159,7 +180,6 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			s.Log("[APPEND] Inconsistent state: selectedMailbox ID %d is set, but mailboxTracker is nil.", s.selectedMailbox.ID)
 		}
 	}
-	s.mutex.Unlock()
 
 	s.server.uploader.NotifyUploadQueued()
 

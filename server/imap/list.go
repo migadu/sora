@@ -11,8 +11,8 @@ import (
 )
 
 func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
 	if len(patterns) == 0 {
 		return w.WriteList(&imap.ListData{

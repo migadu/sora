@@ -15,9 +15,15 @@ import (
 )
 
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
-	s.mutex.Lock()
+	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
+	var selectedMailboxID int64
+	var sessionTrackerSnapshot *imapserver.SessionTracker
+	var decodedNumSet imap.NumSet
+
+	// Acquire read mutex to safely read all session state in one go
+	s.mutex.RLock()
 	if s.selectedMailbox == nil {
-		s.mutex.Unlock()
+		s.mutex.RUnlock()
 		s.Log("[FETCH] no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -25,9 +31,13 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			Text: "No mailbox selected",
 		}
 	}
-	selectedMailboxID := s.selectedMailbox.ID
-	decodedNumSet := s.decodeNumSet(numSet)
-	s.mutex.Unlock()
+
+	selectedMailboxID = s.selectedMailbox.ID
+	sessionTrackerSnapshot = s.sessionTracker
+
+	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
+	decodedNumSet = s.decodeNumSetLocked(numSet)
+	s.mutex.RUnlock()
 
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
@@ -68,17 +78,17 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		messages = filteredMessages
 	}
 
-	for _, msg := range messages {
-		s.mutex.Lock()
-		sessionTrackerSnapshot := s.sessionTracker
-		if s.selectedMailbox == nil || s.selectedMailbox.ID != selectedMailboxID || sessionTrackerSnapshot == nil {
-			s.mutex.Unlock()
-			s.Log("[FETCH] mailbox unselected or changed during FETCH loop, aborting further messages.")
-			return nil
-		}
-		s.mutex.Unlock()
+	// We don't need to check mailbox validity again since we'll use the snapshot consistently
+	// and will detect any issues with the individual message sequence numbers
 
-		// Pass pointers for bodyData and bodyDataFetched to be shared across handlers for a single message
+	if sessionTrackerSnapshot == nil {
+		s.Log("[FETCH] session tracker is nil, cannot process messages")
+		return nil
+	}
+
+	// Process all messages without repeatedly acquiring the mutex
+	for _, msg := range messages {
+		// Use the previously captured sessionTrackerSnapshot for all messages
 		if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
 			return err
 		}

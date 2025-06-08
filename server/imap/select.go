@@ -30,16 +30,22 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
 	}
 
-	// Determine NumRecent based on whether this mailbox was the last one selected.
-	// This logic is outside the main session lock for the DB call, then re-locks for state update.
-	var numRecent uint32
-	var isReselectOfPrevious bool
-	var uidToCompareAgainst imap.UID
+	// First, acquire the read lock once to read necessary session state
+	s.mutex.RLock()
+	// Check if this is a reselection of the previously selected mailbox
+	isReselectOfPrevious := (s.lastSelectedMailboxID == mailbox.ID)
+	// Store the highest UID from previous selection to calculate recent messages
+	uidToCompareAgainst := s.lastHighestUID
+	// Check if the context is already cancelled before proceeding with DB operations
+	if s.ctx.Err() != nil {
+		s.mutex.RUnlock()
+		s.Log("[SELECT] context already cancelled before selecting mailbox '%s'", mboxName)
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
+	}
+	s.mutex.RUnlock()
 
-	s.mutex.Lock()
-	isReselectOfPrevious = (s.lastSelectedMailboxID == mailbox.ID)
-	uidToCompareAgainst = s.lastHighestUID // This is the highest UID from the *previous* selection of this mailbox.
-	s.mutex.Unlock()
+	// Now perform all database operations outside the lock
+	var numRecent uint32
 
 	if isReselectOfPrevious {
 		s.Log("[SELECT] mailbox %s reselected", mboxName)
@@ -58,13 +64,13 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		numRecent = uint32(currentSummary.NumMessages)
 	}
 
+	// Acquire the lock once after all DB operations to update session state
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	// After re-acquiring the lock, check if the session context was cancelled
-	// (e.g., by s.Close() being called concurrently while DB operations were in progress).
+	// Check again if the context was cancelled during DB operations
 	if s.ctx.Err() != nil {
-		s.Log("[SELECT] context cancelled while selecting mailbox '%s', aborting state update.", mboxName)
+		s.Log("[SELECT] context cancelled during mailbox '%s' selection, aborting state update", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 
