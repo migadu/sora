@@ -74,12 +74,13 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
-	backend *LMTPServerBackend
-	sender  *server.Address
-	conn    *smtp.Conn
-	cancel  context.CancelFunc
-	ctx     context.Context
-	mutex   sync.RWMutex
+	backend     *LMTPServerBackend
+	sender      *server.Address
+	conn        *smtp.Conn
+	cancel      context.CancelFunc
+	ctx         context.Context
+	mutex       sync.RWMutex
+	mutexHelper *server.MutexTimeoutHelper
 }
 
 func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
@@ -95,7 +96,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	// Acquire write lock to update sender
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
 		s.Log("[LMTP] failed to acquire write lock for Mail command")
@@ -137,7 +138,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	// Acquire write lock to update User
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
 		s.Log("[LMTP] failed to acquire write lock for Rcpt command")
@@ -163,7 +164,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 func (s *LMTPSession) Data(r io.Reader) error {
 	// Acquire read lock for accessing session state during message processing
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	defer cancel()
 	if !acquired {
 		s.Log("[LMTP] failed to acquire read lock for Data command")
@@ -459,7 +460,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 func (s *LMTPSession) Reset() {
 	// Acquire write lock to reset session state
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
 		s.Log("[LMTP] failed to acquire write lock for Reset command")
@@ -482,7 +483,7 @@ func (s *LMTPSession) Logout() error {
 	}
 
 	// Acquire write lock for logout operations
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
 		s.Log("[LMTP] failed to acquire write lock for Logout command")

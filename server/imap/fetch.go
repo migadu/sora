@@ -21,7 +21,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read all session state in one go
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[FETCH] Failed to acquire read lock within timeout")
 		return &imap.Error{

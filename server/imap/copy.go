@@ -9,7 +9,7 @@ import (
 
 func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
 	// First phase: Read session state with read lock
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[COPY] Failed to acquire read lock within timeout")
 		return nil, &imap.Error{

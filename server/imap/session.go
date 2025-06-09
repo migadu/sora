@@ -16,11 +16,12 @@ import (
 type IMAPSession struct {
 	server.Session
 	*IMAPUser
-	server *IMAPServer
-	conn   *imapserver.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	mutex  sync.RWMutex
+	server      *IMAPServer
+	conn        *imapserver.Conn
+	ctx         context.Context
+	cancel      context.CancelFunc
+	mutex       sync.RWMutex
+	mutexHelper *server.MutexTimeoutHelper
 
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
@@ -151,7 +152,7 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 // It safely acquires the read mutex to protect access to session state.
 func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	// Acquire read mutex with timeout to protect access to session state
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[DECODE] Failed to acquire read lock for decodeNumSet within timeout")
 		// Return unmodified set if we can't acquire the lock

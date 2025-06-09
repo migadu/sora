@@ -12,6 +12,7 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -109,6 +110,14 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	s.Id = uuid.New().String()
 	s.HostName = b.hostname
 	s.Protocol = "LMTP"
+
+	// Create logging function for the mutex helper
+	logFunc := func(format string, args ...interface{}) {
+		s.Log(format, args...)
+	}
+
+	// Initialize the mutex helper
+	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
 
 	s.Log("[LMTP] new session remote=%s id=%s", s.RemoteIP, s.Id)
 

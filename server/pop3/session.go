@@ -26,9 +26,10 @@ const Pop3IdleTimeout = 5 * time.Minute // Maximum duration of inactivity before
 type POP3Session struct {
 	server.Session
 	server         *POP3Server
-	conn           *net.Conn          // Connection to the client
-	*server.User                      // User associated with the session
-	mutex          sync.RWMutex       // Mutex for protecting session state
+	conn           *net.Conn    // Connection to the client
+	*server.User                // User associated with the session
+	mutex          sync.RWMutex // Mutex for protecting session state
+	mutexHelper    *server.MutexTimeoutHelper
 	authenticated  bool               // Flag to indicate if the user has been authenticated
 	messages       []db.Message       // List of messages in the mailbox as returned by the LIST command
 	deleted        map[int]bool       // Map of message IDs marked for deletion
@@ -84,7 +85,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check authentication state
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -124,7 +125,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check authentication state
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -177,7 +178,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update session state
-			acquired, cancel = s.acquireWriteLockWithTimeout()
+			acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -201,7 +202,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check inbox mailbox ID
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -230,7 +231,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check authentication state
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -259,7 +260,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update session state
-			acquired, cancel = s.acquireWriteLockWithTimeout()
+			acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -278,7 +279,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to access messages and deleted status
-			acquired, cancel = s.acquireReadLockWithTimeout()
+			acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -311,7 +312,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check authentication state
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -395,7 +396,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Update session state with the messages
-				acquired, cancel = s.acquireWriteLockWithTimeout()
+				acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 				if !acquired {
 					s.Log("[POP3] Failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -457,7 +458,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update deleted map
-			acquired, cancel := s.acquireWriteLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -480,7 +481,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check authentication state
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -544,7 +545,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update deleted map
-			acquired, cancel = s.acquireWriteLockWithTimeout()
+			acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -567,7 +568,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to access messages, deleted map, and mailbox ID
-			acquired, cancel := s.acquireReadLockWithTimeout()
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("[POP3] Failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -639,7 +640,7 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 
 func (s *POP3Session) Close() error {
 	// Acquire write lock to update session state
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[POP3][CLOSE] Failed to acquire write lock within timeout")
 		// Still close the connection even if we can't acquire the lock

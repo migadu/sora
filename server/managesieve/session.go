@@ -17,7 +17,8 @@ import (
 
 type ManageSieveSession struct {
 	server.Session
-	mutex         sync.Mutex
+	mutex         sync.RWMutex
+	mutexHelper   *server.MutexTimeoutHelper
 	server        *ManageSieveServer
 	conn          *net.Conn          // Connection to the client
 	*server.User                     // User associated with the session
@@ -87,7 +88,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			address, err := server.NewAddress(userAddress)
 			if err != nil {
-				s.Log("error: %v", err)
+				s.Log("[MANAGESIEVE] error: %v", err)
 				s.sendResponse("NO Invalid address\r\n")
 				continue
 			}
@@ -97,9 +98,21 @@ func (s *ManageSieveSession) handleConnection() {
 				s.sendResponse("NO Authentication failed\r\n")
 				continue
 			}
-			s.Log("[MANAGESIEVE] user %s authenticated", address.FullAddress())
+
+			// Acquire write lock for updating session authentication state
+			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+			defer cancel()
+			if !acquired {
+				s.Log("[MANAGESIEVE] failed to acquire write lock for Login command")
+				s.sendResponse("NO Server busy, try again later\r\n")
+				continue
+			}
+
 			s.authenticated = true
 			s.User = server.NewUser(address, userID)
+			s.mutex.Unlock()
+
+			s.Log("[MANAGESIEVE] user %s authenticated", address.FullAddress())
 			s.sendResponse("OK Authenticated\r\n")
 
 		case "LISTSCRIPTS":
@@ -177,11 +190,22 @@ func (s *ManageSieveSession) handleConnection() {
 				continue
 			}
 
+			// Acquire write lock for updating connection state
+			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+			defer cancel()
+			if !acquired {
+				s.Log("[MANAGESIEVE] failed to acquire write lock for STARTTLS command")
+				s.sendResponse("NO Server busy, try again later\r\n")
+				continue
+			}
+
 			// Replace the connection and readers/writers
 			*s.conn = tlsConn
 			s.reader = bufio.NewReader(tlsConn)
 			s.writer = bufio.NewWriter(tlsConn)
 			s.isTLS = true
+			s.mutex.Unlock()
+
 			s.Log("[MANAGESIEVE] TLS negotiation successful")
 
 		case "NOOP":
@@ -225,7 +249,14 @@ func (s *ManageSieveSession) handleCapability() {
 }
 
 func (s *ManageSieveSession) handleListScripts() {
-	s.mutex.Lock()
+	// Acquire write lock for accessing database
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for ListScripts command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
 	defer s.mutex.Unlock()
 
 	scripts, err := s.server.db.GetUserScripts(s.ctx, s.UserID())
@@ -251,7 +282,14 @@ func (s *ManageSieveSession) handleListScripts() {
 }
 
 func (s *ManageSieveSession) handleGetScript(name string) {
-	s.mutex.Lock()
+	// Acquire write lock for accessing database
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for GetScript command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
 	defer s.mutex.Unlock()
 
 	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
@@ -266,7 +304,14 @@ func (s *ManageSieveSession) handleGetScript(name string) {
 }
 
 func (s *ManageSieveSession) handlePutScript(name, content string) {
-	s.mutex.Lock()
+	// Acquire write lock for accessing database
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for PutScript command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
 	defer s.mutex.Unlock()
 
 	if s.server.maxScriptSize > 0 && int64(len(content)) > s.server.maxScriptSize {
@@ -308,7 +353,14 @@ func (s *ManageSieveSession) handlePutScript(name, content string) {
 }
 
 func (s *ManageSieveSession) handleSetActive(name string) {
-	s.mutex.Lock()
+	// Acquire write lock for accessing database
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for SetActive command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
 	defer s.mutex.Unlock()
 
 	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
@@ -340,7 +392,14 @@ func (s *ManageSieveSession) handleSetActive(name string) {
 }
 
 func (s *ManageSieveSession) handleDeleteScript(name string) {
-	s.mutex.Lock()
+	// Acquire write lock for accessing database
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for DeleteScript command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
 	defer s.mutex.Unlock()
 
 	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
@@ -362,9 +421,19 @@ func (s *ManageSieveSession) handleDeleteScript(name string) {
 }
 
 func (s *ManageSieveSession) Close() error {
+	// Acquire write lock for cleanup
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("[MANAGESIEVE] failed to acquire write lock for Close operation")
+		// Continue with close even if we can't get the lock
+	} else {
+		defer s.mutex.Unlock()
+	}
+
 	(*s.conn).Close()
 	if s.User != nil {
-		s.Log("closed")
+		s.Log("[MANAGESIEVE] session closed")
 		s.User = nil
 		s.Id = ""
 		s.authenticated = false

@@ -12,7 +12,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.Log("[SELECT] attempting to select mailbox: %s", mboxName)
 
 	// Phase 1: Read session state with read lock
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SELECT] Failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -46,7 +46,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// First, acquire the read lock once to read necessary session state
-	acquired, cancel = s.acquireReadLockWithTimeout()
+	acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SELECT] Failed to acquire second read lock within timeout")
 		return nil, &imap.Error{
@@ -91,7 +91,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Acquire the lock once after all DB operations to update session state
-	acquired, cancel = s.acquireWriteLockWithTimeout()
+	acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[SELECT] Failed to acquire write lock within timeout")
 		return nil, &imap.Error{
@@ -147,7 +147,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 }
 
 func (s *IMAPSession) Unselect() error {
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[UNSELECT] Failed to acquire write lock within timeout")
 		return &imap.Error{

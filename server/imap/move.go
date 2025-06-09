@@ -16,7 +16,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 
 	// Acquire read mutex to safely read session state
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[MOVE] Failed to acquire read lock within timeout")
 		return &imap.Error{

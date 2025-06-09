@@ -8,7 +8,7 @@ import (
 
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	// First phase: Read state with read lock
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[POLL] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -33,7 +33,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return s.internalError("failed to poll mailbox: %v", err)
 	}
 
-	acquired, cancel = s.acquireWriteLockWithTimeout()
+	acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[POLL] Failed to acquire write lock within timeout")
 		return &imap.Error{

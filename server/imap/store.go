@@ -11,7 +11,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[STORE] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -123,7 +123,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
-	acquired, cancel = s.acquireReadLockWithTimeout()
+	acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[STORE] Failed to acquire second read lock within timeout")
 		return nil // Continue without sending responses since we already updated the flags

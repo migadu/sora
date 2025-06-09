@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/server"
 )
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
@@ -112,6 +113,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			cancel: sessionCancel,
 			isTLS:  isImplicitTLS, // Initialize isTLS based on the listener type
 		}
+
+		// Create logging function for the mutex helper
+		logFunc := func(format string, args ...interface{}) {
+			session.Log(format, args...)
+		}
+
+		// Initialize the mutex helper
+		session.mutexHelper = server.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
 
 		session.RemoteIP = (*session.conn).RemoteAddr().String()
 		session.Protocol = "ManageSieve"

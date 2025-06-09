@@ -158,7 +158,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	// Update the session's message count and notify the tracker if needed
-	acquired, cancel := s.acquireWriteLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[APPEND] Failed to acquire write lock within timeout, returning success without session state update")
 		return &imap.AppendData{

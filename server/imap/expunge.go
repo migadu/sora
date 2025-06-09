@@ -7,7 +7,7 @@ import (
 
 func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
 	// First phase: Read session state with read lock
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[EXPUNGE] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -75,7 +75,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// Final phase: Update session state - write lock needed
-	acquired, cancel = s.acquireWriteLockWithTimeout()
+	acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[EXPUNGE] Failed to acquire write lock within timeout")
 		return &imap.Error{

@@ -12,7 +12,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 
 	// Acquire read mutex to safely read session state
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SEARCH] Failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -173,7 +173,7 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 
 // decodeSearchCriteria safely acquires the read mutex and translates sequence numbers in search criteria.
 func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	acquired, cancel := s.acquireReadLockWithTimeout()
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SEARCH] Failed to acquire read lock for decodeSearchCriteria within timeout")
 		// Return unmodified criteria if we can't acquire the lock
