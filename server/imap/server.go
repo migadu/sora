@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -143,6 +144,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Protocol = "IMAP"
 	session.Id = uuid.New().String()
 	session.HostName = s.hostname
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,

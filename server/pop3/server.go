@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -128,6 +129,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.Protocol = "POP3"
 		session.Id = uuid.New().String()
 		session.HostName = s.hostname
+		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.Log)
 
 		go session.handleConnection()
 	}
