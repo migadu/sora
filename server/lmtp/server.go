@@ -10,9 +10,9 @@ import (
 	"os"
 
 	"github.com/emersion/go-smtp"
-	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -107,7 +107,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		cancel:  sessionCancel,
 	}
 	s.RemoteIP = c.Conn().RemoteAddr().String()
-	s.Id = uuid.New().String()
+	s.Id = idgen.New()
 	s.HostName = b.hostname
 	s.Protocol = "LMTP"
 

@@ -11,10 +11,10 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/google/uuid"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	serverPkg "github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -142,7 +142,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	session.RemoteIP = conn.NetConn().RemoteAddr().String()
 	session.Protocol = "IMAP"
-	session.Id = uuid.New().String()
+	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
 

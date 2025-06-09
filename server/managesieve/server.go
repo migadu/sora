@@ -8,9 +8,9 @@ import (
 	"log"
 	"net"
 
-	"github.com/google/uuid"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 )
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
@@ -124,7 +124,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		session.RemoteIP = (*session.conn).RemoteAddr().String()
 		session.Protocol = "ManageSieve"
-		session.Id = uuid.New().String()
+		session.Id = idgen.New()
 		session.HostName = session.server.hostname
 
 		go session.handleConnection()
