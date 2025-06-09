@@ -18,8 +18,7 @@ func (s *Session) Log(format string, args ...interface{}) {
 	if s.User != nil {
 		user = fmt.Sprintf("%s/%d", s.FullAddress(), s.UserID())
 	}
-	log.Printf("%s remote=%s user=%s session=%s %s: %s",
-		s.HostName,
+	log.Printf("remote=%s user=%s session=%s %s: %s",
 		s.RemoteIP,
 		user,
 		s.Id,
