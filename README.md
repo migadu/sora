@@ -1,5 +1,4 @@
 # SORA — Hackable IMAP Server
-**Status: Experimental – Not Production Ready**
 
 **Sora** is a simple, minimalistic IMAP server built for composability.  
 It serves as a lightweight building block for larger infrastructure systems, with an emphasis on correctness, extensibility, and simplicity.
@@ -33,7 +32,7 @@ Sora is for:
 
 ---
 
-## Status: Experimental
+## Status: Alpha
 
 Sora is functional, but **not yet production-ready**.  
 Cross-client compatibility is still being tested. Some clients may misbehave or fail to operate correctly.

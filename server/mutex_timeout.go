@@ -90,7 +90,7 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, context.Cancel
 			case <-time.After(time.Second):
 				// If we can't get the lock after waiting another second,
 				// something is seriously wrong, but we can't do much about it
-				h.log("[%s][MUTEX] Critical warning: Failed to clean up write lock after timeout", h.name)
+				h.log("[%s][MUTEX] WARNING: failed to clean up write lock after timeout", h.name)
 			}
 		}()
 		return false, cancel

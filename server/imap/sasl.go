@@ -90,7 +90,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			}
 
 			// Authenticate as `username` (authentication-identity).
-			// `s.Login` will handle its own LOGIN-command specific master/proxy logic if `username` contains `\x00`.
 			s.Log("[AUTH] Proceeding with regular authentication for user '%s'", username)
 			return s.Login(username, password)
 		}), nil

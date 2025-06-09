@@ -50,7 +50,7 @@ func (w *CleanupWorker) Start(ctx context.Context) {
 
 	const minAllowedInterval = time.Minute
 	if interval < minAllowedInterval {
-		log.Printf("[CLEANUP] WARNING: Configured interval %v is less than minimum allowed %v. Using minimum.", interval, minAllowedInterval)
+		log.Printf("[CLEANUP] WARNING: configured interval %v is less than minimum allowed %v. Using minimum.", interval, minAllowedInterval)
 		interval = minAllowedInterval
 	}
 	ticker := time.NewTicker(interval)

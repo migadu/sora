@@ -119,15 +119,15 @@ func main() {
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet("config") { // User explicitly set -config
-				log.Fatalf("Error: Specified configuration file '%s' not found: %v", *configPath, err)
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: Default configuration file '%s' not found. Using application defaults and command-line flags.", *configPath)
+				log.Printf("WARNING: default configuration file '%s' not found. Using application defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("Error parsing configuration file '%s': %v", *configPath, err)
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	} else {
-		log.Printf("Loaded configuration from %s", *configPath)
+		log.Printf("loaded configuration from %s", *configPath)
 	}
 
 	// --- Determine Final Log Output ---
@@ -150,7 +150,7 @@ func main() {
 		if runtime.GOOS != "windows" {
 			syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "sora")
 			if err != nil {
-				log.Printf("WARNING: Failed to connect to syslog (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, err)
+				log.Printf("WARNING: failed to connect to syslog (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, err)
 				initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog connection failed, selected by '%s').", finalLogOutput)
 			} else {
 				log.SetOutput(syslogWriter)
@@ -159,7 +159,7 @@ func main() {
 				initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to syslog (selected by '%s').", finalLogOutput)
 			}
 		} else {
-			log.Printf("WARNING: Syslog logging is not supported on Windows (specified by '%s'). Logging will fall back to standard error.", finalLogOutput)
+			log.Printf("WARNING: syslog logging is not supported on Windows (specified by '%s'). Logging will fall back to standard error.", finalLogOutput)
 			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog not supported on this OS, selected by '%s').", finalLogOutput)
 		}
 	case "stderr":
@@ -170,7 +170,7 @@ func main() {
 		logFile, openErr = os.OpenFile(finalLogOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if openErr != nil {
 			// At this point, log output might still be stderr or the default.
-			log.Printf("WARNING: Failed to open log file '%s' (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, finalLogOutput, openErr)
+			log.Printf("WARNING: failed to open log file '%s' (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, finalLogOutput, openErr)
 			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (failed to open log file '%s', selected by '%s').", finalLogOutput, finalLogOutput)
 			logFile = nil // Ensure logFile is nil if open failed
 		} else {
@@ -501,7 +501,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 	appendLimit, err := config.Servers.IMAP.GetAppendLimit()
 	if err != nil {
-		log.Printf("WARNING: Invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.IMAP.AppendLimit, err, imap.DefaultAppendLimit)
+		log.Printf("WARNING: invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.IMAP.AppendLimit, err, imap.DefaultAppendLimit)
 		appendLimit = imap.DefaultAppendLimit
 	}
 
@@ -587,7 +587,7 @@ func startPOP3Server(ctx context.Context, hostname string, addr string, s3storag
 func startManageSieveServer(ctx context.Context, hostname string, addr string, database *db.Database, errChan chan error, config Config) {
 	maxSize, err := config.Servers.ManageSieve.GetMaxScriptSize()
 	if err != nil {
-		log.Printf("WARNING: Invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
+		log.Printf("WARNING: invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
 		maxSize = managesieve.DefaultMaxScriptSize
 	}
 	s, err := managesieve.New(ctx, hostname, addr, database, managesieve.ManageSieveServerOptions{

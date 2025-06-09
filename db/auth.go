@@ -311,7 +311,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 		// Generate a new hash with the current default cost
 		newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			log.Printf("warning: failed to rehash password for address %s: %v", normalizedAddress, err)
+			log.Printf("WARNING: failed to rehash password for address %s: %v", normalizedAddress, err)
 			// Continue even if rehashing fails
 		} else {
 			// If it's a BLF-CRYPT format, preserve the prefix
@@ -325,7 +325,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 			// Update the stored password
 			err = db.UpdatePassword(ctx, normalizedAddress, newHashedPassword)
 			if err != nil {
-				log.Printf("warning: failed to update rehashed password for address %s: %v", normalizedAddress, err)
+				log.Printf("WARNING: failed to update rehashed password for address %s: %v", normalizedAddress, err)
 				// Continue even if update fails
 			} else {
 				log.Printf("rehashed password with new cost for address %s", normalizedAddress)

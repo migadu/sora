@@ -48,7 +48,6 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.
 		return nil, fmt.Errorf("cache base path cannot be empty")
 	}
 
-	// Ensure data subdirectory exists
 	dataDir := filepath.Join(basePath, DataDir)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache data path %s: %w", dataDir, err)
@@ -78,7 +77,7 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.
 	}
 
 	if err := db.Ping(); err != nil {
-		db.Close() // Close the DB if ping fails
+		db.Close()
 		return nil, fmt.Errorf("cache DB ping failed: %w", err)
 	}
 	return &Cache{
@@ -118,7 +117,7 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 		}
 		return fmt.Errorf("failed to track cache file %s: %w", path, err)
 	}
-	log.Printf("[CACHE] successfully cached %s", path)
+	log.Printf("[CACHE] cached %s", path)
 	return nil
 }
 
@@ -126,7 +125,6 @@ func (c *Cache) Exists(contentHash string) (bool, error) {
 	path := c.GetPathForContentHash(contentHash)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Check if the file exists
 	_, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -311,7 +309,7 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 func (c *Cache) runPurgeCycle(ctx context.Context) {
 	log.Println("[CACHE] running cache purge cycle")
 	if err := c.PurgeIfNeeded(ctx); err != nil {
-		log.Printf("[CACHE] purge error: %v\n", err)
+		log.Printf("[CACHE] WARNING: cache purge failed: %v\n", err)
 	}
 	if err := c.RemoveStaleDBEntries(ctx); err != nil {
 		log.Printf("[CACHE] stale file cleanup error: %v\n", err)
@@ -345,7 +343,7 @@ func (c *Cache) cleanupStaleDirectories() error {
 		removeErr := os.Remove(path)
 		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && !isDirNotEmptyError(removeErr) {
 			// Log unexpected errors during removal, but don't stop the walk.
-			log.Printf("[CACHE] error removing directory %s: %v", path, removeErr)
+			log.Printf("[CACHE] WARNING: unexpected error removing directory %s: %v", path, removeErr)
 		}
 		return nil
 	})
