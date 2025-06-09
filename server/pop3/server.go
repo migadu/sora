@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
@@ -25,6 +26,10 @@ type POP3Server struct {
 	uploader  *uploader.UploadWorker
 	cache     *cache.Cache
 	tlsConfig *tls.Config
+
+	// Connection counters
+	totalConnections         atomic.Int64
+	authenticatedConnections atomic.Int64
 }
 
 type POP3ServerOptions struct {
@@ -117,6 +122,9 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Create a new context for this session that inherits from app context
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
+		totalCount := s.totalConnections.Add(1)
+		authCount := s.authenticatedConnections.Load()
+
 		session := &POP3Session{
 			server:  s,
 			conn:    &conn,
@@ -129,7 +137,11 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.Protocol = "POP3"
 		session.Id = idgen.New()
 		session.HostName = s.hostname
+		session.Stats = s
 		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.Log)
+
+		log.Printf("* POP3 new connection from %s (connections: total=%d, authenticated=%d)",
+			session.RemoteIP, totalCount, authCount)
 
 		go session.handleConnection()
 	}
@@ -145,4 +157,14 @@ func (s *POP3Server) Close() {
 	if s.db != nil {
 		s.db.Close()
 	}
+}
+
+// GetTotalConnections returns the current total connection count
+func (s *POP3Server) GetTotalConnections() int64 {
+	return s.totalConnections.Load()
+}
+
+// GetAuthenticatedConnections returns the current authenticated connection count
+func (s *POP3Server) GetAuthenticatedConnections() int64 {
+	return s.authenticatedConnections.Load()
 }

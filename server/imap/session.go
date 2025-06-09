@@ -57,12 +57,19 @@ func (s *IMAPSession) Close() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	totalCount := s.server.totalConnections.Add(-1)
+	var authCount int64 = 0
+
 	if s.IMAPUser != nil {
-		s.Log("closing session for user: %v", s.IMAPUser.FullAddress())
+		authCount = s.server.authenticatedConnections.Add(-1)
+		s.Log("closing session for user: %v (connections: total=%d, authenticated=%d)",
+			s.IMAPUser.FullAddress(), totalCount, authCount)
 		s.IMAPUser = nil
 		s.Session.User = nil
 	} else {
-		s.Log("client dropped unauthenticated connection")
+		authCount = s.server.authenticatedConnections.Load()
+		s.Log("client dropped unauthenticated connection (connections: total=%d, authenticated=%d)",
+			totalCount, authCount)
 	}
 
 	s.clearSelectedMailboxStateLocked()

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/db"
@@ -27,6 +28,9 @@ type LMTPServerBackend struct {
 	appCtx        context.Context
 	externalRelay string
 	tlsConfig     *tls.Config
+
+	// Connection counters
+	totalConnections atomic.Int64
 }
 
 type LMTPServerOptions struct {
@@ -65,7 +69,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 
 		if !options.TLSVerify {
 			backend.tlsConfig.InsecureSkipVerify = true
-			log.Printf("[LMTP] WARNING: TLS certificate verification disabled for LMTP server")
+			log.Printf("WARNING: TLS certificate verification disabled for LMTP server")
 		}
 	}
 
@@ -78,7 +82,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	// Configure StartTLS if enabled and TLS config is available
 	if options.TLSUseStartTLS && backend.tlsConfig != nil {
 		s.TLSConfig = backend.tlsConfig
-		log.Printf("[LMTP] StartTLS is enabled")
+		log.Printf("StartTLS is enabled")
 		// Force AllowInsecureAuth to true when StartTLS is enabled
 		// This is necessary because with StartTLS, initial connections are unencrypted
 		s.AllowInsecureAuth = true
@@ -100,6 +104,10 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 
 func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	sessionCtx, sessionCancel := context.WithCancel(b.appCtx)
+
+	// Increment connection counters (in LMTP all connections are considered authenticated)
+	b.totalConnections.Add(1)
+
 	s := &LMTPSession{
 		backend: b,
 		conn:    c,
@@ -110,6 +118,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	s.Id = idgen.New()
 	s.HostName = b.hostname
 	s.Protocol = "LMTP"
+	s.Stats = b // Set the server as the Stats provider
 
 	// Create logging function for the mutex helper
 	logFunc := func(format string, args ...interface{}) {
@@ -119,7 +128,10 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// Initialize the mutex helper
 	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
 
-	s.Log("[LMTP] new session remote=%s id=%s", s.RemoteIP, s.Id)
+	// Log connection with connection counters
+	totalCount := b.totalConnections.Load()
+	s.Log("new session remote=%s id=%s (connections: total=%d)",
+		s.RemoteIP, s.Id, totalCount)
 
 	return s, nil
 }
@@ -160,4 +172,15 @@ func (b *LMTPServerBackend) Close() error {
 		return b.server.Close()
 	}
 	return nil
+}
+
+// GetTotalConnections returns the current total connection count
+func (b *LMTPServerBackend) GetTotalConnections() int64 {
+	return b.totalConnections.Load()
+}
+
+// GetAuthenticatedConnections returns the current authenticated connection count
+// For LMTP, all connections are considered authenticated
+func (b *LMTPServerBackend) GetAuthenticatedConnections() int64 {
+	return 0
 }

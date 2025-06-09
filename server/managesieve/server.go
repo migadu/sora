@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
@@ -24,6 +25,10 @@ type ManageSieveServer struct {
 	useStartTLS   bool
 	insecureAuth  bool
 	maxScriptSize int64
+
+	// Connection counters
+	totalConnections         atomic.Int64
+	authenticatedConnections atomic.Int64
 }
 
 type ManageSieveServerOptions struct {
@@ -102,6 +107,10 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			return
 		}
 
+		// Increment total connections counter
+		totalCount := s.totalConnections.Add(1)
+		authCount := s.authenticatedConnections.Load()
+
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 		session := &ManageSieveSession{
@@ -126,6 +135,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		session.Protocol = "ManageSieve"
 		session.Id = idgen.New()
 		session.HostName = session.server.hostname
+		session.Stats = s // Set the server as the Stats provider
+
+		// Log connection with connection counters
+		log.Printf("* ManageSieve new connection from %s (connections: total=%d, authenticated=%d)",
+			session.RemoteIP, totalCount, authCount)
 
 		go session.handleConnection()
 	}
@@ -135,4 +149,14 @@ func (s *ManageSieveServer) Close() {
 	// The shared database connection pool is closed by main.go's defer.
 	// If ManageSieveServer had its own specific resources to close (e.g., a listener, which it doesn't),
 	// they would be closed here. For now, this can be a no-op or just log.
+}
+
+// GetTotalConnections returns the current total connection count
+func (s *ManageSieveServer) GetTotalConnections() int64 {
+	return s.totalConnections.Load()
+}
+
+// GetAuthenticatedConnections returns the current authenticated connection count
+func (s *ManageSieveServer) GetAuthenticatedConnections() int64 {
+	return s.authenticatedConnections.Load()
 }

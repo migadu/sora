@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -37,6 +38,10 @@ type IMAPServer struct {
 	masterSASLUsername string
 	masterSASLPassword string
 	appendLimit        int64
+
+	// Connection counters
+	totalConnections         atomic.Int64
+	authenticatedConnections atomic.Int64
 }
 
 type IMAPServerOptions struct {
@@ -133,6 +138,8 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
+	totalCount := s.totalConnections.Add(1)
+
 	session := &IMAPSession{
 		server: s,
 		conn:   conn,
@@ -144,13 +151,15 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Protocol = "IMAP"
 	session.Id = idgen.New()
 	session.HostName = s.hostname
+	session.Stats = s
 	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
 	}
 
-	session.Log("connected")
+	authCount := s.authenticatedConnections.Load()
+	session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
 
 	return session, greeting, nil
 }
@@ -183,4 +192,14 @@ func (s *IMAPServer) Close() {
 		// It will also start closing active client connections.
 		s.server.Close()
 	}
+}
+
+// GetTotalConnections returns the current total connection count
+func (s *IMAPServer) GetTotalConnections() int64 {
+	return s.totalConnections.Load()
+}
+
+// GetAuthenticatedConnections returns the current authenticated connection count
+func (s *IMAPServer) GetAuthenticatedConnections() int64 {
+	return s.authenticatedConnections.Load()
 }

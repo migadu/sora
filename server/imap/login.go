@@ -34,7 +34,10 @@ func (s *IMAPSession) Login(address, password string) error {
 			s.IMAPUser = NewIMAPUser(address, userID)
 			s.Session.User = &s.IMAPUser.User
 
-			s.Log("[LOGIN] user %s/%s authenticated with master password", address, proxyUser)
+			authCount := s.server.authenticatedConnections.Add(1)
+			totalCount := s.server.totalConnections.Load()
+			s.Log("[LOGIN] user %s/%s authenticated with master password (connections: total=%d, authenticated=%d)",
+				address, proxyUser, totalCount, authCount)
 			return nil
 		}
 	}
@@ -71,7 +74,10 @@ func (s *IMAPSession) Login(address, password string) error {
 	s.IMAPUser = NewIMAPUser(addressSt, userID)
 	s.Session.User = &s.IMAPUser.User
 
-	s.Log("[LOGIN] user %s authenticated", address)
+	authCount := s.server.authenticatedConnections.Add(1)
+	totalCount := s.server.totalConnections.Load()
+	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
+		address, totalCount, authCount)
 	return nil
 }
 
