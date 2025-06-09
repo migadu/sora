@@ -41,8 +41,8 @@ github.com/klauspost/cpuid/v2 v2.2.10 h1:tBs3QSyvjDyFTq3uoc/9xFpCuOsJQFNPiAhYdw2
 github.com/klauspost/cpuid/v2 v2.2.10/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
 github.com/mattn/go-sqlite3 v1.14.27 h1:drZCnuvf37yPfs95E5jd9s3XhdVWLal+6BOK6qrv6IU=
 github.com/mattn/go-sqlite3 v1.14.27/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
-github.com/migadu/go-sieve v0.0.0-20240130002450-72d6b002882a h1:6oN2IkkXvgbssEmfFGnC2BP0B3olT9l2FmdnxQk9Vi4=
-github.com/migadu/go-sieve v0.0.0-20240130002450-72d6b002882a/go.mod h1:2r/4pcAuXiYsV2xkGw/Uybwz7ZoS4eOuz3vuqM4eTyg=
+github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25 h1:Oxwm8edsPKTTbEawtsF1TZrk7JcCR3Wwh+9ZVJPvnqw=
+github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25/go.mod h1:2r/4pcAuXiYsV2xkGw/Uybwz7ZoS4eOuz3vuqM4eTyg=
 github.com/minio/crc64nvme v1.0.1 h1:DHQPrYPdqK7jQG/Ls5CTBZWeex/2FMS3G5XGkycuFrY=
 github.com/minio/crc64nvme v1.0.1/go.mod h1:eVfm2fAzLlxMdUGc0EEBGSMmPwmXD5XiNRpnu9J3bvg=
 github.com/minio/md5-simd v1.1.2 h1:Gdi1DZK69+ZVMoNHRXJyNcxrMA4dSxoYHZSQbirFg34=

@@ -230,10 +230,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		s.Log("message sent date: %v", sentDate)
 	}
 
-	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
+	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
+	bodyStructure := &bodyStructureVal
 	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent)
 	if err != nil {
-		s.Log("Failed to extract plaintext body: %v", err)
+		s.Log("WARNING: failed to extract plaintext body: %v", err)
 		// The plaintext body is needed only for indexing, so we can ignore the error
 	}
 
@@ -243,7 +244,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	if err != nil {
 		return s.InternalError("failed to save message to disk: %v", err)
 	}
-	s.Log("message stored locally at: %s", *filePath)
+	s.Log("message accepted locally at: %s", *filePath)
 
 	// SIEVE script processing
 
@@ -271,178 +272,177 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// so we can pass a nil oracle. The SievePolicy will handle this gracefully.
 	defaultSieveExecutor, defaultScriptErr := sieveengine.NewSieveExecutorWithOracle(defaultSieveScript, s.UserID(), nil)
 	if defaultScriptErr != nil {
-		s.Log("failed to create default sieve executor: %v", defaultScriptErr)
+		s.Log("[SIEVE] WARNING: failed to create default sieve executor: %v", defaultScriptErr)
 		// If we can't create a default sieve executor, use a simple keep action
 		result = sieveengine.Result{Action: sieveengine.ActionKeep}
 	} else {
-		s.Log("message headers for SIEVE evaluation:")
-		for key, values := range sieveCtx.Header {
-			for _, value := range values {
-				s.Log("Header: %s: %s", key, value)
+		// SIEVE debugging information
+		if s.backend.debug {
+			s.Log("[SIEVE] message headers for evaluation:")
+			for key, values := range sieveCtx.Header {
+				for _, value := range values {
+					s.Log("[SIEVE] header: %s: %s", key, value)
+				}
 			}
 		}
 
 		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
 		if defaultEvalErr != nil {
-			s.Log("default SIEVE evaluation error: %v", defaultEvalErr)
+			s.Log("[SIEVE] WARNING: default script evaluation error: %v", defaultEvalErr)
 			// fallback: default to INBOX
 			result = sieveengine.Result{Action: sieveengine.ActionKeep}
 		} else {
 			// Set the result from the default script
 			result = defaultResult
-			s.Log("default script result action: %v", result.Action)
+			s.Log("[SIEVE] default script result action: %v", result.Action)
 
 			// Log more details about the action
 			switch result.Action {
 			case sieveengine.ActionFileInto:
-				s.Log("default SIEVE fileinto: %s", result.Mailbox)
+				s.Log("[SIEVE] default fileinto: %s", result.Mailbox)
 			case sieveengine.ActionRedirect:
-				s.Log("default SIEVE redirect: %s", result.RedirectTo)
+				s.Log("[SIEVE] default redirect: %s", result.RedirectTo)
 			case sieveengine.ActionDiscard:
-				s.Log("default SIEVE discard")
+				s.Log("[SIEVE] default discard")
 			case sieveengine.ActionVacation:
-				s.Log("default SIEVE vacation response triggered")
+				s.Log("[SIEVE] default vacation response triggered")
 			case sieveengine.ActionKeep:
-				s.Log("default SIEVE keep (deliver to INBOX)")
+				s.Log("[SIEVE] default keep (deliver to INBOX)")
 			}
 		}
 	}
 
 	// If user has an active script, run it and let it override the resultAction
 	if err == nil && activeScript != nil {
-		s.Log("using user's active script: %s", activeScript.Name)
+		s.Log("[SIEVE] using user's active script: %s", activeScript.Name)
 		userSieveExecutor, userScriptErr := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, s.UserID(), sieveVacOracle)
 		if userScriptErr != nil {
-			s.Log("failed to create sieve executor from user script: %v", userScriptErr)
+			s.Log("[SIEVE] WARNING: failed to create sieve executor from user script: %v", userScriptErr)
 			// Keep the result from the default script
 		} else {
 			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)
 			if userEvalErr != nil {
-				s.Log("user SIEVE evaluation error: %v", userEvalErr)
+				s.Log("[SIEVE] user script evaluation error: %v", userEvalErr)
 				// Keep the result from the default script
 			} else {
 				// Override the result with the user script result
 				result = userResult
-				s.Log("user script overrode result action: %v", result.Action)
+				s.Log("[SIEVE] user script overrode result action: %v", result.Action)
 
 				// Log more details about the action
 				switch result.Action {
 				case sieveengine.ActionFileInto:
-					s.Log("user SIEVE fileinto: %s", result.Mailbox)
+					s.Log("[SIEVE] user fileinto: %s", result.Mailbox)
 				case sieveengine.ActionRedirect:
-					s.Log("user SIEVE redirect: %s", result.RedirectTo)
+					s.Log("[SIEVE] user redirect: %s", result.RedirectTo)
 				case sieveengine.ActionDiscard:
-					s.Log("user SIEVE discard")
+					s.Log("[SIEVE] user discard")
 				case sieveengine.ActionVacation:
-					s.Log("user SIEVE vacation response triggered")
+					s.Log("[SIEVE] user vacation response triggered")
 				case sieveengine.ActionKeep:
-					s.Log("user SIEVE keep (deliver to INBOX)")
+					s.Log("[SIEVE] user keep (deliver to INBOX)")
 				}
 			}
 		}
 	} else {
 		if err != nil && err != consts.ErrDBNotFound {
-			s.Log("failed to get active script: %v", err)
+			s.Log("[SIEVE] WARNING: failed to get active script: %v", err)
 		} else {
-			s.Log("no active script found, using only default script result")
+			s.Log("[SIEVE] no active script found, using default script result")
 		}
 	}
 
-	// Process the result
-	s.Log("processing final SIEVE action: %v", result.Action)
+	s.Log("[SIEVE] executing action: %v", result.Action)
 
 	switch result.Action {
 	case sieveengine.ActionDiscard:
-		s.Log("message discarded by SIEVE - message will not be delivered")
+		s.Log("[SIEVE] WARNING: message discarded - message will not be delivered")
 		return nil
 
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
-		s.Log("SIEVE fileinto action - delivering message to mailbox: %s", mailboxName)
+		if result.Copy {
+			s.Log("[SIEVE] fileinto :copy action - delivering message to mailbox: %s and INBOX", mailboxName)
+
+			// First save to the specified mailbox
+			err := s.saveMessageToMailbox(mailboxName, messageContent, fullMessageBytes, contentHash,
+				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
+			if err != nil {
+				return s.InternalError("failed to save message to specified mailbox: %v", err)
+			}
+
+			// Then save to INBOX (for the :copy functionality)
+			s.Log("[SIEVE] saving copy to INBOX due to :copy modifier")
+
+			// Call saveMessageToMailbox again for INBOX
+			err = s.saveMessageToMailbox(consts.MailboxInbox, messageContent, fullMessageBytes, contentHash,
+				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
+			if err != nil {
+				return s.InternalError("failed to save message copy to INBOX: %v", err)
+			}
+
+			// Success - both copies saved
+			s.Log("message delivered according to fileinto :copy directive")
+			return nil
+		} else {
+			s.Log("[SIEVE] fileinto action - delivering message to mailbox: %s", mailboxName)
+		}
 
 	case sieveengine.ActionRedirect:
-		s.Log("SIEVE redirect action - redirecting message to: %s", result.RedirectTo)
+		if result.Copy {
+			s.Log("[SIEVE][REDIRECT] redirect :copy action - redirecting message to: %s (with local copy)", result.RedirectTo)
+		} else {
+			s.Log("[SIEVE][REDIRECT] redirect action - redirecting message to: %s", result.RedirectTo)
+		}
 
 		// Send the message to the external relay if configured
 		if s.backend.externalRelay != "" {
-			s.Log("redirected message via external relay: %s", s.backend.externalRelay)
+			s.Log("[SIEVE][REDIRECT] redirected message via external relay: %s", s.backend.externalRelay)
 			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, fullMessageBytes)
 			if err != nil {
-				s.Log("error sending redirected message to external relay: %v", err)
-				s.Log("falling back to local delivery to INBOX")
+				s.Log("[SIEVE][REDIRECT] WARNING: error sending redirected message to external relay, falling back to local INBOX delivery: %v", err)
 				// Continue processing even if relay fails, store in INBOX as fallback
 			} else {
-				s.Log("successfully sent redirected message to %s via external relay %s",
+				s.Log("[SIEVE][REDIRECT] successfully redirected message to %s via external relay %s",
 					result.RedirectTo, s.backend.externalRelay)
-				// Message was successfully relayed, no need to store it locally
-				return nil
+
+				// If :copy is not specified and relay succeeded, we don't store the message locally
+				if !result.Copy {
+					s.Log("[SIEVE][REDIRECT] redirect without :copy - skipping local delivery")
+					return nil
+				}
+				s.Log("[SIEVE][REDIRECT] redirect :copy - continuing with local delivery")
 			}
 		} else {
-			s.Log("external relay not configured, storing message in INBOX")
+			s.Log("[SIEVE][REDIRECT] WARNING: redirect requested but external relay not configured, storing message in INBOX")
 		}
 
 		// Fallback: store in INBOX if relay is not configured or fails
+		// Or if :copy is specified
 		mailboxName = consts.MailboxInbox
 
 	case sieveengine.ActionVacation:
-		s.Log("SIEVE vacation action - sending auto-response and delivering original message to INBOX")
 		// Handle vacation response
 		err := s.handleVacationResponse(result, messageContent)
 		if err != nil {
-			s.Log("error handling vacation response: %v", err)
+			s.Log("[SIEVE] WARNING: error handling vacation response: %v", err)
 			// Continue processing even if vacation response fails
 		}
 		// Store the original message in INBOX
 		mailboxName = consts.MailboxInbox
 
 	default:
-		s.Log("SIEVE keep action (default) - delivering message to INBOX")
+		s.Log("[SIEVE] keep action (default) - delivering message to INBOX")
 		mailboxName = consts.MailboxInbox
 	}
 
-	mailbox, err := s.backend.db.GetMailboxByName(s.ctx, s.UserID(), mailboxName)
-	if err != nil {
-		if err == consts.ErrMailboxNotFound {
-			s.Log("mailbox '%s' not found, falling back to INBOX", mailboxName)
-			mailbox, err = s.backend.db.GetMailboxByName(s.ctx, s.UserID(), consts.MailboxInbox)
-			if err != nil {
-				return s.InternalError("failed to get INBOX mailbox: %v", err)
-			}
-		} else {
-			return s.InternalError("failed to get mailbox '%s': %v", mailboxName, err)
-		}
-	}
-
-	size := int64(len(fullMessageBytes))
-
-	_, messageUID, err := s.backend.db.InsertMessage(s.ctx,
-		&db.InsertMessageOptions{
-			UserID:        s.UserID(),
-			MailboxID:     mailbox.ID,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash, // The S3 key is the content hash of the message
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			Flags:         []imap.Flag{}, // Explicitly set empty flags to mark as unread
-			RawHeaders:    rawHeadersText,
-		},
-		db.PendingUpload{ // This struct is used to pass data to InsertMessage, not directly inserted into DB here
-			ContentHash: contentHash,
-			InstanceID:  s.backend.hostname,
-			Size:        size,
-		})
+	// Save the message to the determined mailbox (either the specified one or INBOX)
+	err = s.saveMessageToMailbox(mailboxName, messageContent, fullMessageBytes, contentHash,
+		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 	if err != nil {
 		_ = os.Remove(*filePath) // cleanup file on failure
-		if err == consts.ErrDBUniqueViolation {
-			// Message already exists, continue with the next message
-			s.Log("message already exists in database (content hash: %s)", contentHash)
+		if err.Error() == "message already exists: unique violation" {
+			s.Log("WARNING: message already exists in database (content hash: %s)", contentHash)
 			return &smtp.SMTPError{
 				Code:         541,
 				EnhancedCode: smtp.EnhancedCode{5, 0, 1},
@@ -452,9 +452,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to save message: %v", err)
 	}
 
-	s.backend.uploader.NotifyUploadQueued()
-
-	s.Log("saved with UID %d in mailbox '%s'", messageUID, mailbox.Name)
+	s.Log("message delivered successfully to mailbox '%s'", mailboxName)
 	return nil
 }
 
@@ -463,7 +461,7 @@ func (s *LMTPSession) Reset() {
 	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
-		s.Log("failed to acquire write lock for Reset command")
+		s.Log("WARNING: failed to acquire write lock for Reset command")
 		return
 	}
 
@@ -486,7 +484,7 @@ func (s *LMTPSession) Logout() error {
 	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
-		s.Log("failed to acquire write lock for Logout command")
+		s.Log("WARNING: failed to acquire write lock for Logout command")
 		// Continue with logout even if we can't get the lock
 	} else {
 		// Clean up any session state if needed
@@ -510,7 +508,7 @@ func (s *LMTPSession) Logout() error {
 func (s *LMTPSession) InternalError(format string, a ...interface{}) error {
 	s.Log(format, a...)
 	errorMsg := fmt.Sprintf(format, a...)
-	s.Log("internal error: %s", errorMsg)
+	s.Log("INTERNAL ERROR: %s", errorMsg)
 	return &smtp.SMTPError{
 		Code:         421,
 		EnhancedCode: smtp.EnhancedCode{4, 4, 2},
@@ -523,7 +521,7 @@ func (s *LMTPSession) InternalError(format string, a ...interface{}) error {
 // by the Sieve engine's policy, using the VacationOracle.
 func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
 	if s.backend.externalRelay == "" {
-		s.Log("external relay not configured, cannot send vacation response for sender: %s", s.sender.FullAddress())
+		s.Log("[SIEVE][VACATION] WARNING: external relay not configured, cannot send vacation response for sender: %s", s.sender.FullAddress())
 		// Do not return error, as the Sieve engine might have already recorded the attempt.
 		return nil
 	}
@@ -532,29 +530,29 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	var vacationFrom string
 	if result.VacationFrom != "" {
 		vacationFrom = result.VacationFrom
-		s.Log("using custom vacation from address: %s", vacationFrom)
+		s.Log("[SIEVE][VACATION] using custom vacation from address: %s", vacationFrom)
 	} else {
 		vacationFrom = s.User.Address.FullAddress()
-		s.Log("using default vacation from address: %s", vacationFrom)
+		s.Log("[SIEVE][VACATION] using default vacation from address: %s", vacationFrom)
 	}
 
 	var vacationSubject string
 	if result.VacationSubj != "" {
 		vacationSubject = result.VacationSubj
-		s.Log("using custom vacation subject: %s", vacationSubject)
+		s.Log("[SIEVE][VACATION] using custom vacation subject: %s", vacationSubject)
 	} else {
 		vacationSubject = "Auto: Out of Office"
-		s.Log("using default vacation subject: %s", vacationSubject)
+		s.Log("[SIEVE][VACATION] using default vacation subject: %s", vacationSubject)
 	}
 
 	// Get the original message ID for the In-Reply-To header
 	originalHeader := mail.Header{Header: originalMessage.Header}
 	originalMessageID, _ := originalHeader.MessageID()
 	if originalMessageID != "" {
-		s.Log("Using original message ID for In-Reply-To: %s", originalMessageID)
+		s.Log("[SIEVE][VACATION] using original message ID for In-Reply-To: %s", originalMessageID)
 	}
 
-	s.Log("Creating vacation response message")
+	s.Log("[SIEVE][VACATION] creating response message")
 	var vacationMessage bytes.Buffer
 	var h message.Header
 	h.Set("From", vacationFrom)
@@ -562,7 +560,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	h.Set("Subject", vacationSubject)
 	messageID := fmt.Sprintf("<%d.vacation@%s>", time.Now().UnixNano(), s.HostName)
 	h.Set("Message-ID", messageID)
-	s.Log("Vacation message ID: %s", messageID)
+	s.Log("[SIEVE][VACATION] vacation message ID: %s", messageID)
 
 	if originalMessageID != "" {
 		h.Set("In-Reply-To", originalMessageID)
@@ -574,7 +572,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 
 	w, err := message.CreateWriter(&vacationMessage, h)
 	if err != nil {
-		s.Log("Error creating message writer: %v", err)
+		s.Log("[SIEVE][VACATION] WARNING: error creating message writer: %v", err)
 		return fmt.Errorf("failed to create message writer: %w", err)
 	}
 
@@ -582,14 +580,14 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
 	textWriter, err := w.CreatePart(textHeader)
 	if err != nil {
-		s.Log("Error creating text part: %v", err)
+		s.Log("[SIEVE][VACATION] WARNING: error creating text part: %v", err)
 		return fmt.Errorf("failed to create text part: %w", err)
 	}
 
-	s.Log("Adding vacation message body (length: %d bytes)", len(result.VacationMsg))
+	s.Log("[SIEVE][VACATION] adding vacation message body (length: %d bytes)", len(result.VacationMsg))
 	_, err = textWriter.Write([]byte(result.VacationMsg))
 	if err != nil {
-		s.Log("Error writing vacation message body: %v", err)
+		s.Log("[SIEVE][VACATION] WARNING: error writing vacation message body: %v", err)
 		return fmt.Errorf("failed to write vacation message body: %w", err)
 	}
 
@@ -598,11 +596,11 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 
 	sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
 	if sendErr != nil {
-		s.Log("error sending vacation response via external relay: %v", sendErr)
+		s.Log("[SIEVE][VACATION] WARNING: error sending vacation response via external relay: %v", sendErr)
 		// The Sieve engine's policy should have already recorded the response attempt.
 		// Failure here is a delivery issue.
 	} else {
-		s.Log("sent vacation response to %s via external relay %s",
+		s.Log("[SIEVE][VACATION] sent vacation response to %s via external relay %s",
 			s.sender.FullAddress(), s.backend.externalRelay)
 	}
 
@@ -610,28 +608,60 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	return nil
 }
 
-// dbVacationOracle implements the sieveengine.VacationOracle interface using the database.
-type dbVacationOracle struct {
-	db     db.Database
-	userID int64
-}
+// saveMessageToMailbox saves a message to the specified mailbox
+func (s *LMTPSession) saveMessageToMailbox(mailboxName string, messageContent *message.Entity,
+	fullMessageBytes []byte, contentHash string, subject string, messageID string,
+	sentDate time.Time, inReplyTo []string, bodyStructure *imap.BodyStructure,
+	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string) error {
 
-// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and handle.
-func (o *dbVacationOracle) IsVacationResponseAllowed(ctx context.Context, userID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	// Note: Current db.HasRecentVacationResponse does not take 'handle'.
-	// This might require DB schema/method changes or adapting how 'handle' is stored/checked.
-	// For this example, we'll ignore 'handle' for the DB check, assuming the DB stores per (userID, originalSender).
-	hasRecent, err := o.db.HasRecentVacationResponse(ctx, userID, originalSender, duration)
+	mailbox, err := s.backend.db.GetMailboxByName(s.ctx, s.UserID(), mailboxName)
 	if err != nil {
-		return false, fmt.Errorf("checking db for recent vacation response: %w", err)
+		if err == consts.ErrMailboxNotFound {
+			s.Log("WARNING: mailbox '%s' not found, falling back to INBOX", mailboxName)
+			mailbox, err = s.backend.db.GetMailboxByName(s.ctx, s.UserID(), consts.MailboxInbox)
+			if err != nil {
+				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
+			}
+		} else {
+			return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
+		}
 	}
-	return !hasRecent, nil // Allowed if no recent response found
-}
 
-// RecordVacationResponseSent records that a vacation response has been sent.
-func (o *dbVacationOracle) RecordVacationResponseSent(ctx context.Context, userID int64, originalSender string, handle string) error {
-	// Note: Current db.RecordVacationResponse does not take 'handle'.
-	// This might require DB schema/method changes or adapting how 'handle' is stored/recorded.
-	// For this example, we'll ignore 'handle' for the DB recording.
-	return o.db.RecordVacationResponse(ctx, userID, originalSender)
+	size := int64(len(fullMessageBytes))
+
+	_, messageUID, err := s.backend.db.InsertMessage(s.ctx,
+		&db.InsertMessageOptions{
+			UserID:        s.UserID(),
+			MailboxID:     mailbox.ID,
+			MailboxName:   mailbox.Name,
+			ContentHash:   contentHash,
+			MessageID:     messageID,
+			InternalDate:  time.Now(),
+			Size:          size,
+			Subject:       subject,
+			PlaintextBody: *plaintextBody,
+			SentDate:      sentDate,
+			InReplyTo:     inReplyTo,
+			BodyStructure: bodyStructure,
+			Recipients:    recipients,
+			Flags:         []imap.Flag{}, // Explicitly set empty flags to mark as unread
+			RawHeaders:    rawHeadersText,
+		},
+		db.PendingUpload{
+			ContentHash: contentHash,
+			InstanceID:  s.backend.hostname,
+			Size:        size,
+		})
+
+	if err != nil {
+		if err == consts.ErrDBUniqueViolation {
+			s.Log("WARNING: message already exists in database (content hash: %s)", contentHash)
+			return fmt.Errorf("message already exists: unique violation")
+		}
+		return fmt.Errorf("failed to save message: %v", err)
+	}
+
+	s.backend.uploader.NotifyUploadQueued()
+	s.Log("message saved with UID %d in mailbox '%s'", messageUID, mailbox.Name)
+	return nil
 }

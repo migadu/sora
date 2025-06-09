@@ -28,6 +28,7 @@ type LMTPServerBackend struct {
 	appCtx        context.Context
 	externalRelay string
 	tlsConfig     *tls.Config
+	debug         bool
 
 	// Connection counters
 	totalConnections atomic.Int64
@@ -52,6 +53,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 		s3:            s3,
 		uploader:      uploadWorker,
 		externalRelay: options.ExternalRelay,
+		debug:         options.Debug,
 	}
 
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {

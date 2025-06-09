@@ -18,8 +18,8 @@ require (
 	lukechampine.com/blake3 v1.4.1
 )
 
-// Use the fork at github.com/migadu/go-sieve instead of the original repository
-replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20240130002450-72d6b002882a
+// Use forked versions until upstreams are updated
+replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25
 
 replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250608165812-2ff811049f29
 

@@ -29,6 +29,7 @@ type Result struct {
 	VacationSubj   string            // used for vacation - subject
 	VacationMsg    string            // used for vacation - message body
 	VacationIsMime bool              // used for vacation - is MIME message
+	Copy           bool              // RFC3894 - :copy modifier for redirect and fileinto
 	Additional     map[string]string // future-proofing
 }
 
@@ -151,6 +152,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// Use the first mailbox (we could support multiple mailboxes in the future)
 		result.Action = ActionFileInto
 		result.Mailbox = data.Mailboxes[0]
+
+		// Check if ImplicitKeep is true, which means :copy was used
+		// With normal fileinto (no :copy), ImplicitKeep would be false
+		result.Copy = data.ImplicitKeep
 	}
 
 	// Handle redirect action
@@ -158,6 +163,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// Use the first redirect address (we could support multiple redirects in the future)
 		result.Action = ActionRedirect
 		result.RedirectTo = data.RedirectAddr[0]
+
+		// Check if ImplicitKeep is true, which means :copy was used
+		// With normal redirect (no :copy), ImplicitKeep would be false
+		result.Copy = data.ImplicitKeep
 	}
 
 	// Handle discard action
