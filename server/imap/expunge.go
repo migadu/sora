@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"sort"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 )
@@ -96,6 +98,13 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	s.currentNumMessages.Add(^uint32(len(messagesToExpunge) - 1)) // Subtract len(messagesToExpunge)
 	s.mutex.Unlock()
 	cancel()
+
+	// Sort messages to expunge by sequence number in descending order
+	// This ensures that when expunging multiple messages, we start with the
+	// highest sequence number and work downward, avoiding problems with shifting sequence numbers
+	sort.Slice(messagesToExpunge, func(i, j int) bool {
+		return messagesToExpunge[i].seq > messagesToExpunge[j].seq
+	})
 
 	// Send notifications using snapshot
 	for _, m := range messagesToExpunge {

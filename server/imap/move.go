@@ -13,7 +13,6 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	// First, safely read necessary session state
 	var selectedMailboxID int64
 	var decodedNumSet imap.NumSet
-	var sessionTrackerSnapshot *imapserver.SessionTracker
 
 	// Acquire read mutex to safely read session state
 	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -37,8 +36,6 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 	selectedMailboxID = s.selectedMailbox.ID
-	selectedMailboxUIDValidity := s.selectedMailbox.UIDValidity
-	sessionTrackerSnapshot = s.sessionTracker
 
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
@@ -71,11 +68,8 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	var sourceUIDs []imap.UID
-	var seqNums []uint32
-
 	for _, msg := range messages {
 		sourceUIDs = append(sourceUIDs, msg.UID)
-		seqNums = append(seqNums, uint32(msg.Seq))
 	}
 
 	// Check if the context is still valid before attempting the move
@@ -102,7 +96,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	if len(mappedSourceUIDs) > 0 && len(mappedDestUIDs) > 0 {
 		copyData := &imap.CopyData{
-			UIDValidity: selectedMailboxUIDValidity,          // UIDVALIDITY of the source mailbox
+			UIDValidity: destMailbox.UIDValidity,             // UIDVALIDITY of the destination mailbox
 			SourceUIDs:  imap.UIDSetNum(mappedSourceUIDs...), // Original UIDs (source mailbox)
 			DestUIDs:    imap.UIDSetNum(mappedDestUIDs...),   // New UIDs in the destination mailbox
 		}
@@ -124,31 +118,6 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 				s.Log("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
 				// Continue with other messages even if one fails
 			}
-		}
-	}
-
-	// Before sending expunge responses, check if context is still valid
-	if s.ctx.Err() != nil {
-		s.Log("[MOVE] context cancelled after moving messages, skipping expunge notifications")
-		return nil
-	}
-
-	// Verify we still have a valid session tracker for expunge notifications
-	if sessionTrackerSnapshot == nil {
-		s.Log("[MOVE] session tracker is nil, cannot generate expunge notifications")
-		return nil
-	}
-
-	// Expunge messages in the source mailbox
-	for _, seqNum := range seqNums {
-		sessionSeqNum := sessionTrackerSnapshot.EncodeSeqNum(seqNum)
-		if sessionSeqNum > 0 { // Only write if the message was known to this session and not yet expunged by it
-			if err := w.WriteExpunge(sessionSeqNum); err != nil {
-				s.Log("[MOVE] error writing expunge for sessionSeqNum %d (dbSeq %d): %v", sessionSeqNum, seqNum, err)
-				return s.internalError("failed to write EXPUNGE: %v", err)
-			}
-		} else {
-			s.Log("[MOVE] message with DB seq %d not found in current session view, skipping expunge notification for it.", seqNum)
 		}
 	}
 
