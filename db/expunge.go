@@ -10,7 +10,7 @@ import (
 
 func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uids ...imap.UID) error {
 	if len(uids) == 0 {
-		log.Printf("[EXPUNGE] no UIDs to expunge for mailbox %d", mailboxID)
+		log.Printf("[DB] no UIDs to expunge for mailbox %d", mailboxID)
 		return nil
 	}
 
@@ -21,7 +21,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 	// Defer rollback in case of errors. Commit will be called explicitly on success.
 	defer tx.Rollback(ctx)
 
-	log.Printf("[EXPUNGE] expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
+	log.Printf("[DB] expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
 
 	result, err := tx.Exec(ctx, `
 		UPDATE messages
@@ -30,12 +30,12 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 	`, mailboxID, uids)
 
 	if err != nil {
-		log.Printf("[EXPUNGE] error executing expunge update: %v", err)
+		log.Printf("[DB] error executing expunge update: %v", err)
 		return err
 	}
 
 	rowsAffected := result.RowsAffected()
-	log.Printf("[EXPUNGE] successfully expunged %d messages from mailbox %d", rowsAffected, mailboxID)
+	log.Printf("[DB] successfully expunged %d messages from mailbox %d", rowsAffected, mailboxID)
 
 	// Double-check that the messages were actually expunged within the transaction
 	var count int
@@ -49,9 +49,9 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 		// If the check itself fails, it's an issue, but the primary update might have succeeded.
 		// Depending on policy, you might still want to commit or force a rollback.
 		// For now, log it and proceed to commit if the UPDATE was successful.
-		log.Printf("[EXPUNGE] error checking if messages were expunged within transaction: %v", err)
+		log.Printf("[DB] error checking if messages were expunged within transaction: %v", err)
 	} else if count > 0 {
-		log.Printf("[EXPUNGE] WARNING: %d messages were not expunged", count)
+		log.Printf("[DB] WARNING: %d messages were not expunged", count)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

@@ -25,7 +25,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 		return nil, fmt.Errorf("failed to count messages: %v", err)
 	}
 
-	log.Printf("[LIST] Mailbox %d has %d total messages, %d expunged, %d active",
+	log.Printf("[DB] mailbox %d has %d total messages, %d expunged, %d active",
 		mailboxID, totalCount, expungedCount, totalCount-expungedCount)
 
 	// Now query only the non-expunged messages
@@ -55,6 +55,6 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 		return nil, fmt.Errorf("ListMessages: failed to scan messages: %w", err)
 	}
 
-	log.Printf("[LIST] Returning %d messages for mailbox %d", len(messages), mailboxID)
+	log.Printf("[DB] returning %d messages for mailbox %d", len(messages), mailboxID)
 	return messages, nil
 }

@@ -35,7 +35,7 @@ func (d *Database) DeleteExpungedMessagesByContentHash(ctx context.Context, cont
 	if tag.RowsAffected() == 0 {
 		// This is not necessarily an error. The entry might have been deleted in a previous run,
 		// or if the message was extremely short-lived, the content might not have been inserted.
-		log.Printf("[CLEANER] no rows deleted from message_contents for hash %s (may have been already deleted or never created)", contentHash)
+		log.Printf("[DB] no rows deleted from message_contents for hash %s (may have been already deleted or never created)", contentHash)
 	}
 
 	// Delete from messages (only expunged entries)

@@ -310,7 +310,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	rows, err := db.Pool.Query(ctx, finalQueryString, whereArgs)
 	if err != nil {
-		log.Printf("Error executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
+		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()

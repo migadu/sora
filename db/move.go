@@ -15,21 +15,21 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 
 	// Check if source and destination mailboxes are the same
 	if srcMailboxID == destMailboxID {
-		log.Printf("[MOVE] Source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
+		log.Printf("[DB] WARNING: source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
 		return nil, fmt.Errorf("cannot move messages within the same mailbox")
 	}
 
 	// Ensure the destination mailbox exists
 	_, err := db.GetMailbox(ctx, destMailboxID, userID)
 	if err != nil {
-		log.Printf("Failed to fetch mailbox %d: %v", destMailboxID, err)
+		log.Printf("[DB] ERROR: failed to fetch mailbox %d: %v", destMailboxID, err)
 		return nil, consts.ErrMailboxNotFound
 	}
 
 	// Begin a transaction
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
+		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
 		return nil, consts.ErrInternalError
 	}
 	defer tx.Rollback(ctx) // Rollback if any error occurs
@@ -38,12 +38,12 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	var messageCount int
 	err = tx.QueryRow(ctx, "SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND uid = ANY($2)", srcMailboxID, ids).Scan(&messageCount)
 	if err != nil {
-		log.Printf("Failed to count messages to move: %v", err)
+		log.Printf("[DB] ERROR: failed to count messages to move: %v", err)
 		return nil, consts.ErrInternalError
 	}
 
 	if messageCount == 0 {
-		log.Printf("[MOVE] No messages found to move from mailbox %d", srcMailboxID)
+		log.Printf("[DB] WARNING: no messages found to move from mailbox %d", srcMailboxID)
 		return messageUIDMap, nil
 	}
 
@@ -55,7 +55,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		WHERE id = $1 
 		FOR UPDATE;`, destMailboxID).Scan(&highestUID)
 	if err != nil {
-		log.Printf("Failed to fetch highest UID: %v", err)
+		log.Printf("[DB] ERROR: failed to fetch highest UID: %v", err)
 		return nil, consts.ErrDBQueryFailed
 	}
 
@@ -66,7 +66,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		ORDER BY uid
 	`, srcMailboxID, ids)
 	if err != nil {
-		log.Printf("Failed to query source messages: %v", err)
+		log.Printf("[DB] ERROR: failed to query source messages: %v", err)
 		return nil, consts.ErrInternalError
 	}
 	defer rows.Close()
@@ -98,7 +98,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		WHERE id = $2
 	`, highestUID, destMailboxID)
 	if err != nil {
-		log.Printf("Failed to update highest UID: %v", err)
+		log.Printf("[DB] ERROR: failed to update highest UID: %v", err)
 		return nil, consts.ErrDBUpdateFailed
 	}
 
@@ -151,7 +151,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		`, destMailboxID, newUID, messageID, srcMailboxID)
 
 		if err != nil {
-			log.Printf("Failed to insert message %d into destination mailbox: %v", messageID, err)
+			log.Printf("[DB] ERROR: failed to insert message %d into destination mailbox: %v", messageID, err)
 			return nil, fmt.Errorf("failed to move message %d: %v", messageID, err)
 		}
 	}
@@ -164,16 +164,15 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	`, srcMailboxID, messageIDs)
 
 	if err != nil {
-		log.Printf("Failed to mark original messages as expunged: %v", err)
+		log.Printf("[DB] ERROR: failed to mark original messages as expunged: %v", err)
 		return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
 	}
 
 	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
+		log.Printf("[DB] ERROR: failed to commit transaction: %v", err)
 		return nil, consts.ErrInternalError
 	}
 
-	log.Printf("[MOVE] Successfully moved %d messages from mailbox %d to %d", len(messageUIDMap), srcMailboxID, destMailboxID)
 	return messageUIDMap, nil
 }

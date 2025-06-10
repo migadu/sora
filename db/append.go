@@ -19,7 +19,7 @@ import (
 func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID, srcMailboxID int64, destMailboxID int64, destMailboxName string) (imap.UID, error) {
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
+		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, consts.ErrDBBeginTransactionFailed
 	}
 	defer tx.Rollback(ctx)
@@ -33,7 +33,7 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 			mailbox_id = $2
 		FOR UPDATE;`, srcMessageUID, srcMailboxID)
 	if err != nil {
-		log.Printf("Failed to lock message row: %v", err)
+		log.Printf("[DB] failed to lock message row: %v", err)
 		return 0, consts.ErrDBQueryFailed
 	}
 
@@ -48,7 +48,7 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 			id = $1 
 		FOR UPDATE;`, destMailboxID).Scan(&highestUID)
 	if err != nil {
-		log.Printf("Failed to fetch highest UID: %v", err)
+		log.Printf("[DB] failed to fetch highest UID: %v", err)
 		return 0, consts.ErrDBQueryFailed
 	}
 
@@ -62,12 +62,12 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 			id = $1 
 		RETURNING highest_uid`, destMailboxID).Scan(&highestUID)
 	if err != nil {
-		log.Printf("Failed to update highest UID: %v", err)
+		log.Printf("[DB] failed to update highest UID: %v", err)
 		return 0, consts.ErrDBUpdateFailed
 	}
 
 	// Log the destination mailbox name for debugging
-	log.Printf("Copying message to mailbox '%s'", destMailboxName)
+	log.Printf("[DB] copying message to mailbox '%s'", destMailboxName)
 
 	// Get the updated_modseq of the source message to use for the created_modseq of the copy
 	var srcUpdatedModSeq int64 // This variable is fetched but not directly used for created_modseq in the INSERT below.
@@ -77,7 +77,7 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 		WHERE mailbox_id = $1 AND uid = $2
 	`, srcMailboxID, srcMessageUID).Scan(&srcUpdatedModSeq)
 	if err != nil {
-		log.Printf("Failed to get source message modseq: %v", err)
+		log.Printf("[DB] failed to get source message modseq: %v", err)
 		return 0, consts.ErrDBQueryFailed
 	}
 
@@ -99,10 +99,10 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 	if err != nil {
 		// If unique constraint violation, return an error
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
-			log.Print("Message with same id already exists in mailbox")
+			log.Print("[DB] message with same id already exists in mailbox")
 			return 0, consts.ErrDBUniqueViolation
 		}
-		log.Printf("Failed to insert message into database: %v", err)
+		log.Printf("[DB] failed to insert message into database: %v", err)
 		return 0, consts.ErrDBInsertFailed
 	}
 
@@ -112,7 +112,7 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 	// due to the ON CONFLICT (content_hash) DO NOTHING clause in InsertMessage.
 
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
+		log.Printf("[DB] failed to commit transaction: %v", err)
 		return 0, consts.ErrDBCommitTransactionFailed
 	}
 
@@ -141,14 +141,14 @@ type InsertMessageOptions struct {
 func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
-		log.Printf("MessageID is empty after sanitization, generating a new one without modifying the message.")
+		log.Printf("[DB] messageID is empty after sanitization, generating a new one without modifying the message.")
 		// Generate a new message ID if not provided
 		saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), options.MailboxName)
 	}
 
 	bodyStructureData, err := helpers.SerializeBodyStructureGob(options.BodyStructure)
 	if err != nil {
-		log.Printf("Failed to serialize BodyStructure: %v", err)
+		log.Printf("[DB] failed to serialize BodyStructure: %v", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -158,7 +158,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 
 	tx, err := d.Pool.Begin(ctx)
 	if err != nil {
-		log.Printf("Failed to begin transaction: %v", err)
+		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, 0, consts.ErrDBBeginTransactionFailed
 	}
 	defer tx.Rollback(ctx)
@@ -168,20 +168,20 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	// Lock mailbox and get current UID
 	err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
 	if err != nil {
-		log.Printf("Failed to fetch highest UID: %v", err)
+		log.Printf("[DB] failed to fetch highest UID: %v", err)
 		return 0, 0, consts.ErrDBQueryFailed
 	}
 
 	// Bump UID
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 	if err != nil {
-		log.Printf("Failed to update highest UID: %v", err)
+		log.Printf("[DB] failed to update highest UID: %v", err)
 		return 0, 0, consts.ErrDBUpdateFailed
 	}
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {
-		log.Printf("Failed to marshal recipients: %v", err)
+		log.Printf("[DB] failed to marshal recipients: %v", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -236,7 +236,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 			// Unique constraint violation. Check if it's due to message_id and if we can return the existing message.
 			// The saneMessageID was used in the INSERT attempt.
 
-			log.Printf("Unique constraint violation for MessageID '%s' in MailboxID %d. Attempting to find existing message.", saneMessageID, options.MailboxID)
+			log.Printf("[DB] unique constraint violation for MessageID '%s' in MailboxID %d. Attempting to find existing message.", saneMessageID, options.MailboxID)
 			var existingID, existingUID int64
 			// Query within the same transaction. If we return successfully from here,
 			// the defer tx.Rollback(ctx) will roll back the attempted INSERT and UID bump.
@@ -246,22 +246,22 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 				options.UserID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
 
 			if queryErr == nil {
-				log.Printf("Found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
+				log.Printf("[DB] found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
 				return existingID, existingUID, nil // Return existing message details
 			} else if errors.Is(queryErr, pgx.ErrNoRows) {
 				// This is unexpected: unique constraint fired, but we can't find the row by message_id.
 				// Could be a conflict on UID or another unique constraint.
-				log.Printf("Unique constraint violation for MailboxID %d (MessageID '%s'), but no existing non-expunged message found by this MessageID. Falling back to unique violation error. Lookup error: %v", options.MailboxID, saneMessageID, queryErr)
+				log.Printf("[DB] unique constraint violation for MailboxID %d (MessageID '%s'), but no existing non-expunged message found by this MessageID. Falling back to unique violation error. Lookup error: %v", options.MailboxID, saneMessageID, queryErr)
 			} else {
 				// Error during the lookup query
-				log.Printf("Error querying for existing message after unique constraint violation (MailboxID %d, MessageID '%s'): %v. Falling back to unique violation error.", options.MailboxID, saneMessageID, queryErr)
+				log.Printf("[DB] error querying for existing message after unique constraint violation (MailboxID %d, MessageID '%s'): %v. Falling back to unique violation error.", options.MailboxID, saneMessageID, queryErr)
 			}
 
 			// Fallback to returning the original unique violation error if MessageID was empty or lookup failed.
-			log.Printf("Original unique constraint violation error for MailboxID %d, MessageID '%s': %v", options.MailboxID, saneMessageID, err)
+			log.Printf("[DB] original unique constraint violation error for MailboxID %d, MessageID '%s': %v", options.MailboxID, saneMessageID, err)
 			return 0, 0, consts.ErrDBUniqueViolation // Original error
 		}
-		log.Printf("Failed to insert message into database: %v", err)
+		log.Printf("[DB] failed to insert message into database: %v", err)
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
@@ -274,7 +274,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 		ON CONFLICT (content_hash) DO NOTHING
 	`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
 	if err != nil {
-		log.Printf("Failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
@@ -288,7 +288,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	)
 
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("Failed to commit transaction: %v", err)
+		log.Printf("[DB] failed to commit transaction: %v", err)
 		return 0, 0, consts.ErrDBCommitTransactionFailed
 	}
 

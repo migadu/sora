@@ -26,7 +26,7 @@ func NewDatabase(ctx context.Context, host, port, user, password, dbname string,
 	connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
 		user, password, host, port, dbname, sslMode)
 
-	log.Printf("Connecting to database: postgres://%s@%s:%s/%s?sslmode=%s",
+	log.Printf("[DB] connecting to database: postgres://%s@%s:%s/%s?sslmode=%s",
 		user, host, port, dbname, sslMode)
 
 	config, err := pgxpool.ParseConfig(connString)

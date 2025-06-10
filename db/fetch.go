@@ -32,7 +32,7 @@ func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailbo
 			return "", fmt.Errorf("message with UID %d in mailbox %d not found: %w", uid, mailboxID, err)
 		}
 		// Other database error during query execution.
-		log.Printf("Database error fetching text_body for UID %d, MailboxID %d: %v", uid, mailboxID, err)
+		log.Printf("[DB] database error fetching text_body for UID %d, MailboxID %d: %v", uid, mailboxID, err)
 		return "", fmt.Errorf("database error fetching text_body: %w", err)
 	}
 
@@ -42,7 +42,7 @@ func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailbo
 		// textBody.Valid being false implies no matching row in message_contents.
 		// This indicates a data integrity issue, as a message's content_hash (which is NOT NULL)
 		// should always exist in message_contents.
-		log.Printf("Data integrity issue: Message found (UID %d, Mailbox %d) but no corresponding entry in message_contents.", uid, mailboxID)
+		log.Printf("[DB] data integrity issue: Message found (UID %d, Mailbox %d) but no corresponding entry in message_contents.", uid, mailboxID)
 		return "", fmt.Errorf("message text content missing for UID %d, Mailbox %d (data integrity)", uid, mailboxID)
 	}
 
@@ -74,7 +74,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		&recipientsJSON,
 	)
 	if err != nil {
-		log.Printf("Failed to fetch envelope fields for UID %d, MailboxID %d: %v", UID, mailboxID, err)
+		log.Printf("[DB] failed to fetch envelope fields for UID %d, MailboxID %d: %v", UID, mailboxID, err)
 		return nil, err
 	}
 
@@ -87,7 +87,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 
 	var recipients []helpers.Recipient
 	if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
-		log.Printf("failed to decode recipients JSON: %v", err)
+		log.Printf("[DB] failed to decode recipients JSON: %v", err)
 		return nil, err
 	}
 
@@ -99,7 +99,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 
 		parts := strings.Split(emailAddress, "@")
 		if len(parts) != 2 {
-			log.Printf("WARNING: malformed email address '%s' for recipient type '%s' (UID %d, MailboxID %d)", emailAddress, addressType, UID, mailboxID)
+			log.Printf("[DB] WARNING: malformed email address '%s' for recipient type '%s' (UID %d, MailboxID %d)", emailAddress, addressType, UID, mailboxID)
 			continue
 		}
 		mailboxPart, hostNamePart := parts[0], parts[1]
@@ -122,7 +122,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		case "from":
 			envelope.From = append(envelope.From, address)
 		default:
-			log.Printf("WARNING: unhandled address type: %s (UID %d, MailboxID %d)", addressType, UID, mailboxID)
+			log.Printf("[DB] WARNING: unhandled address type: %s (UID %d, MailboxID %d)", addressType, UID, mailboxID)
 		}
 	}
 

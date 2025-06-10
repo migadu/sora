@@ -216,7 +216,7 @@ func verifyPassword(hashedPassword, password string) error {
 
 	default:
 		// No known scheme prefix
-		log.Printf("Unknown password hash scheme: %s", hashedPassword[:min(10, len(hashedPassword))]) // Using built-in min
+		log.Printf("[DB] unknown password hash scheme: %s", hashedPassword[:min(10, len(hashedPassword))]) // Using built-in min
 		return errors.New("unknown password hash scheme")
 	}
 }
@@ -263,7 +263,7 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 		newHashedPassword, normalizedAddress)
 
 	if err != nil {
-		log.Printf("error updating password for address %s: %v", normalizedAddress, err)
+		log.Printf("[DB] error updating password for address %s: %v", normalizedAddress, err)
 		return fmt.Errorf("database error updating password: %w", err)
 	}
 
@@ -295,7 +295,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 			return 0, consts.ErrUserNotFound
 		}
 		// Log other unexpected database errors
-		log.Printf("error fetching credentials for address %s: %v", normalizedAddress, err)
+		log.Printf("[DB] error fetching credentials for address %s: %v", normalizedAddress, err)
 		return 0, fmt.Errorf("database error during authentication: %w", err)
 	}
 
@@ -311,7 +311,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 		// Generate a new hash with the current default cost
 		newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			log.Printf("WARNING: failed to rehash password for address %s: %v", normalizedAddress, err)
+			log.Printf("[DB] WARNING: failed to rehash password for address %s: %v", normalizedAddress, err)
 			// Continue even if rehashing fails
 		} else {
 			// If it's a BLF-CRYPT format, preserve the prefix
@@ -325,10 +325,10 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 			// Update the stored password
 			err = db.UpdatePassword(ctx, normalizedAddress, newHashedPassword)
 			if err != nil {
-				log.Printf("WARNING: failed to update rehashed password for address %s: %v", normalizedAddress, err)
+				log.Printf("[DB] WARNING: failed to update rehashed password for address %s: %v", normalizedAddress, err)
 				// Continue even if update fails
 			} else {
-				log.Printf("rehashed password with new cost for address %s", normalizedAddress)
+				log.Printf("[DB] rehashed password with new cost for address %s", normalizedAddress)
 			}
 		}
 	}
@@ -353,7 +353,7 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 			// Identity (address) not found in the credentials table
 			return 0, consts.ErrUserNotFound
 		}
-		log.Printf("error fetching account ID for address %s: %v", normalizedAddress, err)
+		log.Printf("[DB] error fetching account ID for address %s: %v", normalizedAddress, err)
 		return 0, fmt.Errorf("database error fetching account ID: %w", err)
 	}
 	return accountID, nil
