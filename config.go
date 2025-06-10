@@ -19,11 +19,13 @@ type DatabaseConfig struct {
 
 // S3Config holds S3 configuration.
 type S3Config struct {
-	Endpoint  string `toml:"endpoint"`
-	AccessKey string `toml:"access_key"`
-	SecretKey string `toml:"secret_key"`
-	Bucket    string `toml:"bucket"`
-	Trace     bool   `toml:"trace"`
+	Endpoint      string `toml:"endpoint"`
+	AccessKey     string `toml:"access_key"`
+	SecretKey     string `toml:"secret_key"`
+	Bucket        string `toml:"bucket"`
+	Trace         bool   `toml:"trace"`
+	Encrypt       bool   `toml:"encrypt"`
+	EncryptionKey string `toml:"encryption_key"`
 }
 
 // Cleaner worker configuration.
@@ -132,10 +134,12 @@ func newDefaultConfig() Config {
 			LogQueries: false,
 		},
 		S3: S3Config{
-			Endpoint:  "",
-			AccessKey: "",
-			SecretKey: "",
-			Bucket:    "",
+			Endpoint:      "",
+			AccessKey:     "",
+			SecretKey:     "",
+			Bucket:        "",
+			Encrypt:       false,
+			EncryptionKey: "",
 		},
 		Cleanup: CleanupConfig{
 			GracePeriod:  "14d",

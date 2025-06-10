@@ -36,6 +36,11 @@ secret_key = "YOUR_S3_SECRET_KEY_HERE"
 bucket = "your-sora-mail-bucket"
 # If true, enables detailed S3 client request tracing. Useful for debugging S3 communication.
 trace = false
+# Enable client-side encryption for objects stored in S3
+encrypt = false
+# Encryption key (32-byte master key) used for client-side encryption
+# This should be a 32-byte hex-encoded string (64 characters)
+encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # --- Local Cache Configuration ---
 [local_cache]

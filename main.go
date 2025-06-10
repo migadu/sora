@@ -412,6 +412,13 @@ func main() {
 		log.Fatalf("Failed to initialize S3 storage at endpoint '%s': %v", s3EndpointToUse, err)
 	}
 
+	// Enable encryption if configured
+	if cfg.S3.Encrypt {
+		if err := s3storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			log.Fatalf("Failed to enable S3 encryption: %v", err)
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
