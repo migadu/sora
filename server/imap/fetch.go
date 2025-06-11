@@ -15,6 +15,8 @@ import (
 	tp "net/textproto"
 )
 
+const crlf = "\r\n"
+
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
@@ -309,8 +311,12 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		if isHeaderFieldsRequest {
 			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
-				// parsedDBHeader is textproto.Header from "github.com/emersion/go-message/textproto"
-				parsedDBHeader, parseErr := textproto.ReadHeader(bufio.NewReader(bytes.NewReader([]byte(headersText))))
+				// Ensure headersText is a valid block for parsing, ending with \r\n if not empty.
+				headerBlockToParse := headersText
+				if !strings.HasSuffix(headerBlockToParse, crlf) && headerBlockToParse != "" {
+					headerBlockToParse += crlf
+				}
+				parsedDBHeader, parseErr := textproto.ReadHeader(bufio.NewReader(bytes.NewReader([]byte(headerBlockToParse))))
 				if parseErr == nil {
 					sectionContent, extractionErr = extractRequestedHeaders(parsedDBHeader, section)
 					satisfiedFromDB = true
@@ -331,7 +337,13 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		} else if isAllHeadersRequest {
 			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
-				sectionContent = []byte(headersText)
+				// headersText from DB is the block of headers.
+				// It might be "H1:V1" or "H1:V1\r\nH2:V2".
+				// We need to ensure its own last line ends with crlf, then add the final separator crlf.
+				if !strings.HasSuffix(headersText, crlf) {
+					headersText += crlf
+				}
+				sectionContent = []byte(headersText + crlf)
 				satisfiedFromDB = true
 				s.Log("[FETCH] UID %d: Served BODY[HEADER] from message_contents.headers", msg.UID)
 			} else {
