@@ -21,7 +21,7 @@ require (
 // Use forked versions until upstreams are updated
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25
 
-replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250608165812-2ff811049f29
+replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250611203636-5c83d840efe0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
