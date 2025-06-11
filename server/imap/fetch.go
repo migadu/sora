@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -341,13 +342,29 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 				}
 			}
 		} else if isMainBodyTextRequest {
+			// Attempt to serve BODY[TEXT] from the pre-extracted text_body in the database.
 			textBody, dbErr := s.server.db.GetMessageTextBody(s.ctx, msg.UID, selectedMailboxID)
-			if dbErr == nil { // textBody can be "" if the message has no text part or it's empty
-				sectionContent = []byte(textBody)
-				satisfiedFromDB = true
-				s.Log("[FETCH] UID %d: Served BODY[TEXT] from message_contents.text_body", msg.UID)
-			} else {
+
+			if dbErr == nil { // DB fetch successful, textBody might be empty or populated.
+				isSuspectDueToEncoding := false
+				if textBody != "" { // Only suspect if non-empty and potentially encoded.
+					if bodyStructureHasEncodedText(msg.BodyStructure) {
+						s.Log("[FETCH] UID %d: BODY[TEXT] from DB is non-empty, and original message structure contains encoded text parts. Suspect, will fall back to ensure decoding.", msg.UID)
+						isSuspectDueToEncoding = true
+					}
+				}
+
+				if !isSuspectDueToEncoding {
+					sectionContent = []byte(textBody)
+					satisfiedFromDB = true
+					s.Log("[FETCH] UID %d: Served BODY[TEXT] from message_contents.text_body.", msg.UID)
+				} else {
+					// isSuspectDueToEncoding is true. Fallback will be triggered by satisfiedFromDB = false.
+					s.Log("[FETCH] UID %d: text_body from DB for BODY[TEXT] is suspect due to original encoding. Falling back.", msg.UID)
+				}
+			} else { // dbErr != nil
 				s.Log("[FETCH] UID %d: Failed to get text_body from DB for BODY[TEXT] ('%v'). Falling back.", msg.UID, dbErr)
+				// satisfiedFromDB remains false. Fallback will occur.
 			}
 		}
 
@@ -492,4 +509,31 @@ func extractRequestedHeaders(parsedDBHeader textproto.Header, section *imap.Fetc
 	}
 
 	return buf.Bytes(), nil
+}
+
+// bodyStructureHasEncodedText checks if any text part (text/plain, text/html, etc.)
+// within the given body structure uses base64 or quoted-printable encoding.
+// This is used to determine if a pre-extracted text_body from the database
+// might be undecoded raw content.
+func bodyStructureHasEncodedText(bs imap.BodyStructure) bool {
+	if bs == nil {
+		return false
+	}
+	switch b := bs.(type) {
+	case *imap.BodyStructureSinglePart:
+		// Check if it's a text part and uses an encoding that needs decoding for BODY[TEXT].
+		// b.MediaType() returns "type/subtype" in lowercase.
+		if strings.HasPrefix(b.MediaType(), "text/") &&
+			(strings.EqualFold(b.Encoding, "base64") || strings.EqualFold(b.Encoding, "quoted-printable")) {
+			return true
+		}
+	case *imap.BodyStructureMultiPart:
+		// Recursively check parts of a multipart message.
+		for _, childPart := range b.Children {
+			if bodyStructureHasEncodedText(childPart) { // Recurse
+				return true
+			}
+		}
+	}
+	return false
 }
