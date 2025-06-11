@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -63,15 +64,25 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 				statusData, err := s.Status(data.Mailbox, options.ReturnStatus)
 				if err == nil && statusData != nil {
 					data.Status = statusData
-					s.Log("[LIST-STATUS] Mailbox '%s': NumMessages=%v, UIDNext=%v, UIDValidity=%v, NumUnseen=%v, HighestModSeq=%v",
+
+					numMessagesStr := "n/a"
+					if statusData.NumMessages != nil {
+						numMessagesStr = fmt.Sprint(*statusData.NumMessages)
+					}
+					numUnseenStr := "n/a"
+					if statusData.NumUnseen != nil {
+						numUnseenStr = fmt.Sprint(*statusData.NumUnseen)
+					}
+
+					s.Log("[LIST-STATUS] Mailbox '%s': NumMessages=%s, UIDNext=%v, UIDValidity=%v, NumUnseen=%s, HighestModSeq=%v",
 						data.Mailbox,
-						statusData.NumMessages,
+						numMessagesStr,
 						statusData.UIDNext,
 						statusData.UIDValidity,
-						statusData.NumUnseen,
+						numUnseenStr,
 						statusData.HighestModSeq)
 				} else {
-					s.Log("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err)
+					s.Log("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err) // err can be nil if statusData is nil
 				}
 			}
 		}
