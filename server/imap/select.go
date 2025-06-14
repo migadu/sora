@@ -124,23 +124,30 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.currentNumMessages.Store(uint32(currentSummary.NumMessages))
 	s.currentHighestModSeq.Store(currentSummary.HighestModSeq)
 
+	// Store the first unseen message sequence number from the mailbox summary
+	s.firstUnseenSeqNum.Store(currentSummary.FirstUnseenSeqNum)
+	if currentSummary.FirstUnseenSeqNum > 0 {
+		s.Log("[SELECT] First unseen message is at sequence number %d", currentSummary.FirstUnseenSeqNum)
+	}
+
 	s.selectedMailbox = mailbox
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 
-	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d",
-		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent)
+	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d FirstUnseenSeq=%d",
+		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent, s.firstUnseenSeqNum.Load())
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
 		Flags: getDisplayFlags(s.ctx, s.server.db, mailbox),
 		// Flags that can be changed, including \* for custom
-		PermanentFlags: getPermanentFlags(),
-		NumMessages:    s.currentNumMessages.Load(),
-		UIDNext:        imap.UID(currentSummary.UIDNext),
-		UIDValidity:    s.selectedMailbox.UIDValidity,
-		NumRecent:      numRecent, // Use the calculated numRecent
-		HighestModSeq:  s.currentHighestModSeq.Load(),
+		PermanentFlags:    getPermanentFlags(),
+		NumMessages:       s.currentNumMessages.Load(),
+		UIDNext:           imap.UID(currentSummary.UIDNext),
+		UIDValidity:       s.selectedMailbox.UIDValidity,
+		NumRecent:         numRecent,
+		HighestModSeq:     s.currentHighestModSeq.Load(),
+		FirstUnseenSeqNum: s.firstUnseenSeqNum.Load(),
 	}
 
 	return selectData, nil

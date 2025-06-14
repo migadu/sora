@@ -30,6 +30,7 @@ type IMAPSession struct {
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
 	currentNumMessages   atomic.Uint32
+	firstUnseenSeqNum    atomic.Uint32 // Sequence number of the first unseen message
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
@@ -90,6 +91,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
 	s.currentNumMessages.Store(0)
+	s.firstUnseenSeqNum.Store(0)
 }
 
 // decodeNumSetLocked translates client sequence numbers to server sequence numbers.

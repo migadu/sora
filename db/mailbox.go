@@ -279,12 +279,13 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, userId int64) er
 }
 
 type MailboxSummary struct {
-	UIDNext       int64
-	NumMessages   int
-	TotalSize     int64
-	HighestModSeq uint64
-	RecentCount   int
-	UnseenCount   int
+	UIDNext           int64
+	NumMessages       int
+	TotalSize         int64
+	HighestModSeq     uint64
+	RecentCount       int
+	UnseenCount       int
+	FirstUnseenSeqNum uint32 // Sequence number of the first unseen message
 }
 
 func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*MailboxSummary, error) {
@@ -312,6 +313,39 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 	var s MailboxSummary
 	err = row.Scan(&s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.UnseenCount)
+
+	// If we have unseen messages, find the first unseen sequence number in the same transaction
+	if s.UnseenCount > 0 {
+		firstUnseenQuery := `
+			WITH numbered_messages AS (
+				SELECT 
+					uid,
+					flags,
+					row_number() OVER (ORDER BY uid) AS seqnum
+				FROM messages
+				WHERE mailbox_id = $1 AND expunged_at IS NULL
+			)
+			SELECT seqnum
+			FROM numbered_messages
+			WHERE (flags & $2) = 0  -- Where \Seen flag is not set
+			ORDER BY seqnum
+			LIMIT 1
+		`
+		err = tx.QueryRow(ctx, firstUnseenQuery, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				// Shouldn't happen since we have a positive unseen count, but handle it anyway
+				s.FirstUnseenSeqNum = 0
+			} else {
+				log.Printf("[DB] ERROR: failed to get first unseen sequence number: %v", err)
+				// Continue with FirstUnseenSeqNum = 0, it's not critical enough to fail the whole operation
+				s.FirstUnseenSeqNum = 0
+			}
+		}
+	} else {
+		// No unseen messages
+		s.FirstUnseenSeqNum = 0
+	}
 	if err != nil {
 		return nil, fmt.Errorf("GetMailboxSummary: %w", err)
 	}
