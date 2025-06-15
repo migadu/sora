@@ -33,10 +33,10 @@ type IMAPServer struct {
 	appCtx             context.Context
 	caps               imap.CapSet
 	tlsConfig          *tls.Config
-	masterUsername     string
-	masterPassword     string
-	masterSASLUsername string
-	masterSASLPassword string
+	masterUsername     []byte
+	masterPassword     []byte
+	masterSASLUsername []byte
+	masterSASLPassword []byte
 	appendLimit        int64
 
 	// Connection counters
@@ -50,10 +50,10 @@ type IMAPServerOptions struct {
 	TLSCertFile        string
 	TLSKeyFile         string
 	TLSVerify          bool
-	MasterUsername     string
-	MasterPassword     string
-	MasterSASLUsername string
-	MasterSASLPassword string
+	MasterUsername     []byte
+	MasterPassword     []byte
+	MasterSASLUsername []byte
+	MasterSASLPassword []byte
 	AppendLimit        int64
 }
 

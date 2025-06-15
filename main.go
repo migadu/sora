@@ -519,10 +519,10 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			TLSCertFile:        config.Servers.IMAP.TLSCertFile,
 			TLSKeyFile:         config.Servers.IMAP.TLSKeyFile,
 			TLSVerify:          config.Servers.IMAP.TLSVerify,
-			MasterUsername:     config.Servers.IMAP.MasterUsername,
-			MasterPassword:     config.Servers.IMAP.MasterPassword,
-			MasterSASLUsername: config.Servers.IMAP.MasterSASLUsername,
-			MasterSASLPassword: config.Servers.IMAP.MasterSASLPassword,
+			MasterUsername:     []byte(config.Servers.IMAP.MasterUsername),
+			MasterPassword:     []byte(config.Servers.IMAP.MasterPassword),
+			MasterSASLUsername: []byte(config.Servers.IMAP.MasterSASLUsername),
+			MasterSASLPassword: []byte(config.Servers.IMAP.MasterSASLPassword),
 			AppendLimit:        appendLimit,
 		})
 	if err != nil {
