@@ -26,10 +26,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", identity, username)
 
 			// 1. Check for Master SASL Authentication
-			if s.server.masterSASLUsername != "" &&
-				s.server.masterSASLPassword != "" {
+			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				// Check if the provided authentication identity and password match the server's master SASL credentials
-				if username == s.server.masterSASLUsername && password == s.server.masterSASLPassword {
+				if checkMasterCredential(username, s.server.masterSASLUsername) &&
+					checkMasterCredential(password, s.server.masterSASLPassword) {
+
 					// Master SASL credentials match. The user to log in as is the authorization-identity.
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {

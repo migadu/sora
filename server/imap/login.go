@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"crypto/subtle"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -14,7 +15,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	authAddress, proxyUser := parseMasterLogin(address)
 
 	// Master password login
-	if s.server.masterUsername != "" && proxyUser != "" {
+	if len(s.server.masterUsername) > 0 && proxyUser != "" && checkMasterCredential(proxyUser, s.server.masterUsername) {
 		address, err := server.NewAddress(authAddress)
 		if err != nil {
 			s.Log("[LOGIN] failed to parse address: %v", err)
@@ -25,7 +26,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			}
 		}
 
-		if password == s.server.masterPassword {
+		if checkMasterCredential(password, s.server.masterPassword) {
 			userID, err := s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
 			if err != nil {
 				return err
@@ -87,4 +88,8 @@ func parseMasterLogin(username string) (realuser, authuser string) {
 		return parts[0], parts[1]
 	}
 	return username, ""
+}
+
+func checkMasterCredential(provided string, actual []byte) bool {
+	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
 }
