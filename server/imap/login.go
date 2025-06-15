@@ -15,7 +15,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	authAddress, proxyUser := parseMasterLogin(address)
 
 	// Master password login
-	if len(s.server.masterUsername) > 0 && proxyUser != "" {
+	if len(s.server.masterUsername) > 0 && proxyUser != "" && checkMasterCredential(proxyUser, s.server.masterUsername) {
 		address, err := server.NewAddress(authAddress)
 		if err != nil {
 			s.Log("[LOGIN] failed to parse address: %v", err)
