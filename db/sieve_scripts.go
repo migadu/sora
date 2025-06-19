@@ -3,8 +3,8 @@ package db
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
-	"github.com/yugabyte/pgx/v5"
 )
 
 type SieveScript struct {

@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
-	"github.com/yugabyte/pgx/v5"
 )
 
 // DBMailbox represents the database structure of a mailbox

@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
-	"github.com/yugabyte/pgx/v5"
 )
 
 // GetMessageTextBody fetches the plain text body of a message from the message_contents table.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/yugabyte/pgx/v5"
+	"github.com/jackc/pgx/v5"
 )
 
 // CustomTracer implements the QueryTracer interface

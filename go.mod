@@ -13,7 +13,6 @@ require (
 	github.com/k3a/html2text v1.2.1
 	github.com/mattn/go-sqlite3 v1.14.27
 	github.com/minio/minio-go/v7 v7.0.89
-	github.com/yugabyte/pgx/v5 v5.5.3-yb-5
 	golang.org/x/crypto v0.37.0
 	lukechampine.com/blake3 v1.4.1
 )
