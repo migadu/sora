@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -17,21 +16,25 @@ import (
 // DBMailbox represents the database structure of a mailbox
 type DBMailbox struct {
 	ID          int64
-	Name        string // Full path
+	Name        string // User-visible, delimiter-separated mailbox name (e.g., "INBOX/Sent")
 	UIDValidity uint32
 	Subscribed  bool
 	HasChildren bool
-	ParentID    *int64 // Nullable parent ID for top-level mailboxes
+	Path        string // Hex-encoded path of ancestor IDs
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
-func NewDBMailbox(mboxId int64, name string, uidValidity uint32, parentID *int64, subscribed, hasChildren bool) DBMailbox {
+func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, subscribed, hasChildren bool, createdAt, updatedAt time.Time) DBMailbox {
 	return DBMailbox{
 		ID:          mboxId,
 		Name:        name,
 		UIDValidity: uidValidity,
-		ParentID:    parentID,
+		Path:        path,
 		HasChildren: hasChildren,
 		Subscribed:  subscribed,
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
 	}
 }
 
@@ -41,9 +44,11 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 			id, 
 			name, 
 			uid_validity, 
-			parent_id, 
+			path,  
 			subscribed, 
-			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.parent_id = m.id) AS has_children 
+			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.path LIKE m.path || '%' AND child.path != m.path) AS has_children,
+			created_at,
+			updated_at
 		FROM 
 			mailboxes m 
 		WHERE 
@@ -64,25 +69,18 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 	var mailboxes []*DBMailbox
 	for rows.Next() {
 		var mailboxID int64
-		var parentID *int64
-
-		var dbParentID sql.NullInt64
-
 		var mailboxName string
 		var hasChildren bool
 		var uidValidityInt64 int64
-
+		var path string
 		var subscribed bool
+		var createdAt, updatedAt time.Time
 
-		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidityInt64, &dbParentID, &subscribed, &hasChildren); err != nil {
+		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidityInt64, &path, &subscribed, &hasChildren, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 
-		if dbParentID.Valid {
-			i := dbParentID.Int64
-			parentID = &i
-		}
-		mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), parentID, subscribed, hasChildren)
+		mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), path, subscribed, hasChildren, createdAt, updatedAt)
 		mailboxes = append(mailboxes, &mailbox)
 	}
 
@@ -96,23 +94,25 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 
 // GetMailbox fetches the mailbox
 func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int64) (*DBMailbox, error) {
-	var dbParentID sql.NullInt64
 	var mailboxName string
 	var hasChildren bool
 	var uidValidityInt64 int64
 	var subscribed bool
+	var path string
+	var createdAt, updatedAt time.Time
 
 	err := db.Pool.QueryRow(ctx, `
 		SELECT 
-			id, name, uid_validity, parent_id, subscribed,
+			id, name, uid_validity, path, subscribed,
 			EXISTS (
 				SELECT 1
 				FROM mailboxes AS child
-				WHERE child.parent_id = m.id
-			) AS has_children
+				WHERE child.path LIKE m.path || '%' AND child.path != m.path
+			) AS has_children,
+			created_at, updated_at
 		FROM mailboxes m
 		WHERE id = $1 AND account_id = $2
-	`, mailboxID, userID).Scan(&mailboxID, &mailboxName, &uidValidityInt64, &dbParentID, &subscribed, &hasChildren)
+	`, mailboxID, userID).Scan(&mailboxID, &mailboxName, &uidValidityInt64, &path, &subscribed, &hasChildren, &createdAt, &updatedAt)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -121,28 +121,23 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 		return nil, err
 	}
 
-	var parentID *int64
-	if dbParentID.Valid {
-		i := dbParentID.Int64
-		parentID = &i
-	}
-
-	mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), parentID, subscribed, hasChildren)
+	mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), path, subscribed, hasChildren, createdAt, updatedAt)
 	return &mailbox, nil
 }
 
-// GetMailboxByFullPath fetches the mailbox for a specific user by full path, working recursively
+// GetMailboxByName fetches the mailbox for a specific user by name
 func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name string) (*DBMailbox, error) {
 	var mailbox DBMailbox
 
 	var uidValidityInt64 int64
 	err := db.Pool.QueryRow(ctx, `
 		SELECT
-			id, name, uid_validity, parent_id, subscribed,
-			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.parent_id = m.id) AS has_children
+			id, name, uid_validity, path, subscribed,
+			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.path LIKE m.path || '%' AND child.path != m.path) AS has_children,
+			created_at, updated_at
 		FROM mailboxes m
 		WHERE account_id = $1 AND LOWER(name) = $2
-	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.ParentID, &mailbox.Subscribed, &mailbox.HasChildren)
+	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.HasChildren, &mailbox.CreatedAt, &mailbox.UpdatedAt)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -157,13 +152,39 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 }
 
 func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+	// Start a transaction
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	// Avoid low uid_validity which may cause issues with some IMAP clients
 	uidValidity := uint32(time.Now().Unix())
-	// Try to insert the mailbox into the database
-	_, err := db.Pool.Exec(ctx, `
-		INSERT INTO mailboxes (account_id, name, parent_id, uid_validity, subscribed)
-		VALUES ($1, $2, $3, $4, $5)
-	`, userID, name, parentID, int64(uidValidity), true)
+
+	// Determine the parent path if parentID is provided
+	var parentPath string
+	if parentID != nil {
+		// Fetch the parent mailbox to get its path
+		err := tx.QueryRow(ctx, `
+			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
+		`, *parentID, userID).Scan(&parentPath)
+
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return consts.ErrMailboxNotFound
+			}
+			return fmt.Errorf("failed to fetch parent mailbox: %w", err)
+		}
+	}
+
+	// Insert the mailbox
+	var mailboxID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
+		VALUES ($1, $2, $3, $4, '')
+		RETURNING id
+	`, userID, name, int64(uidValidity), true).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -177,25 +198,61 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
 					log.Printf("[DB] ERROR: user with ID %d does not exist", userID)
 					return consts.ErrDBNotFound
-				} else if pgErr.ConstraintName == "mailboxes_parent_id_fkey" {
-					log.Printf("[DB] ERROR: parent mailbox does not exist")
-					return consts.ErrDBNotFound
 				}
 			}
 		}
 		return fmt.Errorf("failed to create mailbox: %v", err)
 	}
+
+	// Update the path now that we have the ID
+	mailboxPath := helpers.GetMailboxPath(parentPath, mailboxID)
+	_, err = tx.Exec(ctx, `
+		UPDATE mailboxes SET path = $1 WHERE id = $2
+	`, mailboxPath, mailboxID)
+
+	if err != nil {
+		return fmt.Errorf("failed to update mailbox path: %w", err)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return nil
 }
 
 func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+	// Start a transaction
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	uidValidity := uint32(time.Now().Unix())
+
+	// Determine the parent path if parentID is provided
+	var parentPath string
+	if parentID != nil {
+		// Fetch the parent mailbox to get its path
+		err := tx.QueryRow(ctx, `
+			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
+		`, *parentID, userID).Scan(&parentPath)
+
+		if err != nil && err != pgx.ErrNoRows {
+			return fmt.Errorf("failed to fetch parent mailbox: %w", err)
+		}
+	}
+
 	// Try to insert the mailbox into the database
-	_, err := db.Pool.Exec(ctx, `
-		INSERT INTO mailboxes (account_id, name, parent_id, uid_validity, subscribed)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (account_id, name, parent_id) DO NOTHING
-	`, userID, name, parentID, int64(uidValidity), true)
+	var mailboxID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
+		VALUES ($1, $2, $3, $4, '')
+		ON CONFLICT (account_id, name) DO NOTHING
+		RETURNING id
+	`, userID, name, int64(uidValidity), true).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -209,8 +266,40 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 				}
 			}
 		}
-		return fmt.Errorf("failed to create mailbox: %v", err)
+
+		// If the mailbox already exists (no rows returned), fetch its ID
+		if err == pgx.ErrNoRows {
+			err := tx.QueryRow(ctx, `
+				SELECT id FROM mailboxes 
+				WHERE account_id = $1 AND name = $2
+			`, userID, name).Scan(&mailboxID)
+
+			if err != nil {
+				return fmt.Errorf("failed to get existing mailbox ID: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to create mailbox: %v", err)
+		}
 	}
+
+	// Only update the path if we got a valid mailbox ID
+	if mailboxID > 0 {
+		// Update the path
+		mailboxPath := helpers.GetMailboxPath(parentPath, mailboxID)
+		_, err = tx.Exec(ctx, `
+			UPDATE mailboxes SET path = $1 WHERE id = $2 AND (path = '' OR path IS NULL)
+		`, mailboxPath, mailboxID)
+
+		if err != nil {
+			return fmt.Errorf("failed to update mailbox path: %w", err)
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return nil
 }
 
@@ -229,6 +318,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 	}
 	defer tx.Rollback(ctx) // Ensure the transaction is rolled back if an error occurs
 
+	// Update messages that belong to this mailbox
 	_, err = tx.Exec(ctx, `
 		UPDATE messages SET 
 			mailbox_path = $1 
@@ -238,10 +328,61 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrInternalError
 	}
 
-	result, err := tx.Exec(ctx, `
-		DELETE FROM mailboxes WHERE id = $1`, mailboxID)
+	// Get all child mailbox IDs to update their messages too
+	var childMailboxIDs []int64
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM mailboxes 
+		WHERE account_id = $1 AND path LIKE $2 || '%' AND id != $3
+	`, userID, mbox.Path, mailboxID)
+
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to delete mailbox %d: %v", mailboxID, err)
+		log.Printf("[DB] ERROR: failed to fetch child mailboxes: %v", err)
+		return consts.ErrInternalError
+	}
+
+	for rows.Next() {
+		var childID int64
+		if err := rows.Scan(&childID); err != nil {
+			rows.Close()
+			return fmt.Errorf("error scanning child mailbox ID: %w", err)
+		}
+		childMailboxIDs = append(childMailboxIDs, childID)
+	}
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating child mailboxes: %w", err)
+	}
+
+	// Update messages for all child mailboxes
+	for _, childID := range childMailboxIDs {
+		var childName string
+		err := tx.QueryRow(ctx, `
+			SELECT name FROM mailboxes WHERE id = $1
+		`, childID).Scan(&childName)
+
+		if err != nil {
+			log.Printf("[DB] ERROR: failed to get child mailbox %d name: %v", childID, err)
+			continue
+		}
+
+		_, err = tx.Exec(ctx, `
+			UPDATE messages SET mailbox_path = $1 WHERE mailbox_id = $2
+		`, childName, childID)
+
+		if err != nil {
+			log.Printf("[DB] ERROR: failed to update messages for child mailbox %d: %v", childID, err)
+		}
+	}
+
+	// Delete the mailbox and all its children in one query using path-based approach
+	result, err := tx.Exec(ctx, `
+		DELETE FROM mailboxes 
+		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '%')
+	`, userID, mailboxID, mbox.Path)
+
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to delete mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
@@ -388,7 +529,8 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 		log.Printf("[DB] ERROR: failed to fetch mailbox %d: %v", mailboxID, err)
 		return consts.ErrMailboxNotFound
 	}
-	if mailbox.ParentID == nil {
+	// Check if this is a root folder based on path length (8 chars = root)
+	if len(mailbox.Path) == 8 {
 		for _, rootFolder := range consts.DefaultMailboxes {
 			if strings.EqualFold(mailbox.Name, rootFolder) {
 				log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mailbox.Name)
@@ -398,7 +540,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 	}
 
 	_, err = db.Pool.Exec(ctx, `
-		UPDATE mailboxes SET subscribed = $1 WHERE id = $2
+		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2
 	`, subscribed, mailboxID)
 	if err != nil {
 		return fmt.Errorf("failed to update subscription status for mailbox %d: %v", mailboxID, err)
@@ -434,155 +576,52 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrInternalError
 	}
 
-	// Find common name to determine parent between mailbox.name and newName
-	parentPath := findCommonPath(mailbox.Name, newName, string(consts.MailboxDelimiter))
+	oldName := mailbox.Name
+	delimiter := string(consts.MailboxDelimiter)
 
-	// No common path
-	if parentPath == "" {
-
-		parentPathComponents := strings.Split(newName, string(consts.MailboxDelimiter))
-		parentPath = strings.Join(parentPathComponents[:len(parentPathComponents)-1], string(consts.MailboxDelimiter))
-	}
-
-	// Get the parent mailbox ID
-	var parentMailboxID *int64
-
-	if parentPath != "" {
-		parentMailbox, err := db.GetMailboxByName(ctx, userID, parentPath)
-		if err != nil {
-			log.Printf("[DB] ERROR: failed to fetch parent mailbox %s: %v", parentPath, err)
-			return consts.ErrInternalError
-		}
-		parentMailboxID = &parentMailbox.ID
-	}
-
-	var parentVal interface{}
-	if parentMailboxID == nil {
-		// This will become SQL NULL
-		parentVal = nil
-	} else {
-		// Dereference the pointer, store as an int
-		parentVal = *parentMailboxID
-	}
-
-	// Update the mailbox name and parent ID
-	_, err = tx.Exec(ctx, `UPDATE mailboxes SET name = $1, parent_id = $2 WHERE id = $3`,
-		newName, parentVal, mailboxID)
+	// Update the mailbox name and updated_at timestamp
+	_, err = tx.Exec(ctx, `UPDATE mailboxes SET name = $1, updated_at = now() WHERE id = $2`, newName, mailboxID)
 	if err != nil {
 		return fmt.Errorf("failed to rename mailbox %d: %v", mailboxID, err)
 	}
 
-	// Recursively update child mailboxes' parent paths
+	// Update child mailbox names if this mailbox has children
 	if mailbox.HasChildren {
-		if err := db.updateParentPathOnMailboxChildren(ctx, tx, mailboxID, newName); err != nil {
-			return err
+		// Only append delimiter if it's not already there
+		oldPrefix := oldName
+		if !strings.HasSuffix(oldPrefix, delimiter) {
+			oldPrefix += delimiter
+		}
+
+		newPrefix := newName
+		if !strings.HasSuffix(newPrefix, delimiter) {
+			newPrefix += delimiter
+		}
+
+		// This query replaces the old prefix with the new prefix in all child mailbox names
+		// Also updates the updated_at timestamp
+		_, err = tx.Exec(ctx, `
+			UPDATE mailboxes
+			SET 
+				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
+				updated_at = now()
+			WHERE 
+				account_id = $3 AND 
+				path LIKE $4 || '%' AND 
+				id != $5 AND
+				name LIKE $2 || '%'
+		`, newPrefix, oldPrefix, userID, mailbox.Path, mailboxID)
+
+		if err != nil {
+			return fmt.Errorf("failed to update child mailbox names: %v", err)
 		}
 	}
 
-	committed := false
-	defer func() {
-		if !committed {
-			tx.Rollback(ctx)
-		}
-	}()
-
+	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("[DB] ERROR: failed to commit transaction: %v", err)
 		return consts.ErrDBCommitTransactionFailed
 	}
-	committed = true
 
 	return nil
-}
-
-func (db *Database) updateParentPathOnMailboxChildren(
-	ctx context.Context,
-	tx pgx.Tx,
-	parentMailboxID int64,
-	newParentPath string,
-) error {
-	rows, err := tx.Query(ctx, `
-			SELECT 
-					id,
-					name,
-					EXISTS (
-							SELECT 1
-							FROM mailboxes AS child
-							WHERE child.parent_id = m.id
-					) AS has_children
-			FROM mailboxes m
-			WHERE parent_id = $1
-	`, parentMailboxID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	// First, gather all child info in-memory
-	var children []struct {
-		id          int64
-		name        string
-		hasChildren bool
-	}
-
-	for rows.Next() {
-		var childMailboxID int64
-		var childMailboxName string
-		var hasChildren bool
-		if err := rows.Scan(&childMailboxID, &childMailboxName, &hasChildren); err != nil {
-			return err
-		}
-
-		children = append(children, struct {
-			id          int64
-			name        string
-			hasChildren bool
-		}{
-			id:          childMailboxID,
-			name:        childMailboxName,
-			hasChildren: hasChildren,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for _, child := range children {
-		// Build new path for the child
-		oldNameComponents := strings.Split(child.name, string(consts.MailboxDelimiter))
-		newName := strings.Join([]string{
-			newParentPath,
-			oldNameComponents[len(oldNameComponents)-1],
-		}, string(consts.MailboxDelimiter))
-
-		ct, err := tx.Exec(ctx, `
-					UPDATE mailboxes
-					SET name = $1
-					WHERE id = $2
-						AND parent_id = $3
-			`, newName, child.id, parentMailboxID)
-		if err != nil {
-			return fmt.Errorf("failed to update child mailbox %d: %v", child.id, err)
-		}
-
-		if ct.RowsAffected() == 0 {
-			log.Printf("[DB] ERROR: child mailbox %d not found for update", child.id)
-			continue
-		}
-
-		// If the child itself has children, recurse AFTER closing the parent's rows
-		if child.hasChildren {
-			if err := db.updateParentPathOnMailboxChildren(ctx, tx, child.id, newName); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-// findCommonPath finds the common path between two mailbox names based on the delimiter.
-// This is a wrapper around helpers.FindCommonPath for backward compatibility.
-func findCommonPath(oldName, newName, delimiter string) string {
-	return helpers.FindCommonPath(oldName, newName, delimiter)
 }

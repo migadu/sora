@@ -27,19 +27,15 @@ CREATE TABLE IF NOT EXISTS mailboxes (
 	highest_uid BIGINT DEFAULT 0 NOT NULL,                       -- The highest UID in the mailbox
 	name TEXT NOT NULL,
 	uid_validity BIGINT NOT NULL,                                -- Include uid_validity column for IMAP
-	parent_id BIGINT REFERENCES mailboxes(id) ON DELETE CASCADE, -- Self-referencing for parent mailbox	
-	subscribed BOOLEAN DEFAULT TRUE,  							 -- New field to track mailbox subscription status
-	UNIQUE (account_id, name, parent_id), 						 -- Enforce unique mailbox names per account and parent mailbox
+	path TEXT NOT NULL DEFAULT '',                               -- Hex-encoded path of ancestor IDs
+	subscribed BOOLEAN DEFAULT TRUE,                             -- Track mailbox subscription status	
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-	updated_at TIMESTAMPTZ DEFAULT now() NOT NULL
+	updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+	CONSTRAINT mailboxes_account_id_name_unique UNIQUE (account_id, name) -- Enforce unique mailbox names per account
 );
 
 -- Index for faster mailbox lookups by account_id and case insensitive name
-CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name_parent_id ON mailboxes (account_id, LOWER(name), parent_id);
-
--- Partial unique index for top-level mailboxes
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mailboxes_account_id_name_top_level_unique ON mailboxes (account_id, name)
-	WHERE parent_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name ON mailboxes (account_id, LOWER(name));
 
 -- Index for faster mailbox lookups by account_id and subscription status
 CREATE INDEX IF NOT EXISTS idx_mailboxes_account_subscribed ON mailboxes (account_id, subscribed);
@@ -47,8 +43,11 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_account_subscribed ON mailboxes (accoun
 -- Index for faster mailbox lookups by account_id
 CREATE INDEX IF NOT EXISTS idx_mailboxes_account_id ON mailboxes (account_id);
 
--- Index to speed up parent-child hierarchy lookups
-CREATE INDEX IF NOT EXISTS idx_mailboxes_parent_id ON mailboxes (parent_id);
+-- Index for efficient path-based hierarchy lookups
+CREATE INDEX IF NOT EXISTS idx_mailboxes_path ON mailboxes (path);
+
+-- Index for path prefix searches (finding descendants)
+CREATE INDEX IF NOT EXISTS idx_mailboxes_path_gist ON mailboxes USING gist (path gist_trgm_ops);
 
 CREATE SEQUENCE IF NOT EXISTS messages_modseq;
 
