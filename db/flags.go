@@ -41,6 +41,11 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 	slices.Sort(customKeywords)
 	// Compact removes adjacent duplicates, resulting in a sorted slice of unique keywords.
 	customKeywords = slices.Compact(customKeywords)
+	if len(customKeywords) == 0 {
+		// json.Marshal encodes nil lists as null instead of an empty array,
+		// avoid this by allocating a zero-length slice
+		customKeywords = []string{}
+	}
 	return
 }
 
