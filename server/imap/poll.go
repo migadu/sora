@@ -70,29 +70,25 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// Group updates by sequence number to detect duplicate expunges
 	expungedSeqNums := make(map[uint32]bool)
 
-	// Process all updates
+	// Process expunge updates
 	for _, update := range poll.Updates {
-		if update.IsExpunge {
-			// Check if we've already processed an expunge for this sequence number
-			if expungedSeqNums[update.SeqNum] {
-				s.Log("[POLL] Skipping duplicate expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
-				continue
-			}
-
-			s.Log("[POLL] Processing expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
-			s.mailboxTracker.QueueExpunge(update.SeqNum)
-			// Atomically decrement the current number of messages
-			s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
-
-			// Mark this sequence number as already expunged to prevent duplicates
-			expungedSeqNums[update.SeqNum] = true
-		} else {
-			allFlags := db.BitwiseToFlags(update.BitwiseFlags)
-			for _, customFlag := range update.CustomFlags {
-				allFlags = append(allFlags, imap.Flag(customFlag))
-			}
-			s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, nil)
+		if !update.IsExpunge {
+			continue
 		}
+
+		// Check if we've already processed an expunge for this sequence number
+		if expungedSeqNums[update.SeqNum] {
+			s.Log("[POLL] Skipping duplicate expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
+			continue
+		}
+
+		s.Log("[POLL] Processing expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
+		s.mailboxTracker.QueueExpunge(update.SeqNum)
+		// Atomically decrement the current number of messages
+		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
+
+		// Mark this sequence number as already expunged to prevent duplicates
+		expungedSeqNums[update.SeqNum] = true
 	}
 
 	// Lock-free comparison and update of message count
@@ -100,6 +96,19 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	if poll.NumMessages > currentCount {
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
+	}
+
+	// Process message flag updates
+	for _, update := range poll.Updates {
+		if update.IsExpunge {
+			continue
+		}
+
+		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
+		for _, customFlag := range update.CustomFlags {
+			allFlags = append(allFlags, imap.Flag(customFlag))
+		}
+		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, nil)
 	}
 
 	return s.sessionTracker.Poll(w, allowExpunge)
