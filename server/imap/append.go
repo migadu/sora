@@ -26,7 +26,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			s.Log("[APPEND] mailbox '%s' does not exist", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
+				Code: imap.ResponseCodeTryCreate,
 				Text: fmt.Sprintf("mailbox '%s' does not exist", mboxName),
 			}
 		}

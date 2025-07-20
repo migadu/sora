@@ -48,7 +48,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		s.Log("[MOVE] destination mailbox '%s' not found: %v", dest, err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeNonExistent,
+			Code: imap.ResponseCodeTryCreate,
 			Text: fmt.Sprintf("destination mailbox '%s' not found", dest),
 		}
 	}

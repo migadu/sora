@@ -45,7 +45,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 			s.Log("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
+				Code: imap.ResponseCodeTryCreate,
 				Text: fmt.Sprintf("destination mailbox '%s' does not exist", mboxName),
 			}
 		}
