@@ -406,8 +406,7 @@ func main() {
 		log.Fatal("S3 endpoint not specified")
 	}
 	log.Printf("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
-	// TLS is always enabled for S3
-	s3storage, err := storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, true, cfg.S3.Trace)
+	s3storage, err := storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 	if err != nil {
 		log.Fatalf("Failed to initialize S3 storage at endpoint '%s': %v", s3EndpointToUse, err)
 	}

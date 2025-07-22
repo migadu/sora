@@ -20,6 +20,7 @@ type DatabaseConfig struct {
 // S3Config holds S3 configuration.
 type S3Config struct {
 	Endpoint      string `toml:"endpoint"`
+	DisableTLS    bool   `toml:"disable_tls"`
 	AccessKey     string `toml:"access_key"`
 	SecretKey     string `toml:"secret_key"`
 	Bucket        string `toml:"bucket"`
