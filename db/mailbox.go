@@ -549,77 +549,115 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 	return nil
 }
 
-func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID int64, newName string) error {
+func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID int64, newName string, newParentID *int64) error {
 	if newName == "" {
 		return consts.ErrMailboxInvalidName
 	}
 
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
+		log.Printf("[DB] ERROR: failed to begin transaction for rename: %v", err)
 		return consts.ErrDBBeginTransactionFailed
 	}
 	defer tx.Rollback(ctx)
 
-	// Fetch the mailbox to rename
-	mailbox, err := db.GetMailbox(ctx, mailboxID, userID)
-	if err != nil {
-		return consts.ErrMailboxNotFound
-	}
-
-	// Check if the new name already exists
-	_, err = db.GetMailboxByName(ctx, userID, newName)
+	// Check if the new name already exists within the same transaction to prevent race conditions.
+	var existingID int64
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
 	if err == nil {
+		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists
-	} else if err != consts.ErrMailboxNotFound {
-		log.Printf("[DB] ERROR: failed to fetch mailbox %s: %v", newName, err)
+	} else if err != pgx.ErrNoRows {
+		// An actual error occurred during the check.
+		log.Printf("[DB] ERROR: failed to check for existing mailbox with name '%s': %v", newName, err)
+		return consts.ErrInternalError
+	}
+	// If err is pgx.ErrNoRows, we can proceed.
+
+	// Fetch the mailbox to be moved to get its current state (oldName, oldPath).
+	// Lock this row to prevent other operations on it.
+	var oldName, oldPath string
+	var hasChildren bool
+	err = tx.QueryRow(ctx, `
+		SELECT 
+			name, path, 
+			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.path LIKE m.path || '%' AND child.path != m.path)
+		FROM mailboxes m 
+		WHERE id = $1 AND account_id = $2 FOR UPDATE`, mailboxID, userID).Scan(&oldName, &oldPath, &hasChildren)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return consts.ErrMailboxNotFound
+		}
+		log.Printf("[DB] ERROR: failed to fetch mailbox to rename (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
-	oldName := mailbox.Name
-	delimiter := string(consts.MailboxDelimiter)
+	// Determine the path of the new parent.
+	var newParentPath string
+	if newParentID != nil {
+		// A mailbox cannot be its own parent.
+		if *newParentID == mailboxID {
+			return fmt.Errorf("mailbox %d cannot be its own parent", mailboxID)
+		}
 
-	// Update the mailbox name and updated_at timestamp
-	_, err = tx.Exec(ctx, `UPDATE mailboxes SET name = $1, updated_at = now() WHERE id = $2`, newName, mailboxID)
+		// Lock the parent row as well to prevent it from being deleted/moved during this transaction.
+		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE", *newParentID, userID).Scan(&newParentPath)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				log.Printf("[DB] ERROR: new parent mailbox (ID: %d) not found for rename", *newParentID)
+				return consts.ErrMailboxNotFound
+			}
+			log.Printf("[DB] ERROR: failed to fetch new parent path (ID: %d): %v", *newParentID, err)
+			return consts.ErrInternalError
+		}
+
+		// Also, a mailbox cannot be moved into one of its own children.
+		// The new parent's path cannot start with the old path of the mailbox being moved.
+		if strings.HasPrefix(newParentPath, oldPath) {
+			return fmt.Errorf("cannot move mailbox %d into one of its own sub-mailboxes", mailboxID)
+		}
+	}
+	// If newParentID is nil, newParentPath remains empty, which is correct for a top-level mailbox.
+
+	// Construct the new path
+	newPath := helpers.GetMailboxPath(newParentPath, mailboxID)
+
+	// Update the target mailbox itself.
+	_, err = tx.Exec(ctx, `
+		UPDATE mailboxes 
+		SET name = $1, path = $2, updated_at = now() 
+		WHERE id = $3
+	`, newName, newPath, mailboxID)
 	if err != nil {
-		return fmt.Errorf("failed to rename mailbox %d: %v", mailboxID, err)
+		return fmt.Errorf("failed to update target mailbox %d: %w", mailboxID, err)
 	}
 
-	// Update child mailbox names if this mailbox has children
-	if mailbox.HasChildren {
-		// Only append delimiter if it's not already there
-		oldPrefix := oldName
-		if !strings.HasSuffix(oldPrefix, delimiter) {
-			oldPrefix += delimiter
-		}
+	// Now, update all children of the renamed mailbox if it has any.
+	if hasChildren {
+		delimiter := string(consts.MailboxDelimiter)
+		oldPrefix := oldName + delimiter
+		newPrefix := newName + delimiter
 
-		newPrefix := newName
-		if !strings.HasSuffix(newPrefix, delimiter) {
-			newPrefix += delimiter
-		}
-
-		// This query replaces the old prefix with the new prefix in all child mailbox names
-		// Also updates the updated_at timestamp
 		_, err = tx.Exec(ctx, `
 			UPDATE mailboxes
 			SET 
 				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
+				path = $3 || SUBSTRING(path FROM LENGTH($4) + 1),
 				updated_at = now()
 			WHERE 
-				account_id = $3 AND 
+				account_id = $5 AND 
 				path LIKE $4 || '%' AND 
-				id != $5 AND
-				name LIKE $2 || '%'
-		`, newPrefix, oldPrefix, userID, mailbox.Path, mailboxID)
+				id != $6
+		`, newPrefix, oldPrefix, newPath, oldPath, userID, mailboxID)
 
 		if err != nil {
-			return fmt.Errorf("failed to update child mailbox names: %v", err)
+			return fmt.Errorf("failed to update child mailboxes: %w", err)
 		}
 	}
 
 	// Commit the transaction
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] ERROR: failed to commit transaction: %v", err)
+		log.Printf("[DB] ERROR: failed to commit transaction for rename: %v", err)
 		return consts.ErrDBCommitTransactionFailed
 	}
 

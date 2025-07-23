@@ -2,6 +2,7 @@ package imap
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
@@ -50,8 +51,27 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		}
 	}
 
-	// Final phase: actual rename - no locks needed as it's a DB operation
-	err = s.server.db.RenameMailbox(s.ctx, oldMailbox.ID, userID, newName)
+	// Determine the new parent mailbox ID
+	var newParentMailboxID *int64
+	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
+	if len(newParts) > 1 {
+		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
+		newParentMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, newParentPath)
+		if err != nil {
+			if err == consts.ErrMailboxNotFound {
+				s.Log("[RENAME] new parent mailbox '%s' for '%s' does not exist", newParentPath, newName)
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: fmt.Sprintf("Cannot rename mailbox to '%s' because parent mailbox '%s' does not exist", newName, newParentPath),
+				}
+			}
+			return s.internalError("failed to fetch new parent mailbox '%s': %v", newParentPath, err)
+		}
+		newParentMailboxID = &newParentMailbox.ID
+	}
+	// If len(newParts) <= 1, newParentMailboxID remains nil, which is correct for a top-level mailbox.
+
+	err = s.server.db.RenameMailbox(s.ctx, oldMailbox.ID, userID, newName, newParentMailboxID)
 	if err != nil {
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
