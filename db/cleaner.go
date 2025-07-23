@@ -56,6 +56,24 @@ func (d *Database) DeleteExpungedMessagesByContentHash(ctx context.Context, cont
 	return nil
 }
 
+// ExpungeOldMessages marks messages older than the specified duration as expunged
+// This enables automatic cleanup of old messages based on age restriction
+func (d *Database) ExpungeOldMessages(ctx context.Context, olderThan time.Duration) (int64, error) {
+	threshold := time.Now().Add(-olderThan).UTC()
+
+	result, err := d.Pool.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+		WHERE created_at < $1 AND expunged_at IS NULL
+	`, threshold)
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to expunge old messages: %w", err)
+	}
+
+	return result.RowsAffected(), nil
+}
+
 // GetContentHashesForFullCleanup identifies content_hash values for which all associated messages
 // are expunged and older than the specified 'olderThan' duration (grace period).
 // These content_hash values are candidates for complete removal from S3, message_contents, and messages table.

@@ -31,8 +31,9 @@ type S3Config struct {
 
 // Cleaner worker configuration.
 type CleanupConfig struct {
-	GracePeriod  string `toml:"grace_period"`
-	WakeInterval string `toml:"wake_interval"`
+	GracePeriod       string `toml:"grace_period"`
+	WakeInterval      string `toml:"wake_interval"`
+	MaxAgeRestriction string `toml:"max_age_restriction"`
 }
 
 // Local disk cache configuration.
@@ -216,6 +217,13 @@ func (c *CleanupConfig) GetWakeInterval() (time.Duration, error) {
 		c.WakeInterval = "1h"
 	}
 	return helpers.ParseDuration(c.WakeInterval)
+}
+
+func (c *CleanupConfig) GetMaxAgeRestriction() (time.Duration, error) {
+	if c.MaxAgeRestriction == "" {
+		return 0, nil // 0 means no restriction
+	}
+	return helpers.ParseDuration(c.MaxAgeRestriction)
 }
 
 func (c *LocalCacheConfig) GetCapacity() (int64, error) {

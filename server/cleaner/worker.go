@@ -26,26 +26,32 @@ import (
 )
 
 type CleanupWorker struct {
-	db          *db.Database
-	s3          *storage.S3Storage
-	cache       *cache.Cache
-	interval    time.Duration
-	gracePeriod time.Duration
+	db                *db.Database
+	s3                *storage.S3Storage
+	cache             *cache.Cache
+	interval          time.Duration
+	gracePeriod       time.Duration
+	maxAgeRestriction time.Duration
 }
 
 // New creates a new CleanupWorker.
-func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod time.Duration) *CleanupWorker {
+func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction time.Duration) *CleanupWorker {
 	return &CleanupWorker{
-		db:          db,
-		s3:          s3,
-		cache:       cache,
-		interval:    interval,
-		gracePeriod: gracePeriod,
+		db:                db,
+		s3:                s3,
+		cache:             cache,
+		interval:          interval,
+		gracePeriod:       gracePeriod,
+		maxAgeRestriction: maxAgeRestriction,
 	}
 }
 
 func (w *CleanupWorker) Start(ctx context.Context) {
-	log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v", w.interval, w.gracePeriod)
+	if w.maxAgeRestriction > 0 {
+		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, max age restriction: %v", w.interval, w.gracePeriod, w.maxAgeRestriction)
+	} else {
+		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v", w.interval, w.gracePeriod)
+	}
 	interval := w.interval
 
 	const minAllowedInterval = time.Minute
@@ -83,6 +89,17 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		return nil
 	}
 	defer w.db.ReleaseCleanupLock(ctx)
+
+	// First handle max age restriction if configured
+	if w.maxAgeRestriction > 0 {
+		count, err := w.db.ExpungeOldMessages(ctx, w.maxAgeRestriction)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to expunge old messages: %v", err)
+			// Continue with other cleanup tasks even if this fails
+		} else if count > 0 {
+			log.Printf("[CLEANUP] expunged %d messages older than %v", count, w.maxAgeRestriction)
+		}
+	}
 
 	// Clean up old vacation responses
 	count, err := w.db.CleanupOldVacationResponses(ctx, w.gracePeriod)

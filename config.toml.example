@@ -70,6 +70,11 @@ retry_interval = "30s"
 grace_period = "14d"
 # How often the cleanup process should run to remove old items (e.g., "1h", "24h").
 wake_interval = "1h"
+# Maximum age restriction for messages. Messages older than this will be automatically expunged.
+# Leave empty for no restriction (messages can stay forever).
+# Examples: "30d" (30 days), "90d" (90 days), "365d" (1 year)
+# This enables ephemeral storage where old messages are automatically cleaned up.
+max_age_restriction = "" # Empty means no restriction
 
 # --- General Server Configurations ---
 [servers]

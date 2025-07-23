@@ -18,6 +18,7 @@ It serves as a lightweight building block for larger infrastructure systems, wit
 - **POP3** support
 - **ManageSIEVE** 
 - **SIEVE** scripts support
+- **Configurable message expunge delay** with grace period before permanent deletion
 
 ---
 
@@ -86,6 +87,62 @@ Start the email server:
 ```
 
 ---
+
+## Configuration
+
+### Message Expunge Behavior
+
+Sora implements a two-phase deletion process for expunged messages:
+
+1. When messages are expunged (via IMAP EXPUNGE command), they are marked with an `expunged_at` timestamp but not immediately deleted
+2. A background cleanup worker permanently deletes messages after a configurable grace period
+
+Configure this behavior in your `config.toml`:
+
+```toml
+[cleanup]
+# Time duration for which deleted items are kept before being permanently removed
+# Examples: "14d" (14 days), "30d" (30 days), "7d" (7 days), "24h" (24 hours)
+grace_period = "14d"
+
+# How often the cleanup process should run to remove old items  
+# Examples: "1h" (hourly), "24h" (daily), "6h" (every 6 hours)
+wake_interval = "1h"
+
+# Maximum age restriction for messages - enables ephemeral storage
+# Messages older than this will be automatically expunged
+# Leave empty for no restriction (messages can stay forever)
+# Examples: "30d" (30 days), "90d" (90 days), "365d" (1 year)
+max_age_restriction = "" # Empty means no restriction
+```
+
+This allows for:
+- Recovery of accidentally expunged messages within the grace period
+- Compliance with retention policies
+- Reduced load on the storage backend by batching deletions
+- **Ephemeral storage**: With `max_age_restriction` set, old messages are automatically expunged, ensuring storage doesn't grow indefinitely
+
+### Ephemeral Storage Mode
+
+When `max_age_restriction` is configured, Sora operates in ephemeral storage mode:
+
+1. Messages older than the specified age are automatically marked as expunged during cleanup runs
+2. These auto-expunged messages then enter the grace period before permanent deletion
+3. This ensures that storage usage remains bounded over time
+
+Example configuration for 90-day ephemeral storage:
+
+```toml
+[cleanup]
+grace_period = "7d"           # Keep expunged messages for 7 days
+wake_interval = "6h"          # Run cleanup every 6 hours
+max_age_restriction = "90d"   # Auto-expunge messages older than 90 days
+```
+
+In this example:
+- Messages older than 90 days are automatically expunged
+- Expunged messages are kept for another 7 days before permanent deletion
+- Total maximum message lifetime: 97 days
 
 ## Admin Tool
 

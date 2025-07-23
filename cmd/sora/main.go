@@ -469,7 +469,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid cleanup wake_interval duration: %v", err)
 	}
-	cleanupWorker := cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod)
+	maxAgeRestriction, err := cfg.Cleanup.GetMaxAgeRestriction()
+	if err != nil {
+		log.Fatalf("Invalid cleanup max_age_restriction duration: %v", err)
+	}
+	cleanupWorker := cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction)
 	cleanupWorker.Start(ctx)
 
 	retryInterval, err := cfg.Uploader.GetRetryInterval()
