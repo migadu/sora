@@ -67,6 +67,15 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		s.currentHighestModSeq.Store(poll.ModSeq)
 	}
 
+	// First, update message count if it has increased (new messages)
+	// This must be done before processing expunges to ensure sequence numbers are valid
+	currentCount := s.currentNumMessages.Load()
+	if poll.NumMessages > currentCount {
+		s.Log("[POLL] Updating message count from %d to %d", currentCount, poll.NumMessages)
+		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
+		s.currentNumMessages.Store(poll.NumMessages)
+	}
+
 	// Group updates by sequence number to detect duplicate expunges
 	expungedSeqNums := make(map[uint32]bool)
 
@@ -82,6 +91,13 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 			continue
 		}
 
+		// Validate sequence number is within range
+		currentMessages := s.currentNumMessages.Load()
+		if update.SeqNum > currentMessages {
+			s.Log("[POLL] WARNING: Expunge sequence number %d out of range (mailbox has %d messages), skipping", update.SeqNum, currentMessages)
+			continue
+		}
+
 		s.Log("[POLL] Processing expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
 		s.mailboxTracker.QueueExpunge(update.SeqNum)
 		// Atomically decrement the current number of messages
@@ -91,9 +107,10 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		expungedSeqNums[update.SeqNum] = true
 	}
 
-	// Lock-free comparison and update of message count
-	currentCount := s.currentNumMessages.Load()
-	if poll.NumMessages > currentCount {
+	// Update message count again if it has decreased (after expunges)
+	finalCount := s.currentNumMessages.Load()
+	if poll.NumMessages < finalCount {
+		s.Log("[POLL] Adjusting message count from %d to %d after expunges", finalCount, poll.NumMessages)
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
 	}
