@@ -3,6 +3,7 @@ package pop3
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -37,6 +38,8 @@ type POP3Session struct {
 	ctx            context.Context    // Context for this session
 	cancel         context.CancelFunc // Function to cancel the session's context
 	errorsCount    int                // Number of errors encountered during the session
+	language       string             // Current language for responses (default "en")
+	utf8Mode       bool               // UTF8 mode enabled for this session
 }
 
 func (s *POP3Session) handleConnection() {
@@ -77,6 +80,22 @@ func (s *POP3Session) handleConnection() {
 		cmd := strings.ToUpper(parts[0])
 
 		switch cmd {
+		case "CAPA":
+			// CAPA command - list server capabilities
+			writer.WriteString("+OK Capability list follows\r\n")
+			writer.WriteString("TOP\r\n")
+			writer.WriteString("UIDL\r\n")
+			writer.WriteString("USER\r\n")
+			writer.WriteString("RESP-CODES\r\n")
+			writer.WriteString("EXPIRE NEVER\r\n")
+			writer.WriteString(fmt.Sprintf("LOGIN-DELAY %d\r\n", int(Pop3ErrorDelay.Seconds())))
+			writer.WriteString("AUTH-RESP-CODE\r\n")
+			writer.WriteString("SASL PLAIN\r\n")
+			writer.WriteString("LANG\r\n")
+			writer.WriteString("UTF8\r\n")
+			writer.WriteString("IMPLEMENTATION Sora-POP3-Server\r\n")
+			writer.WriteString(".\r\n")
+
 		case "USER":
 			// Check context before processing command
 			if s.ctx.Err() != nil {
@@ -154,7 +173,7 @@ func (s *POP3Session) handleConnection() {
 
 			userID, err := s.server.db.Authenticate(ctx, userAddress.FullAddress(), parts[1])
 			if err != nil {
-				if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
+				if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 					s.Log("authentication failed")
 					return
 				}
@@ -261,7 +280,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			// Acquire write lock to update session state
+			// Acquire write lock to update session state and read the data
 			acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("WARNING: failed to acquire write lock within timeout")
@@ -271,10 +290,241 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			s.messages = messages
-			s.mutex.Unlock()
+
+			// Build response while still holding the write lock (we can read our own write)
+			if len(messages) == 0 {
+				s.mutex.Unlock()
+				cancel()
+				writer.WriteString("+OK 0 messages\r\n.\r\n")
+			} else {
+				writer.WriteString("+OK scan listing follows\r\n")
+				for i, msg := range messages {
+					if !s.deleted[i] {
+						writer.WriteString(fmt.Sprintf("%d %d\r\n", i+1, msg.Size))
+					}
+				}
+				s.mutex.Unlock()
+				cancel()
+				writer.WriteString(".\r\n")
+			}
+			s.Log("listed %d messages", len(s.messages))
+
+		case "UIDL":
+			// Check context before processing command
+			if s.ctx.Err() != nil {
+				s.Log("WARNING: context cancelled, aborting UIDL command")
+				return
+			}
+
+			// Acquire read lock to check authentication state
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire read lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+
+			isAuthenticated := s.authenticated
+			mailboxID := s.inboxMailboxID
+			s.mutex.RUnlock()
 			cancel()
 
-			// Acquire read lock to access messages and deleted status
+			if !isAuthenticated {
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
+			// If messages haven't been loaded yet, load them
+			if s.messages == nil {
+				messages, err := s.server.db.ListMessages(ctx, mailboxID)
+				if err != nil {
+					s.Log("UIDL error: %v", err)
+					writer.WriteString("-ERR Internal server error\r\n")
+					writer.Flush()
+					continue
+				}
+
+				// Acquire write lock to update session state
+				acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
+				if !acquired {
+					s.Log("WARNING: failed to acquire write lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				s.messages = messages
+				s.mutex.Unlock()
+				cancel()
+			}
+
+			// Handle UIDL with message number argument
+			if len(parts) > 1 {
+				msgNumber, err := strconv.Atoi(parts[1])
+				if err != nil || msgNumber < 1 {
+					if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
+						return
+					}
+					continue
+				}
+
+				// Acquire read lock to access messages
+				acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
+				if !acquired {
+					s.Log("WARNING: failed to acquire read lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				if msgNumber > len(s.messages) {
+					s.mutex.RUnlock()
+					cancel()
+					if s.handleClientError(writer, "-ERR No such message\r\n") {
+						return
+					}
+					continue
+				}
+
+				msg := s.messages[msgNumber-1]
+				if s.deleted[msgNumber-1] {
+					s.mutex.RUnlock()
+					cancel()
+					if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
+						return
+					}
+					continue
+				}
+
+				s.mutex.RUnlock()
+				cancel()
+
+				// Use UID as the unique identifier (more reliable than ContentHash)
+				writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", msgNumber, msg.UID))
+			} else {
+				// UIDL without arguments - list all messages
+				// Acquire read lock to access messages and deleted status
+				acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
+				if !acquired {
+					s.Log("WARNING: failed to acquire read lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				if len(s.messages) == 0 {
+					s.mutex.RUnlock()
+					cancel()
+					writer.WriteString("+OK 0 messages\r\n.\r\n")
+				} else {
+					writer.WriteString("+OK unique-id listing follows\r\n")
+					for i, msg := range s.messages {
+						if !s.deleted[i] {
+							// Use UID as the unique identifier (more reliable than ContentHash)
+							writer.WriteString(fmt.Sprintf("%d %d\r\n", i+1, msg.UID))
+						}
+					}
+					s.mutex.RUnlock()
+					cancel()
+					writer.WriteString(".\r\n")
+				}
+			}
+			s.Log("UIDL command executed")
+
+		case "TOP":
+			// Check context before processing command
+			if s.ctx.Err() != nil {
+				s.Log("WARNING: context cancelled, aborting TOP command")
+				return
+			}
+
+			// Acquire read lock to check authentication state
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire read lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+
+			isAuthenticated := s.authenticated
+			mailboxID := s.inboxMailboxID
+			s.mutex.RUnlock()
+			cancel()
+
+			if !isAuthenticated {
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
+			if len(parts) < 3 {
+				if s.handleClientError(writer, "-ERR Missing message number or lines parameter\r\n") {
+					return
+				}
+				continue
+			}
+
+			msgNumber, err := strconv.Atoi(parts[1])
+			if err != nil || msgNumber < 1 {
+				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
+					return
+				}
+				continue
+			}
+
+			lines, err := strconv.Atoi(parts[2])
+			if err != nil || lines < 0 {
+				if s.handleClientError(writer, "-ERR Invalid lines parameter\r\n") {
+					return
+				}
+				continue
+			}
+
+			// If messages haven't been loaded yet, load them
+			if s.messages == nil {
+				messages, err := s.server.db.ListMessages(ctx, mailboxID)
+				if err != nil {
+					s.Log("TOP error: %v", err)
+					writer.WriteString("-ERR Internal server error\r\n")
+					writer.Flush()
+					continue
+				}
+
+				// Update session state with the messages
+				acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
+				if !acquired {
+					s.Log("WARNING: failed to acquire write lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				s.messages = messages
+				s.mutex.Unlock()
+				cancel()
+			}
+
+			if msgNumber > len(s.messages) {
+				if s.handleClientError(writer, "-ERR No such message\r\n") {
+					return
+				}
+				continue
+			}
+
+			msg := s.messages[msgNumber-1]
+			if msg.UID == 0 {
+				if s.handleClientError(writer, "-ERR No such message\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Check if message is deleted
 			acquired, cancel = s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.Log("WARNING: failed to acquire read lock within timeout")
@@ -283,22 +533,82 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			if len(s.messages) == 0 {
-				s.mutex.RUnlock()
-				cancel()
-				writer.WriteString("+OK 0 messages\r\n.\r\n")
-			} else {
-				writer.WriteString("+OK scan listing follows\r\n")
-				for i, msg := range s.messages {
-					if !s.deleted[i] {
-						writer.WriteString(fmt.Sprintf("%d %d\r\n", i+1, msg.Size))
-					}
+			isDeleted := s.deleted[msgNumber-1]
+			s.mutex.RUnlock()
+			cancel()
+
+			if isDeleted {
+				if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
+					return
 				}
-				s.mutex.RUnlock()
-				cancel()
-				writer.WriteString(".\r\n")
+				continue
 			}
-			s.Log("listed %d messages", len(s.messages))
+
+			log.Printf("fetching message headers for UID %d", msg.UID)
+			bodyData, err := s.getMessageBody(&msg)
+			if err != nil {
+				if err == consts.ErrMessageNotAvailable {
+					writer.WriteString("-ERR Message not available\r\n")
+				} else {
+					s.Log("TOP internal error: %v", err)
+					writer.WriteString("-ERR Internal server error\r\n")
+				}
+				writer.Flush()
+				continue
+			}
+
+			// Normalize line endings for consistent processing
+			messageStr := string(bodyData)
+			messageStr = strings.ReplaceAll(messageStr, "\r\n", "\n") // Normalize to LF
+
+			// Find header/body separator
+			headerEndIndex := strings.Index(messageStr, "\n\n")
+			if headerEndIndex == -1 {
+				// Message has no body, just headers
+				// Convert back to CRLF for POP3 protocol
+				result := strings.ReplaceAll(messageStr, "\n", "\r\n")
+				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
+				writer.WriteString(result)
+				writer.WriteString("\r\n.\r\n")
+				s.Log("retrieved headers for message %d", msg.UID)
+				continue
+			}
+
+			// Extract headers
+			headers := messageStr[:headerEndIndex]
+
+			// Extract body lines if requested
+			var result string
+			if lines > 0 {
+				bodyStart := headerEndIndex + 2 // Skip \n\n
+				if bodyStart < len(messageStr) {
+					bodyPart := messageStr[bodyStart:]
+					bodyLines := strings.Split(bodyPart, "\n")
+
+					// Take only the requested number of lines
+					numLines := lines
+					if numLines > len(bodyLines) {
+						numLines = len(bodyLines)
+					}
+
+					selectedLines := bodyLines[:numLines]
+					bodySnippet := strings.Join(selectedLines, "\n")
+
+					result = headers + "\n\n" + bodySnippet
+				} else {
+					result = headers + "\n\n"
+				}
+			} else {
+				result = headers + "\n\n"
+			}
+
+			// Convert back to CRLF for POP3 protocol
+			result = strings.ReplaceAll(result, "\n", "\r\n")
+
+			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
+			writer.WriteString(result)
+			writer.WriteString("\r\n.\r\n")
+			s.Log("retrieved top %d lines of message %d", lines, msg.UID)
 
 		case "RETR":
 			// Check context before processing command
@@ -556,6 +866,237 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("+OK Message deleted\r\n")
 			s.Log("marked message %d for deletion", msg.UID)
 
+		case "AUTH":
+			// Check context before processing command
+			if s.ctx.Err() != nil {
+				s.Log("WARNING: context cancelled, aborting AUTH command")
+				return
+			}
+
+			// Acquire read lock to check authentication state
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire read lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+
+			isAuthenticated := s.authenticated
+			s.mutex.RUnlock()
+			cancel()
+
+			if isAuthenticated {
+				if s.handleClientError(writer, "-ERR Already authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
+			if len(parts) < 2 {
+				if s.handleClientError(writer, "-ERR Missing authentication mechanism\r\n") {
+					return
+				}
+				continue
+			}
+
+			mechanism := strings.ToUpper(parts[1])
+			if mechanism != "PLAIN" {
+				if s.handleClientError(writer, "-ERR Unsupported authentication mechanism\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Check if initial response is provided
+			var authData string
+			if len(parts) > 2 {
+				// Initial response provided
+				authData = parts[2]
+			} else {
+				// Request the authentication data
+				writer.WriteString("+ \r\n")
+				writer.Flush()
+
+				// Read the authentication data
+				authLine, err := reader.ReadString('\n')
+				if err != nil {
+					s.Log("error reading auth data: %v", err)
+					if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
+						return
+					}
+					continue
+				}
+				authData = strings.TrimSpace(authLine)
+			}
+
+			// Check for cancellation
+			if authData == "*" {
+				writer.WriteString("-ERR Authentication cancelled\r\n")
+				writer.Flush()
+				continue
+			}
+
+			// Decode base64
+			decoded, err := base64.StdEncoding.DecodeString(authData)
+			if err != nil {
+				s.Log("error decoding auth data: %v", err)
+				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication data\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
+			parts := strings.Split(string(decoded), "\x00")
+			if len(parts) != 3 {
+				s.Log("invalid SASL PLAIN format")
+				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication format\r\n") {
+					return
+				}
+				continue
+			}
+
+			authzID := parts[0]  // Authorization identity (who to act as)
+			authnID := parts[1]  // Authentication identity (who is authenticating)
+			password := parts[2] // Password
+
+			s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
+
+			// For POP3, we don't support proxy authentication
+			if authzID != "" && authzID != authnID {
+				s.Log("proxy authentication not supported: authz='%s', authn='%s'", authzID, authnID)
+				if s.handleClientError(writer, "-ERR [AUTH] Proxy authentication not supported\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Authenticate the user
+			address, err := server.NewAddress(authnID)
+			if err != nil {
+				s.Log("invalid address format: %v", err)
+				if s.handleClientError(writer, "-ERR [AUTH] Invalid username format\r\n") {
+					return
+				}
+				continue
+			}
+
+			s.Log("authentication attempt for %s", address.FullAddress())
+
+			userID, err := s.server.db.Authenticate(ctx, address.FullAddress(), password)
+			if err != nil {
+				if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+					s.Log("authentication failed")
+					return
+				}
+				continue
+			}
+
+			// No auto-creation of mailboxes, they have to exist already for POP3
+			inboxMailboxID, err := s.server.db.GetMailboxByName(ctx, userID, consts.MailboxInbox)
+			if err != nil {
+				if err == consts.ErrMailboxNotFound {
+					if s.handleClientError(writer, fmt.Sprintf("-ERR %s\r\n", err.Error())) {
+						return
+					}
+					continue
+				}
+				s.Log("AUTH error: %v", err)
+				writer.WriteString("-ERR Internal server error\r\n")
+				writer.Flush()
+				continue
+			}
+
+			// Acquire write lock to update session state
+			acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire write lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+
+			s.inboxMailboxID = inboxMailboxID.ID
+			s.authenticated = true
+			s.mutex.Unlock()
+			cancel()
+
+			authCount := s.server.authenticatedConnections.Add(1)
+			totalCount := s.server.totalConnections.Load()
+			s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)", totalCount, authCount)
+
+			writer.WriteString("+OK Authentication successful\r\n")
+
+		case "LANG":
+			// LANG command - set or query language
+			// Acquire read lock to access current language
+			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire read lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+			currentLang := s.language
+			s.mutex.RUnlock()
+			cancel()
+
+			if len(parts) == 1 {
+				// LANG without arguments - list supported languages
+				writer.WriteString("+OK Language listing follows\r\n")
+				writer.WriteString("en English\r\n")
+				writer.WriteString(".\r\n")
+			} else {
+				// LANG with language tag
+				langTag := strings.ToLower(parts[1])
+
+				// For now, we only support English
+				if langTag != "en" && langTag != "*" {
+					writer.WriteString("-ERR [LANG] Unsupported language\r\n")
+					writer.Flush()
+					continue
+				}
+
+				// Acquire write lock to update language
+				acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
+				if !acquired {
+					s.Log("WARNING: failed to acquire write lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				if langTag == "*" {
+					s.language = "en" // Default to English
+				} else {
+					s.language = langTag
+				}
+				s.mutex.Unlock()
+				cancel()
+
+				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", s.language))
+			}
+			s.Log("LANG command: current=%s", currentLang)
+
+		case "UTF8":
+			// UTF8 command - enable UTF-8 mode
+			// Acquire write lock to update UTF8 mode
+			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+			if !acquired {
+				s.Log("WARNING: failed to acquire write lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
+				writer.Flush()
+				continue
+			}
+
+			s.utf8Mode = true
+			s.mutex.Unlock()
+			cancel()
+
+			writer.WriteString("+OK UTF8 enabled\r\n")
+			s.Log("UTF8 mode enabled")
+
 		case "QUIT":
 			// Check context before processing command
 			if s.ctx.Err() != nil {
@@ -628,7 +1169,12 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 		return true
 	}
 	// Make a delay to prevent brute force attacks
-	time.Sleep(time.Duration(s.errorsCount) * Pop3ErrorDelay)
+	delay := time.Duration(s.errorsCount) * Pop3ErrorDelay
+	time.Sleep(delay)
+
+	// Replace [AUTH] with [LOGIN-DELAY n] where n is seconds until next attempt is allowed
+	errMsg = strings.Replace(errMsg, "[AUTH]", fmt.Sprintf("[LOGIN-DELAY %d]", int(delay.Seconds())), 1)
+
 	writer.WriteString(errMsg)
 	writer.Flush()
 	return false

@@ -126,11 +126,12 @@ func (s *POP3Server) Start(errChan chan error) {
 		authCount := s.authenticatedConnections.Load()
 
 		session := &POP3Session{
-			server:  s,
-			conn:    &conn,
-			deleted: make(map[int]bool),
-			ctx:     sessionCtx,
-			cancel:  sessionCancel,
+			server:   s,
+			conn:     &conn,
+			deleted:  make(map[int]bool),
+			ctx:      sessionCtx,
+			cancel:   sessionCancel,
+			language: "en", // Default language
 		}
 
 		session.RemoteIP = (*session.conn).RemoteAddr().String()
