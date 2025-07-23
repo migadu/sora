@@ -40,6 +40,16 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		return s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
+	// RFC 3501 Section 6.3.4: It is an error to delete a mailbox that has
+	// inferior hierarchical names.
+	if mailbox.HasChildren {
+		s.Log("[DELETE] attempt to delete mailbox '%s' which has children", mboxName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: fmt.Sprintf("Mailbox '%s' has children and cannot be deleted.", mboxName),
+		}
+	}
+
 	// Final phase: actual deletion - no locks needed as it's a DB operation
 	err = s.server.db.DeleteMailbox(s.ctx, mailbox.ID, userID)
 	if err != nil {
