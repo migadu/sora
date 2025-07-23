@@ -65,8 +65,79 @@ nano config.toml # Or your preferred editor
 ```
 Refer to the comments within `config.toml.example` for guidance on each option.
 
-3.  **Run Sora:**
-Point to your configuration file when running the application:
+3.  **Build the executables:**
 ```bash
-go run main.go -config config.toml
+make build
+```
+This creates two executables:
+- `sora` - The main email server (from `cmd/sora`)
+- `sora-admin` - Administrative tool for account management (from `cmd/sora-admin`)
+
+4.  **Create accounts:**
+Before running the server, create email accounts using the admin tool:
+```bash
+./sora-admin create-account --email user@example.com --password secretpassword
+```
+
+5.  **Run Sora:**
+Start the email server:
+```bash
+./sora -config config.toml
+```
+
+---
+
+## Admin Tool
+
+The `sora-admin` tool provides administrative functions for managing accounts.
+
+### Creating Accounts
+
+Create new email accounts:
+
+```bash
+# Basic account creation
+./sora-admin create-account --email user@example.com --password secretpassword
+
+# Create account with specific hash type
+./sora-admin create-account --email user@example.com --password secretpassword --hash ssha512
+
+# Create account and mark as primary identity
+./sora-admin create-account --email user@example.com --password secretpassword --primary
+
+# Use custom database connection (overriding config file)
+./sora-admin create-account --email user@example.com --password secretpassword \
+  --dbhost localhost --dbport 5432 --dbuser postgres --dbname sora_db
+```
+
+### Updating Accounts
+
+Update existing account passwords:
+
+```bash
+# Basic password update
+./sora-admin update-account --email user@example.com --password newpassword
+
+# Update password with specific hash type
+./sora-admin update-account --email user@example.com --password newpassword --hash ssha512
+
+# Use custom database connection (overriding config file)  
+./sora-admin update-account --email user@example.com --password newpassword \
+  --dbhost localhost --dbport 5432 --dbuser postgres --dbname sora_db
+```
+
+### Available Hash Types
+
+- `bcrypt` (default) - bcrypt hash with salt
+- `ssha512` - Salted SHA512 hash
+- `sha512` - SHA512 hash without salt
+
+### Help
+
+Get help for any command:
+
+```bash
+./sora-admin help
+./sora-admin create-account --help
+./sora-admin update-account --help
 ```
