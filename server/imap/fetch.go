@@ -114,6 +114,9 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 	encodedSeqNum := sessionTracker.EncodeSeqNum(msg.Seq)
 
 	if encodedSeqNum == 0 {
+		// The sequence number from the database doesn't map to a valid client sequence number
+		// This can happen when the mailbox has been modified by another session
+		s.Log("[FETCH] Skipping message UID %d with unmappable sequence number %d", msg.UID, msg.Seq)
 		return nil
 	}
 

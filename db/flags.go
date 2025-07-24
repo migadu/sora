@@ -241,6 +241,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		SELECT DISTINCT flag
 		FROM messages CROSS JOIN LATERAL jsonb_array_elements_text(custom_flags) AS elem(flag)
 		WHERE mailbox_id = $1
+		  AND expunged_at IS NULL
 		  AND flag NOT LIKE '\%';
 	`
 	rows, err := db.Pool.Query(ctx, query, mailboxID)
