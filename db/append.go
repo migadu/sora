@@ -86,14 +86,14 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 		INSERT INTO messages
 			(account_id, mailbox_id, mailbox_path, uid, content_hash, message_id, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, created_modseq)
 		SELECT
-			account_id, $1, $2, $3, content_hash, message_id, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, nextval('messages_modseq')
+			account_id, $1, $2, $3, content_hash, message_id, flags | $6, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, nextval('messages_modseq')
 		FROM
 			messages
 		WHERE
 			mailbox_id = $4 AND
 			uid = $5
 		RETURNING uid
-	`, destMailboxID, destMailboxName, highestUID, srcMailboxID, srcMessageUID).Scan(&newMsgUID)
+	`, destMailboxID, destMailboxName, highestUID, srcMailboxID, srcMessageUID, FlagRecent).Scan(&newMsgUID)
 
 	// TODO: this should not be a fatal error
 	if err != nil {

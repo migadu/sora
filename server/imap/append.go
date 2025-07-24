@@ -111,6 +111,11 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	size := int64(len(fullMessageBytes))
 
+	// Add \Recent flag to newly appended messages
+	appendFlags := make([]imap.Flag, len(options.Flags))
+	copy(appendFlags, options.Flags)
+	appendFlags = append(appendFlags, imap.Flag("\\Recent"))
+
 	_, messageUID, err := s.server.db.InsertMessage(s.ctx,
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
@@ -118,7 +123,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
-			Flags:         options.Flags,
+			Flags:         appendFlags,
 			InternalDate:  sentDate, // Best we can is set to message's sent date
 			Size:          size,
 			Subject:       subject,

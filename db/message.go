@@ -51,6 +51,7 @@ const (
 	FlagFlagged              // 4: 000100
 	FlagDeleted              // 8: 001000
 	FlagDraft                // 16: 010000
+	FlagRecent               // 32: 100000
 )
 
 func ContainsFlag(flags int, flag int) bool {
@@ -69,6 +70,8 @@ func FlagToBitwise(flag imap.Flag) int {
 		return FlagDeleted
 	case "\\draft":
 		return FlagDraft
+	case "\\recent":
+		return FlagRecent
 	}
 
 	return 0
@@ -102,6 +105,9 @@ func BitwiseToFlags(bitwiseFlags int) []imap.Flag {
 	}
 	if bitwiseFlags&FlagDraft != 0 {
 		flags = append(flags, imap.FlagDraft)
+	}
+	if bitwiseFlags&FlagRecent != 0 {
+		flags = append(flags, imap.Flag("\\Recent"))
 	}
 
 	return flags
