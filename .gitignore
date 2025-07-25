@@ -6,3 +6,5 @@ reset-db.sh
 config.toml
 sora
 sora-admin
+!sora/
+!sora-admin/
