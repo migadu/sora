@@ -7,14 +7,29 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/storage"
 )
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
 	Database DatabaseConfig `toml:"database"`
+	S3       S3Config       `toml:"s3"`
+}
+
+// S3Config holds S3 configuration - copied from main config
+type S3Config struct {
+	Endpoint      string `toml:"endpoint"`
+	DisableTLS    bool   `toml:"disable_tls"`
+	AccessKey     string `toml:"access_key"`
+	SecretKey     string `toml:"secret_key"`
+	Bucket        string `toml:"bucket"`
+	Trace         bool   `toml:"trace"`
+	Encrypt       bool   `toml:"encrypt"`
+	EncryptionKey string `toml:"encryption_key"`
 }
 
 // DatabaseConfig holds database configuration - copied from main config
@@ -39,6 +54,14 @@ func newDefaultAdminConfig() AdminConfig {
 			TLSMode:    false,
 			LogQueries: false,
 		},
+		S3: S3Config{
+			Endpoint:      "",
+			AccessKey:     "",
+			SecretKey:     "",
+			Bucket:        "",
+			Encrypt:       false,
+			EncryptionKey: "",
+		},
 	}
 }
 
@@ -59,6 +82,10 @@ func main() {
 		handleUpdateAccount()
 	case "list-credentials":
 		handleListCredentials()
+	case "import-maildir":
+		handleImportMaildir()
+	case "export-maildir":
+		handleExportMaildir()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -79,6 +106,8 @@ Commands:
   add-credential    Add a credential to an existing account
   update-account    Update an existing account's password
   list-credentials  List all credentials for an account
+  import-maildir    Import maildir from a given path
+  export-maildir    Export messages to maildir format
   help              Show this help message
 
 Examples:
@@ -705,4 +734,347 @@ func isFlagSet(fs *flag.FlagSet, name string) bool {
 		}
 	})
 	return isSet
+}
+
+func handleImportMaildir() {
+	// Parse import-maildir specific flags
+	fs := flag.NewFlagSet("import-maildir", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	email := fs.String("email", "", "Email address for the account to import mail to (required)")
+	maildirPath := fs.String("maildir-path", "", "Path to the maildir to import (required)")
+	jobs := fs.Int("jobs", 4, "Number of parallel import jobs")
+	dryRun := fs.Bool("dry-run", false, "Preview what would be imported without making changes")
+	preserveFlags := fs.Bool("preserve-flags", true, "Preserve maildir flags (Seen, Answered, etc)")
+	showProgress := fs.Bool("progress", true, "Show import progress")
+	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate (e.g. 500ms)")
+	forceReimport := fs.Bool("force-reimport", false, "Force reimport of messages even if they already exist")
+	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
+	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, dovecot-keywords)")
+	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to import (e.g. INBOX,Sent)")
+	startDate := fs.String("start-date", "", "Import only messages after this date (YYYY-MM-DD)")
+	endDate := fs.String("end-date", "", "Import only messages before this date (YYYY-MM-DD)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Import maildir from a given path
+
+Usage:
+  sora-admin import-maildir [options]
+
+Options:
+  --email string          Email address for the account to import mail to (required)
+  --maildir-path string   Path to the maildir root directory (must contain cur/, new/, tmp/) (required)
+  --jobs int              Number of parallel import jobs (default: 4)
+  --dry-run               Preview what would be imported without making changes
+  --preserve-flags        Preserve maildir flags (default: true)  
+  --progress              Show import progress (default: true)
+  --force-reimport        Force reimport of messages even if they already exist
+  --cleanup-db            Remove the SQLite import database after successful import
+  --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords)
+  --mailbox-filter string Comma-separated list of mailboxes to import (e.g. INBOX,Sent,Archive*)
+  --start-date string     Import only messages after this date (YYYY-MM-DD)
+  --end-date string       Import only messages before this date (YYYY-MM-DD)
+  --config string         Path to TOML configuration file (default: config.toml)
+
+IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
+not to a parent directory containing multiple maildirs.
+
+Use --dovecot flag to process Dovecot-specific 'subscriptions' and 'dovecot-keywords' files,
+which will create missing mailboxes, subscribe the user to specified folders, and preserve
+custom IMAP keywords/flags on imported messages.
+
+Examples:
+  # Import all mail (correct path points to maildir root)
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+
+  # Dry run to preview (note: correct maildir path)
+  sora-admin import-maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
+
+  # Import only INBOX and Sent folders
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
+
+  # Import messages from 2023
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+
+  # Import with cleanup (removes SQLite database after completion)
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
+
+  # Import from Dovecot with subscriptions and custom keywords
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *email == "" {
+		fmt.Printf("Error: --email is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *maildirPath == "" {
+		fmt.Printf("Error: --maildir-path is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Parse date filters
+	var startDateParsed, endDateParsed *time.Time
+	if *startDate != "" {
+		t, err := time.Parse("2006-01-02", *startDate)
+		if err != nil {
+			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			os.Exit(1)
+		}
+		startDateParsed = &t
+	}
+	if *endDate != "" {
+		t, err := time.Parse("2006-01-02", *endDate)
+		if err != nil {
+			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			os.Exit(1)
+		}
+		// Add 23:59:59 to include the entire end date
+		t = t.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+		endDateParsed = &t
+	}
+
+	// Parse mailbox filter
+	var mailboxList []string
+	if *mailboxFilter != "" {
+		mailboxList = strings.Split(*mailboxFilter, ",")
+		for i := range mailboxList {
+			mailboxList[i] = strings.TrimSpace(mailboxList[i])
+		}
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Connect to database
+	database, err := db.NewDatabase(context.Background(),
+		cfg.Database.Host,
+		cfg.Database.Port,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.TLSMode,
+		cfg.Database.LogQueries)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	// Connect to S3
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	if err != nil {
+		log.Fatalf("Failed to connect to S3: %v", err)
+	}
+	if cfg.S3.Encrypt {
+		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			log.Fatalf("Failed to enable S3 encryption: %v", err)
+		}
+	}
+
+	// Create importer options
+	options := ImporterOptions{
+		DryRun:        *dryRun,
+		StartDate:     startDateParsed,
+		EndDate:       endDateParsed,
+		MailboxFilter: mailboxList,
+		PreserveFlags: *preserveFlags,
+		ShowProgress:  *showProgress,
+		ForceReimport: *forceReimport,
+		CleanupDB:     *cleanupDB,
+		Dovecot:       *dovecot,
+		ImportDelay:   *importDelay,
+	}
+
+	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)
+	if err != nil {
+		log.Fatalf("Failed to create importer: %v", err)
+	}
+
+	if err := importer.Run(); err != nil {
+		log.Fatalf("Failed to import maildir: %v", err)
+	}
+}
+
+func handleExportMaildir() {
+	// Parse export-maildir specific flags
+	fs := flag.NewFlagSet("export-maildir", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	email := fs.String("email", "", "Email address for the account to export mail from (required)")
+	maildirPath := fs.String("maildir-path", "", "Path where the maildir will be created/updated (required)")
+	jobs := fs.Int("jobs", 4, "Number of parallel export jobs")
+	dryRun := fs.Bool("dry-run", false, "Preview what would be exported without making changes")
+	showProgress := fs.Bool("progress", true, "Show export progress")
+	exportDelay := fs.Duration("export-delay", 0, "Delay between exports to control rate (e.g. 500ms)")
+	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions)")
+	overwriteFlags := fs.Bool("overwrite-flags", false, "Update flags on existing messages")
+	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to export (e.g. INBOX,Sent)")
+	startDate := fs.String("start-date", "", "Export only messages after this date (YYYY-MM-DD)")
+	endDate := fs.String("end-date", "", "Export only messages before this date (YYYY-MM-DD)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Export messages to maildir format
+
+Usage:
+  sora-admin export-maildir [options]
+
+Options:
+  --email string          Email address for the account to export mail from (required)
+  --maildir-path string   Path where the maildir will be created/updated (required)
+  --jobs int              Number of parallel export jobs (default: 4)
+  --dry-run               Preview what would be exported without making changes
+  --progress              Show export progress (default: true)
+  --dovecot               Export Dovecot-specific files (subscriptions)
+  --overwrite-flags       Update flags on existing messages (default: false)
+  --mailbox-filter string Comma-separated list of mailboxes to export (e.g. INBOX,Sent,Archive*)
+  --start-date string     Export only messages after this date (YYYY-MM-DD)
+  --end-date string       Export only messages before this date (YYYY-MM-DD)
+  --config string         Path to TOML configuration file (default: config.toml)
+
+The exporter creates a SQLite database (sora-export.db) in the maildir path to track
+exported messages and avoid duplicates. If exporting to an existing maildir, messages
+with the same content hash will be skipped unless --overwrite-flags is specified.
+
+Examples:
+  # Export all mail to a new maildir
+  sora-admin export-maildir --email user@example.com --maildir-path /var/backup/user/Maildir
+
+  # Export only INBOX and Sent folders
+  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+
+  # Export with Dovecot metadata
+  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+
+  # Update flags on existing messages
+  sora-admin export-maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *email == "" {
+		fmt.Printf("Error: --email is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *maildirPath == "" {
+		fmt.Printf("Error: --maildir-path is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Parse date filters
+	var startDateParsed, endDateParsed *time.Time
+	if *startDate != "" {
+		t, err := time.Parse("2006-01-02", *startDate)
+		if err != nil {
+			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			os.Exit(1)
+		}
+		startDateParsed = &t
+	}
+	if *endDate != "" {
+		t, err := time.Parse("2006-01-02", *endDate)
+		if err != nil {
+			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			os.Exit(1)
+		}
+		// Add 23:59:59 to include the entire end date
+		t = t.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+		endDateParsed = &t
+	}
+
+	// Parse mailbox filter
+	var mailboxList []string
+	if *mailboxFilter != "" {
+		mailboxList = strings.Split(*mailboxFilter, ",")
+		for i := range mailboxList {
+			mailboxList[i] = strings.TrimSpace(mailboxList[i])
+		}
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Connect to database
+	database, err := db.NewDatabase(context.Background(),
+		cfg.Database.Host,
+		cfg.Database.Port,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.TLSMode,
+		cfg.Database.LogQueries)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	// Connect to S3
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	if err != nil {
+		log.Fatalf("Failed to connect to S3: %v", err)
+	}
+	if cfg.S3.Encrypt {
+		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			log.Fatalf("Failed to enable S3 encryption: %v", err)
+		}
+	}
+
+	// Create exporter options
+	options := ExporterOptions{
+		DryRun:         *dryRun,
+		StartDate:      startDateParsed,
+		EndDate:        endDateParsed,
+		MailboxFilter:  mailboxList,
+		ShowProgress:   *showProgress,
+		Dovecot:        *dovecot,
+		OverwriteFlags: *overwriteFlags,
+		ExportDelay:    *exportDelay,
+	}
+
+	exporter, err := NewExporter(*maildirPath, *email, *jobs, database, s3, options)
+	if err != nil {
+		log.Fatalf("Failed to create exporter: %v", err)
+	}
+
+	if err := exporter.Run(); err != nil {
+		log.Fatalf("Failed to export maildir: %v", err)
+	}
 }
