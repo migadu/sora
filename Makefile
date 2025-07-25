@@ -37,6 +37,11 @@ build-linux-musl:
 	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -ldflags "-linkmode external -extldflags -static" -o sora-linux-amd64 ./cmd/sora
 	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -ldflags "-linkmode external -extldflags -static" -o sora-admin-linux-amd64 ./cmd/sora-admin
 
+# Cross-compile for FreeBSD
+build-freebsd:
+	GOARCH=amd64 GOOS=freebsd CGO_ENABLED=0 go build -o sora-freebsd-amd64 ./cmd/sora
+	GOARCH=amd64 GOOS=freebsd CGO_ENABLED=0 go build -o sora-admin-freebsd-amd64 ./cmd/sora-admin
+
 # Help target
 help:
 	@echo "Available targets:"
@@ -49,4 +54,5 @@ help:
 	@echo "  test         - Run tests"
 	@echo "  build-release - Build with version information"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"
+	@echo "  build-freebsd - Cross-compile binaries for FreeBSD"
 	@echo "  help         - Show this help message"
