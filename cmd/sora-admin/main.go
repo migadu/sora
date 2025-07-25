@@ -747,7 +747,7 @@ func handleImportMaildir() {
 	dryRun := fs.Bool("dry-run", false, "Preview what would be imported without making changes")
 	preserveFlags := fs.Bool("preserve-flags", true, "Preserve maildir flags (Seen, Answered, etc)")
 	showProgress := fs.Bool("progress", true, "Show import progress")
-	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate (e.g. 500ms)")
+	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
 	forceReimport := fs.Bool("force-reimport", false, "Force reimport of messages even if they already exist")
 	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
 	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, dovecot-keywords)")
@@ -768,6 +768,7 @@ Options:
   --dry-run               Preview what would be imported without making changes
   --preserve-flags        Preserve maildir flags (default: true)  
   --progress              Show import progress (default: true)
+  --delay duration        Delay between operations to control rate (e.g. 500ms)
   --force-reimport        Force reimport of messages even if they already exist
   --cleanup-db            Remove the SQLite import database after successful import
   --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords)
@@ -902,7 +903,7 @@ Examples:
 		ForceReimport: *forceReimport,
 		CleanupDB:     *cleanupDB,
 		Dovecot:       *dovecot,
-		ImportDelay:   *importDelay,
+		ImportDelay:   *delay,
 	}
 
 	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)
@@ -925,7 +926,7 @@ func handleExportMaildir() {
 	jobs := fs.Int("jobs", 4, "Number of parallel export jobs")
 	dryRun := fs.Bool("dry-run", false, "Preview what would be exported without making changes")
 	showProgress := fs.Bool("progress", true, "Show export progress")
-	exportDelay := fs.Duration("export-delay", 0, "Delay between exports to control rate (e.g. 500ms)")
+	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
 	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions)")
 	overwriteFlags := fs.Bool("overwrite-flags", false, "Update flags on existing messages")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to export (e.g. INBOX,Sent)")
@@ -944,6 +945,7 @@ Options:
   --jobs int              Number of parallel export jobs (default: 4)
   --dry-run               Preview what would be exported without making changes
   --progress              Show export progress (default: true)
+  --delay duration        Delay between operations to control rate (e.g. 500ms)
   --dovecot               Export Dovecot-specific files (subscriptions)
   --overwrite-flags       Update flags on existing messages (default: false)
   --mailbox-filter string Comma-separated list of mailboxes to export (e.g. INBOX,Sent,Archive*)
@@ -1066,7 +1068,7 @@ Examples:
 		ShowProgress:   *showProgress,
 		Dovecot:        *dovecot,
 		OverwriteFlags: *overwriteFlags,
-		ExportDelay:    *exportDelay,
+		ExportDelay:    *delay,
 	}
 
 	exporter, err := NewExporter(*maildirPath, *email, *jobs, database, s3, options)
