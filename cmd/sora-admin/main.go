@@ -10,14 +10,18 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/storage"
 )
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database DatabaseConfig `toml:"database"`
-	S3       S3Config       `toml:"s3"`
+	Database   DatabaseConfig   `toml:"database"`
+	S3         S3Config         `toml:"s3"`
+	LocalCache LocalCacheConfig `toml:"local_cache"`
+	Uploader   UploaderConfig   `toml:"uploader"`
 }
 
 // S3Config holds S3 configuration - copied from main config
@@ -43,6 +47,22 @@ type DatabaseConfig struct {
 	LogQueries bool   `toml:"log_queries"`
 }
 
+// LocalCacheConfig holds cache configuration - copied from main config
+type LocalCacheConfig struct {
+	Path          string `toml:"path"`
+	Capacity      string `toml:"capacity"`
+	MaxObjectSize string `toml:"max_object_size"`
+}
+
+// UploaderConfig holds uploader configuration - copied from main config
+type UploaderConfig struct {
+	Path          string `toml:"path"`
+	BatchSize     int    `toml:"batch_size"`
+	Concurrency   int    `toml:"concurrency"`
+	MaxAttempts   int    `toml:"max_attempts"`
+	RetryInterval string `toml:"retry_interval"`
+}
+
 func newDefaultAdminConfig() AdminConfig {
 	return AdminConfig{
 		Database: DatabaseConfig{
@@ -61,6 +81,18 @@ func newDefaultAdminConfig() AdminConfig {
 			Bucket:        "",
 			Encrypt:       false,
 			EncryptionKey: "",
+		},
+		LocalCache: LocalCacheConfig{
+			Path:          "/tmp/sora/cache",
+			Capacity:      "1gb",
+			MaxObjectSize: "5mb",
+		},
+		Uploader: UploaderConfig{
+			Path:          "/tmp/sora/uploads",
+			BatchSize:     20,
+			Concurrency:   10,
+			MaxAttempts:   5,
+			RetryInterval: "30s",
 		},
 	}
 }
@@ -86,6 +118,12 @@ func main() {
 		handleImportMaildir()
 	case "export-maildir":
 		handleExportMaildir()
+	case "cache-stats":
+		handleCacheStats()
+	case "cache-purge":
+		handleCachePurge()
+	case "uploader-status":
+		handleUploaderStatus()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -108,6 +146,9 @@ Commands:
   list-credentials  List all credentials for an account
   import-maildir    Import maildir from a given path
   export-maildir    Export messages to maildir format
+  cache-stats       Show local cache size and object count
+  cache-purge       Clear all cached objects
+  uploader-status   Show uploader queue status and failed uploads
   help              Show this help message
 
 Examples:
@@ -115,7 +156,9 @@ Examples:
   sora-admin add-credential --primary admin@example.com --email alias@example.com --password mypassword
   sora-admin update-account --email user@example.com --password newpassword
   sora-admin list-credentials --email user@example.com
-  sora-admin create-account --config /path/to/config.toml --email user@example.com --password mypassword
+  sora-admin cache-stats --config /path/to/config.toml
+  sora-admin cache-purge --config /path/to/config.toml
+  sora-admin uploader-status --config /path/to/config.toml
 
 Use 'sora-admin <command> --help' for more information about a command.
 `)
@@ -1078,5 +1121,391 @@ Examples:
 
 	if err := exporter.Run(); err != nil {
 		log.Fatalf("Failed to export maildir: %v", err)
+	}
+}
+
+func handleCacheStats() {
+	// Parse cache-stats specific flags
+	fs := flag.NewFlagSet("cache-stats", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show local cache size and object count
+
+Usage:
+  sora-admin cache-stats [options]
+
+Options:
+  --config string      Path to TOML configuration file (default: config.toml)
+
+This command shows:
+  - Cache directory path
+  - Number of cached objects
+  - Total cache size in bytes and human-readable format
+  - Cache capacity and maximum object size
+
+Examples:
+  sora-admin cache-stats
+  sora-admin cache-stats --config /path/to/config.toml
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show cache stats
+	if err := showCacheStats(cfg); err != nil {
+		log.Fatalf("Failed to show cache stats: %v", err)
+	}
+}
+
+func handleCachePurge() {
+	// Parse cache-purge specific flags
+	fs := flag.NewFlagSet("cache-purge", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	confirm := fs.Bool("confirm", false, "Confirm cache purge without interactive prompt")
+
+	fs.Usage = func() {
+		fmt.Printf(`Clear all cached objects
+
+Usage:
+  sora-admin cache-purge [options]
+
+Options:
+  --config string      Path to TOML configuration file (default: config.toml)
+  --confirm            Confirm cache purge without interactive prompt
+
+This command removes all cached objects from the local cache directory
+and clears the cache index database. This action cannot be undone.
+
+Examples:
+  sora-admin cache-purge
+  sora-admin cache-purge --confirm
+  sora-admin cache-purge --config /path/to/config.toml --confirm
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Purge cache
+	if err := purgeCacheWithConfirmation(cfg, *confirm); err != nil {
+		log.Fatalf("Failed to purge cache: %v", err)
+	}
+}
+
+func showCacheStats(cfg AdminConfig) error {
+	// Parse cache configuration
+	capacityBytes, err := helpers.ParseSize(cfg.LocalCache.Capacity)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache capacity '%s': %w", cfg.LocalCache.Capacity, err)
+	}
+
+	maxObjectSizeBytes, err := helpers.ParseSize(cfg.LocalCache.MaxObjectSize)
+	if err != nil {
+		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
+	}
+
+	// Connect to minimal database instance for cache initialization
+	ctx := context.Background()
+	database, err := db.NewDatabase(ctx,
+		cfg.Database.Host,
+		cfg.Database.Port,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.TLSMode,
+		cfg.Database.LogQueries)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Initialize cache
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, database)
+	if err != nil {
+		return fmt.Errorf("failed to initialize cache: %w", err)
+	}
+	defer cacheInstance.Close()
+
+	// Get cache statistics
+	stats, err := cacheInstance.GetStats()
+	if err != nil {
+		return fmt.Errorf("failed to get cache statistics: %w", err)
+	}
+
+	// Display stats
+	fmt.Printf("Cache Statistics\n")
+	fmt.Printf("================\n\n")
+	fmt.Printf("Cache path:         %s\n", cfg.LocalCache.Path)
+	fmt.Printf("Object count:       %d\n", stats.ObjectCount)
+	fmt.Printf("Total size:         %d bytes (%s)\n", stats.TotalSize, formatBytes(stats.TotalSize))
+	fmt.Printf("Capacity:           %d bytes (%s)\n", capacityBytes, cfg.LocalCache.Capacity)
+	fmt.Printf("Max object size:    %d bytes (%s)\n", maxObjectSizeBytes, cfg.LocalCache.MaxObjectSize)
+	fmt.Printf("Utilization:        %.1f%%\n", float64(stats.TotalSize)/float64(capacityBytes)*100)
+
+	return nil
+}
+
+func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
+	if !autoConfirm {
+		fmt.Printf("This will remove ALL cached objects from %s\n", cfg.LocalCache.Path)
+		fmt.Printf("This action cannot be undone. Are you sure? (y/N): ")
+		
+		var response string
+		if _, err := fmt.Scanln(&response); err != nil {
+			return fmt.Errorf("failed to read confirmation: %w", err)
+		}
+		
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			fmt.Println("Cache purge cancelled.")
+			return nil
+		}
+	}
+
+	// Parse cache configuration
+	capacityBytes, err := helpers.ParseSize(cfg.LocalCache.Capacity)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache capacity '%s': %w", cfg.LocalCache.Capacity, err)
+	}
+
+	maxObjectSizeBytes, err := helpers.ParseSize(cfg.LocalCache.MaxObjectSize)
+	if err != nil {
+		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
+	}
+
+	// Connect to minimal database instance for cache initialization
+	ctx := context.Background()
+	database, err := db.NewDatabase(ctx,
+		cfg.Database.Host,
+		cfg.Database.Port,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.TLSMode,
+		cfg.Database.LogQueries)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Initialize cache
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, database)
+	if err != nil {
+		return fmt.Errorf("failed to initialize cache: %w", err)
+	}
+	defer cacheInstance.Close()
+
+	// Get current stats before purging
+	stats, err := cacheInstance.GetStats()
+	if err != nil {
+		return fmt.Errorf("failed to get cache statistics before purge: %w", err)
+	}
+
+	fmt.Printf("Purging %d objects (%s) from cache...\n", stats.ObjectCount, formatBytes(stats.TotalSize))
+
+	// Purge all cached objects
+	if err := cacheInstance.PurgeAll(ctx); err != nil {
+		return fmt.Errorf("failed to purge cache: %w", err)
+	}
+
+	fmt.Printf("Cache purged successfully.\n")
+	return nil
+}
+
+func handleUploaderStatus() {
+	// Parse uploader-status specific flags
+	fs := flag.NewFlagSet("uploader-status", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	showFailed := fs.Bool("show-failed", true, "Show failed uploads details")
+	failedLimit := fs.Int("failed-limit", 10, "Maximum number of failed uploads to show")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show uploader queue status and failed uploads
+
+Usage:
+  sora-admin uploader-status [options]
+
+Options:
+  --config string       Path to TOML configuration file (default: config.toml)
+  --show-failed         Show failed uploads details (default: true)
+  --failed-limit int    Maximum number of failed uploads to show (default: 10)
+
+This command shows:
+  - Number of pending uploads and total size
+  - Number of failed uploads (reached max attempts)
+  - Age of oldest pending upload
+  - Details of failed uploads including content hashes and attempt counts
+
+Examples:
+  sora-admin uploader-status
+  sora-admin uploader-status --config /path/to/config.toml
+  sora-admin uploader-status --failed-limit 20
+  sora-admin uploader-status --show-failed=false
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show uploader status
+	if err := showUploaderStatus(cfg, *showFailed, *failedLimit); err != nil {
+		log.Fatalf("Failed to show uploader status: %v", err)
+	}
+}
+
+func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error {
+	// Connect to database
+	ctx := context.Background()
+	database, err := db.NewDatabase(ctx,
+		cfg.Database.Host,
+		cfg.Database.Port,
+		cfg.Database.User,
+		cfg.Database.Password,
+		cfg.Database.Name,
+		cfg.Database.TLSMode,
+		cfg.Database.LogQueries)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Validate retry interval parsing (for config validation)
+	_, err = helpers.ParseDuration(cfg.Uploader.RetryInterval)
+	if err != nil {
+		return fmt.Errorf("failed to parse retry interval '%s': %w", cfg.Uploader.RetryInterval, err)
+	}
+
+	// Get uploader statistics
+	stats, err := database.GetUploaderStats(ctx, cfg.Uploader.MaxAttempts)
+	if err != nil {
+		return fmt.Errorf("failed to get uploader stats: %w", err)
+	}
+
+	// Display uploader status
+	fmt.Printf("Uploader Status\n")
+	fmt.Printf("===============\n\n")
+	fmt.Printf("Configuration:\n")
+	fmt.Printf("  Upload path:        %s\n", cfg.Uploader.Path)
+	fmt.Printf("  Batch size:         %d\n", cfg.Uploader.BatchSize)
+	fmt.Printf("  Concurrency:        %d\n", cfg.Uploader.Concurrency)
+	fmt.Printf("  Max attempts:       %d\n", cfg.Uploader.MaxAttempts)
+	fmt.Printf("  Retry interval:     %s\n", cfg.Uploader.RetryInterval)
+	fmt.Printf("\n")
+
+	fmt.Printf("Queue Status:\n")
+	fmt.Printf("  Pending uploads:    %d\n", stats.TotalPending)
+	fmt.Printf("  Pending size:       %d bytes (%s)\n", stats.TotalPendingSize, formatBytes(stats.TotalPendingSize))
+	fmt.Printf("  Failed uploads:     %d\n", stats.FailedUploads)
+	
+	if stats.OldestPending.Valid {
+		age := time.Since(stats.OldestPending.Time)
+		fmt.Printf("  Oldest pending:     %s (age: %s)\n", stats.OldestPending.Time.Format(time.RFC3339), formatDuration(age))
+	} else {
+		fmt.Printf("  Oldest pending:     N/A\n")
+	}
+
+	// Show failed uploads if requested
+	if showFailed && stats.FailedUploads > 0 {
+		fmt.Printf("\nFailed Uploads (showing up to %d):\n", failedLimit)
+		fmt.Printf("%-10s %-64s %-8s %-12s %-19s %s\n", "ID", "Content Hash", "Size", "Attempts", "Created", "Instance ID")
+		fmt.Printf("%s\n", strings.Repeat("-", 130))
+
+		failedUploads, err := database.GetFailedUploads(ctx, cfg.Uploader.MaxAttempts, failedLimit)
+		if err != nil {
+			return fmt.Errorf("failed to get failed uploads: %w", err)
+		}
+
+		for _, upload := range failedUploads {
+			fmt.Printf("%-10d %-64s %-8s %-12d %-19s %s\n",
+				upload.ID,
+				upload.ContentHash,
+				formatBytes(upload.Size),
+				upload.Attempts,
+				upload.CreatedAt.Format("2006-01-02 15:04:05"),
+				upload.InstanceID)
+		}
+
+		if int64(len(failedUploads)) < stats.FailedUploads {
+			fmt.Printf("\n... and %d more failed uploads\n", stats.FailedUploads-int64(len(failedUploads)))
+		}
+	}
+
+	return nil
+}
+
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.0fs", d.Seconds())
+	} else if d < time.Hour {
+		return fmt.Sprintf("%.0fm", d.Minutes())
+	} else if d < 24*time.Hour {
+		return fmt.Sprintf("%.1fh", d.Hours())
+	} else {
+		return fmt.Sprintf("%.1fd", d.Hours()/24)
 	}
 }

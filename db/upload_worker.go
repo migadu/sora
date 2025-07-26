@@ -145,3 +145,70 @@ func (db *Database) IsContentHashUploaded(ctx context.Context, contentHash strin
 	}
 	return uploaded, nil
 }
+
+// UploaderStats holds statistics about the upload queue
+type UploaderStats struct {
+	TotalPending     int64
+	TotalPendingSize int64
+	FailedUploads    int64
+	OldestPending    sql.NullTime
+}
+
+// GetUploaderStats returns statistics about pending and failed uploads
+func (db *Database) GetUploaderStats(ctx context.Context, maxAttempts int) (*UploaderStats, error) {
+	var stats UploaderStats
+
+	// Get total pending uploads and their total size
+	err := db.Pool.QueryRow(ctx, `
+		SELECT 
+			COUNT(*), 
+			COALESCE(SUM(size), 0),
+			MIN(created_at)
+		FROM pending_uploads
+		WHERE attempts < $1
+	`, maxAttempts).Scan(&stats.TotalPending, &stats.TotalPendingSize, &stats.OldestPending)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pending upload stats: %w", err)
+	}
+
+	// Get count of failed uploads (reached max attempts)
+	err = db.Pool.QueryRow(ctx, `
+		SELECT COUNT(*) 
+		FROM pending_uploads 
+		WHERE attempts >= $1
+	`, maxAttempts).Scan(&stats.FailedUploads)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get failed upload count: %w", err)
+	}
+
+	return &stats, nil
+}
+
+// GetFailedUploads returns detailed information about failed uploads
+func (db *Database) GetFailedUploads(ctx context.Context, maxAttempts int, limit int) ([]PendingUpload, error) {
+	rows, err := db.Pool.Query(ctx, `
+		SELECT id, content_hash, size, instance_id, attempts, created_at, updated_at, last_attempt
+		FROM pending_uploads
+		WHERE attempts >= $1
+		ORDER BY created_at DESC
+		LIMIT $2
+	`, maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query failed uploads: %w", err)
+	}
+	defer rows.Close()
+
+	var uploads []PendingUpload
+	for rows.Next() {
+		var u PendingUpload
+		if err := rows.Scan(&u.ID, &u.ContentHash, &u.Size, &u.InstanceID, &u.Attempts, &u.CreatedAt, &u.UpdatedAt, &u.LastAttempt); err != nil {
+			return nil, fmt.Errorf("failed to scan failed upload: %w", err)
+		}
+		uploads = append(uploads, u)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating failed uploads: %w", err)
+	}
+
+	return uploads, nil
+}

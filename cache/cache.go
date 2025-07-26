@@ -508,3 +508,72 @@ func isDirNotEmptyError(err error) bool {
 	// syscall.ENOTEMPTY is common on POSIX systems.
 	return errors.Is(err, syscall.ENOTEMPTY)
 }
+
+// CacheStats holds cache statistics
+type CacheStats struct {
+	ObjectCount int64
+	TotalSize   int64
+}
+
+// GetStats returns current cache statistics
+func (c *Cache) GetStats() (*CacheStats, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var objectCount int64
+	var totalSize int64
+
+	row := c.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(size), 0) FROM cache_index`)
+	if err := row.Scan(&objectCount, &totalSize); err != nil {
+		return nil, fmt.Errorf("failed to query cache statistics: %w", err)
+	}
+
+	return &CacheStats{
+		ObjectCount: objectCount,
+		TotalSize:   totalSize,
+	}, nil
+}
+
+// PurgeAll removes all cached objects and clears the cache index
+func (c *Cache) PurgeAll(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Get all cached file paths
+	rows, err := c.db.QueryContext(ctx, `SELECT path FROM cache_index`)
+	if err != nil {
+		return fmt.Errorf("failed to query cache index: %w", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			log.Printf("[CACHE] error scanning path during purge: %v", err)
+			continue
+		}
+		paths = append(paths, path)
+	}
+
+	// Remove all files
+	dataDir := filepath.Join(c.basePath, DataDir)
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("[CACHE] failed to remove file %s: %v", path, err)
+		}
+		removeEmptyParents(path, dataDir)
+	}
+
+	// Clear the cache index
+	if _, err := c.db.ExecContext(ctx, `DELETE FROM cache_index`); err != nil {
+		return fmt.Errorf("failed to clear cache index: %w", err)
+	}
+
+	// Clean up any remaining empty directories
+	if err := c.cleanupStaleDirectories(); err != nil {
+		log.Printf("[CACHE] error during cleanupStaleDirectories: %v", err)
+	}
+
+	return nil
+}
