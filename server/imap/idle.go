@@ -6,7 +6,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
-var idlePollInterval = 15 * time.Second
+var idlePollInterval = 5 * time.Second // Reduced from 15s for better concurrent client sync
 
 func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) error {
 	s.Log("client entered IDLE mode")
