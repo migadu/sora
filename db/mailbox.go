@@ -184,7 +184,7 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
 		VALUES ($1, $2, $3, $4, '')
 		RETURNING id
-	`, userID, name, int64(uidValidity), true).Scan(&mailboxID)
+	`, userID, name, int64(uidValidity), false).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
