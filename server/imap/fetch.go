@@ -47,15 +47,34 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	selectedMailboxID = s.selectedMailbox.ID
 	sessionTrackerSnapshot = s.sessionTracker
-
+	
+	// Capture modseq before unlocking
+	modSeqSnapshot := s.currentHighestModSeq.Load()
+	
 	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	s.mutex.RUnlock()
-
+	
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
+	
+	// Check if mailbox changed during our operation
+	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
+		s.Log("[FETCH] WARNING: Mailbox changed during FETCH operation (modseq %d -> %d)", 
+			modSeqSnapshot, s.currentHighestModSeq.Load())
+		// For sequence sets, this could mean we fetched wrong messages
+		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
+			// Re-decode and re-fetch to ensure consistency
+			decodedNumSet = s.decodeNumSet(numSet)
+			messages, err = s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+			if err != nil {
+				return s.internalError("failed to retrieve messages: %v", err)
+			}
+		}
+	}
+	
 	if len(messages) == 0 {
 		return nil
 	}

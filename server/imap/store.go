@@ -34,6 +34,9 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	selectedMailboxID = s.selectedMailbox.ID
 
+	// Capture modseq before unlocking
+	modSeqSnapshot := s.currentHighestModSeq.Load()
+	
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	s.mutex.RUnlock()
@@ -43,6 +46,21 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
+	}
+	
+	// Check if mailbox changed during our operation
+	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
+		s.Log("[STORE] WARNING: Mailbox changed during STORE operation (modseq %d -> %d)", 
+			modSeqSnapshot, s.currentHighestModSeq.Load())
+		// For sequence sets, this could mean we're updating wrong messages
+		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
+			// Re-decode and re-fetch to ensure consistency
+			decodedNumSet = s.decodeNumSet(numSet)
+			messages, err = s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+			if err != nil {
+				return s.internalError("failed to retrieve messages: %v", err)
+			}
+		}
 	}
 
 	var modifiedMessages []struct {
