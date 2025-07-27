@@ -72,7 +72,8 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// Database operation - no lock needed
-	if err := s.server.db.ExpungeMessageUIDs(s.ctx, mailboxID, uidsToDelete...); err != nil {
+	newModSeq, err := s.server.db.ExpungeMessageUIDs(s.ctx, mailboxID, uidsToDelete...)
+	if err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}
 
@@ -96,6 +97,12 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 
 	// Update our count using atomic operation
 	s.currentNumMessages.Add(^uint32(len(messagesToExpunge) - 1)) // Subtract len(messagesToExpunge)
+	
+	// Update highest MODSEQ to prevent POLL from re-processing these expunges
+	if newModSeq > 0 {
+		s.currentHighestModSeq.Store(uint64(newModSeq))
+	}
+	
 	s.mutex.Unlock()
 	cancel()
 

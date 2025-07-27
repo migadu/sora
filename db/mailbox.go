@@ -438,17 +438,19 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 	const query = `
 		SELECT
-			COALESCE(MAX(uid) FILTER (WHERE expunged_at IS NULL), 0) + 1 AS uid_next,
-			COUNT(*) FILTER (WHERE expunged_at IS NULL) AS num_messages,
-			COALESCE(SUM(size) FILTER (WHERE expunged_at IS NULL), 0) AS total_size,
+			mb.highest_uid + 1 AS uid_next,
+			COALESCE(COUNT(m.uid) FILTER (WHERE m.expunged_at IS NULL), 0) AS num_messages,
+			COALESCE(SUM(m.size) FILTER (WHERE m.expunged_at IS NULL), 0) AS total_size,
 			(
 				SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 1)
 				FROM messages m_mod
 				WHERE m_mod.mailbox_id = $1
 			) AS highest_modseq,
-			COUNT(*) FILTER (WHERE (flags & $2) = 0 AND expunged_at IS NULL) AS unseen_count -- $2 is FlagSeen
-		FROM messages
-		WHERE mailbox_id = $1;
+			COALESCE(COUNT(m.uid) FILTER (WHERE (m.flags & $2) = 0 AND m.expunged_at IS NULL), 0) AS unseen_count -- $2 is FlagSeen
+		FROM mailboxes mb
+		LEFT JOIN messages m ON m.mailbox_id = mb.id
+		WHERE mb.id = $1
+		GROUP BY mb.id, mb.highest_uid;
 	`
 	row := tx.QueryRow(ctx, query, mailboxID, FlagSeen)
 
