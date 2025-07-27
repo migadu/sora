@@ -50,7 +50,6 @@ build-freebsd:
 	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_FREEBSD_BINARY) ./cmd/sora
 	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
 
-
 # Help target
 help:
 	@echo "Available targets:"
