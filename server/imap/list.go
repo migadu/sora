@@ -21,27 +21,78 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	}
 
 	// Database operations should be done outside of lock
-	mboxes, err := s.server.db.GetMailboxes(s.ctx, s.UserID(), options.SelectSubscribed)
+	// For LSUB, we need all mailboxes to find parents of subscribed ones
+	mboxes, err := s.server.db.GetMailboxes(s.ctx, s.UserID(), false)
 	if err != nil {
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
 	var l []imap.ListData
-	for _, mbox := range mboxes {
-		match := false
-		for _, pattern := range patterns {
-			match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
-			if match {
-				break
+	
+	// For LSUB, we need to include parent folders of subscribed mailboxes
+	if options.SelectSubscribed {
+		// First, collect all subscribed mailboxes
+		subscribedMailboxes := make(map[string]bool)
+		for _, mbox := range mboxes {
+			if mbox.Subscribed {
+				subscribedMailboxes[mbox.Name] = true
 			}
 		}
-		if !match {
-			continue
+		
+		// Then, find all parent folders that should be included
+		parentFolders := make(map[string]bool)
+		for subscribedName := range subscribedMailboxes {
+			parts := strings.Split(subscribedName, string(consts.MailboxDelimiter))
+			// Add all parent paths
+			for i := 1; i < len(parts); i++ {
+				parentPath := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+				if parentPath != "" {
+					parentFolders[parentPath] = true
+					// Also try with trailing delimiter
+					parentFolders[parentPath+string(consts.MailboxDelimiter)] = true
+				}
+			}
 		}
+		
+		// Process mailboxes for LSUB
+		for _, mbox := range mboxes {
+			match := false
+			for _, pattern := range patterns {
+				match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
+				if match {
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			
+			// Include if subscribed or if it's a parent of a subscribed mailbox
+			if mbox.Subscribed || parentFolders[mbox.Name] {
+				data := listMailbox(mbox, options, s.server.caps, parentFolders[mbox.Name])
+				if data != nil {
+					l = append(l, *data)
+				}
+			}
+		}
+	} else {
+		// Regular LIST behavior
+		for _, mbox := range mboxes {
+			match := false
+			for _, pattern := range patterns {
+				match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
+				if match {
+					break
+				}
+			}
+			if !match {
+				continue
+			}
 
-		data := listMailbox(mbox, options, s.server.caps)
-		if data != nil {
-			l = append(l, *data)
+			data := listMailbox(mbox, options, s.server.caps, false)
+			if data != nil {
+				l = append(l, *data)
+			}
 		}
 	}
 
@@ -97,12 +148,13 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	return nil
 }
 
-func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet) *imap.ListData {
-	if options.SelectSubscribed && !mbox.Subscribed {
-		return nil
-	}
-
+func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, isParentFolder bool) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
+	
+	// Add \noselect for parent folders that aren't directly subscribed
+	if isParentFolder && !mbox.Subscribed {
+		attributes = append(attributes, imap.MailboxAttrNoSelect)
+	}
 
 	if serverCaps.Has(imap.CapChildren) {
 		if mbox.HasChildren {
