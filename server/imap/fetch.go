@@ -17,6 +17,21 @@ import (
 
 const crlf = "\r\n"
 
+func extractPartial(b []byte, partial *imap.SectionPartial) []byte {
+	if partial == nil {
+		return b
+	}
+
+	end := partial.Offset + partial.Size
+	if partial.Offset > int64(len(b)) {
+		return nil
+	}
+	if end > int64(len(b)) {
+		end = int64(len(b))
+	}
+	return b[partial.Offset:end]
+}
+
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
@@ -341,6 +356,9 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 				parsedDBHeader, parseErr := textproto.ReadHeader(bufio.NewReader(bytes.NewReader([]byte(headerBlockToParse))))
 				if parseErr == nil {
 					sectionContent, extractionErr = extractRequestedHeaders(parsedDBHeader, section)
+					if extractionErr == nil && section.Partial != nil {
+						sectionContent = extractPartial(sectionContent, section.Partial)
+					}
 					satisfiedFromDB = true
 					s.Log("[FETCH] UID %d: Served BODY[HEADER.FIELDS (...)] from message_contents.headers", msg.UID)
 				} else {
@@ -366,6 +384,9 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 					headersText += crlf
 				}
 				sectionContent = []byte(headersText + crlf)
+				if section.Partial != nil {
+					sectionContent = extractPartial(sectionContent, section.Partial)
+				}
 				satisfiedFromDB = true
 				s.Log("[FETCH] UID %d: Served BODY[HEADER] from message_contents.headers", msg.UID)
 			} else {
@@ -390,6 +411,9 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 
 				if !isSuspectDueToEncoding {
 					sectionContent = []byte(textBody)
+					if section.Partial != nil {
+						sectionContent = extractPartial(sectionContent, section.Partial)
+					}
 					satisfiedFromDB = true
 					s.Log("[FETCH] UID %d: Served BODY[TEXT] from message_contents.text_body.", msg.UID)
 				} else {
