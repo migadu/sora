@@ -1137,7 +1137,7 @@ func (s *POP3Session) handleConnection() {
 			s.mutex.RUnlock()
 			cancel()
 
-			err = s.server.db.ExpungeMessageUIDs(ctx, mailboxID, expungeUIDs...)
+			_, err = s.server.db.ExpungeMessageUIDs(ctx, mailboxID, expungeUIDs...)
 			if err != nil {
 				s.Log("error expunging messages: %v", err)
 			}
