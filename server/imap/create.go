@@ -1,11 +1,11 @@
 package imap
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
 // Create a new mailbox
@@ -39,32 +39,53 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 
 		// Still nested after cleanup?
 		if len(parts) > 1 {
-			// Build parent path
-			parentPathComponents := parts[:len(parts)-1]
-			parentPath := strings.Join(parentPathComponents, string(consts.MailboxDelimiter))
-
-			// Try to find parent, first without trailing delimiter
-			parentMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, parentPath)
-			if err == consts.ErrMailboxNotFound {
-				// Try with trailing delimiter
-				parentPath = parentPath + string(consts.MailboxDelimiter)
-				parentMailbox, err = s.server.db.GetMailboxByName(s.ctx, userID, parentPath)
-			}
+			// Auto-create missing parent mailboxes (like Dovecot)
+			var currentParentID *int64
 			
-			if err != nil {
-				if err == consts.ErrMailboxNotFound {
-					s.Log("[CREATE] parent mailbox '%s' does not exist", strings.TrimRight(parentPath, string(consts.MailboxDelimiter)))
-					return &imap.Error{
-						Type: imap.StatusResponseTypeNo,
-						Code: imap.ResponseCodeNonExistent,
-						Text: fmt.Sprintf("parent mailbox '%s' does not exist", strings.TrimRight(parentPath, string(consts.MailboxDelimiter))),
+			// Create each level of the hierarchy if it doesn't exist
+			for i := 1; i < len(parts); i++ {
+				parentPathWithoutDelim := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+				parentPathWithDelim := parentPathWithoutDelim + string(consts.MailboxDelimiter)
+				
+				var parentMailbox *db.DBMailbox
+				
+				// Check if without-delimiter version exists
+				parentMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, parentPathWithoutDelim)
+				withoutDelimExists := (err == nil)
+				
+				// Check if with-delimiter version exists  
+				_, err = s.server.db.GetMailboxByName(s.ctx, userID, parentPathWithDelim)
+				withDelimExists := (err == nil)
+				
+				// Create missing versions
+				if !withoutDelimExists {
+					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithoutDelim)
+					err = s.server.db.CreateMailbox(s.ctx, userID, parentPathWithoutDelim, currentParentID)
+					if err != nil {
+						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
+					}
+					
+					// Get the newly created parent
+					parentMailbox, err = s.server.db.GetMailboxByName(s.ctx, userID, parentPathWithoutDelim)
+					if err != nil {
+						return s.internalError("failed to fetch auto-created parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
 				}
-				return s.internalError("failed to fetch parent mailbox '%s': %v", parentPath, err)
+				
+				if !withDelimExists {
+					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithDelim)
+					err = s.server.db.CreateMailbox(s.ctx, userID, parentPathWithDelim, currentParentID)
+					if err != nil {
+						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithDelim, err)
+					}
+				}
+				
+				if parentMailbox != nil {
+					currentParentID = &parentMailbox.ID
+				}
 			}
-			if parentMailbox != nil {
-				parentMailboxID = &parentMailbox.ID
-			}
+			
+			parentMailboxID = currentParentID
 		}
 	}
 
