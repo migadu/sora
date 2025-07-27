@@ -42,13 +42,14 @@ build-release:
 
 # Cross-compile with musl libc for Linux
 build-linux-musl:
-	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -ldflags "-linkmode external -extldflags -static" -o $(SORA_LINUX_BINARY) ./cmd/sora
-	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -ldflags "-linkmode external -extldflags -static" -o $(SORA_ADMIN_LINUX_BINARY) ./cmd/sora-admin
+	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags "-extldflags -static" -o $(SORA_LINUX_BINARY) ./cmd/sora
+	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags "-extldflags -static" -o $(SORA_ADMIN_LINUX_BINARY) ./cmd/sora-admin
 
 # Cross-compile for FreeBSD
 build-freebsd:
-	GOARCH=amd64 GOOS=freebsd CGO_ENABLED=0 go build -o $(SORA_FREEBSD_BINARY) ./cmd/sora
-	GOARCH=amd64 GOOS=freebsd CGO_ENABLED=0 go build -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
+	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_FREEBSD_BINARY) ./cmd/sora
+	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
+
 
 # Help target
 help:
