@@ -21,7 +21,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/mail"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -75,7 +75,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	log.Printf("Using maildir database: %s", dbPath)
 	
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}

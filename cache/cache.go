@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/migadu/sora/db"
 )
 
@@ -54,7 +54,7 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.
 	}
 
 	dbPath := filepath.Join(basePath, IndexDB)
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open cache index DB: %w", err)
 	}
