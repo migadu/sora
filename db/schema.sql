@@ -40,14 +40,12 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name ON mailboxes (account_id, LO
 -- Index for faster mailbox lookups by account_id and subscription status
 CREATE INDEX IF NOT EXISTS idx_mailboxes_account_subscribed ON mailboxes (account_id, subscribed);
 
--- Index for faster mailbox lookups by account_id
-CREATE INDEX IF NOT EXISTS idx_mailboxes_account_id ON mailboxes (account_id);
-
 -- Index for efficient path-based hierarchy lookups
 CREATE INDEX IF NOT EXISTS idx_mailboxes_path ON mailboxes (path);
 
 -- Index for path prefix searches (finding descendants)
-CREATE INDEX IF NOT EXISTS idx_mailboxes_path_gist ON mailboxes USING gist (path gist_trgm_ops);
+-- Composite index with account_id first to reduce search scope
+CREATE INDEX IF NOT EXISTS idx_mailboxes_path_prefix ON mailboxes (account_id, path text_pattern_ops);
 
 CREATE SEQUENCE IF NOT EXISTS messages_modseq;
 
