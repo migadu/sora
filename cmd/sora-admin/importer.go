@@ -221,7 +221,20 @@ func (i *Importer) processSubscriptions() error {
 			}
 		}
 		if line != "" && !strings.HasPrefix(line, "V") {
-			folders = append(folders, line)
+			// Handle tab-separated folder names on the same line
+			// Some Dovecot versions may have multiple folders per line separated by tabs
+			if strings.Contains(line, "\t") {
+				// Split by tabs and add each non-empty part as a separate folder
+				parts := strings.Split(line, "\t")
+				for _, part := range parts {
+					part = strings.TrimSpace(part)
+					if part != "" {
+						folders = append(folders, part)
+					}
+				}
+			} else {
+				folders = append(folders, line)
+			}
 		}
 	}
 	
@@ -252,6 +265,7 @@ func (i *Importer) processSubscriptions() error {
 	
 	// Process each subscribed folder
 	for _, folderName := range folders {
+		
 		// Check if mailbox exists, create if needed
 		mailbox, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), folderName)
 		if err != nil {
@@ -733,6 +747,7 @@ func (i *Importer) scanMaildir() error {
 			return fmt.Errorf("could not get relative path for %s: %w", path, err)
 		}
 
+
 		var mailboxName string
 		if relPath == "." {
 			mailboxName = "INBOX"
@@ -748,6 +763,9 @@ func (i *Importer) scanMaildir() error {
 			
 			// Replace maildir separator (.) with IMAP separator (/)
 			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
+			
+			// Trim any leading or trailing spaces from the mailbox name
+			mailboxName = strings.TrimSpace(mailboxName)
 			
 			// Handle special folder name mappings
 			switch strings.ToLower(mailboxName) {
