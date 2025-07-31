@@ -794,6 +794,7 @@ func handleImportMaildir() {
 	forceReimport := fs.Bool("force-reimport", false, "Force reimport of messages even if they already exist")
 	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
 	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, dovecot-keywords)")
+	sievePath := fs.String("sieve", "", "Path to Sieve script file to import for the user")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to import (e.g. INBOX,Sent)")
 	startDate := fs.String("start-date", "", "Import only messages after this date (YYYY-MM-DD)")
 	endDate := fs.String("end-date", "", "Import only messages before this date (YYYY-MM-DD)")
@@ -815,6 +816,7 @@ Options:
   --force-reimport        Force reimport of messages even if they already exist
   --cleanup-db            Remove the SQLite import database after successful import
   --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords)
+  --sieve string          Path to Sieve script file to import for the user
   --mailbox-filter string Comma-separated list of mailboxes to import (e.g. INBOX,Sent,Archive*)
   --start-date string     Import only messages after this date (YYYY-MM-DD)
   --end-date string       Import only messages before this date (YYYY-MM-DD)
@@ -845,6 +847,9 @@ Examples:
 
   # Import from Dovecot with subscriptions and custom keywords
   sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+
+  # Import with Sieve script
+  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
 `)
 	}
 
@@ -947,6 +952,7 @@ Examples:
 		CleanupDB:     *cleanupDB,
 		Dovecot:       *dovecot,
 		ImportDelay:   *delay,
+		SievePath:     *sievePath,
 	}
 
 	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)

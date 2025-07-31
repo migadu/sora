@@ -21,12 +21,12 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/mail"
-	_ "modernc.org/sqlite"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -35,16 +35,17 @@ const (
 
 // ImporterOptions contains configuration options for the importer
 type ImporterOptions struct {
-	DryRun          bool
-	StartDate       *time.Time
-	EndDate         *time.Time
-	MailboxFilter   []string
-	PreserveFlags   bool
-	ShowProgress    bool
-	ForceReimport   bool
-	CleanupDB       bool
-	Dovecot         bool
-	ImportDelay     time.Duration // Delay between imports to control rate
+	DryRun        bool
+	StartDate     *time.Time
+	EndDate       *time.Time
+	MailboxFilter []string
+	PreserveFlags bool
+	ShowProgress  bool
+	ForceReimport bool
+	CleanupDB     bool
+	Dovecot       bool
+	ImportDelay   time.Duration // Delay between imports to control rate
+	SievePath     string        // Path to Sieve script file to import
 }
 
 // Importer handles the maildir import process.
@@ -64,7 +65,7 @@ type Importer struct {
 	failedMessages   int64
 	startTime        time.Time
 	mu               sync.Mutex
-	
+
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
 }
@@ -74,7 +75,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 	// Create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	log.Printf("Using maildir database: %s", dbPath)
-	
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
@@ -111,7 +112,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 		startTime:       time.Now(),
 		dovecotKeywords: make(map[int]string),
 	}
-	
+
 	// Parse Dovecot keywords if Dovecot mode is enabled
 	if options.Dovecot {
 		if err := importer.parseDovecotKeywords(); err != nil {
@@ -119,7 +120,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 			// Don't fail creation for keyword parsing errors
 		}
 	}
-	
+
 	return importer, nil
 }
 
@@ -140,7 +141,7 @@ func (i *Importer) Close() error {
 // Run starts the import process.
 func (i *Importer) Run() error {
 	defer i.Close()
-	
+
 	// Process Dovecot subscriptions if Dovecot mode is enabled
 	if i.options.Dovecot {
 		if err := i.processSubscriptions(); err != nil {
@@ -148,19 +149,26 @@ func (i *Importer) Run() error {
 			// Don't fail the import for subscription errors
 		}
 	}
-	
+
+	// Import Sieve script if provided
+	if i.options.SievePath != "" {
+		if err := i.importSieveScript(); err != nil {
+			log.Printf("Warning: Failed to import Sieve script: %v", err)
+		}
+	}
+
 	log.Println("Scanning maildir...")
 	if err := i.scanMaildir(); err != nil {
 		return fmt.Errorf("failed to scan maildir: %w", err)
 	}
-	
+
 	// After scanning, count total messages in SQLite database (including existing ones)
 	var totalCount int64
 	countErr := i.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&totalCount)
 	if countErr != nil {
 		return fmt.Errorf("failed to count messages in database: %w", countErr)
 	}
-	
+
 	// Set totalMessages to the actual count in database
 	atomic.StoreInt64(&i.totalMessages, totalCount)
 	log.Printf("Found %d total messages in database", totalCount)
@@ -187,29 +195,29 @@ func (i *Importer) Run() error {
 // processSubscriptions reads and processes the Dovecot subscriptions file
 func (i *Importer) processSubscriptions() error {
 	subscriptionsPath := filepath.Join(i.maildirPath, "subscriptions")
-	
+
 	// Check if subscriptions file exists
 	if _, err := os.Stat(subscriptionsPath); os.IsNotExist(err) {
 		log.Printf("No subscriptions file found at %s, skipping subscription processing", subscriptionsPath)
 		return nil
 	}
-	
+
 	log.Printf("Processing Dovecot subscriptions from: %s", subscriptionsPath)
-	
+
 	// Read the subscriptions file
 	content, err := os.ReadFile(subscriptionsPath)
 	if err != nil {
 		return fmt.Errorf("failed to read subscriptions file: %w", err)
 	}
-	
+
 	lines := strings.Split(string(content), "\n")
-	
+
 	// Parse Dovecot subscriptions format
 	// First line should be version (e.g., "V	2")
 	if len(lines) == 0 {
 		return fmt.Errorf("empty subscriptions file")
 	}
-	
+
 	// Skip version line and empty lines, collect folder names
 	var folders []string
 	for i, line := range lines {
@@ -237,35 +245,35 @@ func (i *Importer) processSubscriptions() error {
 			}
 		}
 	}
-	
+
 	if len(folders) == 0 {
 		log.Printf("No folders found in subscriptions file")
 		return nil
 	}
-	
+
 	log.Printf("Found %d subscribed folders: %v", len(folders), folders)
-	
+
 	// Get user context for database operations
 	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
-	
+
 	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
 	user := server.NewUser(address, accountID)
-	
+
 	// Ensure default mailboxes exist first
 	if err := i.soraDB.CreateDefaultMailboxes(ctx, user.UserID()); err != nil {
 		return fmt.Errorf("failed to create default mailboxes: %w", err)
 	}
-	
+
 	// Process each subscribed folder
 	for _, folderName := range folders {
-		
+
 		// Check if mailbox exists, create if needed
 		mailbox, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), folderName)
 		if err != nil {
@@ -286,7 +294,7 @@ func (i *Importer) processSubscriptions() error {
 				continue
 			}
 		}
-		
+
 		// Subscribe the user to the folder
 		if err := i.soraDB.SetMailboxSubscribed(ctx, mailbox.ID, user.UserID(), true); err != nil {
 			log.Printf("Warning: Failed to subscribe to mailbox %s: %v", folderName, err)
@@ -294,89 +302,166 @@ func (i *Importer) processSubscriptions() error {
 			log.Printf("Successfully subscribed to mailbox: %s", folderName)
 		}
 	}
-	
+
+	return nil
+}
+
+// importSieveScript imports a Sieve script file for the user
+func (i *Importer) importSieveScript() error {
+	// Check if file exists (follow symlinks if present)
+	if _, err := os.Stat(i.options.SievePath); os.IsNotExist(err) {
+		log.Printf("Sieve script file does not exist, ignoring: %s", i.options.SievePath)
+		return nil
+	}
+
+	if i.options.DryRun {
+		log.Printf("DRY RUN: Would import Sieve script from: %s", i.options.SievePath)
+		return nil
+	}
+
+	log.Printf("Importing Sieve script from: %s", i.options.SievePath)
+
+	// Read the script content
+	scriptContent, err := os.ReadFile(i.options.SievePath)
+	if err != nil {
+		return fmt.Errorf("failed to read Sieve script file: %w", err)
+	}
+
+	// Get user context for database operations
+	ctx := context.Background()
+	address, err := server.NewAddress(i.email)
+	if err != nil {
+		return fmt.Errorf("invalid email address: %w", err)
+	}
+
+	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	if err != nil {
+		return fmt.Errorf("failed to get account ID: %w", err)
+	}
+	user := server.NewUser(address, accountID)
+
+	// Check if user already has an active script
+	existingScript, err := i.soraDB.GetActiveScript(ctx, user.UserID())
+	if err != nil && err != consts.ErrDBNotFound {
+		return fmt.Errorf("failed to check for existing active script: %w", err)
+	}
+
+	scriptName := "imported"
+	if existingScript != nil {
+		log.Printf("User already has an active Sieve script named '%s', it will be replaced", existingScript.Name)
+		scriptName = existingScript.Name
+	}
+
+	// Create or update the script
+	var script *db.SieveScript
+	existingByName, err := i.soraDB.GetScriptByName(ctx, scriptName, user.UserID())
+	switch err {
+	case nil:
+		// Script with this name exists, update it
+		script, err = i.soraDB.UpdateScript(ctx, existingByName.ID, user.UserID(), scriptName, string(scriptContent))
+		if err != nil {
+			return fmt.Errorf("failed to update existing Sieve script: %w", err)
+		}
+		log.Printf("Updated existing Sieve script '%s'", scriptName)
+	case consts.ErrDBNotFound:
+		// Create new script
+		script, err = i.soraDB.CreateScript(ctx, user.UserID(), scriptName, string(scriptContent))
+		if err != nil {
+			return fmt.Errorf("failed to create Sieve script: %w", err)
+		}
+		log.Printf("Created new Sieve script '%s'", scriptName)
+	default:
+		return fmt.Errorf("failed to check for existing script by name: %w", err)
+	}
+
+	// Activate the script
+	if err := i.soraDB.SetScriptActive(ctx, script.ID, user.UserID(), true); err != nil {
+		return fmt.Errorf("failed to activate Sieve script: %w", err)
+	}
+
+	log.Printf("Successfully imported and activated Sieve script '%s' for user %s", scriptName, i.email)
 	return nil
 }
 
 // parseDovecotKeywords reads and parses the Dovecot keywords file
 func (i *Importer) parseDovecotKeywords() error {
 	keywordsPath := filepath.Join(i.maildirPath, "dovecot-keywords")
-	
+
 	// Check if keywords file exists
 	if _, err := os.Stat(keywordsPath); os.IsNotExist(err) {
 		log.Printf("No dovecot-keywords file found at %s, custom keywords will not be imported", keywordsPath)
 		return nil
 	}
-	
+
 	log.Printf("Parsing Dovecot keywords from: %s", keywordsPath)
-	
+
 	content, err := os.ReadFile(keywordsPath)
 	if err != nil {
 		return fmt.Errorf("failed to read dovecot-keywords file: %w", err)
 	}
-	
+
 	lines := strings.Split(string(content), "\n")
 	keywordCount := 0
-	
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		
+
 		// Parse format: "ID keyword_name"
 		parts := strings.SplitN(line, " ", 2)
 		if len(parts) != 2 {
 			log.Printf("Warning: Skipping malformed dovecot-keywords line: %s", line)
 			continue
 		}
-		
+
 		// Parse the ID
 		id, err := strconv.Atoi(parts[0])
 		if err != nil {
 			log.Printf("Warning: Invalid keyword ID in line: %s", line)
 			continue
 		}
-		
+
 		keyword := parts[1]
 		i.dovecotKeywords[id] = keyword
 		keywordCount++
 	}
-	
+
 	if keywordCount > 0 {
 		log.Printf("Loaded %d Dovecot custom keywords", keywordCount)
 	}
-	
+
 	return nil
 }
 
 // performDryRun analyzes what would be imported without making changes
 func (i *Importer) performDryRun() error {
 	fmt.Printf("\n=== DRY RUN: Import Analysis ===\n\n")
-	
+
 	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
-	
+
 	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
 	user := server.NewUser(address, accountID)
-	
+
 	// Query the SQLite database for scanned messages
 	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path")
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
 	defer rows.Close()
-	
+
 	var totalWouldImport, totalWouldSkip int64
 	currentMailbox := ""
 	var mailboxWouldImport, mailboxWouldSkip int
-	
+
 	for rows.Next() {
 		var path, filename, hash, mailbox string
 		var size int64
@@ -384,21 +469,21 @@ func (i *Importer) performDryRun() error {
 			log.Printf("Failed to scan row: %v", err)
 			continue
 		}
-		
+
 		// Check if we're starting a new mailbox
 		if mailbox != currentMailbox {
 			// Print summary for previous mailbox
 			if currentMailbox != "" {
 				fmt.Printf("   Summary: %d would import, %d would skip\n\n", mailboxWouldImport, mailboxWouldSkip)
 			}
-			
+
 			// Start new mailbox
 			currentMailbox = mailbox
 			mailboxWouldImport = 0
 			mailboxWouldSkip = 0
 			fmt.Printf("Mailbox: %s\n", mailbox)
 		}
-		
+
 		// Check date filter if specified
 		if i.options.StartDate != nil || i.options.EndDate != nil {
 			info, err := os.Stat(path)
@@ -414,7 +499,7 @@ func (i *Importer) performDryRun() error {
 				}
 			}
 		}
-		
+
 		// Check if message already exists in Sora
 		mailboxObj, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), mailbox)
 		var alreadyExists bool
@@ -426,10 +511,10 @@ func (i *Importer) performDryRun() error {
 				}
 			}
 		}
-		
+
 		action := "IMPORT"
 		reason := "new message"
-		
+
 		if alreadyExists {
 			if i.options.ForceReimport {
 				action = "REIMPORT"
@@ -441,18 +526,18 @@ func (i *Importer) performDryRun() error {
 				continue
 			}
 		}
-		
+
 		mailboxWouldImport++
-		
+
 		// Extract basic message info
 		subject := "(unknown subject)"
 		dateStr := "(unknown date)"
-		
+
 		// Try to extract subject and date from message file
 		if info, err := os.Stat(path); err == nil {
 			dateStr = info.ModTime().Format("2006-01-02 15:04")
 		}
-		
+
 		// Try to get subject from message content (first few hundred bytes)
 		if file, err := os.Open(path); err == nil {
 			buffer := make([]byte, 1024)
@@ -471,20 +556,20 @@ func (i *Importer) performDryRun() error {
 			}
 			file.Close()
 		}
-		
+
 		if subject == "" || subject == "\r" {
 			subject = "(no subject)"
 		}
-		
+
 		// Show detailed message info
 		fmt.Printf("   %s %s\n", action, filename)
 		fmt.Printf("      Subject: %s\n", subject)
-		fmt.Printf("      Date: %s | Size: %s | Hash: %s\n", 
-			dateStr, 
+		fmt.Printf("      Date: %s | Size: %s | Hash: %s\n",
+			dateStr,
 			formatImportSize(size),
 			hash[:12]+"...")
 		fmt.Printf("      Action: %s: %s\n", action, reason)
-		
+
 		// Show flags if preserve-flags is enabled
 		if i.options.PreserveFlags {
 			flags := i.parseMaildirFlags(filename)
@@ -496,32 +581,31 @@ func (i *Importer) performDryRun() error {
 				fmt.Printf("      Flags: %v\n", flagNames)
 			}
 		}
-		
+
 		fmt.Println()
 	}
-	
+
 	// Print summary for last mailbox
 	if currentMailbox != "" {
 		fmt.Printf("   Summary: %d would import, %d would skip\n\n", mailboxWouldImport, mailboxWouldSkip)
 	}
-	
+
 	totalWouldImport = atomic.LoadInt64(&i.totalMessages) - totalWouldSkip
 	totalWouldSkip = atomic.LoadInt64(&i.skippedMessages)
-	
+
 	// Overall summary
 	fmt.Printf("=== DRY RUN: Overall Summary ===\n")
 	fmt.Printf("Would import: %d messages\n", totalWouldImport)
 	fmt.Printf("Would skip: %d messages\n", totalWouldSkip)
 	fmt.Printf("Total files scanned: %d\n", atomic.LoadInt64(&i.totalMessages))
-	
+
 	if i.options.Dovecot {
 		fmt.Printf("Would process Dovecot subscriptions and keywords\n")
 	}
-	
+
 	fmt.Printf("\nRun without --dry-run to perform the actual import.\n")
 	return nil
 }
-
 
 // formatImportSize formats a byte size into human readable format
 func formatImportSize(bytes int64) string {
@@ -569,7 +653,7 @@ func hashFile(path string) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	
+
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
@@ -582,7 +666,7 @@ func HashContent(content []byte) string {
 // parseMaildirFlags extracts IMAP flags from a maildir filename.
 func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 	var flags []imap.Flag
-	
+
 	// Maildir flags are after the colon, e.g., "1234567890.M123P456.hostname:2,FS"
 	if idx := strings.LastIndex(filename, ":2,"); idx != -1 && idx+3 < len(filename) {
 		flagStr := filename[idx+3:]
@@ -612,10 +696,10 @@ func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 			}
 		}
 	}
-	
+
 	// Add \Recent flag to newly imported messages
 	flags = append(flags, imap.Flag("\\Recent"))
-	
+
 	return flags
 }
 
@@ -636,7 +720,7 @@ func isValidMaildirMessage(filename string) bool {
 	if strings.HasPrefix(filename, ".") {
 		return false
 	}
-	
+
 	// If it's a regular file in cur/ or new/, it should be a message
 	// Invalid files will be caught by the email parser later
 	return true
@@ -647,7 +731,7 @@ func (i *Importer) shouldImportMailbox(mailboxName string) bool {
 	if len(i.options.MailboxFilter) == 0 {
 		return true
 	}
-	
+
 	for _, filter := range i.options.MailboxFilter {
 		if strings.EqualFold(mailboxName, filter) {
 			return true
@@ -660,15 +744,15 @@ func (i *Importer) shouldImportMailbox(mailboxName string) bool {
 			}
 		}
 	}
-	
+
 	return false
 }
 
 // isMessageAlreadyImported checks if a message with the given hash already exists in the Sora database.
 func (i *Importer) isMessageAlreadyImported(ctx context.Context, hash string, mailboxID int64) (bool, error) {
 	var count int
-	err := i.soraDB.Pool.QueryRow(ctx, 
-		"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND mailbox_id = $2 AND expunged_at IS NULL", 
+	err := i.soraDB.Pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
 		hash, mailboxID).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if message exists: %w", err)
@@ -676,14 +760,13 @@ func (i *Importer) isMessageAlreadyImported(ctx context.Context, hash string, ma
 	return count > 0, nil
 }
 
-
 // isMaildirFolder checks if a directory is a valid maildir folder.
 func isMaildirFolder(path string) bool {
 	// Check if the directory contains 'cur', 'new', and 'tmp' subdirectories
 	_, errCur := os.Stat(filepath.Join(path, "cur"))
 	_, errNew := os.Stat(filepath.Join(path, "new"))
 	_, errTmp := os.Stat(filepath.Join(path, "tmp"))
-	
+
 	return !os.IsNotExist(errCur) && !os.IsNotExist(errNew) && !os.IsNotExist(errTmp)
 }
 
@@ -691,7 +774,7 @@ func isMaildirFolder(path string) bool {
 func (i *Importer) scanMaildir() error {
 	// Ensure path is clean and safe
 	cleanPath := filepath.Clean(i.maildirPath)
-	
+
 	// First, validate that the root path is a valid maildir
 	if !isMaildirFolder(cleanPath) {
 		// Check if there's a Maildir subdirectory (common mistake)
@@ -699,7 +782,7 @@ func (i *Importer) scanMaildir() error {
 		if isMaildirFolder(possibleMaildir) {
 			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, possibleMaildir)
 		}
-		
+
 		// Check for other common maildir subdirectories
 		entries, err := os.ReadDir(cleanPath)
 		if err == nil {
@@ -716,10 +799,10 @@ func (i *Importer) scanMaildir() error {
 				return fmt.Errorf("path '%s' is not a valid maildir root.\nFound possible maildir(s): %s\nThe path should point directly to a maildir (containing cur/, new/, tmp/ directories)", cleanPath, strings.Join(suggestions, ", "))
 			}
 		}
-		
+
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/, new/, and tmp/ directories)", cleanPath)
 	}
-	
+
 	return filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -747,7 +830,6 @@ func (i *Importer) scanMaildir() error {
 			return fmt.Errorf("could not get relative path for %s: %w", path, err)
 		}
 
-
 		var mailboxName string
 		if relPath == "." {
 			mailboxName = "INBOX"
@@ -757,16 +839,16 @@ func (i *Importer) scanMaildir() error {
 			// .Sent (Dovecot style)
 			// Sent (Courier style)
 			// .Sent.2024 (hierarchical)
-			
+
 			// Remove leading dot if present
 			cleanName := strings.TrimPrefix(relPath, ".")
-			
+
 			// Replace maildir separator (.) with IMAP separator (/)
 			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-			
+
 			// Trim any leading or trailing spaces from the mailbox name
 			mailboxName = strings.TrimSpace(mailboxName)
-			
+
 			// Handle special folder name mappings
 			switch strings.ToLower(mailboxName) {
 			case "sent", "sent items", "sent mail":
@@ -781,7 +863,7 @@ func (i *Importer) scanMaildir() error {
 				mailboxName = "Archive"
 			}
 		}
-		
+
 		log.Printf("Processing maildir folder: %s -> mailbox: %s", relPath, mailboxName)
 
 		// Check if this mailbox should be imported
@@ -805,14 +887,14 @@ func (i *Importer) scanMaildir() error {
 				}
 
 				filename := message.Name()
-				
+
 				// Only process files that look like maildir messages
 				if !isValidMaildirMessage(filename) {
 					continue
 				}
 
 				messagePath := filepath.Join(path, subDir, filename)
-				
+
 				// Use streaming hash function
 				hash, size, err := hashFile(messagePath)
 				if err != nil {
@@ -828,13 +910,13 @@ func (i *Importer) scanMaildir() error {
 				}
 
 				// Try to insert, relying on unique constraints to prevent duplicates
-				result, err := i.db.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)", 
+				result, err := i.db.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
 					messagePath, filename, hash, size, mailboxName)
 				if err != nil {
 					log.Printf("Failed to insert message into sqlite db: %v", err)
 					continue
 				}
-				
+
 				// Only count if the insert actually happened (not a duplicate)
 				rowsAffected, err := result.RowsAffected()
 				if err != nil {
@@ -862,7 +944,7 @@ func (i *Importer) importMessages() error {
 		log.Println("No messages to import")
 		return nil
 	}
-	
+
 	log.Printf("Processing %d messages from database", i.totalMessages)
 
 	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path")
@@ -895,13 +977,13 @@ func (i *Importer) importMessages() error {
 					if err == nil {
 						break // Success
 					}
-					
+
 					if retry < 2 { // Don't delay after last attempt
 						log.Printf("%s Import attempt %d/3 failed for %s: %v, retrying...", i.getProgressPrefix(), retry+1, j.path, err)
 						time.Sleep(time.Duration(retry+1) * time.Second) // Exponential backoff
 					}
 				}
-				
+
 				if err != nil {
 					log.Printf("%s Failed to import message %s after 3 attempts: %v", i.getProgressPrefix(), j.path, err)
 					atomic.AddInt64(&i.failedMessages, 1)
@@ -918,7 +1000,7 @@ func (i *Importer) importMessages() error {
 			log.Printf("Failed to scan row: %v", err)
 			continue
 		}
-		
+
 		// Check date filter if specified
 		if i.options.StartDate != nil || i.options.EndDate != nil {
 			// Quick check based on file modification time
@@ -935,7 +1017,7 @@ func (i *Importer) importMessages() error {
 				}
 			}
 		}
-		
+
 		jobs <- struct {
 			path     string
 			filename string
@@ -948,8 +1030,6 @@ func (i *Importer) importMessages() error {
 	close(jobs)
 	wg.Wait()
 
-
-
 	return nil
 }
 
@@ -959,10 +1039,10 @@ func (i *Importer) getProgressPrefix() string {
 	failed := atomic.LoadInt64(&i.failedMessages)
 	skipped := atomic.LoadInt64(&i.skippedMessages)
 	total := atomic.LoadInt64(&i.totalMessages)
-	
+
 	processed := imported + failed + skipped
 	percentage := float64(processed) * 100.0 / float64(total)
-	
+
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
 }
 
@@ -973,7 +1053,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		log.Printf("%s File no longer exists on disk, skipping: %s", i.getProgressPrefix(), path)
 		return nil
 	}
-	
+
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
@@ -1014,7 +1094,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		if err != nil {
 			return fmt.Errorf("failed to check if message already imported: %w", err)
 		}
-		
+
 		if alreadyImported {
 			atomic.AddInt64(&i.skippedMessages, 1)
 			log.Printf("%s Message already imported in Sora database, skipping: %s (hash: %s)", i.getProgressPrefix(), path, hash[:12])
@@ -1080,7 +1160,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	}
 
 	// Log message details for debugging
-	log.Printf("Importing message: mailbox=%s, subject=%s, messageID=%s, hash=%s, size=%d", 
+	log.Printf("Importing message: mailbox=%s, subject=%s, messageID=%s, hash=%s, size=%d",
 		mailbox.Name, subject, messageID, hash, size)
 
 	// If S3 upload is successful, then insert into the database.
@@ -1118,7 +1198,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 	atomic.AddInt64(&i.importedMessages, 1)
 	log.Printf("%s Successfully imported message: msgID=%d, uid=%d, mailbox=%s", i.getProgressPrefix(), msgID, uid, mailbox.Name)
-	
+
 	// Add delay if configured to control rate
 	if i.options.ImportDelay > 0 {
 		time.Sleep(i.options.ImportDelay)
