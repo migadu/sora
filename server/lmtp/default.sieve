@@ -1,6 +1,6 @@
 require ["fileinto"];
 
-if exists "X-Spam-Flag" {
+if exists "X-Spam" {
     fileinto "Junk";
 } else {
     keep;
