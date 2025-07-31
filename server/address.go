@@ -15,6 +15,7 @@ type Address struct {
 	fullAddress string
 	localPart   string
 	domain      string
+	detail      string
 }
 
 func NewAddress(address string) (Address, error) {
@@ -30,10 +31,18 @@ func NewAddress(address string) (Address, error) {
 		return Address{}, fmt.Errorf("unacceptable domain: '%s'", parts[1])
 	}
 
+	// Parse detail part from local part
+	localPart := parts[0]
+	detail := ""
+	if plusIndex := strings.Index(localPart, "+"); plusIndex != -1 {
+		detail = localPart[plusIndex+1:]
+	}
+
 	return Address{
 		fullAddress: address,
-		localPart:   parts[0],
+		localPart:   localPart,
 		domain:      parts[1],
+		detail:      detail,
 	}, nil
 }
 
@@ -44,6 +53,24 @@ func (a Address) FullAddress() string {
 func (a Address) LocalPart() string {
 	return a.localPart
 }
+
 func (a Address) Domain() string {
 	return a.domain
+}
+
+func (a Address) Detail() string {
+	return a.detail
+}
+
+// BaseLocalPart returns the local part without the detail (everything before the "+")
+func (a Address) BaseLocalPart() string {
+	if plusIndex := strings.Index(a.localPart, "+"); plusIndex != -1 {
+		return a.localPart[:plusIndex]
+	}
+	return a.localPart
+}
+
+// BaseAddress returns the address without the detail part (e.g., "user@domain.com" from "user+detail@domain.com")
+func (a Address) BaseAddress() string {
+	return a.BaseLocalPart() + "@" + a.domain
 }

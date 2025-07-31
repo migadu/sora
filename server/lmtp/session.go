@@ -126,8 +126,15 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 	}
 	fullAddress := toAddress.FullAddress()
-	s.Log("looking up user ID for address: %s", fullAddress)
-	userId, err := s.backend.db.GetAccountIDByAddress(s.ctx, fullAddress)
+	lookupAddress := toAddress.BaseAddress()
+
+	// Log if we're using a detail address
+	if toAddress.Detail() != "" {
+		s.Log("ignoring address detail for lookup: %s -> %s", fullAddress, lookupAddress)
+	}
+
+	s.Log("looking up user ID for address: %s", lookupAddress)
+	userId, err := s.backend.db.GetAccountIDByAddress(s.ctx, lookupAddress)
 	if err != nil {
 		s.Log("failed to get user ID by address: %v", err)
 		return &smtp.SMTPError{
@@ -149,6 +156,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 	}
 
+	// Use the original address (with detail part) for the User object
 	s.User = server.NewUser(toAddress, userId)
 	s.mutex.Unlock()
 
