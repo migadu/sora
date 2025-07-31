@@ -844,7 +844,15 @@ func (i *Importer) scanMaildir() error {
 			cleanName := strings.TrimPrefix(relPath, ".")
 
 			// Replace maildir separator (.) with IMAP separator (/)
+			// But avoid creating names that will cause UTF-7 encoding issues
 			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
+			
+			// Validate the mailbox name doesn't contain problematic characters
+			// that will cause UTF-7 encoding issues when sent to IMAP clients
+			if strings.ContainsAny(mailboxName, "\t\r\n") {
+				log.Printf("Warning: Skipping mailbox with invalid characters: %s", mailboxName)
+				return nil
+			}
 
 			// Trim any leading or trailing spaces from the mailbox name
 			mailboxName = strings.TrimSpace(mailboxName)

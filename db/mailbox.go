@@ -152,6 +152,12 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 }
 
 func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+	// Validate mailbox name doesn't contain problematic characters
+	if strings.ContainsAny(name, "\t\r\n\x00") {
+		log.Printf("[DB] ERROR: attempted to create mailbox with invalid characters: %q for user %d", name, userID)
+		return consts.ErrMailboxInvalidName
+	}
+	
 	// Start a transaction
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -223,6 +229,12 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 }
 
 func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+	// Validate mailbox name doesn't contain problematic characters
+	if strings.ContainsAny(name, "\t\r\n\x00") {
+		log.Printf("[DB] ERROR: attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
+		return consts.ErrMailboxInvalidName
+	}
+	
 	// Start a transaction
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -553,6 +565,12 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 
 func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID int64, newName string, newParentID *int64) error {
 	if newName == "" {
+		return consts.ErrMailboxInvalidName
+	}
+	
+	// Validate mailbox name doesn't contain problematic characters
+	if strings.ContainsAny(newName, "\t\r\n\x00") {
+		log.Printf("[DB] ERROR: attempted to rename mailbox to name with invalid characters: %q for user %d", newName, userID)
 		return consts.ErrMailboxInvalidName
 	}
 
