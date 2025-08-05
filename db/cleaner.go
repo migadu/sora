@@ -7,17 +7,34 @@ import (
 	"time"
 )
 
-const CLEANUP_LOCK_KEY = 925955823 // Used by all instances
+const CLEANUP_LOCK_NAME = "cleanup_worker"
 const BATCH_PURGE_SIZE = 100
+const LOCK_TIMEOUT = 30 * time.Second
 
 func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
-	var success bool
-	err := d.Pool.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, CLEANUP_LOCK_KEY).Scan(&success)
-	return success, err
+	// Try to acquire lock by inserting a row, or updating if expired
+	now := time.Now().UTC()
+	expiresAt := now.Add(LOCK_TIMEOUT)
+	
+	result, err := d.Pool.Exec(ctx, `
+		INSERT INTO locks (lock_name, acquired_at, expires_at) 
+		VALUES ($1, $2, $3)
+		ON CONFLICT (lock_name) DO UPDATE SET
+			acquired_at = $2,
+			expires_at = $3
+		WHERE locks.expires_at < $2
+	`, CLEANUP_LOCK_NAME, now, expiresAt)
+	
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	
+	// Check if we successfully acquired the lock
+	return result.RowsAffected() > 0, nil
 }
 
 func (d *Database) ReleaseCleanupLock(ctx context.Context) {
-	_, _ = d.Pool.Exec(ctx, `SELECT pg_advisory_unlock($1)`, CLEANUP_LOCK_KEY)
+	_, _ = d.Pool.Exec(ctx, `DELETE FROM locks WHERE lock_name = $1`, CLEANUP_LOCK_NAME)
 }
 
 func (d *Database) DeleteExpungedMessagesByContentHash(ctx context.Context, contentHash string) error {

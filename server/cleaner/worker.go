@@ -2,7 +2,7 @@ package cleaner
 
 // Package cleaner provides a worker that periodically cleans up S3 objects
 // that are no longer needed, based on a grace period defined in the database.
-// It uses a database advisory lock to ensure that only one instance of the
+// It uses a database table-based lock to ensure that only one instance of the
 // cleanup worker is running at a time. The cleanup process involves listing
 // S3 objects that are candidates for deletion and removing them from both
 // S3 and the database. The worker runs at a specified interval, which can

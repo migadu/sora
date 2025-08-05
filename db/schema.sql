@@ -219,3 +219,10 @@ CREATE INDEX IF NOT EXISTS idx_vacation_responses_account_sender ON vacation_res
 
 -- Index for cleanup of old responses
 CREATE INDEX IF NOT EXISTS idx_vacation_responses_response_date ON vacation_responses (response_date);
+
+-- Table-based locks for coordinating background workers
+CREATE TABLE IF NOT EXISTS locks (
+	lock_name TEXT PRIMARY KEY,
+	acquired_at TIMESTAMPTZ NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL
+);
