@@ -56,6 +56,10 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	if len(criteria.UID) > 0 {
 		for i, uidSet := range criteria.UID {
 			s.Log("[SEARCH DEBUG] UID set %d: %v", i, uidSet)
+			// Also show the raw range values
+			for j, uidRange := range uidSet {
+				s.Log("[SEARCH DEBUG] UID set %d range %d: Start=%d, Stop=%d", i, j, uidRange.Start, uidRange.Stop)
+			}
 		}
 	}
 
@@ -82,18 +86,11 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 
-		// Apple Mail compatibility: When search returns 0 results and client requests ALL,
-		// some clients hang on empty ESEARCH responses. Convert to standard SEARCH response.
-		if len(messages) == 0 && options.ReturnAll && !options.ReturnMin && !options.ReturnMax && !options.ReturnCount {
-			s.Log("[SEARCH ESEARCH] Converting empty ESEARCH ALL to standard SEARCH for Apple Mail compatibility")
-			// Return standard SEARCH format instead of ESEARCH
-			if numKind == imapserver.NumKindUID {
-				searchData.All = imap.UIDSet{}
-			} else {
-				searchData.All = imap.SeqSet{}
-			}
-			return searchData, nil
-		}
+		// Temporarily disabled Apple Mail compatibility workaround to debug the real issue
+		// if len(messages) == 0 && options.ReturnAll && !options.ReturnMin && !options.ReturnMax && !options.ReturnCount {
+		//     s.Log("[SEARCH ESEARCH] Converting empty ESEARCH ALL to standard SEARCH for Apple Mail compatibility")
+		//     return searchData, nil
+		// }
 
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			if len(messages) > 0 {
@@ -195,6 +192,9 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 	for i, seqSet := range criteria.SeqNum {
 		decoded.SeqNum[i] = s.decodeNumSetLocked(seqSet).(imap.SeqSet)
 	}
+
+	// UID sets don't need decoding like sequence numbers do
+	// The * wildcard should already be handled by the go-imap library
 
 	decoded.Not = make([]imap.SearchCriteria, len(criteria.Not))
 	for i, not := range criteria.Not {

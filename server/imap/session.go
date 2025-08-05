@@ -101,6 +101,11 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 		return numSet
 	}
 
+	// Handle UIDSet separately - * should be replaced with highest UID
+	if uidSet, ok := numSet.(imap.UIDSet); ok {
+		return s.decodeUIDSetLocked(uidSet)
+	}
+
 	seqSet, ok := numSet.(imap.SeqSet)
 	if !ok {
 		return numSet
@@ -154,6 +159,35 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 	if len(out) == 0 && len(seqSet) > 0 {
 		return imap.SeqSet{}
 	}
+	return out
+}
+
+// decodeUIDSetLocked translates UID sets, replacing * with the highest UID in the mailbox.
+// IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
+func (s *IMAPSession) decodeUIDSetLocked(uidSet imap.UIDSet) imap.UIDSet {
+	// For UID sets, * should be replaced with the highest UID in the mailbox
+	// Use the lastHighestUID which is set during SELECT
+	highestUID := s.lastHighestUID
+	if highestUID == 0 {
+		// If no highest UID known, there are no messages or no mailbox selected
+		return uidSet
+	}
+
+	var out imap.UIDSet
+	for _, uidRange := range uidSet {
+		actualStart := uidRange.Start
+		if uidRange.Start == 0 { // Represents '*' for the start of the range
+			actualStart = highestUID
+		}
+
+		actualStop := uidRange.Stop
+		if uidRange.Stop == 0 { // Represents '*' for the end of the range
+			actualStop = highestUID
+		}
+
+		out = append(out, imap.UIDRange{Start: actualStart, Stop: actualStop})
+	}
+
 	return out
 }
 
