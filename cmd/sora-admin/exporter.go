@@ -30,6 +30,7 @@ type ExporterOptions struct {
 	Dovecot       bool
 	OverwriteFlags bool // Whether to overwrite flags on existing messages
 	ExportDelay   time.Duration // Delay between exports to control rate
+	ExportUIDList bool // Whether to export dovecot-uidlist files
 }
 
 // Exporter handles the maildir export process.
@@ -49,6 +50,9 @@ type Exporter struct {
 	failedMessages   int64
 	startTime        time.Time
 	mu               sync.Mutex
+	
+	// UID mappings per mailbox for dovecot-uidlist generation
+	uidMappings map[string][]UIDFileMapping // mailbox name -> UID mappings
 }
 
 // NewExporter creates a new Exporter instance.
@@ -96,6 +100,7 @@ func NewExporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 		s3:          s3,
 		options:     options,
 		startTime:   time.Now(),
+		uidMappings: make(map[string][]UIDFileMapping),
 	}
 	
 	return exporter, nil
@@ -168,6 +173,13 @@ func (exporter *Exporter) Run() error {
 	if exporter.options.Dovecot {
 		if err := exporter.exportDovecotFiles(mailboxes); err != nil {
 			log.Printf("Warning: Failed to export Dovecot files: %v", err)
+		}
+	}
+	
+	// Generate dovecot-uidlist files if requested
+	if exporter.options.ExportUIDList {
+		if err := exporter.generateDovecotUIDLists(mailboxes); err != nil {
+			log.Printf("Warning: Failed to generate dovecot-uidlist files: %v", err)
 		}
 	}
 	
@@ -528,6 +540,22 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 	atomic.AddInt64(&exporter.exportedMessages, 1)
 	log.Printf("%s Successfully exported message: UID=%d, mailbox=%s, file=%s", exporter.getProgressPrefix(), msg.UID, mailboxName, filename)
 	
+	// Collect UID mapping for dovecot-uidlist generation if enabled
+	if exporter.options.ExportUIDList {
+		exporter.mu.Lock()
+		// Extract base filename without flags for UID mapping
+		baseFilename := filename
+		if idx := strings.LastIndex(baseFilename, ":"); idx > 0 {
+			baseFilename = baseFilename[:idx]
+		}
+		
+		exporter.uidMappings[mailboxName] = append(exporter.uidMappings[mailboxName], UIDFileMapping{
+			UID:      uint32(msg.UID),
+			Filename: baseFilename,
+		})
+		exporter.mu.Unlock()
+	}
+	
 	// Add delay if configured to control rate
 	if exporter.options.ExportDelay > 0 {
 		time.Sleep(exporter.options.ExportDelay)
@@ -680,5 +708,58 @@ func (exporter *Exporter) printSummary() error {
 	if exporter.options.Dovecot {
 		fmt.Printf("\nNote: Dovecot subscriptions file exported.\n")
 	}
+	if exporter.options.ExportUIDList {
+		fmt.Printf("Note: Dovecot uidlist files generated.\n")
+	}
+	return nil
+}
+
+// generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes
+func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) error {
+	log.Println("Generating dovecot-uidlist files...")
+	
+	exporter.mu.Lock()
+	defer exporter.mu.Unlock()
+	
+	for mailboxName, mappings := range exporter.uidMappings {
+		if len(mappings) == 0 {
+			continue
+		}
+		
+		// Find the mailbox to get its UIDVALIDITY
+		var uidValidity uint32
+		for _, mbox := range mailboxes {
+			if mbox.Name == mailboxName {
+				uidValidity = uint32(mbox.UIDValidity)
+				break
+			}
+		}
+		
+		// If no UIDVALIDITY found, generate one based on current timestamp
+		if uidValidity == 0 {
+			uidValidity = uint32(time.Now().Unix())
+			log.Printf("Warning: No UIDVALIDITY found for mailbox %s, using generated value: %d", mailboxName, uidValidity)
+		}
+		
+		// Create DovecotUIDList from mappings
+		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
+		
+		// Determine maildir path for this mailbox
+		var maildirPath string
+		if mailboxName == "INBOX" {
+			maildirPath = exporter.maildirPath
+		} else {
+			maildirPath = filepath.Join(exporter.maildirPath, mailboxName)
+		}
+		
+		// Write dovecot-uidlist file  
+		if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
+			return fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err)
+		}
+		
+		log.Printf("Generated dovecot-uidlist for mailbox %s: %d messages, UIDVALIDITY=%d, NextUID=%d", 
+			mailboxName, len(mappings), uidValidity, uidList.NextUID)
+	}
+	
 	return nil
 }

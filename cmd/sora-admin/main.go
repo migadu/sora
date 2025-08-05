@@ -795,6 +795,7 @@ func handleImportMaildir() {
 	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
 	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, dovecot-keywords)")
 	sievePath := fs.String("sieve", "", "Path to Sieve script file to import for the user")
+	preserveUIDs := fs.Bool("preserve-uids", false, "Preserve original UIDs from dovecot-uidlist files")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to import (e.g. INBOX,Sent)")
 	startDate := fs.String("start-date", "", "Import only messages after this date (YYYY-MM-DD)")
 	endDate := fs.String("end-date", "", "Import only messages before this date (YYYY-MM-DD)")
@@ -815,8 +816,9 @@ Options:
   --delay duration        Delay between operations to control rate (e.g. 500ms)
   --force-reimport        Force reimport of messages even if they already exist
   --cleanup-db            Remove the SQLite import database after successful import
-  --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords)
+  --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords, dovecot-uidlist)
   --sieve string          Path to Sieve script file to import for the user
+  --preserve-uids         Preserve original UIDs from dovecot-uidlist files (implied by --dovecot)
   --mailbox-filter string Comma-separated list of mailboxes to import (e.g. INBOX,Sent,Archive*)
   --start-date string     Import only messages after this date (YYYY-MM-DD)
   --end-date string       Import only messages before this date (YYYY-MM-DD)
@@ -825,9 +827,9 @@ Options:
 IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
 not to a parent directory containing multiple maildirs.
 
-Use --dovecot flag to process Dovecot-specific 'subscriptions' and 'dovecot-keywords' files,
-which will create missing mailboxes, subscribe the user to specified folders, and preserve
-custom IMAP keywords/flags on imported messages.
+Use --dovecot flag to process Dovecot-specific files including 'subscriptions', 'dovecot-keywords', and
+'dovecot-uidlist'. This will create missing mailboxes, subscribe the user to specified folders, preserve
+custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist files.
 
 Examples:
   # Import all mail (correct path points to maildir root)
@@ -953,6 +955,7 @@ Examples:
 		Dovecot:       *dovecot,
 		ImportDelay:   *delay,
 		SievePath:     *sievePath,
+		PreserveUIDs:  *preserveUIDs || *dovecot,
 	}
 
 	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)
@@ -977,6 +980,7 @@ func handleExportMaildir() {
 	showProgress := fs.Bool("progress", true, "Show export progress")
 	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
 	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions)")
+	exportUIDList := fs.Bool("export-dovecot-uidlist", false, "Export dovecot-uidlist files with UID mappings")
 	overwriteFlags := fs.Bool("overwrite-flags", false, "Update flags on existing messages")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to export (e.g. INBOX,Sent)")
 	startDate := fs.String("start-date", "", "Export only messages after this date (YYYY-MM-DD)")
@@ -995,7 +999,8 @@ Options:
   --dry-run               Preview what would be exported without making changes
   --progress              Show export progress (default: true)
   --delay duration        Delay between operations to control rate (e.g. 500ms)
-  --dovecot               Export Dovecot-specific files (subscriptions)
+  --dovecot               Export Dovecot-specific files (subscriptions, dovecot-uidlist)
+  --export-dovecot-uidlist Export dovecot-uidlist files with UID mappings (implied by --dovecot)
   --overwrite-flags       Update flags on existing messages (default: false)
   --mailbox-filter string Comma-separated list of mailboxes to export (e.g. INBOX,Sent,Archive*)
   --start-date string     Export only messages after this date (YYYY-MM-DD)
@@ -1013,8 +1018,11 @@ Examples:
   # Export only INBOX and Sent folders
   sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
 
-  # Export with Dovecot metadata
+  # Export with Dovecot metadata (includes dovecot-uidlist files)
   sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  
+  # Export with only dovecot-uidlist files (no subscriptions)
+  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
 
   # Update flags on existing messages
   sora-admin export-maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
@@ -1108,6 +1116,9 @@ Examples:
 		}
 	}
 
+	// If dovecot flag is enabled, also enable UID list export
+	exportUIDListEnabled := *exportUIDList || *dovecot
+
 	// Create exporter options
 	options := ExporterOptions{
 		DryRun:         *dryRun,
@@ -1118,6 +1129,7 @@ Examples:
 		Dovecot:        *dovecot,
 		OverwriteFlags: *overwriteFlags,
 		ExportDelay:    *delay,
+		ExportUIDList:  exportUIDListEnabled,
 	}
 
 	exporter, err := NewExporter(*maildirPath, *email, *jobs, database, s3, options)
