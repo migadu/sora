@@ -38,12 +38,19 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	s.mutex.RUnlock()
 	cancel()
 
+	// Debug: log original criteria before decoding
+	s.Log("[SEARCH DEBUG] Original criteria before decoding: SeqNum=%v, UID=%v, Since=%v, Before=%v, SentSince=%v, SentBefore=%v", 
+		len(criteria.SeqNum), len(criteria.UID), criteria.Since, criteria.Before, criteria.SentSince, criteria.SentBefore)
+	
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
 	
 	// Debug: log the search criteria to understand what Apple Mail is searching for
 	s.Log("[SEARCH DEBUG] Decoded criteria: SeqNum=%v, UID=%v, Since=%v, Before=%v, Body=%v, Text=%v, Flag=%v, NotFlag=%v", 
 		len(criteria.SeqNum), len(criteria.UID), criteria.Since, criteria.Before, len(criteria.Body), len(criteria.Text), len(criteria.Flag), len(criteria.NotFlag))
+	
+	// Debug: check if dates are actually zero
+	s.Log("[SEARCH DEBUG] Date checks: Since.IsZero()=%v, Before.IsZero()=%v", criteria.Since.IsZero(), criteria.Before.IsZero())
 	
 	// Additional debug: show actual UID values
 	if len(criteria.UID) > 0 {
