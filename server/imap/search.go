@@ -38,30 +38,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	s.mutex.RUnlock()
 	cancel()
 
-	// Debug: log original criteria before decoding
-	s.Log("[SEARCH DEBUG] Original criteria before decoding: SeqNum=%v, UID=%v, Since=%v, Before=%v, SentSince=%v, SentBefore=%v", 
-		len(criteria.SeqNum), len(criteria.UID), criteria.Since, criteria.Before, criteria.SentSince, criteria.SentBefore)
-	
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
-	
-	// Debug: log the search criteria to understand what Apple Mail is searching for
-	s.Log("[SEARCH DEBUG] Decoded criteria: SeqNum=%v, UID=%v, Since=%v, Before=%v, Body=%v, Text=%v, Flag=%v, NotFlag=%v", 
-		len(criteria.SeqNum), len(criteria.UID), criteria.Since, criteria.Before, len(criteria.Body), len(criteria.Text), len(criteria.Flag), len(criteria.NotFlag))
-	
-	// Debug: check if dates are actually zero
-	s.Log("[SEARCH DEBUG] Date checks: Since.IsZero()=%v, Before.IsZero()=%v", criteria.Since.IsZero(), criteria.Before.IsZero())
-	
-	// Additional debug: show actual UID values
-	if len(criteria.UID) > 0 {
-		for i, uidSet := range criteria.UID {
-			s.Log("[SEARCH DEBUG] UID set %d: %v", i, uidSet)
-			// Also show the raw range values
-			for j, uidRange := range uidSet {
-				s.Log("[SEARCH DEBUG] UID set %d range %d: Start=%d, Stop=%d", i, j, uidRange.Start, uidRange.Stop)
-			}
-		}
-	}
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
 		s.Log("[SEARCH] skipping UID SEARCH because mailbox is empty")
@@ -80,7 +58,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	searchData := &imap.SearchData{}
 	searchData.Count = uint32(len(messages))
 	
-	s.Log("[SEARCH DEBUG] Found %d messages matching criteria", len(messages))
 
 	if options != nil {
 		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
@@ -126,7 +103,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
 			// The go-imap library will include Count in ESEARCH responses when it's set
 			
-			s.Log("[SEARCH DEBUG] ESEARCH response: Count=%d, All=%v (type=%T)", searchData.Count, searchData.All, searchData.All)
 		} else {
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.

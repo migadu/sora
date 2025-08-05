@@ -248,14 +248,21 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 				param := nextParam()
 				args[param] = r.Start
 				conditions = append(conditions, fmt.Sprintf("%s = @%s", columnName, param))
-				log.Printf("[DB SEARCH DEBUG] UID exact match: %s = %d", columnName, r.Start)
 			} else {
 				startParam := nextParam()
 				stopParam := nextParam()
 				args[startParam] = r.Start
-				args[stopParam] = r.Stop
+				
+				// Handle * wildcard: Stop=0 means "highest UID in mailbox"
+				stopValue := r.Stop
+				if r.Stop == 0 {
+					// For UID ranges, * should be the highest possible UID (MaxUint32)
+					// This ensures the range includes all UIDs from Start to the actual highest UID
+					stopValue = 4294967295 // MaxUint32
+				}
+				args[stopParam] = stopValue
+				
 				conditions = append(conditions, fmt.Sprintf("%s BETWEEN @%s AND @%s", columnName, startParam, stopParam))
-				log.Printf("[DB SEARCH DEBUG] UID range: %s BETWEEN %d AND %d", columnName, r.Start, r.Stop)
 			}
 		}
 	default:
@@ -303,8 +310,6 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		return nil, err
 	}
 	
-	// Debug: log the generated SQL condition
-	log.Printf("[DB SEARCH DEBUG] Generated WHERE condition: %s, args: %v", whereCondition, whereArgs)
 	whereArgs["mailboxID"] = mailboxID
 
 	if orderByClause == "" {
