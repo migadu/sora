@@ -248,12 +248,14 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 				param := nextParam()
 				args[param] = r.Start
 				conditions = append(conditions, fmt.Sprintf("%s = @%s", columnName, param))
+				log.Printf("[DB SEARCH DEBUG] UID exact match: %s = %d", columnName, r.Start)
 			} else {
 				startParam := nextParam()
 				stopParam := nextParam()
 				args[startParam] = r.Start
 				args[stopParam] = r.Stop
 				conditions = append(conditions, fmt.Sprintf("%s BETWEEN @%s AND @%s", columnName, startParam, stopParam))
+				log.Printf("[DB SEARCH DEBUG] UID range: %s BETWEEN %d AND %d", columnName, r.Start, r.Stop)
 			}
 		}
 	default:
@@ -303,20 +305,6 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	
 	// Debug: log the generated SQL condition
 	log.Printf("[DB SEARCH DEBUG] Generated WHERE condition: %s, args: %v", whereCondition, whereArgs)
-	
-	// Debug: also show what UIDs exist in this mailbox
-	var existingUIDs []int64
-	rows, dbErr := db.Pool.Query(ctx, "SELECT uid FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL ORDER BY uid LIMIT 10", mailboxID)
-	if dbErr == nil {
-		for rows.Next() {
-			var uid int64
-			if scanErr := rows.Scan(&uid); scanErr == nil {
-				existingUIDs = append(existingUIDs, uid)
-			}
-		}
-		rows.Close()
-		log.Printf("[DB SEARCH DEBUG] First 10 UIDs in mailbox %d: %v", mailboxID, existingUIDs)
-	}
 	whereArgs["mailboxID"] = mailboxID
 
 	if orderByClause == "" {
@@ -325,7 +313,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	finalQueryString := baseQuery + fmt.Sprintf(" WHERE %s %s", whereCondition, orderByClause)
 
-	rows, err = db.Pool.Query(ctx, finalQueryString, whereArgs)
+	rows, err := db.Pool.Query(ctx, finalQueryString, whereArgs)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
