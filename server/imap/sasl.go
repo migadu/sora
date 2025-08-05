@@ -72,7 +72,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					if dbErr := s.server.db.CreateDefaultMailboxes(s.ctx, userID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
-					s.Log("[AUTH] Session established for impersonated user '%s' (ID: %d) via master SASL login.", targetUserToImpersonate, userID)
+
+					authCount := s.server.authenticatedConnections.Add(1)
+					totalCount := s.server.totalConnections.Load()
+					s.Log("[AUTH] Session established for impersonated user '%s' (ID: %d) via master SASL login. (connections: total=%d, authenticated=%d)", targetUserToImpersonate, userID, totalCount, authCount)
 					return nil
 				}
 			}
