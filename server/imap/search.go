@@ -44,6 +44,13 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// Debug: log the search criteria to understand what Apple Mail is searching for
 	s.Log("[SEARCH DEBUG] Decoded criteria: SeqNum=%v, UID=%v, Since=%v, Before=%v, Body=%v, Text=%v, Flag=%v, NotFlag=%v", 
 		len(criteria.SeqNum), len(criteria.UID), criteria.Since, criteria.Before, len(criteria.Body), len(criteria.Text), len(criteria.Flag), len(criteria.NotFlag))
+	
+	// Additional debug: show actual UID values
+	if len(criteria.UID) > 0 {
+		for i, uidSet := range criteria.UID {
+			s.Log("[SEARCH DEBUG] UID set %d: %v", i, uidSet)
+		}
+	}
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
 		s.Log("[SEARCH] skipping UID SEARCH because mailbox is empty")
@@ -67,6 +74,19 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	if options != nil {
 		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
+
+		// Apple Mail compatibility: When search returns 0 results and client requests ALL,
+		// some clients hang on empty ESEARCH responses. Convert to standard SEARCH response.
+		if len(messages) == 0 && options.ReturnAll && !options.ReturnMin && !options.ReturnMax && !options.ReturnCount {
+			s.Log("[SEARCH ESEARCH] Converting empty ESEARCH ALL to standard SEARCH for Apple Mail compatibility")
+			// Return standard SEARCH format instead of ESEARCH
+			if numKind == imapserver.NumKindUID {
+				searchData.All = imap.UIDSet{}
+			} else {
+				searchData.All = imap.SeqSet{}
+			}
+			return searchData, nil
+		}
 
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			if len(messages) > 0 {
@@ -101,6 +121,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// RFC 4731: For ESEARCH, COUNT should be included unless explicitly excluded
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
 			// The go-imap library will include Count in ESEARCH responses when it's set
+			
+			s.Log("[SEARCH DEBUG] ESEARCH response: Count=%d, All=%v (type=%T)", searchData.Count, searchData.All, searchData.All)
 		} else {
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
