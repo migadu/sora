@@ -46,6 +46,7 @@ type ImporterOptions struct {
 	Dovecot       bool
 	ImportDelay   time.Duration // Delay between imports to control rate
 	SievePath     string        // Path to Sieve script file to import
+	PreserveUIDs  bool          // Preserve UIDs from dovecot-uidlist files
 }
 
 // Importer handles the maildir import process.
@@ -68,6 +69,9 @@ type Importer struct {
 
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
+	
+	// Dovecot UID lists: mailbox path -> UID list
+	dovecotUIDLists map[string]*DovecotUIDList
 }
 
 // NewImporter creates a new Importer instance.
@@ -111,6 +115,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 		options:         options,
 		startTime:       time.Now(),
 		dovecotKeywords: make(map[int]string),
+		dovecotUIDLists: make(map[string]*DovecotUIDList),
 	}
 
 	// Parse Dovecot keywords if Dovecot mode is enabled
@@ -940,6 +945,18 @@ func (i *Importer) scanMaildir() error {
 			}
 		}
 
+		// Parse dovecot-uidlist if preserving UIDs
+		if i.options.PreserveUIDs {
+			uidList, err := ParseDovecotUIDList(path)
+			if err != nil {
+				log.Printf("Warning: Failed to parse dovecot-uidlist in %s: %v", path, err)
+			} else if uidList != nil {
+				i.dovecotUIDLists[path] = uidList
+				log.Printf("Loaded dovecot-uidlist for %s: UIDVALIDITY=%d, NextUID=%d, %d mappings", 
+					mailboxName, uidList.UIDValidity, uidList.NextUID, len(uidList.UIDMappings))
+			}
+		}
+
 		// Do not skip the directory, so we can find nested maildir folders.
 		return nil
 	})
@@ -1167,6 +1184,25 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		return fmt.Errorf("failed to upload to s3 after 3 attempts: %w", s3Err)
 	}
 
+	// Look up preserved UID if enabled
+	var preservedUID *uint32
+	var preservedUIDValidity *uint32
+	
+	if i.options.PreserveUIDs {
+		// Find the maildir path for this mailbox
+		maildirPath := filepath.Dir(filepath.Dir(path)) // Go up from cur/new to maildir folder
+		
+		if uidList, ok := i.dovecotUIDLists[maildirPath]; ok && uidList != nil {
+			if uid, found := uidList.GetUIDForFile(filename); found {
+				preservedUID = &uid
+				preservedUIDValidity = &uidList.UIDValidity
+				log.Printf("Using preserved UID %d for %s (UIDVALIDITY=%d)", uid, filename, uidList.UIDValidity)
+			} else {
+				log.Printf("No preserved UID found for %s in dovecot-uidlist", filename)
+			}
+		}
+	}
+
 	// Log message details for debugging
 	log.Printf("Importing message: mailbox=%s, subject=%s, messageID=%s, hash=%s, size=%d",
 		mailbox.Name, subject, messageID, hash, size)
@@ -1189,6 +1225,8 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
 			RawHeaders:    rawHeadersText,
+			PreservedUID:  preservedUID,
+			PreservedUIDValidity: preservedUIDValidity,
 		})
 	if err != nil {
 		// Don't fail on unique violation, just log it

@@ -136,6 +136,8 @@ type InsertMessageOptions struct {
 	BodyStructure *imap.BodyStructure
 	Recipients    []helpers.Recipient
 	RawHeaders    string
+	PreservedUID  *uint32          // Optional: preserved UID from import
+	PreservedUIDValidity *uint32  // Optional: preserved UIDVALIDITY from import
 }
 
 func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -321,19 +323,51 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 	defer tx.Rollback(ctx)
 
 	var highestUID int64
+	var uidToUse int64
 
-	// Lock mailbox and get current UID
-	err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to fetch highest UID: %v", err)
-		return 0, 0, consts.ErrDBQueryFailed
-	}
+	// If we have a preserved UID, use it; otherwise generate a new one
+	if options.PreservedUID != nil {
+		uidToUse = int64(*options.PreservedUID)
+		
+		// Update highest_uid if preserved UID is higher
+		err = tx.QueryRow(ctx, `
+			UPDATE mailboxes 
+			SET highest_uid = GREATEST(highest_uid, $2)
+			WHERE id = $1 
+			RETURNING highest_uid`, 
+			options.MailboxID, uidToUse).Scan(&highestUID)
+		if err != nil {
+			log.Printf("[DB] failed to update highest UID with preserved UID: %v", err)
+			return 0, 0, consts.ErrDBUpdateFailed
+		}
+		
+		// If we have a preserved UIDVALIDITY, update it
+		if options.PreservedUIDValidity != nil {
+			_, err = tx.Exec(ctx, `
+				UPDATE mailboxes 
+				SET uid_validity = $2
+				WHERE id = $1`, 
+				options.MailboxID, *options.PreservedUIDValidity)
+			if err != nil {
+				log.Printf("[DB] failed to update UIDVALIDITY: %v", err)
+				return 0, 0, consts.ErrDBUpdateFailed
+			}
+		}
+	} else {
+		// Lock mailbox and get current UID
+		err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
+		if err != nil {
+			log.Printf("[DB] failed to fetch highest UID: %v", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
 
-	// Bump UID
-	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to update highest UID: %v", err)
-		return 0, 0, consts.ErrDBUpdateFailed
+		// Bump UID
+		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
+		if err != nil {
+			log.Printf("[DB] failed to update highest UID: %v", err)
+			return 0, 0, consts.ErrDBUpdateFailed
+		}
+		uidToUse = highestUID
 	}
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
@@ -374,7 +408,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 		"account_id":      options.UserID,
 		"mailbox_id":      options.MailboxID,
 		"mailbox_path":    options.MailboxName,
-		"uid":             highestUID,
+		"uid":             uidToUse,
 		"message_id":      saneMessageID,
 		"content_hash":    options.ContentHash,
 		"flags":           bitwiseFlags,
@@ -440,5 +474,5 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 		return 0, 0, consts.ErrDBCommitTransactionFailed
 	}
 
-	return messageRowId, highestUID, nil
+	return messageRowId, uidToUse, nil
 }
