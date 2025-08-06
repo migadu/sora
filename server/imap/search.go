@@ -63,33 +63,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 
-		// iOS Mail compatibility: Fall back to standard SEARCH response for certain ESEARCH patterns
-		// that iOS Mail has trouble with, particularly when requesting ALL results
-		if options.ReturnAll && !options.ReturnMin && !options.ReturnMax && !options.ReturnCount {
-			s.Log("[SEARCH ESEARCH] Converting ESEARCH ALL to standard SEARCH for iOS Mail compatibility")
-			// Return as standard SEARCH instead of ESEARCH to avoid iOS Mail infinite retry
-			var uids imap.UIDSet
-			var seqNums imap.SeqSet
-			for _, msg := range messages {
-				uids.AddNum(msg.UID)
-				// Use our snapshot of sessionTracker which is thread-safe
-				if sessionTrackerSnapshot != nil {
-					seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
-				} else {
-					// Fallback to just using the sequence number if session tracker isn't available
-					seqNums.AddNum(msg.Seq)
-				}
-			}
-			if numKind == imapserver.NumKindUID {
-				searchData.All = uids
-			} else {
-				searchData.All = seqNums
-			}
-			// Clear ESEARCH-specific fields to force standard SEARCH response
-			searchData.Min = 0
-			searchData.Max = 0
-			return searchData, nil
-		}
+		// ESEARCH is disabled in capabilities for iOS Mail compatibility
+		// The go-imap library should fall back to standard SEARCH responses
 
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			if len(messages) > 0 {
