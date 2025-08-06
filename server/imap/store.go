@@ -80,8 +80,8 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	for _, msg := range messages {
-		// Always enable CONDSTORE functionality when UnchangedSince option is provided
-		if options != nil && options.UnchangedSince > 0 {
+		// CONDSTORE functionality - only process if capability is enabled
+		if s.server.caps.Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq
 
@@ -156,8 +156,10 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 			m.WriteFlags(modified.flags)
 			m.WriteUID(modified.uid)
-			// CONDSTORE: Uncomment the following line if CONDSTORE capability is used
-			// m.WriteModSeq(uint64(modified.modSeq))
+			// CONDSTORE: Include MODSEQ in response if capability is enabled
+			if s.server.caps.Has(imap.CapCondStore) {
+				m.WriteModSeq(uint64(modified.modSeq))
+			}
 
 			if err := m.Close(); err != nil {
 				s.Log("[STORE] WARNING: failed to close fetch response for message UID %d: %v",
