@@ -146,8 +146,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		UIDNext:           imap.UID(currentSummary.UIDNext),
 		UIDValidity:       s.selectedMailbox.UIDValidity,
 		NumRecent:         numRecent,
-		HighestModSeq:     s.currentHighestModSeq.Load(),
 		FirstUnseenSeqNum: s.firstUnseenSeqNum.Load(),
+	}
+
+	// Only include HighestModSeq if CONDSTORE capability is enabled
+	if s.server.caps.Has(imap.CapCondStore) {
+		selectData.HighestModSeq = s.currentHighestModSeq.Load()
 	}
 
 	return selectData, nil

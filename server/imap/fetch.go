@@ -224,7 +224,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 
-	if options.ModSeq {
+	if s.server.caps.Has(imap.CapCondStore) && options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
 
