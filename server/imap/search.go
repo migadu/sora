@@ -57,15 +57,10 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	searchData := &imap.SearchData{}
 	searchData.Count = uint32(len(messages))
-	
 
 	if options != nil {
 		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
-
-		// ESEARCH is disabled in capabilities for iOS Mail compatibility
-		// The go-imap library should fall back to standard SEARCH responses
-
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			if len(messages) > 0 {
 				if options.ReturnMin {
@@ -99,7 +94,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// RFC 4731: For ESEARCH, COUNT should be included unless explicitly excluded
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
 			// The go-imap library will include Count in ESEARCH responses when it's set
-			
+
 		} else {
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.

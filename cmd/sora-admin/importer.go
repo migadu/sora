@@ -877,7 +877,7 @@ func (i *Importer) scanMaildir() error {
 			}
 		}
 
-		log.Printf("Processing maildir folder: %s -> mailbox: %s", relPath, mailboxName)
+		log.Printf("Processing maildir folder: %s -> mailbox: '%s' (contains '/' delimiter: %v)", relPath, mailboxName, strings.Contains(mailboxName, "/"))
 
 		// Check if this mailbox should be imported
 		if !i.shouldImportMailbox(mailboxName) {
@@ -1108,9 +1108,9 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		if err != nil {
 			return fmt.Errorf("failed to get mailbox '%s' after creation: %w", mailboxName, err)
 		}
-		log.Printf("Created mailbox '%s' with ID %d", mailboxName, mailbox.ID)
+		log.Printf("Created mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
 	} else {
-		log.Printf("Using existing mailbox '%s' with ID %d", mailboxName, mailbox.ID)
+		log.Printf("Using existing mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
 	}
 
 	// Check if this message is already imported in the Sora database (unless forcing reimport)

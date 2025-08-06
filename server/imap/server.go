@@ -82,7 +82,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			imap.CapSpecialUse:  struct{}{},
 			imap.CapListStatus:  struct{}{},
 			imap.CapBinary:      struct{}{},
-			imap.CapCondStore:   struct{}{},
+			// imap.CapCondStore:   struct{}{}, // Disabled
 			imap.CapChildren:    struct{}{},
 			imap.CapID:          struct{}{},
 		},
