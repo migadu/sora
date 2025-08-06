@@ -75,14 +75,14 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 			imap.CapMove:        struct{}{},
 			imap.CapIdle:        struct{}{},
 			imap.CapUIDPlus:     struct{}{},
-			// imap.CapESearch:     struct{}{}, // Disabled for iOS Mail compatibility
+			// imap.CapESearch:     struct{}{}, // Disabled for iOS Mail compatibility for now
 			imap.CapESort:       struct{}{},
 			imap.CapSort:        struct{}{},
 			imap.CapSortDisplay: struct{}{},
 			imap.CapSpecialUse:  struct{}{},
 			imap.CapListStatus:  struct{}{},
 			imap.CapBinary:      struct{}{},
-			// imap.CapCondStore:   struct{}{}, // Disabled
+			imap.CapCondStore:   struct{}{},
 			imap.CapChildren:    struct{}{},
 			imap.CapID:          struct{}{},
 		},
