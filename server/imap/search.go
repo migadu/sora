@@ -71,24 +71,25 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				}
 			}
 
-			if options.ReturnAll {
-				var uids imap.UIDSet
-				var seqNums imap.SeqSet
-				for _, msg := range messages {
-					uids.AddNum(msg.UID)
-					// Use our snapshot of sessionTracker which is thread-safe
-					if sessionTrackerSnapshot != nil {
-						seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
-					} else {
-						// Fallback to just using the sequence number if session tracker isn't available
-						seqNums.AddNum(msg.Seq)
-					}
-				}
-				if numKind == imapserver.NumKindUID {
-					searchData.All = uids
+			// Always include ALL for ESEARCH responses (iOS compatibility)
+			// Many clients expect ALL to be present even if not explicitly requested
+			var uids imap.UIDSet
+			var seqNums imap.SeqSet
+			for _, msg := range messages {
+				uids.AddNum(msg.UID)
+				// Use our snapshot of sessionTracker which is thread-safe
+				if sessionTrackerSnapshot != nil {
+					seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
 				} else {
-					searchData.All = seqNums
+					// Fallback to just using the sequence number if session tracker isn't available
+					seqNums.AddNum(msg.Seq)
 				}
+			}
+			// Always set All field, even if empty, for ESEARCH compatibility
+			if numKind == imapserver.NumKindUID {
+				searchData.All = uids
+			} else {
+				searchData.All = seqNums
 			}
 
 			// RFC 4731: For ESEARCH, COUNT should be included unless explicitly excluded
