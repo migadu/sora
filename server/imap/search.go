@@ -71,26 +71,28 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				}
 			}
 
-			// Always include ALL for ESEARCH responses (iOS compatibility)
-			// Many clients expect ALL to be present even if not explicitly requested
-			var uids imap.UIDSet
-			var seqNums imap.SeqSet
-			for _, msg := range messages {
-				uids.AddNum(msg.UID)
-				// Use our snapshot of sessionTracker which is thread-safe
-				if sessionTrackerSnapshot != nil {
-					seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+			// Include ALL for ESEARCH responses when there are results
+			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
+			if len(messages) > 0 {
+				var uids imap.UIDSet
+				var seqNums imap.SeqSet
+				for _, msg := range messages {
+					uids.AddNum(msg.UID)
+					// Use our snapshot of sessionTracker which is thread-safe
+					if sessionTrackerSnapshot != nil {
+						seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+					} else {
+						// Fallback to just using the sequence number if session tracker isn't available
+						seqNums.AddNum(msg.Seq)
+					}
+				}
+				if numKind == imapserver.NumKindUID {
+					searchData.All = uids
 				} else {
-					// Fallback to just using the sequence number if session tracker isn't available
-					seqNums.AddNum(msg.Seq)
+					searchData.All = seqNums
 				}
 			}
-			// Always set All field, even if empty, for ESEARCH compatibility
-			if numKind == imapserver.NumKindUID {
-				searchData.All = uids
-			} else {
-				searchData.All = seqNums
-			}
+			// When empty, go-imap will output "ESEARCH (TAG ...) UID" without ALL
 
 			// RFC 4731: For ESEARCH, COUNT should be included unless explicitly excluded
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
@@ -102,21 +104,24 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
 			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
 			
-			// For iOS compatibility, always include ALL in ESEARCH responses
-			var uids imap.UIDSet
-			var seqNums imap.SeqSet
-			for _, msg := range messages {
-				uids.AddNum(msg.UID)
-				if sessionTrackerSnapshot != nil {
-					seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
-				} else {
-					seqNums.AddNum(msg.Seq)
+			// Include ALL for ESEARCH responses when there are results
+			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
+			if len(messages) > 0 {
+				var uids imap.UIDSet
+				var seqNums imap.SeqSet
+				for _, msg := range messages {
+					uids.AddNum(msg.UID)
+					if sessionTrackerSnapshot != nil {
+						seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+					} else {
+						seqNums.AddNum(msg.Seq)
+					}
 				}
-			}
-			if numKind == imapserver.NumKindUID {
-				searchData.All = uids
-			} else {
-				searchData.All = seqNums
+				if numKind == imapserver.NumKindUID {
+					searchData.All = uids
+				} else {
+					searchData.All = seqNums
+				}
 			}
 		}
 	} else { // Standard SEARCH command (options == nil)
