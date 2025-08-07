@@ -101,6 +101,23 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
 			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
+			
+			// For iOS compatibility, always include ALL in ESEARCH responses
+			var uids imap.UIDSet
+			var seqNums imap.SeqSet
+			for _, msg := range messages {
+				uids.AddNum(msg.UID)
+				if sessionTrackerSnapshot != nil {
+					seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+				} else {
+					seqNums.AddNum(msg.Seq)
+				}
+			}
+			if numKind == imapserver.NumKindUID {
+				searchData.All = uids
+			} else {
+				searchData.All = seqNums
+			}
 		}
 	} else { // Standard SEARCH command (options == nil)
 		s.Log("[SEARCH] Standard SEARCH, returning ALL and COUNT.")
