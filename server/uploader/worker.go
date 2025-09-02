@@ -185,6 +185,17 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return
 	}
 
+	// Finalize the upload in the database. This is a transactional operation.
+	// It's critical to do this *before* removing the local source file.
+	err = w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID)
+	if err != nil {
+		// If this fails, the S3 object might be orphaned temporarily, but the task is not lost.
+		// The task will be retried after the lease expires. Because the local file still
+		// exists, the retry can succeed.
+		log.Printf("[UPLOADER] CRITICAL: failed to finalize DB after S3 upload for hash %s, account %d: %v. Will retry.", upload.ContentHash, upload.AccountID, err)
+		return
+	}
+
 	// Move the uploaded file to the global cache. If the move fails (e.g., file
 	// already in cache from another user's upload), delete the local file.
 	if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
@@ -196,12 +207,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		log.Printf("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
 	}
 
-	err = w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID)
-	if err != nil {
-		log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
-	} else {
-		log.Printf("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
-	}
+	log.Printf("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
 }
 
 func (w *UploadWorker) FilePath(contentHash string, accountID int64) string {

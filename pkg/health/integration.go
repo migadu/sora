@@ -7,10 +7,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/minio/minio-go/v7"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/storage"
+	"github.com/minio/minio-go/v7"
 )
 
 // HealthIntegration manages health monitoring for the Sora server
@@ -36,10 +36,10 @@ func NewHealthIntegration(database *db.Database) *HealthIntegration {
 func (hi *HealthIntegration) Start(ctx context.Context) {
 	// Register standard health checks
 	hi.registerStandardChecks()
-	
+
 	// Start the health monitor
 	hi.monitor.Start(ctx)
-	
+
 	// Register callback to store health data in database
 	hi.monitor.AddStatusCallback(hi.storeHealthStatus)
 }
@@ -88,13 +88,16 @@ func (hi *HealthIntegration) RegisterS3Check(s3storage *storage.S3Storage) {
 		Check: func(ctx context.Context) error {
 			// Test S3 connectivity by attempting to list objects
 			objectCh := s3storage.Client.ListObjects(ctx, s3storage.BucketName, minio.ListObjectsOptions{MaxKeys: 1})
-			for obj := range objectCh {
-				// Check for errors in the object listing
+			select {
+			case obj, ok := <-objectCh:
+				if !ok {
+					return fmt.Errorf("S3 list objects channel closed unexpectedly")
+				}
 				if obj.Err != nil {
 					return fmt.Errorf("S3 list objects failed: %w", obj.Err)
 				}
-				// Just check if we can connect, don't need to process results
-				break
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 			return nil
 		},
@@ -111,22 +114,22 @@ func (hi *HealthIntegration) RegisterCircuitBreakerCheck(name string, breaker *c
 		Check: func(ctx context.Context) error {
 			state := breaker.State()
 			counts := breaker.Counts()
-			
+
 			// Store circuit breaker state in metadata but don't fail the check
 			// The actual health will be determined by failure rates
 			if state == circuitbreaker.StateOpen {
-				return fmt.Errorf("circuit breaker is open (requests: %d, failures: %d)", 
+				return fmt.Errorf("circuit breaker is open (requests: %d, failures: %d)",
 					counts.Requests, counts.TotalFailures)
 			}
-			
+
 			if counts.Requests > 0 {
 				failureRate := float64(counts.TotalFailures) / float64(counts.Requests)
 				if failureRate > 0.5 {
-					return fmt.Errorf("high failure rate %.2f%% (requests: %d, failures: %d)", 
+					return fmt.Errorf("high failure rate %.2f%% (requests: %d, failures: %d)",
 						failureRate*100, counts.Requests, counts.TotalFailures)
 				}
 			}
-			
+
 			return nil
 		},
 	}
@@ -140,16 +143,16 @@ func (hi *HealthIntegration) RegisterCustomCheck(check *HealthCheck) {
 func (hi *HealthIntegration) storeHealthStatus(componentName string, status ComponentStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	// Get the health check details with proper locking
 	hi.monitor.mu.RLock()
 	check, exists := hi.monitor.checks[componentName]
 	hi.monitor.mu.RUnlock()
-	
+
 	if !exists {
 		return
 	}
-	
+
 	// Read check fields with proper locking
 	check.mu.RLock()
 	interval := check.Interval
@@ -159,13 +162,13 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	checkCount := check.CheckCount
 	failCount := check.FailCount
 	check.mu.RUnlock()
-	
+
 	// Create metadata with additional information
 	metadata := make(map[string]interface{})
 	metadata["interval"] = interval.String()
 	metadata["critical"] = critical
 	metadata["enabled"] = enabled
-	
+
 	// Convert health status to db status type
 	var dbStatus db.ComponentStatus
 	switch status {
@@ -180,7 +183,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	default:
 		dbStatus = db.StatusUnreachable
 	}
-	
+
 	// Store in database
 	err := hi.database.StoreHealthStatus(
 		ctx,
@@ -192,7 +195,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 		failCount,
 		metadata,
 	)
-	
+
 	if err != nil {
 		log.Printf("Failed to store health status for %s: %v", componentName, err)
 	}

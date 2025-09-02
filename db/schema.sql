@@ -134,6 +134,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_expunged_at_is_null ON messag
 -- Index for PollMailbox: efficiently filter messages by mailbox_id and expunged_modseq
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_expunged_modseq ON messages (mailbox_id, expunged_modseq);
 
+-- Index for GetUnusedContentHashes: efficiently find active messages for a given content hash
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash_active ON messages (content_hash) WHERE expunged_at IS NULL;
+
 -- Index for faster searches on the subject field
 CREATE INDEX IF NOT EXISTS idx_messages_subject_trgm ON messages USING gin (LOWER(subject) gin_trgm_ops);
 

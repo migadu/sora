@@ -21,6 +21,8 @@ import (
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
+
 	"github.com/migadu/sora/storage"
 	"github.com/minio/minio-go/v7"
 )
@@ -110,59 +112,89 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		log.Printf("[CLEANUP] deleted %d old vacation responses", count)
 	}
 
-	candidates, err := w.db.GetContentHashesForFullCleanup(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
+	// --- Phase 1: User-scoped cleanup (S3 objects and message references) ---
+	// Get objects to clean up, scoped by user, as S3 storage is user-scoped.
+	candidates, err := w.db.GetUserScopedObjectsForCleanup(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		log.Printf("[CLEANUP] failed to list content hashes for full cleanup: %v", err)
-		return fmt.Errorf("failed to list content hashes for full cleanup: %w", err) // Return error to log it at worker level
+		log.Printf("[CLEANUP] failed to list user-scoped objects for cleanup: %v", err)
+		return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
 	}
 
-	if len(candidates) == 0 {
-		log.Println("[CLEANUP] no objects to clean up")
-		return nil
+	if len(candidates) > 0 {
+		log.Printf("[CLEANUP] found %d user-scoped objects for S3 cleanup", len(candidates))
+		for _, candidate := range candidates {
+			address, err := w.db.GetPrimaryEmailForAccount(ctx, candidate.AccountID)
+			if err != nil {
+				log.Printf("[CLEANUP] failed to get primary address for account %d, skipping cleanup for hash %s: %v", candidate.AccountID, candidate.ContentHash, err)
+				continue
+			}
+
+			s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), candidate.ContentHash)
+			log.Printf("[CLEANUP] deleting user-scoped object: %s", s3Key)
+
+			cHash := candidate.ContentHash // Keep a local copy for logging
+			s3Err := w.s3.Delete(s3Key)
+
+			// Check if the error indicates the object was not found (HTTP 404)
+			isS3ObjectNotFoundError := false
+			var minioErr minio.ErrorResponse
+			if s3Err != nil && errors.As(s3Err, &minioErr) {
+				if minioErr.StatusCode == 404 {
+					isS3ObjectNotFoundError = true
+				}
+			}
+
+			// If S3 deletion failed AND it was NOT a 'not found' error, log and skip DB delete.
+			if s3Err != nil && !isS3ObjectNotFoundError {
+				log.Printf("[CLEANUP] failed to delete S3 object %s: %v", s3Key, s3Err)
+				continue // Skip to the next candidate
+			}
+
+			if isS3ObjectNotFoundError {
+				log.Printf("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", s3Key)
+			}
+
+			if err := w.db.DeleteExpungedMessagesByUserAndContentHash(ctx, candidate.AccountID, cHash); err != nil {
+				// Log the error but continue processing other candidates.
+				// The advisory lock is held, so we don't want to block. The next run will pick it up.
+				log.Printf("[CLEANUP] failed to delete DB message rows for account %d and hash %s: %v", candidate.AccountID, cHash, err)
+				continue
+			}
+
+			log.Printf("[CLEANUP] successfully cleaned up user-scoped resources for account %d and hash %s", candidate.AccountID, cHash)
+		}
+	} else {
+		log.Println("[CLEANUP] no user-scoped objects to clean up")
 	}
 
-	for _, cHash := range candidates {
-		log.Printf("[CLEANUP] deleting object: %s", cHash)
+	// --- Phase 2: Global resource cleanup (message_contents and cache) ---
+	orphanHashes, err := w.db.GetUnusedContentHashes(ctx, db.BATCH_PURGE_SIZE)
+	if err != nil {
+		log.Printf("[CLEANUP] failed to list unused content hashes for global cleanup: %v", err)
+		return fmt.Errorf("failed to list unused content hashes for global cleanup: %w", err)
+	}
 
-		s3Err := w.s3.Delete(cHash)
+	if len(orphanHashes) > 0 {
+		log.Printf("[CLEANUP] found %d orphaned content hashes for global cleanup", len(orphanHashes))
+		for _, cHash := range orphanHashes {
+			log.Printf("[CLEANUP] cleaning up global resources for hash %s", cHash)
 
-		// Check if the error indicates the object was not found (HTTP 404)
-		isS3ObjectNotFoundError := false
-		var minioErr minio.ErrorResponse
-		if s3Err != nil && errors.As(s3Err, &minioErr) {
-			if minioErr.StatusCode == 404 {
-				isS3ObjectNotFoundError = true
+			// Delete from message_contents table
+			if err := w.db.DeleteMessageContentByHash(ctx, cHash); err != nil {
+				log.Printf("[CLEANUP] failed to delete from message_contents for hash %s: %v", cHash, err)
+				// Continue to next hash, as this might be a transient error.
+				// The next cleanup run will pick it up again.
+				continue
+			}
+
+			// Delete from local cache
+			if err := w.cache.Delete(cHash); err != nil {
+				// This is not critical, as the cache has its own TTL and eviction policies.
+				log.Printf("[CLEANUP] failed to delete from cache for hash %s: %v", cHash, err)
 			}
 		}
-
-		// If S3 deletion failed AND it was NOT a 'not found' error, log and skip DB delete.
-		if s3Err != nil && !isS3ObjectNotFoundError {
-			log.Printf("[CLEANUP] failed to delete object %s: %v", cHash, s3Err)
-			continue // Skip to the next candidate
-		}
-
-		if isS3ObjectNotFoundError {
-			log.Printf("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", cHash)
-		}
-
-		if err := w.db.DeleteExpungedMessagesByContentHash(ctx, cHash); err != nil {
-			// Log the error but continue processing other candidates
-			// This is important to ensure that we don't stop the entire cleanup
-			// process if one deletion fails. We don't retry here as the
-			// advisory lock is already held and we don't want to block other
-			// cleanup processes. Next run will pick it up.
-			log.Printf("[CLEANUP] failed to delete DB rows for hash %s: %v", cHash, err)
-			continue
-		}
-
-		if err := w.cache.Delete(cHash); err != nil {
-			log.Printf("[CLEANUP] failed to delete from cache for hash %s: %v", cHash, err)
-			// Continue processing other candidates, cache will expire
-			// eventually if not deleted
-			continue
-		}
-
-		log.Printf("[CLEANUP] deleted hash %s", cHash)
+	} else {
+		log.Println("[CLEANUP] no orphaned content hashes to clean up")
 	}
 
 	return nil
