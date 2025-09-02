@@ -7,7 +7,7 @@ func (d *Database) FindExistingContentHashes(ctx context.Context, ids []string) 
 		return nil, nil
 	}
 
-	rows, err := d.Pool.Query(ctx, `SELECT content_hash FROM messages WHERE content_hash = ANY($1)`, ids)
+	rows, err := d.GetReadPool().Query(ctx, `SELECT content_hash FROM messages WHERE content_hash = ANY($1)`, ids)
 	if err != nil {
 		return nil, err
 	}

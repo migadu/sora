@@ -59,7 +59,7 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	}
 
 	// Begin transaction
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -128,7 +128,7 @@ func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest)
 
 	// Find the account ID by primary identity
 	var accountID int64
-	err = db.Pool.QueryRow(ctx,
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx,
 		"SELECT account_id FROM credentials WHERE address = $1 AND primary_identity = true",
 		normalizedPrimaryEmail).Scan(&accountID)
 	if err != nil {
@@ -155,7 +155,7 @@ func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest)
 	}
 
 	// Begin transaction
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -244,7 +244,7 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
-		tx, err := db.Pool.Begin(ctx)
+		tx, err := db.GetWritePool().Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
@@ -281,7 +281,7 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 		}
 	} else {
 		// Just update password without changing primary status
-		_, err = db.Pool.Exec(ctx,
+		_, err = db.GetWritePool().Exec(ctx,
 			"UPDATE credentials SET password = $1, updated_at = now() WHERE account_id = $2 AND address = $3",
 			hashedPassword, accountID, normalizedEmail)
 		if err != nil {
@@ -320,7 +320,7 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	}
 
 	// Get all credentials for this account
-	rows, err := db.Pool.Query(ctx,
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx,
 		"SELECT address, primary_identity, created_at, updated_at FROM credentials WHERE account_id = $1 ORDER BY primary_identity DESC, address ASC",
 		accountID)
 	if err != nil {

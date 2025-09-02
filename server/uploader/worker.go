@@ -12,6 +12,7 @@ import (
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/storage"
 )
 
@@ -130,71 +131,86 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 }
 
 func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) {
-	log.Printf("[UPLOADER] uploading hash %s", upload.ContentHash)
+	log.Printf("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
 
-	// Check if this content hash is already marked as uploaded by another worker
-	isUploaded, err := w.db.IsContentHashUploaded(ctx, upload.ContentHash)
+	// Get primary address to construct S3 path
+	address, err := w.db.GetPrimaryEmailForAccount(ctx, upload.AccountID)
 	if err != nil {
-		log.Printf("[UPLOADER] failed to check if content hash %s is already uploaded: %v", upload.ContentHash, err)
+		log.Printf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
+		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
+		return
+	}
+
+	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), upload.ContentHash)
+
+	filePath := w.FilePath(upload.ContentHash, upload.AccountID)
+
+	// Check if this content hash is already marked as uploaded by another worker for this user
+	isUploaded, err := w.db.IsContentHashUploaded(ctx, upload.ContentHash, upload.AccountID)
+	if err != nil {
+		log.Printf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
 		// Mark attempt and let it be retried
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash) // Log error if this fails too?
+		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID) // Log error if this fails too?
 		return
 	}
 
 	if isUploaded {
-		log.Printf("[UPLOADER] content hash %s already uploaded, skipping S3 upload", upload.ContentHash)
+		log.Printf("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
 		// Content is already in S3. Mark this specific message instance as uploaded
 		// and delete the pending upload record.
-		if err := w.db.CompleteS3Upload(ctx, upload.ContentHash); err != nil {
-			log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s: %v", upload.ContentHash, err)
+		if err := w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
 		} else {
-			log.Printf("[UPLOADER] upload completed (already uploaded hash) for hash %s", upload.ContentHash)
+			log.Printf("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
 		}
-		// Still remove the local file as it's no longer needed on this instance
-		filePath := w.FilePath(upload.ContentHash)
+		// The local file is unique to this upload task, so it can be safely removed.
 		if err := w.RemoveLocalFile(filePath); err != nil {
-			log.Printf("[UPLOADER] WARNING: uploaded but could not delete file %s: %v", filePath, err)
+			// Log is inside RemoveLocalFile
 		}
 		return // Done with this upload record
 	}
 
-	filePath := w.FilePath(upload.ContentHash)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash)
+		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
 		log.Printf("[UPLOADER] could not read file %s: %v", filePath, err)
 		return // Cannot proceed without the file
 	}
 
 	// Attempt to upload to S3. The storage layer should handle checking for existence.
-	err = w.s3.Put(upload.ContentHash, bytes.NewReader(data), upload.Size)
+	err = w.s3.Put(s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash)
-		log.Printf("[UPLOADER] upload failed for %s: %v", upload.ContentHash, err)
+		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
+		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
 		return
 	}
 
-	// Regardless of the size of the message, always move into cache message
+	// Move the uploaded file to the global cache. If the move fails (e.g., file
+	// already in cache from another user's upload), delete the local file.
 	if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
-		log.Printf("[UPLOADER] failed to move uploaded hash %s to cache: %v", upload.ContentHash, err)
+		log.Printf("[UPLOADER] failed to move uploaded hash %s to cache: %v. Deleting local file.", upload.ContentHash, err)
+		if removeErr := w.RemoveLocalFile(filePath); removeErr != nil {
+			// Log is inside RemoveLocalFile
+		}
 	} else {
 		log.Printf("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
 	}
 
-	err = w.db.CompleteS3Upload(ctx, upload.ContentHash)
+	err = w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
-		log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s: %v", upload.ContentHash, err)
+		log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
 	} else {
-		log.Printf("[UPLOADER] upload completed for hash %s", upload.ContentHash)
+		log.Printf("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
 	}
 }
 
-func (w *UploadWorker) FilePath(contentHash string) string {
-	return filepath.Join(w.path, contentHash)
+func (w *UploadWorker) FilePath(contentHash string, accountID int64) string {
+	// Scope the local file by account ID to prevent conflicts and simplify cleanup.
+	return filepath.Join(w.path, fmt.Sprintf("%d", accountID), contentHash)
 }
 
-func (w *UploadWorker) StoreLocally(contentHash string, data []byte) (*string, error) {
-	path := w.FilePath(contentHash)
+func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {
+	path := w.FilePath(contentHash, accountID)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", filepath.Dir(path), err)
 	}
@@ -228,13 +244,4 @@ func removeEmptyParents(path, stopAt string) {
 		}
 		path = parent
 	}
-}
-
-func (w *UploadWorker) GetLocalFile(contentHash string) ([]byte, error) {
-	path := w.FilePath(contentHash)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read message %s from disk: %v", path, err)
-	}
-	return data, nil
 }

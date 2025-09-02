@@ -4,8 +4,13 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS accounts (
 	id BIGSERIAL PRIMARY KEY,
+	last_server_addr VARCHAR(255),
+	last_server_time TIMESTAMP,
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL
 );
+
+-- Create index for better performance
+CREATE INDEX IF NOT EXISTS idx_accounts_last_server ON accounts(last_server_addr);
 
 -- A table to store account passwords and identities
 CREATE TABLE IF NOT EXISTS credentials (
@@ -159,13 +164,15 @@ CREATE INDEX IF NOT EXISTS idx_message_contents_headers_tsv ON message_contents 
 -- Pending uploads table for processing messages at own pace
 CREATE TABLE IF NOT EXISTS pending_uploads (
 	id BIGSERIAL PRIMARY KEY,
+	account_id BIGINT REFERENCES accounts(id) ON DELETE CASCADE,
 	instance_id TEXT NOT NULL, -- Unique identifier for the instance processing the upload, e.g., hostname
 	content_hash VARCHAR(64) NOT NULL,	
 	attempts INTEGER DEFAULT 0,
 	last_attempt TIMESTAMPTZ,
 	size INTEGER NOT NULL,
 	created_at TIMESTAMPTZ DEFAULT now(),
-	updated_at TIMESTAMPTZ DEFAULT now()
+	updated_at TIMESTAMPTZ DEFAULT now(),
+	UNIQUE (content_hash, account_id)
 );
 
 -- Index for retry loop: ordered by creation time
@@ -180,8 +187,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_uploads_attempts ON pending_uploads (atte
 -- Index to quickly check retries by file age
 CREATE INDEX IF NOT EXISTS idx_pending_uploads_last_attempt ON pending_uploads (last_attempt);
 
--- Index on content_hash to speed up deduplication checks
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_uploads_content_hash ON pending_uploads (content_hash);
+-- Index on content_hash to speed up lookups for file deletion checks
+CREATE INDEX IF NOT EXISTS idx_pending_uploads_content_hash ON pending_uploads (content_hash);
 
 --
 -- SIEVE scripts
@@ -220,9 +227,84 @@ CREATE INDEX IF NOT EXISTS idx_vacation_responses_account_sender ON vacation_res
 -- Index for cleanup of old responses
 CREATE INDEX IF NOT EXISTS idx_vacation_responses_response_date ON vacation_responses (response_date);
 
+-- Authentication rate limiting tracking table
+CREATE TABLE IF NOT EXISTS auth_attempts (
+	id BIGSERIAL PRIMARY KEY,
+	ip_address INET NOT NULL,
+	username TEXT,
+	protocol TEXT NOT NULL,
+	success BOOLEAN NOT NULL,
+	attempted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes for efficient rate limiting queries
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip_time ON auth_attempts (ip_address, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_username_time ON auth_attempts (username, attempted_at) WHERE username IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_cleanup ON auth_attempts (attempted_at);
+
+-- Partial indexes for failed attempts only (most common rate limiting case)
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip_failed ON auth_attempts (ip_address, attempted_at) WHERE success = false;
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_username_failed ON auth_attempts (username, attempted_at) WHERE success = false AND username IS NOT NULL;
+
 -- Table-based locks for coordinating background workers
 CREATE TABLE IF NOT EXISTS locks (
 	lock_name TEXT PRIMARY KEY,
 	acquired_at TIMESTAMPTZ NOT NULL,
 	expires_at TIMESTAMPTZ NOT NULL
 );
+
+-- Table for tracking active proxy connections
+CREATE TABLE IF NOT EXISTS active_connections (
+    id BIGSERIAL PRIMARY KEY,
+    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	instance_id VARCHAR(255) NOT NULL,
+    protocol VARCHAR(20) NOT NULL,
+    client_addr VARCHAR(255) NOT NULL,
+    server_addr VARCHAR(255) NOT NULL,
+    connected_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    last_activity TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    should_terminate BOOLEAN DEFAULT false,
+    UNIQUE(account_id, protocol, client_addr)
+);
+
+-- It's a good idea to add an index for faster cleanup on startup.
+CREATE INDEX IF NOT EXISTS idx_active_connections_instance_id ON active_connections(instance_id);
+
+-- Index for faster lookups by account_id
+CREATE INDEX IF NOT EXISTS idx_active_connections_account_id ON active_connections (account_id);
+
+-- Index for faster lookups by server_addr
+CREATE INDEX IF NOT EXISTS idx_active_connections_server_addr ON active_connections (server_addr);
+
+-- Index for cleanup of stale connections
+CREATE INDEX IF NOT EXISTS idx_active_connections_last_activity ON active_connections (last_activity);
+
+-- Index for protocol-based queries
+CREATE INDEX IF NOT EXISTS idx_active_connections_protocol ON active_connections (protocol);
+
+-- Health status tracking for system components
+CREATE TABLE IF NOT EXISTS health_status (
+    component_name VARCHAR(255) NOT NULL,
+    server_hostname VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL CHECK (status IN ('healthy', 'degraded', 'unhealthy', 'unreachable')),
+    last_check TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    last_error TEXT,
+    check_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    metadata JSONB,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    PRIMARY KEY (component_name, server_hostname)
+);
+
+-- Index for faster health status lookups by server
+CREATE INDEX IF NOT EXISTS idx_health_status_server ON health_status (server_hostname);
+
+-- Index for faster health status lookups by status
+CREATE INDEX IF NOT EXISTS idx_health_status_status ON health_status (status);
+
+-- Index for faster health status cleanup by updated_at
+CREATE INDEX IF NOT EXISTS idx_health_status_updated_at ON health_status (updated_at);
+
+-- Index for faster health status lookups by component and server
+CREATE INDEX IF NOT EXISTS idx_health_status_component_server ON health_status (component_name, server_hostname);

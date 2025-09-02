@@ -14,7 +14,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 		return 0, nil
 	}
 
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction for ExpungeMessageUIDs: %w", err)
 	}
@@ -41,7 +41,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 		return 0, err
 	}
 
-	log.Printf("[DB] successfully expunged %d messages from mailbox %d", rowsAffected, mailboxID)
+	log.Printf("[DB] successfully expunged %d messages from mailbox %d, current modseq: %d", rowsAffected, mailboxID, currentModSeq)
 
 	// Double-check that the messages were actually expunged within the transaction
 	var count int
@@ -61,8 +61,10 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		log.Printf("[DB] FAILED to commit expunge transaction for mailbox %d: %v", mailboxID, err)
 		return 0, fmt.Errorf("failed to commit transaction for ExpungeMessageUIDs: %w", err)
 	}
 
+	log.Printf("[DB] transaction committed successfully for expunge of %d messages from mailbox %d", rowsAffected, mailboxID)
 	return currentModSeq, nil
 }

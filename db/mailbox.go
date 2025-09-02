@@ -59,7 +59,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 	}
 
 	// Prepare the query to fetch all mailboxes for the given user
-	rows, err := db.Pool.Query(ctx, query, userID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +101,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 	var path string
 	var createdAt, updatedAt time.Time
 
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT 
 			id, name, uid_validity, path, subscribed,
 			EXISTS (
@@ -130,7 +130,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 	var mailbox DBMailbox
 
 	var uidValidityInt64 int64
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT
 			id, name, uid_validity, path, subscribed,
 			EXISTS (SELECT 1 FROM mailboxes AS child WHERE child.path LIKE m.path || '%' AND child.path != m.path) AS has_children,
@@ -159,7 +159,7 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 	}
 	
 	// Start a transaction
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -236,7 +236,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 	}
 	
 	// Start a transaction
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -323,7 +323,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrMailboxNotFound
 	}
 
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
 		return consts.ErrInternalError
@@ -442,7 +442,7 @@ type MailboxSummary struct {
 }
 
 func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*MailboxSummary, error) {
-	tx, err := d.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := d.GetReadPoolWithContext(ctx).BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -528,7 +528,7 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailboxID int64) (int, int64, error) {
 	var count int
 	var size int64
-	err := d.Pool.QueryRow(ctx, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL", mailboxID).Scan(&count, &size)
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL", mailboxID).Scan(&count, &size)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -553,7 +553,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 		}
 	}
 
-	_, err = db.Pool.Exec(ctx, `
+	_, err = db.GetWritePool().Exec(ctx, `
 		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2
 	`, subscribed, mailboxID)
 	if err != nil {
@@ -574,7 +574,7 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrMailboxInvalidName
 	}
 
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to begin transaction for rename: %v", err)
 		return consts.ErrDBBeginTransactionFailed

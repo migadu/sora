@@ -11,7 +11,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 
 	// First, check if there are any messages in the mailbox at all (including expunged)
 	var totalCount, expungedCount int
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT 
 			COUNT(*) as total_count,
 			COUNT(*) FILTER (WHERE expunged_at IS NOT NULL) as expunged_count
@@ -46,7 +46,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 		FROM numbered_messages
 		ORDER BY uid` // Ordering by uid is fine, seqnum is derived based on id order
 
-	rows, err := db.Pool.Query(ctx, query, mailboxID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages: %v", err)
 	}

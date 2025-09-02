@@ -23,6 +23,23 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// callback `username`: authentication-identity (user whose credentials are provided)
 			// callback `password`: password for authentication-identity
 
+			// Check authentication rate limiting before attempting any authentication
+			if s.server.authLimiter != nil {
+				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+				targetUser := username
+				if identity != "" {
+					targetUser = identity // Use authorization identity if provided
+				}
+				if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, targetUser); err != nil {
+					s.Log("[SASL PLAIN] rate limited: %v", err)
+					return &imap.Error{
+						Type: imap.StatusResponseTypeNo,
+						Code: imap.ResponseCodeAuthenticationFailed,
+						Text: "Too many authentication attempts. Please try again later.",
+					}
+				}
+			}
+
 			s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", identity, username)
 
 			// 1. Check for Master SASL Authentication

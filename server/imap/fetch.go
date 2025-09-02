@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/textproto"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 
 	tp "net/textproto"
 )
@@ -62,22 +64,22 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	selectedMailboxID = s.selectedMailbox.ID
 	sessionTrackerSnapshot = s.sessionTracker
-	
+
 	// Capture modseq before unlocking
 	modSeqSnapshot := s.currentHighestModSeq.Load()
-	
+
 	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	s.mutex.RUnlock()
-	
+
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
-	
+
 	// Check if mailbox changed during our operation
 	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.Log("[FETCH] WARNING: Mailbox changed during FETCH operation (modseq %d -> %d)", 
+		s.Log("[FETCH] WARNING: Mailbox changed during FETCH operation (modseq %d -> %d)",
 			modSeqSnapshot, s.currentHighestModSeq.Load())
 		// For sequence sets, this could mean we fetched wrong messages
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
@@ -89,13 +91,13 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			}
 		}
 	}
-	
+
 	if len(messages) == 0 {
 		return nil
 	}
 
-	// Always enable CONDSTORE functionality when ChangedSince option is provided
-	if options.ChangedSince > 0 {
+	// CONDSTORE functionality - only process if capability is enabled
+	if s.server.caps.Has(imap.CapCondStore) && options.ChangedSince > 0 {
 		s.Log("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
 		var filteredMessages []db.Message
 
@@ -224,7 +226,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 
-	if options.ModSeq {
+	if s.server.caps.Has(imap.CapCondStore) && options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
 
@@ -471,7 +473,14 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3
 		s.Log("[FETCH] cache miss fetching UID %d from S3 (%s)", msg.UID, msg.ContentHash)
-		reader, err := s.server.s3.Get(msg.ContentHash)
+		address, err := s.server.db.GetPrimaryEmailForAccount(s.ctx, msg.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.UserID, err)
+		}
+
+		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
+
+		reader, err := s.server.s3.Get(s3Key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve message UID %d from S3: %v", msg.UID, err)
 		}
@@ -486,7 +495,8 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 
 	// If not uploaded to S3, fetch from local disk
 	s.Log("[FETCH] fetching not yet uploaded message UID %d from disk", msg.UID)
-	data, err := s.server.uploader.GetLocalFile(msg.ContentHash)
+	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.UserID)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve message UID %d from disk: %v", msg.UID, err)
 	}

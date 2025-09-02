@@ -13,6 +13,7 @@ import (
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
+	"github.com/emersion/go-sasl"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -81,6 +82,8 @@ type LMTPSession struct {
 	ctx         context.Context
 	mutex       sync.RWMutex
 	mutexHelper *server.MutexTimeoutHelper
+	releaseConn func() // Function to release connection from limiter
+	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
 }
 
 func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
@@ -108,7 +111,6 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	s.sender = &fromAddress
-	s.mutex.Unlock()
 
 	s.Log("mail from=%s accepted", fromAddress.FullAddress())
 	return nil
@@ -134,7 +136,13 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	s.Log("looking up user ID for address: %s", lookupAddress)
-	userId, err := s.backend.db.GetAccountIDByAddress(s.ctx, lookupAddress)
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	userId, err := s.backend.db.GetAccountIDByAddress(readCtx, lookupAddress)
 	if err != nil {
 		s.Log("failed to get user ID by address: %v", err)
 		return &smtp.SMTPError{
@@ -158,13 +166,15 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	// Use the original address (with detail part) for the User object
 	s.User = server.NewUser(toAddress, userId)
-	s.mutex.Unlock()
 
+	// This is a potential write operation, so it must use the main context.
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
 	err = s.backend.db.CreateDefaultMailboxes(s.ctx, userId)
 	if err != nil {
 		return s.InternalError("failed to create default mailboxes: %v", err)
 	}
+	// Pin the session to the master DB to prevent reading stale data from a replica.
+	s.useMasterDB = true
 
 	s.Log("recipient accepted: %s (UserID: %d)", fullAddress, userId)
 	return nil
@@ -200,6 +210,41 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to read message: %v", err)
 	}
 	s.Log("message data read successfully (%d bytes)", buf.Len())
+
+	// Check if we should use affinity-based routing
+	if s.backend.enableAffinityRoute && s.backend.connManager != nil && s.User != nil {
+		// Check user's server affinity
+		// Create a context for read operations that respects session pinning
+		readCtx := s.ctx
+		if s.useMasterDB {
+			readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		}
+
+		lastServerAddr, lastServerTime, err := s.backend.db.GetLastServerAddress(readCtx, s.UserID())
+		if err == nil && lastServerAddr != "" {
+			// Calculate time since last connection
+			timeSinceLastConnection := time.Since(lastServerTime)
+			if timeSinceLastConnection < s.backend.affinityValidity {
+				s.Log("[AFFINITY] User has recent connection to server %s (%v ago), attempting remote delivery",
+					lastServerAddr, timeSinceLastConnection)
+
+				// Try to deliver to the affinity server
+				err = s.deliverToRemoteServer(lastServerAddr, buf.Bytes())
+				if err == nil {
+					s.Log("[AFFINITY] Successfully delivered message to affinity server %s", lastServerAddr)
+					return nil
+				}
+				s.Log("[AFFINITY] Failed to deliver to affinity server %s: %v, falling back to local delivery", lastServerAddr, err)
+			} else {
+				s.Log("[AFFINITY] User's last connection to %s is too old (%v ago), using local delivery",
+					lastServerAddr, timeSinceLastConnection)
+			}
+		} else if err != nil && err.Error() != "no server affinity found" {
+			s.Log("[AFFINITY] Error checking server affinity: %v", err)
+		} else {
+			s.Log("[AFFINITY] No server affinity found for user, using local delivery")
+		}
+	}
 
 	// Use the full message bytes as received for hashing, size, and header extraction.
 	fullMessageBytes := buf.Bytes()
@@ -248,7 +293,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	filePath, err := s.backend.uploader.StoreLocally(contentHash, fullMessageBytes)
+	filePath, err := s.backend.uploader.StoreLocally(contentHash, s.UserID(), fullMessageBytes)
 	if err != nil {
 		return s.InternalError("failed to save message to disk: %v", err)
 	}
@@ -256,7 +301,13 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// SIEVE script processing
 
-	activeScript, err := s.backend.db.GetActiveScript(s.ctx, s.UserID())
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	activeScript, err := s.backend.db.GetActiveScript(readCtx, s.UserID())
 	var result sieveengine.Result
 	var mailboxName string
 
@@ -276,14 +327,8 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Always run the default script first as a "before script"
-	// The default script typically doesn't involve user-specific vacation persistence,
-	// so we can pass a nil oracle. The SievePolicy will handle this gracefully.
-	defaultSieveExecutor, defaultScriptErr := sieveengine.NewSieveExecutorWithOracle(defaultSieveScript, s.UserID(), nil)
-	if defaultScriptErr != nil {
-		s.Log("[SIEVE] WARNING: failed to create default sieve executor: %v", defaultScriptErr)
-		// If we can't create a default sieve executor, use a simple keep action
-		result = sieveengine.Result{Action: sieveengine.ActionKeep}
-	} else {
+	// Use the pre-parsed default executor from the backend
+	if s.backend.defaultSieveExecutor != nil {
 		// SIEVE debugging information
 		if s.backend.debug {
 			s.Log("[SIEVE] message headers for evaluation:")
@@ -294,7 +339,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			}
 		}
 
-		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
+		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
 		if defaultEvalErr != nil {
 			s.Log("[SIEVE] WARNING: default script evaluation error: %v", defaultEvalErr)
 			// fallback: default to INBOX
@@ -318,14 +363,24 @@ func (s *LMTPSession) Data(r io.Reader) error {
 				s.Log("[SIEVE] default keep (deliver to INBOX)")
 			}
 		}
+	} else {
+		s.Log("[SIEVE] WARNING: no default sieve executor available")
+		result = sieveengine.Result{Action: sieveengine.ActionKeep}
 	}
 
 	// If user has an active script, run it and let it override the resultAction
 	if err == nil && activeScript != nil {
-		s.Log("[SIEVE] using user's active script: %s", activeScript.Name)
-		userSieveExecutor, userScriptErr := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, s.UserID(), sieveVacOracle)
+		s.Log("[SIEVE] using user's active script: %s (ID: %d, updated: %s)", activeScript.Name, activeScript.ID, activeScript.UpdatedAt.Format(time.RFC3339))
+		// Try to get the user script from cache or create and cache it with metadata validation
+		userSieveExecutor, userScriptErr := s.backend.sieveCache.GetOrCreateWithMetadata(
+			activeScript.Script,
+			activeScript.ID,
+			activeScript.UpdatedAt,
+			s.UserID(),
+			sieveVacOracle,
+		)
 		if userScriptErr != nil {
-			s.Log("[SIEVE] WARNING: failed to create sieve executor from user script: %v", userScriptErr)
+			s.Log("[SIEVE] WARNING: failed to get/create sieve executor from user script: %v", userScriptErr)
 			// Keep the result from the default script
 		} else {
 			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)
@@ -373,7 +428,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.Log("[SIEVE] fileinto :copy action - delivering message to mailbox: %s and INBOX", mailboxName)
 
 			// First save to the specified mailbox
-			err := s.saveMessageToMailbox(mailboxName, messageContent, fullMessageBytes, contentHash,
+			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 			if err != nil {
 				return s.InternalError("failed to save message to specified mailbox: %v", err)
@@ -383,7 +438,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.Log("[SIEVE] saving copy to INBOX due to :copy modifier")
 
 			// Call saveMessageToMailbox again for INBOX
-			err = s.saveMessageToMailbox(consts.MailboxInbox, messageContent, fullMessageBytes, contentHash,
+			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 			if err != nil {
 				return s.InternalError("failed to save message copy to INBOX: %v", err)
@@ -445,7 +500,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Save the message to the determined mailbox (either the specified one or INBOX)
-	err = s.saveMessageToMailbox(mailboxName, messageContent, fullMessageBytes, contentHash,
+	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
 		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 	if err != nil {
 		_ = os.Remove(*filePath) // cleanup file on failure
@@ -475,7 +530,6 @@ func (s *LMTPSession) Reset() {
 
 	s.User = nil
 	s.sender = nil
-	s.mutex.Unlock()
 
 	s.Log("session reset")
 }
@@ -496,7 +550,12 @@ func (s *LMTPSession) Logout() error {
 		// Continue with logout even if we can't get the lock
 	} else {
 		// Clean up any session state if needed
-		s.mutex.Unlock()
+	}
+
+	// Release connection from limiter
+	if s.releaseConn != nil {
+		s.releaseConn()
+		s.releaseConn = nil
 	}
 
 	totalCount := s.backend.totalConnections.Add(-1)
@@ -616,17 +675,97 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	return nil
 }
 
+// deliverToRemoteServer delivers a message to a remote LMTP server
+func (s *LMTPSession) deliverToRemoteServer(serverAddr string, messageBytes []byte) error {
+	// Try to connect to the specific server
+	conn, err := s.backend.connManager.ConnectToSpecific(serverAddr)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server %s: %w", serverAddr, err)
+	}
+	defer conn.Close()
+
+	// Create SMTP client
+	c := smtp.NewClient(conn)
+	defer c.Close()
+
+	// Send greeting
+	if err := c.Hello(s.backend.hostname); err != nil {
+		return fmt.Errorf("HELO/EHLO failed: %w", err)
+	}
+
+	// Check if remote server supports LMTP
+	if ok, _ := c.Extension("LMTP"); !ok {
+		s.Log("[REMOTE] Remote server does not advertise LMTP extension")
+		// Continue anyway as some servers don't advertise but still support LMTP
+	}
+
+	// Authenticate if credentials are provided
+	if s.backend.remoteLMTPUsername != "" && s.backend.remoteLMTPPassword != "" {
+		if ok, _ := c.Extension("AUTH"); ok {
+			// Use SASL PLAIN authentication
+			auth := sasl.NewPlainClient("", s.backend.remoteLMTPUsername, s.backend.remoteLMTPPassword)
+			if err := c.Auth(auth); err != nil {
+				return fmt.Errorf("LMTP authentication failed: %w", err)
+			}
+			s.Log("[REMOTE] Successfully authenticated to remote LMTP server")
+		} else {
+			s.Log("[REMOTE] Remote server does not support AUTH")
+		}
+	}
+
+	// Send MAIL FROM
+	if err := c.Mail(s.sender.FullAddress(), nil); err != nil {
+		return fmt.Errorf("MAIL FROM failed: %w", err)
+	}
+
+	// Send RCPT TO
+	if err := c.Rcpt(s.User.Address.FullAddress(), nil); err != nil {
+		return fmt.Errorf("RCPT TO failed: %w", err)
+	}
+
+	// Send DATA
+	wc, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("DATA command failed: %w", err)
+	}
+
+	_, err = wc.Write(messageBytes)
+	if err != nil {
+		wc.Close()
+		return fmt.Errorf("failed to write message data: %w", err)
+	}
+
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("failed to close data writer: %w", err)
+	}
+
+	// Send QUIT
+	if err := c.Quit(); err != nil {
+		s.Log("[REMOTE] Warning: QUIT command failed: %v", err)
+		// Don't fail the delivery if QUIT fails
+	}
+
+	s.Log("[REMOTE] Successfully delivered message to remote LMTP server %s", serverAddr)
+	return nil
+}
+
 // saveMessageToMailbox saves a message to the specified mailbox
-func (s *LMTPSession) saveMessageToMailbox(mailboxName string, messageContent *message.Entity,
+func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, bodyStructure *imap.BodyStructure,
 	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string) error {
 
-	mailbox, err := s.backend.db.GetMailboxByName(s.ctx, s.UserID(), mailboxName)
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	mailbox, err := s.backend.db.GetMailboxByName(readCtx, s.UserID(), mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("WARNING: mailbox '%s' not found, falling back to INBOX", mailboxName)
-			mailbox, err = s.backend.db.GetMailboxByName(s.ctx, s.UserID(), consts.MailboxInbox)
+			mailbox, err = s.backend.db.GetMailboxByName(readCtx, s.UserID(), consts.MailboxInbox)
 			if err != nil {
 				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
 			}
@@ -659,6 +798,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string, messageContent *m
 			ContentHash: contentHash,
 			InstanceID:  s.backend.hostname,
 			Size:        size,
+			AccountID:   s.UserID(),
 		})
 
 	if err != nil {
@@ -668,6 +808,9 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string, messageContent *m
 		}
 		return fmt.Errorf("failed to save message: %v", err)
 	}
+
+	// Pin this session to the master DB to ensure read-your-writes consistency
+	s.useMasterDB = true
 
 	s.backend.uploader.NotifyUploadQueued()
 	s.Log("message saved with UID %d in mailbox '%s'", messageUID, mailbox.Name)

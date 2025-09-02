@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -25,8 +26,14 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.mutex.RUnlock()
 	cancel()
 
+	// Create a context that signals to use the master DB if the session is pinned.
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
 	// Phase 2: Database operations outside lock
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
+	mailbox, err := s.server.db.GetMailboxByName(readCtx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[SELECT] mailbox '%s' does not exist for user %d", mboxName, s.UserID())
@@ -40,7 +47,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to fetch mailbox '%s' for user %d: %v", mboxName, s.UserID(), err)
 	}
 
-	currentSummary, err := s.server.db.GetMailboxSummary(s.ctx, mailbox.ID)
+	currentSummary, err := s.server.db.GetMailboxSummary(readCtx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
 	}
@@ -76,8 +83,8 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	if isReselectOfPrevious {
 		s.Log("[SELECT] mailbox %s reselected", mboxName)
 		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
-		// Count messages with UID > uidToCompareAgainst.
-		count, dbErr := s.server.db.CountMessagesGreaterThanUID(s.ctx, mailbox.ID, uidToCompareAgainst)
+		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
+		count, dbErr := s.server.db.CountMessagesGreaterThanUID(readCtx, mailbox.ID, uidToCompareAgainst)
 		if dbErr != nil {
 			s.Log("[SELECT] Error counting messages greater than UID %d for mailbox %d: %v. Defaulting RECENT to total.", uidToCompareAgainst, mailbox.ID, dbErr)
 			numRecent = uint32(currentSummary.NumMessages) // Fallback
@@ -139,15 +146,19 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
-		Flags: getDisplayFlags(s.ctx, s.server.db, mailbox),
+		Flags: getDisplayFlags(readCtx, s.server.db, mailbox),
 		// Flags that can be changed, including \* for custom
 		PermanentFlags:    getPermanentFlags(),
 		NumMessages:       s.currentNumMessages.Load(),
 		UIDNext:           imap.UID(currentSummary.UIDNext),
 		UIDValidity:       s.selectedMailbox.UIDValidity,
 		NumRecent:         numRecent,
-		HighestModSeq:     s.currentHighestModSeq.Load(),
 		FirstUnseenSeqNum: s.firstUnseenSeqNum.Load(),
+	}
+
+	// Only include HighestModSeq if CONDSTORE capability is enabled
+	if s.server.caps.Has(imap.CapCondStore) {
+		selectData.HighestModSeq = s.currentHighestModSeq.Load()
 	}
 
 	return selectData, nil

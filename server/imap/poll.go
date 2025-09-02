@@ -1,8 +1,11 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -28,7 +31,13 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	s.mutex.RUnlock()
 	cancel()
 
-	poll, err := s.server.db.PollMailbox(s.ctx, mailboxID, highestModSeqToPollFrom)
+	// Create a context that signals to use the master DB if the session is pinned.
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	poll, err := s.server.db.PollMailbox(readCtx, mailboxID, highestModSeqToPollFrom)
 	if err != nil {
 		return s.internalError("failed to poll mailbox: %v", err)
 	}

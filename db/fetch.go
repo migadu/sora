@@ -19,7 +19,7 @@ import (
 // can be used for IMAP BODY[TEXT] requests.
 func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
 	var textBody sql.NullString // Use sql.NullString to handle case where LEFT JOIN finds no match
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT mc.text_body 
 		FROM messages m
 		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
@@ -56,7 +56,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 	var recipientsJSON []byte
 	var internalMessageDBId int64
 
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
         SELECT 
             id, internal_date, subject, in_reply_to, message_id, recipients_json 
         FROM 

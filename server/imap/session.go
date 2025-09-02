@@ -22,6 +22,7 @@ type IMAPSession struct {
 	cancel      context.CancelFunc
 	mutex       sync.RWMutex
 	mutexHelper *server.MutexTimeoutHelper
+	releaseConn func() // Function to release connection from limiter
 
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
@@ -34,6 +35,7 @@ type IMAPSession struct {
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
+	useMasterDB           bool // Pin session to master DB after a write to ensure consistency
 }
 
 func (s *IMAPSession) Context() context.Context {
@@ -57,6 +59,12 @@ func (s *IMAPSession) Close() error {
 	// to protect modifications to IMAPSession fields and embedded Session fields.
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	// Release connection from limiter
+	if s.releaseConn != nil {
+		s.releaseConn()
+		s.releaseConn = nil
+	}
 
 	totalCount := s.server.totalConnections.Add(-1)
 	var authCount int64 = 0

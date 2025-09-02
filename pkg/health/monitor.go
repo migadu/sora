@@ -1,0 +1,347 @@
+package health
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/migadu/sora/pkg/circuitbreaker"
+)
+
+type ComponentStatus string
+
+const (
+	StatusHealthy     ComponentStatus = "healthy"
+	StatusDegraded    ComponentStatus = "degraded"
+	StatusUnhealthy   ComponentStatus = "unhealthy"
+	StatusUnreachable ComponentStatus = "unreachable"
+)
+
+type HealthCheck struct {
+	Name     string
+	Check    func(ctx context.Context) error
+	Interval time.Duration
+	Timeout  time.Duration
+	Critical bool // If true, failure affects overall system health
+	Enabled  bool
+
+	// Fields below are protected by mu
+	mu         sync.RWMutex
+	LastCheck  time.Time
+	LastError  error
+	Status     ComponentStatus
+	CheckCount int
+	FailCount  int
+}
+
+type HealthMonitor struct {
+	checks          map[string]*HealthCheck
+	mu              sync.RWMutex
+	overallStatus   ComponentStatus
+	ctx             context.Context
+	cancel          context.CancelFunc
+	statusCallbacks []func(name string, status ComponentStatus)
+}
+
+func NewHealthMonitor() *HealthMonitor {
+	return &HealthMonitor{
+		checks:          make(map[string]*HealthCheck),
+		overallStatus:   StatusHealthy,
+		statusCallbacks: make([]func(string, ComponentStatus), 0),
+	}
+}
+
+func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
+	if check.Interval == 0 {
+		check.Interval = 30 * time.Second
+	}
+	if check.Timeout == 0 {
+		check.Timeout = 10 * time.Second
+	}
+	check.Status = StatusHealthy
+	check.Enabled = true
+
+	hm.mu.Lock()
+	hm.checks[check.Name] = check
+	hm.mu.Unlock()
+}
+
+func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status ComponentStatus)) {
+	hm.mu.Lock()
+	hm.statusCallbacks = append(hm.statusCallbacks, callback)
+	hm.mu.Unlock()
+}
+
+func (hm *HealthMonitor) Start(ctx context.Context) {
+	hm.ctx, hm.cancel = context.WithCancel(ctx)
+
+	hm.mu.RLock()
+	for _, check := range hm.checks {
+		if check.Enabled {
+			go hm.runHealthCheck(check)
+		}
+	}
+	hm.mu.RUnlock()
+}
+
+func (hm *HealthMonitor) Stop() {
+	if hm.cancel != nil {
+		hm.cancel()
+	}
+}
+
+func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
+	ticker := time.NewTicker(check.Interval)
+	defer ticker.Stop()
+
+	hm.performCheck(check)
+
+	for {
+		select {
+		case <-hm.ctx.Done():
+			return
+		case <-ticker.C:
+			hm.performCheck(check)
+		}
+	}
+}
+
+func (hm *HealthMonitor) performCheck(check *HealthCheck) {
+	// Recover from panics within a health check to prevent the monitor goroutine from crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			// A panic is a critical failure, so we mark the component as unhealthy.
+			err := fmt.Errorf("panic: %v", r)
+			log.Printf("PANIC during health check for component '%s': %v", check.Name, err)
+
+			check.mu.Lock()
+			check.Status = StatusUnhealthy
+			check.LastError = err
+			check.mu.Unlock()
+
+			hm.notifyStatusChange(check.Name, StatusUnhealthy)
+			hm.updateOverallStatus()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(hm.ctx, check.Timeout)
+	defer cancel()
+
+	// Perform the actual check first (no lock needed)
+	err := check.Check(ctx)
+
+	// Now update the check state with proper locking
+	check.mu.Lock()
+	check.CheckCount++
+	check.LastCheck = time.Now()
+	previousStatus := check.Status
+	isFirstCheck := check.CheckCount == 1
+
+	if err != nil {
+		check.FailCount++
+		check.LastError = err
+
+		failureRate := float64(check.FailCount) / float64(check.CheckCount)
+
+		// If failure rate is high, mark as unhealthy. Otherwise, a single
+		// failure will result in a 'degraded' state.
+		if failureRate >= 0.5 {
+			check.Status = StatusUnhealthy
+		} else {
+			check.Status = StatusDegraded
+		}
+
+		log.Printf("Health check '%s' failed: %v (status: %s, failure rate: %.2f)",
+			check.Name, err, check.Status, failureRate)
+	} else {
+		check.LastError = nil
+		// A successful check transitions the state back to healthy.
+		check.Status = StatusHealthy
+	}
+
+	currentStatus := check.Status
+	check.mu.Unlock()
+
+	if previousStatus != currentStatus || isFirstCheck {
+		if isFirstCheck {
+			log.Printf("Health check '%s' initialized with status: %s", check.Name, currentStatus)
+		} else {
+			log.Printf("Health check '%s' status changed: %s -> %s", check.Name, previousStatus, currentStatus)
+		}
+		hm.notifyStatusChange(check.Name, currentStatus)
+	}
+
+	hm.updateOverallStatus()
+}
+
+func (hm *HealthMonitor) notifyStatusChange(name string, status ComponentStatus) {
+	hm.mu.RLock()
+	callbacks := make([]func(string, ComponentStatus), len(hm.statusCallbacks))
+	copy(callbacks, hm.statusCallbacks)
+	hm.mu.RUnlock()
+
+	for _, callback := range callbacks {
+		go callback(name, status)
+	}
+}
+
+func (hm *HealthMonitor) updateOverallStatus() {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+
+	var criticalUnhealthy, criticalDegraded bool
+	var anyDegraded bool
+
+	for _, check := range hm.checks {
+		check.mu.RLock()
+		status := check.Status
+		critical := check.Critical
+		check.mu.RUnlock()
+
+		if critical {
+			switch status {
+			case StatusUnhealthy, StatusUnreachable:
+				criticalUnhealthy = true
+			case StatusDegraded:
+				criticalDegraded = true
+			}
+		}
+
+		if status == StatusDegraded {
+			anyDegraded = true
+		}
+	}
+
+	previousStatus := hm.overallStatus
+
+	switch {
+	case criticalUnhealthy:
+		hm.overallStatus = StatusUnhealthy
+	case criticalDegraded || anyDegraded:
+		hm.overallStatus = StatusDegraded
+	default:
+		hm.overallStatus = StatusHealthy
+	}
+
+	if previousStatus != hm.overallStatus {
+		log.Printf("Overall system health status changed: %s -> %s",
+			previousStatus, hm.overallStatus)
+	}
+}
+
+func (hm *HealthMonitor) GetOverallStatus() ComponentStatus {
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+	return hm.overallStatus
+}
+
+func (hm *HealthMonitor) GetCheckStatus(name string) (ComponentStatus, bool) {
+	hm.mu.RLock()
+	check, exists := hm.checks[name]
+	hm.mu.RUnlock()
+
+	if !exists {
+		return StatusUnreachable, false
+	}
+
+	check.mu.RLock()
+	status := check.Status
+	check.mu.RUnlock()
+
+	return status, true
+}
+
+func (hm *HealthMonitor) GetAllStatuses() map[string]ComponentStatus {
+	hm.mu.RLock()
+	checks := make(map[string]*HealthCheck)
+	for name, check := range hm.checks {
+		checks[name] = check
+	}
+	hm.mu.RUnlock()
+
+	statuses := make(map[string]ComponentStatus)
+	for name, check := range checks {
+		check.mu.RLock()
+		statuses[name] = check.Status
+		check.mu.RUnlock()
+	}
+
+	return statuses
+}
+
+func (hm *HealthMonitor) IsHealthy(name string) bool {
+	status, exists := hm.GetCheckStatus(name)
+	return exists && status == StatusHealthy
+}
+
+func (hm *HealthMonitor) IsDegraded(name string) bool {
+	status, exists := hm.GetCheckStatus(name)
+	return exists && status == StatusDegraded
+}
+
+func (hm *HealthMonitor) IsUnhealthy(name string) bool {
+	status, exists := hm.GetCheckStatus(name)
+	return exists && (status == StatusUnhealthy || status == StatusUnreachable)
+}
+
+func CreateDatabaseHealthCheck() *HealthCheck {
+	return &HealthCheck{
+		Name:     "database",
+		Interval: 15 * time.Second,
+		Timeout:  5 * time.Second,
+		Critical: true,
+		Check: func(ctx context.Context) error {
+			// This would be implemented to actually check database connectivity
+			// For now, return nil (healthy)
+			return nil
+		},
+	}
+}
+
+func CreateS3HealthCheck() *HealthCheck {
+	return &HealthCheck{
+		Name:     "s3_storage",
+		Interval: 30 * time.Second,
+		Timeout:  10 * time.Second,
+		Critical: true,
+		Check: func(ctx context.Context) error {
+			// This would be implemented to actually check S3 connectivity
+			// For now, return nil (healthy)
+			return nil
+		},
+	}
+}
+
+type CircuitBreakerHealthAdapter struct {
+	breaker *circuitbreaker.CircuitBreaker
+	name    string
+}
+
+func NewCircuitBreakerHealthAdapter(breaker *circuitbreaker.CircuitBreaker, name string) *CircuitBreakerHealthAdapter {
+	return &CircuitBreakerHealthAdapter{
+		breaker: breaker,
+		name:    name,
+	}
+}
+
+func (cb *CircuitBreakerHealthAdapter) GetStatus() ComponentStatus {
+	switch cb.breaker.State() {
+	case circuitbreaker.StateClosed:
+		counts := cb.breaker.Counts()
+		if counts.TotalFailures > 0 {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			if failureRatio > 0.2 {
+				return StatusDegraded
+			}
+		}
+		return StatusHealthy
+	case circuitbreaker.StateHalfOpen:
+		return StatusDegraded
+	case circuitbreaker.StateOpen:
+		return StatusUnhealthy
+	default:
+		return StatusUnreachable
+	}
+}

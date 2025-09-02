@@ -165,12 +165,12 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			// Wildcard range (e.g., 1:*)
 			rangeDesc = fmt.Sprintf("%d:*", uidRange.Start)
 			query := baseQuery + " ORDER BY seqnum"
-			rows, err = db.Pool.Query(ctx, query, mailboxID, uint32(uidRange.Start))
+			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start))
 		} else {
 			// Regular range (e.g., 1:5)
 			rangeDesc = fmt.Sprintf("%d:%d", uidRange.Start, uidRange.Stop)
 			query := baseQuery + " AND uid <= $3 ORDER BY seqnum"
-			rows, err = db.Pool.Query(ctx, query, mailboxID, uint32(uidRange.Start), uint32(uidRange.Stop))
+			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start), uint32(uidRange.Stop))
 		}
 
 		if err != nil {
@@ -217,7 +217,7 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 			ORDER BY seqnum
 		`
 
-		rows, err := db.Pool.Query(ctx, query, mailboxID, seqRange.Start, stopSeq)
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, seqRange.Start, stopSeq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query messages for sequence range %d:%d: %v",
 				seqRange.Start, stopSeq, err)
@@ -251,7 +251,7 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 		FROM numbered_messages
 		ORDER BY seqnum
 	`
-	rows, err := db.Pool.Query(ctx, query, mailboxID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
 		return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query: %w", err)
 	}
@@ -296,7 +296,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 	// Query to select messages with the specified flag, including custom_flags
 	// and other necessary fields to populate the Message struct.
 	// It also calculates seqnum.
-	rows, err := db.Pool.Query(ctx, `
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		WITH numbered_messages AS (
 			SELECT 
 				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
@@ -329,7 +329,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 // GetMessageHeaders retrieves the raw headers for a specific message.
 func (db *Database) GetMessageHeaders(ctx context.Context, messageUID imap.UID, mailboxID int64) (string, error) {
 	var headers string
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT mc.headers
 		FROM message_contents mc
 		JOIN messages m ON m.content_hash = mc.content_hash

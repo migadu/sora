@@ -1,164 +1,1225 @@
-# Sora Mail Server Configuration
+# =============================================================================
+# SORA MAIL SERVER - CONFIGURATION FILE
+# =============================================================================
+# 
+# This is the main configuration file for Sora, a hackable IMAP server built
+# with Go and PostgreSQL. This file contains all available configuration
+# options with detailed explanations and examples.
+#
+# IMPORTANT: 
+# - Copy this file to config.toml and modify the values for your deployment
+# - All sections and options are documented with their default values
+# - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
+# - Size values accept common suffixes: "1gb", "100mb", "5kb"
+#
+# =============================================================================
 
-# Specifies where log output should be directed.
-# "stderr": Log to standard error.
-# "stdout": Log to standard output.
-# "syslog": Log to syslog (Unix-like systems only).
-# "/path/to/logfile.log": Log to a specified file.
+# =============================================================================
+# GLOBAL LOGGING CONFIGURATION
+# =============================================================================
+# Controls where Sora sends its log output. Supports multiple destinations
+# and flexible formatting options.
+
+# Log output destination - determines where logs are written
+# Options:
+#   "stderr"  - Standard error output (default, good for systemd)
+#   "stdout"  - Standard output (good for containers/Docker)
+#   "syslog"  - System log daemon (Unix/Linux only)
+#   "/path/to/file.log" - Write to specific file (ensure directory exists)
+#
+# Examples:
+#   log_output = "stderr"                    # Development/systemd
+#   log_output = "/var/log/sora/server.log"  # Production file logging
+#   log_output = "syslog"                    # Centralized logging
 log_output = "stderr"
 
-# --- Database Configuration ---
+# =============================================================================
+# DATABASE CONFIGURATION
+# =============================================================================
+# PostgreSQL database connection settings. Sora requires PostgreSQL with
+# the pg_trgm extension for full-text search capabilities.
 [database]
-# Hostname or IP address of the PostgreSQL server.
+# PostgreSQL server hostname or IP address
+# Examples:
+#   host = "localhost"           # Local development
+#   host = "db.example.com"      # Remote server
+#   host = "10.0.1.100"         # IP address
 host = "localhost"
-# Port number the PostgreSQL server is listening on.
+
+# PostgreSQL server port (standard is 5432)
 port = "5432"
-# Username for connecting to the PostgreSQL database.
+
+# Database username for authentication
+# Examples:
+#   user = "postgres"            # Default superuser
+#   user = "sora_user"          # Dedicated application user (recommended)
 user = "postgres"
-# Password for the PostgreSQL user. Leave empty if no password is set.
+
+# Database user password (leave empty for no password/trust auth)
+# Examples:
+#   password = ""                # No password (development only)
+#   password = "secure_password" # Production password
 password = ""
-# Name of the PostgreSQL database to use.
+
+# Database name to connect to
+# Examples:
+#   name = "sora_mail_db"        # Dedicated database (recommended)
+#   name = "postgres"            # Default database
 name = "sora_mail_db"
-# Whether to use TLS (SSL) for the connection to the PostgreSQL server.
+
+# Enable TLS/SSL for database connection (recommended for remote connections)
+# Examples:
+#   tls = false                  # Local/development connections
+#   tls = true                   # Remote/production connections
 tls = false
-# If true, all SQL queries executed by Sora will be logged. Useful for debugging.
+
+# Enable SQL query logging (useful for debugging, impacts performance)
+# Examples:
+#   log_queries = false          # Production (default)
+#   log_queries = true           # Development/debugging
 log_queries = false
 
-# --- S3-Compatible Object Storage Configuration ---
+# --- DATABASE CONNECTION POOL SETTINGS ---
+# Fine-tune database connection management for optimal performance
+
+# Maximum connections in the pool (should be < PostgreSQL max_connections)
+# Consider: concurrent users × avg connections per user × protocol count
+# Examples:
+#   max_conns = 100              # Small deployment
+#   max_conns = 500              # Medium deployment  
+#   max_conns = 1000             # Large deployment
+max_conns = 100
+
+# Minimum connections maintained in pool (kept alive always)
+# These connections are established at startup and never closed
+# Examples:
+#   min_conns = 10               # Light load
+#   min_conns = 50               # Heavy load
+min_conns = 10
+
+# Maximum lifetime before connection refresh (prevents stale connections)
+# Examples:
+#   max_conn_lifetime = "1h"     # Standard refresh
+#   max_conn_lifetime = "30m"    # Aggressive refresh
+#   max_conn_lifetime = "4h"     # Conservative refresh
+max_conn_lifetime = "1h"
+
+# Maximum idle time before closing excess connections (above min_conns)
+# Examples:
+#   max_conn_idle_time = "30m"   # Standard cleanup
+#   max_conn_idle_time = "5m"    # Aggressive cleanup
+#   max_conn_idle_time = "2h"    # Conservative cleanup
+max_conn_idle_time = "30m"
+
+# =============================================================================
+# S3-COMPATIBLE OBJECT STORAGE CONFIGURATION  
+# =============================================================================
+# Sora stores message bodies in S3-compatible object storage for scalability
+# and durability. Message metadata remains in PostgreSQL for fast access.
+
 [s3]
-# S3-compatible storage endpoint URL. For AWS S3, this is typically "s3.amazonaws.com".
+# S3-compatible storage endpoint URL
+# Examples:
+#   endpoint = "s3.amazonaws.com"               # AWS S3
+#   endpoint = "s3.us-west-2.amazonaws.com"     # AWS S3 specific region
+#   endpoint = "minio.example.com:9000"         # MinIO server
+#   endpoint = "storage.googleapis.com"         # Google Cloud Storage
+#   endpoint = "blob.core.windows.net"          # Azure Blob Storage
 endpoint = "s3.amazonaws.com"
-# Your S3 access key ID.
+
+# S3 access key ID for authentication
+# Examples:
+#   access_key = "AKIAIOSFODNN7EXAMPLE"        # AWS access key format
+#   access_key = "minioadmin"                   # MinIO default
 access_key = "YOUR_S3_ACCESS_KEY_HERE"
-# Your S3 secret access key.
+
+# S3 secret access key for authentication  
+# Examples:
+#   secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # AWS secret key format
+#   secret_key = "minioadmin"                   # MinIO default
 secret_key = "YOUR_S3_SECRET_KEY_HERE"
-# The name of the S3 bucket where mail data will be stored.
+
+# S3 bucket name for storing message bodies
+# Requirements: Must be globally unique, follow S3 naming conventions
+# Examples:
+#   bucket = "sora-mail-prod-us-east-1"        # Production with region
+#   bucket = "company-sora-dev"                # Development environment
+#   bucket = "mail-storage-2024"               # Year-based naming
 bucket = "your-sora-mail-bucket"
-# If true, enables detailed S3 client request tracing. Useful for debugging S3 communication.
+
+# Enable detailed S3 request/response tracing (impacts performance)
+# Examples:
+#   trace = false                              # Production (default)
+#   trace = true                               # Development/debugging
 trace = false
-# Enable client-side encryption for objects stored in S3
+
+# --- CLIENT-SIDE ENCRYPTION SETTINGS ---
+# Encrypt message bodies before uploading to S3 for additional security
+
+# Enable client-side encryption (messages encrypted before S3 upload)
+# Examples:
+#   encrypt = false                            # No encryption (default)
+#   encrypt = true                             # Enable encryption
 encrypt = false
-# Encryption key (32-byte master key) used for client-side encryption
-# This should be a 32-byte hex-encoded string (64 characters)
+
+# 32-byte master encryption key (256-bit AES key in hex format)
+# CRITICAL: Store this key securely! Lost keys = lost messages!
+# Generate with: openssl rand -hex 32
+# Examples:
+#   encryption_key = "abcd1234..."             # 64-character hex string
+#   encryption_key = ""                        # Empty when encrypt=false
 encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-# --- Local Cache Configuration ---
+# =============================================================================
+# LOCAL CACHE CONFIGURATION
+# =============================================================================
+# Local filesystem cache for frequently accessed message bodies, reducing
+# S3 API calls and improving performance for recently accessed messages.
+
 [local_cache]
-# Filesystem path where local cache data will be stored.
+# Filesystem path for cache storage
+# Requirements: Must be writable by Sora process, fast storage preferred (SSD)
+# Examples:
+#   path = "/tmp/sora/cache"                   # Temporary storage
+#   path = "/var/cache/sora"                   # Persistent cache
+#   path = "/opt/sora/cache"                   # Application directory
 path = "/tmp/sora/cache"
-# Maximum total size of the local cache (e.g., "1gb", "500mb").
+
+# Maximum total cache size (LRU eviction when exceeded)
+# Consider: Available disk space, message sizes, access patterns
+# Examples:
+#   capacity = "100mb"                         # Small deployment
+#   capacity = "1gb"                           # Medium deployment
+#   capacity = "10gb"                          # Large deployment
 capacity = "1gb"
-# Maximum size of a single object that can be stored in the local cache (e.g., "5mb", "100kb").
+
+# Maximum size for individual cached objects
+# Prevents large messages from dominating cache space
+# Examples:
+#   max_object_size = "1mb"                    # Conservative limit
+#   max_object_size = "5mb"                    # Standard limit
+#   max_object_size = "25mb"                   # Liberal limit
 max_object_size = "5mb"
 
-# --- Uploader Configuration (for staging and uploading to S3) ---
+# =============================================================================
+# S3 UPLOADER CONFIGURATION
+# =============================================================================
+# Background worker that handles asynchronous uploads of message bodies
+# to S3 storage after messages are initially stored locally.
+
 [uploader]
-# Filesystem path used for temporarily staging files before they are uploaded to S3.
+# Filesystem path for staging uploads (temporary storage before S3)
+# Requirements: Must be writable, sufficient space for concurrent uploads
+# Examples:
+#   path = "/tmp/sora/uploads"                 # Temporary staging
+#   path = "/var/spool/sora/uploads"           # Persistent staging
 path = "/tmp/sora/uploads"
-# Number of mail items to batch together for a single upload operation.
+
+# Number of messages batched together per upload operation
+# Higher values improve efficiency but increase memory usage
+# Examples:
+#   batch_size = 10                            # Conservative batching
+#   batch_size = 20                            # Standard batching  
+#   batch_size = 50                            # Aggressive batching
 batch_size = 20
-# Number of concurrent upload operations.
+
+# Number of concurrent upload workers
+# Should match your S3 rate limits and connection capacity
+# Examples:
+#   concurrency = 5                            # Conservative parallelism
+#   concurrency = 10                           # Standard parallelism
+#   concurrency = 20                           # Aggressive parallelism  
 concurrency = 10
-# Maximum number of times to attempt uploading a batch if an error occurs.
+
+# Maximum retry attempts for failed uploads
+# Examples:
+#   max_attempts = 3                           # Quick failure
+#   max_attempts = 5                           # Standard retry
+#   max_attempts = 10                          # Persistent retry
 max_attempts = 5
-# Time duration to wait before retrying a failed upload (e.g., "30s", "1m").
+
+# Delay between retry attempts (exponential backoff applied)
+# Examples:
+#   retry_interval = "10s"                     # Quick retry
+#   retry_interval = "30s"                     # Standard retry
+#   retry_interval = "1m"                      # Conservative retry
 retry_interval = "30s"
 
-# --- Cleanup Process Configuration (for removing old/deleted items) ---
+# =============================================================================
+# CLEANUP PROCESS CONFIGURATION
+# =============================================================================
+# Background worker that manages message lifecycle and removes old/deleted
+# messages according to configured retention policies.
+
 [cleanup]
-# Time duration for which deleted items are kept before being permanently removed (e.g., "14d", "30d").
+# Grace period for deleted messages before permanent removal
+# Provides recovery window for accidentally deleted messages
+# Examples:
+#   grace_period = "7d"                        # Quick cleanup
+#   grace_period = "14d"                       # Standard grace period
+#   grace_period = "30d"                       # Extended recovery window
 grace_period = "14d"
-# How often the cleanup process should run to remove old items (e.g., "1h", "24h").
+
+# How often cleanup worker runs
+# Balance between cleanup responsiveness and system load
+# Examples:
+#   wake_interval = "30m"                      # Frequent cleanup
+#   wake_interval = "1h"                       # Standard cleanup
+#   wake_interval = "6h"                       # Infrequent cleanup
 wake_interval = "1h"
-# Maximum age restriction for messages. Messages older than this will be automatically expunged.
-# Leave empty for no restriction (messages can stay forever).
-# Examples: "30d" (30 days), "90d" (90 days), "365d" (1 year)
-# This enables ephemeral storage where old messages are automatically cleaned up.
+
+# Maximum message age before automatic expungement (ephemeral storage)
+# Empty string = no age limit (messages kept indefinitely)
+# Examples:
+#   max_age_restriction = ""                   # No limit (default)
+#   max_age_restriction = "30d"                # 30 days retention
+#   max_age_restriction = "90d"                # 90 days retention
+#   max_age_restriction = "1y"                 # 1 year retention
 max_age_restriction = "" # Empty means no restriction
 
-# --- General Server Configurations ---
+# =============================================================================
+# PROTOCOL SERVERS CONFIGURATION
+# =============================================================================
+# Sora supports multiple email protocols. Each can be enabled/disabled and
+# configured independently for different deployment scenarios.
+
 [servers]
-# Global debug flag for all server components. If true, enables more verbose logging for server operations.
+# Global debug flag affecting all protocol servers
+# Enables verbose logging for troubleshooting (impacts performance)
+# Examples:
+#   debug = false                              # Production (default)  
+#   debug = true                               # Development/debugging
 debug = false
 
-# --- IMAP Server Configuration ---
+# =============================================================================
+# IMAP SERVER CONFIGURATION
+# =============================================================================
+# Internet Message Access Protocol - primary protocol for email access
+# Supports IMAP4rev1 with IDLE extension for real-time notifications.
+
 [servers.imap]
-# Whether to start the IMAP server.
+# Enable/disable IMAP server
+# Examples:
+#   start = true                               # Enable IMAP service
+#   start = false                              # Disable IMAP service
 start = true
-# Address and port for the IMAP server to listen on (e.g., ":143" for IMAP, ":993" for IMAPS).
+
+# Listen address and port
+# Examples:
+#   addr = ":143"                              # Standard IMAP port
+#   addr = ":993"                              # IMAPS (TLS) port
+#   addr = "127.0.0.1:143"                     # Localhost only
+#   addr = "10.0.1.5:143"                      # Specific interface
 addr = ":143"
-# Maximum message size allowed for the IMAP APPEND command.
-# If not defined or set to an empty string, there is no limit. (e.g., "25mb").
-append_limit = "25mb" # Maximum message size for IMAP APPEND command, unlimited if not defined
-# Master username for IMAP administrative access (e.g., for proxying).
+
+# Maximum message size for IMAP APPEND command
+# Empty string = no limit (be careful with disk space!)
+# Examples:
+#   append_limit = ""                          # No limit
+#   append_limit = "25mb"                      # Standard limit
+#   append_limit = "50mb"                      # Large attachment support
+#   append_limit = "100mb"                     # Very large messages
+append_limit = "25mb"
+
+# --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
+# Controls concurrent connections to prevent resource exhaustion
+
+# Maximum concurrent IMAP connections across all clients
+# Consider: Available memory, database connections, system limits
+# Examples:
+#   max_connections = 500                      # Small server
+#   max_connections = 1000                     # Standard server
+#   max_connections = 2000                     # High-capacity server  
+max_connections = 1000
+
+# Maximum connections per client IP address
+# Set to 0 when behind load balancers (all traffic appears from proxy IPs)
+# Examples:
+#   max_connections_per_ip = 0                 # Behind proxy/load balancer
+#   max_connections_per_ip = 10                # Direct client access
+#   max_connections_per_ip = 50                # Shared/corporate networks
+max_connections_per_ip = 10
+
+# --- MASTER USER AUTHENTICATION ---
+# Administrative access for proxy servers and management tools
+
+# Master username for administrative IMAP access
+# Used by proxy servers to authenticate on behalf of users  
+# Examples:
+#   master_username = ""                       # Disabled (default)
+#   master_username = "soraadmin"              # Administrative user
 master_username = ""
-# Password for the IMAP master username.
+
+# Master user password (used with master_username)
+# Examples:
+#   master_password = ""                       # Disabled (default)
+#   master_password = "secure_admin_password"  # Strong password required
 master_password = ""
-# SASL username for IMAP master user (alternative to master_username/master_password, often used with specific SASL mechanisms).
+
+# Master SASL username (alternative to master_username for SASL auth)
+# Examples:  
+#   master_sasl_username = ""                  # Disabled (default)
+#   master_sasl_username = "proxy@example.com" # SASL format
 master_sasl_username = ""
-# SASL password for the IMAP master SASL username.
+
+# Master SASL password (used with master_sasl_username)
+# Examples:
+#   master_sasl_password = ""                  # Disabled (default) 
+#   master_sasl_password = "sasl_proxy_pass"   # SASL authentication password
 master_sasl_password = ""
-# Whether to enable TLS for the IMAP server (IMAPS). If true, addr should typically be ":993".
+
+# --- TLS/SSL CONFIGURATION ---
+# Transport Layer Security for encrypted IMAP connections
+
+# Enable TLS for IMAP connections (IMAPS)
+# Examples:
+#   tls = false                                # Plain IMAP (port 143)
+#   tls = true                                 # IMAPS (port 993)
 tls = false
-# Path to the TLS certificate file for IMAPS.
+
+# TLS certificate file path (required when tls=true)
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/imap.crt"  # System certificate location
+#   tls_cert_file = "/opt/sora/certs/imap.pem" # Application certificate
 tls_cert_file = "/path/to/your/imap.crt"
-# Path to the TLS private key file for IMAPS.
+
+# TLS private key file path (required when tls=true)  
+# Examples:
+#   tls_key_file = "/etc/ssl/private/imap.key" # System key location
+#   tls_key_file = "/opt/sora/certs/imap.key"  # Application key
 tls_key_file = "/path/to/your/imap.key"
-# Whether to verify client certificates (if client presents one). Not commonly used for standard IMAP.
+
+# Verify client certificates (mutual TLS)
+# Usually false for standard IMAP deployments
+# Examples:
+#   tls_verify = false                         # Standard TLS (server cert only)
+#   tls_verify = true                          # Mutual TLS (client cert required)
 tls_verify = true
 
-# --- LMTP Server Configuration ---
+# --- PROXY PROTOCOL CONFIGURATION ---
+# Enable real client IP detection when behind load balancers/proxies
+# CRITICAL: Only enable when actually behind a proxy that sends PROXY headers!
+
+[servers.imap.proxy_protocol]
+# Enable PROXY protocol v1/v2 support 
+# WARNING: Only enable if you trust the source! Allows IP spoofing if misconfigured.
+# Examples:
+#   enabled = false                            # Direct connections (default)
+#   enabled = true                             # Behind HAProxy/nginx/Dovecot proxy
+enabled = false
+
+# Trusted proxy networks allowed to send PROXY protocol headers
+# SECURITY: Only list networks you control! Attackers can spoof IPs otherwise.
+# Examples for different scenarios:
+#   ["127.0.0.1/32"]                           # Single localhost proxy
+#   ["10.0.0.0/8", "172.16.0.0/12"]           # Private networks only
+#   ["192.168.1.100/32"]                       # Specific proxy server
+trusted_proxies = [
+    "127.0.0.0/8",    # localhost
+    "10.0.0.0/8",     # RFC1918 private networks  
+    "172.16.0.0/12",  # RFC1918 private networks
+    "192.168.0.0/16"  # RFC1918 private networks
+]
+
+# Timeout for reading PROXY protocol header
+# Balance between slow proxies and DoS protection
+# Examples:
+#   timeout = "2s"                             # Strict timeout
+#   timeout = "5s"                             # Standard timeout
+#   timeout = "10s"                            # Generous timeout  
+timeout = "5s"
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Protect against brute force attacks with progressive delays and blocking
+
+[servers.imap.auth_rate_limit]
+# Enable authentication rate limiting and anti-brute-force protection
+# Examples:
+#   enabled = false                            # Disabled (default)
+#   enabled = true                             # Enable protection
+enabled = false
+
+# Maximum failed authentication attempts per IP address
+# Examples:
+#   max_attempts_per_ip = 5                    # Strict IP limiting
+#   max_attempts_per_ip = 10                   # Standard IP limiting
+#   max_attempts_per_ip = 20                   # Lenient IP limiting
+max_attempts_per_ip = 10
+
+# Maximum failed attempts per username (across all IPs)
+# Examples:
+#   max_attempts_per_username = 3              # Strict user limiting  
+#   max_attempts_per_username = 5              # Standard user limiting
+#   max_attempts_per_username = 10             # Lenient user limiting
+max_attempts_per_username = 5
+
+# Time window for IP-based rate limiting
+# Examples:
+#   ip_window_duration = "5m"                  # Short window
+#   ip_window_duration = "15m"                 # Standard window
+#   ip_window_duration = "1h"                  # Extended window
+ip_window_duration = "15m"
+
+# Time window for username-based rate limiting
+# Examples:
+#   username_window_duration = "15m"           # Short window
+#   username_window_duration = "30m"           # Standard window  
+#   username_window_duration = "2h"            # Extended window
+username_window_duration = "30m"
+
+# Cleanup interval for expired rate limiting data
+# Examples:
+#   cleanup_interval = "1m"                    # Frequent cleanup
+#   cleanup_interval = "5m"                    # Standard cleanup
+#   cleanup_interval = "15m"                   # Infrequent cleanup
+cleanup_interval = "5m"
+
+# --- ENHANCED ANTI-BRUTE-FORCE FEATURES ---
+# Advanced protection with fast blocking and progressive delays
+
+# Failed attempts before immediate IP blocking (bypass normal rate limiting)
+# Examples:
+#   fast_block_threshold = 5                   # Aggressive blocking
+#   fast_block_threshold = 10                  # Standard blocking
+#   fast_block_threshold = 20                  # Conservative blocking
+fast_block_threshold = 10
+
+# Duration of fast IP blocking
+# Examples:
+#   fast_block_duration = "1m"                 # Short block
+#   fast_block_duration = "5m"                 # Standard block  
+#   fast_block_duration = "15m"                # Extended block
+fast_block_duration = "5m"
+
+# Failed attempts before applying authentication delays
+# Examples:
+#   delay_start_threshold = 1                  # Delay after first failure
+#   delay_start_threshold = 2                  # Delay after second failure
+#   delay_start_threshold = 3                  # Delay after third failure
+delay_start_threshold = 2
+
+# Initial authentication delay after threshold reached
+# Examples:
+#   initial_delay = "1s"                       # Minimal delay
+#   initial_delay = "2s"                       # Standard delay
+#   initial_delay = "5s"                       # Longer delay
+initial_delay = "2s"
+
+# Maximum authentication delay (prevents infinite delays)
+# Examples:
+#   max_delay = "10s"                          # Conservative maximum
+#   max_delay = "30s"                          # Standard maximum
+#   max_delay = "60s"                          # Extended maximum
+max_delay = "30s"
+
+# Progressive delay multiplier (exponential backoff)
+# Examples:
+#   delay_multiplier = 1.5                     # Gradual increase
+#   delay_multiplier = 2.0                     # Standard exponential
+#   delay_multiplier = 3.0                     # Aggressive increase
+delay_multiplier = 2.0
+
+# =============================================================================
+# LMTP SERVER CONFIGURATION
+# =============================================================================
+# Local Mail Transfer Protocol - handles incoming mail delivery from MTAs
+# Executes SIEVE filters and delivers messages to user mailboxes.
+
 [servers.lmtp]
-# Whether to start the LMTP server.
+# Enable/disable LMTP server
+# Examples:
+#   start = true                               # Enable mail delivery
+#   start = false                              # Disable mail delivery
 start = true
-# Address and port for the LMTP server to listen on (e.g., ":24").
+
+# Listen address and port
+# Examples:
+#   addr = ":24"                               # Standard LMTP port
+#   addr = ":2525"                             # Alternative port
+#   addr = "127.0.0.1:24"                      # Localhost only
 addr = ":24"
-# Optional external SMTP relay to forward mail through if Sora is not the final delivery agent.
-# Format: "hostname:port" (e.g., "smtp.your-relay.com:25").
-external_relay = "" # e.g. "smtp.your-relay.com:25"
-# Whether to enable TLS for the LMTP server.
+
+# External SMTP relay for mail forwarding (optional)
+# Used when Sora forwards mail instead of final delivery
+# Examples:
+#   external_relay = ""                        # No relay (default)
+#   external_relay = "smtp.example.com:25"     # External relay server
+#   external_relay = "localhost:587"           # Local submission server
+external_relay = ""
+
+# --- TLS/SSL CONFIGURATION ---
+# Transport encryption for LMTP connections
+
+# Enable TLS for LMTP server (immediate TLS)
+# Examples:
+#   tls = false                                # Plain LMTP (default)
+#   tls = true                                 # TLS-wrapped LMTP
 tls = false
-# If true, LMTP will use STARTTLS to upgrade an insecure connection to TLS.
-# If 'tls' is true, this is usually false as the connection starts as TLS.
+
+# Use STARTTLS for opportunistic encryption
+# Allows upgrading plain connections to TLS
+# Examples:
+#   tls_use_starttls = false                   # No STARTTLS (default)
+#   tls_use_starttls = true                    # Support STARTTLS upgrade
 tls_use_starttls = false
-# Path to the TLS certificate file for LMTP.
+
+# TLS certificate file path
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/lmtp.crt"  # System certificate
+#   tls_cert_file = "/opt/sora/certs/lmtp.pem" # Application certificate
 tls_cert_file = "/path/to/your/lmtp.crt"
-# Path to the TLS private key file for LMTP.
+
+# TLS private key file path  
+# Examples:
+#   tls_key_file = "/etc/ssl/private/lmtp.key" # System key
+#   tls_key_file = "/opt/sora/certs/lmtp.key"  # Application key
 tls_key_file = "/path/to/your/lmtp.key"
-# Whether to verify client certificates during TLS handshake.
+
+# Verify client certificates (mutual TLS)
+# Examples:
+#   tls_verify = false                         # Standard TLS
+#   tls_verify = true                          # Mutual TLS (client cert required)
 tls_verify = true
 
-# --- POP3 Server Configuration ---
+# --- CONNECTION LIMITING ---
+# Control concurrent LMTP connections for resource management
+
+# Maximum concurrent LMTP connections
+# Examples:
+#   max_connections = 100                      # Small mail server
+#   max_connections = 500                      # Standard mail server
+#   max_connections = 1000                     # High-volume mail server
+max_connections = 500
+
+# Maximum connections per client IP
+# Examples:
+#   max_connections_per_ip = 0                 # Behind proxy (disable IP limits)
+#   max_connections_per_ip = 5                 # Direct connections
+#   max_connections_per_ip = 20                # Bulk mail senders
+max_connections_per_ip = 5
+
+# --- PROXY PROTOCOL CONFIGURATION ---
+[servers.lmtp.proxy_protocol]
+# Enable PROXY protocol support for real client IP detection
+# Examples:
+#   enabled = false                            # Direct connections (default)
+#   enabled = true                             # Behind load balancer/proxy
+enabled = false
+
+# Trusted networks allowed to send PROXY protocol headers
+trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# Timeout for reading PROXY protocol header
+timeout = "5s"
+
+# =============================================================================
+# POP3 SERVER CONFIGURATION  
+# =============================================================================
+# Post Office Protocol version 3 - legacy protocol for downloading email
+# Generally used by older clients or specific use cases.
+
 [servers.pop3]
-# Whether to start the POP3 server.
+# Enable/disable POP3 server
+# Examples:
+#   start = true                               # Enable POP3 service
+#   start = false                              # Disable POP3 service
 start = true
-# Address and port for the POP3 server to listen on (e.g., ":110" for POP3, ":995" for POP3S).
-addr = ":110" 
-# Whether to enable TLS for the POP3 server (POP3S). If true, addr should typically be ":995".
+
+# Listen address and port
+# Examples:
+#   addr = ":110"                              # Standard POP3 port
+#   addr = ":995"                              # POP3S (TLS) port  
+#   addr = "127.0.0.1:110"                     # Localhost only
+addr = ":110"
+
+# --- TLS/SSL CONFIGURATION ---
+# Transport encryption for POP3 connections
+
+# Enable TLS for POP3 connections (POP3S)
+# Examples:
+#   tls = false                                # Plain POP3 (port 110)
+#   tls = true                                 # POP3S (port 995)
 tls = false
-# Path to the TLS certificate file for POP3S.
+
+# TLS certificate file path
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/pop3.crt"  # System certificate
+#   tls_cert_file = "/opt/sora/certs/pop3.pem" # Application certificate
 tls_cert_file = "/path/to/your/pop3.crt"
-# Path to the TLS private key file for POP3S.
+
+# TLS private key file path
+# Examples:
+#   tls_key_file = "/etc/ssl/private/pop3.key" # System key
+#   tls_key_file = "/opt/sora/certs/pop3.key"  # Application key  
 tls_key_file = "/path/to/your/pop3.key"
-# Whether to verify client certificates. Not commonly used for standard POP3.
+
+# Verify client certificates (usually disabled for POP3)
+# Examples:
+#   tls_verify = false                         # Standard POP3 (default)
+#   tls_verify = true                          # Mutual TLS (rare for POP3)
 tls_verify = false
 
-# --- ManageSieve Server Configuration ---
+# --- CONNECTION LIMITING ---
+# Control concurrent POP3 connections
+
+# Maximum concurrent POP3 connections
+# Examples:
+#   max_connections = 100                      # Small deployment
+#   max_connections = 500                      # Standard deployment
+#   max_connections = 1000                     # Large deployment
+max_connections = 500
+
+# Maximum connections per client IP
+# Examples:
+#   max_connections_per_ip = 0                 # Behind proxy (disable IP limits)
+#   max_connections_per_ip = 5                 # Direct connections
+#   max_connections_per_ip = 10                # Shared networks
+max_connections_per_ip = 5
+
+# --- PROXY PROTOCOL CONFIGURATION ---
+[servers.pop3.proxy_protocol]
+# Enable PROXY protocol support for real client IP detection
+enabled = false
+trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+timeout = "5s"
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Same anti-brute-force protection as IMAP (see IMAP section for detailed explanations)
+
+[servers.pop3.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+max_attempts_per_username = 5
+ip_window_duration = "15m"
+username_window_duration = "30m"
+cleanup_interval = "5m"
+fast_block_threshold = 10
+fast_block_duration = "5m"
+delay_start_threshold = 2
+initial_delay = "2s"
+max_delay = "30s"
+delay_multiplier = 2.0
+
+# =============================================================================
+# MANAGESIEVE SERVER CONFIGURATION
+# =============================================================================
+# ManageSieve protocol for managing SIEVE mail filtering scripts
+# Allows clients to upload, edit, and manage server-side email filters.
+
 [servers.managesieve]
-# Whether to start the ManageSieve server (for Sieve script management).
+# Enable/disable ManageSieve server
+# Examples:
+#   start = true                               # Enable SIEVE management
+#   start = false                              # Disable SIEVE management
 start = true
-# Address and port for the ManageSieve server to listen on (e.g., ":4190").
+
+# Listen address and port
+# Examples:
+#   addr = ":4190"                             # Standard ManageSieve port
+#   addr = ":2000"                             # Alternative port
+#   addr = "127.0.0.1:4190"                    # Localhost only
 addr = ":4190"
-# If true, allows authentication over unencrypted connections. Not recommended for production.
+
+# Allow authentication over unencrypted connections
+# SECURITY: Should be false in production unless behind trusted proxy
+# Examples:
+#   insecure_auth = false                      # Require encryption (default)
+#   insecure_auth = true                       # Allow plaintext auth (dev only)
 insecure_auth = false
-# Whether to enable TLS for the ManageSieve server.
+
+# --- TLS/SSL CONFIGURATION ---
+# Transport encryption for ManageSieve connections
+
+# Enable TLS for ManageSieve connections
+# Examples:
+#   tls = false                                # Plain ManageSieve (default)
+#   tls = true                                 # TLS-wrapped ManageSieve
 tls = false
-# If true, ManageSieve will use STARTTLS to upgrade an insecure connection to TLS.
-# If 'tls' is true, this is usually false as the connection starts as TLS.
+
+# Use STARTTLS for opportunistic encryption  
+# Examples:
+#   tls_use_starttls = false                   # No STARTTLS (default)
+#   tls_use_starttls = true                    # Support STARTTLS upgrade
 tls_use_starttls = false
-# Path to the TLS certificate file for ManageSieve.
+
+# TLS certificate file path
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/sieve.crt" # System certificate
+#   tls_cert_file = "/opt/sora/certs/sieve.pem"# Application certificate
 tls_cert_file = "/path/to/your/managesieve.crt"
-# Path to the TLS private key file for ManageSieve.
+
+# TLS private key file path
+# Examples:
+#   tls_key_file = "/etc/ssl/private/sieve.key"# System key
+#   tls_key_file = "/opt/sora/certs/sieve.key" # Application key
 tls_key_file = "/path/to/your/managesieve.key"
-# Whether to verify client certificates during TLS handshake.
+
+# Verify client certificates
+# Examples:
+#   tls_verify = false                         # Standard TLS
+#   tls_verify = true                          # Mutual TLS (client cert required)
 tls_verify = true
+
+# --- CONNECTION LIMITING ---
+# Control concurrent ManageSieve connections
+
+# Maximum concurrent ManageSieve connections
+# Generally lower than IMAP/POP3 since script management is less frequent
+# Examples:
+#   max_connections = 50                       # Small deployment
+#   max_connections = 200                      # Standard deployment
+#   max_connections = 500                      # Large deployment
+max_connections = 200
+
+# Maximum connections per client IP
+# Examples:
+#   max_connections_per_ip = 0                 # Behind proxy (disable IP limits)
+#   max_connections_per_ip = 3                 # Direct connections (conservative)
+#   max_connections_per_ip = 10                # Shared networks
+max_connections_per_ip = 3
+
+# --- PROXY PROTOCOL CONFIGURATION ---
+[servers.managesieve.proxy_protocol]
+# Enable PROXY protocol support for real client IP detection
+enabled = false
+trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+timeout = "5s"
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Same anti-brute-force protection as IMAP/POP3 (see IMAP section for details)
+
+[servers.managesieve.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+max_attempts_per_username = 5
+ip_window_duration = "15m"
+username_window_duration = "30m"
+cleanup_interval = "5m"
+fast_block_threshold = 10
+fast_block_duration = "5m"
+delay_start_threshold = 2
+initial_delay = "2s"
+max_delay = "30s"
+delay_multiplier = 2.0
+
+# =============================================================================
+# PROXY SERVER CONFIGURATIONS
+# =============================================================================
+# Sora can act as a proxy server, load balancing connections across multiple
+# backend Sora servers. This enables horizontal scaling and high availability.
+
+# =============================================================================  
+# IMAP PROXY CONFIGURATION
+# =============================================================================
+# Proxy IMAP connections across multiple backend servers with load balancing
+# and user-server affinity support.
+
+[servers.imap_proxy]
+# Enable/disable IMAP proxy server
+# Examples:
+#   start = true                               # Enable IMAP proxy
+#   start = false                              # Disable IMAP proxy  
+start = true
+
+# Proxy listen address (different from backend to avoid conflicts)
+# Examples:
+#   addr = ":1143"                             # Alternative IMAP port
+#   addr = ":143"                              # Standard port (if backends on different IPs)
+#   addr = "10.0.1.100:143"                    # Specific interface
+addr = ":1143"
+
+# Backend server addresses for load balancing
+# Examples:
+#   remote_addrs = ["backend1.internal:143"]   # Single backend
+#   remote_addrs = ["server1:143", "server2:143", "server3:143"]  # Multiple backends
+#   remote_addrs = ["10.0.1.10:143", "10.0.1.11:143"]           # IP addresses
+remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
+
+# Master authentication for backend servers
+# Used to authenticate with backend servers on behalf of users
+# Examples:
+#   master_sasl_username = "proxyuser"         # Proxy service account
+#   master_sasl_username = "sora-proxy@domain" # Email format
+master_sasl_username = "proxyuser"
+
+# Master password for backend authentication
+# Examples:
+#   master_sasl_password = "secure_proxy_pass" # Strong password
+#   master_sasl_password = "token_or_key"      # API token/key
+master_sasl_password = "proxypass"
+
+# --- PROXY TLS CONFIGURATION ---
+# TLS settings for client-to-proxy connections
+
+# Enable TLS for proxy server
+# Examples:
+#   tls = false                                # Plain proxy connections
+#   tls = true                                 # TLS proxy connections
+tls = false
+
+# TLS certificate file for proxy server
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/proxy.crt" # Proxy certificate
+#   tls_cert_file = ""                         # No TLS (default)
+tls_cert_file = ""
+
+# TLS private key file for proxy server
+# Examples:
+#   tls_key_file = "/etc/ssl/private/proxy.key"# Proxy key
+#   tls_key_file = ""                          # No TLS (default)
+tls_key_file = ""
+
+# Verify client certificates for proxy connections
+# Examples:
+#   tls_verify = false                         # Standard TLS
+#   tls_verify = true                          # Mutual TLS
+tls_verify = true
+
+# --- BACKEND TLS CONFIGURATION ---
+# TLS settings for proxy-to-backend connections
+
+# Enable TLS for connections to backend servers
+# Examples:
+#   remote_tls = false                         # Plain backend connections
+#   remote_tls = true                          # TLS backend connections
+remote_tls = false
+
+# Verify backend server certificates
+# Examples:
+#   remote_tls_verify = false                  # Skip backend cert verification
+#   remote_tls_verify = true                   # Verify backend certificates
+remote_tls_verify = true
+
+# --- PROXY BEHAVIOR CONFIGURATION ---
+# Control proxy connection handling and load balancing
+
+# Connection timeout for backend servers
+# Examples:
+#   connect_timeout = "10s"                    # Fast timeout
+#   connect_timeout = "30s"                    # Standard timeout
+#   connect_timeout = "60s"                    # Generous timeout
+connect_timeout = "30s"
+
+# Enable user-server affinity (sticky connections)
+# Remembers which backend server each user connects to for session consistency
+# Examples:
+#   enable_affinity = false                    # Round-robin load balancing
+#   enable_affinity = true                     # Sticky sessions
+enable_affinity = true
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Same anti-brute-force protection as IMAP (see IMAP section for detailed explanations)
+
+[servers.imap_proxy.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+max_attempts_per_username = 5
+ip_window_duration = "15m"
+username_window_duration = "30m"
+cleanup_interval = "5m"
+fast_block_threshold = 10
+fast_block_duration = "5m"
+delay_start_threshold = 2
+initial_delay = "2s"
+max_delay = "30s"
+delay_multiplier = 2.0
+
+# =============================================================================
+# POP3 PROXY CONFIGURATION  
+# =============================================================================
+# Proxy POP3 connections across multiple backend servers with load balancing.
+
+[servers.pop3_proxy]
+# Enable/disable POP3 proxy server
+start = true
+
+# Proxy listen address (different from backend to avoid conflicts)
+addr = ":1110"
+
+# Backend server addresses for load balancing
+remote_addrs = ["backend1.example.com:110", "backend2.example.com:110", "backend3.example.com:110"]
+
+# Master authentication credentials for backend servers
+master_sasl_username = "proxyuser"
+master_sasl_password = "proxypass"
+
+# TLS configuration (same pattern as IMAP proxy - see above for details)
+tls = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+remote_tls = false
+remote_tls_verify = true
+
+# Connection and behavior settings
+connect_timeout = "30s"
+enable_affinity = true  # User-server affinity for session consistency
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Same anti-brute-force protection as IMAP (see IMAP section for details)
+
+[servers.pop3_proxy.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+max_attempts_per_username = 5
+ip_window_duration = "15m"
+username_window_duration = "30m"
+cleanup_interval = "5m"
+fast_block_threshold = 10
+fast_block_duration = "5m"
+delay_start_threshold = 2
+initial_delay = "2s"
+max_delay = "30s"
+delay_multiplier = 2.0
+
+# =============================================================================
+# MANAGESIEVE PROXY CONFIGURATION
+# =============================================================================
+# Proxy ManageSieve connections across multiple backend servers.
+
+[servers.managesieve_proxy]
+start = true
+addr = ":14190"  # Different port to avoid conflict with backend
+remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190", "backend3.example.com:4190"]
+master_sasl_username = "proxyuser"
+master_sasl_password = "proxypass"
+
+# TLS configuration (same pattern as other proxies)
+tls = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+remote_tls = false
+remote_tls_verify = true
+
+# Connection and behavior settings
+connect_timeout = "30s"
+enable_affinity = true  # User-server affinity for session consistency
+affinity_validity = "24h"  # How long to remember user-server affinity
+
+# --- AUTHENTICATION RATE LIMITING ---
+# Same anti-brute-force protection as other protocols
+
+[servers.managesieve_proxy.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+max_attempts_per_username = 5
+ip_window_duration = "15m"
+username_window_duration = "30m"
+cleanup_interval = "5m"
+fast_block_threshold = 10
+fast_block_duration = "5m"
+delay_start_threshold = 2
+initial_delay = "2s"
+max_delay = "30s"
+delay_multiplier = 2.0
+
+# =============================================================================
+# LMTP PROXY CONFIGURATION
+# =============================================================================
+# Proxy LMTP connections for mail delivery load balancing.
+
+[servers.lmtp_proxy]
+start = true
+addr = ":124"  # Different port to avoid conflict with backend
+remote_addrs = ["backend1.example.com:24", "backend2.example.com:24", "backend3.example.com:24"]
+
+# TLS configuration (same pattern as other proxies)
+tls = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+remote_tls = false
+remote_tls_verify = true
+
+# Connection and behavior settings
+connect_timeout = "30s"
+enable_affinity = true  # User-server affinity for consistent delivery
+affinity_validity = "24h"  # How long to remember user-server affinity
+
+# =============================================================================
+# CONNECTION TRACKING CONFIGURATION
+# =============================================================================
+# Monitor and log active connections across all servers for operational visibility.
+
+[servers.connection_tracking]
+# Enable connection tracking across all protocols
+# Examples:
+#   enabled = false                            # Disable tracking
+#   enabled = true                             # Enable tracking
+enabled = true
+
+# How often to update connection statistics in database
+# Examples:
+#   update_interval = "10s"                    # Frequent updates
+#   update_interval = "15s"                    # Standard updates
+#   update_interval = "30s"                    # Infrequent updates
+update_interval = "15s"
+
+# Batch multiple connection updates together for efficiency
+# Examples:
+#   batch_updates = true                       # Batch for performance (recommended)
+#   batch_updates = false                      # Individual updates
+batch_updates = true
+
+# Store connection tracking information in database
+# Examples:
+#   persist_to_db = true                       # Store in database (recommended)
+#   persist_to_db = false                      # Memory only
+persist_to_db = true
+
+# =============================================================================
+# DEPLOYMENT SCENARIOS AND CONFIGURATION PATTERNS
+# =============================================================================
+# This section provides common deployment patterns and configuration examples
+# for different environments and use cases.
+
+# -----------------------------------------------------------------------------
+# SCENARIO 1: DIRECT CLIENT ACCESS (Simple Deployment)
+# -----------------------------------------------------------------------------
+# Use case: Small deployment with clients connecting directly to Sora
+# Network: Direct internet connection without load balancers or proxies
+#
+# Configuration pattern:
+# - Enable per-IP connection limits to prevent abuse
+# - Disable PROXY protocol (not needed for direct connections)
+# - Use standard ports for all services
+#
+# Example configuration:
+# [servers.imap]
+# addr = ":143"                    # Standard IMAP port
+# max_connections = 1000           # Total connection limit
+# max_connections_per_ip = 10      # Per-client IP limit
+# [servers.imap.proxy_protocol]
+# enabled = false                  # No proxy protocol needed
+
+# -----------------------------------------------------------------------------  
+# SCENARIO 2: BEHIND LOAD BALANCER/PROXY (Production Deployment)
+# -----------------------------------------------------------------------------
+# Use case: Production deployment with HAProxy, nginx, or Dovecot proxy
+# Network: Load balancer terminates client connections and forwards to backends
+#
+# Configuration pattern:
+# - Enable PROXY protocol to preserve real client IPs
+# - Disable per-IP limits on backend servers (all traffic appears from proxy)
+# - Configure load balancer to send PROXY protocol headers
+#
+# Backend server configuration:
+# [servers.imap]
+# max_connections = 1000           # Total connection limit
+# max_connections_per_ip = 0       # Disable (all traffic from proxy IPs)
+# [servers.imap.proxy_protocol]
+# enabled = true                   # Enable PROXY protocol support
+# trusted_proxies = ["10.0.0.0/8"] # Trust load balancer network
+#
+# HAProxy configuration example:
+# backend sora_imap
+#     balance roundrobin
+#     server sora1 10.0.1.10:143 send-proxy-v2
+#     server sora2 10.0.1.11:143 send-proxy-v2
+
+# -----------------------------------------------------------------------------
+# SCENARIO 3: MIXED DEPLOYMENT (Hybrid Architecture)
+# -----------------------------------------------------------------------------
+# Use case: Some protocols behind proxy, others with direct access
+# Network: Complex setup with different access patterns per protocol
+#
+# Configuration pattern:
+# - Configure each protocol individually based on access method
+# - IMAP/POP3 might be behind proxy, LMTP direct from mail servers
+# - Different connection limits and PROXY protocol settings per service
+#
+# Example configuration:
+# [servers.imap]                  # Behind load balancer
+# max_connections_per_ip = 0      
+# [servers.imap.proxy_protocol]
+# enabled = true
+#
+# [servers.lmtp]                  # Direct from mail servers
+# max_connections_per_ip = 20     # Higher limit for mail servers
+# [servers.lmtp.proxy_protocol]
+# enabled = false
+
+# -----------------------------------------------------------------------------
+# SCENARIO 4: HIGH-AVAILABILITY WITH DOVECOT PROXY
+# -----------------------------------------------------------------------------
+# Use case: High-traffic setup using Dovecot Director for load balancing
+# Network: Dovecot proxy frontend with multiple Sora backend servers
+#
+# Configuration pattern:
+# - Dovecot proxy automatically sends PROXY protocol v2
+# - Backend servers must trust Dovecot proxy network
+# - Higher connection limits for high-traffic scenarios
+#
+# Backend server configuration:
+# [servers.imap]
+# max_connections = 2000           # Higher limit for traffic
+# max_connections_per_ip = 0       # Disabled for proxy deployment
+# [servers.imap.proxy_protocol]
+# enabled = true                   # Required for Dovecot proxy
+# trusted_proxies = ["192.168.1.0/24"] # Dovecot proxy network
+# timeout = "5s"
+
+# -----------------------------------------------------------------------------
+# SCENARIO 5: SORA PROXY DEPLOYMENT (Horizontal Scaling)
+# -----------------------------------------------------------------------------
+# Use case: Using Sora's built-in proxy functionality for scaling
+# Network: Sora proxy servers fronting multiple Sora backend servers
+#
+# Configuration pattern:
+# - Frontend Sora servers act as proxies only
+# - Backend Sora servers handle actual mail storage/processing
+# - User-server affinity for session consistency
+#
+# Proxy server configuration:
+# [servers.imap]
+# start = false                    # Disable backend IMAP
+# [servers.imap_proxy]
+# start = true                     # Enable IMAP proxy
+# addr = ":143"                    # Standard port on proxy
+# remote_addrs = ["backend1:143", "backend2:143"]
+# enable_affinity = true          # Sticky sessions
+
+# -----------------------------------------------------------------------------
+# LOGGING AND MONITORING WITH PROXY PROTOCOL
+# -----------------------------------------------------------------------------
+# When PROXY protocol is enabled, logs show both real client and proxy IPs:
+#
+# Direct connection (no proxy):
+# 2024-01-15 10:30:45 [INFO] IMAP remote=203.0.113.45 user=alice@example.com session=abc123: LOGIN successful
+#
+# Connection through proxy:  
+# 2024-01-15 10:30:45 [INFO] IMAP remote=203.0.113.45 proxy=10.0.0.1 user=alice@example.com session=abc123: LOGIN successful
+#                                   ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+#                                   real client IP   proxy server IP
+#
+# This allows proper client IP tracking for:
+# - Security analysis and abuse detection  
+# - Geographic access patterns
+# - Rate limiting and authentication controls
+# - Compliance and audit requirements
+
+# -----------------------------------------------------------------------------
+# SECURITY CONSIDERATIONS
+# -----------------------------------------------------------------------------
+# CRITICAL: PROXY protocol security implications
+#
+# 1. TRUSTED NETWORKS ONLY
+#    - Only enable PROXY protocol when behind trusted proxies
+#    - Limit trusted_proxies to specific networks you control
+#    - Never trust public or unknown networks
+#
+# 2. IP SPOOFING RISKS
+#    - Incorrect PROXY protocol configuration allows IP spoofing
+#    - Attackers could impersonate any client IP address
+#    - Verify proxy configuration before enabling
+#
+# 3. NETWORK ISOLATION
+#    - Backend servers should not be directly accessible
+#    - Use firewall rules to restrict access to proxy networks only
+#    - Monitor for direct connections bypassing proxies
+#
+# 4. MONITORING AND ALERTING
+#    - Monitor for connections from untrusted sources
+#    - Alert on PROXY protocol violations or errors
+#    - Regular security audits of proxy configurations
