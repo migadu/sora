@@ -114,7 +114,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 		if r := recover(); r != nil {
 			// A panic is a critical failure, so we mark the component as unhealthy.
 			err := fmt.Errorf("panic: %v", r)
-			log.Printf("PANIC during health check for component '%s': %v", check.Name, err)
+			log.Printf("[HEALTH] PANIC during check for component '%s': %v", check.Name, err)
 
 			check.mu.Lock()
 			check.Status = StatusUnhealthy
@@ -153,7 +153,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 			check.Status = StatusDegraded
 		}
 
-		log.Printf("Health check '%s' failed: %v (status: %s, failure rate: %.2f)",
+		log.Printf("[HEALTH] check '%s' failed: %v (status: %s, failure rate: %.2f)",
 			check.Name, err, check.Status, failureRate)
 	} else {
 		check.LastError = nil
@@ -166,9 +166,9 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 
 	if previousStatus != currentStatus || isFirstCheck {
 		if isFirstCheck {
-			log.Printf("Health check '%s' initialized with status: %s", check.Name, currentStatus)
+			log.Printf("[HEALTH] check '%s' initialized: %s", check.Name, currentStatus)
 		} else {
-			log.Printf("Health check '%s' status changed: %s -> %s", check.Name, previousStatus, currentStatus)
+			log.Printf("[HEALTH] check '%s' status changed: %s -> %s", check.Name, previousStatus, currentStatus)
 		}
 		hm.notifyStatusChange(check.Name, currentStatus)
 	}
@@ -226,8 +226,7 @@ func (hm *HealthMonitor) updateOverallStatus() {
 	}
 
 	if previousStatus != hm.overallStatus {
-		log.Printf("Overall system health status changed: %s -> %s",
-			previousStatus, hm.overallStatus)
+		log.Printf("[HEALTH] overall system status changed: %s -> %s", previousStatus, hm.overallStatus)
 	}
 }
 
