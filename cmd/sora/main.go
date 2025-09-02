@@ -828,6 +828,7 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		RemoteTLSVerify:    config.Servers.IMAPProxy.RemoteTLSVerify,
 		ConnectTimeout:     connectTimeout,
 		EnableAffinity:     config.Servers.IMAPProxy.EnableAffinity,
+		AffinityStickiness: config.Servers.IMAPProxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
 	})
 	if err != nil {
@@ -885,6 +886,7 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		ConnectTimeout:     connectTimeout,
 		Debug:              config.Servers.Debug,
 		EnableAffinity:     config.Servers.POP3Proxy.EnableAffinity,
+		AffinityStickiness: config.Servers.POP3Proxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
 	})
 	if err != nil {
@@ -938,11 +940,6 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		return
 	}
 
-	// Start connection tracker if affinity is enabled for this proxy.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", database, hostname, &config.Servers.ConnectionTracking, config.Servers.ManageSieveProxy.EnableAffinity, server); tracker != nil {
-		defer tracker.Stop()
-	}
-
 	go func() {
 		<-ctx.Done()
 		log.Println("Shutting down ManageSieve proxy server...")
@@ -974,17 +971,18 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 	}
 
 	server, err := lmtpproxy.New(ctx, database, hostname, lmtpproxy.ServerOptions{
-		Addr:             config.Servers.LMTPProxy.Addr,
-		RemoteAddrs:      remoteAddrs,
-		TLS:              config.Servers.LMTPProxy.TLS,
-		TLSCertFile:      config.Servers.LMTPProxy.TLSCertFile,
-		TLSKeyFile:       config.Servers.LMTPProxy.TLSKeyFile,
-		TLSVerify:        config.Servers.LMTPProxy.TLSVerify,
-		RemoteTLS:        config.Servers.LMTPProxy.RemoteTLS,
-		RemoteTLSVerify:  config.Servers.LMTPProxy.RemoteTLSVerify,
-		ConnectTimeout:   connectTimeout,
-		EnableAffinity:   config.Servers.LMTPProxy.EnableAffinity,
-		AffinityValidity: affinityValidity,
+		Addr:               config.Servers.LMTPProxy.Addr,
+		RemoteAddrs:        remoteAddrs,
+		TLS:                config.Servers.LMTPProxy.TLS,
+		TLSCertFile:        config.Servers.LMTPProxy.TLSCertFile,
+		TLSKeyFile:         config.Servers.LMTPProxy.TLSKeyFile,
+		TLSVerify:          config.Servers.LMTPProxy.TLSVerify,
+		RemoteTLS:          config.Servers.LMTPProxy.RemoteTLS,
+		RemoteTLSVerify:    config.Servers.LMTPProxy.RemoteTLSVerify,
+		ConnectTimeout:     connectTimeout,
+		EnableAffinity:     config.Servers.LMTPProxy.EnableAffinity,
+		AffinityStickiness: config.Servers.LMTPProxy.AffinityStickiness,
+		AffinityValidity:   affinityValidity,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)

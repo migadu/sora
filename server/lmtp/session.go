@@ -13,7 +13,6 @@ import (
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
-	"github.com/emersion/go-sasl"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -210,41 +209,6 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to read message: %v", err)
 	}
 	s.Log("message data read successfully (%d bytes)", buf.Len())
-
-	// Check if we should use affinity-based routing
-	if s.backend.enableAffinityRoute && s.backend.connManager != nil && s.User != nil {
-		// Check user's server affinity
-		// Create a context for read operations that respects session pinning
-		readCtx := s.ctx
-		if s.useMasterDB {
-			readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
-		}
-
-		lastServerAddr, lastServerTime, err := s.backend.db.GetLastServerAddress(readCtx, s.UserID())
-		if err == nil && lastServerAddr != "" {
-			// Calculate time since last connection
-			timeSinceLastConnection := time.Since(lastServerTime)
-			if timeSinceLastConnection < s.backend.affinityValidity {
-				s.Log("[AFFINITY] User has recent connection to server %s (%v ago), attempting remote delivery",
-					lastServerAddr, timeSinceLastConnection)
-
-				// Try to deliver to the affinity server
-				err = s.deliverToRemoteServer(lastServerAddr, buf.Bytes())
-				if err == nil {
-					s.Log("[AFFINITY] Successfully delivered message to affinity server %s", lastServerAddr)
-					return nil
-				}
-				s.Log("[AFFINITY] Failed to deliver to affinity server %s: %v, falling back to local delivery", lastServerAddr, err)
-			} else {
-				s.Log("[AFFINITY] User's last connection to %s is too old (%v ago), using local delivery",
-					lastServerAddr, timeSinceLastConnection)
-			}
-		} else if err != nil && err.Error() != "no server affinity found" {
-			s.Log("[AFFINITY] Error checking server affinity: %v", err)
-		} else {
-			s.Log("[AFFINITY] No server affinity found for user, using local delivery")
-		}
-	}
 
 	// Use the full message bytes as received for hashing, size, and header extraction.
 	fullMessageBytes := buf.Bytes()
@@ -672,80 +636,6 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	}
 
 	// The recording of the vacation response is now handled by SievePolicy via VacationOracle
-	return nil
-}
-
-// deliverToRemoteServer delivers a message to a remote LMTP server
-func (s *LMTPSession) deliverToRemoteServer(serverAddr string, messageBytes []byte) error {
-	// Try to connect to the specific server
-	conn, err := s.backend.connManager.ConnectToSpecific(serverAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to server %s: %w", serverAddr, err)
-	}
-	defer conn.Close()
-
-	// Create SMTP client
-	c := smtp.NewClient(conn)
-	defer c.Close()
-
-	// Send greeting
-	if err := c.Hello(s.backend.hostname); err != nil {
-		return fmt.Errorf("HELO/EHLO failed: %w", err)
-	}
-
-	// Check if remote server supports LMTP
-	if ok, _ := c.Extension("LMTP"); !ok {
-		s.Log("[REMOTE] Remote server does not advertise LMTP extension")
-		// Continue anyway as some servers don't advertise but still support LMTP
-	}
-
-	// Authenticate if credentials are provided
-	if s.backend.remoteLMTPUsername != "" && s.backend.remoteLMTPPassword != "" {
-		if ok, _ := c.Extension("AUTH"); ok {
-			// Use SASL PLAIN authentication
-			auth := sasl.NewPlainClient("", s.backend.remoteLMTPUsername, s.backend.remoteLMTPPassword)
-			if err := c.Auth(auth); err != nil {
-				return fmt.Errorf("LMTP authentication failed: %w", err)
-			}
-			s.Log("[REMOTE] Successfully authenticated to remote LMTP server")
-		} else {
-			s.Log("[REMOTE] Remote server does not support AUTH")
-		}
-	}
-
-	// Send MAIL FROM
-	if err := c.Mail(s.sender.FullAddress(), nil); err != nil {
-		return fmt.Errorf("MAIL FROM failed: %w", err)
-	}
-
-	// Send RCPT TO
-	if err := c.Rcpt(s.User.Address.FullAddress(), nil); err != nil {
-		return fmt.Errorf("RCPT TO failed: %w", err)
-	}
-
-	// Send DATA
-	wc, err := c.Data()
-	if err != nil {
-		return fmt.Errorf("DATA command failed: %w", err)
-	}
-
-	_, err = wc.Write(messageBytes)
-	if err != nil {
-		wc.Close()
-		return fmt.Errorf("failed to write message data: %w", err)
-	}
-
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("failed to close data writer: %w", err)
-	}
-
-	// Send QUIT
-	if err := c.Quit(); err != nil {
-		s.Log("[REMOTE] Warning: QUIT command failed: %v", err)
-		// Don't fail the delivery if QUIT fails
-	}
-
-	s.Log("[REMOTE] Successfully delivered message to remote LMTP server %s", serverAddr)
 	return nil
 }
 

@@ -29,6 +29,7 @@ type Server struct {
 	tlsVerify          bool
 	enableAffinity     bool
 	affinityValidity   time.Duration
+	affinityStickiness float64
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -50,6 +51,7 @@ type ServerOptions struct {
 	ConnectTimeout     time.Duration
 	EnableAffinity     bool
 	AffinityValidity   time.Duration
+	AffinityStickiness float64
 }
 
 // New creates a new IMAP proxy server.
@@ -76,12 +78,20 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	// Create connection manager
 	connManager, err := proxy.NewConnectionManager(remoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		log.Printf("[IMAP Proxy] Failed to resolve addresses: %v", err)
+	}
+
+	// Validate affinity stickiness
+	stickiness := opts.AffinityStickiness
+	if stickiness < 0.0 || stickiness > 1.0 {
+		log.Printf("WARNING: invalid IMAP proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		stickiness = 1.0
 	}
 
 	return &Server{
@@ -97,6 +107,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		tlsVerify:          opts.TLSVerify,
 		enableAffinity:     opts.EnableAffinity,
 		affinityValidity:   opts.AffinityValidity,
+		affinityStickiness: stickiness,
 		ctx:                ctx,
 		cancel:             cancel,
 	}, nil

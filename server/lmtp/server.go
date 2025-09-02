@@ -15,28 +15,22 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
 type LMTPServerBackend struct {
-	addr                string
-	hostname            string
-	db                  *db.Database
-	s3                  *storage.S3Storage
-	uploader            *uploader.UploadWorker
-	server              *smtp.Server
-	appCtx              context.Context
-	externalRelay       string
-	tlsConfig           *tls.Config
-	debug               bool
-	connManager         *proxy.ConnectionManager
-	enableAffinityRoute bool
-	affinityValidity    time.Duration
-	remoteLMTPUsername  string
-	remoteLMTPPassword  string
+	addr          string
+	hostname      string
+	db            *db.Database
+	s3            *storage.S3Storage
+	uploader      *uploader.UploadWorker
+	server        *smtp.Server
+	appCtx        context.Context
+	externalRelay string
+	tlsConfig     *tls.Config
+	debug         bool
 
 	// Connection counters
 	totalConnections atomic.Int64
@@ -60,14 +54,6 @@ type LMTPServerOptions struct {
 	TLSKeyFile          string
 	TLSVerify           bool
 	TLSUseStartTLS      bool
-	RemoteAddrs         []string
-	RemoteTLS           bool
-	RemoteTLSVerify     bool
-	ConnectTimeout      time.Duration
-	EnableAffinityRoute bool
-	AffinityValidity    time.Duration
-	RemoteLMTPUsername  string
-	RemoteLMTPPassword  string
 	MaxConnections      int
 	MaxConnectionsPerIP int
 	ProxyProtocol       server.ProxyProtocolConfig
@@ -85,20 +71,16 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	}
 
 	backend := &LMTPServerBackend{
-		addr:                addr,
-		appCtx:              appCtx,
-		hostname:            hostname,
-		db:                  db,
-		s3:                  s3,
-		uploader:            uploadWorker,
-		externalRelay:       options.ExternalRelay,
-		debug:               options.Debug,
-		enableAffinityRoute: options.EnableAffinityRoute,
-		affinityValidity:    options.AffinityValidity,
-		remoteLMTPUsername:  options.RemoteLMTPUsername,
-		remoteLMTPPassword:  options.RemoteLMTPPassword,
-		limiter:             server.NewConnectionLimiter("LMTP", options.MaxConnections, options.MaxConnectionsPerIP),
-		proxyReader:         proxyReader,
+		addr:          addr,
+		appCtx:        appCtx,
+		hostname:      hostname,
+		db:            db,
+		s3:            s3,
+		uploader:      uploadWorker,
+		externalRelay: options.ExternalRelay,
+		debug:         options.Debug,
+		limiter:       server.NewConnectionLimiter("LMTP", options.MaxConnections, options.MaxConnectionsPerIP),
+		proxyReader:   proxyReader,
 	}
 
 	// Initialize Sieve script cache with a reasonable default size and TTL
@@ -113,27 +95,6 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	backend.defaultSieveExecutor = defaultExecutor
 	log.Printf("LMTP default Sieve script parsed and cached")
 
-	// Set up connection manager if remote addresses are configured
-	if len(options.RemoteAddrs) > 0 {
-		connManager, err := proxy.NewConnectionManager(
-			options.RemoteAddrs,
-			options.RemoteTLS,
-			options.RemoteTLSVerify,
-			options.ConnectTimeout,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create connection manager: %w", err)
-		}
-		backend.connManager = connManager
-		if err := backend.connManager.ResolveAddresses(); err != nil {
-			// Log as a warning, not a fatal error, as we can still proceed with unresolved addresses
-			log.Printf("WARNING: Failed to resolve some remote LMTP addresses: %v", err)
-		}
-		log.Printf("LMTP configured with %d remote servers for affinity-based delivery", len(options.RemoteAddrs))
-		if options.EnableAffinityRoute {
-			log.Printf("LMTP affinity routing enabled")
-		}
-	}
 
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)

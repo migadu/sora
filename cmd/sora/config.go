@@ -36,21 +36,21 @@ type LocalCacheConfig struct {
 
 // IMAPServerConfig holds IMAP server configuration.
 type IMAPServerConfig struct {
-	Start               bool                          `toml:"start"`
-	Addr                string                        `toml:"addr"`
-	AppendLimit         string                        `toml:"append_limit"`
-	MaxConnections      int                           `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                           `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterUsername      string                        `toml:"master_username"`
-	MasterPassword      string                        `toml:"master_password"`
-	MasterSASLUsername  string                        `toml:"master_sasl_username"`
-	MasterSASLPassword  string                        `toml:"master_sasl_password"`
-	TLS                 bool                          `toml:"tls"`
-	TLSCertFile         string                        `toml:"tls_cert_file"`
-	TLSKeyFile          string                        `toml:"tls_key_file"`
-	TLSVerify           bool                          `toml:"tls_verify"`
-	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`   // PROXY protocol configuration
-	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"`  // Authentication rate limiting
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	AppendLimit         string                       `toml:"append_limit"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterUsername      string                       `toml:"master_username"`
+	MasterPassword      string                       `toml:"master_password"`
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // LMTPServerConfig holds LMTP server configuration.
@@ -60,77 +60,70 @@ type LMTPServerConfig struct {
 	MaxConnections      int                        `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP int                        `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	ExternalRelay       string                     `toml:"external_relay"`
-	RemoteAddrs         []string                   `toml:"remote_addrs"`         // Remote LMTP servers for affinity-based delivery
-	RemoteLMTPUsername  string                     `toml:"remote_lmtp_username"` // Username for remote LMTP auth
-	RemoteLMTPPassword  string                     `toml:"remote_lmtp_password"` // Password for remote LMTP auth
 	TLS                 bool                       `toml:"tls"`
 	TLSUseStartTLS      bool                       `toml:"tls_use_starttls"`
 	TLSCertFile         string                     `toml:"tls_cert_file"`
 	TLSKeyFile          string                     `toml:"tls_key_file"`
 	TLSVerify           bool                       `toml:"tls_verify"`
-	RemoteTLS           bool                       `toml:"remote_tls"`
-	RemoteTLSVerify     bool                       `toml:"remote_tls_verify"`
-	ConnectTimeout      string                     `toml:"connect_timeout"`
-	EnableAffinityRoute bool                       `toml:"enable_affinity_route"`
-	AffinityValidity    string                     `toml:"affinity_validity"`
 	ProxyProtocol       server.ProxyProtocolConfig `toml:"proxy_protocol"` // PROXY protocol configuration
 }
 
 // POP3ServerConfig holds POP3 server configuration.
 type POP3ServerConfig struct {
-	Start               bool                          `toml:"start"`
-	Addr                string                        `toml:"addr"`
-	MaxConnections      int                           `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                           `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername  string                        `toml:"master_sasl_username"`
-	MasterSASLPassword  string                        `toml:"master_sasl_password"`
-	TLS                 bool                          `toml:"tls"`
-	TLSCertFile         string                        `toml:"tls_cert_file"`
-	TLSKeyFile          string                        `toml:"tls_key_file"`
-	TLSVerify           bool                          `toml:"tls_verify"`
-	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`   // PROXY protocol configuration
-	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"`  // Authentication rate limiting
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // ManageSieveServerConfig holds ManageSieve server configuration.
 type ManageSieveServerConfig struct {
-	Start               bool                          `toml:"start"`
-	Addr                string                        `toml:"addr"`
-	MaxConnections      int                           `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                           `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MaxScriptSize       string                        `toml:"max_script_size"`
-	InsecureAuth        bool                          `toml:"insecure_auth"`
-	MasterSASLUsername  string                        `toml:"master_sasl_username"`
-	MasterSASLPassword  string                        `toml:"master_sasl_password"`
-	TLS                 bool                          `toml:"tls"`
-	TLSUseStartTLS      bool                          `toml:"tls_use_starttls"`
-	TLSCertFile         string                        `toml:"tls_cert_file"`
-	TLSKeyFile          string                        `toml:"tls_key_file"`
-	TLSVerify           bool                          `toml:"tls_verify"`
-	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`   // PROXY protocol configuration
-	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"`  // Authentication rate limiting
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MaxScriptSize       string                       `toml:"max_script_size"`
+	InsecureAuth        bool                         `toml:"insecure_auth"`
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSUseStartTLS      bool                         `toml:"tls_use_starttls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	ProxyProtocol       server.ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // IMAPProxyServerConfig holds IMAP proxy server configuration.
 type IMAPProxyServerConfig struct {
-	Start               bool                          `toml:"start"`
-	Addr                string                        `toml:"addr"`
-	RemoteAddr          string                        `toml:"remote_addr"`     // Deprecated: use RemoteAddrs
-	RemoteAddrs         []string                      `toml:"remote_addrs"`
-	MaxConnections      int                           `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                           `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername  string                        `toml:"master_sasl_username"`
-	MasterSASLPassword  string                        `toml:"master_sasl_password"`
-	TLS                 bool                          `toml:"tls"`
-	TLSCertFile         string                        `toml:"tls_cert_file"`
-	TLSKeyFile          string                        `toml:"tls_key_file"`
-	TLSVerify           bool                          `toml:"tls_verify"`
-	RemoteTLS           bool                          `toml:"remote_tls"`
-	RemoteTLSVerify     bool                          `toml:"remote_tls_verify"`
-	ConnectTimeout      string                        `toml:"connect_timeout"`
-	EnableAffinity      bool                          `toml:"enable_affinity"`
-	AffinityValidity    string                        `toml:"affinity_validity"`
-	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"`  // Authentication rate limiting
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	RemoteAddr          string                       `toml:"remote_addr"` // Deprecated: use RemoteAddrs
+	RemoteAddrs         []string                     `toml:"remote_addrs"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	RemoteTLS           bool                         `toml:"remote_tls"`
+	RemoteTLSVerify     bool                         `toml:"remote_tls_verify"`
+	ConnectTimeout      string                       `toml:"connect_timeout"`
+	EnableAffinity      bool                         `toml:"enable_affinity"`
+	AffinityStickiness  float64                      `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity    string                       `toml:"affinity_validity"`
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
@@ -151,6 +144,7 @@ type POP3ProxyServerConfig struct {
 	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
 	ConnectTimeout      string   `toml:"connect_timeout"`
 	EnableAffinity      bool     `toml:"enable_affinity"`
+	AffinityStickiness  float64  `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity    string   `toml:"affinity_validity"`
 }
 
@@ -171,8 +165,6 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLS           bool     `toml:"remote_tls"`
 	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
 	ConnectTimeout      string   `toml:"connect_timeout"`
-	EnableAffinity      bool     `toml:"enable_affinity"`
-	AffinityValidity    string   `toml:"affinity_validity"`
 }
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
@@ -191,6 +183,7 @@ type LMTPProxyServerConfig struct {
 	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
 	ConnectTimeout      string   `toml:"connect_timeout"`
 	EnableAffinity      bool     `toml:"enable_affinity"`
+	AffinityStickiness  float64  `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity    string   `toml:"affinity_validity"`
 }
 
@@ -316,7 +309,6 @@ func newDefaultConfig() Config {
 				TLSCertFile:         "",
 				TLSKeyFile:          "",
 				TLSVerify:           true,
-				AffinityValidity:    "24h",
 			},
 			POP3: POP3ServerConfig{
 				Start:               true,
@@ -357,6 +349,7 @@ func newDefaultConfig() Config {
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
 				EnableAffinity:      true,
+				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
 			},
 			POP3Proxy: POP3ProxyServerConfig{
@@ -371,6 +364,7 @@ func newDefaultConfig() Config {
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
 				EnableAffinity:      true,
+				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
 			},
 			ManageSieveProxy: ManageSieveProxyServerConfig{
@@ -384,8 +378,6 @@ func newDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
-				EnableAffinity:      true,
-				AffinityValidity:    "24h",
 			},
 			LMTPProxy: LMTPProxyServerConfig{
 				Start:               false,
@@ -397,6 +389,7 @@ func newDefaultConfig() Config {
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
 				EnableAffinity:      true,
+				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
 			},
 			ConnectionTracking: ConnectionTrackingConfig{
@@ -505,14 +498,6 @@ func (c *IMAPProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(c.ConnectTimeout)
 }
 
-// GetAffinityValidity parses the affinity validity duration for IMAP proxy
-func (c *IMAPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
-}
-
 // GetConnectTimeout parses the connect timeout duration for POP3 proxy
 func (c *POP3ProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	if c.ConnectTimeout == "" {
@@ -535,22 +520,6 @@ func (c *ManageSieveProxyServerConfig) GetConnectTimeout() (time.Duration, error
 		return 30 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.ConnectTimeout)
-}
-
-// GetConnectTimeout parses the connect timeout duration for LMTP
-func (c *LMTPServerConfig) GetConnectTimeout() (time.Duration, error) {
-	if c.ConnectTimeout == "" {
-		return 30 * time.Second, nil
-	}
-	return helpers.ParseDuration(c.ConnectTimeout)
-}
-
-// GetAffinityValidity parses the affinity validity duration for LMTP
-func (c *LMTPServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
 }
 
 // GetUpdateInterval parses the update interval duration for connection tracking
@@ -577,8 +546,8 @@ func (c *LMTPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
 	return helpers.ParseDuration(c.AffinityValidity)
 }
 
-// GetAffinityValidity parses the affinity validity duration for ManageSieve proxy
-func (c *ManageSieveProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
+// GetAffinityValidity parses the affinity validity duration for LMTP proxy
+func (c *IMAPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
 	if c.AffinityValidity == "" {
 		return 24 * time.Hour, nil
 	}

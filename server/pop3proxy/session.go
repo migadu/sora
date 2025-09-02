@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -239,17 +240,48 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	return nil
 }
 
-func (s *POP3ProxySession) connectToBackend() error {
-	// Check for server affinity if enabled
-	var preferredAddr string
-	if s.server.enableAffinity {
-		lastAddr, lastTime, err := s.server.db.GetLastServerAddress(s.ctx, s.accountID)
-		if err == nil && lastAddr != "" {
-			if time.Since(lastTime) < s.server.affinityValidity {
-				preferredAddr = lastAddr
-				log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
-			}
+// getPreferredBackend fetches the preferred backend server for the user based on affinity.
+func (s *POP3ProxySession) getPreferredBackend() (string, error) {
+	if !s.server.enableAffinity {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+	defer cancel()
+
+	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	if err != nil {
+		// Don't log ErrDBNotFound as an error, it's an expected case.
+		if err.Error() == "no server affinity found" {
+			return "", nil
 		}
+		return "", err
+	}
+
+	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
+		return lastAddr, nil
+	}
+
+	return "", nil
+}
+
+func (s *POP3ProxySession) connectToBackend() error {
+	// Get preferred backend from affinity
+	preferredAddr, err := s.getPreferredBackend()
+	if err != nil {
+		log.Printf("[POP3PROXY %s] Could not get preferred backend for %s: %v", s.RemoteIP, s.username, err)
+	}
+
+	// Probabilistically ignore affinity to improve load balancing
+	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+		if rand.Float64() > s.server.affinityStickiness {
+			log.Printf("[POP3PROXY %s] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.RemoteIP, s.username, s.server.affinityStickiness)
+			preferredAddr = "" // This will cause the connection manager to use round-robin
+		}
+	}
+
+	if preferredAddr != "" {
+		log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
 	}
 
 	// Extract client connection information for PROXY protocol
@@ -283,7 +315,10 @@ func (s *POP3ProxySession) connectToBackend() error {
 
 	// Record successful connection for future affinity
 	if s.server.enableAffinity && actualAddr != "" {
-		if err := s.server.db.UpdateLastServerAddress(s.ctx, s.accountID, actualAddr); err != nil {
+		// Use a new, short-lived context for this update to avoid issues with the parent context's timeout.
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer updateCancel()
+		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[POP3PROXY %s] Failed to update server affinity for %s: %v", s.RemoteIP, s.username, err)
 		} else {
 			log.Printf("[POP3PROXY %s] Updated server affinity for %s to %s", s.RemoteIP, s.username, actualAddr)

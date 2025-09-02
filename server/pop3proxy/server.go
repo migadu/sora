@@ -27,6 +27,7 @@ type POP3ProxyServer struct {
 	wg                 sync.WaitGroup
 	enableAffinity     bool
 	affinityValidity   time.Duration
+	affinityStickiness float64
 }
 
 type POP3ProxyServerOptions struct {
@@ -43,6 +44,7 @@ type POP3ProxyServerOptions struct {
 	ConnectTimeout     time.Duration
 	EnableAffinity     bool
 	AffinityValidity   time.Duration
+	AffinityStickiness float64
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -66,6 +68,13 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		log.Printf("WARNING: Failed to resolve some addresses for POP3 proxy: %v", err)
 	}
 
+	// Validate affinity stickiness
+	stickiness := options.AffinityStickiness
+	if stickiness < 0.0 || stickiness > 1.0 {
+		log.Printf("WARNING: invalid POP3 proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		stickiness = 1.0
+	}
+
 	server := &POP3ProxyServer{
 		hostname:           hostname,
 		addr:               addr,
@@ -77,6 +86,7 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		connManager:        connManager,
 		enableAffinity:     options.EnableAffinity,
 		affinityValidity:   options.AffinityValidity,
+		affinityStickiness: stickiness,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided

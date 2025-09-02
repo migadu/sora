@@ -15,37 +15,39 @@ import (
 
 // Server represents an LMTP proxy server.
 type Server struct {
-	listener         net.Listener
-	db               *db.Database
-	addr             string
-	hostname         string
-	connManager      *proxy.ConnectionManager
-	connTracker      *proxy.ConnectionTracker
-	tls              bool
-	tlsCertFile      string
-	tlsKeyFile       string
-	tlsVerify        bool
-	enableAffinity   bool
-	affinityValidity time.Duration
-	wg               sync.WaitGroup
-	ctx              context.Context
-	cancel           context.CancelFunc
+	listener           net.Listener
+	db                 *db.Database
+	addr               string
+	hostname           string
+	connManager        *proxy.ConnectionManager
+	connTracker        *proxy.ConnectionTracker
+	tls                bool
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsVerify          bool
+	enableAffinity     bool
+	affinityValidity   time.Duration
+	affinityStickiness float64
+	wg                 sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
 type ServerOptions struct {
-	Addr             string
-	RemoteAddr       string // Deprecated: use RemoteAddrs
-	RemoteAddrs      []string
-	TLS              bool
-	TLSCertFile      string
-	TLSKeyFile       string
-	TLSVerify        bool
-	RemoteTLS        bool
-	RemoteTLSVerify  bool
-	ConnectTimeout   time.Duration
-	EnableAffinity   bool
-	AffinityValidity time.Duration
+	Addr               string
+	RemoteAddr         string // Deprecated: use RemoteAddrs
+	RemoteAddrs        []string
+	TLS                bool
+	TLSCertFile        string
+	TLSKeyFile         string
+	TLSVerify          bool
+	RemoteTLS          bool
+	RemoteTLSVerify    bool
+	ConnectTimeout     time.Duration
+	EnableAffinity     bool
+	AffinityValidity   time.Duration
+	AffinityStickiness float64
 }
 
 // New creates a new LMTP proxy server.
@@ -72,6 +74,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	// Create connection manager
 	connManager, err := proxy.NewConnectionManager(remoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
 
@@ -80,19 +83,27 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		log.Printf("[LMTP Proxy] Failed to resolve addresses: %v", err)
 	}
 
+	// Validate affinity stickiness
+	stickiness := opts.AffinityStickiness
+	if stickiness < 0.0 || stickiness > 1.0 {
+		log.Printf("WARNING: invalid POP3 proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		stickiness = 1.0
+	}
+
 	return &Server{
-		db:               db,
-		addr:             opts.Addr,
-		hostname:         hostname,
-		connManager:      connManager,
-		tls:              opts.TLS,
-		tlsCertFile:      opts.TLSCertFile,
-		tlsKeyFile:       opts.TLSKeyFile,
-		tlsVerify:        opts.TLSVerify,
-		enableAffinity:   opts.EnableAffinity,
-		affinityValidity: opts.AffinityValidity,
-		ctx:              ctx,
-		cancel:           cancel,
+		db:                 db,
+		addr:               opts.Addr,
+		hostname:           hostname,
+		connManager:        connManager,
+		tls:                opts.TLS,
+		tlsCertFile:        opts.TLSCertFile,
+		tlsKeyFile:         opts.TLSKeyFile,
+		tlsVerify:          opts.TLSVerify,
+		enableAffinity:     opts.EnableAffinity,
+		affinityValidity:   opts.AffinityValidity,
+		affinityStickiness: stickiness,
+		ctx:                ctx,
+		cancel:             cancel,
 	}, nil
 }
 

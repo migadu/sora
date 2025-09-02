@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -229,21 +230,49 @@ func (s *Session) extractAddress(param string) string {
 	return param
 }
 
-// connectToBackend establishes a connection to the backend server.
-func (s *Session) connectToBackend() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// getPreferredBackend fetches the preferred backend server for the user based on affinity.
+func (s *Session) getPreferredBackend() (string, error) {
+	if !s.server.enableAffinity {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 	defer cancel()
 
-	// Check for server affinity if enabled
-	var preferredAddr string
-	if s.server.enableAffinity {
-		lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
-		if err == nil && lastAddr != "" {
-			if time.Since(lastTime) < s.server.affinityValidity {
-				preferredAddr = lastAddr
-				log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-			}
+	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	if err != nil {
+		// Don't log ErrDBNotFound as an error, it's an expected case.
+		if err.Error() == "no server affinity found" {
+			return "", nil
 		}
+		return "", err
+	}
+
+	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
+		return lastAddr, nil
+	}
+
+	return "", nil
+}
+
+// connectToBackend establishes a connection to the backend server.
+func (s *Session) connectToBackend() error {
+	// Get preferred backend from affinity
+	preferredAddr, err := s.getPreferredBackend()
+	if err != nil {
+		log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
+	}
+
+	// Probabilistically ignore affinity to improve load balancing
+	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+		if rand.Float64() > s.server.affinityStickiness {
+			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
+			preferredAddr = "" // This will cause the connection manager to use round-robin
+		}
+	}
+
+	if preferredAddr != "" {
+		log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 	}
 
 	// Extract client connection information for PROXY protocol
@@ -279,7 +308,10 @@ func (s *Session) connectToBackend() error {
 
 	// Record successful connection for future affinity
 	if s.server.enableAffinity && actualAddr != "" {
-		if err = s.server.db.UpdateLastServerAddress(ctx, s.accountID, actualAddr); err != nil {
+		// Use a new, short-lived context for this update to avoid issues with the parent context's timeout.
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer updateCancel()
+		if err = s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[LMTP Proxy] Failed to update server affinity for %s: %v", s.username, err)
 		} else {
 			log.Printf("[LMTP Proxy] Updated server affinity for %s to %s", s.username, actualAddr)

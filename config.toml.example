@@ -907,6 +907,12 @@ connect_timeout = "30s"
 #   enable_affinity = true                     # Sticky sessions
 enable_affinity = true
 
+# The probability (0.0 to 1.0) that a connection will stick to its preferred server.
+# A value of 1.0 means connections are always sticky. A value of 0.9 (the default)
+# means there is a 90% chance of using the affinity server and a 10% chance of
+# using round-robin to help balance load.
+affinity_stickiness = 0.9
+
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as IMAP (see IMAP section for detailed explanations)
 
@@ -953,7 +959,12 @@ remote_tls_verify = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
-enable_affinity = true  # User-server affinity for session consistency
+enable_affinity = true # User-server affinity for session consistency
+# The probability (0.0 to 1.0) that a connection will stick to its preferred server.
+# A value of 1.0 means connections are always sticky. A value of 0.9 (the default)
+# means there is a 90% chance of using the affinity server and a 10% chance of
+# using round-robin to help balance load.
+affinity_stickiness = 0.9
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as IMAP (see IMAP section for details)
@@ -994,8 +1005,6 @@ remote_tls_verify = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
-enable_affinity = true  # User-server affinity for session consistency
-affinity_validity = "24h"  # How long to remember user-server affinity
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as other protocols
@@ -1034,8 +1043,13 @@ remote_tls_verify = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
-enable_affinity = true  # User-server affinity for consistent delivery
-affinity_validity = "24h"  # How long to remember user-server affinity
+enable_affinity = true    # User-server affinity for consistent delivery
+affinity_validity = "24h" # How long to remember user-server affinity
+# The probability (0.0 to 1.0) that a connection will stick to its preferred server.
+# A value of 1.0 means connections are always sticky. A value of 0.9 (the default)
+# means there is a 90% chance of using the affinity server and a 10% chance of
+# using round-robin to help balance load.
+affinity_stickiness = 0.9
 
 # =============================================================================
 # CONNECTION TRACKING CONFIGURATION
