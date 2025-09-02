@@ -16,8 +16,8 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 
 ### Storage Architecture
 - **PostgreSQL** for metadata with full-text search (pg_trgm)
-- **S3-compatible** object storage for message bodies with deduplication
-- **Local cache** for frequently accessed messages
+- **S3-compatible** object storage for message bodies
+- **Local cache** for frequently accessed messages, providing read-level deduplication
 - **Configurable retention** with grace periods and ephemeral storage
 
 ### Production Features
