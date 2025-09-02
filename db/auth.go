@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -258,7 +259,7 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 		return errors.New("address cannot be empty")
 	}
 
-	_, err := db.Pool.Exec(ctx,
+	_, err := db.GetWritePool().Exec(ctx,
 		"UPDATE credentials SET password = $1 WHERE address = $2",
 		newHashedPassword, normalizedAddress)
 
@@ -285,7 +286,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 		return 0, errors.New("password cannot be empty")
 	}
 
-	err := db.Pool.QueryRow(ctx,
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
 		"SELECT account_id, password FROM credentials WHERE address = $1",
 		normalizedAddress).Scan(&accountID, &hashedPassword)
 
@@ -347,7 +348,7 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 	}
 
 	// Query the credentials table for the account_id associated with the address
-	err := db.Pool.QueryRow(ctx, "SELECT account_id FROM credentials WHERE address = $1", normalizedAddress).Scan(&accountID)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT account_id FROM credentials WHERE address = $1", normalizedAddress).Scan(&accountID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Identity (address) not found in the credentials table
@@ -389,4 +390,28 @@ func decodePasswordData(hashedPassword, pB64, pB64Explicit, pHex string) (data [
 		}
 	}
 	return data, nil
+}
+
+// GetPrimaryEmailForAccount retrieves the primary email address for a given account ID.
+func (db *Database) GetPrimaryEmailForAccount(ctx context.Context, accountID int64) (server.Address, error) {
+	var email string
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		"SELECT address FROM credentials WHERE account_id = $1 AND primary_identity = TRUE",
+		accountID).Scan(&email)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// This case is an error because every account should have a primary email.
+			return server.Address{}, fmt.Errorf("no primary email found for account ID %d", accountID)
+		}
+		return server.Address{}, fmt.Errorf("database error getting primary email for account ID %d: %w", accountID, err)
+	}
+
+	address, err := server.NewAddress(email)
+	if err != nil {
+		// This indicates a data integrity issue, as addresses in the DB should be valid.
+		return server.Address{}, fmt.Errorf("invalid primary email format in database for account ID %d: %w", accountID, err)
+	}
+
+	return address, nil
 }

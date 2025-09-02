@@ -9,51 +9,130 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
+	"github.com/migadu/sora/server/proxy"
+	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
 type LMTPServerBackend struct {
-	addr          string
-	hostname      string
-	db            *db.Database
-	s3            *storage.S3Storage
-	uploader      *uploader.UploadWorker
-	server        *smtp.Server
-	appCtx        context.Context
-	externalRelay string
-	tlsConfig     *tls.Config
-	debug         bool
+	addr                string
+	hostname            string
+	db                  *db.Database
+	s3                  *storage.S3Storage
+	uploader            *uploader.UploadWorker
+	server              *smtp.Server
+	appCtx              context.Context
+	externalRelay       string
+	tlsConfig           *tls.Config
+	debug               bool
+	connManager         *proxy.ConnectionManager
+	enableAffinityRoute bool
+	affinityValidity    time.Duration
+	remoteLMTPUsername  string
+	remoteLMTPPassword  string
 
 	// Connection counters
 	totalConnections atomic.Int64
+
+	// Connection limiting
+	limiter *server.ConnectionLimiter
+
+	// Sieve script caching
+	sieveCache           *SieveScriptCache
+	defaultSieveExecutor sieveengine.Executor
+
+	// PROXY protocol support
+	proxyReader *server.ProxyProtocolReader
 }
 
 type LMTPServerOptions struct {
-	ExternalRelay  string
-	Debug          bool
-	TLS            bool
-	TLSCertFile    string
-	TLSKeyFile     string
-	TLSVerify      bool
-	TLSUseStartTLS bool
+	ExternalRelay       string
+	Debug               bool
+	TLS                 bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSVerify           bool
+	TLSUseStartTLS      bool
+	RemoteAddrs         []string
+	RemoteTLS           bool
+	RemoteTLSVerify     bool
+	ConnectTimeout      time.Duration
+	EnableAffinityRoute bool
+	AffinityValidity    time.Duration
+	RemoteLMTPUsername  string
+	RemoteLMTPPassword  string
+	MaxConnections      int
+	MaxConnectionsPerIP int
+	ProxyProtocol       server.ProxyProtocolConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, db *db.Database, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if options.ProxyProtocol.Enabled {
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("LMTP", options.ProxyProtocol)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
+		}
+	}
+
 	backend := &LMTPServerBackend{
-		addr:          addr,
-		appCtx:        appCtx,
-		hostname:      hostname,
-		db:            db,
-		s3:            s3,
-		uploader:      uploadWorker,
-		externalRelay: options.ExternalRelay,
-		debug:         options.Debug,
+		addr:                addr,
+		appCtx:              appCtx,
+		hostname:            hostname,
+		db:                  db,
+		s3:                  s3,
+		uploader:            uploadWorker,
+		externalRelay:       options.ExternalRelay,
+		debug:               options.Debug,
+		enableAffinityRoute: options.EnableAffinityRoute,
+		affinityValidity:    options.AffinityValidity,
+		remoteLMTPUsername:  options.RemoteLMTPUsername,
+		remoteLMTPPassword:  options.RemoteLMTPPassword,
+		limiter:             server.NewConnectionLimiter("LMTP", options.MaxConnections, options.MaxConnectionsPerIP),
+		proxyReader:         proxyReader,
+	}
+
+	// Initialize Sieve script cache with a reasonable default size and TTL
+	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
+	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute)
+
+	// Parse and cache the default Sieve script at startup
+	defaultExecutor, err := sieveengine.NewSieveExecutor(defaultSieveScript)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
+	}
+	backend.defaultSieveExecutor = defaultExecutor
+	log.Printf("LMTP default Sieve script parsed and cached")
+
+	// Set up connection manager if remote addresses are configured
+	if len(options.RemoteAddrs) > 0 {
+		connManager, err := proxy.NewConnectionManager(
+			options.RemoteAddrs,
+			options.RemoteTLS,
+			options.RemoteTLSVerify,
+			options.ConnectTimeout,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create connection manager: %w", err)
+		}
+		backend.connManager = connManager
+		if err := backend.connManager.ResolveAddresses(); err != nil {
+			// Log as a warning, not a fatal error, as we can still proceed with unresolved addresses
+			log.Printf("WARNING: Failed to resolve some remote LMTP addresses: %v", err)
+		}
+		log.Printf("LMTP configured with %d remote servers for affinity-based delivery", len(options.RemoteAddrs))
+		if options.EnableAffinityRoute {
+			log.Printf("LMTP affinity routing enabled")
+		}
 	}
 
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
@@ -101,22 +180,43 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 		s.Debug = debugWriter
 	}
 
+	// Start connection limiter cleanup
+	backend.limiter.StartCleanup(appCtx)
+
 	return backend, nil
 }
 
 func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	// Check connection limits
+	releaseConn, err := b.limiter.Accept(c.Conn().RemoteAddr())
+	if err != nil {
+		log.Printf("[LMTP] Connection rejected: %v", err)
+		return nil, fmt.Errorf("connection limit exceeded: %w", err)
+	}
+
 	sessionCtx, sessionCancel := context.WithCancel(b.appCtx)
 
 	// Increment connection counters (in LMTP all connections are considered authenticated)
 	b.totalConnections.Add(1)
 
 	s := &LMTPSession{
-		backend: b,
-		conn:    c,
-		ctx:     sessionCtx,
-		cancel:  sessionCancel,
+		backend:     b,
+		conn:        c,
+		ctx:         sessionCtx,
+		cancel:      sessionCancel,
+		releaseConn: releaseConn,
 	}
-	s.RemoteIP = c.Conn().RemoteAddr().String()
+
+	// Extract real client IP and proxy IP from PROXY protocol if available
+	netConn := c.Conn()
+	var proxyInfo *server.ProxyProtocolInfo
+	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
+		proxyInfo = proxyConn.GetProxyInfo()
+	}
+
+	clientIP, proxyIP := server.GetConnectionIPs(netConn, proxyInfo)
+	s.RemoteIP = clientIP
+	s.ProxyIP = proxyIP
 	s.Id = idgen.New()
 	s.HostName = b.hostname
 	s.Protocol = "LMTP"
@@ -161,6 +261,14 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// Wrap listener with PROXY protocol support if enabled
+	if b.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: b.proxyReader,
+		}
+	}
+
 	if err := b.server.Serve(listener); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		if b.appCtx.Err() == nil {
@@ -185,4 +293,42 @@ func (b *LMTPServerBackend) GetTotalConnections() int64 {
 // For LMTP, all connections are considered authenticated
 func (b *LMTPServerBackend) GetAuthenticatedConnections() int64 {
 	return 0
+}
+
+// proxyProtocolListener wraps a listener to handle PROXY protocol
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *server.ProxyProtocolReader
+}
+
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to read PROXY protocol header
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		conn.Close()
+		// Log but don't crash - let the server continue accepting other connections
+		log.Printf("[LMTP] PROXY protocol error, rejecting connection: %v", err)
+		return nil, fmt.Errorf("PROXY protocol error: %w", err)
+	}
+
+	// Wrap the connection with proxy info for later extraction
+	return &proxyProtocolConn{
+		Conn:      wrappedConn,
+		proxyInfo: proxyInfo,
+	}, nil
+}
+
+// proxyProtocolConn wraps a connection with PROXY protocol information
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
+	return c.proxyInfo
 }

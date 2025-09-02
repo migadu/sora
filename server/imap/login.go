@@ -12,6 +12,24 @@ import (
 const MasterUsernameSeparator = "~"
 
 func (s *IMAPSession) Login(address, password string) error {
+	// Create a fake net.Addr from the RemoteIP for rate limiting
+	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+	
+	// Apply progressive authentication delay BEFORE any other checks
+	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN")
+	
+	// Check authentication rate limiting after delay
+	if s.server.authLimiter != nil {
+		if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address); err != nil {
+			s.Log("[LOGIN] rate limited: %v", err)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeAuthenticationFailed,
+				Text: "Too many authentication attempts. Please try again later.",
+			}
+		}
+	}
+
 	authAddress, proxyUser := parseMasterLogin(address)
 
 	// Master password login
@@ -39,7 +57,20 @@ func (s *IMAPSession) Login(address, password string) error {
 			totalCount := s.server.totalConnections.Load()
 			s.Log("[LOGIN] user %s/%s authenticated with master password (connections: total=%d, authenticated=%d)",
 				address, proxyUser, totalCount, authCount)
+			
+			// Record successful authentication
+			if s.server.authLimiter != nil {
+				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
+			}
+			
 			return nil
+		}
+		
+		// Record failed master password authentication
+		if s.server.authLimiter != nil {
+			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, authAddress, false)
 		}
 	}
 
@@ -58,6 +89,12 @@ func (s *IMAPSession) Login(address, password string) error {
 	userID, err := s.server.db.Authenticate(s.ctx, addressSt.FullAddress(), password)
 	if err != nil {
 		s.Log("[LOGIN] authentication failed: %v", err)
+
+		// Record failed authentication
+		if s.server.authLimiter != nil {
+			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), false)
+		}
 
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -79,6 +116,13 @@ func (s *IMAPSession) Login(address, password string) error {
 	totalCount := s.server.totalConnections.Load()
 	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
 		address, totalCount, authCount)
+	
+	// Record successful authentication
+	if s.server.authLimiter != nil {
+		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), true)
+	}
+	
 	return nil
 }
 

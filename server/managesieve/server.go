@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 
 	"github.com/migadu/sora/db"
@@ -17,49 +18,90 @@ import (
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
 type ManageSieveServer struct {
-	addr          string
-	hostname      string
-	db            *db.Database
-	appCtx        context.Context
-	tlsConfig     *tls.Config
-	useStartTLS   bool
-	insecureAuth  bool
-	maxScriptSize int64
+	addr               string
+	hostname           string
+	db                 *db.Database
+	appCtx             context.Context
+	cancel             context.CancelFunc
+	tlsConfig          *tls.Config
+	useStartTLS        bool
+	insecureAuth       bool
+	maxScriptSize      int64
+	masterSASLUsername []byte
+	masterSASLPassword []byte
 
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+	
+	// Connection limiting
+	limiter *server.ConnectionLimiter
+	
+	// PROXY protocol support
+	proxyReader *server.ProxyProtocolReader
+	
+	// Authentication rate limiting
+	authLimiter server.AuthLimiter
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth   bool
-	Debug          bool
-	TLS            bool
-	TLSCertFile    string
-	TLSKeyFile     string
-	TLSVerify      bool
-	TLSUseStartTLS bool
-	MaxScriptSize  int64
+	InsecureAuth       bool
+	Debug              bool
+	TLS                bool
+	TLSCertFile        string
+	TLSKeyFile         string
+	TLSVerify          bool
+	TLSUseStartTLS     bool
+	MaxScriptSize      int64
+	MasterSASLUsername string
+	MasterSASLPassword string
+	MaxConnections     int
+	MaxConnectionsPerIP int
+	ProxyProtocol      server.ProxyProtocolConfig
+	AuthRateLimit      server.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options ManageSieveServerOptions) (*ManageSieveServer, error) {
-	server := &ManageSieveServer{
-		hostname:      hostname,
-		addr:          addr,
-		db:            database,
-		appCtx:        appCtx,
-		useStartTLS:   options.TLSUseStartTLS,
-		insecureAuth:  options.InsecureAuth,
-		maxScriptSize: options.MaxScriptSize,
+	serverCtx, serverCancel := context.WithCancel(appCtx)
+
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if options.ProxyProtocol.Enabled {
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("ManageSieve", options.ProxyProtocol)
+		if err != nil {
+			serverCancel()
+			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
+		}
+	}
+
+	// Initialize enhanced authentication rate limiter
+	authLimiter := server.NewEnhancedAuthRateLimiterFromBasic("ManageSieve", options.AuthRateLimit, database)
+
+	serverInstance := &ManageSieveServer{
+		hostname:           hostname,
+		addr:               addr,
+		db:                 database,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
+		useStartTLS:        options.TLSUseStartTLS,
+		insecureAuth:       options.InsecureAuth,
+		maxScriptSize:      options.MaxScriptSize,
+		masterSASLUsername: []byte(options.MasterSASLUsername),
+		masterSASLPassword: []byte(options.MasterSASLPassword),
+		limiter:            server.NewConnectionLimiter("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP),
+		proxyReader:        proxyReader,
+		authLimiter:        authLimiter,
 	}
 
 	// Set up TLS config if TLS is enabled and certificates are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
+			serverCancel()
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
-		server.tlsConfig = &tls.Config{
+		serverInstance.tlsConfig = &tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			MinVersion:               tls.VersionTLS12,
 			ClientAuth:               tls.NoClientCert,
@@ -68,12 +110,15 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		}
 
 		if !options.TLSVerify {
-			server.tlsConfig.InsecureSkipVerify = true
+			serverInstance.tlsConfig.InsecureSkipVerify = true
 			log.Printf("WARNING: TLS certificate verification disabled for ManageSieve server")
 		}
 	}
 
-	return server, nil
+	// Start connection limiter cleanup
+	serverInstance.limiter.StartCleanup(serverCtx)
+
+	return serverInstance, nil
 }
 
 func (s *ManageSieveServer) Start(errChan chan error) {
@@ -100,11 +145,47 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// Wrap listener with PROXY protocol support if enabled
+	if s.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: s.proxyReader,
+		}
+	}
+
+	// Use a goroutine to monitor application context cancellation
+	go func() {
+		<-s.appCtx.Done()
+		log.Printf("* ManageSieve server shutting down due to context cancellation")
+		listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// Check if the error is due to the listener being closed
+			if s.appCtx.Err() != nil {
+				log.Printf("* ManageSieve server closed: %v", s.appCtx.Err())
+				return
+			}
+			
+			// Check if this is a PROXY protocol error (connection-specific, not fatal)
+			if strings.Contains(err.Error(), "PROXY protocol error") {
+				log.Printf("[ManageSieve] PROXY protocol error, rejecting connection: %v", err)
+				continue // Continue accepting other connections
+			}
+			
+			// For other errors, this might be a fatal server error
 			errChan <- err
 			return
+		}
+
+		// Check connection limits
+		releaseConn, err := s.limiter.Accept(conn.RemoteAddr())
+		if err != nil {
+			log.Printf("[ManageSieve] Connection rejected: %v", err)
+			conn.Close()
+			continue
 		}
 
 		// Increment total connections counter
@@ -114,15 +195,30 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 		session := &ManageSieveSession{
-			server: s,
-			conn:   &conn,
-			reader: bufio.NewReader(conn),
-			writer: bufio.NewWriter(conn),
-			ctx:    sessionCtx,
-			cancel: sessionCancel,
-			isTLS:  isImplicitTLS, // Initialize isTLS based on the listener type
+			server:      s,
+			conn:        &conn,
+			reader:      bufio.NewReader(conn),
+			writer:      bufio.NewWriter(conn),
+			ctx:         sessionCtx,
+			cancel:      sessionCancel,
+			isTLS:       isImplicitTLS, // Initialize isTLS based on the listener type
+			releaseConn: releaseConn,
 		}
 
+		// Extract real client IP and proxy IP from PROXY protocol if available
+		var proxyInfo *server.ProxyProtocolInfo
+		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
+			proxyInfo = proxyConn.GetProxyInfo()
+		}
+		
+		clientIP, proxyIP := server.GetConnectionIPs(conn, proxyInfo)
+		session.RemoteIP = clientIP
+		session.ProxyIP = proxyIP
+		session.Protocol = "ManageSieve"
+		session.Id = idgen.New()
+		session.HostName = session.server.hostname
+		session.Stats = s // Set the server as the Stats provider
+		
 		// Create logging function for the mutex helper
 		logFunc := func(format string, args ...interface{}) {
 			session.Log(format, args...)
@@ -131,24 +227,26 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// Initialize the mutex helper
 		session.mutexHelper = server.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
 
-		session.RemoteIP = (*session.conn).RemoteAddr().String()
-		session.Protocol = "ManageSieve"
-		session.Id = idgen.New()
-		session.HostName = session.server.hostname
-		session.Stats = s // Set the server as the Stats provider
-
+		// Build connection info for logging
+		var remoteInfo string
+		if session.ProxyIP != "" {
+			remoteInfo = fmt.Sprintf("%s proxy=%s", session.RemoteIP, session.ProxyIP)
+		} else {
+			remoteInfo = session.RemoteIP
+		}
 		// Log connection with connection counters
 		log.Printf("* ManageSieve new connection from %s (connections: total=%d, authenticated=%d)",
-			session.RemoteIP, totalCount, authCount)
+			remoteInfo, totalCount, authCount)
 
 		go session.handleConnection()
 	}
 }
 
 func (s *ManageSieveServer) Close() {
-	// The shared database connection pool is closed by main.go's defer.
-	// If ManageSieveServer had its own specific resources to close (e.g., a listener, which it doesn't),
-	// they would be closed here. For now, this can be a no-op or just log.
+	log.Printf("* ManageSieve server closing")
+	if s.cancel != nil {
+		s.cancel()
+	}
 }
 
 // GetTotalConnections returns the current total connection count
@@ -159,4 +257,40 @@ func (s *ManageSieveServer) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *ManageSieveServer) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
+}
+
+// proxyProtocolListener wraps a listener to handle PROXY protocol
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *server.ProxyProtocolReader
+}
+
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to read PROXY protocol header
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("PROXY protocol error: %w", err)
+	}
+
+	// Wrap the connection with proxy info for later extraction
+	return &proxyProtocolConn{
+		Conn:      wrappedConn,
+		proxyInfo: proxyInfo,
+	}, nil
+}
+
+// proxyProtocolConn wraps a connection with PROXY protocol information
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
+	return c.proxyInfo
 }

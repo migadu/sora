@@ -81,7 +81,7 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 }
 
 func (db *Database) SetMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to begin transaction for SetMessageFlags: %w", err)
 	}
@@ -116,7 +116,7 @@ func (db *Database) SetMessageFlags(ctx context.Context, messageUID imap.UID, ma
 }
 
 func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to begin transaction for AddMessageFlags: %w", err)
 	}
@@ -177,7 +177,7 @@ func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, ma
 }
 
 func (db *Database) RemoveMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.GetWritePool().Begin(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to begin transaction for RemoveMessageFlags: %w", err)
 	}
@@ -244,7 +244,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		  AND expunged_at IS NULL
 		  AND flag NOT LIKE '\%';
 	`
-	rows, err := db.Pool.Query(ctx, query, mailboxID)
+	rows, err := db.GetReadPool().Query(ctx, query, mailboxID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query unique custom flags for mailbox %d: %w", mailboxID, err)
 	}

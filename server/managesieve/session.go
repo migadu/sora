@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -26,9 +27,11 @@ type ManageSieveSession struct {
 	ctx           context.Context    // Context for this session
 	cancel        context.CancelFunc // Function to cancel the session's context
 
-	reader *bufio.Reader
-	writer *bufio.Writer
-	isTLS  bool
+	reader      *bufio.Reader
+	writer      *bufio.Writer
+	isTLS       bool
+	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
+	releaseConn func() // Function to release connection from limiter
 }
 
 func (s *ManageSieveSession) sendRawLine(line string) {
@@ -93,10 +96,60 @@ func (s *ManageSieveSession) handleConnection() {
 				continue
 			}
 
-			userID, err := s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
-			if err != nil {
-				s.sendResponse("NO Authentication failed\r\n")
-				continue
+			// Apply progressive authentication delay BEFORE any other checks
+			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+			server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN")
+
+			// Check authentication rate limiting after delay
+			if s.server.authLimiter != nil {
+				if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address.FullAddress()); err != nil {
+					s.Log("[LOGIN] rate limited: %v", err)
+					s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
+					continue
+				}
+			}
+
+			// Try master password authentication first
+			authSuccess := false
+			var userID int64
+			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+				if address.FullAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+					s.Log("[LOGIN] Master password authentication successful for '%s'", address.FullAddress())
+					authSuccess = true
+					// For master password, we need to get the user ID
+					userID, err = s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+					if err != nil {
+						s.Log("[LOGIN] Failed to get account ID for master user '%s': %v", address.FullAddress(), err)
+						// Record failed attempt
+						if s.server.authLimiter != nil {
+							remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+							s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+						}
+						s.sendResponse("NO Authentication failed\r\n")
+						continue
+					}
+				}
+			}
+
+			// If master password didn't work, try regular authentication
+			if !authSuccess {
+				userID, err = s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
+				if err != nil {
+					// Record failed attempt
+					if s.server.authLimiter != nil {
+						remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+						s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+					}
+					s.sendResponse("NO Authentication failed\r\n")
+					continue
+				}
+				authSuccess = true
+			}
+
+			// Record successful attempt
+			if s.server.authLimiter != nil {
+				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
 			}
 
 			// Acquire write lock for updating session authentication state
@@ -118,6 +171,9 @@ func (s *ManageSieveSession) handleConnection() {
 			s.Log("user %s authenticated (connections: total=%d, authenticated=%d)",
 				address.FullAddress(), totalCount, authCount)
 			s.sendResponse("OK Authenticated\r\n")
+
+		case "AUTHENTICATE":
+			s.handleAuthenticate(parts)
 
 		case "LISTSCRIPTS":
 			if !s.authenticated {
@@ -253,17 +309,29 @@ func (s *ManageSieveSession) handleCapability() {
 }
 
 func (s *ManageSieveSession) handleListScripts() {
-	// Acquire write lock for accessing database
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	// Acquire a read lock only to get the necessary session state.
+	// A write lock is not needed for a read-only command.
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for ListScripts command")
+		s.Log("WARNING: failed to acquire read lock for ListScripts command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return
 	}
-	defer s.mutex.Unlock()
 
-	scripts, err := s.server.db.GetUserScripts(s.ctx, s.UserID())
+	// Copy the necessary state under lock.
+	userID := s.UserID()
+	useMaster := s.useMasterDB
+
+	// Release the lock before the database call.
+	s.mutex.RUnlock()
+	cancel()
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if useMaster {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	scripts, err := s.server.db.GetUserScripts(readCtx, userID)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return
@@ -286,17 +354,29 @@ func (s *ManageSieveSession) handleListScripts() {
 }
 
 func (s *ManageSieveSession) handleGetScript(name string) {
-	// Acquire write lock for accessing database
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	// Acquire a read lock only to get the necessary session state.
+	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for GetScript command")
+		s.Log("WARNING: failed to acquire read lock for GetScript command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return
 	}
-	defer s.mutex.Unlock()
 
-	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
+	// Copy the necessary state under lock.
+	userID := s.UserID()
+	useMaster := s.useMasterDB
+
+	// Release the lock before the database call.
+	s.mutex.RUnlock()
+	cancel()
+
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if useMaster {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	script, err := s.server.db.GetScriptByName(readCtx, name, userID)
 	if err != nil {
 		s.sendResponse("NO No such script\r\n")
 		return
@@ -331,7 +411,13 @@ func (s *ManageSieveSession) handlePutScript(name, content string) {
 		return
 	}
 
-	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
 	if err != nil {
 		if err != consts.ErrDBNotFound {
 			s.sendResponse("NO Internal server error\r\n")
@@ -344,6 +430,8 @@ func (s *ManageSieveSession) handlePutScript(name, content string) {
 			s.sendResponse("NO Internal server error\r\n")
 			return
 		}
+		// Pin this session to the master DB to ensure read-your-writes consistency
+		s.useMasterDB = true
 		s.sendResponse("OK Script updated\r\n")
 		return
 	}
@@ -353,6 +441,8 @@ func (s *ManageSieveSession) handlePutScript(name, content string) {
 		s.sendResponse("NO Internal server error\r\n")
 		return
 	}
+	// Pin this session to the master DB to ensure read-your-writes consistency
+	s.useMasterDB = true
 	s.sendResponse("OK Script stored\r\n")
 }
 
@@ -367,7 +457,13 @@ func (s *ManageSieveSession) handleSetActive(name string) {
 	}
 	defer s.mutex.Unlock()
 
-	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n")
@@ -392,6 +488,8 @@ func (s *ManageSieveSession) handleSetActive(name string) {
 		return
 	}
 
+	// Pin this session to the master DB to ensure read-your-writes consistency
+	s.useMasterDB = true
 	s.sendResponse("OK Script activated\r\n")
 }
 
@@ -406,7 +504,13 @@ func (s *ManageSieveSession) handleDeleteScript(name string) {
 	}
 	defer s.mutex.Unlock()
 
-	script, err := s.server.db.GetScriptByName(s.ctx, name, s.UserID())
+	// Create a context for read operations that respects session pinning
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n") // RFC uses NO for "No such script"
@@ -421,6 +525,8 @@ func (s *ManageSieveSession) handleDeleteScript(name string) {
 		s.sendResponse("NO Internal server error\r\n")
 		return
 	}
+	// Pin this session to the master DB to ensure read-your-writes consistency
+	s.useMasterDB = true
 	s.sendResponse("OK Script deleted\r\n")
 }
 
@@ -440,6 +546,13 @@ func (s *ManageSieveSession) Close() error {
 	var authCount int64 = 0
 
 	(*s.conn).Close()
+
+	// Release connection from limiter
+	if s.releaseConn != nil {
+		s.releaseConn()
+		s.releaseConn = nil // Prevent double release
+	}
+
 	if s.User != nil {
 		// If authenticated, decrement the authenticated connections counter
 		if s.authenticated {
@@ -461,4 +574,180 @@ func (s *ManageSieveSession) Close() error {
 			totalCount, authCount)
 	}
 	return nil
+}
+
+func (s *ManageSieveSession) handleAuthenticate(parts []string) {
+	if len(parts) < 2 {
+		s.sendResponse("NO Syntax: AUTHENTICATE mechanism\r\n")
+		return
+	}
+
+	mechanism := strings.ToUpper(parts[1])
+	if mechanism != "PLAIN" {
+		s.sendResponse("NO Unsupported authentication mechanism\r\n")
+		return
+	}
+
+	// Check if initial response is provided
+	var authData string
+	if len(parts) > 2 {
+		// Initial response provided - need to decode from base64
+		authData = parts[2]
+	} else {
+		// No initial response, send continuation
+		s.sendResponse("\"\"\r\n")
+
+		// Read the authentication data
+		authLine, err := s.reader.ReadString('\n')
+		if err != nil {
+			s.Log("error reading auth data: %v", err)
+			s.sendResponse("NO Authentication failed\r\n")
+			return
+		}
+		authData = strings.TrimSpace(authLine)
+
+		// Check for cancellation
+		if authData == "*" {
+			s.sendResponse("NO Authentication cancelled\r\n")
+			return
+		}
+	}
+
+	// Decode base64
+	decoded, err := base64.StdEncoding.DecodeString(authData)
+	if err != nil {
+		s.Log("error decoding auth data: %v", err)
+		s.sendResponse("NO Invalid authentication data\r\n")
+		return
+	}
+
+	// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
+	parts = strings.Split(string(decoded), "\x00")
+	if len(parts) != 3 {
+		s.Log("invalid SASL PLAIN format")
+		s.sendResponse("NO Invalid authentication format\r\n")
+		return
+	}
+
+	authzID := parts[0]  // Authorization identity (who to act as)
+	authnID := parts[1]  // Authentication identity (who is authenticating)
+	password := parts[2] // Password
+
+	s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
+
+	// Check for Master SASL Authentication
+	var userID int64
+	var impersonating bool
+	var targetAddress *server.Address
+
+	if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+		// Check if this is a master SASL login
+		if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+			// Master SASL authentication successful
+			if authzID == "" {
+				s.Log("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity provided.", authnID)
+				s.sendResponse("NO Master SASL login requires an authorization identity.\r\n")
+				return
+			}
+
+			s.Log("[AUTH] Master SASL user '%s' authenticated. Attempting to impersonate '%s'.", authnID, authzID)
+
+			// Log in as the authzID without a password check
+			address, err := server.NewAddress(authzID)
+			if err != nil {
+				s.Log("[AUTH] Failed to parse impersonation target user '%s': %v", authzID, err)
+				s.sendResponse("NO Invalid impersonation target user format\r\n")
+				return
+			}
+
+			userID, err = s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+			if err != nil {
+				s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
+				s.sendResponse("NO Impersonation target user not found\r\n")
+				return
+			}
+
+			targetAddress = &address
+			impersonating = true
+		}
+	}
+
+	// If not using master SASL, perform regular authentication
+	if !impersonating {
+		// For regular ManageSieve, we don't support proxy authentication
+		if authzID != "" && authzID != authnID {
+			s.Log("proxy authentication not supported: authz='%s', authn='%s'", authzID, authnID)
+			s.sendResponse("NO Proxy authentication not supported\r\n")
+			return
+		}
+
+		// Authenticate the user
+		address, err := server.NewAddress(authnID)
+		if err != nil {
+			s.Log("invalid address format: %v", err)
+			s.sendResponse("NO Invalid username format\r\n")
+			return
+		}
+
+		s.Log("authentication attempt for %s", address.FullAddress())
+
+		// Apply progressive authentication delay BEFORE any other checks
+		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+		server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL")
+
+		// Check authentication rate limiting after delay
+		if s.server.authLimiter != nil {
+			if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address.FullAddress()); err != nil {
+				s.Log("[SASL PLAIN] rate limited: %v", err)
+				s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
+				return
+			}
+		}
+
+		userID, err = s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
+		if err != nil {
+			// Record failed attempt
+			if s.server.authLimiter != nil {
+				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+			}
+			s.sendResponse("NO Authentication failed\r\n")
+			s.Log("authentication failed")
+			return
+		}
+
+		// Record successful attempt
+		if s.server.authLimiter != nil {
+			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
+		}
+
+		targetAddress = &address
+	}
+
+	// Acquire write lock for updating session authentication state
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	defer cancel()
+	if !acquired {
+		s.Log("WARNING: failed to acquire write lock for Authenticate command")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return
+	}
+
+	s.authenticated = true
+	s.User = server.NewUser(*targetAddress, userID)
+	s.mutex.Unlock()
+
+	// Increment authenticated connections counter
+	authCount := s.server.authenticatedConnections.Add(1)
+	totalCount := s.server.totalConnections.Load()
+	if impersonating {
+		s.Log("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
+			targetAddress.FullAddress(), totalCount, authCount)
+	} else {
+		s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
+			totalCount, authCount)
+	}
+
+	s.sendResponse("OK Authenticated\r\n")
 }

@@ -17,7 +17,7 @@ import (
 )
 
 func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID, srcMailboxID int64, destMailboxID int64, destMailboxName string) (imap.UID, error) {
-	tx, err := d.Pool.Begin(ctx)
+	tx, err := d.GetWritePool().Begin(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, consts.ErrDBBeginTransactionFailed
@@ -126,18 +126,18 @@ type InsertMessageOptions struct {
 	ContentHash string
 	MessageID   string
 	// CustomFlags are handled by splitting options.Flags in InsertMessage
-	Flags         []imap.Flag
-	InternalDate  time.Time
-	Size          int64
-	Subject       string
-	PlaintextBody string
-	SentDate      time.Time
-	InReplyTo     []string
-	BodyStructure *imap.BodyStructure
-	Recipients    []helpers.Recipient
-	RawHeaders    string
-	PreservedUID  *uint32          // Optional: preserved UID from import
-	PreservedUIDValidity *uint32  // Optional: preserved UIDVALIDITY from import
+	Flags                []imap.Flag
+	InternalDate         time.Time
+	Size                 int64
+	Subject              string
+	PlaintextBody        string
+	SentDate             time.Time
+	InReplyTo            []string
+	BodyStructure        *imap.BodyStructure
+	Recipients           []helpers.Recipient
+	RawHeaders           string
+	PreservedUID         *uint32 // Optional: preserved UID from import
+	PreservedUIDValidity *uint32 // Optional: preserved UIDVALIDITY from import
 }
 
 func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -158,7 +158,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 		options.InternalDate = time.Now()
 	}
 
-	tx, err := d.Pool.Begin(ctx)
+	tx, err := d.GetWritePool().Begin(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, 0, consts.ErrDBBeginTransactionFailed
@@ -281,12 +281,13 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	}
 
 	_, err = tx.Exec(ctx, `
-	INSERT INTO pending_uploads (instance_id, content_hash, size, created_at)
-	VALUES ($1, $2, $3, $4) ON CONFLICT (content_hash) DO NOTHING`,
+	INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+	VALUES ($1, $2, $3, $4, $5) ON CONFLICT (content_hash, account_id) DO NOTHING`,
 		upload.InstanceID,
-		options.ContentHash,
+		upload.ContentHash,
 		upload.Size,
 		time.Now(),
+		upload.AccountID,
 	)
 
 	if err := tx.Commit(ctx); err != nil {
@@ -315,7 +316,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 		options.InternalDate = time.Now()
 	}
 
-	tx, err := d.Pool.Begin(ctx)
+	tx, err := d.GetWritePool().Begin(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, 0, consts.ErrDBBeginTransactionFailed
@@ -328,25 +329,25 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 	// If we have a preserved UID, use it; otherwise generate a new one
 	if options.PreservedUID != nil {
 		uidToUse = int64(*options.PreservedUID)
-		
+
 		// Update highest_uid if preserved UID is higher
 		err = tx.QueryRow(ctx, `
 			UPDATE mailboxes 
 			SET highest_uid = GREATEST(highest_uid, $2)
 			WHERE id = $1 
-			RETURNING highest_uid`, 
+			RETURNING highest_uid`,
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
 			log.Printf("[DB] failed to update highest UID with preserved UID: %v", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
-		
+
 		// If we have a preserved UIDVALIDITY, update it
 		if options.PreservedUIDValidity != nil {
 			_, err = tx.Exec(ctx, `
 				UPDATE mailboxes 
 				SET uid_validity = $2
-				WHERE id = $1`, 
+				WHERE id = $1`,
 				options.MailboxID, *options.PreservedUIDValidity)
 			if err != nil {
 				log.Printf("[DB] failed to update UIDVALIDITY: %v", err)

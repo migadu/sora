@@ -17,7 +17,7 @@ type VacationResponse struct {
 // RecordVacationResponse records that a vacation response was sent to a specific sender
 func (db *Database) RecordVacationResponse(ctx context.Context, userID int64, senderAddress string) error {
 	now := time.Now()
-	_, err := db.Pool.Exec(ctx, `
+	_, err := db.GetWritePool().Exec(ctx, `
 		INSERT INTO vacation_responses (account_id, sender_address, response_date, created_at)
 		VALUES ($1, $2, $3, $4)
 	`, userID, senderAddress, now, now)
@@ -30,7 +30,7 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, userID int64,
 	cutoffTime := time.Now().Add(-duration)
 
 	var exists bool
-	err := db.Pool.QueryRow(ctx, `
+	err := db.GetReadPool().QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM vacation_responses 
 			WHERE account_id = $1 
@@ -46,7 +46,7 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, userID int64,
 func (db *Database) CleanupOldVacationResponses(ctx context.Context, olderThan time.Duration) (int64, error) {
 	cutoffTime := time.Now().Add(-olderThan)
 
-	result, err := db.Pool.Exec(ctx, `
+	result, err := db.GetWritePool().Exec(ctx, `
 		DELETE FROM vacation_responses
 		WHERE response_date < $1
 	`, cutoffTime)

@@ -42,22 +42,48 @@ type IMAPServer struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+
+	// Connection limiting
+	limiter *serverPkg.ConnectionLimiter
+
+	// Authentication rate limiting
+	authLimiter serverPkg.AuthLimiter
+
+	// PROXY protocol support
+	proxyReader *serverPkg.ProxyProtocolReader
 }
 
 type IMAPServerOptions struct {
-	Debug              bool
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	MasterUsername     []byte
-	MasterPassword     []byte
-	MasterSASLUsername []byte
-	MasterSASLPassword []byte
-	AppendLimit        int64
+	Debug               bool
+	TLS                 bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSVerify           bool
+	MasterUsername      []byte
+	MasterPassword      []byte
+	MasterSASLUsername  []byte
+	MasterSASLPassword  []byte
+	AppendLimit         int64
+	MaxConnections      int
+	MaxConnectionsPerIP int
+	ProxyProtocol       serverPkg.ProxyProtocolConfig
+	AuthRateLimit       serverPkg.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *serverPkg.ProxyProtocolReader
+	if options.ProxyProtocol.Enabled {
+		var err error
+		proxyReader, err = serverPkg.NewProxyProtocolReader("IMAP", options.ProxyProtocol)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
+		}
+	}
+
+	// Initialize enhanced authentication rate limiter
+	authLimiter := serverPkg.NewEnhancedAuthRateLimiterFromBasic("IMAP", options.AuthRateLimit, database)
+
 	s := &IMAPServer{
 		hostname:    hostname,
 		appCtx:      appCtx,
@@ -67,6 +93,9 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		uploader:    uploadWorker,
 		cache:       cache,
 		appendLimit: options.AppendLimit,
+		limiter:     serverPkg.NewConnectionLimiter("IMAP", options.MaxConnections, options.MaxConnectionsPerIP),
+		authLimiter: authLimiter,
+		proxyReader: proxyReader,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:   struct{}{},
 			imap.CapLiteralPlus: struct{}{},
@@ -132,22 +161,42 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		TLSConfig:    s.tlsConfig,
 	})
 
+	// Start connection limiter cleanup
+	s.limiter.StartCleanup(appCtx)
+
 	return s, nil
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	// Check connection limits
+	releaseConn, err := s.limiter.Accept(conn.NetConn().RemoteAddr())
+	if err != nil {
+		log.Printf("[IMAP] Connection rejected: %v", err)
+		return nil, nil, fmt.Errorf("connection limit exceeded: %w", err)
+	}
+
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	totalCount := s.totalConnections.Add(1)
 
 	session := &IMAPSession{
-		server: s,
-		conn:   conn,
-		ctx:    sessionCtx,
-		cancel: sessionCancel,
+		server:      s,
+		conn:        conn,
+		ctx:         sessionCtx,
+		cancel:      sessionCancel,
+		releaseConn: releaseConn,
 	}
 
-	session.RemoteIP = conn.NetConn().RemoteAddr().String()
+	// Extract real client IP and proxy IP from PROXY protocol if available
+	netConn := conn.NetConn()
+	var proxyInfo *serverPkg.ProxyProtocolInfo
+	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
+		proxyInfo = proxyConn.GetProxyInfo()
+	}
+
+	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
+	session.RemoteIP = clientIP
+	session.ProxyIP = proxyIP
 	session.Protocol = "IMAP"
 	session.Id = idgen.New()
 	session.HostName = s.hostname
@@ -183,6 +232,14 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	}
 	defer listener.Close()
 
+	// Wrap listener with PROXY protocol support if enabled
+	if s.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: s.proxyReader,
+		}
+	}
+
 	return s.server.Serve(listener)
 }
 
@@ -202,4 +259,42 @@ func (s *IMAPServer) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *IMAPServer) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
+}
+
+// proxyProtocolListener wraps a listener to handle PROXY protocol
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *serverPkg.ProxyProtocolReader
+}
+
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to read PROXY protocol header
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		conn.Close()
+		// Log but don't crash - let the server continue accepting other connections
+		log.Printf("[IMAP] PROXY protocol error, rejecting connection: %v", err)
+		return nil, fmt.Errorf("PROXY protocol error: %w", err)
+	}
+
+	// Wrap the connection with proxy info for later extraction
+	return &proxyProtocolConn{
+		Conn:      wrappedConn,
+		proxyInfo: proxyInfo,
+	}, nil
+}
+
+// proxyProtocolConn wraps a connection with PROXY protocol information
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *serverPkg.ProxyProtocolInfo
+}
+
+func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
+	return c.proxyInfo
 }

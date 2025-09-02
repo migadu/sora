@@ -16,7 +16,7 @@ func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
 	now := time.Now().UTC()
 	expiresAt := now.Add(LOCK_TIMEOUT)
 	
-	result, err := d.Pool.Exec(ctx, `
+	result, err := d.GetWritePool().Exec(ctx, `
 		INSERT INTO locks (lock_name, acquired_at, expires_at) 
 		VALUES ($1, $2, $3)
 		ON CONFLICT (lock_name) DO UPDATE SET
@@ -34,11 +34,11 @@ func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
 }
 
 func (d *Database) ReleaseCleanupLock(ctx context.Context) {
-	_, _ = d.Pool.Exec(ctx, `DELETE FROM locks WHERE lock_name = $1`, CLEANUP_LOCK_NAME)
+	_, _ = d.GetWritePool().Exec(ctx, `DELETE FROM locks WHERE lock_name = $1`, CLEANUP_LOCK_NAME)
 }
 
 func (d *Database) DeleteExpungedMessagesByContentHash(ctx context.Context, contentHash string) error {
-	tx, err := d.Pool.Begin(ctx)
+	tx, err := d.GetWritePool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction for content hash %s cleanup: %w", contentHash, err)
 	}
@@ -78,7 +78,7 @@ func (d *Database) DeleteExpungedMessagesByContentHash(ctx context.Context, cont
 func (d *Database) ExpungeOldMessages(ctx context.Context, olderThan time.Duration) (int64, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
 
-	result, err := d.Pool.Exec(ctx, `
+	result, err := d.GetWritePool().Exec(ctx, `
 		UPDATE messages
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
 		WHERE created_at < $1 AND expunged_at IS NULL
@@ -96,7 +96,7 @@ func (d *Database) ExpungeOldMessages(ctx context.Context, olderThan time.Durati
 // These content_hash values are candidates for complete removal from S3, message_contents, and messages table.
 func (d *Database) GetContentHashesForFullCleanup(ctx context.Context, olderThan time.Duration, limit int) ([]string, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
-	rows, err := d.Pool.Query(ctx, `
+	rows, err := d.GetReadPool().Query(ctx, `
 		WITH deletable_hashes AS (
 			SELECT content_hash
 			FROM messages m

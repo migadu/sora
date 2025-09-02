@@ -1,0 +1,79 @@
+package retry
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"math/rand"
+	"time"
+)
+
+type BackoffConfig struct {
+	InitialInterval time.Duration
+	MaxInterval     time.Duration
+	Multiplier      float64
+	Jitter          bool
+	MaxRetries      int
+}
+
+func DefaultBackoffConfig() BackoffConfig {
+	return BackoffConfig{
+		InitialInterval: 1 * time.Second,
+		MaxInterval:     30 * time.Second,
+		Multiplier:      2.0,
+		Jitter:          true,
+		MaxRetries:      5,
+	}
+}
+
+func ExponentialBackoff(config BackoffConfig) func(int) time.Duration {
+	return func(attempt int) time.Duration {
+		if attempt <= 0 {
+			return config.InitialInterval
+		}
+
+		interval := float64(config.InitialInterval) * math.Pow(config.Multiplier, float64(attempt-1))
+		
+		if interval > float64(config.MaxInterval) {
+			interval = float64(config.MaxInterval)
+		}
+
+		duration := time.Duration(interval)
+		
+		if config.Jitter {
+			jitter := time.Duration(rand.Int63n(int64(duration/2)))
+			duration = duration/2 + jitter
+		}
+
+		return duration
+	}
+}
+
+type RetryableFunc func() error
+
+func WithRetry(ctx context.Context, fn RetryableFunc, config BackoffConfig) error {
+	backoff := ExponentialBackoff(config)
+	
+	var lastErr error
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := backoff(attempt)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("retry cancelled by context: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		if err := fn(); err != nil {
+			lastErr = err
+			if attempt < config.MaxRetries {
+				continue
+			}
+		} else {
+			return nil
+		}
+	}
+	
+	return fmt.Errorf("operation failed after %d attempts: %w", config.MaxRetries+1, lastErr)
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/storage"
@@ -18,10 +20,10 @@ import (
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database   DatabaseConfig   `toml:"database"`
-	S3         S3Config         `toml:"s3"`
-	LocalCache LocalCacheConfig `toml:"local_cache"`
-	Uploader   UploaderConfig   `toml:"uploader"`
+	Database   config.DatabaseConfig `toml:"database"`
+	S3         S3Config              `toml:"s3"`
+	LocalCache LocalCacheConfig      `toml:"local_cache"`
+	Uploader   UploaderConfig        `toml:"uploader"`
 }
 
 // S3Config holds S3 configuration - copied from main config
@@ -34,17 +36,6 @@ type S3Config struct {
 	Trace         bool   `toml:"trace"`
 	Encrypt       bool   `toml:"encrypt"`
 	EncryptionKey string `toml:"encryption_key"`
-}
-
-// DatabaseConfig holds database configuration - copied from main config
-type DatabaseConfig struct {
-	Host       string `toml:"host"`
-	Port       string `toml:"port"`
-	User       string `toml:"user"`
-	Password   string `toml:"password"`
-	Name       string `toml:"name"`
-	TLSMode    bool   `toml:"tls"`
-	LogQueries bool   `toml:"log_queries"`
 }
 
 // LocalCacheConfig holds cache configuration - copied from main config
@@ -65,14 +56,22 @@ type UploaderConfig struct {
 
 func newDefaultAdminConfig() AdminConfig {
 	return AdminConfig{
-		Database: DatabaseConfig{
-			Host:       "localhost",
-			Port:       "5432",
-			User:       "postgres",
-			Password:   "",
-			Name:       "sora_mail_db",
-			TLSMode:    false,
+		Database: config.DatabaseConfig{
 			LogQueries: false,
+			Write: &config.DatabaseEndpointConfig{
+				Hosts:    []string{"localhost:5432"},
+				User:     "postgres",
+				Password: "",
+				Name:     "sora_mail_db",
+				TLSMode:  false,
+			},
+			Read: &config.DatabaseEndpointConfig{
+				Hosts:    []string{"localhost:5432"},
+				User:     "postgres",
+				Password: "",
+				Name:     "sora_mail_db",
+				TLSMode:  false,
+			},
 		},
 		S3: S3Config{
 			Endpoint:      "",
@@ -124,6 +123,14 @@ func main() {
 		handleCachePurge()
 	case "uploader-status":
 		handleUploaderStatus()
+	case "connection-stats":
+		handleConnectionStats()
+	case "kick-connections":
+		handleKickConnections()
+	case "auth-stats":
+		handleAuthStats()
+	case "health-status":
+		handleHealthStatus()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -149,6 +156,10 @@ Commands:
   cache-stats       Show local cache size and object count
   cache-purge       Clear all cached objects
   uploader-status   Show uploader queue status and failed uploads
+  connection-stats  Show active proxy connections and statistics
+  kick-connections  Force disconnect proxy connections
+  auth-stats        Show authentication statistics and blocked IPs
+  health-status     Show system health status and component monitoring
   help              Show this help message
 
 Examples:
@@ -157,8 +168,11 @@ Examples:
   sora-admin update-account --email user@example.com --password newpassword
   sora-admin list-credentials --email user@example.com
   sora-admin cache-stats --config /path/to/config.toml
+  sora-admin auth-stats --window 1h --blocked
   sora-admin cache-purge --config /path/to/config.toml
   sora-admin uploader-status --config /path/to/config.toml
+  sora-admin connection-stats --config /path/to/config.toml
+  sora-admin kick-connections --user user@example.com
 
 Use 'sora-admin <command> --help' for more information about a command.
 `)
@@ -173,14 +187,6 @@ func handleCreateAccount() {
 	password := fs.String("password", "", "Password for the new account (required)")
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
-	// Database connection flags (overrides from config file)
-	dbHost := fs.String("dbhost", "", "Database host (overrides config)")
-	dbPort := fs.String("dbport", "", "Database port (overrides config)")
-	dbUser := fs.String("dbuser", "", "Database user (overrides config)")
-	dbPassword := fs.String("dbpassword", "", "Database password (overrides config)")
-	dbName := fs.String("dbname", "", "Database name (overrides config)")
-	dbTLS := fs.Bool("dbtls", false, "Enable TLS for database connection (overrides config)")
-
 	fs.Usage = func() {
 		fmt.Printf(`Create a new account
 
@@ -192,14 +198,6 @@ Options:
   --password string    Password for the new account (required)
   --hash string        Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
   --config string      Path to TOML configuration file (default: config.toml)
-  
-Database Options:
-  --dbhost string      Database host (overrides config)
-  --dbport string      Database port (overrides config)
-  --dbuser string      Database user (overrides config)
-  --dbpassword string  Database password (overrides config)
-  --dbname string      Database name (overrides config)
-  --dbtls              Enable TLS for database connection (overrides config)
 
 Examples:
   sora-admin create-account --email user@example.com --password mypassword
@@ -254,26 +252,6 @@ Examples:
 		}
 	}
 
-	// Apply command-line flag overrides
-	if isFlagSet(fs, "dbhost") {
-		cfg.Database.Host = *dbHost
-	}
-	if isFlagSet(fs, "dbport") {
-		cfg.Database.Port = *dbPort
-	}
-	if isFlagSet(fs, "dbuser") {
-		cfg.Database.User = *dbUser
-	}
-	if isFlagSet(fs, "dbpassword") {
-		cfg.Database.Password = *dbPassword
-	}
-	if isFlagSet(fs, "dbname") {
-		cfg.Database.Name = *dbName
-	}
-	if isFlagSet(fs, "dbtls") {
-		cfg.Database.TLSMode = *dbTLS
-	}
-
 	// Create the account (always as primary identity)
 	if err := createAccount(cfg, *email, *password, true, *hashType); err != nil {
 		log.Fatalf("Failed to create account: %v", err)
@@ -294,12 +272,6 @@ func handleAddCredential() {
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
 	// Database connection flags (overrides from config file)
-	dbHost := fs.String("dbhost", "", "Database host (overrides config)")
-	dbPort := fs.String("dbport", "", "Database port (overrides config)")
-	dbUser := fs.String("dbuser", "", "Database user (overrides config)")
-	dbPassword := fs.String("dbpassword", "", "Database password (overrides config)")
-	dbName := fs.String("dbname", "", "Database name (overrides config)")
-	dbTLS := fs.Bool("dbtls", false, "Enable TLS for database connection (overrides config)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Add a credential to an existing account
@@ -314,14 +286,6 @@ Options:
   --make-primary        Make this the new primary identity for the account
   --hash string         Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
   --config string       Path to TOML configuration file (default: config.toml)
-  
-Database Options:
-  --dbhost string       Database host (overrides config)
-  --dbport string       Database port (overrides config)
-  --dbuser string       Database user (overrides config)
-  --dbpassword string   Database password (overrides config)
-  --dbname string       Database name (overrides config)
-  --dbtls               Enable TLS for database connection (overrides config)
 
 Examples:
   sora-admin add-credential --primary admin@example.com --email alias@example.com --password mypassword
@@ -382,26 +346,6 @@ Examples:
 		}
 	}
 
-	// Apply command-line flag overrides
-	if isFlagSet(fs, "dbhost") {
-		cfg.Database.Host = *dbHost
-	}
-	if isFlagSet(fs, "dbport") {
-		cfg.Database.Port = *dbPort
-	}
-	if isFlagSet(fs, "dbuser") {
-		cfg.Database.User = *dbUser
-	}
-	if isFlagSet(fs, "dbpassword") {
-		cfg.Database.Password = *dbPassword
-	}
-	if isFlagSet(fs, "dbname") {
-		cfg.Database.Name = *dbName
-	}
-	if isFlagSet(fs, "dbtls") {
-		cfg.Database.TLSMode = *dbTLS
-	}
-
 	// Add the credential
 	if err := addCredential(cfg, *primaryIdentity, *email, *password, *makePrimary, *hashType); err != nil {
 		log.Fatalf("Failed to add credential: %v", err)
@@ -414,14 +358,7 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 	ctx := context.Background()
 
 	// Connect to database
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -442,18 +379,209 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 	return nil
 }
 
+func handleKickConnections() {
+	// Parse kick-connections specific flags
+	fs := flag.NewFlagSet("kick-connections", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	userEmail := fs.String("user", "", "Kick all connections for specific user email")
+	protocol := fs.String("protocol", "", "Kick connections using specific protocol (IMAP, POP3, ManageSieve)")
+	server := fs.String("server", "", "Kick connections to specific server")
+	clientAddr := fs.String("client", "", "Kick connection from specific client address")
+	all := fs.Bool("all", false, "Kick all active connections")
+	confirm := fs.Bool("confirm", false, "Confirm kick without interactive prompt")
+
+	// Database connection flags (overrides from config file)
+
+	fs.Usage = func() {
+		fmt.Printf(`Force disconnect proxy connections
+
+Usage:
+  sora-admin kick-connections [options]
+
+Options:
+  --user string         Kick all connections for specific user email
+  --protocol string     Kick connections using specific protocol (IMAP, POP3, ManageSieve)
+  --server string       Kick connections to specific server
+  --client string       Kick connection from specific client address
+  --all                 Kick all active connections
+  --confirm             Confirm kick without interactive prompt
+  --config string       Path to TOML configuration file (default: config.toml)
+
+This command marks connections for termination. The proxy servers check for
+termination marks every 30 seconds and will close marked connections.
+
+At least one filtering option (--user, --protocol, --server, --client, or --all) must be specified.
+
+Examples:
+  sora-admin kick-connections --user user@example.com
+  sora-admin kick-connections --user user@example.com --protocol IMAP
+  sora-admin kick-connections --server 127.0.0.1:143
+  sora-admin kick-connections --all --confirm
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate that at least one filter is specified
+	if *userEmail == "" && *protocol == "" && *server == "" && *clientAddr == "" && !*all {
+		fmt.Printf("Error: At least one filtering option must be specified\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Validate protocol if specified
+	if *protocol != "" {
+		validProtocols := []string{"IMAP", "POP3", "ManageSieve"}
+		valid := false
+		for _, p := range validProtocols {
+			if strings.EqualFold(*protocol, p) {
+				valid = true
+				*protocol = p // Normalize case
+				break
+			}
+		}
+		if !valid {
+			fmt.Printf("Error: Invalid protocol. Must be one of: %s\n\n", strings.Join(validProtocols, ", "))
+			fs.Usage()
+			os.Exit(1)
+		}
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Kick connections
+	if err := kickConnections(cfg, *userEmail, *protocol, *server, *clientAddr, *all, *confirm); err != nil {
+		log.Fatalf("Failed to kick connections: %v", err)
+	}
+}
+
+func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Build criteria
+	criteria := db.TerminationCriteria{
+		Email:      userEmail,
+		Protocol:   protocol,
+		ServerAddr: serverAddr,
+		ClientAddr: clientAddr,
+	}
+
+	// Get preview of what will be kicked
+	stats, err := database.GetConnectionStats(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get connection stats: %w", err)
+	}
+
+	// Count matching connections
+	matchCount := 0
+	for _, conn := range stats.Users {
+		if matches(conn, criteria, all) {
+			matchCount++
+		}
+	}
+
+	if matchCount == 0 {
+		fmt.Println("No matching connections found.")
+		return nil
+	}
+
+	// Show what will be kicked
+	fmt.Printf("Connections to be kicked:\n")
+	fmt.Printf("%-30s %-12s %-21s %-21s\n", "Email", "Protocol", "Client Address", "Server Address")
+	fmt.Printf("%s\n", strings.Repeat("-", 84))
+
+	for _, conn := range stats.Users {
+		if matches(conn, criteria, all) {
+			fmt.Printf("%-30s %-12s %-21s %-21s\n",
+				conn.Email,
+				conn.Protocol,
+				conn.ClientAddr,
+				conn.ServerAddr)
+		}
+	}
+
+	fmt.Printf("\nTotal connections to kick: %d\n", matchCount)
+
+	// Confirm if not auto-confirmed
+	if !autoConfirm {
+		fmt.Printf("\nAre you sure you want to kick these connections? (y/N): ")
+		var response string
+		if _, err := fmt.Scanln(&response); err != nil {
+			return fmt.Errorf("failed to read confirmation: %w", err)
+		}
+
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			fmt.Println("Operation cancelled.")
+			return nil
+		}
+	}
+
+	// Mark connections for termination
+	affected, err := database.MarkConnectionsForTermination(ctx, criteria)
+	if err != nil {
+		return fmt.Errorf("failed to mark connections for termination: %w", err)
+	}
+
+	fmt.Printf("\n%d connections marked for termination.\n", affected)
+	fmt.Println("Connections will be closed within a few seconds.")
+	return nil
+}
+
+// matches checks if a connection matches the given criteria
+func matches(conn db.ConnectionInfo, criteria db.TerminationCriteria, all bool) bool {
+	if all {
+		return true
+	}
+
+	// Check each criteria
+	if criteria.Email != "" && !strings.EqualFold(conn.Email, criteria.Email) {
+		return false
+	}
+
+	if criteria.Protocol != "" && conn.Protocol != criteria.Protocol {
+		return false
+	}
+
+	if criteria.ServerAddr != "" && conn.ServerAddr != criteria.ServerAddr {
+		return false
+	}
+
+	if criteria.ClientAddr != "" && conn.ClientAddr != criteria.ClientAddr {
+		return false
+	}
+
+	// If we get here, all specified criteria matched
+	return criteria.Email != "" || criteria.Protocol != "" || criteria.ServerAddr != "" || criteria.ClientAddr != ""
+}
+
 func addCredential(cfg AdminConfig, primaryIdentity, email, password string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
 	// Connect to database
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -486,12 +614,6 @@ func handleUpdateAccount() {
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
 	// Database connection flags (overrides from config file)
-	dbHost := fs.String("dbhost", "", "Database host (overrides config)")
-	dbPort := fs.String("dbport", "", "Database port (overrides config)")
-	dbUser := fs.String("dbuser", "", "Database user (overrides config)")
-	dbPassword := fs.String("dbpassword", "", "Database password (overrides config)")
-	dbName := fs.String("dbname", "", "Database name (overrides config)")
-	dbTLS := fs.Bool("dbtls", false, "Enable TLS for database connection (overrides config)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Update an existing account's password and/or primary status
@@ -505,14 +627,6 @@ Options:
   --make-primary        Make this credential the primary identity for the account
   --hash string        Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
   --config string      Path to TOML configuration file (default: config.toml)
-  
-Database Options:
-  --dbhost string      Database host (overrides config)
-  --dbport string      Database port (overrides config)
-  --dbuser string      Database user (overrides config)
-  --dbpassword string  Database password (overrides config)
-  --dbname string      Database name (overrides config)
-  --dbtls              Enable TLS for database connection (overrides config)
 
 Examples:
   sora-admin update-account --email user@example.com --password newpassword
@@ -569,26 +683,6 @@ Examples:
 		}
 	}
 
-	// Apply command-line flag overrides
-	if isFlagSet(fs, "dbhost") {
-		cfg.Database.Host = *dbHost
-	}
-	if isFlagSet(fs, "dbport") {
-		cfg.Database.Port = *dbPort
-	}
-	if isFlagSet(fs, "dbuser") {
-		cfg.Database.User = *dbUser
-	}
-	if isFlagSet(fs, "dbpassword") {
-		cfg.Database.Password = *dbPassword
-	}
-	if isFlagSet(fs, "dbname") {
-		cfg.Database.Name = *dbName
-	}
-	if isFlagSet(fs, "dbtls") {
-		cfg.Database.TLSMode = *dbTLS
-	}
-
 	// Update the account
 	if err := updateAccount(cfg, *email, *password, *makePrimary, *hashType); err != nil {
 		log.Fatalf("Failed to update account: %v", err)
@@ -608,14 +702,7 @@ func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, ha
 	ctx := context.Background()
 
 	// Connect to database
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -644,12 +731,6 @@ func handleListCredentials() {
 	email := fs.String("email", "", "Email address associated with the account (required)")
 
 	// Database connection flags (overrides from config file)
-	dbHost := fs.String("dbhost", "", "Database host (overrides config)")
-	dbPort := fs.String("dbport", "", "Database port (overrides config)")
-	dbUser := fs.String("dbuser", "", "Database user (overrides config)")
-	dbPassword := fs.String("dbpassword", "", "Database password (overrides config)")
-	dbName := fs.String("dbname", "", "Database name (overrides config)")
-	dbTLS := fs.Bool("dbtls", false, "Enable TLS for database connection (overrides config)")
 
 	fs.Usage = func() {
 		fmt.Printf(`List all credentials for an account
@@ -660,14 +741,6 @@ Usage:
 Options:
   --email string       Email address associated with the account (required)
   --config string      Path to TOML configuration file (default: config.toml)
-  
-Database Options:
-  --dbhost string      Database host (overrides config)
-  --dbport string      Database port (overrides config)
-  --dbuser string      Database user (overrides config)
-  --dbpassword string  Database password (overrides config)
-  --dbname string      Database name (overrides config)
-  --dbtls              Enable TLS for database connection (overrides config)
 
 Examples:
   sora-admin list-credentials --email user@example.com
@@ -701,26 +774,6 @@ Examples:
 		}
 	}
 
-	// Apply command-line flag overrides
-	if isFlagSet(fs, "dbhost") {
-		cfg.Database.Host = *dbHost
-	}
-	if isFlagSet(fs, "dbport") {
-		cfg.Database.Port = *dbPort
-	}
-	if isFlagSet(fs, "dbuser") {
-		cfg.Database.User = *dbUser
-	}
-	if isFlagSet(fs, "dbpassword") {
-		cfg.Database.Password = *dbPassword
-	}
-	if isFlagSet(fs, "dbname") {
-		cfg.Database.Name = *dbName
-	}
-	if isFlagSet(fs, "dbtls") {
-		cfg.Database.TLSMode = *dbTLS
-	}
-
 	// List the credentials
 	if err := listCredentials(cfg, *email); err != nil {
 		log.Fatalf("Failed to list credentials: %v", err)
@@ -731,14 +784,7 @@ func listCredentials(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
 	// Connect to database
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -918,14 +964,7 @@ Examples:
 	}
 
 	// Connect to database
-	database, err := db.NewDatabase(context.Background(),
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(context.Background(), &cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -1092,14 +1131,7 @@ Examples:
 	}
 
 	// Connect to database
-	database, err := db.NewDatabase(context.Background(),
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(context.Background(), &cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -1260,14 +1292,7 @@ func showCacheStats(cfg AdminConfig) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -1303,12 +1328,12 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 	if !autoConfirm {
 		fmt.Printf("This will remove ALL cached objects from %s\n", cfg.LocalCache.Path)
 		fmt.Printf("This action cannot be undone. Are you sure? (y/N): ")
-		
+
 		var response string
 		if _, err := fmt.Scanln(&response); err != nil {
 			return fmt.Errorf("failed to read confirmation: %w", err)
 		}
-		
+
 		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
 			fmt.Println("Cache purge cancelled.")
 			return nil
@@ -1328,14 +1353,7 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -1426,14 +1444,7 @@ Examples:
 func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error {
 	// Connect to database
 	ctx := context.Background()
-	database, err := db.NewDatabase(ctx,
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.TLSMode,
-		cfg.Database.LogQueries)
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -1466,7 +1477,7 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 	fmt.Printf("  Pending uploads:    %d\n", stats.TotalPending)
 	fmt.Printf("  Pending size:       %d bytes (%s)\n", stats.TotalPendingSize, formatBytes(stats.TotalPendingSize))
 	fmt.Printf("  Failed uploads:     %d\n", stats.FailedUploads)
-	
+
 	if stats.OldestPending.Valid {
 		age := time.Since(stats.OldestPending.Time)
 		fmt.Printf("  Oldest pending:     %s (age: %s)\n", stats.OldestPending.Time.Format(time.RFC3339), formatDuration(age))
@@ -1477,8 +1488,8 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 	// Show failed uploads if requested
 	if showFailed && stats.FailedUploads > 0 {
 		fmt.Printf("\nFailed Uploads (showing up to %d):\n", failedLimit)
-		fmt.Printf("%-10s %-64s %-8s %-12s %-19s %s\n", "ID", "Content Hash", "Size", "Attempts", "Created", "Instance ID")
-		fmt.Printf("%s\n", strings.Repeat("-", 130))
+		fmt.Printf("%-10s %-10s %-64s %-8s %-12s %-19s %s\n", "ID", "Account ID", "Content Hash", "Size", "Attempts", "Created", "Instance ID")
+		fmt.Printf("%s\n", strings.Repeat("-", 141))
 
 		failedUploads, err := database.GetFailedUploads(ctx, cfg.Uploader.MaxAttempts, failedLimit)
 		if err != nil {
@@ -1486,8 +1497,9 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 		}
 
 		for _, upload := range failedUploads {
-			fmt.Printf("%-10d %-64s %-8s %-12d %-19s %s\n",
+			fmt.Printf("%-10d %-10d %-64s %-8s %-12d %-19s %s\n",
 				upload.ID,
+				upload.AccountID,
 				upload.ContentHash,
 				formatBytes(upload.Size),
 				upload.Attempts,
@@ -1525,5 +1537,742 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%.1fh", d.Hours())
 	} else {
 		return fmt.Sprintf("%.1fd", d.Hours()/24)
+	}
+}
+
+func handleConnectionStats() {
+	// Parse connection-stats specific flags
+	fs := flag.NewFlagSet("connection-stats", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	userEmail := fs.String("user", "", "Show connections for specific user email")
+	server := fs.String("server", "", "Show connections for specific server")
+	cleanupStale := fs.Bool("cleanup-stale", false, "Remove stale connections (no activity for 30 minutes)")
+	staleMinutes := fs.Int("stale-minutes", 30, "Minutes of inactivity to consider connection stale")
+	showDetail := fs.Bool("detail", true, "Show detailed connection list")
+
+	// Database connection flags (overrides from config file)
+
+	fs.Usage = func() {
+		fmt.Printf(`Show active proxy connections and statistics
+
+Usage:
+  sora-admin connection-stats [options]
+
+Options:
+  --user string         Show connections for specific user email
+  --server string       Show connections for specific server
+  --cleanup-stale       Remove stale connections (no activity for specified minutes)
+  --stale-minutes int   Minutes of inactivity to consider connection stale (default: 30)
+  --detail              Show detailed connection list (default: true)
+  --config string       Path to TOML configuration file (default: config.toml)
+
+This command shows:
+  - Total number of active connections
+  - Connections grouped by protocol (IMAP, POP3, ManageSieve)
+  - Connections grouped by server
+  - Detailed list of all connections with user, protocol, client address, etc.
+  - Option to filter by specific user or server
+  - Option to cleanup stale connections
+
+Examples:
+  sora-admin connection-stats
+  sora-admin connection-stats --user user@example.com
+  sora-admin connection-stats --server 127.0.0.1:143
+  sora-admin connection-stats --cleanup-stale
+  sora-admin connection-stats --cleanup-stale --stale-minutes 60
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show connection statistics
+	if err := showConnectionStats(cfg, *userEmail, *server, *cleanupStale, *staleMinutes, *showDetail); err != nil {
+		log.Fatalf("Failed to show connection stats: %v", err)
+	}
+}
+
+func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanupStale bool, staleMinutes int, showDetail bool) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Cleanup stale connections if requested
+	if cleanupStale {
+		staleDuration := time.Duration(staleMinutes) * time.Minute
+		removed, err := database.CleanupStaleConnections(ctx, staleDuration)
+		if err != nil {
+			return fmt.Errorf("failed to cleanup stale connections: %w", err)
+		}
+		fmt.Printf("Cleaned up %d stale connections (no activity for %d minutes)\n\n", removed, staleMinutes)
+	}
+
+	// Get connection statistics
+	var stats *db.ConnectionStats
+	if userEmail != "" {
+		// Get connections for specific user
+		connections, err := database.GetUserConnections(ctx, userEmail)
+		if err != nil {
+			return fmt.Errorf("failed to get user connections: %w", err)
+		}
+
+		// Build stats from user connections
+		stats = &db.ConnectionStats{
+			TotalConnections:      int64(len(connections)),
+			ConnectionsByProtocol: make(map[string]int64),
+			ConnectionsByServer:   make(map[string]int64),
+			Users:                 connections,
+		}
+
+		// Count by protocol and server
+		for _, conn := range connections {
+			stats.ConnectionsByProtocol[conn.Protocol]++
+			stats.ConnectionsByServer[conn.ServerAddr]++
+		}
+	} else {
+		// Get all connection statistics
+		stats, err = database.GetConnectionStats(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get connection stats: %w", err)
+		}
+	}
+
+	// Apply server filter if specified
+	if serverFilter != "" && userEmail == "" {
+		filteredUsers := []db.ConnectionInfo{}
+		for _, conn := range stats.Users {
+			if conn.ServerAddr == serverFilter {
+				filteredUsers = append(filteredUsers, conn)
+			}
+		}
+		stats.Users = filteredUsers
+	}
+
+	if stats.TotalConnections == 0 && userEmail == "" && serverFilter == "" {
+		fmt.Println("No active proxy connections found.")
+		fmt.Println("\nNote: This command only shows connections made to Sora proxy servers (e.g., imap_proxy).")
+		fmt.Println("Ensure your clients are connecting to the proxy ports defined in your configuration.")
+		return nil
+	}
+
+	// Display statistics
+	fmt.Printf("Active Proxy Connections\n")
+	fmt.Printf("========================\n\n")
+
+	if userEmail != "" {
+		fmt.Printf("User: %s\n\n", userEmail)
+	}
+	if serverFilter != "" {
+		fmt.Printf("Server: %s\n\n", serverFilter)
+	}
+
+	fmt.Printf("Summary:\n")
+	fmt.Printf("  Total connections: %d\n", stats.TotalConnections)
+	fmt.Printf("\n")
+
+	// Show connections by protocol
+	if len(stats.ConnectionsByProtocol) > 0 {
+		fmt.Printf("By Protocol:\n")
+		for protocol, count := range stats.ConnectionsByProtocol {
+			fmt.Printf("  %-12s %d\n", protocol+":", count)
+		}
+		fmt.Printf("\n")
+	}
+
+	// Show connections by server
+	if len(stats.ConnectionsByServer) > 0 && userEmail == "" && serverFilter == "" {
+		fmt.Printf("By Server:\n")
+		for server, count := range stats.ConnectionsByServer {
+			fmt.Printf("  %-20s %d\n", server+":", count)
+		}
+		fmt.Printf("\n")
+	}
+
+	// Show detailed connection list
+	if showDetail && len(stats.Users) > 0 {
+		fmt.Printf("Active Connections:\n")
+		fmt.Printf("%-30s %-12s %-21s %-21s %-19s %-19s\n", "Email", "Protocol", "Client Address", "Server Address", "Connected At", "Last Activity")
+		fmt.Printf("%s\n", strings.Repeat("-", 135))
+
+		for _, conn := range stats.Users {
+			connectedTime := conn.ConnectedAt.Format("2006-01-02 15:04:05")
+			lastActivityTime := conn.LastActivity.Format("2006-01-02 15:04:05")
+
+			fmt.Printf("%-30s %-12s %-21s %-21s %-19s %-19s\n",
+				conn.Email,
+				conn.Protocol,
+				conn.ClientAddr,
+				conn.ServerAddr,
+				connectedTime,
+				lastActivityTime)
+		}
+		fmt.Printf("\n")
+
+		// Show connection duration info
+		now := time.Now()
+		fmt.Printf("Connection Durations:\n")
+		for _, conn := range stats.Users {
+			duration := now.Sub(conn.ConnectedAt)
+			idle := now.Sub(conn.LastActivity)
+			fmt.Printf("  %s (%s): Connected for %s, idle for %s\n",
+				conn.Email,
+				conn.Protocol,
+				formatDuration(duration),
+				formatDuration(idle))
+		}
+	}
+
+	return nil
+}
+
+func handleAuthStats() {
+	// Parse auth-stats specific flags
+	fs := flag.NewFlagSet("auth-stats", flag.ExitOnError)
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	windowDuration := fs.String("window", "15m", "Time window for statistics (e.g., '15m', '1h', '24h')")
+	showBlocked := fs.Bool("blocked", true, "Show currently blocked IPs and usernames")
+	showStats := fs.Bool("stats", true, "Show overall authentication statistics")
+	maxAttemptsIP := fs.Int("max-attempts-ip", 10, "Max attempts per IP for blocking threshold")
+	maxAttemptsUsername := fs.Int("max-attempts-username", 5, "Max attempts per username for blocking threshold")
+
+	// Database connection flags (overrides from config file)
+
+	fs.Usage = func() {
+		fmt.Printf(`Show authentication statistics and blocked IPs
+Usage:
+  sora-admin auth-stats [options]
+
+Options:
+  --window string               Time window for statistics (default: "15m")
+  --blocked                     Show currently blocked IPs and usernames (default: true)
+  --stats                       Show overall authentication statistics (default: true)
+  --max-attempts-ip int         Max attempts per IP for blocking threshold (default: 10)
+  --max-attempts-username int   Max attempts per username for blocking threshold (default: 5)
+  --config string              Path to TOML configuration file (default: "config.toml")
+
+
+Examples:
+  sora-admin auth-stats                                    # Show stats for last 15 minutes
+  sora-admin auth-stats --window 1h --blocked             # Show blocked IPs in last hour
+  sora-admin auth-stats --window 24h --stats              # Show 24-hour auth statistics
+`)
+	}
+
+	err := fs.Parse(os.Args[2:])
+	if err != nil {
+		log.Fatalf("Failed to parse flags: %v", err)
+	}
+
+	// Parse window duration
+	window, err := time.ParseDuration(*windowDuration)
+	if err != nil {
+		log.Fatalf("Invalid window duration '%s': %v", *windowDuration, err)
+	}
+
+	// Load configuration
+	var adminConfig AdminConfig
+	if _, err := toml.DecodeFile(*configPath, &adminConfig); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Create context for database operations
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &adminConfig.Database)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	fmt.Printf("Authentication Statistics and Blocked IPs\n")
+	fmt.Printf("Window: %s\n", window)
+	fmt.Printf("Generated at: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	// Show general auth statistics
+	if *showStats {
+		stats, err := database.GetAuthAttemptsStats(ctx, window)
+		if err != nil {
+			log.Printf("Failed to get auth statistics: %v", err)
+		} else {
+			fmt.Printf("Overall Statistics (last %s):\n", window)
+			fmt.Printf("  Total Attempts:     %v\n", stats["total_attempts"])
+			fmt.Printf("  Failed Attempts:    %v\n", stats["failed_attempts"])
+			fmt.Printf("  Success Rate:       %.2f%%\n", stats["success_rate"])
+			fmt.Printf("  Unique IPs:         %v\n", stats["unique_ips"])
+			fmt.Printf("  Unique Usernames:   %v\n", stats["unique_usernames"])
+			fmt.Printf("  Unique Protocols:   %v\n", stats["unique_protocols"])
+			fmt.Printf("\n")
+		}
+	}
+
+	// Show currently blocked IPs and usernames
+	if *showBlocked {
+		blocked, err := database.GetBlockedIPs(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
+		if err != nil {
+			log.Printf("Failed to get blocked IPs: %v", err)
+		} else {
+			if len(blocked) > 0 {
+				fmt.Printf("Currently Blocked (exceeding thresholds):\n")
+				fmt.Printf("%-12s %-25s %-8s %-20s %-20s %-25s\n", "Type", "Identifier", "Failures", "First Failure", "Last Failure", "Username")
+				fmt.Printf("%s\n", strings.Repeat("-", 115))
+
+				for _, block := range blocked {
+					blockType := block["block_type"].(string)
+					identifier := block["identifier"].(string)
+					failureCount := block["failure_count"].(int)
+					firstFailure := block["first_failure"].(time.Time)
+					lastFailure := block["last_failure"].(time.Time)
+
+					username := ""
+					if block["username"] != nil {
+						username = block["username"].(string)
+					}
+
+					fmt.Printf("%-12s %-25s %-8d %-20s %-20s %-25s\n",
+						blockType,
+						identifier,
+						failureCount,
+						firstFailure.Format("2006-01-02 15:04:05"),
+						lastFailure.Format("2006-01-02 15:04:05"),
+						username)
+				}
+				fmt.Printf("\nTotal blocked: %d\n", len(blocked))
+			} else {
+				fmt.Printf("No currently blocked IPs or usernames (exceeding %d failures per IP, %d per username).\n", *maxAttemptsIP, *maxAttemptsUsername)
+			}
+		}
+	}
+}
+
+func handleHealthStatus() {
+	fs := flag.NewFlagSet("health-status", flag.ExitOnError)
+
+	// Command-specific flags
+	hostname := fs.String("hostname", "", "Show health status for specific hostname")
+	component := fs.String("component", "", "Show health status for specific component")
+	detailed := fs.Bool("detailed", false, "Show detailed health information including metadata")
+	history := fs.Bool("history", false, "Show health status history")
+	since := fs.String("since", "1h", "Time window for history (e.g., 1h, 24h, 7d)")
+	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+
+	// Configuration
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show system health status and component monitoring
+
+Usage:
+  sora-admin health-status [options]
+
+Options:
+  --hostname string     Show health status for specific hostname
+  --component string    Show health status for specific component
+  --detailed            Show detailed health information including metadata
+  --history             Show health status history
+  --since string        Time window for history, e.g. 1h, 24h, 7d (default: 1h)
+  --json                Output in JSON format
+  --config string       Path to TOML configuration file (default: config.toml)
+
+This command shows:
+  - Overall system health status
+  - Component health status (database, S3, circuit breakers)
+  - Server-specific health information
+  - Health status history and trends
+  - Component failure rates and error details
+
+Examples:
+  sora-admin health-status
+  sora-admin health-status --hostname server1.example.com
+  sora-admin health-status --component database --detailed
+  sora-admin health-status --history --since 24h
+  sora-admin health-status --json
+`)
+	}
+
+	// Parse command arguments (skip program name and command name)
+	args := os.Args[2:]
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate time window format for history
+	var sinceTime time.Time
+	if *history {
+		duration, err := time.ParseDuration(*since)
+		if err != nil {
+			// time.ParseDuration doesn't support 'd' for days, so we handle it by converting to hours.
+			if strings.HasSuffix(*since, "d") {
+				sinceInHours := strings.Replace(*since, "d", "h", 1)
+				if d, err := time.ParseDuration(sinceInHours); err == nil {
+					duration = d * 24
+				} else {
+					// The inner parse failed, so the format is invalid.
+					log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+				}
+			} else {
+				// The original parse failed and it's not a 'd' unit we can handle.
+				log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+			}
+		}
+		sinceTime = time.Now().Add(-duration)
+	}
+
+	// Load configuration
+	cfg := AdminConfig{}
+	if _, err := os.Stat(*configPath); err == nil {
+		if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	} else {
+		if isFlagSet(fs, "config") {
+			log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+		} else {
+			log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+		}
+	}
+
+	// Connect to database
+	ctx := context.Background()
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	if *jsonOutput {
+		if err := showHealthStatusJSON(ctx, database, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+			log.Fatalf("Failed to show health status: %v", err)
+		}
+	} else {
+		if err := showHealthStatus(ctx, database, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+			log.Fatalf("Failed to show health status: %v", err)
+		}
+	}
+}
+
+func showHealthStatus(ctx context.Context, database *db.Database, hostname, component string, detailed, history bool, sinceTime time.Time) error {
+	if history && component != "" {
+		return showComponentHistory(ctx, database, hostname, component, sinceTime)
+	}
+
+	// Show overview first
+	overview, err := database.GetSystemHealthOverview(ctx, hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get system health overview: %w", err)
+	}
+
+	// Display system overview
+	fmt.Printf("System Health Overview\n")
+	fmt.Printf("======================\n\n")
+
+	statusColor := getStatusColor(overview.OverallStatus)
+	fmt.Printf("Overall Status: %s%s%s\n", statusColor, strings.ToUpper(string(overview.OverallStatus)), "\033[0m")
+	fmt.Printf("Last Updated: %s\n", overview.LastUpdated.Format("2006-01-02 15:04:05 UTC"))
+	if hostname != "" {
+		fmt.Printf("Hostname: %s\n", hostname)
+	}
+	fmt.Printf("\n")
+
+	// Component summary
+	fmt.Printf("Component Summary:\n")
+	fmt.Printf("  Total Components: %d\n", overview.ComponentCount)
+	if overview.ComponentCount > 0 {
+		fmt.Printf("  Healthy: %s%d%s\n", "\033[32m", overview.HealthyCount, "\033[0m")
+		if overview.DegradedCount > 0 {
+			fmt.Printf("  Degraded: %s%d%s\n", "\033[33m", overview.DegradedCount, "\033[0m")
+		}
+		if overview.UnhealthyCount > 0 {
+			fmt.Printf("  Unhealthy: %s%d%s\n", "\033[31m", overview.UnhealthyCount, "\033[0m")
+		}
+		if overview.UnreachableCount > 0 {
+			fmt.Printf("  Unreachable: %s%d%s\n", "\033[35m", overview.UnreachableCount, "\033[0m")
+		}
+	}
+	fmt.Printf("\n")
+
+	// Get detailed component status
+	statuses, err := database.GetAllHealthStatuses(ctx, hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get health statuses: %w", err)
+	}
+
+	if len(statuses) == 0 {
+		fmt.Printf("No health data available.\n")
+		if hostname != "" {
+			fmt.Printf("Note: No health data found for hostname '%s'.\n", hostname)
+		} else {
+			fmt.Printf("Note: Health monitoring may not be active or data may have been cleaned up.\n")
+		}
+		return nil
+	}
+
+	// Filter by component if specified
+	if component != "" {
+		filteredStatuses := []*db.HealthStatus{}
+		for _, status := range statuses {
+			if status.ComponentName == component {
+				filteredStatuses = append(filteredStatuses, status)
+			}
+		}
+		statuses = filteredStatuses
+
+		if len(statuses) == 0 {
+			fmt.Printf("No health data found for component '%s'", component)
+			if hostname != "" {
+				fmt.Printf(" on hostname '%s'", hostname)
+			}
+			fmt.Printf(".\n")
+			return nil
+		}
+	}
+
+	// Display component details
+	fmt.Printf("Component Health Details\n")
+	fmt.Printf("========================\n\n")
+
+	// Group by server hostname for better organization
+	serverGroups := make(map[string][]*db.HealthStatus)
+	for _, status := range statuses {
+		serverGroups[status.ServerHostname] = append(serverGroups[status.ServerHostname], status)
+	}
+
+	for serverName, serverStatuses := range serverGroups {
+		if len(serverGroups) > 1 {
+			fmt.Printf("Server: %s\n", serverName)
+			fmt.Printf("%s\n", strings.Repeat("-", len(serverName)+8))
+		}
+
+		for _, status := range serverStatuses {
+			statusColor := getStatusColor(status.Status)
+			fmt.Printf("%-20s %s%-12s%s", status.ComponentName, statusColor, strings.ToUpper(string(status.Status)), "\033[0m")
+
+			// Calculate failure rate
+			failureRate := 0.0
+			if status.CheckCount > 0 {
+				failureRate = float64(status.FailCount) / float64(status.CheckCount) * 100
+			}
+
+			fmt.Printf(" (%.1f%% failure rate)\n", failureRate)
+
+			if detailed {
+				fmt.Printf("  Last Check: %s\n", status.LastCheck.Format("2006-01-02 15:04:05 UTC"))
+				fmt.Printf("  Checks: %d total, %d failed\n", status.CheckCount, status.FailCount)
+
+				if status.LastError != nil {
+					fmt.Printf("  Last Error: %s\n", *status.LastError)
+				}
+
+				if status.Metadata != nil && len(status.Metadata) > 0 {
+					fmt.Printf("  Metadata:\n")
+					for key, value := range status.Metadata {
+						fmt.Printf("    %s: %v\n", key, value)
+					}
+				}
+				fmt.Printf("\n")
+			}
+		}
+
+		if len(serverGroups) > 1 {
+			fmt.Printf("\n")
+		}
+	}
+
+	return nil
+}
+
+func showComponentHistory(ctx context.Context, database *db.Database, hostname, component string, sinceTime time.Time) error {
+	if hostname == "" {
+		// Get all hostnames for this component
+		allStatuses, err := database.GetAllHealthStatuses(ctx, "")
+		if err != nil {
+			return fmt.Errorf("failed to get health statuses: %w", err)
+		}
+
+		hostnames := make(map[string]bool)
+		for _, status := range allStatuses {
+			if status.ComponentName == component {
+				hostnames[status.ServerHostname] = true
+			}
+		}
+
+		if len(hostnames) == 0 {
+			fmt.Printf("No health data found for component '%s'.\n", component)
+			return nil
+		}
+
+		// Show history for each hostname
+		for hn := range hostnames {
+			fmt.Printf("Component Health History: %s on %s\n", component, hn)
+			fmt.Printf("%s\n", strings.Repeat("=", 40+len(component)+len(hn)))
+
+			history, err := database.GetHealthHistory(ctx, hn, component, sinceTime, 50)
+			if err != nil {
+				fmt.Printf("Error getting history for %s: %v\n\n", hn, err)
+				continue
+			}
+
+			showHistoryTable(history)
+			fmt.Printf("\n")
+		}
+	} else {
+		fmt.Printf("Component Health History: %s on %s\n", component, hostname)
+		fmt.Printf("%s\n", strings.Repeat("=", 40+len(component)+len(hostname)))
+
+		history, err := database.GetHealthHistory(ctx, hostname, component, sinceTime, 50)
+		if err != nil {
+			return fmt.Errorf("failed to get health history: %w", err)
+		}
+
+		showHistoryTable(history)
+	}
+
+	return nil
+}
+
+func showHistoryTable(history []*db.HealthStatus) {
+	if len(history) == 0 {
+		fmt.Printf("No health history available.\n")
+		return
+	}
+
+	fmt.Printf("%-19s %-12s %-8s %-8s %s\n", "Timestamp", "Status", "Checks", "Failures", "Error")
+	fmt.Printf("%s\n", strings.Repeat("-", 80))
+
+	for _, h := range history {
+		statusColor := getStatusColor(h.Status)
+		errorMsg := ""
+		if h.LastError != nil {
+			errorMsg = *h.LastError
+			if len(errorMsg) > 40 {
+				errorMsg = errorMsg[:37] + "..."
+			}
+		}
+
+		fmt.Printf("%-19s %s%-12s%s %-8d %-8d %s\n",
+			h.UpdatedAt.Format("2006-01-02 15:04:05"),
+			statusColor,
+			strings.ToUpper(string(h.Status)),
+			"\033[0m",
+			h.CheckCount,
+			h.FailCount,
+			errorMsg)
+	}
+}
+
+func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, component string, detailed, history bool, sinceTime time.Time) error {
+	type JSONHealthOutput struct {
+		Overview   *db.SystemHealthOverview `json:"overview"`
+		Components []*db.HealthStatus       `json:"components,omitempty"`
+		History    []*db.HealthStatus       `json:"history,omitempty"`
+		Timestamp  time.Time                `json:"timestamp"`
+		Filter     map[string]string        `json:"filter,omitempty"`
+	}
+
+	output := JSONHealthOutput{
+		Timestamp: time.Now(),
+		Filter:    make(map[string]string),
+	}
+
+	if hostname != "" {
+		output.Filter["hostname"] = hostname
+	}
+	if component != "" {
+		output.Filter["component"] = component
+	}
+
+	// Get overview
+	overview, err := database.GetSystemHealthOverview(ctx, hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get system health overview: %w", err)
+	}
+	output.Overview = overview
+
+	if history && component != "" {
+		// Get history for specific component
+		if hostname == "" {
+			// Get all hostnames for this component first
+			allStatuses, err := database.GetAllHealthStatuses(ctx, "")
+			if err != nil {
+				return fmt.Errorf("failed to get health statuses: %w", err)
+			}
+
+			for _, status := range allStatuses {
+				if status.ComponentName == component {
+					hist, err := database.GetHealthHistory(ctx, status.ServerHostname, component, sinceTime, 50)
+					if err != nil {
+						continue
+					}
+					output.History = append(output.History, hist...)
+				}
+			}
+		} else {
+			hist, err := database.GetHealthHistory(ctx, hostname, component, sinceTime, 50)
+			if err != nil {
+				return fmt.Errorf("failed to get health history: %w", err)
+			}
+			output.History = hist
+		}
+	} else {
+		// Get current component status
+		statuses, err := database.GetAllHealthStatuses(ctx, hostname)
+		if err != nil {
+			return fmt.Errorf("failed to get health statuses: %w", err)
+		}
+
+		// Filter by component if specified
+		if component != "" {
+			filteredStatuses := []*db.HealthStatus{}
+			for _, status := range statuses {
+				if status.ComponentName == component {
+					filteredStatuses = append(filteredStatuses, status)
+				}
+			}
+			statuses = filteredStatuses
+		}
+
+		output.Components = statuses
+	}
+
+	// Output JSON
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(output)
+}
+
+func getStatusColor(status db.ComponentStatus) string {
+	switch status {
+	case db.StatusHealthy:
+		return "\033[32m" // Green
+	case db.StatusDegraded:
+		return "\033[33m" // Yellow
+	case db.StatusUnhealthy:
+		return "\033[31m" // Red
+	case db.StatusUnreachable:
+		return "\033[35m" // Magenta
+	default:
+		return "\033[0m" // Reset
 	}
 }

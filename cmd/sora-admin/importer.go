@@ -69,7 +69,7 @@ type Importer struct {
 
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
-	
+
 	// Dovecot UID lists: mailbox path -> UID list
 	dovecotUIDLists map[string]*DovecotUIDList
 }
@@ -218,7 +218,7 @@ func (i *Importer) processSubscriptions() error {
 	lines := strings.Split(string(content), "\n")
 
 	// Parse Dovecot subscriptions format
-	// First line should be version (e.g., "V	2")
+	// First line should be version (e.g., "V\t2")
 	if len(lines) == 0 {
 		return fmt.Errorf("empty subscriptions file")
 	}
@@ -228,7 +228,7 @@ func (i *Importer) processSubscriptions() error {
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
 		if i == 0 {
-			// Skip version line (e.g., "V	2")
+			// Skip version line (e.g., "V\t2")
 			if strings.HasPrefix(line, "V\t") || strings.HasPrefix(line, "V ") {
 				continue
 			}
@@ -457,6 +457,7 @@ func (i *Importer) performDryRun() error {
 	user := server.NewUser(address, accountID)
 
 	// Query the SQLite database for scanned messages
+
 	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path")
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
@@ -756,7 +757,7 @@ func (i *Importer) shouldImportMailbox(mailboxName string) bool {
 // isMessageAlreadyImported checks if a message with the given hash already exists in the Sora database.
 func (i *Importer) isMessageAlreadyImported(ctx context.Context, hash string, mailboxID int64) (bool, error) {
 	var count int
-	err := i.soraDB.Pool.QueryRow(ctx,
+	err := i.soraDB.GetReadPool().QueryRow(ctx,
 		"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
 		hash, mailboxID).Scan(&count)
 	if err != nil {
@@ -851,7 +852,7 @@ func (i *Importer) scanMaildir() error {
 			// Replace maildir separator (.) with IMAP separator (/)
 			// But avoid creating names that will cause UTF-7 encoding issues
 			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-			
+
 			// Validate the mailbox name doesn't contain problematic characters
 			// that will cause UTF-7 encoding issues when sent to IMAP clients
 			if strings.ContainsAny(mailboxName, "\t\r\n") {
@@ -931,6 +932,7 @@ func (i *Importer) scanMaildir() error {
 				}
 
 				// Only count if the insert actually happened (not a duplicate)
+
 				rowsAffected, err := result.RowsAffected()
 				if err != nil {
 					log.Printf("Failed to get rows affected: %v", err)
@@ -952,7 +954,7 @@ func (i *Importer) scanMaildir() error {
 				log.Printf("Warning: Failed to parse dovecot-uidlist in %s: %v", path, err)
 			} else if uidList != nil {
 				i.dovecotUIDLists[path] = uidList
-				log.Printf("Loaded dovecot-uidlist for %s: UIDVALIDITY=%d, NextUID=%d, %d mappings", 
+				log.Printf("Loaded dovecot-uidlist for %s: UIDVALIDITY=%d, NextUID=%d, %d mappings",
 					mailboxName, uidList.UIDValidity, uidList.NextUID, len(uidList.UIDMappings))
 			}
 		}
@@ -1170,10 +1172,13 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		flags = []imap.Flag{imap.Flag("\\Recent")}
 	}
 
+	// Construct S3 key
+	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
+
 	// First, upload to S3 with retries.
 	var s3Err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		s3Err = i.s3.Put(hash, bytes.NewReader(content), size)
+		s3Err = i.s3.Put(s3Key, bytes.NewReader(content), size)
 		if s3Err == nil {
 			break // Success
 		}
@@ -1187,11 +1192,11 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// Look up preserved UID if enabled
 	var preservedUID *uint32
 	var preservedUIDValidity *uint32
-	
+
 	if i.options.PreserveUIDs {
 		// Find the maildir path for this mailbox
 		maildirPath := filepath.Dir(filepath.Dir(path)) // Go up from cur/new to maildir folder
-		
+
 		if uidList, ok := i.dovecotUIDLists[maildirPath]; ok && uidList != nil {
 			if uid, found := uidList.GetUIDForFile(filename); found {
 				preservedUID = &uid
@@ -1210,22 +1215,22 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// If S3 upload is successful, then insert into the database.
 	msgID, uid, err := i.soraDB.InsertMessageFromImporter(ctx,
 		&db.InsertMessageOptions{
-			UserID:        user.UserID(),
-			MailboxID:     mailbox.ID,
-			MailboxName:   mailbox.Name,
-			ContentHash:   hash,
-			MessageID:     messageID,
-			Flags:         flags,
-			InternalDate:  sentDate,
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			RawHeaders:    rawHeadersText,
-			PreservedUID:  preservedUID,
+			UserID:               user.UserID(),
+			MailboxID:            mailbox.ID,
+			MailboxName:          mailbox.Name,
+			ContentHash:          hash,
+			MessageID:            messageID,
+			Flags:                flags,
+			InternalDate:         sentDate,
+			Size:                 size,
+			Subject:              subject,
+			PlaintextBody:        actualPlaintextBody,
+			SentDate:             sentDate,
+			InReplyTo:            inReplyTo,
+			BodyStructure:        &bodyStructure,
+			Recipients:           recipients,
+			RawHeaders:           rawHeadersText,
+			PreservedUID:         preservedUID,
 			PreservedUIDValidity: preservedUIDValidity,
 		})
 	if err != nil {

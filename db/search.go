@@ -23,14 +23,20 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 
 	// For SeqNum
 	for _, seqSet := range criteria.SeqNum {
-		seqCond, seqArgs := buildNumSetCondition(seqSet, "seqnum", paramPrefix, paramCounter)
+		seqCond, seqArgs, err := buildNumSetCondition(seqSet, "seqnum", paramPrefix, paramCounter)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to build SeqNum condition: %w", err)
+		}
 		maps.Copy(args, seqArgs)
 		conditions = append(conditions, seqCond)
 	}
 
 	// For UID
 	for _, uidSet := range criteria.UID {
-		uidCond, uidArgs := buildNumSetCondition(uidSet, "uid", paramPrefix, paramCounter)
+		uidCond, uidArgs, err := buildNumSetCondition(uidSet, "uid", paramPrefix, paramCounter)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to build UID condition: %w", err)
+		}
 		maps.Copy(args, uidArgs)
 		conditions = append(conditions, uidCond)
 	}
@@ -218,7 +224,7 @@ func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) stri
 	return "ORDER BY " + strings.Join(orderClauses, ", ")
 }
 
-func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs) {
+func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
 	args := pgx.NamedArgs{}
 	var conditions []string
 
@@ -266,7 +272,7 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 			}
 		}
 	default:
-		panic("unsupported NumSet type")
+		return "", nil, fmt.Errorf("unsupported NumSet type: %T", numSet)
 	}
 
 	finalCondition := strings.Join(conditions, " OR ")
@@ -274,7 +280,7 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 		finalCondition = "(" + finalCondition + ")"
 	}
 
-	return finalCondition, args
+	return finalCondition, args, nil
 }
 
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
@@ -318,7 +324,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	finalQueryString := baseQuery + fmt.Sprintf(" WHERE %s %s", whereCondition, orderByClause)
 
-	rows, err := db.Pool.Query(ctx, finalQueryString, whereArgs)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, finalQueryString, whereArgs)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)

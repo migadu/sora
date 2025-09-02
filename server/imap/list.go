@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -20,15 +21,21 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		})
 	}
 
+	// Create a context that signals to use the master DB if the session is pinned.
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
 	// Database operations should be done outside of lock
 	// For LSUB, we need all mailboxes to find parents of subscribed ones
-	mboxes, err := s.server.db.GetMailboxes(s.ctx, s.UserID(), false)
+	mboxes, err := s.server.db.GetMailboxes(readCtx, s.UserID(), false)
 	if err != nil {
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
 	var l []imap.ListData
-	
+
 	// For LSUB, we need to include parent folders of subscribed mailboxes
 	if options.SelectSubscribed {
 		// First, collect all subscribed mailboxes
@@ -38,7 +45,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 				subscribedMailboxes[mbox.Name] = true
 			}
 		}
-		
+
 		// Then, find all parent folders that should be included
 		parentFolders := make(map[string]bool)
 		for subscribedName := range subscribedMailboxes {
@@ -53,7 +60,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 				}
 			}
 		}
-		
+
 		// Process mailboxes for LSUB
 		for _, mbox := range mboxes {
 			match := false
@@ -66,7 +73,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 			if !match {
 				continue
 			}
-			
+
 			// Include if subscribed or if it's a parent of a subscribed mailbox
 			if mbox.Subscribed || parentFolders[mbox.Name] {
 				data := listMailbox(mbox, options, s.server.caps, parentFolders[mbox.Name])
@@ -150,7 +157,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 
 func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, isParentFolder bool) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
-	
+
 	// Add \noselect for parent folders that aren't directly subscribed
 	if isParentFolder && !mbox.Subscribed {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)

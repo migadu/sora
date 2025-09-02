@@ -7,7 +7,7 @@ import (
 )
 
 // MutexTimeout defines how long to wait for mutex acquisition before timing out
-const MutexTimeout = 30 * time.Second
+const MutexTimeout = 5 * time.Second
 
 // MutexTimeoutHelper provides methods for acquiring mutex locks with timeouts
 type MutexTimeoutHelper struct {

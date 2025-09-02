@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,13 @@ import (
 )
 
 func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), mboxName)
+	// Create a context that signals to use the master DB if the session is pinned.
+	readCtx := s.ctx
+	if s.useMasterDB {
+		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+	}
+
+	mailbox, err := s.server.db.GetMailboxByName(readCtx, s.UserID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[APPEND] mailbox '%s' does not exist", mboxName)
@@ -104,7 +111,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	filePath, err := s.server.uploader.StoreLocally(contentHash, fullMessageBytes)
+	filePath, err := s.server.uploader.StoreLocally(contentHash, s.UserID(), fullMessageBytes)
 	if err != nil {
 		return nil, s.internalError("failed to save message to disk: %v", err)
 	}
@@ -116,7 +123,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	copy(appendFlags, options.Flags)
 	appendFlags = append(appendFlags, imap.Flag("\\Recent"))
 
-	_, messageUID, err := s.server.db.InsertMessage(s.ctx,
+	_, messageUID, err := s.server.db.InsertMessage(s.ctx, // This method must use the write pool.
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
 			MailboxID:     mailbox.ID,
@@ -138,6 +145,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			InstanceID:  s.server.hostname,
 			ContentHash: contentHash,
 			Size:        size,
+			AccountID:   s.UserID(),
 		})
 	if err != nil {
 		_ = os.Remove(*filePath) // cleanup file on failure
@@ -175,6 +183,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		s.mutex.Unlock()
 		cancel()
 	}()
+
+	// Pin this session to the master DB to ensure read-your-writes consistency.
+	s.useMasterDB = true
 
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {
