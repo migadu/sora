@@ -2085,7 +2085,7 @@ func showHealthStatus(ctx context.Context, database *db.Database, hostname, comp
 					fmt.Printf("  Last Error: %s\n", *status.LastError)
 				}
 
-				if status.Metadata != nil && len(status.Metadata) > 0 {
+				if len(status.Metadata) > 0 {
 					fmt.Printf("  Metadata:\n")
 					for key, value := range status.Metadata {
 						fmt.Printf("    %s: %v\n", key, value)

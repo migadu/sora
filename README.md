@@ -29,7 +29,7 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 - **Graceful degradation** strategies under load
 - **Background workers** with distributed task processing
 
-### Proxy Mode (NEW)
+### Proxy Mode 
 - **Multi-backend support** for horizontal scaling
 - **Load balancing** across backend servers
 - **Server affinity** for consistent user routing
@@ -50,9 +50,9 @@ Sora is designed for:
 
 ---
 
-## Status: Production-Ready
+## Status: BETA
 
-Sora has evolved from alpha to production-ready with comprehensive resilience features, monitoring, and horizontal scaling capabilities. It's actively used in production environments.
+Sora has evolved from alpha to production-ready with comprehensive resilience features, monitoring, and horizontal scaling capabilities. 
 
 ---
 

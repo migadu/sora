@@ -65,7 +65,6 @@ type Importer struct {
 	skippedMessages  int64
 	failedMessages   int64
 	startTime        time.Time
-	mu               sync.Mutex
 
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
