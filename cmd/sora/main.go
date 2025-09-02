@@ -414,35 +414,47 @@ func main() {
 
 	// --- Application Logic using cfg ---
 
-	if !cfg.Servers.IMAP.Start && !cfg.Servers.LMTP.Start && !cfg.Servers.POP3.Start && !cfg.Servers.ManageSieve.Start {
-		errorHandler.ValidationError("servers", fmt.Errorf("no servers enabled. Please enable at least one server (IMAP, LMTP, POP3, or ManageSieve)"))
+	// Determine if any mail storage services are enabled, which require S3, cache, uploader, and cleaner.
+	storageServicesNeeded := cfg.Servers.IMAP.Start || cfg.Servers.LMTP.Start || cfg.Servers.POP3.Start
+
+	// Check if any server at all is configured to start.
+	anyServerStarted := storageServicesNeeded || cfg.Servers.ManageSieve.Start ||
+		cfg.Servers.IMAPProxy.Start || cfg.Servers.POP3Proxy.Start ||
+		cfg.Servers.ManageSieveProxy.Start || cfg.Servers.LMTPProxy.Start
+
+	if !anyServerStarted {
+		errorHandler.ValidationError("servers", fmt.Errorf("no servers enabled. Please enable at least one server in your configuration"))
 		os.Exit(errorHandler.WaitForExit())
 	}
 
-	// Ensure required arguments are provided
-	if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-		errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required credentials. Ensure S3 access key, secret key, and bucket are provided"))
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Initialize S3 storage
-	s3EndpointToUse := cfg.S3.Endpoint
-	if s3EndpointToUse == "" {
-		errorHandler.ValidationError("S3 endpoint", fmt.Errorf("S3 endpoint not specified"))
-		os.Exit(errorHandler.WaitForExit())
-	}
-	log.Printf("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
-	s3storage, err := storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
-	if err != nil {
-		errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Enable encryption if configured
-	if cfg.S3.Encrypt {
-		if err := s3storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
-			errorHandler.FatalError("enable S3 encryption", err)
+	var s3storage *storage.S3Storage
+	if storageServicesNeeded {
+		// Ensure required S3 arguments are provided only if needed
+		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
+			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3)"))
 			os.Exit(errorHandler.WaitForExit())
+		}
+
+		// Initialize S3 storage
+		s3EndpointToUse := cfg.S3.Endpoint
+		if s3EndpointToUse == "" {
+			errorHandler.ValidationError("S3 endpoint", fmt.Errorf("S3 endpoint not specified"))
+			os.Exit(errorHandler.WaitForExit())
+		}
+		log.Printf("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
+		var err error
+		s3storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+		if err != nil {
+			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
+		// Enable encryption if configured
+		if cfg.S3.Encrypt {
+			if err := s3storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+				errorHandler.FatalError("enable S3 encryption", err)
+				os.Exit(errorHandler.WaitForExit())
+			}
 		}
 	}
 
@@ -460,7 +472,7 @@ func main() {
 
 	// Initialize the database connection with read/write split configuration
 	log.Printf("Connecting to database with read/write split configuration")
-	
+
 	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		errorHandler.FatalError("connect to database", err)
@@ -472,89 +484,102 @@ func main() {
 
 	errChan := make(chan error, 1)
 
-	// Initialize the local cache
-	cacheSizeBytes, err := cfg.LocalCache.GetCapacity()
-	if err != nil {
-		errorHandler.ValidationError("cache size", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	maxObjectSizeBytes, err := cfg.LocalCache.GetMaxObjectSize()
-	if err != nil {
-		errorHandler.ValidationError("cache max object size", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, database)
-	if err != nil {
-		errorHandler.FatalError("initialize cache", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	defer cacheInstance.Close()
-	if err := cacheInstance.SyncFromDisk(); err != nil {
-		errorHandler.FatalError("sync cache from disk", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	cacheInstance.StartPurgeLoop(ctx)
+	// Declare workers and cache, they will be initialized only if needed.
+	var cacheInstance *cache.Cache
+	var cleanupWorker *cleaner.CleanupWorker
+	var uploadWorker *uploader.UploadWorker
 
 	// Initialize health monitoring
 	log.Printf("Initializing health monitoring...")
 	healthIntegration := health.NewHealthIntegration(database)
-	
-	// Register S3 health check
-	healthIntegration.RegisterS3Check(s3storage)
-	
-	// Register cache health check
-	healthIntegration.RegisterCustomCheck(&health.HealthCheck{
-		Name:     "cache",
-		Interval: 30 * time.Second,
-		Timeout:  5 * time.Second,
-		Critical: false,
-		Check: func(ctx context.Context) error {
-			// Check if cache directory is accessible
-			stats, err := cacheInstance.GetStats()
-			if err != nil {
-				return fmt.Errorf("cache error: %w", err)
-			}
-			if stats.TotalSize < 0 {
-				return fmt.Errorf("cache stats unavailable")
-			}
-			return nil
-		},
-	})
-	
+
+	if storageServicesNeeded {
+		log.Println("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
+
+		// Register S3 health check
+		healthIntegration.RegisterS3Check(s3storage)
+
+		// Initialize the local cache
+		cacheSizeBytes, err := cfg.LocalCache.GetCapacity()
+		if err != nil {
+			errorHandler.ValidationError("cache size", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		maxObjectSizeBytes, err := cfg.LocalCache.GetMaxObjectSize()
+		if err != nil {
+			errorHandler.ValidationError("cache max object size", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cacheInstance, err = cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, database)
+		if err != nil {
+			errorHandler.FatalError("initialize cache", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		defer cacheInstance.Close()
+		if err := cacheInstance.SyncFromDisk(); err != nil {
+			errorHandler.FatalError("sync cache from disk", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cacheInstance.StartPurgeLoop(ctx)
+
+		// Register cache health check
+		healthIntegration.RegisterCustomCheck(&health.HealthCheck{
+			Name:     "cache",
+			Interval: 30 * time.Second,
+			Timeout:  5 * time.Second,
+			Critical: false,
+			Check: func(ctx context.Context) error {
+				// Check if cache directory is accessible
+				stats, err := cacheInstance.GetStats()
+				if err != nil {
+					return fmt.Errorf("cache error: %w", err)
+				}
+				if stats.TotalSize < 0 {
+					return fmt.Errorf("cache stats unavailable")
+				}
+				return nil
+			},
+		})
+
+		// Initialize and start the cleanup worker
+		gracePeriod, err := cfg.Cleanup.GetGracePeriod()
+		if err != nil {
+			errorHandler.ValidationError("cleanup grace_period duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		wakeInterval, err := cfg.Cleanup.GetWakeInterval()
+		if err != nil {
+			errorHandler.ValidationError("cleanup wake_interval duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		maxAgeRestriction, err := cfg.Cleanup.GetMaxAgeRestriction()
+		if err != nil {
+			errorHandler.ValidationError("cleanup max_age_restriction duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cleanupWorker = cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction)
+		cleanupWorker.Start(ctx)
+
+		// Initialize and start the upload worker
+		retryInterval, err := cfg.Uploader.GetRetryInterval()
+		if err != nil {
+			errorHandler.ValidationError("uploader retry_interval duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, database, s3storage, cacheInstance, errChan)
+		if err != nil {
+			errorHandler.FatalError("create upload worker", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		uploadWorker.Start(ctx)
+	} else {
+		log.Println("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
+	}
+
 	// Start health monitoring (this begins writing to the database)
 	healthIntegration.Start(ctx)
 	defer healthIntegration.Stop()
 	log.Printf("Health monitoring started - collecting metrics every 30-60 seconds")
-
-	gracePeriod, err := cfg.Cleanup.GetGracePeriod()
-	if err != nil {
-		errorHandler.ValidationError("cleanup grace_period duration", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	wakeInterval, err := cfg.Cleanup.GetWakeInterval()
-	if err != nil {
-		errorHandler.ValidationError("cleanup wake_interval duration", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	maxAgeRestriction, err := cfg.Cleanup.GetMaxAgeRestriction()
-	if err != nil {
-		errorHandler.ValidationError("cleanup max_age_restriction duration", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	cleanupWorker := cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction)
-	cleanupWorker.Start(ctx)
-
-	retryInterval, err := cfg.Uploader.GetRetryInterval()
-	if err != nil {
-		errorHandler.ValidationError("uploader retry_interval duration", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	uploadWorker, err := uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, database, s3storage, cacheInstance, errChan)
-	if err != nil {
-		errorHandler.FatalError("create upload worker", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-	uploadWorker.Start(ctx)
 
 	if cfg.Servers.LMTP.Start {
 		go startLMTPServer(ctx, hostname, cfg.Servers.LMTP.Addr, s3storage, database, uploadWorker, errChan, cfg)
@@ -602,20 +627,20 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 
 	s, err := imap.New(ctx, hostname, addr, s3storage, database, uploadWorker, cacheInstance,
 		imap.IMAPServerOptions{
-			Debug:              config.Servers.Debug,
-			TLS:                config.Servers.IMAP.TLS,
-			TLSCertFile:        config.Servers.IMAP.TLSCertFile,
-			TLSKeyFile:         config.Servers.IMAP.TLSKeyFile,
-			TLSVerify:          config.Servers.IMAP.TLSVerify,
-			MasterUsername:     []byte(config.Servers.IMAP.MasterUsername),
-			MasterPassword:     []byte(config.Servers.IMAP.MasterPassword),
-			MasterSASLUsername: []byte(config.Servers.IMAP.MasterSASLUsername),
-			MasterSASLPassword: []byte(config.Servers.IMAP.MasterSASLPassword),
-			AppendLimit:        appendLimit,
-			MaxConnections:     config.Servers.IMAP.MaxConnections,
+			Debug:               config.Servers.Debug,
+			TLS:                 config.Servers.IMAP.TLS,
+			TLSCertFile:         config.Servers.IMAP.TLSCertFile,
+			TLSKeyFile:          config.Servers.IMAP.TLSKeyFile,
+			TLSVerify:           config.Servers.IMAP.TLSVerify,
+			MasterUsername:      []byte(config.Servers.IMAP.MasterUsername),
+			MasterPassword:      []byte(config.Servers.IMAP.MasterPassword),
+			MasterSASLUsername:  []byte(config.Servers.IMAP.MasterSASLUsername),
+			MasterSASLPassword:  []byte(config.Servers.IMAP.MasterSASLPassword),
+			AppendLimit:         appendLimit,
+			MaxConnections:      config.Servers.IMAP.MaxConnections,
 			MaxConnectionsPerIP: config.Servers.IMAP.MaxConnectionsPerIP,
-			ProxyProtocol:      config.Servers.IMAP.ProxyProtocol,
-			AuthRateLimit:      config.Servers.IMAP.AuthRateLimit,
+			ProxyProtocol:       config.Servers.IMAP.ProxyProtocol,
+			AuthRateLimit:       config.Servers.IMAP.AuthRateLimit,
 		})
 	if err != nil {
 		errChan <- err
@@ -729,6 +754,35 @@ func startManageSieveServer(ctx context.Context, hostname string, addr string, d
 	s.Start(errChan)
 }
 
+// startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol if affinity is enabled.
+func startConnectionTrackerForProxy(protocol string, database *db.Database, hostname string, trackingConfig *ConnectionTrackingConfig, affinityEnabled bool, server interface {
+	SetConnectionTracker(*proxy.ConnectionTracker)
+}) *proxy.ConnectionTracker {
+	if !affinityEnabled || !trackingConfig.Enabled {
+		return nil
+	}
+
+	updateInterval, err := trackingConfig.GetUpdateInterval()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking update_interval '%s': %v. Using default.", trackingConfig.UpdateInterval, err)
+		updateInterval = 10 * time.Second
+	}
+
+	log.Printf("[%s Proxy] Starting connection tracker for affinity.", protocol)
+	tracker := proxy.NewConnectionTracker(
+		protocol,
+		database,
+		hostname,
+		updateInterval,
+		trackingConfig.PersistToDB,
+		trackingConfig.BatchUpdates,
+		trackingConfig.Enabled,
+	)
+	server.SetConnectionTracker(tracker)
+	tracker.Start()
+	return tracker
+}
+
 // Helper function to check if a flag was explicitly set on the command line
 func isFlagSet(name string) bool {
 	isSet := false
@@ -781,20 +835,8 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Set up connection tracker if affinity is enabled
-	if config.Servers.IMAPProxy.EnableAffinity {
-		updateInterval, _ := config.Servers.ConnectionTracking.GetUpdateInterval()
-		tracker := proxy.NewConnectionTracker(
-			"IMAP",
-			database,
-			hostname,
-			updateInterval,
-			config.Servers.ConnectionTracking.PersistToDB,
-			config.Servers.ConnectionTracking.BatchUpdates,
-			config.Servers.ConnectionTracking.Enabled,
-		)
-		server.SetConnectionTracker(tracker)
-		tracker.Start()
+	// Start connection tracker if affinity is enabled for this proxy.
+	if tracker := startConnectionTrackerForProxy("IMAP", database, hostname, &config.Servers.ConnectionTracking, config.Servers.IMAPProxy.EnableAffinity, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
@@ -850,20 +892,8 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Set up connection tracker if affinity is enabled
-	if config.Servers.POP3Proxy.EnableAffinity {
-		updateInterval, _ := config.Servers.ConnectionTracking.GetUpdateInterval()
-		tracker := proxy.NewConnectionTracker(
-			"POP3",
-			database,
-			hostname,
-			updateInterval,
-			config.Servers.ConnectionTracking.PersistToDB,
-			config.Servers.ConnectionTracking.BatchUpdates,
-			config.Servers.ConnectionTracking.Enabled,
-		)
-		server.SetConnectionTracker(tracker)
-		tracker.Start()
+	// Start connection tracker if affinity is enabled for this proxy.
+	if tracker := startConnectionTrackerForProxy("POP3", database, hostname, &config.Servers.ConnectionTracking, config.Servers.POP3Proxy.EnableAffinity, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
@@ -908,21 +938,8 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		return
 	}
 
-	// Set up connection tracker if affinity is enabled
-	if config.Servers.ManageSieveProxy.EnableAffinity {
-		_, _ = config.Servers.ManageSieveProxy.GetAffinityValidity()
-		updateInterval, _ := config.Servers.ConnectionTracking.GetUpdateInterval()
-		tracker := proxy.NewConnectionTracker(
-			"ManageSieve",
-			database,
-			hostname,
-			updateInterval,
-			config.Servers.ConnectionTracking.PersistToDB,
-			config.Servers.ConnectionTracking.BatchUpdates,
-			config.Servers.ConnectionTracking.Enabled,
-		)
-		server.SetConnectionTracker(tracker)
-		tracker.Start()
+	// Start connection tracker if affinity is enabled for this proxy.
+	if tracker := startConnectionTrackerForProxy("ManageSieve", database, hostname, &config.Servers.ConnectionTracking, config.Servers.ManageSieveProxy.EnableAffinity, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
@@ -974,20 +991,8 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Set up connection tracker if affinity is enabled
-	if config.Servers.LMTPProxy.EnableAffinity {
-		updateInterval, _ := config.Servers.ConnectionTracking.GetUpdateInterval()
-		tracker := proxy.NewConnectionTracker(
-			"LMTP",
-			database,
-			hostname,
-			updateInterval,
-			config.Servers.ConnectionTracking.PersistToDB,
-			config.Servers.ConnectionTracking.BatchUpdates,
-			config.Servers.ConnectionTracking.Enabled,
-		)
-		server.SetConnectionTracker(tracker)
-		tracker.Start()
+	// Start connection tracker if affinity is enabled for this proxy.
+	if tracker := startConnectionTrackerForProxy("LMTP", database, hostname, &config.Servers.ConnectionTracking, config.Servers.LMTPProxy.EnableAffinity, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
