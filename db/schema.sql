@@ -311,3 +311,31 @@ CREATE INDEX IF NOT EXISTS idx_health_status_updated_at ON health_status (update
 
 -- Index for faster health status lookups by component and server
 CREATE INDEX IF NOT EXISTS idx_health_status_component_server ON health_status (component_name, server_hostname);
+
+-- Cache metrics tracking for hit/miss ratios per instance
+CREATE TABLE IF NOT EXISTS cache_metrics (
+    instance_id VARCHAR(255) NOT NULL,
+    server_hostname VARCHAR(255) NOT NULL,
+    hits BIGINT DEFAULT 0,
+    misses BIGINT DEFAULT 0,
+    hit_rate DECIMAL(5,2) DEFAULT 0.00,
+    total_operations BIGINT DEFAULT 0,
+    uptime_seconds INTEGER DEFAULT 0,
+    recorded_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    PRIMARY KEY (instance_id, server_hostname, recorded_at)
+);
+
+-- Index for faster cache metrics lookups by instance
+CREATE INDEX IF NOT EXISTS idx_cache_metrics_instance ON cache_metrics (instance_id);
+
+-- Index for faster cache metrics lookups by server
+CREATE INDEX IF NOT EXISTS idx_cache_metrics_server ON cache_metrics (server_hostname);
+
+-- Index for faster cache metrics cleanup by recorded_at
+CREATE INDEX IF NOT EXISTS idx_cache_metrics_recorded_at ON cache_metrics (recorded_at);
+
+-- Index for latest metrics per instance
+CREATE INDEX IF NOT EXISTS idx_cache_metrics_instance_latest ON cache_metrics (instance_id, recorded_at DESC);
+
+-- Index for GetLatestCacheMetrics: efficiently find the latest record per instance and server
+CREATE INDEX IF NOT EXISTS idx_cache_metrics_latest_per_instance_server ON cache_metrics (instance_id, server_hostname, recorded_at DESC);

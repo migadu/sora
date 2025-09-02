@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,6 +32,10 @@ type Cache struct {
 	db            *sql.DB
 	mu            sync.Mutex
 	sourceDB      *db.Database
+	// Metrics - using atomic for thread-safe counters
+	cacheHits   int64
+	cacheMisses int64
+	startTime   time.Time
 }
 
 // Close closes the cache database connection
@@ -86,12 +91,21 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.
 		maxObjectSize: maxObjectSize,
 		db:            db,
 		sourceDB:      sourceDb,
+		startTime:     time.Now(),
 	}, nil
 }
 
 func (c *Cache) Get(contentHash string) ([]byte, error) {
 	path := c.GetPathForContentHash(contentHash)
-	return os.ReadFile(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			atomic.AddInt64(&c.cacheMisses, 1)
+		}
+		return nil, err
+	}
+	atomic.AddInt64(&c.cacheHits, 1)
+	return data, nil
 }
 
 func (c *Cache) Put(contentHash string, data []byte) error {
@@ -127,7 +141,11 @@ func (c *Cache) Exists(contentHash string) (bool, error) {
 	defer c.mu.Unlock()
 	_, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
+		atomic.AddInt64(&c.cacheMisses, 1)
 		return false, nil
+	}
+	if err == nil {
+		atomic.AddInt64(&c.cacheHits, 1)
 	}
 	return err == nil, err
 }
@@ -515,6 +533,17 @@ type CacheStats struct {
 	TotalSize   int64
 }
 
+// CacheMetrics holds cache hit/miss metrics
+type CacheMetrics struct {
+	Hits        int64     `json:"hits"`
+	Misses      int64     `json:"misses"`
+	HitRate     float64   `json:"hit_rate"`
+	TotalOps    int64     `json:"total_ops"`
+	StartTime   time.Time `json:"start_time"`
+	Uptime      string    `json:"uptime"`
+	InstanceID  string    `json:"instance_id"`
+}
+
 // GetStats returns current cache statistics
 func (c *Cache) GetStats() (*CacheStats, error) {
 	c.mu.Lock()
@@ -533,6 +562,38 @@ func (c *Cache) GetStats() (*CacheStats, error) {
 		TotalSize:   totalSize,
 	}, nil
 }
+
+// GetMetrics returns current cache hit/miss metrics
+func (c *Cache) GetMetrics(instanceID string) *CacheMetrics {
+	hits := atomic.LoadInt64(&c.cacheHits)
+	misses := atomic.LoadInt64(&c.cacheMisses)
+	totalOps := hits + misses
+	
+	var hitRate float64
+	if totalOps > 0 {
+		hitRate = float64(hits) / float64(totalOps) * 100
+	}
+	
+	uptime := time.Since(c.startTime)
+	
+	return &CacheMetrics{
+		Hits:       hits,
+		Misses:     misses,
+		HitRate:    hitRate,
+		TotalOps:   totalOps,
+		StartTime:  c.startTime,
+		Uptime:     uptime.String(),
+		InstanceID: instanceID,
+	}
+}
+
+// ResetMetrics resets the hit/miss counters (useful for testing or periodic resets)
+func (c *Cache) ResetMetrics() {
+	atomic.StoreInt64(&c.cacheHits, 0)
+	atomic.StoreInt64(&c.cacheMisses, 0)
+	c.startTime = time.Now()
+}
+
 
 // PurgeAll removes all cached objects and clears the cache index
 func (c *Cache) PurgeAll(ctx context.Context) error {

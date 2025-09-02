@@ -40,9 +40,10 @@ type S3Config struct {
 
 // LocalCacheConfig holds cache configuration - copied from main config
 type LocalCacheConfig struct {
-	Path          string `toml:"path"`
-	Capacity      string `toml:"capacity"`
-	MaxObjectSize string `toml:"max_object_size"`
+	Path            string `toml:"path"`
+	Capacity        string `toml:"capacity"`
+	MaxObjectSize   string `toml:"max_object_size"`
+	MetricsInterval string `toml:"metrics_interval"`
 }
 
 // UploaderConfig holds uploader configuration - copied from main config
@@ -82,9 +83,10 @@ func newDefaultAdminConfig() AdminConfig {
 			EncryptionKey: "",
 		},
 		LocalCache: LocalCacheConfig{
-			Path:          "/tmp/sora/cache",
-			Capacity:      "1gb",
-			MaxObjectSize: "5mb",
+			Path:            "/tmp/sora/cache",
+			Capacity:        "1gb",
+			MaxObjectSize:   "5mb",
+			MetricsInterval: "5m",
 		},
 		Uploader: UploaderConfig{
 			Path:          "/tmp/sora/uploads",
@@ -119,6 +121,8 @@ func main() {
 		handleExportMaildir()
 	case "cache-stats":
 		handleCacheStats()
+	case "cache-metrics":
+		handleCacheMetrics()
 	case "cache-purge":
 		handleCachePurge()
 	case "uploader-status":
@@ -154,6 +158,7 @@ Commands:
   import-maildir    Import maildir from a given path
   export-maildir    Export messages to maildir format
   cache-stats       Show local cache size and object count
+  cache-metrics     Show cache hit/miss ratios and performance metrics
   cache-purge       Clear all cached objects
   uploader-status   Show uploader queue status and failed uploads
   connection-stats  Show active proxy connections and statistics
@@ -168,6 +173,7 @@ Examples:
   sora-admin update-account --email user@example.com --password newpassword
   sora-admin list-credentials --email user@example.com
   sora-admin cache-stats --config /path/to/config.toml
+  sora-admin cache-metrics --config /path/to/config.toml
   sora-admin auth-stats --window 1h --blocked
   sora-admin cache-purge --config /path/to/config.toml
   sora-admin uploader-status --config /path/to/config.toml
@@ -2275,4 +2281,230 @@ func getStatusColor(status db.ComponentStatus) string {
 	default:
 		return "\033[0m" // Reset
 	}
+}
+
+func handleCacheMetrics() {
+	// Parse cache-metrics specific flags
+	fs := flag.NewFlagSet("cache-metrics", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	instanceID := fs.String("instance", "", "Show metrics for specific instance ID")
+	since := fs.String("since", "24h", "Time window for historical metrics (e.g., 1h, 24h, 7d)")
+	showHistory := fs.Bool("history", false, "Show historical metrics instead of just latest")
+	limit := fs.Int("limit", 50, "Maximum number of historical records to show")
+	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show cache hit/miss ratios and performance metrics
+
+Usage:
+  sora-admin cache-metrics [options]
+
+Options:
+  --instance string    Show metrics for specific instance ID
+  --since string       Time window for historical metrics (default: 24h)
+  --history            Show historical metrics instead of just latest
+  --limit int          Maximum number of historical records to show (default: 50)
+  --json               Output in JSON format
+  --config string      Path to TOML configuration file (default: config.toml)
+
+This command shows:
+  - Cache hit/miss ratios for each instance
+  - Total cache operations and performance trends
+  - Instance uptime and performance over time
+  - Historical trends when using --history flag
+
+Examples:
+  sora-admin cache-metrics
+  sora-admin cache-metrics --instance server1-cache
+  sora-admin cache-metrics --history --since 7d
+  sora-admin cache-metrics --json
+`)
+	}
+
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Parse since duration
+	sinceDuration, err := helpers.ParseDuration(*since)
+	if err != nil {
+		log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show cache metrics
+	if err := showCacheMetrics(cfg, *instanceID, sinceDuration, *showHistory, *limit, *jsonOutput); err != nil {
+		log.Fatalf("Failed to show cache metrics: %v", err)
+	}
+}
+
+func showCacheMetrics(cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
+	// Connect to database
+	ctx := context.Background()
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	if showHistory {
+		return showHistoricalCacheMetrics(ctx, database, instanceID, sinceDuration, limit, jsonOutput)
+	}
+
+	return showLatestCacheMetrics(ctx, database, instanceID, jsonOutput)
+}
+
+func showLatestCacheMetrics(ctx context.Context, database *db.Database, instanceID string, jsonOutput bool) error {
+	var metrics []*db.CacheMetricsRecord
+	var err error
+
+	if instanceID != "" {
+		// Get metrics for specific instance
+		// Get the single most recent metric for the instance, regardless of age.
+		metrics, err = database.GetCacheMetrics(ctx, instanceID, time.Time{}, 1)
+	} else {
+		// Get latest metrics for all instances
+		metrics, err = database.GetLatestCacheMetrics(ctx)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to get cache metrics: %w", err)
+	}
+
+	if jsonOutput {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(map[string]interface{}{
+			"metrics":   metrics,
+			"timestamp": time.Now(),
+		})
+	}
+
+	if len(metrics) == 0 {
+		fmt.Println("No cache metrics available.")
+		fmt.Println("\nNote: Cache metrics are collected when the cache is actively used.")
+		fmt.Println("Start the Sora server and perform some operations to generate metrics.")
+		return nil
+	}
+
+	// Display metrics in table format
+	fmt.Printf("Cache Performance Metrics (Latest)\n")
+	fmt.Printf("==================================\n\n")
+
+	fmt.Printf("%-20s %-15s %-8s %-8s %-8s %-12s %-10s %-19s\n",
+		"Instance ID", "Server", "Hits", "Misses", "Hit Rate", "Total Ops", "Uptime", "Recorded At")
+	fmt.Printf("%s\n", strings.Repeat("-", 110))
+
+	for _, m := range metrics {
+		uptimeDuration := time.Duration(m.UptimeSeconds) * time.Second
+		fmt.Printf("%-20s %-15s %-8d %-8d %-7.1f%% %-12d %-10s %-19s\n",
+			truncateString(m.InstanceID, 20),
+			truncateString(m.ServerHostname, 15),
+			m.Hits,
+			m.Misses,
+			m.HitRate,
+			m.TotalOperations,
+			formatDuration(uptimeDuration),
+			m.RecordedAt.Format("2006-01-02 15:04:05"))
+	}
+
+	// Show summary statistics
+	if len(metrics) > 1 {
+		var totalHits, totalMisses, totalOps int64
+		for _, m := range metrics {
+			totalHits += m.Hits
+			totalMisses += m.Misses
+			totalOps += m.TotalOperations
+		}
+
+		overallHitRate := 0.0
+		if totalOps > 0 {
+			overallHitRate = float64(totalHits) / float64(totalOps) * 100
+		}
+
+		fmt.Printf("\nSummary Across All Instances:\n")
+		fmt.Printf("  Total Instances: %d\n", len(metrics))
+		fmt.Printf("  Combined Hits:   %d\n", totalHits)
+		fmt.Printf("  Combined Misses: %d\n", totalMisses)
+		fmt.Printf("  Overall Hit Rate: %.1f%%\n", overallHitRate)
+	}
+
+	return nil
+}
+
+func showHistoricalCacheMetrics(ctx context.Context, database *db.Database, instanceID string, sinceDuration time.Duration, limit int, jsonOutput bool) error {
+	since := time.Now().Add(-sinceDuration)
+	metrics, err := database.GetCacheMetrics(ctx, instanceID, since, limit)
+	if err != nil {
+		return fmt.Errorf("failed to get cache metrics: %w", err)
+	}
+
+	if jsonOutput {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(map[string]interface{}{
+			"metrics":   metrics,
+			"since":     since,
+			"timestamp": time.Now(),
+		})
+	}
+
+	if len(metrics) == 0 {
+		fmt.Printf("No cache metrics available for the last %s.\n", sinceDuration)
+		return nil
+	}
+
+	fmt.Printf("Cache Performance Metrics (Historical - Last %s)\n", sinceDuration)
+	fmt.Printf("=================================================\n\n")
+
+	// Group by instance for better display
+	instanceGroups := make(map[string][]*db.CacheMetricsRecord)
+	for _, m := range metrics {
+		instanceGroups[m.InstanceID] = append(instanceGroups[m.InstanceID], m)
+	}
+
+	for instance, instanceMetrics := range instanceGroups {
+		fmt.Printf("Instance: %s\n", instance)
+		fmt.Printf("%s\n", strings.Repeat("-", len(instance)+10))
+
+		fmt.Printf("%-8s %-8s %-8s %-12s %-10s %-19s\n",
+			"Hits", "Misses", "Hit Rate", "Total Ops", "Uptime", "Recorded At")
+		fmt.Printf("%s\n", strings.Repeat("-", 75))
+
+		for _, m := range instanceMetrics {
+			uptimeDuration := time.Duration(m.UptimeSeconds) * time.Second
+			fmt.Printf("%-8d %-8d %-7.1f%% %-12d %-10s %-19s\n",
+				m.Hits,
+				m.Misses,
+				m.HitRate,
+				m.TotalOperations,
+				formatDuration(uptimeDuration),
+				m.RecordedAt.Format("2006-01-02 15:04:05"))
+		}
+		fmt.Printf("\n")
+	}
+
+	return nil
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }

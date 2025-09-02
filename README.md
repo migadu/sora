@@ -263,6 +263,9 @@ Update existing account passwords:
 ./sora-admin connections         # List all active connections
 ./sora-admin connections --user user@example.com  # User-specific
 
+# View cache performance metrics
+./sora-admin cache-metrics       # Show latest hit/miss ratios per instance
+
 # Check system health
 ./sora-admin health-status       # Overall health check
 ./sora-admin health-status --detailed  # Component details

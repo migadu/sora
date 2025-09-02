@@ -29,9 +29,11 @@ type CleanupConfig struct {
 
 // Local disk cache configuration.
 type LocalCacheConfig struct {
-	Capacity      string `toml:"capacity"`
-	MaxObjectSize string `toml:"max_object_size"`
-	Path          string `toml:"path"`
+	Capacity         string `toml:"capacity"`
+	MaxObjectSize    string `toml:"max_object_size"`
+	Path             string `toml:"path"`
+	MetricsInterval  string `toml:"metrics_interval"`
+	MetricsRetention string `toml:"metrics_retention"`
 }
 
 // IMAPServerConfig holds IMAP server configuration.
@@ -279,9 +281,11 @@ func newDefaultConfig() Config {
 			WakeInterval: "1h",
 		},
 		LocalCache: LocalCacheConfig{
-			Capacity:      "1gb",
-			MaxObjectSize: "5mb",
-			Path:          "/tmp/sora/cache",
+			Capacity:         "1gb",
+			MaxObjectSize:    "5mb",
+			Path:             "/tmp/sora/cache",
+			MetricsInterval:  "5m",
+			MetricsRetention: "30d",
 		},
 		Servers: ServersConfig{
 			Debug: false,
@@ -462,6 +466,20 @@ func (c *LocalCacheConfig) GetMaxObjectSize() (int64, error) {
 		c.MaxObjectSize = "5mb"
 	}
 	return helpers.ParseSize(c.MaxObjectSize)
+}
+
+func (c *LocalCacheConfig) GetMetricsInterval() (time.Duration, error) {
+	if c.MetricsInterval == "" {
+		c.MetricsInterval = "5m"
+	}
+	return helpers.ParseDuration(c.MetricsInterval)
+}
+
+func (c *LocalCacheConfig) GetMetricsRetention() (time.Duration, error) {
+	if c.MetricsRetention == "" {
+		c.MetricsRetention = "30d"
+	}
+	return helpers.ParseDuration(c.MetricsRetention)
 }
 
 func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {

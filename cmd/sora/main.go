@@ -83,6 +83,7 @@ func main() {
 	fCachePath := flag.String("cachedir", cfg.LocalCache.Path, "Local path for storing cached files (overrides config)")
 	fCacheCapacity := flag.String("cachesize", cfg.LocalCache.Capacity, "Disk cache size in Megabytes (overrides config)")
 	fCacheMaxObjectSize := flag.String("cachemaxobject", cfg.LocalCache.MaxObjectSize, "Maximum object size accepted in cache (overrides config)")
+	fCacheMetricsInterval := flag.String("cachemetricsinterval", cfg.LocalCache.MetricsInterval, "Interval for storing cache metrics (overrides config)")
 
 	// LMTP specific
 	fExternalRelay := flag.String("externalrelay", cfg.Servers.LMTP.ExternalRelay, "External relay for LMTP (overrides config)")
@@ -234,6 +235,9 @@ func main() {
 	}
 	if isFlagSet("cachemaxobject") {
 		cfg.LocalCache.MaxObjectSize = *fCacheMaxObjectSize
+	}
+	if isFlagSet("cachemetricsinterval") {
+		cfg.LocalCache.MetricsInterval = *fCacheMetricsInterval
 	}
 
 	// S3 Config
@@ -540,6 +544,47 @@ func main() {
 				return nil
 			},
 		})
+
+		// Start cache metrics collection
+		metricsInterval, err := cfg.LocalCache.GetMetricsInterval()
+		if err != nil {
+			errorHandler.ValidationError("cache metrics_interval", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		metricsRetention, err := cfg.LocalCache.GetMetricsRetention()
+		if err != nil {
+			errorHandler.ValidationError("cache metrics_retention", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
+		log.Printf("[CACHE] starting metrics collection with interval: %v", metricsInterval)
+		go func() {
+			metricsTicker := time.NewTicker(metricsInterval) // Store metrics at configured interval
+			cleanupTicker := time.NewTicker(24 * time.Hour)  // Cleanup old metrics daily
+			defer metricsTicker.Stop()
+			defer cleanupTicker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-metricsTicker.C:
+					metrics := cacheInstance.GetMetrics(hostname)
+					uptimeSeconds := int64(time.Since(metrics.StartTime).Seconds())
+
+					if err := database.StoreCacheMetrics(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
+						log.Printf("[CACHE] WARNING: failed to store metrics: %v", err)
+					}
+				case <-cleanupTicker.C:
+					// Cleanup old cache metrics
+					if deleted, err := database.CleanupOldCacheMetrics(ctx, metricsRetention); err != nil {
+						log.Printf("[CACHE] WARNING: failed to cleanup old metrics: %v", err)
+					} else if deleted > 0 {
+						log.Printf("[CACHE] cleaned up %d old cache metrics records", deleted)
+					}
+				}
+			}
+		}()
 
 		// Initialize and start the cleanup worker
 		gracePeriod, err := cfg.Cleanup.GetGracePeriod()

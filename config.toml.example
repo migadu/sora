@@ -201,6 +201,22 @@ capacity = "1gb"
 #   max_object_size = "25mb"                   # Liberal limit
 max_object_size = "5mb"
 
+# Cache metrics collection interval
+# Controls how often cache hit/miss ratios are stored in the database
+# Examples:
+#   metrics_interval = "1m"                    # High frequency monitoring
+#   metrics_interval = "5m"                    # Standard monitoring (default)
+#   metrics_interval = "15m"                   # Low frequency monitoring
+#   metrics_interval = "30m"                   # Minimal monitoring
+metrics_interval = "5m"
+
+# Cache metrics retention period
+# Examples:
+#   metrics_retention = "7d"
+#   metrics_retention = "14d"
+#   metrics_retention = "30d"                 # Default retention (recommended)
+metrics_retention = "30d"
+
 # =============================================================================
 # S3 UPLOADER CONFIGURATION
 # =============================================================================
