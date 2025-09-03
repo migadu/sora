@@ -8,9 +8,11 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
@@ -33,29 +35,29 @@ type POP3Server struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
-	
+
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
-	
+
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
-	
+
 	// Authentication rate limiting
 	authLimiter serverPkg.AuthLimiter
 }
 
 type POP3ServerOptions struct {
-	Debug              bool
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	MasterSASLUsername string
-	MasterSASLPassword string
-	MaxConnections     int
+	Debug               bool
+	TLS                 bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSVerify           bool
+	MasterSASLUsername  string
+	MasterSASLPassword  string
+	MaxConnections      int
 	MaxConnectionsPerIP int
-	ProxyProtocol      serverPkg.ProxyProtocolConfig
-	AuthRateLimit      serverPkg.AuthRateLimiterConfig
+	ProxyProtocol       serverPkg.ProxyProtocolConfig
+	AuthRateLimit       serverPkg.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -73,8 +75,8 @@ func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3St
 		}
 	}
 
-	// Initialize enhanced authentication rate limiter
-	authLimiter := serverPkg.NewEnhancedAuthRateLimiterFromBasic("POP3", options.AuthRateLimit, database)
+	// Initialize authentication rate limiter
+	authLimiter := serverPkg.NewAuthRateLimiter("POP3", options.AuthRateLimit, database)
 
 	server := &POP3Server{
 		hostname:           hostname,
@@ -166,13 +168,13 @@ func (s *POP3Server) Start(errChan chan error) {
 				log.Printf("* POP3 server closed: %v", s.appCtx.Err())
 				return
 			}
-			
+
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if strings.Contains(err.Error(), "PROXY protocol error") {
 				log.Printf("[POP3] PROXY protocol error, rejecting connection: %v", err)
 				continue // Continue accepting other connections
 			}
-			
+
 			// For other errors, this might be a fatal server error
 			errChan <- err
 			return
@@ -192,6 +194,10 @@ func (s *POP3Server) Start(errChan chan error) {
 		totalCount := s.totalConnections.Add(1)
 		authCount := s.authenticatedConnections.Load()
 
+		// Prometheus metrics - connection established
+		metrics.ConnectionsTotal.WithLabelValues("pop3").Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("pop3").Inc()
+
 		session := &POP3Session{
 			server:      s,
 			conn:        &conn,
@@ -200,6 +206,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			cancel:      sessionCancel,
 			language:    "en", // Default language
 			releaseConn: releaseConn,
+			startTime:   time.Now(),
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available
@@ -207,7 +214,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
 			proxyInfo = proxyConn.GetProxyInfo()
 		}
-		
+
 		clientIP, proxyIP := serverPkg.GetConnectionIPs(conn, proxyInfo)
 		session.RemoteIP = clientIP
 		session.ProxyIP = proxyIP

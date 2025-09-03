@@ -1114,17 +1114,27 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		log.Printf("Using existing mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
 	}
 
-	// Check if this message is already imported in the Sora database (unless forcing reimport)
-	if !i.options.ForceReimport {
-		alreadyImported, err := i.isMessageAlreadyImported(ctx, hash, mailbox.ID)
-		if err != nil {
-			return fmt.Errorf("failed to check if message already imported: %w", err)
+	// Check if this message is already imported
+	alreadyImported, err := i.isMessageAlreadyImported(ctx, hash, mailbox.ID)
+	if err != nil {
+		return fmt.Errorf("failed to check if message is already imported: %w", err)
+	}
+
+	if alreadyImported {
+		if !i.options.ForceReimport {
+			log.Printf("%s Message already exists in DB, skipping: %s", i.getProgressPrefix(), path)
+			atomic.AddInt64(&i.skippedMessages, 1)
+			return nil
 		}
 
-		if alreadyImported {
-			atomic.AddInt64(&i.skippedMessages, 1)
-			log.Printf("%s Message already imported in Sora database, skipping: %s (hash: %s)", i.getProgressPrefix(), path, hash[:12])
-			return nil
+		// ForceReimport is true: delete the existing message before proceeding.
+		// This requires a `DeleteMessageByHashAndMailbox` method in the db package.
+		deleted, err := i.soraDB.DeleteMessageByHashAndMailbox(ctx, user.UserID(), mailbox.ID, hash)
+		if err != nil {
+			return fmt.Errorf("failed to delete existing message for re-import: %w", err)
+		}
+		if deleted > 0 {
+			log.Printf("%s Deleted %d existing message(s) for re-import (hash: %s, mailbox: %s)", i.getProgressPrefix(), deleted, hash[:12], mailboxName)
 		}
 	}
 
@@ -1171,23 +1181,6 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		flags = []imap.Flag{imap.Flag("\\Recent")}
 	}
 
-	// Construct S3 key
-	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
-
-	// First, upload to S3 with retries.
-	var s3Err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		s3Err = i.s3.Put(s3Key, bytes.NewReader(content), size)
-		if s3Err == nil {
-			break // Success
-		}
-		log.Printf("Failed to upload to S3 (attempt %d/3): %v. Retrying in 2 seconds...", attempt, s3Err)
-		time.Sleep(2 * time.Second)
-	}
-	if s3Err != nil {
-		return fmt.Errorf("failed to upload to s3 after 3 attempts: %w", s3Err)
-	}
-
 	// Look up preserved UID if enabled
 	var preservedUID *uint32
 	var preservedUIDValidity *uint32
@@ -1207,12 +1200,12 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		}
 	}
 
-	// Log message details for debugging
-	log.Printf("Importing message: mailbox=%s, subject=%s, messageID=%s, hash=%s, size=%d",
-		mailbox.Name, subject, messageID, hash, size)
-
-	// If S3 upload is successful, then insert into the database.
-	msgID, uid, err := i.soraDB.InsertMessageFromImporter(ctx,
+	// --- Robust Import Flow ---
+	// Step 1: Queue the message in the database. This is a transactional write
+	// that creates the message metadata and a pending_uploads record. This is the
+	// "commit point" for the message's existence.
+	hostname, _ := os.Hostname()
+	msgID, uid, err := i.soraDB.InsertMessage(ctx,
 		&db.InsertMessageOptions{
 			UserID:               user.UserID(),
 			MailboxID:            mailbox.ID,
@@ -1231,19 +1224,40 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			RawHeaders:           rawHeadersText,
 			PreservedUID:         preservedUID,
 			PreservedUIDValidity: preservedUIDValidity,
+		},
+		db.PendingUpload{
+			InstanceID:  hostname,
+			ContentHash: hash,
+			Size:        size,
+			AccountID:   user.UserID(),
 		})
+
 	if err != nil {
-		// Don't fail on unique violation, just log it
-		if strings.Contains(err.Error(), "23505") {
-			log.Printf("Message already exists in DB, skipping: %s", path)
+		if errors.Is(err, consts.ErrDBUniqueViolation) {
+			// This can happen if another process imported the message between our check and insert (race condition).
+			// It's safe to skip, as no S3 orphan was created.
+			log.Printf("%s Message already exists in DB (race condition?), skipping: %s", i.getProgressPrefix(), path)
 			atomic.AddInt64(&i.skippedMessages, 1)
-			// The S3 object was uploaded but the DB record already exists.
-			// This is a safe state, so we can continue.
 			return nil
 		}
-		// If DB insert fails for other reasons, we have an orphaned S3 object.
-		// This is a trade-off for robustness. Manual cleanup might be needed in rare cases.
-		return fmt.Errorf("failed to insert message metadata after S3 upload: %w", err)
+		return fmt.Errorf("failed to queue message in database: %w", err)
+	}
+
+	// Step 2: Now that the message is safely queued, upload its content to S3.
+	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
+	s3Err := i.s3.Put(s3Key, bytes.NewReader(content), size)
+	if s3Err != nil {
+		// S3 upload failed. The message remains in the 'pending_uploads' queue.
+		// It can be retried by re-running the import. No S3 orphan was created.
+		return fmt.Errorf("failed to upload to S3. Message is queued in DB for retry on next run: %w", s3Err)
+	}
+
+	// Step 3: Finalize the upload in the database.
+	err = i.soraDB.CompleteS3Upload(ctx, hash, user.UserID())
+	if err != nil {
+		// The S3 object exists, but we failed to mark it as complete in the DB.
+		// The message remains in the 'pending_uploads' queue and can be retried.
+		return fmt.Errorf("S3 upload succeeded, but failed to finalize in DB. Message is queued for retry on next run: %w", err)
 	}
 
 	atomic.AddInt64(&i.importedMessages, 1)

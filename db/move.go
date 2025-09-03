@@ -27,7 +27,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	}
 
 	// Begin a transaction
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
 		return nil, consts.ErrInternalError

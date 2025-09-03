@@ -18,6 +18,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -43,7 +44,7 @@ type POP3Session struct {
 	utf8Mode       bool               // UTF8 mode enabled for this session
 	releaseConn    func()             // Function to release connection from limiter
 	useMasterDB    bool               // Pin session to master DB after a write to ensure consistency
-
+	startTime      time.Time
 }
 
 func (s *POP3Session) handleConnection() {
@@ -93,6 +94,17 @@ func (s *POP3Session) handleConnection() {
 
 		switch cmd {
 		case "CAPA":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "CAPA", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "CAPA").Observe(time.Since(start).Seconds())
+			}()
+
 			// CAPA command - list server capabilities
 			writer.WriteString("+OK Capability list follows\r\n")
 			writer.WriteString("TOP\r\n")
@@ -107,8 +119,20 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("UTF8\r\n")
 			writer.WriteString("IMPLEMENTATION Sora-POP3-Server\r\n")
 			writer.WriteString(".\r\n")
+			success = true
 
 		case "USER":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "USER", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "USER").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting USER command")
@@ -147,8 +171,20 @@ func (s *POP3Session) handleConnection() {
 			}
 			userAddress = &newUserAddress
 			writer.WriteString("+OK User accepted\r\n")
+			success = true
 
 		case "PASS":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "PASS", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "PASS").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting PASS command")
@@ -191,6 +227,8 @@ func (s *POP3Session) handleConnection() {
 			if s.server.authLimiter != nil {
 				if err := s.server.authLimiter.CanAttemptAuth(ctx, remoteAddr, userAddress.FullAddress()); err != nil {
 					s.Log("[PASS] rate limited: %v", err)
+					// Track rate limiting
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
 					if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
 						return
 					}
@@ -232,6 +270,9 @@ func (s *POP3Session) handleConnection() {
 						remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 						s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, userAddress.FullAddress(), false)
 					}
+					// Track failed authentication
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+					metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
 					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 						s.Log("authentication failed")
 						return
@@ -289,9 +330,32 @@ func (s *POP3Session) handleConnection() {
 			totalCount := s.server.totalConnections.Load()
 			s.Log("authenticated (connections: total=%d, authenticated=%d)", totalCount, authCount)
 
+			// Track successful authentication
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", "success").Inc()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3").Inc()
+			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
+
+			// Track domain and user connection activity
+			if s.User != nil {
+				metrics.TrackDomainConnection("pop3", s.Domain())
+				metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
+			}
+
 			writer.WriteString("+OK Password accepted\r\n")
+			success = true
 
 		case "STAT":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "STAT", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "STAT").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting STAT command")
@@ -325,8 +389,20 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", messagesCount, size))
+			success = true
 
 		case "LIST":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "LIST", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "LIST").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting LIST command")
@@ -396,7 +472,20 @@ func (s *POP3Session) handleConnection() {
 			cancel()
 			s.Log("listed %d messages", len(s.messages))
 
+			success = true
+
 		case "UIDL":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "UIDL", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "UIDL").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting UIDL command")
@@ -523,8 +612,20 @@ func (s *POP3Session) handleConnection() {
 				}
 			}
 			s.Log("UIDL command executed")
+			success = true
 
 		case "TOP":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "TOP", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "TOP").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting TOP command")
@@ -718,8 +819,20 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(result)
 			writer.WriteString("\r\n.\r\n")
 			s.Log("retrieved top %d lines of message %d", lines, msg.UID)
+			success = true
 
 		case "RETR":
+			retrieveStart := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "RETR", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "RETR").Observe(time.Since(retrieveStart).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting RETR command")
@@ -880,10 +993,47 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("\r\n.\r\n")
 			s.Log("retrieved message %d", localMsg.UID)
 
+			// Track successful message retrieval
+			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
+			metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(localMsg.Size))
+			metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(time.Since(retrieveStart).Seconds())
+
+			// Track domain and user activity - RETR is bandwidth intensive!
+			if s.User != nil {
+				metrics.TrackDomainCommand("pop3", s.Domain(), "RETR")
+				metrics.TrackUserActivity("pop3", s.FullAddress(), "command", 1)
+				metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(localMsg.Size))
+				metrics.TrackDomainMessage("pop3", s.Domain(), "fetched")
+			}
+			success = true
+
 		case "NOOP":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "NOOP", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "NOOP").Observe(time.Since(start).Seconds())
+			}()
+
 			writer.WriteString("+OK\r\n")
+			success = true
 
 		case "RSET":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "RSET", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "RSET").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting RSET command")
@@ -905,8 +1055,20 @@ func (s *POP3Session) handleConnection() {
 
 			writer.WriteString("+OK\r\n")
 			s.Log("reset")
+			success = true
 
 		case "DELE":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "DELE", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "DELE").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting DELE command")
@@ -995,7 +1157,21 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("+OK Message deleted\r\n")
 			s.Log("DELE: marked message %d (UID %d) for deletion in mailbox %d. Total deleted: %d", msgNumber, msg.UID, s.inboxMailboxID, len(s.deleted))
 
+			metrics.MessageThroughput.WithLabelValues("pop3", "deleted", "success").Inc()
+			success = true
+
 		case "AUTH":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "AUTH", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "AUTH").Observe(time.Since(start).Seconds())
+			}()
+
 			// Check context before processing command
 			if s.ctx.Err() != nil {
 				s.Log("WARNING: context cancelled, aborting AUTH command")
@@ -1240,8 +1416,20 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			writer.WriteString("+OK Authentication successful\r\n")
+			success = true
 
 		case "LANG":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "LANG", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "LANG").Observe(time.Since(start).Seconds())
+			}()
+
 			// LANG command - set or query language
 			// Acquire read lock to access current language
 			acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -1291,8 +1479,20 @@ func (s *POP3Session) handleConnection() {
 				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", s.language))
 			}
 			s.Log("LANG command: current=%s", currentLang)
+			success = true
 
 		case "UTF8":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "UTF8", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "UTF8").Observe(time.Since(start).Seconds())
+			}()
+
 			// UTF8 command - enable UTF-8 mode
 			// Acquire write lock to update UTF8 mode
 			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
@@ -1309,8 +1509,20 @@ func (s *POP3Session) handleConnection() {
 
 			writer.WriteString("+OK UTF8 enabled\r\n")
 			s.Log("UTF8 mode enabled")
+			success = true
 
 		case "QUIT":
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "QUIT", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "QUIT").Observe(time.Since(start).Seconds())
+			}()
+
 			s.Log("QUIT: Command received, starting message expunge process")
 			// Check context before processing command
 			if s.ctx.Err() != nil {
@@ -1364,6 +1576,7 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("+OK Goodbye\r\n")
 			writer.Flush()
 			s.Close()
+			success = true
 			return
 
 		default:
@@ -1417,8 +1630,13 @@ func (s *POP3Session) Close() error {
 	defer s.mutex.Unlock()
 	defer cancel()
 
+	metrics.ConnectionDuration.WithLabelValues("pop3").Observe(time.Since(s.startTime).Seconds())
+
 	totalCount := s.server.totalConnections.Add(-1)
 	var authCount int64 = 0
+
+	// Prometheus metrics - connection closed
+	metrics.ConnectionsCurrent.WithLabelValues("pop3").Dec()
 
 	(*s.conn).Close()
 
@@ -1443,6 +1661,7 @@ func (s *POP3Session) Close() error {
 
 		if s.authenticated {
 			authCount = s.server.authenticatedConnections.Add(-1)
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3").Dec()
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}

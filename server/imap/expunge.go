@@ -5,6 +5,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
@@ -106,6 +107,13 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	s.Log("[EXPUNGE] command processed, %d messages expunged from DB. Client notified.", len(messagesToExpunge))
+
+	// Track domain and user command activity - EXPUNGE is database intensive!
+	if s.IMAPUser != nil && len(messagesToExpunge) > 0 {
+		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "EXPUNGE")
+		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
+		metrics.TrackDomainMessage("imap", s.IMAPUser.Address.Domain(), "deleted")
+	}
 
 	return nil
 }

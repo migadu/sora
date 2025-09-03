@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -195,6 +196,16 @@ func (s *Session) authenticateUser(username, password string) error {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
+	remoteAddr := s.clientConn.RemoteAddr()
+
+	// Check if the authentication attempt is allowed by the rate limiter.
+	if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, username); err != nil {
+		// Record the failed attempt before returning the error.
+		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+		return err
+	}
+
 	address, err := server.NewAddress(username)
 	if err != nil {
 		return fmt.Errorf("invalid address format: %w", err)
@@ -202,10 +213,20 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	accountID, err := s.server.db.Authenticate(ctx, address.FullAddress(), password)
 	if err != nil {
+		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
+	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 	s.accountID = accountID
+
+	// Track successful authentication.
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+
+	// Track domain and user connection activity for the login event.
+	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
+	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
 
 	return nil
 }
@@ -313,7 +334,9 @@ func (s *Session) startProxy() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(s.backendConn, s.clientConn); err != nil && !isClosingError(err) {
+		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
+		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "in").Add(float64(bytesIn))
+		if err != nil && !isClosingError(err) {
 			log.Printf("[ManageSieve Proxy] Error copying from client to backend: %v", err)
 		}
 		s.backendConn.Close() // Close backend to unblock the other io.Copy
@@ -324,7 +347,9 @@ func (s *Session) startProxy() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(s.clientConn, s.backendConn); err != nil && !isClosingError(err) {
+		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "out").Add(float64(bytesOut))
+		if err != nil && !isClosingError(err) {
 			log.Printf("[ManageSieve Proxy] Error copying from backend to client: %v", err)
 		}
 		s.clientConn.Close() // Close client to unblock the other io.Copy
@@ -344,6 +369,9 @@ func (s *Session) startProxy() {
 func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Decrement current connections metric
+	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
 
 	// Unregister connection
 	if s.accountID > 0 {

@@ -7,6 +7,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
@@ -143,6 +144,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d FirstUnseenSeq=%d",
 		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent, s.firstUnseenSeqNum.Load())
+	
+	// Track domain and user command activity
+	if s.IMAPUser != nil {
+		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "SELECT")
+		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
+	}
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)

@@ -19,13 +19,13 @@ type ProxyProtocolConfig struct {
 
 // ProxyProtocolInfo contains information extracted from PROXY protocol header
 type ProxyProtocolInfo struct {
-	Version    int    // 1 or 2
-	Command    string // PROXY or TCP4/TCP6
-	SrcIP      string // Real client IP
-	DstIP      string // Destination IP  
-	SrcPort    int    // Real client port
-	DstPort    int    // Destination port
-	Protocol   string // TCP4, TCP6, UDP4, UDP6
+	Version  int    // 1 or 2
+	Command  string // PROXY or TCP4/TCP6
+	SrcIP    string // Real client IP
+	DstIP    string // Destination IP
+	SrcPort  int    // Real client port
+	DstPort  int    // Destination port
+	Protocol string // TCP4, TCP6, UDP4, UDP6
 }
 
 // ProxyProtocolReader handles PROXY protocol parsing
@@ -41,10 +41,10 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		config:  config,
 		timeout: 5 * time.Second, // default timeout
 	}
-	
-	log.Printf("[%s-PROXY] Initializing PROXY protocol reader: enabled=%t, trusted_proxies=%v, timeout=%v", 
+
+	log.Printf("[%s-PROXY] Initializing PROXY protocol reader: enabled=%t, trusted_proxies=%v, timeout=%v",
 		protocol, config.Enabled, config.TrustedProxies, reader.timeout)
-	
+
 	// Parse timeout
 	if config.Timeout != "" {
 		var err error
@@ -53,7 +53,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 			return nil, fmt.Errorf("invalid proxy protocol timeout: %w", err)
 		}
 	}
-	
+
 	// Parse trusted proxy CIDR blocks
 	for _, cidr := range config.TrustedProxies {
 		_, network, err := net.ParseCIDR(cidr)
@@ -62,7 +62,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		}
 		reader.trustedNets = append(reader.trustedNets, network)
 	}
-	
+
 	return reader, nil
 }
 
@@ -72,29 +72,29 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	if !r.config.Enabled {
 		return nil, conn, nil
 	}
-	
+
 	// Check if connection is from trusted proxy
 	if !r.isTrustedConnection(conn) {
 		log.Printf("[PROXY] WARNING: Connection from %s is NOT in trusted_proxies list - PROXY protocol will be IGNORED! Check your trusted_proxies configuration.", conn.RemoteAddr())
 		return nil, conn, nil // Not from trusted proxy, no PROXY protocol expected
 	}
-	
+
 	log.Printf("[PROXY] Processing connection from trusted proxy %s", conn.RemoteAddr())
-	
+
 	// Set read deadline for PROXY header
 	if err := conn.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
 		return nil, conn, fmt.Errorf("failed to set read deadline: %w", err)
 	}
-	
+
 	// Create buffered reader
 	reader := bufio.NewReader(conn)
-	
+
 	// Peek at first few bytes to detect PROXY protocol
 	peek, err := reader.Peek(16) // Peek more bytes to detect PROXY v2 signature
 	if err != nil {
 		return nil, conn, fmt.Errorf("failed to peek connection: %w", err)
 	}
-	
+
 	// Check for PROXY v1 signature
 	if len(peek) >= 5 && string(peek[:5]) == "PROXY" {
 		log.Printf("[PROXY] Detected PROXY v1 protocol from %s", conn.RemoteAddr())
@@ -102,21 +102,21 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 		if err != nil {
 			return nil, conn, fmt.Errorf("failed to parse PROXY v1 header: %w", err)
 		}
-		
+
 		log.Printf("[PROXY] Parsed PROXY v1: client=%s:%d -> server=%s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
-		
+
 		// Clear read deadline
 		conn.SetReadDeadline(time.Time{})
-		
+
 		// Return wrapped connection with buffered reader
 		wrappedConn := &proxyProtocolConn{
 			Conn:   conn,
 			reader: reader,
 		}
-		
+
 		return info, wrappedConn, nil
 	}
-	
+
 	// Check for PROXY v2 signature (binary)
 	if len(peek) >= 12 {
 		// PROXY v2 signature: \x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A
@@ -135,37 +135,37 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 				if err != nil {
 					return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
 				}
-				
+
 				if info.SrcIP != "" {
 					log.Printf("[PROXY] Parsed PROXY v2: client=%s:%d -> server=%s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
 				} else {
 					log.Printf("[PROXY] Parsed PROXY v2: %s command", info.Command)
 				}
-				
+
 				// Clear read deadline
 				conn.SetReadDeadline(time.Time{})
-				
+
 				// Return wrapped connection
 				wrappedConn := &proxyProtocolConn{
 					Conn:   conn,
 					reader: reader,
 				}
-				
+
 				return info, wrappedConn, nil
 			}
 		}
 	}
-	
+
 	// No PROXY protocol detected, clear deadline and return original connection
 	log.Printf("[PROXY] No PROXY protocol detected from %s (peeked: %x)", conn.RemoteAddr(), peek)
 	conn.SetReadDeadline(time.Time{})
-	
+
 	// Need to return the buffered connection since we peeked
 	wrappedConn := &proxyProtocolConn{
 		Conn:   conn,
 		reader: reader,
 	}
-	
+
 	return nil, wrappedConn, nil
 }
 
@@ -176,26 +176,26 @@ func (r *ProxyProtocolReader) parseProxyV1(reader *bufio.Reader) (*ProxyProtocol
 	if err != nil {
 		return nil, fmt.Errorf("failed to read PROXY line: %w", err)
 	}
-	
+
 	// Remove \r\n
 	line = strings.TrimRight(line, "\r\n")
-	
+
 	// Parse: "PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535"
 	parts := strings.Split(line, " ")
 	if len(parts) != 6 {
 		return nil, fmt.Errorf("invalid PROXY v1 format: expected 6 parts, got %d", len(parts))
 	}
-	
+
 	if parts[0] != "PROXY" {
 		return nil, fmt.Errorf("invalid PROXY v1 header: expected PROXY, got %s", parts[0])
 	}
-	
+
 	protocol := parts[1] // TCP4, TCP6, UNKNOWN
 	srcIP := parts[2]
 	dstIP := parts[3]
 	srcPortStr := parts[4]
 	dstPortStr := parts[5]
-	
+
 	// Handle UNKNOWN connections
 	if protocol == "UNKNOWN" {
 		return &ProxyProtocolInfo{
@@ -204,18 +204,18 @@ func (r *ProxyProtocolReader) parseProxyV1(reader *bufio.Reader) (*ProxyProtocol
 			Protocol: protocol,
 		}, nil
 	}
-	
+
 	// Parse ports
 	srcPort, err := strconv.Atoi(srcPortStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid source port: %w", err)
 	}
-	
+
 	dstPort, err := strconv.Atoi(dstPortStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid destination port: %w", err)
 	}
-	
+
 	return &ProxyProtocolInfo{
 		Version:  1,
 		Command:  "PROXY",
@@ -235,7 +235,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	if err != nil {
 		return nil, fmt.Errorf("failed to read PROXY v2 header: %w", err)
 	}
-	
+
 	// Verify signature (already checked by caller, but double-check)
 	v2Sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
 	for i, b := range v2Sig {
@@ -243,24 +243,24 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			return nil, fmt.Errorf("invalid PROXY v2 signature")
 		}
 	}
-	
+
 	// Parse version and command (byte 12)
 	versionCmd := header[12]
 	version := (versionCmd & 0xF0) >> 4
 	command := versionCmd & 0x0F
-	
+
 	if version != 2 {
 		return nil, fmt.Errorf("invalid PROXY version: %d", version)
 	}
-	
+
 	// Parse address family and protocol (byte 13)
 	famAndProto := header[13]
 	addressFamily := (famAndProto & 0xF0) >> 4
 	protocol := famAndProto & 0x0F
-	
+
 	// Parse length (bytes 14-15, big endian)
 	length := (int(header[14]) << 8) | int(header[15])
-	
+
 	// Handle LOCAL command (no address info)
 	if command == 0x0 {
 		// LOCAL: connection established without PROXY protocol
@@ -277,17 +277,17 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			Command: "LOCAL",
 		}, nil
 	}
-	
+
 	// Handle PROXY command (0x1)
 	if command != 0x1 {
 		return nil, fmt.Errorf("unsupported PROXY v2 command: %d", command)
 	}
-	
+
 	// Read address information based on family
 	var srcIP, dstIP string
 	var srcPort, dstPort int
 	var protocolStr string
-	
+
 	switch addressFamily {
 	case 0x1: // AF_INET (IPv4)
 		if length < 12 {
@@ -298,19 +298,20 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		if err != nil {
 			return nil, fmt.Errorf("failed to read IPv4 address data: %w", err)
 		}
-		
+
 		// Parse IPv4 addresses and ports
 		srcIP = fmt.Sprintf("%d.%d.%d.%d", addrData[0], addrData[1], addrData[2], addrData[3])
 		dstIP = fmt.Sprintf("%d.%d.%d.%d", addrData[4], addrData[5], addrData[6], addrData[7])
 		srcPort = (int(addrData[8]) << 8) | int(addrData[9])
 		dstPort = (int(addrData[10]) << 8) | int(addrData[11])
-		
-		if protocol == 0x1 {
+
+		switch protocol {
+		case 0x1:
 			protocolStr = "TCP4"
-		} else if protocol == 0x2 {
+		case 0x2:
 			protocolStr = "UDP4"
 		}
-		
+
 		// Skip any remaining data
 		remaining := length - 12
 		if remaining > 0 {
@@ -320,7 +321,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 				return nil, fmt.Errorf("failed to skip remaining data: %w", err)
 			}
 		}
-		
+
 	case 0x2: // AF_INET6 (IPv6)
 		if length < 36 {
 			return nil, fmt.Errorf("insufficient data for IPv6 addresses")
@@ -330,7 +331,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		if err != nil {
 			return nil, fmt.Errorf("failed to read IPv6 address data: %w", err)
 		}
-		
+
 		// Parse IPv6 addresses
 		srcIPBytes := addrData[0:16]
 		dstIPBytes := addrData[16:32]
@@ -338,13 +339,14 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		dstIP = net.IP(dstIPBytes).String()
 		srcPort = (int(addrData[32]) << 8) | int(addrData[33])
 		dstPort = (int(addrData[34]) << 8) | int(addrData[35])
-		
-		if protocol == 0x1 {
+
+		switch protocol {
+		case 0x1:
 			protocolStr = "TCP6"
-		} else if protocol == 0x2 {
+		case 0x2:
 			protocolStr = "UDP6"
 		}
-		
+
 		// Skip any remaining data
 		remaining := length - 36
 		if remaining > 0 {
@@ -354,7 +356,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 				return nil, fmt.Errorf("failed to skip remaining data: %w", err)
 			}
 		}
-		
+
 	case 0x0: // AF_UNSPEC (UNKNOWN)
 		// Skip the data
 		if length > 0 {
@@ -365,15 +367,15 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			}
 		}
 		return &ProxyProtocolInfo{
-			Version: 2,
-			Command: "UNKNOWN",
+			Version:  2,
+			Command:  "UNKNOWN",
 			Protocol: "UNKNOWN",
 		}, nil
-		
+
 	default:
 		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
 	}
-	
+
 	return &ProxyProtocolInfo{
 		Version:  2,
 		Command:  "PROXY",
@@ -388,7 +390,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 // isTrustedConnection checks if connection is from trusted proxy
 func (r *ProxyProtocolReader) isTrustedConnection(conn net.Conn) bool {
 	remoteAddr := conn.RemoteAddr()
-	
+
 	var ip net.IP
 	switch addr := remoteAddr.(type) {
 	case *net.TCPAddr:
@@ -406,13 +408,13 @@ func (r *ProxyProtocolReader) isTrustedConnection(conn net.Conn) bool {
 			return false
 		}
 	}
-	
+
 	for _, network := range r.trustedNets {
 		if network.Contains(ip) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -435,7 +437,7 @@ func GetRealClientIP(conn net.Conn, proxyInfo *ProxyProtocolInfo) string {
 	if proxyInfo != nil && proxyInfo.SrcIP != "" {
 		return proxyInfo.SrcIP
 	}
-	
+
 	// Fallback to connection remote address
 	remoteAddr := conn.RemoteAddr()
 	switch addr := remoteAddr.(type) {
@@ -470,13 +472,13 @@ func GetConnectionIPs(conn net.Conn, proxyInfo *ProxyProtocolInfo) (clientIP, pr
 			directIP = host
 		}
 	}
-	
+
 	// If we have PROXY protocol info, use it for client IP
 	if proxyInfo != nil && proxyInfo.SrcIP != "" {
 		log.Printf("[PROXY] Using PROXY protocol IPs: client=%s, proxy=%s", proxyInfo.SrcIP, directIP)
 		return proxyInfo.SrcIP, directIP
 	}
-	
+
 	// No proxy, direct connection
 	log.Printf("[PROXY] Direct connection from %s (no proxy)", directIP)
 	return directIP, ""
@@ -487,26 +489,26 @@ func GenerateProxyV2Header(clientIP string, clientPort int, serverIP string, ser
 	// PROXY v2 signature
 	header := make([]byte, 16)
 	copy(header[0:12], []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A})
-	
+
 	// Version and Command (byte 12): version=2, command=PROXY
 	header[12] = 0x21 // version=2 (bits 7-4), command=1/PROXY (bits 3-0)
-	
+
 	// Parse IPs to determine address family
 	clientIPNet := net.ParseIP(clientIP)
 	serverIPNet := net.ParseIP(serverIP)
-	
+
 	if clientIPNet == nil || serverIPNet == nil {
 		return nil, fmt.Errorf("invalid IP addresses: client=%s, server=%s", clientIP, serverIP)
 	}
-	
+
 	var addressData []byte
 	var addressFamily byte
 	var transportProtocol byte = 0x1 // TCP
-	
+
 	// Determine if IPv4 or IPv6
 	clientIPv4 := clientIPNet.To4()
 	serverIPv4 := serverIPNet.To4()
-	
+
 	if clientIPv4 != nil && serverIPv4 != nil {
 		// IPv4
 		addressFamily = 0x1 // AF_INET
@@ -534,21 +536,21 @@ func GenerateProxyV2Header(clientIP string, clientPort int, serverIP string, ser
 		addressData[34] = byte(serverPort >> 8)
 		addressData[35] = byte(serverPort & 0xFF)
 	}
-	
+
 	// Address family and protocol (byte 13)
 	header[13] = (addressFamily << 4) | transportProtocol
-	
+
 	// Length (bytes 14-15, big endian)
 	dataLen := len(addressData)
 	header[14] = byte(dataLen >> 8)
 	header[15] = byte(dataLen & 0xFF)
-	
+
 	// Combine header and address data
 	result := append(header, addressData...)
-	
-	log.Printf("[PROXY] Generated PROXY v2 header: client=%s:%d -> server=%s:%d (family=%d, len=%d)", 
+
+	log.Printf("[PROXY] Generated PROXY v2 header: client=%s:%d -> server=%s:%d (family=%d, len=%d)",
 		clientIP, clientPort, serverIP, serverPort, addressFamily, dataLen)
-	
+
 	return result, nil
 }
 
@@ -558,12 +560,12 @@ func WriteProxyV2Header(conn net.Conn, clientIP string, clientPort int, serverIP
 	if err != nil {
 		return fmt.Errorf("failed to generate PROXY v2 header: %w", err)
 	}
-	
+
 	_, err = conn.Write(header)
 	if err != nil {
 		return fmt.Errorf("failed to write PROXY v2 header: %w", err)
 	}
-	
+
 	log.Printf("[PROXY] Sent PROXY v2 header to %s", conn.RemoteAddr())
 	return nil
 }

@@ -29,11 +29,17 @@ type CleanupConfig struct {
 
 // Local disk cache configuration.
 type LocalCacheConfig struct {
-	Capacity         string `toml:"capacity"`
-	MaxObjectSize    string `toml:"max_object_size"`
-	Path             string `toml:"path"`
-	MetricsInterval  string `toml:"metrics_interval"`
-	MetricsRetention string `toml:"metrics_retention"`
+	Capacity             string   `toml:"capacity"`
+	MaxObjectSize        string   `toml:"max_object_size"`
+	Path                 string   `toml:"path"`
+	MetricsInterval      string   `toml:"metrics_interval"`
+	MetricsRetention     string   `toml:"metrics_retention"`
+	PurgeInterval        string   `toml:"purge_interval"`
+	OrphanCleanupAge     string   `toml:"orphan_cleanup_age"`
+	EnableWarmup         bool     `toml:"enable_warmup"`
+	WarmupMessageCount   int      `toml:"warmup_message_count"`
+	WarmupMailboxes      []string `toml:"warmup_mailboxes"`
+	WarmupAsync          bool     `toml:"warmup_async"`
 }
 
 // IMAPServerConfig holds IMAP server configuration.
@@ -109,7 +115,6 @@ type ManageSieveServerConfig struct {
 type IMAPProxyServerConfig struct {
 	Start               bool                         `toml:"start"`
 	Addr                string                       `toml:"addr"`
-	RemoteAddr          string                       `toml:"remote_addr"` // Deprecated: use RemoteAddrs
 	RemoteAddrs         []string                     `toml:"remote_addrs"`
 	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
@@ -130,50 +135,49 @@ type IMAPProxyServerConfig struct {
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
 type POP3ProxyServerConfig struct {
-	Start               bool     `toml:"start"`
-	Addr                string   `toml:"addr"`
-	RemoteAddr          string   `toml:"remote_addr"` // Deprecated: use RemoteAddrs
-	RemoteAddrs         []string `toml:"remote_addrs"`
-	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername  string   `toml:"master_sasl_username"`
-	MasterSASLPassword  string   `toml:"master_sasl_password"`
-	TLS                 bool     `toml:"tls"`
-	TLSCertFile         string   `toml:"tls_cert_file"`
-	TLSKeyFile          string   `toml:"tls_key_file"`
-	TLSVerify           bool     `toml:"tls_verify"`
-	RemoteTLS           bool     `toml:"remote_tls"`
-	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
-	ConnectTimeout      string   `toml:"connect_timeout"`
-	EnableAffinity      bool     `toml:"enable_affinity"`
-	AffinityStickiness  float64  `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity    string   `toml:"affinity_validity"`
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	RemoteAddrs         []string                     `toml:"remote_addrs"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	RemoteTLS           bool                         `toml:"remote_tls"`
+	RemoteTLSVerify     bool                         `toml:"remote_tls_verify"`
+	ConnectTimeout      string                       `toml:"connect_timeout"`
+	EnableAffinity      bool                         `toml:"enable_affinity"`
+	AffinityStickiness  float64                      `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity    string                       `toml:"affinity_validity"`
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // ManageSieveProxyServerConfig holds ManageSieve proxy server configuration.
 type ManageSieveProxyServerConfig struct {
-	Start               bool     `toml:"start"`
-	Addr                string   `toml:"addr"`
-	RemoteAddr          string   `toml:"remote_addr"` // Deprecated: use RemoteAddrs
-	RemoteAddrs         []string `toml:"remote_addrs"`
-	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername  string   `toml:"master_sasl_username"`
-	MasterSASLPassword  string   `toml:"master_sasl_password"`
-	TLS                 bool     `toml:"tls"`
-	TLSCertFile         string   `toml:"tls_cert_file"`
-	TLSKeyFile          string   `toml:"tls_key_file"`
-	TLSVerify           bool     `toml:"tls_verify"`
-	RemoteTLS           bool     `toml:"remote_tls"`
-	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
-	ConnectTimeout      string   `toml:"connect_timeout"`
+	Start               bool                         `toml:"start"`
+	Addr                string                       `toml:"addr"`
+	RemoteAddrs         []string                     `toml:"remote_addrs"`
+	MaxConnections      int                          `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                          `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername  string                       `toml:"master_sasl_username"`
+	MasterSASLPassword  string                       `toml:"master_sasl_password"`
+	TLS                 bool                         `toml:"tls"`
+	TLSCertFile         string                       `toml:"tls_cert_file"`
+	TLSKeyFile          string                       `toml:"tls_key_file"`
+	TLSVerify           bool                         `toml:"tls_verify"`
+	RemoteTLS           bool                         `toml:"remote_tls"`
+	RemoteTLSVerify     bool                         `toml:"remote_tls_verify"`
+	ConnectTimeout      string                       `toml:"connect_timeout"`
+	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
 type LMTPProxyServerConfig struct {
 	Start               bool     `toml:"start"`
 	Addr                string   `toml:"addr"`
-	RemoteAddr          string   `toml:"remote_addr"` // Deprecated: use RemoteAddrs
 	RemoteAddrs         []string `toml:"remote_addrs"`
 	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
@@ -204,6 +208,18 @@ type RealIPConfig struct {
 	HeaderNames    []string `toml:"header_names"`    // Headers to check for real IP
 }
 
+// MetricsConfig holds metrics server configuration
+type MetricsConfig struct {
+	Enabled              bool   `toml:"enabled"`
+	Addr                 string `toml:"addr"`
+	Path                 string `toml:"path"`
+	EnableUserMetrics    bool   `toml:"enable_user_metrics"`    // High-cardinality user metrics
+	EnableDomainMetrics  bool   `toml:"enable_domain_metrics"`  // Domain-level metrics (safer)
+	UserMetricsThreshold int    `toml:"user_metrics_threshold"` // Threshold for tracking users
+	MaxTrackedUsers      int    `toml:"max_tracked_users"`      // Maximum users to track
+	HashUsernames        bool   `toml:"hash_usernames"`         // Hash usernames for privacy
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	Debug              bool                         `toml:"debug"`
@@ -217,6 +233,7 @@ type ServersConfig struct {
 	LMTPProxy          LMTPProxyServerConfig        `toml:"lmtp_proxy"`
 	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
 	RealIP             RealIPConfig                 `toml:"real_ip"`
+	Metrics            MetricsConfig                `toml:"metrics"`
 }
 
 // UploaderConfig holds upload worker configuration.
@@ -281,11 +298,17 @@ func newDefaultConfig() Config {
 			WakeInterval: "1h",
 		},
 		LocalCache: LocalCacheConfig{
-			Capacity:         "1gb",
-			MaxObjectSize:    "5mb",
-			Path:             "/tmp/sora/cache",
-			MetricsInterval:  "5m",
-			MetricsRetention: "30d",
+			Capacity:           "1gb",
+			MaxObjectSize:      "5mb",
+			Path:               "/tmp/sora/cache",
+			MetricsInterval:    "5m",
+			MetricsRetention:   "30d",
+			PurgeInterval:      "12h",
+			OrphanCleanupAge:   "30d",
+			EnableWarmup:       true,
+			WarmupMessageCount: 50,
+			WarmupMailboxes:    []string{"INBOX"},
+			WarmupAsync:        true,
 		},
 		Servers: ServersConfig{
 			Debug: false,
@@ -344,7 +367,6 @@ func newDefaultConfig() Config {
 			IMAPProxy: IMAPProxyServerConfig{
 				Start:               false,
 				Addr:                ":1143",
-				RemoteAddr:          "127.0.0.1:143",
 				MaxConnections:      2000,
 				MaxConnectionsPerIP: 50,
 				MasterSASLUsername:  "",
@@ -359,7 +381,6 @@ func newDefaultConfig() Config {
 			POP3Proxy: POP3ProxyServerConfig{
 				Start:               false,
 				Addr:                ":1110",
-				RemoteAddr:          "127.0.0.1:110",
 				MaxConnections:      1000,
 				MaxConnectionsPerIP: 20,
 				MasterSASLUsername:  "",
@@ -370,11 +391,11 @@ func newDefaultConfig() Config {
 				EnableAffinity:      true,
 				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
+				AuthRateLimit:       server.DefaultAuthRateLimiterConfig(),
 			},
 			ManageSieveProxy: ManageSieveProxyServerConfig{
 				Start:               false,
 				Addr:                ":14190",
-				RemoteAddr:          "127.0.0.1:4190",
 				MaxConnections:      500,
 				MaxConnectionsPerIP: 10,
 				MasterSASLUsername:  "",
@@ -382,11 +403,11 @@ func newDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
+				AuthRateLimit:       server.DefaultAuthRateLimiterConfig(),
 			},
 			LMTPProxy: LMTPProxyServerConfig{
 				Start:               false,
 				Addr:                ":124",
-				RemoteAddr:          "127.0.0.1:24",
 				MaxConnections:      1000,
 				MaxConnectionsPerIP: 0, // Disable per-IP limits for proxy scenarios
 				TLS:                 false,
@@ -421,6 +442,16 @@ func newDefaultConfig() Config {
 					"Forwarded-For",
 					"Forwarded",
 				},
+			},
+			Metrics: MetricsConfig{
+				Enabled:              true,
+				Addr:                 ":9090",
+				Path:                 "/metrics",
+				EnableUserMetrics:    false,
+				EnableDomainMetrics:  true,
+				UserMetricsThreshold: 1000,
+				MaxTrackedUsers:      1000,
+				HashUsernames:        true,
 			},
 		},
 		Uploader: UploaderConfig{
@@ -480,6 +511,20 @@ func (c *LocalCacheConfig) GetMetricsRetention() (time.Duration, error) {
 		c.MetricsRetention = "30d"
 	}
 	return helpers.ParseDuration(c.MetricsRetention)
+}
+
+func (c *LocalCacheConfig) GetPurgeInterval() (time.Duration, error) {
+	if c.PurgeInterval == "" {
+		c.PurgeInterval = "12h"
+	}
+	return helpers.ParseDuration(c.PurgeInterval)
+}
+
+func (c *LocalCacheConfig) GetOrphanCleanupAge() (time.Duration, error) {
+	if c.OrphanCleanupAge == "" {
+		c.OrphanCleanupAge = "30d"
+	}
+	return helpers.ParseDuration(c.OrphanCleanupAge)
 }
 
 func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {

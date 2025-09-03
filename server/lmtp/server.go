@@ -13,6 +13,7 @@ import (
 
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/sieveengine"
@@ -95,7 +96,6 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 	backend.defaultSieveExecutor = defaultExecutor
 	log.Printf("LMTP default Sieve script parsed and cached")
 
-
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
@@ -160,12 +160,17 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// Increment connection counters (in LMTP all connections are considered authenticated)
 	b.totalConnections.Add(1)
 
+	// Prometheus metrics - connection established
+	metrics.ConnectionsTotal.WithLabelValues("lmtp").Inc()
+	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Inc()
+
 	s := &LMTPSession{
 		backend:     b,
 		conn:        c,
 		ctx:         sessionCtx,
 		cancel:      sessionCancel,
 		releaseConn: releaseConn,
+		startTime:   time.Now(),
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available

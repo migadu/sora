@@ -24,7 +24,7 @@ type PendingUpload struct {
 // last_attempt timestamp to "lease" them to the current worker.
 // This is the recommended method for workers to fetch tasks.
 func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]PendingUpload, error) {
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -108,7 +108,7 @@ func (db *Database) MarkUploadAttempt(ctx context.Context, contentHash string, a
 // and deletes the specific pending upload record.
 // Called by an upload worker after successfully uploading the content hash.
 func (db *Database) CompleteS3Upload(ctx context.Context, contentHash string, accountID int64) error {
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return err
 	}

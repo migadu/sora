@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -214,6 +215,15 @@ func (s *POP3ProxySession) handleConnection() {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
+	remoteAddr := s.clientConn.RemoteAddr()
+
+	// Check if the authentication attempt is allowed by the rate limiter.
+	if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, username); err != nil {
+		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+		return err
+	}
+
 	// Authenticate against the database
 	address, err := server.NewAddress(username)
 	if err != nil {
@@ -222,11 +232,22 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	accountID, err := s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
 	if err != nil {
+		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
+	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 	// Store user details on the session
 	s.mutex.Lock()
+
+	// Track successful authentication.
+	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
+
+	// Track domain and user connection activity for the login event.
+	metrics.TrackDomainConnection("pop3_proxy", address.Domain())
+	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
+
 	s.authenticated = true
 	s.username = address.FullAddress()
 	s.accountID = accountID
@@ -394,7 +415,9 @@ func (s *POP3ProxySession) startProxying() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(s.clientConn, s.backendConn); err != nil && !isClosingError(err) {
+		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "out").Add(float64(bytesOut))
+		if err != nil && !isClosingError(err) {
 			log.Printf("[POP3PROXY %s] error copying backend to client: %v", s.RemoteIP, err)
 		}
 		s.clientConn.Close() // Close client to unblock the other io.Copy
@@ -416,6 +439,9 @@ func (s *POP3ProxySession) startProxying() {
 func (s *POP3ProxySession) close() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	// Decrement current connections metric
+	metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Dec()
 
 	// Unregister connection
 	if s.accountID > 0 {
@@ -549,6 +575,11 @@ func isClosingError(err error) bool {
 func (s *POP3ProxySession) filteredCopyClientToBackend() {
 	reader := bufio.NewReader(s.clientConn)
 	writer := bufio.NewWriter(s.backendConn)
+	var totalBytesIn int64
+	defer func() {
+		// Record total bytes when the copy loop exits
+		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "in").Add(float64(totalBytesIn))
+	}()
 
 	for {
 		// Set read deadline
@@ -576,7 +607,9 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		}
 
 		// Forward the command to backend
-		if _, err := writer.WriteString(line); err != nil {
+		n, err := writer.WriteString(line)
+		totalBytesIn += int64(n)
+		if err != nil {
 			if !isClosingError(err) {
 				log.Printf("[POP3PROXY %s] error writing to backend: %v", s.RemoteIP, err)
 			}

@@ -13,9 +13,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 type S3Storage struct {
@@ -93,9 +95,12 @@ func (s *S3Storage) Exists(key string) (bool, string, error) {
 }
 
 func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
+	start := time.Now()
+	
 	exists, _, err := s.Exists(key)
 	if err != nil {
 		log.Printf("[STORAGE] error checking existence of object %s: %v", key, err)
+		metrics.StorageOperationErrors.WithLabelValues("HEAD", classifyS3Error(err)).Inc()
 		return err
 	}
 	if exists {
@@ -107,11 +112,13 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	if s.Encrypt {
 		data, err := io.ReadAll(body)
 		if err != nil {
+			metrics.StorageOperationErrors.WithLabelValues("PUT", "read_error").Inc()
 			return fmt.Errorf("failed to read data for encryption: %w", err)
 		}
 
 		encryptedData, err := s.encryptData(data)
 		if err != nil {
+			metrics.StorageOperationErrors.WithLabelValues("PUT", "encryption_error").Inc()
 			return fmt.Errorf("failed to encrypt data: %w", err)
 		}
 
@@ -123,6 +130,10 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 			int64(len(encryptedData)),
 			minio.PutObjectOptions{SendContentMd5: true},
 		)
+		if err != nil {
+			metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
+		}
+		metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 		return err
 	}
 
@@ -135,6 +146,10 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 		size,
 		minio.PutObjectOptions{SendContentMd5: true},
 	)
+	if err != nil {
+		metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
+	}
+	metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 	return err
 }
 
@@ -230,6 +245,35 @@ func (s *S3Storage) Delete(key string) error {
 		return nil
 	}
 	return s.Client.RemoveObject(context.Background(), s.BucketName, key, minio.RemoveObjectOptions{VersionID: versionId})
+}
+
+// classifyS3Error classifies S3 errors for metrics tracking
+func classifyS3Error(err error) string {
+	if err == nil {
+		return "none"
+	}
+	
+	errStr := err.Error()
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case contains(errStr, "AccessDenied") || contains(errStr, "Forbidden"):
+		return "access_denied"
+	case contains(errStr, "NoSuchKey") || contains(errStr, "NotFound"):
+		return "not_found"
+	case contains(errStr, "SlowDown") || contains(errStr, "RequestLimitExceeded"):
+		return "throttled"
+	case contains(errStr, "connection refused") || contains(errStr, "no such host"):
+		return "network_error"
+	default:
+		return "unknown"
+	}
+}
+
+func contains(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
 }
 
 func (s *S3Storage) Copy(sourcePath, destPath string) error {

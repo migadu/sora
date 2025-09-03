@@ -13,6 +13,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/storage"
 )
 
@@ -100,6 +101,9 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 			return fmt.Errorf("failed to list pending uploads: %w", err)
 		}
 
+		// Track queue depth - critical for monitoring backpressure
+		metrics.QueueDepth.WithLabelValues("s3_upload").Set(float64(len(uploads)))
+
 		if len(uploads) == 0 {
 			// Nothing to process, break and let the outer loop sleep
 			break
@@ -178,10 +182,16 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	}
 
 	// Attempt to upload to S3. The storage layer should handle checking for existence.
+	start := time.Now()
 	err = w.s3.Put(s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
 		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
 		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
+
+		// Track upload failure
+		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
+		metrics.S3UploadAttempts.WithLabelValues("failure").Inc()
+		metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 		return
 	}
 
@@ -206,6 +216,11 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	} else {
 		log.Printf("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
 	}
+
+	// Track successful upload
+	metrics.UploadWorkerJobs.WithLabelValues("success").Inc()
+	metrics.S3UploadAttempts.WithLabelValues("success").Inc()
+	metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
 	log.Printf("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
 }

@@ -40,10 +40,16 @@ type S3Config struct {
 
 // LocalCacheConfig holds cache configuration - copied from main config
 type LocalCacheConfig struct {
-	Path            string `toml:"path"`
-	Capacity        string `toml:"capacity"`
-	MaxObjectSize   string `toml:"max_object_size"`
-	MetricsInterval string `toml:"metrics_interval"`
+	Path               string   `toml:"path"`
+	Capacity           string   `toml:"capacity"`
+	MaxObjectSize      string   `toml:"max_object_size"`
+	MetricsInterval    string   `toml:"metrics_interval"`
+	PurgeInterval      string   `toml:"purge_interval"`
+	OrphanCleanupAge   string   `toml:"orphan_cleanup_age"`
+	EnableWarmup       bool     `toml:"enable_warmup"`
+	WarmupMessageCount int      `toml:"warmup_message_count"`
+	WarmupMailboxes    []string `toml:"warmup_mailboxes"`
+	WarmupAsync        bool     `toml:"warmup_async"`
 }
 
 // UploaderConfig holds uploader configuration - copied from main config
@@ -83,10 +89,16 @@ func newDefaultAdminConfig() AdminConfig {
 			EncryptionKey: "",
 		},
 		LocalCache: LocalCacheConfig{
-			Path:            "/tmp/sora/cache",
-			Capacity:        "1gb",
-			MaxObjectSize:   "5mb",
-			MetricsInterval: "5m",
+			Path:               "/tmp/sora/cache",
+			Capacity:           "1gb",
+			MaxObjectSize:      "5mb",
+			MetricsInterval:    "5m",
+			PurgeInterval:      "12h",
+			OrphanCleanupAge:   "30d",
+			EnableWarmup:       true,
+			WarmupMessageCount: 50,
+			WarmupMailboxes:    []string{"INBOX"},
+			WarmupAsync:        true,
 		},
 		Uploader: UploaderConfig{
 			Path:          "/tmp/sora/uploads",
@@ -1296,6 +1308,16 @@ func showCacheStats(cfg AdminConfig) error {
 		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
 	}
 
+	// Parse additional cache configuration
+	purgeInterval, err := helpers.ParseDuration(cfg.LocalCache.PurgeInterval)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache purge interval '%s': %w", cfg.LocalCache.PurgeInterval, err)
+	}
+	orphanCleanupAge, err := helpers.ParseDuration(cfg.LocalCache.OrphanCleanupAge)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache orphan cleanup age '%s': %w", cfg.LocalCache.OrphanCleanupAge, err)
+	}
+
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
 	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
@@ -1305,7 +1327,7 @@ func showCacheStats(cfg AdminConfig) error {
 	defer database.Close()
 
 	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, database)
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
@@ -1357,6 +1379,16 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
 	}
 
+	// Parse additional cache configuration
+	purgeInterval, err := helpers.ParseDuration(cfg.LocalCache.PurgeInterval)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache purge interval '%s': %w", cfg.LocalCache.PurgeInterval, err)
+	}
+	orphanCleanupAge, err := helpers.ParseDuration(cfg.LocalCache.OrphanCleanupAge)
+	if err != nil {
+		return fmt.Errorf("failed to parse cache orphan cleanup age '%s': %w", cfg.LocalCache.OrphanCleanupAge, err)
+	}
+
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
 	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
@@ -1366,7 +1398,7 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 	defer database.Close()
 
 	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, database)
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
@@ -2260,6 +2292,16 @@ func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, 
 		}
 
 		output.Components = statuses
+	}
+
+	// Remove metadata if not detailed mode
+	if !detailed {
+		for _, status := range output.Components {
+			status.Metadata = nil
+		}
+		for _, status := range output.History {
+			status.Metadata = nil
+		}
 	}
 
 	// Output JSON

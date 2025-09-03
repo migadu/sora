@@ -9,11 +9,14 @@ import (
 	"net"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
@@ -51,6 +54,12 @@ type IMAPServer struct {
 
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
+	
+	// Cache warmup configuration
+	enableWarmup       bool
+	warmupMessageCount int
+	warmupMailboxes    []string
+	warmupAsync        bool
 }
 
 type IMAPServerOptions struct {
@@ -68,6 +77,11 @@ type IMAPServerOptions struct {
 	MaxConnectionsPerIP int
 	ProxyProtocol       serverPkg.ProxyProtocolConfig
 	AuthRateLimit       serverPkg.AuthRateLimiterConfig
+	// Cache warmup configuration
+	EnableWarmup         bool
+	WarmupMessageCount   int
+	WarmupMailboxes      []string
+	WarmupAsync          bool
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -81,21 +95,25 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		}
 	}
 
-	// Initialize enhanced authentication rate limiter
-	authLimiter := serverPkg.NewEnhancedAuthRateLimiterFromBasic("IMAP", options.AuthRateLimit, database)
+	// Initialize authentication rate limiter
+	authLimiter := serverPkg.NewAuthRateLimiter("IMAP", options.AuthRateLimit, database)
 
 	s := &IMAPServer{
-		hostname:    hostname,
-		appCtx:      appCtx,
-		addr:        imapAddr,
-		db:          database,
-		s3:          storage,
-		uploader:    uploadWorker,
-		cache:       cache,
-		appendLimit: options.AppendLimit,
-		limiter:     serverPkg.NewConnectionLimiter("IMAP", options.MaxConnections, options.MaxConnectionsPerIP),
-		authLimiter: authLimiter,
-		proxyReader: proxyReader,
+		hostname:           hostname,
+		appCtx:             appCtx,
+		addr:               imapAddr,
+		db:                 database,
+		s3:                 storage,
+		uploader:           uploadWorker,
+		cache:              cache,
+		appendLimit:        options.AppendLimit,
+		limiter:            serverPkg.NewConnectionLimiter("IMAP", options.MaxConnections, options.MaxConnectionsPerIP),
+		authLimiter:        authLimiter,
+		proxyReader:        proxyReader,
+		enableWarmup:       options.EnableWarmup,
+		warmupMessageCount: options.WarmupMessageCount,
+		warmupMailboxes:    options.WarmupMailboxes,
+		warmupAsync:        options.WarmupAsync,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:   struct{}{},
 			imap.CapLiteralPlus: struct{}{},
@@ -179,12 +197,17 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	totalCount := s.totalConnections.Add(1)
 
+	// Prometheus metrics - connection established
+	metrics.ConnectionsTotal.WithLabelValues("imap").Inc()
+	metrics.ConnectionsCurrent.WithLabelValues("imap").Inc()
+
 	session := &IMAPSession{
 		server:      s,
 		conn:        conn,
 		ctx:         sessionCtx,
 		cancel:      sessionCancel,
 		releaseConn: releaseConn,
+		startTime:   time.Now(),
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
@@ -297,4 +320,97 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
+}
+
+// WarmupCache pre-fetches recent messages for a user to improve performance when they reconnect
+// This method fetches message content from S3 and stores it in the local cache
+func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames []string, messageCount int, async bool) error {
+	if messageCount <= 0 || len(mailboxNames) == 0 || s.cache == nil {
+		return nil
+	}
+
+	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t)", 
+		userID, messageCount, mailboxNames, async)
+
+	warmupFunc := func() {
+		// Get recent message content hashes from database through cache
+		messageHashes, err := s.cache.GetRecentMessagesForWarmup(ctx, userID, mailboxNames, messageCount)
+		if err != nil {
+			log.Printf("[IMAP] failed to get recent messages for warmup: %v", err)
+			return
+		}
+
+		totalHashes := 0
+		for mailbox, hashes := range messageHashes {
+			totalHashes += len(hashes)
+			log.Printf("[IMAP] warmup found %d messages in mailbox '%s'", len(hashes), mailbox)
+		}
+
+		if totalHashes == 0 {
+			log.Printf("[IMAP] no messages found for warmup")
+			return
+		}
+
+		// Get user's primary email for S3 key construction
+		address, err := s.db.GetPrimaryEmailForAccount(ctx, userID)
+		if err != nil {
+			log.Printf("[IMAP] warmup: failed to get primary address for account %d: %v", userID, err)
+			return
+		}
+
+		warmedCount := 0
+		skippedCount := 0
+
+		// Pre-fetch each message content
+		for _, hashes := range messageHashes {
+			for _, contentHash := range hashes {
+				// Check if already in cache
+				exists, err := s.cache.Exists(contentHash)
+				if err != nil {
+					log.Printf("[IMAP] warmup: error checking existence of %s: %v", contentHash, err)
+					continue
+				}
+
+				if exists {
+					skippedCount++
+					continue // Already cached
+				}
+
+				// Build S3 key and fetch from S3
+				s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
+				reader, err := s.s3.Get(s3Key)
+				if err != nil {
+					log.Printf("[IMAP] warmup: failed to fetch content %s from S3: %v", contentHash, err)
+					continue
+				}
+
+				data, err := io.ReadAll(reader)
+				reader.Close()
+				if err != nil {
+					log.Printf("[IMAP] warmup: failed to read content %s: %v", contentHash, err)
+					continue
+				}
+
+				// Store in cache
+				err = s.cache.Put(contentHash, data)
+				if err != nil {
+					log.Printf("[IMAP] warmup: failed to cache content %s: %v", contentHash, err)
+					continue
+				}
+
+				warmedCount++
+			}
+		}
+
+		log.Printf("[IMAP] warmup completed for user %d: %d messages cached, %d skipped (already cached)", 
+			userID, warmedCount, skippedCount)
+	}
+
+	if async {
+		go warmupFunc()
+	} else {
+		warmupFunc()
+	}
+
+	return nil
 }

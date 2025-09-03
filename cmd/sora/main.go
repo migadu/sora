@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/syslog"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/imapproxy"
@@ -29,6 +31,7 @@ import (
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -123,6 +126,11 @@ func main() {
 	fManageSieveProxyAddr := flag.String("managesieveproxyaddr", cfg.Servers.ManageSieveProxy.Addr, "ManageSieve proxy server address (overrides config)")
 	fStartLmtpProxy := flag.Bool("lmtpproxy", cfg.Servers.LMTPProxy.Start, "Start the LMTP proxy server (overrides config)")
 	fLmtpProxyAddr := flag.String("lmtpproxyaddr", cfg.Servers.LMTPProxy.Addr, "LMTP proxy server address (overrides config)")
+
+	// Metrics flags
+	fMetricsEnabled := flag.Bool("metrics", cfg.Servers.Metrics.Enabled, "Enable metrics server (overrides config)")
+	fMetricsAddr := flag.String("metricsaddr", cfg.Servers.Metrics.Addr, "Metrics server address (overrides config)")
+	fMetricsPath := flag.String("metricspath", cfg.Servers.Metrics.Path, "Metrics endpoint path (overrides config)")
 
 	flag.Parse()
 
@@ -255,6 +263,17 @@ func main() {
 	}
 	if isFlagSet("s3trace") {
 		cfg.S3.Trace = *fS3Trace
+	}
+
+	// Metrics
+	if isFlagSet("metrics") {
+		cfg.Servers.Metrics.Enabled = *fMetricsEnabled
+	}
+	if isFlagSet("metricsaddr") {
+		cfg.Servers.Metrics.Addr = *fMetricsAddr
+	}
+	if isFlagSet("metricspath") {
+		cfg.Servers.Metrics.Path = *fMetricsPath
 	}
 
 	// Servers
@@ -484,6 +503,9 @@ func main() {
 	}
 	defer database.Close()
 
+	// Start database pool monitoring
+	database.StartPoolMetrics(ctx)
+
 	hostname, _ := os.Hostname()
 
 	errChan := make(chan error, 1)
@@ -514,7 +536,17 @@ func main() {
 			errorHandler.ValidationError("cache max object size", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		cacheInstance, err = cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, database)
+		purgeInterval, err := cfg.LocalCache.GetPurgeInterval()
+		if err != nil {
+			errorHandler.ValidationError("cache purge interval", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		orphanCleanupAge, err := cfg.LocalCache.GetOrphanCleanupAge()
+		if err != nil {
+			errorHandler.ValidationError("cache orphan cleanup age", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cacheInstance, err = cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, database)
 		if err != nil {
 			errorHandler.FatalError("initialize cache", err)
 			os.Exit(errorHandler.WaitForExit())
@@ -639,6 +671,19 @@ func main() {
 		go startManageSieveServer(ctx, hostname, cfg.Servers.ManageSieve.Addr, database, errChan, cfg)
 	}
 
+	// Start metrics server
+	if cfg.Servers.Metrics.Enabled {
+		// Configure metrics collection settings
+		metrics.Configure(
+			cfg.Servers.Metrics.EnableUserMetrics,
+			cfg.Servers.Metrics.EnableDomainMetrics,
+			cfg.Servers.Metrics.UserMetricsThreshold,
+			cfg.Servers.Metrics.MaxTrackedUsers,
+			cfg.Servers.Metrics.HashUsernames,
+		)
+		go startMetricsServer(ctx, cfg.Servers.Metrics, errChan)
+	}
+
 	// Start proxy servers
 	if cfg.Servers.IMAPProxy.Start {
 		go startIMAPProxyServer(ctx, hostname, database, errChan, cfg)
@@ -686,6 +731,10 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			MaxConnectionsPerIP: config.Servers.IMAP.MaxConnectionsPerIP,
 			ProxyProtocol:       config.Servers.IMAP.ProxyProtocol,
 			AuthRateLimit:       config.Servers.IMAP.AuthRateLimit,
+			EnableWarmup:        config.LocalCache.EnableWarmup,
+			WarmupMessageCount:  config.LocalCache.WarmupMessageCount,
+			WarmupMailboxes:     config.LocalCache.WarmupMailboxes,
+			WarmupAsync:         config.LocalCache.WarmupAsync,
 		})
 	if err != nil {
 		errChan <- err
@@ -854,15 +903,9 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		affinityValidity = 24 * time.Hour
 	}
 
-	// Handle backward compatibility for remote addresses
-	remoteAddrs := config.Servers.IMAPProxy.RemoteAddrs
-	if len(remoteAddrs) == 0 && config.Servers.IMAPProxy.RemoteAddr != "" {
-		remoteAddrs = []string{config.Servers.IMAPProxy.RemoteAddr}
-	}
-
 	server, err := imapproxy.New(ctx, database, hostname, imapproxy.ServerOptions{
 		Addr:               config.Servers.IMAPProxy.Addr,
-		RemoteAddrs:        remoteAddrs,
+		RemoteAddrs:        config.Servers.IMAPProxy.RemoteAddrs,
 		MasterSASLUsername: config.Servers.IMAPProxy.MasterSASLUsername,
 		MasterSASLPassword: config.Servers.IMAPProxy.MasterSASLPassword,
 		TLS:                config.Servers.IMAPProxy.TLS,
@@ -875,6 +918,7 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		EnableAffinity:     config.Servers.IMAPProxy.EnableAffinity,
 		AffinityStickiness: config.Servers.IMAPProxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
+		AuthRateLimit:      config.Servers.IMAPProxy.AuthRateLimit,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
@@ -912,14 +956,8 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		affinityValidity = 24 * time.Hour
 	}
 
-	// Handle backward compatibility for remote addresses
-	remoteAddrs := config.Servers.POP3Proxy.RemoteAddrs
-	if len(remoteAddrs) == 0 && config.Servers.POP3Proxy.RemoteAddr != "" {
-		remoteAddrs = []string{config.Servers.POP3Proxy.RemoteAddr}
-	}
-
 	server, err := pop3proxy.New(ctx, hostname, config.Servers.POP3Proxy.Addr, database, pop3proxy.POP3ProxyServerOptions{
-		RemoteAddrs:        remoteAddrs,
+		RemoteAddrs:        config.Servers.POP3Proxy.RemoteAddrs,
 		MasterSASLUsername: config.Servers.POP3Proxy.MasterSASLUsername,
 		MasterSASLPassword: config.Servers.POP3Proxy.MasterSASLPassword,
 		TLS:                config.Servers.POP3Proxy.TLS,
@@ -933,6 +971,7 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		EnableAffinity:     config.Servers.POP3Proxy.EnableAffinity,
 		AffinityStickiness: config.Servers.POP3Proxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
+		AuthRateLimit:      config.Servers.POP3Proxy.AuthRateLimit,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -961,15 +1000,9 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		connectTimeout = 30 * time.Second
 	}
 
-	// Handle backward compatibility for remote addresses
-	remoteAddrs := config.Servers.ManageSieveProxy.RemoteAddrs
-	if len(remoteAddrs) == 0 && config.Servers.ManageSieveProxy.RemoteAddr != "" {
-		remoteAddrs = []string{config.Servers.ManageSieveProxy.RemoteAddr}
-	}
-
 	server, err := managesieveproxy.New(ctx, database, hostname, managesieveproxy.ServerOptions{
 		Addr:               config.Servers.ManageSieveProxy.Addr,
-		RemoteAddrs:        remoteAddrs,
+		RemoteAddrs:        config.Servers.ManageSieveProxy.RemoteAddrs,
 		MasterSASLUsername: config.Servers.ManageSieveProxy.MasterSASLUsername,
 		MasterSASLPassword: config.Servers.ManageSieveProxy.MasterSASLPassword,
 		TLS:                config.Servers.ManageSieveProxy.TLS,
@@ -979,6 +1012,7 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		RemoteTLS:          config.Servers.ManageSieveProxy.RemoteTLS,
 		RemoteTLSVerify:    config.Servers.ManageSieveProxy.RemoteTLSVerify,
 		ConnectTimeout:     connectTimeout,
+		AuthRateLimit:      config.Servers.ManageSieveProxy.AuthRateLimit,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
@@ -1009,15 +1043,9 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		affinityValidity = 24 * time.Hour
 	}
 
-	// Handle backward compatibility for remote addresses
-	remoteAddrs := config.Servers.LMTPProxy.RemoteAddrs
-	if len(remoteAddrs) == 0 && config.Servers.LMTPProxy.RemoteAddr != "" {
-		remoteAddrs = []string{config.Servers.LMTPProxy.RemoteAddr}
-	}
-
 	server, err := lmtpproxy.New(ctx, database, hostname, lmtpproxy.ServerOptions{
 		Addr:               config.Servers.LMTPProxy.Addr,
-		RemoteAddrs:        remoteAddrs,
+		RemoteAddrs:        config.Servers.LMTPProxy.RemoteAddrs,
 		TLS:                config.Servers.LMTPProxy.TLS,
 		TLSCertFile:        config.Servers.LMTPProxy.TLSCertFile,
 		TLSKeyFile:         config.Servers.LMTPProxy.TLSKeyFile,
@@ -1046,4 +1074,31 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 	}()
 
 	server.Start()
+}
+
+// startMetricsServer starts the Prometheus metrics HTTP server
+func startMetricsServer(ctx context.Context, config MetricsConfig, errChan chan error) {
+	log.Printf("Starting metrics server on %s%s", config.Addr, config.Path)
+
+	mux := http.NewServeMux()
+	mux.Handle(config.Path, promhttp.Handler())
+
+	server := &http.Server{
+		Addr:    config.Addr,
+		Handler: mux,
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down metrics server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Error shutting down metrics server: %v", err)
+		}
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		errChan <- fmt.Errorf("metrics server failed: %w", err)
+	}
 }

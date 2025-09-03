@@ -217,6 +217,54 @@ metrics_interval = "5m"
 #   metrics_retention = "30d"                 # Default retention (recommended)
 metrics_retention = "30d"
 
+# Cache purge interval - how often to run cache cleanup operations
+# Controls the frequency of capacity enforcement and stale entry cleanup
+# Examples:
+#   purge_interval = "6h"                      # Frequent cleanup (high activity)
+#   purge_interval = "12h"                     # Standard cleanup (default)
+#   purge_interval = "24h"                     # Infrequent cleanup (low activity)
+purge_interval = "12h"
+
+# Orphan cleanup age - minimum age before orphaned cache entries are removed
+# Cache entries for messages no longer in the database are considered orphaned
+# Examples:
+#   orphan_cleanup_age = "7d"                 # Aggressive cleanup
+#   orphan_cleanup_age = "30d"                # Standard cleanup (default)
+#   orphan_cleanup_age = "90d"                # Conservative cleanup
+orphan_cleanup_age = "30d"
+
+# Cache warmup - preload recent messages when users reconnect
+# This improves performance by proactively fetching message content from S3
+# Enable cache warmup on user login
+# Examples:
+#   enable_warmup = false                      # Disable warmup (minimal resource usage)
+#   enable_warmup = true                       # Enable warmup (better performance)
+enable_warmup = true
+
+# Number of recent messages to preload per mailbox
+# Higher values improve cache hit ratio but use more bandwidth and storage
+# Examples:
+#   warmup_message_count = 10                  # Minimal warmup
+#   warmup_message_count = 50                  # Standard warmup (default)
+#   warmup_message_count = 100                 # Aggressive warmup
+warmup_message_count = 50
+
+# Mailboxes to warm up (in addition to or instead of INBOX)
+# Most email clients check INBOX first, so it's always a good candidate
+# Examples:
+#   warmup_mailboxes = ["INBOX"]               # Only INBOX (default)
+#   warmup_mailboxes = ["INBOX", "Sent"]       # INBOX and Sent folder
+#   warmup_mailboxes = ["INBOX", "Sent", "Drafts"]  # Multiple important folders
+warmup_mailboxes = ["INBOX"]
+
+# Run warmup asynchronously in background
+# true = warmup happens in background (login returns quickly)
+# false = warmup blocks login (ensures cache is warm before client proceeds)
+# Examples:
+#   warmup_async = true                        # Background warmup (default, recommended)
+#   warmup_async = false                       # Blocking warmup (slower login, guaranteed warm cache)
+warmup_async = true
+
 # =============================================================================
 # S3 UPLOADER CONFIGURATION
 # =============================================================================
@@ -535,6 +583,36 @@ max_delay = "30s"
 #   delay_multiplier = 3.0                     # Aggressive increase
 delay_multiplier = 2.0
 
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
+
 # =============================================================================
 # LMTP SERVER CONFIGURATION
 # =============================================================================
@@ -716,6 +794,36 @@ initial_delay = "2s"
 max_delay = "30s"
 delay_multiplier = 2.0
 
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
+
 # =============================================================================
 # MANAGESIEVE SERVER CONFIGURATION
 # =============================================================================
@@ -817,6 +925,36 @@ delay_start_threshold = 2
 initial_delay = "2s"
 max_delay = "30s"
 delay_multiplier = 2.0
+
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
 
 # =============================================================================
 # PROXY SERVER CONFIGURATIONS
@@ -946,6 +1084,36 @@ initial_delay = "2s"
 max_delay = "30s"
 delay_multiplier = 2.0
 
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
+
 # =============================================================================
 # POP3 PROXY CONFIGURATION  
 # =============================================================================
@@ -999,6 +1167,36 @@ initial_delay = "2s"
 max_delay = "30s"
 delay_multiplier = 2.0
 
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
+
 # =============================================================================
 # MANAGESIEVE PROXY CONFIGURATION
 # =============================================================================
@@ -1039,6 +1237,36 @@ initial_delay = "2s"
 max_delay = "30s"
 delay_multiplier = 2.0
 
+# --- ENHANCED CACHE AND DATABASE SETTINGS ---
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
+
 # =============================================================================
 # LMTP PROXY CONFIGURATION
 # =============================================================================
@@ -1066,6 +1294,125 @@ affinity_validity = "24h" # How long to remember user-server affinity
 # means there is a 90% chance of using the affinity server and a 10% chance of
 # using round-robin to help balance load.
 affinity_stickiness = 0.9
+
+# =============================================================================
+# PROMETHEUS METRICS CONFIGURATION
+# =============================================================================
+# Prometheus metrics endpoint for monitoring Sora mail server performance,
+# connections, errors, and operational health across all protocols.
+
+[servers.metrics]
+# Enable/disable Prometheus metrics HTTP endpoint
+# When enabled, exposes metrics at http://[addr][path] for Prometheus scraping
+# Examples:
+#   enabled = false                            # No metrics endpoint (default)
+#   enabled = true                             # Enable metrics collection
+enabled = false
+
+# Listen address and port for metrics HTTP server
+# Should be different from mail protocol ports to avoid conflicts
+# Examples:
+#   addr = ":8080"                             # Standard metrics port
+#   addr = ":9090"                             # Prometheus default
+#   addr = "127.0.0.1:8080"                    # Localhost only (secure)
+#   addr = "10.0.1.100:8080"                   # Specific interface
+addr = ":8080"
+
+# HTTP endpoint path for metrics
+# Examples:
+#   path = "/metrics"                          # Standard Prometheus path
+#   path = "/sora/metrics"                     # Custom path
+#   path = "/health/prometheus"                # Alternative path
+path = "/metrics"
+
+# --- USER AND DOMAIN METRICS CONFIGURATION ---
+# Track user and domain-level activity for identifying heavy usage patterns
+
+# Enable domain-level metrics (RECOMMENDED - low cardinality)
+# Tracks commands, connections, and data transfer per domain
+# Examples:
+#   enable_domain_metrics = true               # Safe for all deployments
+#   enable_domain_metrics = false              # Disable domain tracking
+enable_domain_metrics = true
+
+# Enable user-level metrics (CAUTION - high cardinality)
+# WARNING: Can create many metric series in large deployments
+# Only enable if you need per-user visibility and have adequate Prometheus resources
+# Examples:
+#   enable_user_metrics = false                # Disabled (recommended for >1000 users)
+#   enable_user_metrics = true                 # Enable (small deployments only)
+enable_user_metrics = false
+
+# Threshold for user tracking (only track heavy users above this limit)
+# Users exceeding this command/connection count get individual tracking
+# Examples:
+#   user_metrics_threshold = 100               # Track very active users
+#   user_metrics_threshold = 1000              # Track heavy users only (default)
+#   user_metrics_threshold = 10000             # Track only extremely heavy users
+user_metrics_threshold = 1000
+
+# Maximum number of users to track individually (cardinality limit)
+# Prevents memory explosion in Prometheus with many heavy users
+# Examples:
+#   max_tracked_users = 100                    # Conservative limit
+#   max_tracked_users = 1000                   # Standard limit (default)
+#   max_tracked_users = 5000                   # Large deployment limit
+max_tracked_users = 1000
+
+# Hash usernames in metrics for privacy protection
+# When enabled, usernames are SHA256 hashed before including in metrics
+# Examples:
+#   hash_usernames = true                      # Privacy protection (recommended)
+#   hash_usernames = false                     # Plain usernames (development only)
+hash_usernames = true
+
+# -----------------------------------------------------------------------------
+# AVAILABLE METRICS
+# -----------------------------------------------------------------------------
+# When enabled, Sora exposes the following metrics for monitoring:
+#
+# CONNECTION METRICS:
+# - sora_connections_total{protocol} - Total connections handled
+# - sora_connections_current{protocol} - Currently active connections
+# - sora_proxy_backend_connections_total{protocol,result} - Backend health
+#
+# PERFORMANCE METRICS:
+# - sora_db_connection_pool_wait_seconds - Database pool contention
+# - sora_storage_errors_total{operation,error_type} - S3 operation health
+# - sora_queue_depth{queue_type} - Background job queue status
+# - sora_critical_operation_duration_seconds{operation} - Slow operations
+#
+# AUTHENTICATION METRICS:
+# - sora_auth_attempts_total{protocol,result} - Login attempts and failures
+# - sora_auth_rate_limit_blocks_total{type} - Rate limiting activity
+#
+# ERROR METRICS:
+# - sora_protocol_errors_total{protocol,command,error_type,severity} - Protocol issues
+# - sora_mailbox_lock_timeouts_total{protocol,lock_type} - Resource contention
+#
+# BUSINESS METRICS:
+# - sora_messages_throughput_total{protocol,operation} - Message processing
+# - sora_bytes_throughput_total{protocol,direction} - Data transfer volume
+# - sora_active_mailboxes - Currently active user accounts
+#
+# DOMAIN METRICS (when enable_domain_metrics=true):
+# - sora_domain_commands_total{protocol,domain,command} - Commands per domain
+# - sora_domain_connections_total{protocol,domain} - Connections per domain
+# - sora_domain_bytes_total{protocol,domain,direction} - Data transfer per domain
+# - sora_domain_messages_total{protocol,domain,operation} - Messages per domain
+#
+# USER METRICS (when enable_user_metrics=true):
+# - sora_top_user_commands_total{protocol,user_hash,command} - Heavy user commands
+# - sora_top_user_connections_total{protocol,user_hash} - Heavy user connections  
+# - sora_heavy_user_operations_total{protocol,user_hash,operation_type} - Above threshold activity
+#
+# Example Prometheus configuration:
+# scrape_configs:
+#   - job_name: 'sora-mail'
+#     static_configs:
+#       - targets: ['sora-server:8080']
+#     metrics_path: '/metrics'
+#     scrape_interval: 30s
 
 # =============================================================================
 # CONNECTION TRACKING CONFIGURATION

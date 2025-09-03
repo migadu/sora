@@ -259,7 +259,7 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 		return errors.New("address cannot be empty")
 	}
 
-	_, err := db.GetWritePool().Exec(ctx,
+	err := db.TimedExec(ctx, "update_password",
 		"UPDATE credentials SET password = $1 WHERE address = $2",
 		newHashedPassword, normalizedAddress)
 
@@ -286,7 +286,7 @@ func (db *Database) Authenticate(ctx context.Context, address string, password s
 		return 0, errors.New("password cannot be empty")
 	}
 
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+	err := db.TimedQueryRow(ctx, "authenticate",
 		"SELECT account_id, password FROM credentials WHERE address = $1",
 		normalizedAddress).Scan(&accountID, &hashedPassword)
 

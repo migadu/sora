@@ -14,7 +14,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 		return 0, nil
 	}
 
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction for ExpungeMessageUIDs: %w", err)
 	}

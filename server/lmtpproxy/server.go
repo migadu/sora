@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -36,7 +37,6 @@ type Server struct {
 // ServerOptions holds options for creating a new LMTP proxy server.
 type ServerOptions struct {
 	Addr               string
-	RemoteAddr         string // Deprecated: use RemoteAddrs
 	RemoteAddrs        []string
 	TLS                bool
 	TLSCertFile        string
@@ -54,13 +54,7 @@ type ServerOptions struct {
 func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// Handle backward compatibility
-	remoteAddrs := opts.RemoteAddrs
-	if len(remoteAddrs) == 0 && opts.RemoteAddr != "" {
-		remoteAddrs = []string{opts.RemoteAddr}
-	}
-
-	if len(remoteAddrs) == 0 {
+	if len(opts.RemoteAddrs) == 0 {
 		cancel()
 		return nil, fmt.Errorf("no remote addresses configured")
 	}
@@ -72,7 +66,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	}
 
 	// Create connection manager
-	connManager, err := proxy.NewConnectionManager(remoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
+	connManager, err := proxy.NewConnectionManager(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
@@ -154,6 +148,11 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+
+			// Track proxy connection
+			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy").Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Inc()
+
 			session := newSession(s, conn)
 			session.handleConnection()
 		}()

@@ -21,17 +21,17 @@ import (
 
 const DataDir = "data"
 const IndexDB = "cache_index.db"
-const PurgeTick = 12 * time.Hour
-
 const PurgeBatchSize = 1000
 
 type Cache struct {
-	basePath      string
-	capacity      int64
-	maxObjectSize int64
-	db            *sql.DB
-	mu            sync.Mutex
-	sourceDB      *db.Database
+	basePath           string
+	capacity           int64
+	maxObjectSize      int64
+	purgeInterval      time.Duration
+	orphanCleanupAge   time.Duration
+	db                 *sql.DB
+	mu                 sync.Mutex
+	sourceDB           *db.Database
 	// Metrics - using atomic for thread-safe counters
 	cacheHits   int64
 	cacheMisses int64
@@ -47,7 +47,7 @@ func (c *Cache) Close() error {
 	return nil
 }
 
-func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.Database) (*Cache, error) {
+func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval time.Duration, orphanCleanupAge time.Duration, sourceDb *db.Database) (*Cache, error) {
 	basePath = filepath.Clean(strings.TrimSpace(basePath))
 	if basePath == "" {
 		return nil, fmt.Errorf("cache base path cannot be empty")
@@ -86,12 +86,14 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, sourceDb *db.
 		return nil, fmt.Errorf("cache DB ping failed: %w", err)
 	}
 	return &Cache{
-		basePath:      basePath,
-		capacity:      maxSizeBytes,
-		maxObjectSize: maxObjectSize,
-		db:            db,
-		sourceDB:      sourceDb,
-		startTime:     time.Now(),
+		basePath:         basePath,
+		capacity:         maxSizeBytes,
+		maxObjectSize:    maxObjectSize,
+		purgeInterval:    purgeInterval,
+		orphanCleanupAge: orphanCleanupAge,
+		db:               db,
+		sourceDB:         sourceDb,
+		startTime:        time.Now(),
 	}, nil
 }
 
@@ -310,7 +312,7 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 		// Run immediately on startup
 		c.runPurgeCycle(ctx)
 
-		ticker := time.NewTicker(PurgeTick)
+		ticker := time.NewTicker(c.purgeInterval)
 		defer ticker.Stop()
 
 		for {
@@ -368,7 +370,7 @@ func (c *Cache) cleanupStaleDirectories() error {
 }
 
 func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
-	threshold := time.Now().Add(-30 * 24 * time.Hour) // Example: filter entries older than 30 days
+	threshold := time.Now().Add(-c.orphanCleanupAge)
 	rows, err := c.db.Query(`SELECT path FROM cache_index WHERE mod_time < ?`, threshold)
 	if err != nil {
 		return err
@@ -637,4 +639,10 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// GetRecentMessagesForWarmup is a helper method that delegates to the source database
+// This provides a convenient way for higher-level services to get warmup data through the cache
+func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+	return c.sourceDB.GetRecentMessagesForWarmup(ctx, userID, mailboxNames, messageCount)
 }

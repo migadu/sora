@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -44,30 +45,39 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 	defer c.Close()
 
 	if err := c.Mail(from, nil); err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to set sender: %w", err)
 	}
 	if err := c.Rcpt(to, nil); err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to set recipient: %w", err)
 	}
 
 	wc, err := c.Data()
 	if err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to start data: %w", err)
 	}
 	_, err = wc.Write(message)
 	if err != nil {
+		// Attempt to close the data writer even if write fails, to send the final dot.
+		_ = wc.Close()
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to write message: %w", err)
 	}
 	err = wc.Close()
 	if err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to close data writer: %w", err)
 	}
 
 	err = c.Quit()
 	if err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to quit: %w", err)
 	}
 
+	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
 	return nil
 }
 
@@ -83,9 +93,21 @@ type LMTPSession struct {
 	mutexHelper *server.MutexTimeoutHelper
 	releaseConn func() // Function to release connection from limiter
 	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
+	startTime   time.Time
 }
 
 func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
+	start := time.Now()
+	success := false
+	defer func() {
+		status := "failure"
+		if success {
+			status = "success"
+		}
+		metrics.CommandsTotal.WithLabelValues("lmtp", "MAIL", status).Inc()
+		metrics.CommandDuration.WithLabelValues("lmtp", "MAIL").Observe(time.Since(start).Seconds())
+	}()
+
 	s.Log("processing MAIL FROM command: %s", from)
 	fromAddress, err := server.NewAddress(from)
 	if err != nil {
@@ -111,11 +133,23 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 
 	s.sender = &fromAddress
 
+	success = true
 	s.Log("mail from=%s accepted", fromAddress.FullAddress())
 	return nil
 }
 
 func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+	start := time.Now()
+	success := false
+	defer func() {
+		status := "failure"
+		if success {
+			status = "success"
+		}
+		metrics.CommandsTotal.WithLabelValues("lmtp", "RCPT", status).Inc()
+		metrics.CommandDuration.WithLabelValues("lmtp", "RCPT").Observe(time.Since(start).Seconds())
+	}()
+
 	s.Log("processing RCPT TO command: %s", to)
 	toAddress, err := server.NewAddress(to)
 	if err != nil {
@@ -175,11 +209,24 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	// Pin the session to the master DB to prevent reading stale data from a replica.
 	s.useMasterDB = true
 
+	success = true
 	s.Log("recipient accepted: %s (UserID: %d)", fullAddress, userId)
 	return nil
 }
 
 func (s *LMTPSession) Data(r io.Reader) error {
+	// Prometheus metrics - start delivery timing
+	start := time.Now()
+	success := false
+	defer func() {
+		status := "failure"
+		if success {
+			status = "success"
+		}
+		metrics.CommandsTotal.WithLabelValues("lmtp", "DATA", status).Inc()
+		metrics.CommandDuration.WithLabelValues("lmtp", "DATA").Observe(time.Since(start).Seconds())
+	}()
+
 	// Acquire read lock for accessing session state during message processing
 	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	defer cancel()
@@ -212,6 +259,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// Use the full message bytes as received for hashing, size, and header extraction.
 	fullMessageBytes := buf.Bytes()
+
+	// Prometheus metrics
+	metrics.MessageSizeBytes.WithLabelValues("lmtp").Observe(float64(len(fullMessageBytes)))
+	metrics.BytesThroughput.WithLabelValues("lmtp", "in").Add(float64(len(fullMessageBytes)))
+	metrics.MessageThroughput.WithLabelValues("lmtp", "received", "success").Inc()
 
 	// Extract raw headers string.
 	// Headers are typically terminated by a double CRLF (\r\n\r\n).
@@ -305,10 +357,12 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
 		if defaultEvalErr != nil {
+			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.Log("[SIEVE] WARNING: default script evaluation error: %v", defaultEvalErr)
 			// fallback: default to INBOX
 			result = sieveengine.Result{Action: sieveengine.ActionKeep}
 		} else {
+			metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 			// Set the result from the default script
 			result = defaultResult
 			s.Log("[SIEVE] default script result action: %v", result.Action)
@@ -349,9 +403,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		} else {
 			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)
 			if userEvalErr != nil {
+				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 				s.Log("[SIEVE] user script evaluation error: %v", userEvalErr)
 				// Keep the result from the default script
 			} else {
+				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 				// Override the result with the user script result
 				result = userResult
 				s.Log("[SIEVE] user script overrode result action: %v", result.Action)
@@ -468,6 +524,8 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 	if err != nil {
 		_ = os.Remove(*filePath) // cleanup file on failure
+		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
+
 		if err.Error() == "message already exists: unique violation" {
 			s.Log("WARNING: message already exists in database (content hash: %s)", contentHash)
 			return &smtp.SMTPError{
@@ -479,11 +537,27 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to save message: %v", err)
 	}
 
+	metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
 	s.Log("message delivered successfully to mailbox '%s'", mailboxName)
+
+	// Track domain and user activity - LMTP delivery is critical!
+	if s.User != nil {
+		metrics.TrackDomainMessage("lmtp", s.Domain(), "delivered")
+		metrics.TrackDomainBytes("lmtp", s.Domain(), "in", int64(len(fullMessageBytes)))
+		metrics.TrackUserActivity("lmtp", s.FullAddress(), "command", 1)
+	}
+
+	success = true
 	return nil
 }
 
 func (s *LMTPSession) Reset() {
+	start := time.Now()
+	defer func() {
+		metrics.CommandsTotal.WithLabelValues("lmtp", "RSET", "success").Inc()
+		metrics.CommandDuration.WithLabelValues("lmtp", "RSET").Observe(time.Since(start).Seconds())
+	}()
+
 	// Acquire write lock to reset session state
 	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
@@ -522,7 +596,12 @@ func (s *LMTPSession) Logout() error {
 		s.releaseConn = nil
 	}
 
+	metrics.ConnectionDuration.WithLabelValues("lmtp").Observe(time.Since(s.startTime).Seconds())
+
 	totalCount := s.backend.totalConnections.Add(-1)
+
+	// Prometheus metrics - connection closed
+	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Dec()
 
 	if s.cancel != nil {
 		s.cancel()

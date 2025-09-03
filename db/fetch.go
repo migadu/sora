@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // GetMessageTextBody fetches the plain text body of a message from the message_contents table.
@@ -19,12 +21,17 @@ import (
 // can be used for IMAP BODY[TEXT] requests.
 func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
 	var textBody sql.NullString // Use sql.NullString to handle case where LEFT JOIN finds no match
+	
+	start := time.Now()
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT mc.text_body 
 		FROM messages m
 		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
 		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
 	`, uid, mailboxID).Scan(&textBody)
+
+	// Record the duration
+	metrics.DBQueryDuration.WithLabelValues("fetch_message_body", "read").Observe(time.Since(start).Seconds())
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

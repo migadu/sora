@@ -59,7 +59,7 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	}
 
 	// Begin transaction
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -155,7 +155,7 @@ func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest)
 	}
 
 	// Begin transaction
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -244,7 +244,7 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
-		tx, err := db.GetWritePool().Begin(ctx)
+		tx, err := db.BeginTx(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to begin transaction: %w", err)
 		}

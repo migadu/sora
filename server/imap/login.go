@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -22,6 +23,8 @@ func (s *IMAPSession) Login(address, password string) error {
 	if s.server.authLimiter != nil {
 		if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address); err != nil {
 			s.Log("[LOGIN] rate limited: %v", err)
+			// Track rate limiting as a specific error type
+			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeAuthenticationFailed,
@@ -37,6 +40,8 @@ func (s *IMAPSession) Login(address, password string) error {
 		address, err := server.NewAddress(authAddress)
 		if err != nil {
 			s.Log("[LOGIN] failed to parse address: %v", err)
+			// Track invalid address format as client error
+			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeAuthenticationFailed,
@@ -58,16 +63,24 @@ func (s *IMAPSession) Login(address, password string) error {
 			s.Log("[LOGIN] user %s/%s authenticated with master password (connections: total=%d, authenticated=%d)",
 				address, proxyUser, totalCount, authCount)
 			
+			// Prometheus metrics - successful authentication
+			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+			
 			// Record successful authentication
 			if s.server.authLimiter != nil {
 				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
 			}
 			
+			// Trigger cache warmup for the authenticated user (if configured)
+			s.triggerCacheWarmup(userID)
+			
 			return nil
 		}
 		
 		// Record failed master password authentication
+		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, authAddress, false)
@@ -91,6 +104,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		s.Log("[LOGIN] authentication failed: %v", err)
 
 		// Record failed authentication
+		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), false)
@@ -117,11 +131,23 @@ func (s *IMAPSession) Login(address, password string) error {
 	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
 		address, totalCount, authCount)
 	
+	// Prometheus metrics - successful authentication
+	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
+	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+	
+	// Domain and user tracking
+	metrics.TrackDomainConnection("imap", addressSt.Domain())
+	metrics.TrackUserActivity("imap", addressSt.FullAddress(), "connection", 1)
+	
 	// Record successful authentication
 	if s.server.authLimiter != nil {
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), true)
 	}
+	
+	// Trigger cache warmup for the authenticated user (if configured)
+	// This happens after successful authentication and improves performance for reconnections
+	s.triggerCacheWarmup(userID)
 	
 	return nil
 }
@@ -136,4 +162,24 @@ func parseMasterLogin(username string) (realuser, authuser string) {
 
 func checkMasterCredential(provided string, actual []byte) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
+}
+
+// triggerCacheWarmup triggers cache warmup for a user if enabled
+func (s *IMAPSession) triggerCacheWarmup(userID int64) {
+	// Check if warmup is enabled
+	if !s.server.enableWarmup || s.server.warmupMessageCount <= 0 {
+		return
+	}
+
+	// Use configured mailboxes or default to INBOX
+	mailboxes := s.server.warmupMailboxes
+	if len(mailboxes) == 0 {
+		mailboxes = []string{"INBOX"}
+	}
+
+	// Trigger warmup (this handles async/sync based on configuration)
+	err := s.server.WarmupCache(s.ctx, userID, mailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
+	if err != nil {
+		s.Log("[WARMUP] failed to trigger cache warmup for user %d: %v", userID, err)
+	}
 }

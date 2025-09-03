@@ -8,9 +8,11 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 //go:embed schema.sql
@@ -89,6 +91,39 @@ func (db *Database) Close() {
 	}
 	if db.ReadPool != nil && db.ReadPool != db.WritePool {
 		db.ReadPool.Close()
+	}
+}
+
+// StartPoolMetrics starts a goroutine that periodically collects connection pool metrics
+func (db *Database) StartPoolMetrics(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				db.collectPoolStats()
+			}
+		}
+	}()
+}
+
+// collectPoolStats gathers stats from both read and write pools and updates metrics.
+func (d *Database) collectPoolStats() {
+	if d.WritePool != nil {
+		stats := d.WritePool.Stat()
+		metrics.DBPoolTotalConns.WithLabelValues("write").Set(float64(stats.TotalConns()))
+		metrics.DBPoolIdleConns.WithLabelValues("write").Set(float64(stats.IdleConns()))
+		metrics.DBPoolInUseConns.WithLabelValues("write").Set(float64(stats.AcquiredConns()))
+	}
+	if d.ReadPool != nil {
+		stats := d.ReadPool.Stat()
+		metrics.DBPoolTotalConns.WithLabelValues("read").Set(float64(stats.TotalConns()))
+		metrics.DBPoolIdleConns.WithLabelValues("read").Set(float64(stats.IdleConns()))
+		metrics.DBPoolInUseConns.WithLabelValues("read").Set(float64(stats.AcquiredConns()))
 	}
 }
 
@@ -230,4 +265,106 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 		dbPool.Config().MaxConnLifetime, dbPool.Config().MaxConnIdleTime)
 
 	return dbPool, nil
+}
+
+// measuredTx wraps a pgx.Tx to record metrics on commit or rollback.
+type measuredTx struct {
+	pgx.Tx
+	start time.Time
+}
+
+// BeginTx starts a new transaction and wraps it for metric collection.
+func (db *Database) BeginTx(ctx context.Context) (pgx.Tx, error) {
+	tx, err := db.GetWritePool().Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &measuredTx{
+		Tx:    tx,
+		start: time.Now(),
+	}, nil
+}
+
+func (mtx *measuredTx) Commit(ctx context.Context) error {
+	err := mtx.Tx.Commit(ctx)
+	if err == nil {
+		metrics.DBTransactionsTotal.WithLabelValues("commit").Inc()
+	}
+	metrics.DBTransactionDuration.Observe(time.Since(mtx.start).Seconds())
+	return err
+}
+
+func (mtx *measuredTx) Rollback(ctx context.Context) error {
+	err := mtx.Tx.Rollback(ctx)
+	// We count a rollback attempt even if the rollback itself fails.
+	metrics.DBTransactionsTotal.WithLabelValues("rollback").Inc()
+	metrics.DBTransactionDuration.Observe(time.Since(mtx.start).Seconds())
+	return err
+}
+
+// Database timing helpers for critical operations
+
+// TimedQueryRow wraps QueryRow with duration metrics
+func (db *Database) TimedQueryRow(ctx context.Context, operation string, sql string, args ...interface{}) pgx.Row {
+	start := time.Now()
+
+	// Choose the appropriate pool
+	pool := db.GetReadPoolWithContext(ctx)
+	row := pool.QueryRow(ctx, sql, args...)
+
+	role := "read"
+	if pool == db.WritePool {
+		role = "write"
+	}
+	// Record the duration
+	metrics.DBQueryDuration.WithLabelValues(operation, role).Observe(time.Since(start).Seconds())
+	// Record query count
+	metrics.DBQueriesTotal.WithLabelValues(operation, "success", role).Inc()
+
+	return row
+}
+
+// TimedQuery wraps Query with duration metrics
+func (db *Database) TimedQuery(ctx context.Context, operation string, sql string, args ...interface{}) (pgx.Rows, error) {
+	start := time.Now()
+
+	// Choose the appropriate pool
+	pool := db.GetReadPoolWithContext(ctx)
+	rows, err := pool.Query(ctx, sql, args...)
+
+	role := "read"
+	if pool == db.WritePool {
+		role = "write"
+	}
+	// Record the duration
+	metrics.DBQueryDuration.WithLabelValues(operation, role).Observe(time.Since(start).Seconds())
+	// Record query count
+	if err != nil {
+		metrics.DBQueriesTotal.WithLabelValues(operation, "failure", role).Inc()
+	} else {
+		metrics.DBQueriesTotal.WithLabelValues(operation, "success", role).Inc()
+	}
+
+	return rows, err
+}
+
+// TimedExec wraps Exec with duration metrics
+func (db *Database) TimedExec(ctx context.Context, operation string, sql string, args ...interface{}) error {
+	start := time.Now()
+
+	// Write operations always use write pool
+	pool := db.GetWritePool()
+	_, err := pool.Exec(ctx, sql, args...)
+
+	// Record the duration
+	metrics.DBQueryDuration.WithLabelValues(operation, "write").Observe(time.Since(start).Seconds())
+	// Record query count
+	if err != nil {
+		metrics.DBQueriesTotal.WithLabelValues(operation, "failure", "write").Inc()
+	} else {
+		metrics.DBQueriesTotal.WithLabelValues(operation, "success", "write").Inc()
+	}
+
+	return err
 }

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -28,6 +30,7 @@ type POP3ProxyServer struct {
 	enableAffinity     bool
 	affinityValidity   time.Duration
 	affinityStickiness float64
+	authLimiter        server.AuthLimiter
 }
 
 type POP3ProxyServerOptions struct {
@@ -45,6 +48,7 @@ type POP3ProxyServerOptions struct {
 	EnableAffinity     bool
 	AffinityValidity   time.Duration
 	AffinityStickiness float64
+	AuthRateLimit      server.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -75,6 +79,9 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		stickiness = 1.0
 	}
 
+	// Initialize authentication rate limiter
+	authLimiter := server.NewAuthRateLimiter("POP3-PROXY", options.AuthRateLimit, database)
+
 	server := &POP3ProxyServer{
 		hostname:           hostname,
 		addr:               addr,
@@ -87,6 +94,7 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		enableAffinity:     options.EnableAffinity,
 		affinityValidity:   options.AffinityValidity,
 		affinityStickiness: stickiness,
+		authLimiter:        authLimiter,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided
@@ -164,6 +172,10 @@ func (s *POP3ProxyServer) Start() error {
 
 		session.RemoteIP = conn.RemoteAddr().String()
 		log.Printf("* POP3 proxy new connection from %s", session.RemoteIP)
+
+		// Track proxy connection
+		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Inc()
 
 		s.wg.Add(1)
 		go session.handleConnection()

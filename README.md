@@ -142,10 +142,11 @@ max_connections_per_ip = 10  # Per-IP limit
 
 [servers.imap.auth_rate_limit]
 enabled = true
-max_failures_per_ip = 5      # Block after 5 failures
-max_failures_per_user = 10   # Per-user limit
-failure_window = "15m"       # Time window for failures
-block_duration = "1h"        # How long to block
+max_attempts_per_ip = 10       # Max failed attempts per IP
+max_attempts_per_username = 5  # Max failed attempts per username
+ip_window_duration = "15m"     # Time window for IP-based limiting
+username_window_duration = "30m" # Time window for username-based limiting
+# See config.toml.example for advanced options like progressive delays and fast blocking.
 ```
 
 #### Health Monitoring

@@ -6,9 +6,11 @@ import (
 	"log"
 	"maps"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
@@ -324,7 +326,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	finalQueryString := baseQuery + fmt.Sprintf(" WHERE %s %s", whereCondition, orderByClause)
 
+	start := time.Now()
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, finalQueryString, whereArgs)
+	// Record the duration
+	metrics.DBQueryDuration.WithLabelValues("search_messages", "read").Observe(time.Since(start).Seconds())
 	if err != nil {
 		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)

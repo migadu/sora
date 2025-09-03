@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -52,6 +53,7 @@ func newSession(server *Server, conn net.Conn) *Session {
 func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
+	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 	log.Printf("[LMTP Proxy] New connection from %s", clientAddr)
@@ -299,8 +301,13 @@ func (s *Session) connectToBackend() error {
 	var actualAddr string
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(preferredAddr, clientHost, clientPort, serverHost, serverPort)
 	if err != nil {
+		// Track backend connection failure
+		metrics.ProxyBackendConnections.WithLabelValues("lmtp", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
+	
+	// Track backend connection success
+	metrics.ProxyBackendConnections.WithLabelValues("lmtp", "success").Inc()
 	s.backendConn = backendConn
 	s.serverAddr = actualAddr
 	s.backendReader = bufio.NewReader(s.backendConn)

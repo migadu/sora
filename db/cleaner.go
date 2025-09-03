@@ -104,6 +104,21 @@ func (d *Database) DeleteExpungedMessagesByUserAndContentHash(ctx context.Contex
 	return nil
 }
 
+// DeleteMessageByHashAndMailbox deletes message rows from the database that match
+// the given AccountID, MailboxID, and ContentHash. This is a hard delete used
+// by the importer for the --force-reimport option.
+// It returns the number of messages deleted.
+func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, accountID int64, mailboxID int64, contentHash string) (int64, error) {
+	tag, err := d.GetWritePool().Exec(ctx, `
+		DELETE FROM messages
+		WHERE account_id = $1 AND mailbox_id = $2 AND content_hash = $3
+	`, accountID, mailboxID, contentHash)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete message for re-import (account: %d, mailbox: %d, hash: %s): %w", accountID, mailboxID, contentHash, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // DeleteMessageContentByHash deletes a row from the message_contents table.
 // This should only be called after confirming the hash is no longer in use by any message.
 func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash string) error {

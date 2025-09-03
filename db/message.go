@@ -345,3 +345,55 @@ func (db *Database) GetMessageHeaders(ctx context.Context, messageUID imap.UID, 
 
 	return headers, nil
 }
+
+// GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming
+// Returns a map of mailboxName -> []contentHash for the most recent messages
+func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+	if messageCount <= 0 {
+		return make(map[string][]string), nil
+	}
+
+	result := make(map[string][]string)
+
+	for _, mailboxName := range mailboxNames {
+		mailbox, err := db.GetMailboxByName(ctx, userID, mailboxName)
+		if err != nil {
+			log.Printf("[WARMUP] failed to get mailbox '%s' for user %d: %v", mailboxName, userID, err)
+			continue // Skip this mailbox if not found
+		}
+
+		// Create search criteria to get all messages (no filters)
+		criteria := &imap.SearchCriteria{}
+
+		// Create sort criteria to order by internal date descending (most recent first)
+		sortCriteria := []imap.SortCriterion{{
+			Key:     imap.SortKeyArrival,
+			Reverse: true, // Most recent first
+		}}
+
+		// Get the sorted messages (most recent first)
+		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria)
+		if err != nil {
+			log.Printf("[WARMUP] failed to get recent messages for mailbox '%s': %v", mailboxName, err)
+			continue
+		}
+
+		// Extract content hashes for the most recent messages (up to messageCount)
+		var contentHashes []string
+		for i, message := range messages {
+			if i >= messageCount {
+				break
+			}
+			if message.ContentHash != "" {
+				contentHashes = append(contentHashes, message.ContentHash)
+			}
+		}
+
+		if len(contentHashes) > 0 {
+			result[mailboxName] = contentHashes
+			log.Printf("[WARMUP] prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
+		}
+	}
+
+	return result, nil
+}

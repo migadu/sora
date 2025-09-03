@@ -2,14 +2,19 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	_ "github.com/emersion/go-message/charset"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -23,6 +28,7 @@ type IMAPSession struct {
 	mutex       sync.RWMutex
 	mutexHelper *server.MutexTimeoutHelper
 	releaseConn func() // Function to release connection from limiter
+	startTime   time.Time
 
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
@@ -51,6 +57,67 @@ func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error
 	}
 }
 
+// classifyAndTrackError classifies IMAP errors and tracks them in metrics
+func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *imap.Error) {
+	if err == nil && imapErr == nil {
+		return
+	}
+
+	var errorType, severity string
+
+	if imapErr != nil {
+		// Classify based on IMAP error code and type
+		switch imapErr.Code {
+		case imap.ResponseCodeAuthenticationFailed:
+			errorType = "auth_failed"
+			severity = "client_error"
+		case imap.ResponseCodeServerBug:
+			errorType = "server_bug"
+			severity = "server_error"
+		case imap.ResponseCodeTryCreate:
+			errorType = "mailbox_not_found"
+			severity = "client_error"
+		case imap.ResponseCodeNonExistent:
+			errorType = "not_found"
+			severity = "client_error"
+		case imap.ResponseCodeTooBig:
+			errorType = "message_too_big"
+			severity = "client_error"
+		default:
+			if imapErr.Type == imap.StatusResponseTypeBad {
+				errorType = "invalid_command"
+				severity = "client_error"
+			} else {
+				errorType = "unknown"
+				severity = "server_error"
+			}
+		}
+	} else if err != nil {
+		// Classify based on underlying error
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			errorType = "timeout"
+			severity = "server_error"
+		case errors.Is(err, context.Canceled):
+			errorType = "canceled"
+			severity = "client_error"
+		case errors.Is(err, os.ErrPermission):
+			errorType = "permission_denied"
+			severity = "server_error"
+		default:
+			if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) || errors.Is(err, consts.ErrMessageNotAvailable) {
+				errorType = "not_found"
+				severity = "client_error"
+			} else {
+				errorType = "unknown"
+				severity = "server_error"
+			}
+		}
+	}
+
+	metrics.ProtocolErrors.WithLabelValues("imap", command, errorType, severity).Inc()
+}
+
 func (s *IMAPSession) Close() error {
 	if s == nil {
 		return nil
@@ -66,11 +133,18 @@ func (s *IMAPSession) Close() error {
 		s.releaseConn = nil
 	}
 
+	// Observe connection duration
+	metrics.ConnectionDuration.WithLabelValues("imap").Observe(time.Since(s.startTime).Seconds())
+
 	totalCount := s.server.totalConnections.Add(-1)
 	var authCount int64 = 0
 
+	// Prometheus metrics - connection closed
+	metrics.ConnectionsCurrent.WithLabelValues("imap").Dec()
+
 	if s.IMAPUser != nil {
 		authCount = s.server.authenticatedConnections.Add(-1)
+		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
 		s.Log("closing session for user: %v (connections: total=%d, authenticated=%d)",
 			s.IMAPUser.FullAddress(), totalCount, authCount)
 		s.IMAPUser = nil
@@ -166,7 +240,6 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 	}
 	return out
 }
-
 
 // decodeNumSet translates client sequence numbers to server sequence numbers.
 // It safely acquires the read mutex to protect access to session state.

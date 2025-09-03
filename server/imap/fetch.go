@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -15,6 +16,8 @@ import (
 	"github.com/migadu/sora/helpers"
 
 	tp "net/textproto"
+
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 const crlf = "\r\n"
@@ -35,12 +38,22 @@ func extractPartial(b []byte, partial *imap.SectionPartial) []byte {
 }
 
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	start := time.Now()
+	success := false
+	defer func() {
+		status := "failure"
+		if success {
+			status = "success"
+		}
+		metrics.CommandsTotal.WithLabelValues("imap", "FETCH", status).Inc()
+		metrics.CommandDuration.WithLabelValues("imap", "FETCH").Observe(time.Since(start).Seconds())
+	}()
+
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
-	// Acquire read mutex to safely read all session state in one go
 	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[FETCH] Failed to acquire read lock within timeout")
@@ -50,7 +63,6 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			Text: "Server busy, please try again",
 		}
 	}
-	defer cancel()
 
 	if s.selectedMailbox == nil {
 		s.mutex.RUnlock()
@@ -70,6 +82,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
+	cancel()
 	s.mutex.RUnlock()
 
 	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
@@ -93,6 +106,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	if len(messages) == 0 {
+		success = true
 		return nil
 	}
 
@@ -135,12 +149,24 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	// Process all messages without repeatedly acquiring the mutex
+	var totalBytesFetched int64
 	for _, msg := range messages {
+		totalBytesFetched += int64(msg.Size)
+		metrics.MessageThroughput.WithLabelValues("imap", "fetched", "success").Inc()
+		if s.IMAPUser != nil {
+			metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
+		}
 		// Use the previously captured sessionTrackerSnapshot for all messages
 		if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
 			return err
 		}
 	}
+
+	if s.IMAPUser != nil {
+		metrics.TrackDomainBytes("imap", s.IMAPUser.Domain(), "out", totalBytesFetched)
+	}
+
+	success = true
 	return nil
 }
 

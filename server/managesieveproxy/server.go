@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -30,12 +32,12 @@ type Server struct {
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
+	authLimiter        server.AuthLimiter
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
 type ServerOptions struct {
 	Addr               string
-	RemoteAddr         string // Deprecated: use RemoteAddrs
 	RemoteAddrs        []string
 	MasterSASLUsername string
 	MasterSASLPassword string
@@ -46,19 +48,14 @@ type ServerOptions struct {
 	RemoteTLS          bool
 	RemoteTLSVerify    bool
 	ConnectTimeout     time.Duration
+	AuthRateLimit      server.AuthRateLimiterConfig
 }
 
 // New creates a new ManageSieve proxy server.
 func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	// Handle backward compatibility
-	remoteAddrs := opts.RemoteAddrs
-	if len(remoteAddrs) == 0 && opts.RemoteAddr != "" {
-		remoteAddrs = []string{opts.RemoteAddr}
-	}
-
-	if len(remoteAddrs) == 0 {
+	if len(opts.RemoteAddrs) == 0 {
 		cancel()
 		return nil, fmt.Errorf("no remote addresses configured")
 	}
@@ -70,7 +67,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	}
 
 	// Create connection manager
-	connManager, err := proxy.NewConnectionManager(remoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
+	connManager, err := proxy.NewConnectionManager(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
@@ -80,6 +77,9 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	if err := connManager.ResolveAddresses(); err != nil {
 		log.Printf("[ManageSieve Proxy] Failed to resolve addresses: %v", err)
 	}
+
+	// Initialize authentication rate limiter
+	authLimiter := server.NewAuthRateLimiter("SIEVE-PROXY", opts.AuthRateLimit, db)
 
 	return &Server{
 		db:                 db,
@@ -94,6 +94,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		connManager:        connManager,
 		ctx:                ctx,
 		cancel:             cancel,
+		authLimiter:        authLimiter,
 	}, nil
 }
 
@@ -144,6 +145,11 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+
+			// Track proxy connection
+			metrics.ConnectionsTotal.WithLabelValues("managesieve_proxy").Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Inc()
+
 			session := newSession(s, conn)
 			session.handleConnection()
 		}()

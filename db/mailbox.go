@@ -157,9 +157,9 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 		log.Printf("[DB] ERROR: attempted to create mailbox with invalid characters: %q for user %d", name, userID)
 		return consts.ErrMailboxInvalidName
 	}
-	
+
 	// Start a transaction
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -234,9 +234,9 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 		log.Printf("[DB] ERROR: attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
 		return consts.ErrMailboxInvalidName
 	}
-	
+
 	// Start a transaction
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -323,7 +323,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrMailboxNotFound
 	}
 
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
 		return consts.ErrInternalError
@@ -567,14 +567,14 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID i
 	if newName == "" {
 		return consts.ErrMailboxInvalidName
 	}
-	
+
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(newName, "\t\r\n\x00") {
 		log.Printf("[DB] ERROR: attempted to rename mailbox to name with invalid characters: %q for user %d", newName, userID)
 		return consts.ErrMailboxInvalidName
 	}
 
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to begin transaction for rename: %v", err)
 		return consts.ErrDBBeginTransactionFailed

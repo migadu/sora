@@ -17,7 +17,7 @@ import (
 )
 
 func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID, srcMailboxID int64, destMailboxID int64, destMailboxName string) (imap.UID, error) {
-	tx, err := d.GetWritePool().Begin(ctx)
+	tx, err := d.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, consts.ErrDBBeginTransactionFailed
@@ -158,7 +158,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 		options.InternalDate = time.Now()
 	}
 
-	tx, err := d.GetWritePool().Begin(ctx)
+	tx, err := d.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, 0, consts.ErrDBBeginTransactionFailed
@@ -316,7 +316,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 		options.InternalDate = time.Now()
 	}
 
-	tx, err := d.GetWritePool().Begin(ctx)
+	tx, err := d.BeginTx(ctx)
 	if err != nil {
 		log.Printf("[DB] failed to begin transaction: %v", err)
 		return 0, 0, consts.ErrDBBeginTransactionFailed

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 var idlePollInterval = 15 * time.Second
@@ -12,6 +13,9 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	s.mutex.RLock()
 	s.Log("client entered IDLE mode")
 	s.mutex.RUnlock()
+
+	metrics.IMAPIdleConnections.Inc()
+	defer metrics.IMAPIdleConnections.Dec()
 
 	for {
 		if stop, err := s.idleLoop(w, done); err != nil {

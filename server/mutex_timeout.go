@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+	
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // MutexTimeout defines how long to wait for mutex acquisition before timing out
@@ -32,6 +34,7 @@ func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string
 // The caller must call the returned cancel function when done with the lock,
 // after calling RUnlock() themselves.
 func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, context.CancelFunc) {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
 	lockChan := make(chan struct{})
 
@@ -43,9 +46,12 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, context.CancelF
 	select {
 	case <-lockChan:
 		// Lock acquired successfully
+		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
 		return true, cancel
 	case <-ctx.Done():
 		// Lock acquisition timed out or context was canceled
+		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "read").Inc()
+		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
 			select {
@@ -67,6 +73,7 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, context.CancelF
 // The caller must call the returned cancel function when done with the lock,
 // after calling Unlock() themselves.
 func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, context.CancelFunc) {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
 	lockChan := make(chan struct{})
 
@@ -78,9 +85,12 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, context.Cancel
 	select {
 	case <-lockChan:
 		// Lock acquired successfully
+		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
 		return true, cancel
 	case <-ctx.Done():
 		// Lock acquisition timed out or context was canceled
+		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "write").Inc()
+		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
 			select {

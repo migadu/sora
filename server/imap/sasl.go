@@ -3,6 +3,7 @@ package imap
 import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-sasl"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -52,6 +53,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {
 						s.Log("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity (target user to impersonate) provided.", username)
+						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -66,6 +68,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
 						s.Log("[AUTH] Failed to parse impersonation target user '%s' as address: %v", targetUserToImpersonate, err)
+						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -76,6 +79,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					userID, err := s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
 					if err != nil {
 						s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed, // Target user does not exist
@@ -93,6 +97,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					authCount := s.server.authenticatedConnections.Add(1)
 					totalCount := s.server.totalConnections.Load()
 					s.Log("[AUTH] Session established for impersonated user '%s' (ID: %d) via master SASL login. (connections: total=%d, authenticated=%d)", targetUserToImpersonate, userID, totalCount, authCount)
+
+					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
+					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+					
+					// Trigger cache warmup for the authenticated user (if configured)
+					s.triggerCacheWarmup(userID)
+					
 					return nil
 				}
 			}

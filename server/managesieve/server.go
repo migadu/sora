@@ -9,8 +9,10 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 )
@@ -33,32 +35,32 @@ type ManageSieveServer struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
-	
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
-	
+
 	// PROXY protocol support
 	proxyReader *server.ProxyProtocolReader
-	
+
 	// Authentication rate limiting
 	authLimiter server.AuthLimiter
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth       bool
-	Debug              bool
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	TLSUseStartTLS     bool
-	MaxScriptSize      int64
-	MasterSASLUsername string
-	MasterSASLPassword string
-	MaxConnections     int
+	InsecureAuth        bool
+	Debug               bool
+	TLS                 bool
+	TLSCertFile         string
+	TLSKeyFile          string
+	TLSVerify           bool
+	TLSUseStartTLS      bool
+	MaxScriptSize       int64
+	MasterSASLUsername  string
+	MasterSASLPassword  string
+	MaxConnections      int
 	MaxConnectionsPerIP int
-	ProxyProtocol      server.ProxyProtocolConfig
-	AuthRateLimit      server.AuthRateLimiterConfig
+	ProxyProtocol       server.ProxyProtocolConfig
+	AuthRateLimit       server.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -75,8 +77,8 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 		}
 	}
 
-	// Initialize enhanced authentication rate limiter
-	authLimiter := server.NewEnhancedAuthRateLimiterFromBasic("ManageSieve", options.AuthRateLimit, database)
+	// Initialize authentication rate limiter
+	authLimiter := server.NewAuthRateLimiter("ManageSieve", options.AuthRateLimit, database)
 
 	serverInstance := &ManageSieveServer{
 		hostname:           hostname,
@@ -168,13 +170,13 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 				log.Printf("* ManageSieve server closed: %v", s.appCtx.Err())
 				return
 			}
-			
+
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if strings.Contains(err.Error(), "PROXY protocol error") {
 				log.Printf("[ManageSieve] PROXY protocol error, rejecting connection: %v", err)
 				continue // Continue accepting other connections
 			}
-			
+
 			// For other errors, this might be a fatal server error
 			errChan <- err
 			return
@@ -190,6 +192,10 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		// Increment total connections counter
 		totalCount := s.totalConnections.Add(1)
+
+		// Prometheus metrics - connection established
+		metrics.ConnectionsTotal.WithLabelValues("managesieve").Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("managesieve").Inc()
 		authCount := s.authenticatedConnections.Load()
 
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
@@ -203,6 +209,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			cancel:      sessionCancel,
 			isTLS:       isImplicitTLS, // Initialize isTLS based on the listener type
 			releaseConn: releaseConn,
+			startTime:   time.Now(),
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available
@@ -210,7 +217,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
 			proxyInfo = proxyConn.GetProxyInfo()
 		}
-		
+
 		clientIP, proxyIP := server.GetConnectionIPs(conn, proxyInfo)
 		session.RemoteIP = clientIP
 		session.ProxyIP = proxyIP
@@ -218,7 +225,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		session.Id = idgen.New()
 		session.HostName = session.server.hostname
 		session.Stats = s // Set the server as the Stats provider
-		
+
 		// Create logging function for the mutex helper
 		logFunc := func(format string, args ...interface{}) {
 			session.Log(format, args...)

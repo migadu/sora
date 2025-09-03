@@ -99,7 +99,7 @@ func (db *Database) DeleteScript(ctx context.Context, scriptID, userID int64) er
 }
 
 func (db *Database) SetScriptActive(ctx context.Context, scriptID, userID int64, active bool) error {
-	tx, err := db.GetWritePool().Begin(ctx)
+	tx, err := db.BeginTx(ctx)
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package imap
 import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
@@ -169,6 +170,12 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		if highestModSeq > 0 {
 			searchData.ModSeq = highestModSeq
 		}
+	}
+
+	// Track domain and user command activity - SEARCH is expensive!
+	if s.IMAPUser != nil {
+		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "SEARCH")
+		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
 	}
 
 	return searchData, nil

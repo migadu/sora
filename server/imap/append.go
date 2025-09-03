@@ -15,12 +15,24 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 
 	_ "github.com/emersion/go-message/charset"
 )
 
 func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+	start := time.Now()
+	success := false
+	defer func() {
+		status := "failure"
+		if success {
+			status = "success"
+		}
+		metrics.CommandsTotal.WithLabelValues("imap", "APPEND", status).Inc()
+		metrics.CommandDuration.WithLabelValues("imap", "APPEND").Observe(time.Since(start).Seconds())
+	}()
+
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := s.ctx
 	if s.useMasterDB {
@@ -31,18 +43,22 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[APPEND] mailbox '%s' does not exist", mboxName)
-			return nil, &imap.Error{
+			imapErr := &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeTryCreate,
 				Text: fmt.Sprintf("mailbox '%s' does not exist", mboxName),
 			}
+			s.classifyAndTrackError("APPEND", err, imapErr)
+			return nil, imapErr
 		}
+		s.classifyAndTrackError("APPEND", err, nil)
 		return nil, s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
 	// Read the entire message into a buffer
 	var buf bytes.Buffer
 	if _, err = io.Copy(&buf, r); err != nil {
+		s.classifyAndTrackError("APPEND", err, nil)
 		return nil, s.internalError("failed to read message: %v", err)
 	}
 
@@ -52,6 +68,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Check if the message exceeds the configured APPENDLIMIT
 	if s.server.appendLimit > 0 && int64(len(fullMessageBytes)) > s.server.appendLimit {
 		s.Log("[APPEND] message size %d bytes exceeds APPENDLIMIT of %d bytes", len(fullMessageBytes), s.server.appendLimit)
+		s.classifyAndTrackError("APPEND", nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig})
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTooBig,
@@ -164,6 +181,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	if s.ctx.Err() != nil {
 		s.Log("[APPEND] context cancelled after message insertion, aborting session state update")
 		// We've already inserted the message successfully, so still return success
+		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -174,6 +192,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[APPEND] Failed to acquire write lock within timeout, returning success without session state update")
+		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -190,6 +209,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {
 		s.Log("[APPEND] context cancelled during mutex acquisition, aborting session state update")
+		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -208,8 +228,19 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		}
 	}
 
+	metrics.MessageThroughput.WithLabelValues("imap", "appended", "success").Inc()
+
 	s.server.uploader.NotifyUploadQueued()
 
+	// Track domain and user command activity - APPEND is storage intensive!
+	if s.IMAPUser != nil {
+		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "APPEND")
+		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
+		metrics.TrackDomainBytes("imap", s.IMAPUser.Address.Domain(), "in", int64(buf.Len()))
+		metrics.TrackDomainMessage("imap", s.IMAPUser.Address.Domain(), "appended")
+	}
+
+	success = true
 	return &imap.AppendData{
 		UID:         imap.UID(messageUID),
 		UIDValidity: mailbox.UIDValidity,
