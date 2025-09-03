@@ -18,6 +18,13 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// Version information, injected at build time.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
 	Database   config.DatabaseConfig `toml:"database"`
@@ -116,6 +123,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Allow 'sora-admin -v' and 'sora-admin --version' as shortcuts
+	if os.Args[1] == "-v" || os.Args[1] == "--version" {
+		printVersion()
+		os.Exit(0)
+	}
+
 	command := os.Args[1]
 
 	switch command {
@@ -147,6 +160,8 @@ func main() {
 		handleAuthStats()
 	case "health-status":
 		handleHealthStatus()
+	case "version":
+		printVersion()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -154,6 +169,10 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+func printVersion() {
+	fmt.Printf("sora-admin version %s (commit: %s, built at: %s)\n", version, commit, date)
 }
 
 func printUsage() {
@@ -177,6 +196,7 @@ Commands:
   kick-connections  Force disconnect proxy connections
   auth-stats        Show authentication statistics and blocked IPs
   health-status     Show system health status and component monitoring
+  version           Show version information
   help              Show this help message
 
 Examples:
@@ -191,6 +211,7 @@ Examples:
   sora-admin uploader-status --config /path/to/config.toml
   sora-admin connection-stats --config /path/to/config.toml
   sora-admin kick-connections --user user@example.com
+  sora-admin version
 
 Use 'sora-admin <command> --help' for more information about a command.
 `)

@@ -8,6 +8,18 @@ SORA_ADMIN_LINUX_BINARY ?= sora-admin-linux-amd64
 SORA_FREEBSD_BINARY ?= sora-freebsd-amd64
 SORA_ADMIN_FREEBSD_BINARY ?= sora-admin-freebsd-amd64
 
+# ====================================================================================
+# Version Information
+# You can override these variables during the build, e.g., make build VERSION=v1.0.0
+# ====================================================================================
+VERSION ?= $(shell git describe --tags --always --dirty --match='v*')
+COMMIT ?= $(shell git rev-parse --short HEAD)
+DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Go linker flags to inject version info
+LDFLAGS_VARS = -X 'main.version=${VERSION}' -X 'main.commit=${COMMIT}' -X 'main.date=${DATE}'
+LDFLAGS = -ldflags="${LDFLAGS_VARS}"
+
 # Default target
 all: build
 
@@ -16,11 +28,11 @@ build: sora sora-admin
 
 # Build the main sora server
 sora:
-	go build -o $(SORA_BINARY) ./cmd/sora
+	go build $(LDFLAGS) -o $(SORA_BINARY) ./cmd/sora
 
 # Build the sora-admin tool
 sora-admin:
-	go build -o $(SORA_ADMIN_BINARY) ./cmd/sora-admin
+	go build $(LDFLAGS) -o $(SORA_ADMIN_BINARY) ./cmd/sora-admin
 
 # Install both executables to GOPATH/bin
 install:
@@ -35,20 +47,15 @@ clean:
 test:
 	go test ./...
 
-# Build with version and build info
-build-release:
-	go build -ldflags "-X main.version=$(shell git describe --tags --always --dirty)" -o $(SORA_BINARY) ./cmd/sora
-	go build -ldflags "-X main.version=$(shell git describe --tags --always --dirty)" -o $(SORA_ADMIN_BINARY) ./cmd/sora-admin
-
 # Cross-compile with musl libc for Linux
 build-linux-musl:
-	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags "-extldflags -static" -o $(SORA_LINUX_BINARY) ./cmd/sora
-	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags "-extldflags -static" -o $(SORA_ADMIN_LINUX_BINARY) ./cmd/sora-admin
+	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags="${LDFLAGS_VARS} -extldflags -static" -o $(SORA_LINUX_BINARY) ./cmd/sora
+	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags="${LDFLAGS_VARS} -extldflags -static" -o $(SORA_ADMIN_LINUX_BINARY) ./cmd/sora-admin
 
 # Cross-compile for FreeBSD
 build-freebsd:
-	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_FREEBSD_BINARY) ./cmd/sora
-	GOARCH=amd64 GOOS=freebsd go build -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
+	GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_FREEBSD_BINARY) ./cmd/sora
+	GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
 
 # Help target
 help:
@@ -60,7 +67,6 @@ help:
 	@echo "  install      - Install both executables to GOPATH/bin"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  test         - Run tests"
-	@echo "  build-release - Build with version information"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"
 	@echo "  build-freebsd - Cross-compile binaries for FreeBSD"
 	@echo "  help         - Show this help message"

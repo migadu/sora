@@ -34,11 +34,24 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Version information, injected at build time.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
+	// Handle -v or --version flag before anything else
+	showVersion := flag.Bool("v", false, "Show version information and exit")
+	flag.BoolVar(showVersion, "version", false, "Show version information and exit")
+
 	errorHandler := errors.NewErrorHandler()
 	cfg := newDefaultConfig()
 
 	// --- Define Command-Line Flags ---
+	// Note: The version flag is defined above to be handled before other flags are parsed
+	// in their final form.
 	// These flags will override values from the config file if set.
 	// Their default values are set from the initial `cfg` for consistent -help messages.
 
@@ -133,6 +146,11 @@ func main() {
 	fMetricsPath := flag.String("metricspath", cfg.Servers.Metrics.Path, "Metrics endpoint path (overrides config)")
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("sora version %s (commit: %s, built at: %s)\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	// --- Load Configuration from TOML File ---
 	// Values from the TOML file will override the application defaults.
