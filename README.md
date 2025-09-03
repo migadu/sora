@@ -260,9 +260,9 @@ Update existing account passwords:
 ### Monitoring Commands
 
 ```bash
-# View active connections
-./sora-admin connections         # List all active connections
-./sora-admin connections --user user@example.com  # User-specific
+# View connection statistics
+./sora-admin connection-stats    # Connection metrics by protocol/server
+./sora-admin connection-stats --user user@example.com  # User-specific
 
 # View cache performance metrics
 ./sora-admin cache-metrics       # Show latest hit/miss ratios per instance
@@ -271,13 +271,10 @@ Update existing account passwords:
 ./sora-admin health-status       # Overall health check
 ./sora-admin health-status --detailed  # Component details
 
-# Connection statistics
-./sora-admin connection-stats    # Connection metrics by protocol/server
-
-# Terminate connections
-./sora-admin terminate-connections --user user@example.com
-./sora-admin terminate-connections --protocol imap
-./sora-admin terminate-connections --server backend1.example.com
+# Kick connections
+./sora-admin kick-connections --user user@example.com
+./sora-admin kick-connections --protocol imap
+./sora-admin kick-connections --server backend1.example.com
 ```
 
 ### Import/Export Operations
@@ -299,6 +296,10 @@ Get help for any command:
 ./sora-admin create-account --help
 ./sora-admin update-account --help
 ./sora-admin health-status --help
+
+# Show version information
+./sora-admin version
+./sora-admin -v
 ```
 
 ## Operational Guide
