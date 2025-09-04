@@ -204,7 +204,19 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 	// Handle host:port combination
 	// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
 	if !strings.Contains(selectedHost, ":") {
-		portStr := endpoint.Port
+		var portStr string
+		if endpoint.Port != nil {
+			switch v := endpoint.Port.(type) {
+			case string:
+				portStr = v
+			case int:
+				portStr = strconv.Itoa(v)
+			case int64: // TOML parsers often use int64 for numbers
+				portStr = strconv.FormatInt(v, 10)
+			default:
+				return nil, fmt.Errorf("invalid type for port: %T", v)
+			}
+		}
 		if portStr == "" {
 			portStr = "5432" // Default PostgreSQL port
 		}
