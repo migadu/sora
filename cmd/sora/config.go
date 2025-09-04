@@ -268,7 +268,8 @@ func newDefaultConfig() Config {
 		Database: config.DatabaseConfig{
 			LogQueries: false,
 			Write: &config.DatabaseEndpointConfig{
-				Hosts:           []string{"localhost:5432"},
+				Hosts:           []string{"localhost"},
+				Port:            5432,
 				User:            "postgres",
 				Password:        "",
 				Name:            "sora_mail_db",
@@ -279,7 +280,8 @@ func newDefaultConfig() Config {
 				MaxConnIdleTime: "30m",
 			},
 			Read: &config.DatabaseEndpointConfig{
-				Hosts:           []string{"localhost:5432"},
+				Hosts:           []string{"localhost"},
+				Port:            5432,
 				User:            "postgres",
 				Password:        "",
 				Name:            "sora_mail_db",

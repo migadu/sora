@@ -56,10 +56,17 @@ log_queries = false
 [database.write]
 # Database server hosts (can specify multiple for failover)
 # Examples:
-#   hosts = ["localhost:5432"]                    # Single local server
-#   hosts = ["primary.example.com:5432"]         # Single remote server
-#   hosts = ["db1.example.com:5432", "db2.example.com:5432"] # Multiple for failover
-hosts = ["localhost:5432"]
+#   hosts = ["localhost"]                       # Single local server (with port field)
+#   hosts = ["primary.example.com"]             # Single remote server (with port field)
+#   hosts = ["db1.example.com", "db2.example.com"] # Multiple hosts for failover
+#   hosts = ["localhost:5432"]                  # With port (host:port)
+hosts = ["localhost"]
+
+# Database port (alternative to including port in hosts)
+# Examples:
+#   port = 5432                      # Standard PostgreSQL port (default)
+#   port = 5433                      # Custom port
+port = 5432
 
 # Database username for authentication
 # Examples:
@@ -128,10 +135,17 @@ max_conn_idle_time = "30m"
 [database.read]
 # Database server hosts for read operations (can specify multiple for load balancing)
 # Examples:
-#   hosts = ["localhost:5432"]                    # Same as write (no replicas)
-#   hosts = ["replica1.example.com:5432"]        # Single read replica
-#   hosts = ["replica1.example.com:5432", "replica2.example.com:5432"] # Multiple replicas
-hosts = ["localhost:5432"]
+#   hosts = ["localhost"]                       # Same as write (with port field)
+#   hosts = ["replica1.example.com"]            # Single read replica (with port field)
+#   hosts = ["replica1.example.com", "replica2.example.com"] # Multiple replicas
+#   hosts = ["localhost:5432"]                  # With port
+hosts = ["localhost"]
+
+# Database port for read operations (alternative to including port in hosts)
+# Examples:
+#   port = 5432                      # Standard PostgreSQL port (default)
+#   port = 5433                      # Custom port for read replicas
+port = 5432
 
 # Database username for read operations
 # Examples:

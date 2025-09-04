@@ -73,14 +73,16 @@ func newDefaultAdminConfig() AdminConfig {
 		Database: config.DatabaseConfig{
 			LogQueries: false,
 			Write: &config.DatabaseEndpointConfig{
-				Hosts:    []string{"localhost:5432"},
+				Hosts:    []string{"localhost"},
+				Port:     5432,
 				User:     "postgres",
 				Password: "",
 				Name:     "sora_mail_db",
 				TLSMode:  false,
 			},
 			Read: &config.DatabaseEndpointConfig{
-				Hosts:    []string{"localhost:5432"},
+				Hosts:    []string{"localhost"},
+				Port:     5432,
 				User:     "postgres",
 				Password: "",
 				Name:     "sora_mail_db",

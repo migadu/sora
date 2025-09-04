@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -198,6 +199,16 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 
 	// For now, randomly select one host. In the future, this could implement load balancing
 	selectedHost := endpoint.Hosts[rand.Intn(len(endpoint.Hosts))]
+	
+	// Handle host:port combination
+	// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
+	if !strings.Contains(selectedHost, ":") {
+		port := endpoint.Port
+		if port == 0 {
+			port = 5432 // Default PostgreSQL port
+		}
+		selectedHost = fmt.Sprintf("%s:%d", selectedHost, port)
+	}
 
 	sslMode := "disable"
 	if endpoint.TLSMode {
