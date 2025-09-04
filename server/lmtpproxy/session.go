@@ -297,9 +297,17 @@ func (s *Session) connectToBackend() error {
 		return fmt.Errorf("failed to parse server port: %w", err)
 	}
 
-	// Connect using the connection manager with PROXY protocol
+	// Connect using the connection manager with user routing and PROXY protocol
+	// Note: For LMTP, we need a recipient email for routing, but we'll use the sender for now
+	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer routingCancel()
+	
 	var actualAddr string
-	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(preferredAddr, clientHost, clientPort, serverHost, serverPort)
+	backendConn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
+		routingCtx,
+		s.from, // Use sender email for routing lookup (could be enhanced to use recipient)
+		clientHost, clientPort, serverHost, serverPort,
+	)
 	if err != nil {
 		// Track backend connection failure
 		metrics.ProxyBackendConnections.WithLabelValues("lmtp", "failure").Inc()

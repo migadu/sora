@@ -49,6 +49,7 @@ type ServerOptions struct {
 	RemoteTLSVerify    bool
 	ConnectTimeout     time.Duration
 	AuthRateLimit      server.AuthRateLimiterConfig
+	PreLookup          *proxy.PreLookupConfig
 }
 
 // New creates a new ManageSieve proxy server.
@@ -66,9 +67,29 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		connectTimeout = 10 * time.Second
 	}
 
-	// Create connection manager
-	connManager, err := proxy.NewConnectionManager(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout)
+	// Initialize prelookup client if configured
+	var routingLookup proxy.UserRoutingLookup
+	if opts.PreLookup != nil && opts.PreLookup.Enabled {
+		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
+		if err != nil {
+			log.Printf("[ManageSieve Proxy] Failed to initialize prelookup client: %v", err)
+			if !opts.PreLookup.FallbackDefault {
+				cancel()
+				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+			}
+			log.Printf("[ManageSieve Proxy] Continuing without prelookup due to fallback_to_default=true")
+		} else {
+			routingLookup = prelookupClient
+			log.Printf("[ManageSieve Proxy] Prelookup database client initialized successfully")
+		}
+	}
+
+	// Create connection manager with routing
+	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout, routingLookup)
 	if err != nil {
+		if routingLookup != nil {
+			routingLookup.Close()
+		}
 		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}

@@ -1192,6 +1192,148 @@ max_pending_batch = 100
 #   db_error_threshold = "5m"                  # Conservative recovery
 db_error_threshold = "1m"
 
+# --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
+# Advanced feature for routing users to specific backend servers based on database queries.
+# Enables smart load balancing and user distribution across multiple backend servers.
+
+[servers.imap_proxy.prelookup]
+# Enable/disable database-driven user routing
+# When enabled, the proxy queries a database to determine which backend server
+# should handle each user's connection, enabling advanced routing strategies.
+# Examples:
+#   enabled = false                            # Standard round-robin/affinity routing
+#   enabled = true                             # Database-driven routing
+enabled = false
+
+# Database server hosts for prelookup queries (separate from main Sora database)
+# This is typically a central routing database shared across proxy servers
+# Examples:
+#   hosts = ["routing-db.example.com:5432"]    # Single routing database
+#   hosts = ["route1.example.com:5432", "route2.example.com:5432"] # Multiple for HA
+hosts = ["localhost:5432"]
+
+# Database username for prelookup connections
+# Examples:
+#   user = "router_user"                       # Dedicated routing user
+#   user = "postgres"                          # Database superuser
+user = "postgres"
+
+# Database password for prelookup connections
+# Examples:
+#   password = "routing_password"              # Production password
+#   password = ""                              # No password (development)
+password = ""
+
+# Database name for prelookup queries
+# Examples:
+#   name = "routing_db"                        # Dedicated routing database
+#   name = "sora_routing"                      # Routing schema in main database
+name = "routing_db"
+
+# Enable TLS for prelookup database connections
+# Examples:
+#   tls = false                                # Plain connections (development)
+#   tls = true                                 # Encrypted connections (production)
+tls = false
+
+# --- PRELOOKUP DATABASE CONNECTION POOL ---
+# Configure connection pool for prelookup database queries
+
+# Maximum connections in the prelookup pool
+# Examples:
+#   max_conns = 5                              # Light routing load
+#   max_conns = 10                             # Standard routing load
+#   max_conns = 20                             # Heavy routing load
+max_conns = 10
+
+# Minimum connections in the prelookup pool
+# Examples:
+#   min_conns = 1                              # Minimal resources
+#   min_conns = 2                              # Standard minimum
+#   min_conns = 5                              # High availability
+min_conns = 2
+
+# Connection lifetime for prelookup connections
+# Examples:
+#   max_conn_lifetime = "30m"                  # Short lifetime
+#   max_conn_lifetime = "1h"                   # Standard lifetime
+#   max_conn_lifetime = "2h"                   # Long lifetime
+max_conn_lifetime = "1h"
+
+# Connection idle time for prelookup connections
+# Examples:
+#   max_conn_idle_time = "15m"                 # Aggressive cleanup
+#   max_conn_idle_time = "30m"                 # Standard cleanup
+#   max_conn_idle_time = "1h"                  # Conservative cleanup
+max_conn_idle_time = "30m"
+
+# --- PRELOOKUP CACHING CONFIGURATION ---
+# Cache routing decisions to reduce database load and improve performance
+
+# Cache duration for routing decisions
+# Examples:
+#   cache_ttl = "5m"                           # Frequent updates
+#   cache_ttl = "10m"                          # Standard caching
+#   cache_ttl = "30m"                          # Long-term caching
+cache_ttl = "10m"
+
+# Maximum entries in the routing cache
+# Examples:
+#   cache_size = 1000                          # Small cache
+#   cache_size = 10000                         # Standard cache
+#   cache_size = 50000                         # Large cache
+cache_size = 10000
+
+# --- PRELOOKUP QUERY CONFIGURATION ---
+# Customize SQL queries for routing decisions
+
+# SQL query to determine user routing
+# The query should return (server_address) for the given email
+# Default query assumes a 'user_routing' table with email, server_address, and active columns
+# Examples:
+#   routing_query = "SELECT server_addr FROM users WHERE email = $1"
+#   routing_query = "SELECT backend_host FROM routing WHERE user_email = $1 AND enabled = true"
+routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
+
+# --- PRELOOKUP AUTHENTICATION MODE ---
+# Control whether prelookup also handles authentication or just routing
+
+# Authentication mode for prelookup
+# Options:
+#   "routing_only"     - Only perform routing lookups, authentication handled by backend
+#   "auth_and_route"   - Perform both authentication and routing in prelookup database
+# Examples:
+#   auth_mode = "routing_only"                 # Separate auth and routing
+#   auth_mode = "auth_and_route"               # Combined auth and routing
+auth_mode = "routing_only"
+
+# Authentication method when auth_mode = "auth_and_route"
+# Options:
+#   "bcrypt"    - bcrypt password hashing (recommended)
+#   "plain"     - plain text passwords (insecure, testing only)
+# Examples:
+#   auth_method = "bcrypt"                     # Secure password hashing
+#   auth_method = "plain"                      # Plain text (development only)
+auth_method = "bcrypt"
+
+# SQL query for authentication and routing (used when auth_mode = "auth_and_route")
+# The query should return (password_hash, server_address) for the given email
+# Examples:
+#   auth_query = "SELECT pass_hash, server_addr FROM users WHERE email = $1 AND active = true"
+#   auth_query = "SELECT password, backend_host FROM user_auth WHERE user_email = $1 AND enabled = true"
+auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+
+# --- PRELOOKUP FALLBACK BEHAVIOR ---
+# Control what happens when prelookup fails or user is not found
+
+# Enable fallback to default routing when prelookup fails
+# When true, connection continues with standard load balancing if database lookup fails
+# When false, connection is rejected if database lookup fails
+# Examples:
+#   fallback_to_default = true                 # Graceful degradation
+#   fallback_to_default = false                # Strict routing enforcement
+fallback_to_default = true
+
 # =============================================================================
 # POP3 PROXY CONFIGURATION  
 # =============================================================================
@@ -1275,6 +1417,30 @@ max_pending_batch = 100
 #   db_error_threshold = "5m"                  # Conservative recovery
 db_error_threshold = "1m"
 
+# --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
+# Advanced feature for routing users to specific backend servers based on database queries.
+# Same configuration as IMAP proxy - see IMAP proxy section for detailed explanations.
+
+[servers.pop3_proxy.prelookup]
+# Enable/disable database-driven user routing for POP3 proxy
+enabled = false
+hosts = ["localhost:5432"]
+user = "postgres"
+password = ""
+name = "routing_db"
+tls = false
+max_conns = 10
+min_conns = 2
+max_conn_lifetime = "1h"
+max_conn_idle_time = "30m"
+cache_ttl = "10m"
+cache_size = 10000
+routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
+auth_mode = "routing_only"
+auth_method = "bcrypt"
+auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+fallback_to_default = true
+
 # =============================================================================
 # MANAGESIEVE PROXY CONFIGURATION
 # =============================================================================
@@ -1345,6 +1511,30 @@ max_pending_batch = 100
 #   db_error_threshold = "5m"                  # Conservative recovery
 db_error_threshold = "1m"
 
+# --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
+# Advanced feature for routing users to specific backend servers based on database queries.
+# Same configuration as IMAP proxy - see IMAP proxy section for detailed explanations.
+
+[servers.managesieve_proxy.prelookup]
+# Enable/disable database-driven user routing for ManageSieve proxy
+enabled = false
+hosts = ["localhost:5432"]
+user = "postgres"
+password = ""
+name = "routing_db"
+tls = false
+max_conns = 10
+min_conns = 2
+max_conn_lifetime = "1h"
+max_conn_idle_time = "30m"
+cache_ttl = "10m"
+cache_size = 10000
+routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
+auth_mode = "routing_only"
+auth_method = "bcrypt"
+auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+fallback_to_default = true
+
 # =============================================================================
 # LMTP PROXY CONFIGURATION
 # =============================================================================
@@ -1372,6 +1562,30 @@ affinity_validity = "24h" # How long to remember user-server affinity
 # means there is a 90% chance of using the affinity server and a 10% chance of
 # using round-robin to help balance load.
 affinity_stickiness = 0.9
+
+# --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
+# Advanced feature for routing users to specific backend servers based on database queries.
+# Same configuration as IMAP proxy - see IMAP proxy section for detailed explanations.
+
+[servers.lmtp_proxy.prelookup]
+# Enable/disable database-driven user routing for LMTP proxy
+enabled = false
+hosts = ["localhost:5432"]
+user = "postgres"
+password = ""
+name = "routing_db"
+tls = false
+max_conns = 10
+min_conns = 2
+max_conn_lifetime = "1h"
+max_conn_idle_time = "30m"
+cache_ttl = "10m"
+cache_size = 10000
+routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
+auth_mode = "routing_only"
+auth_method = "bcrypt"
+auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+fallback_to_default = true
 
 # =============================================================================
 # PROMETHEUS METRICS CONFIGURATION

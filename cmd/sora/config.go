@@ -6,6 +6,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // S3Config holds S3 configuration.
@@ -131,6 +132,7 @@ type IMAPProxyServerConfig struct {
 	AffinityStickiness  float64                      `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity    string                       `toml:"affinity_validity"`
 	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	PreLookup           *proxy.PreLookupConfig       `toml:"prelookup"`       // Database-driven user routing
 }
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
@@ -153,6 +155,7 @@ type POP3ProxyServerConfig struct {
 	AffinityStickiness  float64                      `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity    string                       `toml:"affinity_validity"`
 	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	PreLookup           *proxy.PreLookupConfig       `toml:"prelookup"`       // Database-driven user routing
 }
 
 // ManageSieveProxyServerConfig holds ManageSieve proxy server configuration.
@@ -172,25 +175,27 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLSVerify     bool                         `toml:"remote_tls_verify"`
 	ConnectTimeout      string                       `toml:"connect_timeout"`
 	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	PreLookup           *proxy.PreLookupConfig       `toml:"prelookup"`       // Database-driven user routing
 }
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
 type LMTPProxyServerConfig struct {
-	Start               bool     `toml:"start"`
-	Addr                string   `toml:"addr"`
-	RemoteAddrs         []string `toml:"remote_addrs"`
-	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                 bool     `toml:"tls"`
-	TLSCertFile         string   `toml:"tls_cert_file"`
-	TLSKeyFile          string   `toml:"tls_key_file"`
-	TLSVerify           bool     `toml:"tls_verify"`
-	RemoteTLS           bool     `toml:"remote_tls"`
-	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
-	ConnectTimeout      string   `toml:"connect_timeout"`
-	EnableAffinity      bool     `toml:"enable_affinity"`
-	AffinityStickiness  float64  `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity    string   `toml:"affinity_validity"`
+	Start               bool                   `toml:"start"`
+	Addr                string                 `toml:"addr"`
+	RemoteAddrs         []string               `toml:"remote_addrs"`
+	MaxConnections      int                    `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int                    `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                 bool                   `toml:"tls"`
+	TLSCertFile         string                 `toml:"tls_cert_file"`
+	TLSKeyFile          string                 `toml:"tls_key_file"`
+	TLSVerify           bool                   `toml:"tls_verify"`
+	RemoteTLS           bool                   `toml:"remote_tls"`
+	RemoteTLSVerify     bool                   `toml:"remote_tls_verify"`
+	ConnectTimeout      string                 `toml:"connect_timeout"`
+	EnableAffinity      bool                   `toml:"enable_affinity"`
+	AffinityStickiness  float64                `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity    string                 `toml:"affinity_validity"`
+	PreLookup           *proxy.PreLookupConfig `toml:"prelookup"` // Database-driven user routing
 }
 
 // ConnectionTrackingConfig holds connection tracking configuration.

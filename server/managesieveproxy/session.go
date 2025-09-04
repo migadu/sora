@@ -263,9 +263,16 @@ func (s *Session) connectToBackendAndAuth() error {
 		return fmt.Errorf("failed to parse server port: %w", err)
 	}
 
-	// Connect using the connection manager with PROXY protocol (no affinity for ManageSieve)
+	// Connect using the connection manager with user routing and PROXY protocol
+	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer routingCancel()
+	
 	var actualAddr string
-	s.backendConn, actualAddr, err = s.server.connManager.ConnectWithProxy("", clientHost, clientPort, serverHost, serverPort)
+	s.backendConn, actualAddr, err = s.server.connManager.ConnectForUserWithProxy(
+		routingCtx,
+		s.username, // User email for routing lookup
+		clientHost, clientPort, serverHost, serverPort,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}

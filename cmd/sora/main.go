@@ -937,6 +937,7 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		AffinityStickiness: config.Servers.IMAPProxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
 		AuthRateLimit:      config.Servers.IMAPProxy.AuthRateLimit,
+		PreLookup:          config.Servers.IMAPProxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
@@ -990,6 +991,7 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		AffinityStickiness: config.Servers.POP3Proxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
 		AuthRateLimit:      config.Servers.POP3Proxy.AuthRateLimit,
+		PreLookup:          config.Servers.POP3Proxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -1031,6 +1033,7 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		RemoteTLSVerify:    config.Servers.ManageSieveProxy.RemoteTLSVerify,
 		ConnectTimeout:     connectTimeout,
 		AuthRateLimit:      config.Servers.ManageSieveProxy.AuthRateLimit,
+		PreLookup:          config.Servers.ManageSieveProxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
@@ -1074,6 +1077,7 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		EnableAffinity:     config.Servers.LMTPProxy.EnableAffinity,
 		AffinityStickiness: config.Servers.LMTPProxy.AffinityStickiness,
 		AffinityValidity:   affinityValidity,
+		PreLookup:          config.Servers.LMTPProxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)

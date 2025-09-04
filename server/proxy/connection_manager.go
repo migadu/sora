@@ -25,10 +25,18 @@ type ConnectionManager struct {
 	healthyMu     sync.RWMutex
 	healthyStatus map[string]bool
 	lastCheck     map[string]time.Time
+
+	// User routing lookup
+	routingLookup UserRoutingLookup
 }
 
 // NewConnectionManager creates a new connection manager
 func NewConnectionManager(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, connectTimeout time.Duration) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRouting(remoteAddrs, remoteTLS, remoteTLSVerify, connectTimeout, nil)
+}
+
+// NewConnectionManagerWithRouting creates a new connection manager with optional user routing
+func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
@@ -49,6 +57,7 @@ func NewConnectionManager(remoteAddrs []string, remoteTLS bool, remoteTLSVerify 
 		connectTimeout:  connectTimeout,
 		healthyStatus:   healthyStatus,
 		lastCheck:       lastCheck,
+		routingLookup:   routingLookup,
 	}, nil
 }
 
@@ -329,4 +338,69 @@ func (cm *ConnectionManager) IsRemoteTLS() bool {
 // IsRemoteTLSVerifyEnabled returns whether TLS verification is enabled
 func (cm *ConnectionManager) IsRemoteTLSVerifyEnabled() bool {
 	return cm.remoteTLSVerify
+}
+
+// ConnectForUser attempts to connect to a server based on user routing lookup
+// If routing lookup fails or returns no result, falls back to default behavior
+func (cm *ConnectionManager) ConnectForUser(ctx context.Context, email string) (net.Conn, string, error) {
+	return cm.ConnectForUserWithProxy(ctx, email, "", 0, "", 0)
+}
+
+// ConnectForUserWithProxy attempts to connect to a server based on user routing lookup with PROXY protocol
+func (cm *ConnectionManager) ConnectForUserWithProxy(ctx context.Context, email, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, error) {
+	var preferredAddr string
+
+	// Try routing lookup if available
+	if cm.routingLookup != nil && email != "" {
+		routingInfo, err := cm.routingLookup.LookupUserRoute(ctx, email)
+		if err != nil {
+			log.Printf("[ConnectionManager] Routing lookup failed for user %s: %v, falling back to default", email, err)
+		} else {
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[ConnectionManager] User %s routed to server: %s", 
+				email, routingInfo.ServerAddress)
+		}
+	}
+
+	// Use the preferred address if found, otherwise fall back to round-robin
+	return cm.ConnectWithProxy(preferredAddr, clientIP, clientPort, serverIP, serverPort)
+}
+
+// AuthenticateAndConnectForUserWithProxy performs authentication and routing in one step
+// Returns connection, server address, authentication result, and error
+func (cm *ConnectionManager) AuthenticateAndConnectForUserWithProxy(ctx context.Context, email, password, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, AuthResult, error) {
+	var preferredAddr string
+	authResult := AuthUserNotFound
+
+	// Try authentication and routing lookup if available
+	if cm.routingLookup != nil && email != "" {
+		routingInfo, result, authErr := cm.routingLookup.AuthenticateAndRoute(ctx, email, password)
+		
+		authResult = result
+		
+		switch result {
+		case AuthUserNotFound:
+			log.Printf("[ConnectionManager] User %s not found in prelookup DB, falling back to default routing", email)
+			// Continue with fallback
+			
+		case AuthSuccess:
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[ConnectionManager] User %s authenticated and routed to server: %s", 
+				email, routingInfo.ServerAddress)
+			// Continue with connection
+			
+		case AuthFailed:
+			log.Printf("[ConnectionManager] Authentication failed for user %s, rejecting connection", email)
+			return nil, "", authResult, fmt.Errorf("authentication failed for user: %s", email)
+		}
+		
+		// Log auth errors for debugging but don't fail unless it's AuthFailed
+		if authErr != nil && result != AuthUserNotFound {
+			log.Printf("[ConnectionManager] Auth error for user %s: %v", email, authErr)
+		}
+	}
+
+	// Connect using the preferred address if found, otherwise fall back to round-robin
+	conn, serverAddr, err := cm.ConnectWithProxy(preferredAddr, clientIP, clientPort, serverIP, serverPort)
+	return conn, serverAddr, authResult, err
 }

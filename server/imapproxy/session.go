@@ -325,8 +325,47 @@ func (s *Session) getPreferredBackend() (string, error) {
 
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
+	// First try user-based routing from prelookup database
+	var preferredAddr string
+	
+	// Try routing lookup first (takes precedence over affinity)
+	routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer routingCancel()
+	
+	conn, serverAddr, err := s.server.connManager.ConnectForUserWithProxy(
+		routingCtx, 
+		s.username,
+		s.getClientHost(),
+		s.getClientPort(),
+		s.getServerHost(),
+		s.getServerPort(),
+	)
+	
+	if err == nil {
+		// Successfully connected using routing lookup or fallback
+		s.backendConn = conn
+		s.serverAddr = serverAddr
+		s.backendReader = bufio.NewReader(s.backendConn)
+		s.backendWriter = bufio.NewWriter(s.backendConn)
+		
+		// Record successful connection for future affinity if enabled
+		if s.server.enableAffinity && s.accountID != 0 {
+			updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer updateCancel()
+			if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, serverAddr); err != nil {
+				log.Printf("[IMAP Proxy] Failed to record server affinity for %s: %v", s.username, err)
+			}
+		}
+		
+		log.Printf("[IMAP Proxy] Connected to backend %s for user %s", serverAddr, s.username)
+		return nil
+	}
+	
+	// Fallback to original affinity-based logic if user routing fails completely
+	log.Printf("[IMAP Proxy] User-based routing failed for %s: %v, falling back to affinity", s.username, err)
+	
 	// Get preferred backend from affinity
-	preferredAddr, err := s.getPreferredBackend()
+	preferredAddr, err = s.getPreferredBackend()
 	if err != nil {
 		log.Printf("[IMAP Proxy] Could not get preferred backend for %s: %v", s.username, err)
 	}
@@ -609,4 +648,45 @@ func (s *Session) pollDatabaseDirectly(ctx context.Context) {
 
 func isClosingError(err error) bool {
 	return err == io.EOF || strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// Helper methods for extracting connection information
+func (s *Session) getClientHost() string {
+	host, _, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func (s *Session) getClientPort() int {
+	_, portStr, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+func (s *Session) getServerHost() string {
+	host, _, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func (s *Session) getServerPort() int {
+	_, portStr, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+	return port
 }

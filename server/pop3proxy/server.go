@@ -49,20 +49,42 @@ type POP3ProxyServerOptions struct {
 	AffinityValidity   time.Duration
 	AffinityStickiness float64
 	AuthRateLimit      server.AuthRateLimiterConfig
+	PreLookup          *proxy.PreLookupConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, database *db.Database, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
-	// Create connection manager
-	connManager, err := proxy.NewConnectionManager(
+	// Initialize prelookup client if configured
+	var routingLookup proxy.UserRoutingLookup
+	if options.PreLookup != nil && options.PreLookup.Enabled {
+		prelookupClient, err := proxy.NewPreLookupClient(serverCtx, options.PreLookup)
+		if err != nil {
+			log.Printf("[POP3 Proxy] Failed to initialize prelookup client: %v", err)
+			if !options.PreLookup.FallbackDefault {
+				serverCancel()
+				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+			}
+			log.Printf("[POP3 Proxy] Continuing without prelookup due to fallback_to_default=true")
+		} else {
+			routingLookup = prelookupClient
+			log.Printf("[POP3 Proxy] Prelookup database client initialized successfully")
+		}
+	}
+
+	// Create connection manager with routing
+	connManager, err := proxy.NewConnectionManagerWithRouting(
 		options.RemoteAddrs,
 		options.RemoteTLS,
 		options.RemoteTLSVerify,
 		options.ConnectTimeout,
+		routingLookup,
 	)
 	if err != nil {
+		if routingLookup != nil {
+			routingLookup.Close()
+		}
 		serverCancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
