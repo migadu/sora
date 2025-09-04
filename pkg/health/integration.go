@@ -91,7 +91,8 @@ func (hi *HealthIntegration) RegisterS3Check(s3storage *storage.S3Storage) {
 			select {
 			case obj, ok := <-objectCh:
 				if !ok {
-					return fmt.Errorf("S3 list objects channel closed unexpectedly")
+					// Channel closed without error means bucket is accessible but empty - this is OK
+					return nil
 				}
 				if obj.Err != nil {
 					return fmt.Errorf("S3 list objects failed: %w", obj.Err)
