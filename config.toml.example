@@ -36,18 +36,30 @@ log_output = "stderr"
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
-# PostgreSQL database connection settings. Sora requires PostgreSQL with
-# the pg_trgm extension for full-text search capabilities.
-[database]
-# PostgreSQL server hostname or IP address
-# Examples:
-#   host = "localhost"           # Local development
-#   host = "db.example.com"      # Remote server
-#   host = "10.0.1.100"         # IP address
-host = "localhost"
+# PostgreSQL database connection settings with read/write split support.
+# Sora requires PostgreSQL with the pg_trgm extension for full-text search.
+# Configuration supports separate read and write endpoints for scaling.
 
-# PostgreSQL server port (standard is 5432)
-port = "5432"
+[database]
+# Enable SQL query logging (useful for debugging, impacts performance)
+# Examples:
+#   log_queries = false          # Production (default)
+#   log_queries = true           # Development/debugging
+log_queries = false
+
+# =============================================================================
+# WRITE DATABASE CONFIGURATION
+# =============================================================================
+# Primary database endpoint for all write operations (INSERT, UPDATE, DELETE)
+# This should point to your primary PostgreSQL server.
+
+[database.write]
+# Database server hosts (can specify multiple for failover)
+# Examples:
+#   hosts = ["localhost:5432"]                    # Single local server
+#   hosts = ["primary.example.com:5432"]         # Single remote server
+#   hosts = ["db1.example.com:5432", "db2.example.com:5432"] # Multiple for failover
+hosts = ["localhost:5432"]
 
 # Database username for authentication
 # Examples:
@@ -73,38 +85,104 @@ name = "sora_mail_db"
 #   tls = true                   # Remote/production connections
 tls = false
 
-# Enable SQL query logging (useful for debugging, impacts performance)
+# --- WRITE DATABASE CONNECTION POOL SETTINGS ---
+# Fine-tune write database connection management for optimal performance
+
+# Maximum connections in the write pool (should be < PostgreSQL max_connections)
+# Consider: concurrent users × avg write operations per user × protocol count
 # Examples:
-#   log_queries = false          # Production (default)
-#   log_queries = true           # Development/debugging
-log_queries = false
+#   max_conns = 50               # Small deployment
+#   max_conns = 100              # Standard deployment  
+#   max_conns = 200              # Large deployment
+max_conns = 50
 
-# --- DATABASE CONNECTION POOL SETTINGS ---
-# Fine-tune database connection management for optimal performance
-
-# Maximum connections in the pool (should be < PostgreSQL max_connections)
-# Consider: concurrent users × avg connections per user × protocol count
-# Examples:
-#   max_conns = 100              # Small deployment
-#   max_conns = 500              # Medium deployment  
-#   max_conns = 1000             # Large deployment
-max_conns = 100
-
-# Minimum connections maintained in pool (kept alive always)
+# Minimum connections maintained in write pool (kept alive always)
 # These connections are established at startup and never closed
 # Examples:
-#   min_conns = 10               # Light load
-#   min_conns = 50               # Heavy load
-min_conns = 10
+#   min_conns = 5                # Light load
+#   min_conns = 10               # Standard load
+#   min_conns = 25               # Heavy load
+min_conns = 5
 
-# Maximum lifetime before connection refresh (prevents stale connections)
+# Maximum lifetime before write connection refresh (prevents stale connections)
 # Examples:
 #   max_conn_lifetime = "1h"     # Standard refresh
 #   max_conn_lifetime = "30m"    # Aggressive refresh
 #   max_conn_lifetime = "4h"     # Conservative refresh
 max_conn_lifetime = "1h"
 
-# Maximum idle time before closing excess connections (above min_conns)
+# Maximum idle time before closing excess write connections (above min_conns)
+# Examples:
+#   max_conn_idle_time = "30m"   # Standard cleanup
+#   max_conn_idle_time = "5m"    # Aggressive cleanup
+#   max_conn_idle_time = "2h"    # Conservative cleanup
+max_conn_idle_time = "30m"
+
+# =============================================================================
+# READ DATABASE CONFIGURATION
+# =============================================================================
+# Read replica database endpoint(s) for SELECT operations. Can specify multiple
+# hosts for load balancing across read replicas. If not configured, read
+# operations will use the write database connection pool.
+
+[database.read]
+# Database server hosts for read operations (can specify multiple for load balancing)
+# Examples:
+#   hosts = ["localhost:5432"]                    # Same as write (no replicas)
+#   hosts = ["replica1.example.com:5432"]        # Single read replica
+#   hosts = ["replica1.example.com:5432", "replica2.example.com:5432"] # Multiple replicas
+hosts = ["localhost:5432"]
+
+# Database username for read operations
+# Examples:
+#   user = "postgres"            # Default superuser
+#   user = "sora_read_user"     # Dedicated read-only user (recommended)
+user = "postgres"
+
+# Database user password for read operations
+# Examples:
+#   password = ""                # No password (development only)
+#   password = "read_password"   # Production password
+password = ""
+
+# Database name for read operations (typically same as write)
+# Examples:
+#   name = "sora_mail_db"        # Same database as write
+name = "sora_mail_db"
+
+# Enable TLS/SSL for read database connections
+# Examples:
+#   tls = false                  # Local/development connections
+#   tls = true                   # Remote/production connections
+tls = false
+
+# --- READ DATABASE CONNECTION POOL SETTINGS ---
+# Fine-tune read database connection management for optimal performance
+
+# Maximum connections in the read pool (can be higher than write pool)
+# Consider: concurrent users × avg read operations per user × protocol count
+# Examples:
+#   max_conns = 100              # Small deployment
+#   max_conns = 200              # Standard deployment  
+#   max_conns = 500              # Large deployment (read-heavy workload)
+max_conns = 100
+
+# Minimum connections maintained in read pool (kept alive always)
+# These connections are established at startup and never closed
+# Examples:
+#   min_conns = 10               # Light load
+#   min_conns = 25               # Standard load
+#   min_conns = 50               # Heavy load
+min_conns = 10
+
+# Maximum lifetime before read connection refresh (prevents stale connections)
+# Examples:
+#   max_conn_lifetime = "1h"     # Standard refresh
+#   max_conn_lifetime = "30m"    # Aggressive refresh
+#   max_conn_lifetime = "4h"     # Conservative refresh
+max_conn_lifetime = "1h"
+
+# Maximum idle time before closing excess read connections (above min_conns)
 # Examples:
 #   max_conn_idle_time = "30m"   # Standard cleanup
 #   max_conn_idle_time = "5m"    # Aggressive cleanup
