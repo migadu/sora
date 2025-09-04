@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,11 +204,17 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 	// Handle host:port combination
 	// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
 	if !strings.Contains(selectedHost, ":") {
-		port := endpoint.Port
-		if port == 0 {
-			port = 5432 // Default PostgreSQL port
+		portStr := endpoint.Port
+		if portStr == "" {
+			portStr = "5432" // Default PostgreSQL port
 		}
-		selectedHost = fmt.Sprintf("%s:%d", selectedHost, port)
+		
+		// Validate port is a valid integer
+		if port, err := strconv.Atoi(portStr); err != nil {
+			return nil, fmt.Errorf("invalid port value '%s': %v", portStr, err)
+		} else {
+			selectedHost = fmt.Sprintf("%s:%d", selectedHost, port)
+		}
 	}
 
 	sslMode := "disable"

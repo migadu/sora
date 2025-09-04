@@ -9,7 +9,7 @@ import (
 // DatabaseEndpointConfig holds configuration for a single database endpoint
 type DatabaseEndpointConfig struct {
 	Hosts           []string `toml:"hosts"`              // List of database hosts (e.g., ["db1", "db2"] or ["db1:5432", "db2:5432"])
-	Port            int      `toml:"port"`               // Database port (default: 5432)
+	Port            string   `toml:"port"`               // Database port (default: "5432")
 	User            string   `toml:"user"`
 	Password        string   `toml:"password"`
 	Name            string   `toml:"name"`

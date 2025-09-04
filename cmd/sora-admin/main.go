@@ -74,7 +74,7 @@ func newDefaultAdminConfig() AdminConfig {
 			LogQueries: false,
 			Write: &config.DatabaseEndpointConfig{
 				Hosts:    []string{"localhost"},
-				Port:     5432,
+				Port:     "5432",
 				User:     "postgres",
 				Password: "",
 				Name:     "sora_mail_db",
@@ -82,7 +82,7 @@ func newDefaultAdminConfig() AdminConfig {
 			},
 			Read: &config.DatabaseEndpointConfig{
 				Hosts:    []string{"localhost"},
-				Port:     5432,
+				Port:     "5432",
 				User:     "postgres",
 				Password: "",
 				Name:     "sora_mail_db",
@@ -162,6 +162,8 @@ func main() {
 		handleAuthStats()
 	case "health-status":
 		handleHealthStatus()
+	case "config-dump":
+		handleConfigDump()
 	case "version":
 		printVersion()
 	case "help", "--help", "-h":
@@ -198,6 +200,7 @@ Commands:
   kick-connections  Force disconnect proxy connections
   auth-stats        Show authentication statistics and blocked IPs
   health-status     Show system health status and component monitoring
+  config-dump       Dump the parsed configuration for debugging
   version           Show version information
   help              Show this help message
 
@@ -213,6 +216,7 @@ Examples:
   sora-admin uploader-status --config /path/to/config.toml
   sora-admin connection-stats --config /path/to/config.toml
   sora-admin kick-connections --user user@example.com
+  sora-admin config-dump --config /path/to/config.toml
   sora-admin version
 
 Use 'sora-admin <command> --help' for more information about a command.
@@ -2565,6 +2569,129 @@ func showHistoricalCacheMetrics(ctx context.Context, database *db.Database, inst
 	}
 
 	return nil
+}
+
+func handleConfigDump() {
+	// Parse config-dump specific flags
+	var configFile, format string
+	var maskSecrets bool
+
+	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
+	flagSet.StringVar(&configFile, "config", "config.toml", "Path to configuration file")
+	flagSet.StringVar(&format, "format", "toml", "Output format: toml, json, or pretty")
+	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
+	flagSet.Usage = func() {
+		fmt.Printf(`Dump the parsed configuration for debugging
+
+Usage:
+  sora-admin config-dump [options]
+
+Options:
+  --config PATH        Path to configuration file (default: config.toml)
+  --format FORMAT      Output format: toml, json, or pretty (default: toml)
+  --mask-secrets       Mask sensitive values like passwords (default: true)
+
+Examples:
+  sora-admin config-dump --config sora.config.toml
+  sora-admin config-dump --format json --mask-secrets=false
+  sora-admin config-dump --format pretty
+`)
+	}
+
+	flagSet.Parse(os.Args[2:])
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(configFile, &cfg); err != nil {
+		log.Fatalf("Failed to load config file: %v", err)
+	}
+
+	// Mask secrets if requested
+	if maskSecrets {
+		if cfg.Database.Write != nil {
+			cfg.Database.Write.Password = "***MASKED***"
+		}
+		if cfg.Database.Read != nil {
+			cfg.Database.Read.Password = "***MASKED***"
+		}
+		cfg.S3.AccessKey = "***MASKED***"
+		cfg.S3.SecretKey = "***MASKED***"
+		cfg.S3.EncryptionKey = "***MASKED***"
+	}
+
+	// Output in requested format
+	switch format {
+	case "json":
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(cfg); err != nil {
+			log.Fatalf("Failed to encode config as JSON: %v", err)
+		}
+	case "pretty":
+		printPrettyConfig(cfg)
+	case "toml":
+		encoder := toml.NewEncoder(os.Stdout)
+		if err := encoder.Encode(cfg); err != nil {
+			log.Fatalf("Failed to encode config as TOML: %v", err)
+		}
+	default:
+		log.Fatalf("Unknown format: %s (supported: toml, json, pretty)", format)
+	}
+}
+
+func printPrettyConfig(cfg AdminConfig) {
+	fmt.Println("=== SORA ADMIN CONFIGURATION ===")
+	fmt.Println()
+	
+	fmt.Println("DATABASE CONFIGURATION:")
+	fmt.Printf("  Log Queries: %t\n", cfg.Database.LogQueries)
+	
+	if cfg.Database.Write != nil {
+		fmt.Println("  Write Database:")
+		fmt.Printf("    Hosts: %v\n", cfg.Database.Write.Hosts)
+		fmt.Printf("    Port: %s\n", cfg.Database.Write.Port)
+		fmt.Printf("    User: %s\n", cfg.Database.Write.User)
+		fmt.Printf("    Password: %s\n", cfg.Database.Write.Password)
+		fmt.Printf("    Database: %s\n", cfg.Database.Write.Name)
+		fmt.Printf("    TLS Mode: %t\n", cfg.Database.Write.TLSMode)
+		fmt.Printf("    Max Connections: %d\n", cfg.Database.Write.MaxConns)
+		fmt.Printf("    Min Connections: %d\n", cfg.Database.Write.MinConns)
+		fmt.Printf("    Max Connection Lifetime: %s\n", cfg.Database.Write.MaxConnLifetime)
+		fmt.Printf("    Max Connection Idle Time: %s\n", cfg.Database.Write.MaxConnIdleTime)
+	}
+	
+	if cfg.Database.Read != nil {
+		fmt.Println("  Read Database:")
+		fmt.Printf("    Hosts: %v\n", cfg.Database.Read.Hosts)
+		fmt.Printf("    Port: %s\n", cfg.Database.Read.Port)
+		fmt.Printf("    User: %s\n", cfg.Database.Read.User)
+		fmt.Printf("    Password: %s\n", cfg.Database.Read.Password)
+		fmt.Printf("    Database: %s\n", cfg.Database.Read.Name)
+		fmt.Printf("    TLS Mode: %t\n", cfg.Database.Read.TLSMode)
+		fmt.Printf("    Max Connections: %d\n", cfg.Database.Read.MaxConns)
+		fmt.Printf("    Min Connections: %d\n", cfg.Database.Read.MinConns)
+		fmt.Printf("    Max Connection Lifetime: %s\n", cfg.Database.Read.MaxConnLifetime)
+		fmt.Printf("    Max Connection Idle Time: %s\n", cfg.Database.Read.MaxConnIdleTime)
+	}
+	
+	fmt.Println()
+	fmt.Println("S3 CONFIGURATION:")
+	fmt.Printf("  Endpoint: %s\n", cfg.S3.Endpoint)
+	fmt.Printf("  Disable TLS: %t\n", cfg.S3.DisableTLS)
+	fmt.Printf("  Access Key: %s\n", cfg.S3.AccessKey)
+	fmt.Printf("  Secret Key: %s\n", cfg.S3.SecretKey)
+	fmt.Printf("  Bucket: %s\n", cfg.S3.Bucket)
+	fmt.Printf("  Trace: %t\n", cfg.S3.Trace)
+	fmt.Printf("  Encrypt: %t\n", cfg.S3.Encrypt)
+	fmt.Printf("  Encryption Key: %s\n", cfg.S3.EncryptionKey)
+	
+	fmt.Println()
+	fmt.Println("UPLOADER CONFIGURATION:")
+	fmt.Printf("  Path: %s\n", cfg.Uploader.Path)
+	fmt.Printf("  Batch Size: %d\n", cfg.Uploader.BatchSize)
+	fmt.Printf("  Concurrency: %d\n", cfg.Uploader.Concurrency)
+	fmt.Printf("  Max Attempts: %d\n", cfg.Uploader.MaxAttempts)
+	fmt.Printf("  Retry Interval: %s\n", cfg.Uploader.RetryInterval)
 }
 
 func truncateString(s string, maxLen int) string {

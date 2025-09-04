@@ -269,7 +269,7 @@ func newDefaultConfig() Config {
 			LogQueries: false,
 			Write: &config.DatabaseEndpointConfig{
 				Hosts:           []string{"localhost"},
-				Port:            5432,
+				Port:            "5432",
 				User:            "postgres",
 				Password:        "",
 				Name:            "sora_mail_db",
@@ -281,7 +281,7 @@ func newDefaultConfig() Config {
 			},
 			Read: &config.DatabaseEndpointConfig{
 				Hosts:           []string{"localhost"},
-				Port:            5432,
+				Port:            "5432",
 				User:            "postgres",
 				Password:        "",
 				Name:            "sora_mail_db",
