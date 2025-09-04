@@ -200,7 +200,7 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 
 	// For now, randomly select one host. In the future, this could implement load balancing
 	selectedHost := endpoint.Hosts[rand.Intn(len(endpoint.Hosts))]
-	
+
 	// Handle host:port combination
 	// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
 	if !strings.Contains(selectedHost, ":") {
@@ -208,7 +208,7 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 		if portStr == "" {
 			portStr = "5432" // Default PostgreSQL port
 		}
-		
+
 		// Validate port is a valid integer
 		if port, err := strconv.Atoi(portStr); err != nil {
 			return nil, fmt.Errorf("invalid port value '%s': %v", portStr, err)
@@ -222,15 +222,9 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 		sslMode = "require"
 	}
 
-	// Build connection string with read-only parameter for read connections
-	var connString string
-	if poolType == "read" {
-		connString = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&default_transaction_read_only=on&application_name=sora_read",
-			endpoint.User, endpoint.Password, selectedHost, endpoint.Name, sslMode)
-	} else {
-		connString = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&application_name=sora_write",
-			endpoint.User, endpoint.Password, selectedHost, endpoint.Name, sslMode)
-	}
+	// Build connection string
+	connString := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
+		endpoint.User, endpoint.Password, selectedHost, endpoint.Name, sslMode)
 
 	log.Printf("[DB] connecting to %s database: postgres://%s@%s/%s?sslmode=%s (hosts: %v)",
 		poolType, endpoint.User, selectedHost, endpoint.Name, sslMode, endpoint.Hosts)
