@@ -204,29 +204,29 @@ func createPoolFromEndpoint(ctx context.Context, endpoint *config.DatabaseEndpoi
 	// Handle host:port combination
 	// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
 	if !strings.Contains(selectedHost, ":") {
-		var portStr string
+		port := 5432 // Default PostgreSQL port
 		if endpoint.Port != nil {
+			var p int64
+			var err error
 			switch v := endpoint.Port.(type) {
 			case string:
-				portStr = v
+				p, err = strconv.ParseInt(v, 10, 32)
+				if err != nil {
+					return nil, fmt.Errorf("invalid string for port: %q", v)
+				}
 			case int:
-				portStr = strconv.Itoa(v)
+				p = int64(v)
 			case int64: // TOML parsers often use int64 for numbers
-				portStr = strconv.FormatInt(v, 10)
+				p = v
 			default:
 				return nil, fmt.Errorf("invalid type for port: %T", v)
 			}
+			port = int(p)
 		}
-		if portStr == "" {
-			portStr = "5432" // Default PostgreSQL port
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("port number %d is out of the valid range (1-65535)", port)
 		}
-
-		// Validate port is a valid integer
-		if port, err := strconv.Atoi(portStr); err != nil {
-			return nil, fmt.Errorf("invalid port value '%s': %v", portStr, err)
-		} else {
-			selectedHost = fmt.Sprintf("%s:%d", selectedHost, port)
-		}
+		selectedHost = fmt.Sprintf("%s:%d", selectedHost, port)
 	}
 
 	sslMode := "disable"
