@@ -132,6 +132,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	s.sender = &fromAddress
+	s.mutex.Unlock()
 
 	success = true
 	s.Log("mail from=%s accepted", fromAddress.FullAddress())
@@ -185,6 +186,13 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 	}
 
+	// This is a potential write operation, so it must use the main context.
+	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
+	err = s.backend.db.CreateDefaultMailboxes(s.ctx, userId)
+	if err != nil {
+		return s.InternalError("failed to create default mailboxes: %v", err)
+	}
+
 	// Acquire write lock to update User
 	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
@@ -196,18 +204,10 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Message:      "Server busy, try again later",
 		}
 	}
-
-	// Use the original address (with detail part) for the User object
-	s.User = server.NewUser(toAddress, userId)
-
-	// This is a potential write operation, so it must use the main context.
-	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-	err = s.backend.db.CreateDefaultMailboxes(s.ctx, userId)
-	if err != nil {
-		return s.InternalError("failed to create default mailboxes: %v", err)
-	}
+	s.User = server.NewUser(toAddress, userId) // Use the original address (with detail part)
 	// Pin the session to the master DB to prevent reading stale data from a replica.
 	s.useMasterDB = true
+	s.mutex.Unlock()
 
 	success = true
 	s.Log("recipient accepted: %s (UserID: %d)", fullAddress, userId)
@@ -227,18 +227,18 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		metrics.CommandDuration.WithLabelValues("lmtp", "DATA").Observe(time.Since(start).Seconds())
 	}()
 
-	// Acquire read lock for accessing session state during message processing
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	// Acquire write lock for accessing session state and potentially updating it (useMasterDB)
+	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
 	defer cancel()
 	if !acquired {
-		s.Log("failed to acquire read lock for Data command")
+		s.Log("failed to acquire write lock for Data command")
 		return &smtp.SMTPError{
 			Code:         421,
 			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
 			Message:      "Server busy, try again later",
 		}
 	}
-	defer s.mutex.RUnlock()
+	defer s.mutex.Unlock()
 
 	// Check if we have a valid sender and recipient
 	if s.sender == nil || s.User == nil {
@@ -568,6 +568,7 @@ func (s *LMTPSession) Reset() {
 
 	s.User = nil
 	s.sender = nil
+	s.mutex.Unlock()
 
 	s.Log("session reset")
 }
@@ -588,6 +589,7 @@ func (s *LMTPSession) Logout() error {
 		// Continue with logout even if we can't get the lock
 	} else {
 		// Clean up any session state if needed
+		s.mutex.Unlock()
 	}
 
 	// Release connection from limiter
