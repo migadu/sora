@@ -60,6 +60,7 @@ type IMAPServer struct {
 	warmupMessageCount int
 	warmupMailboxes    []string
 	warmupAsync        bool
+	warmupTimeout      time.Duration
 }
 
 type IMAPServerOptions struct {
@@ -82,6 +83,7 @@ type IMAPServerOptions struct {
 	WarmupMessageCount   int
 	WarmupMailboxes      []string
 	WarmupAsync          bool
+	WarmupTimeout        string
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -97,6 +99,16 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 
 	// Initialize authentication rate limiter
 	authLimiter := serverPkg.NewAuthRateLimiter("IMAP", options.AuthRateLimit, database)
+
+	// Parse warmup timeout with default fallback
+	warmupTimeout := 5 * time.Minute // Default timeout
+	if options.WarmupTimeout != "" {
+		if parsed, err := helpers.ParseDuration(options.WarmupTimeout); err != nil {
+			log.Printf("[IMAP] WARNING: invalid warmup_timeout '%s': %v. Using default of %v", options.WarmupTimeout, err, warmupTimeout)
+		} else {
+			warmupTimeout = parsed
+		}
+	}
 
 	s := &IMAPServer{
 		hostname:           hostname,
@@ -114,6 +126,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		warmupMessageCount: options.WarmupMessageCount,
 		warmupMailboxes:    options.WarmupMailboxes,
 		warmupAsync:        options.WarmupAsync,
+		warmupTimeout:      warmupTimeout,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:   struct{}{},
 			imap.CapLiteralPlus: struct{}{},
@@ -329,12 +342,15 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		return nil
 	}
 
-	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t)", 
-		userID, messageCount, mailboxNames, async)
+	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)", 
+		userID, messageCount, mailboxNames, async, s.warmupTimeout)
 
 	warmupFunc := func() {
+		// Add timeout to prevent runaway warmup operations
+		warmupCtx, cancel := context.WithTimeout(ctx, s.warmupTimeout)
+		defer cancel()
 		// Get recent message content hashes from database through cache
-		messageHashes, err := s.cache.GetRecentMessagesForWarmup(ctx, userID, mailboxNames, messageCount)
+		messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, userID, mailboxNames, messageCount)
 		if err != nil {
 			log.Printf("[IMAP] failed to get recent messages for warmup: %v", err)
 			return
@@ -352,7 +368,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		}
 
 		// Get user's primary email for S3 key construction
-		address, err := s.db.GetPrimaryEmailForAccount(ctx, userID)
+		address, err := s.db.GetPrimaryEmailForAccount(warmupCtx, userID)
 		if err != nil {
 			log.Printf("[IMAP] warmup: failed to get primary address for account %d: %v", userID, err)
 			return
@@ -364,6 +380,15 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		// Pre-fetch each message content
 		for _, hashes := range messageHashes {
 			for _, contentHash := range hashes {
+				// Check for context cancellation
+				select {
+				case <-warmupCtx.Done():
+					log.Printf("[IMAP] warmup cancelled for user %d: %v", userID, warmupCtx.Err())
+					return
+				default:
+					// Continue processing
+				}
+
 				// Check if already in cache
 				exists, err := s.cache.Exists(contentHash)
 				if err != nil {
@@ -376,18 +401,46 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 					continue // Already cached
 				}
 
-				// Build S3 key and fetch from S3
+				// Build S3 key and fetch from S3 with retry logic
 				s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
-				reader, err := s.s3.Get(s3Key)
-				if err != nil {
-					log.Printf("[IMAP] warmup: failed to fetch content %s from S3: %v", contentHash, err)
-					continue
+				var data []byte
+				
+				// Retry S3 operations up to 3 times with exponential backoff
+				maxRetries := 3
+				var fetchErr error
+				for attempt := 0; attempt < maxRetries; attempt++ {
+					if attempt > 0 {
+						// Exponential backoff: 100ms, 200ms, 400ms
+						backoffTime := time.Duration(100*(1<<uint(attempt-1))) * time.Millisecond
+						select {
+						case <-time.After(backoffTime):
+						case <-warmupCtx.Done():
+							log.Printf("[IMAP] warmup cancelled during retry backoff for user %d", userID)
+							return
+						}
+						log.Printf("[IMAP] warmup: retrying S3 fetch for %s (attempt %d/%d)", contentHash, attempt+1, maxRetries)
+					}
+
+					reader, err := s.s3.Get(s3Key)
+					if err != nil {
+						fetchErr = err
+						continue
+					}
+
+					data, err = io.ReadAll(reader)
+					reader.Close()
+					if err != nil {
+						fetchErr = err
+						continue
+					}
+
+					// Success - break out of retry loop
+					fetchErr = nil
+					break
 				}
 
-				data, err := io.ReadAll(reader)
-				reader.Close()
-				if err != nil {
-					log.Printf("[IMAP] warmup: failed to read content %s: %v", contentHash, err)
+				if fetchErr != nil {
+					log.Printf("[IMAP] warmup: failed to fetch content %s from S3 after %d attempts: %v", contentHash, maxRetries, fetchErr)
 					continue
 				}
 

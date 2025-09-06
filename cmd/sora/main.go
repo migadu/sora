@@ -753,6 +753,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			WarmupMessageCount:  config.LocalCache.WarmupMessageCount,
 			WarmupMailboxes:     config.LocalCache.WarmupMailboxes,
 			WarmupAsync:         config.LocalCache.WarmupAsync,
+			WarmupTimeout:       config.LocalCache.WarmupTimeout,
 		})
 	if err != nil {
 		errChan <- err

@@ -41,6 +41,7 @@ type LocalCacheConfig struct {
 	WarmupMessageCount   int      `toml:"warmup_message_count"`
 	WarmupMailboxes      []string `toml:"warmup_mailboxes"`
 	WarmupAsync          bool     `toml:"warmup_async"`
+	WarmupTimeout        string   `toml:"warmup_timeout"`
 }
 
 // IMAPServerConfig holds IMAP server configuration.

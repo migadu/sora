@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/migadu/sora/db"
+	_ "modernc.org/sqlite"
 )
 
 const DataDir = "data"
@@ -24,14 +24,14 @@ const IndexDB = "cache_index.db"
 const PurgeBatchSize = 1000
 
 type Cache struct {
-	basePath           string
-	capacity           int64
-	maxObjectSize      int64
-	purgeInterval      time.Duration
-	orphanCleanupAge   time.Duration
-	db                 *sql.DB
-	mu                 sync.Mutex
-	sourceDB           *db.Database
+	basePath         string
+	capacity         int64
+	maxObjectSize    int64
+	purgeInterval    time.Duration
+	orphanCleanupAge time.Duration
+	db               *sql.DB
+	mu               sync.Mutex
+	sourceDB         *db.Database
 	// Metrics - using atomic for thread-safe counters
 	cacheHits   int64
 	cacheMisses int64
@@ -111,26 +111,48 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 }
 
 func (c *Cache) Put(contentHash string, data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if int64(len(data)) > c.maxObjectSize {
 		return fmt.Errorf("data size %d exceeds object limit %d", len(data), c.maxObjectSize)
 	}
 
 	path := c.GetPathForContentHash(contentHash)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write cache file: %w", err)
+
+	// Write to a temporary file first to minimize time holding the lock.
+	// This also helps prevent corruption if the write is interrupted.
+	tempFile, err := os.CreateTemp(dir, "put-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary cache file: %w", err)
 	}
-	if err := c.trackFile(path); err != nil {
-		log.Printf("[CACHE] failed to track file %s: %v. Attempting to remove.\n", path, err)
-		// Attempt to clean up the file if tracking failed to avoid untracked files
-		if remErr := os.Remove(path); remErr != nil && !os.IsNotExist(remErr) {
-			log.Printf("[CACHE] failed to remove untracked file %s after tracking error: %v\n", path, remErr)
+	defer os.Remove(tempFile.Name()) // Ensure temp file is cleaned up on return
+
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close() // Attempt to close, but prioritize write error
+		return fmt.Errorf("failed to write to temporary cache file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary cache file: %w", err)
+	}
+
+	// Atomically move the file into its final location.
+	if err := os.Rename(tempFile.Name(), path); err != nil {
+		// If rename fails because the file exists, it means another process cached it. This is not an error.
+		if !os.IsExist(err) {
+			return fmt.Errorf("failed to move temporary file to final cache location %s: %w", path, err)
 		}
+		log.Printf("[CACHE] file %s appeared during rename, assuming concurrent cache success", path)
+	}
+
+	// Now, acquire lock just to update the index.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.trackFile(path); err != nil {
+		// The file exists, but we failed to track it. The next purge/sync cycle might fix it.
+		// We don't remove the file here because it might be a valid cache entry from a concurrent Put.
 		return fmt.Errorf("failed to track cache file %s: %w", path, err)
 	}
 	log.Printf("[CACHE] cached %s", path)
@@ -537,13 +559,13 @@ type CacheStats struct {
 
 // CacheMetrics holds cache hit/miss metrics
 type CacheMetrics struct {
-	Hits        int64     `json:"hits"`
-	Misses      int64     `json:"misses"`
-	HitRate     float64   `json:"hit_rate"`
-	TotalOps    int64     `json:"total_ops"`
-	StartTime   time.Time `json:"start_time"`
-	Uptime      string    `json:"uptime"`
-	InstanceID  string    `json:"instance_id"`
+	Hits       int64     `json:"hits"`
+	Misses     int64     `json:"misses"`
+	HitRate    float64   `json:"hit_rate"`
+	TotalOps   int64     `json:"total_ops"`
+	StartTime  time.Time `json:"start_time"`
+	Uptime     string    `json:"uptime"`
+	InstanceID string    `json:"instance_id"`
 }
 
 // GetStats returns current cache statistics
@@ -570,14 +592,14 @@ func (c *Cache) GetMetrics(instanceID string) *CacheMetrics {
 	hits := atomic.LoadInt64(&c.cacheHits)
 	misses := atomic.LoadInt64(&c.cacheMisses)
 	totalOps := hits + misses
-	
+
 	var hitRate float64
 	if totalOps > 0 {
 		hitRate = float64(hits) / float64(totalOps) * 100
 	}
-	
+
 	uptime := time.Since(c.startTime)
-	
+
 	return &CacheMetrics{
 		Hits:       hits,
 		Misses:     misses,
@@ -595,7 +617,6 @@ func (c *Cache) ResetMetrics() {
 	atomic.StoreInt64(&c.cacheMisses, 0)
 	c.startTime = time.Now()
 }
-
 
 // PurgeAll removes all cached objects and clears the cache index
 func (c *Cache) PurgeAll(ctx context.Context) error {

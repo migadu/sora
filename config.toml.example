@@ -357,6 +357,14 @@ warmup_mailboxes = ["INBOX"]
 #   warmup_async = false                       # Blocking warmup (slower login, guaranteed warm cache)
 warmup_async = true
 
+# Maximum time allowed for cache warmup operations
+# Prevents runaway warmup processes from consuming resources indefinitely
+# Examples:
+#   warmup_timeout = "1m"                      # Quick timeout for fast environments
+#   warmup_timeout = "5m"                      # Standard timeout (default)
+#   warmup_timeout = "10m"                     # Extended timeout for slow storage
+warmup_timeout = "5m"
+
 # =============================================================================
 # S3 UPLOADER CONFIGURATION
 # =============================================================================
@@ -1222,9 +1230,16 @@ enabled = false
 # Database server hosts for prelookup queries (separate from main Sora database)
 # This is typically a central routing database shared across proxy servers
 # Examples:
-#   hosts = ["routing-db.example.com:5432"]    # Single routing database
-#   hosts = ["route1.example.com:5432", "route2.example.com:5432"] # Multiple for HA
-hosts = ["localhost:5432"]
+#   hosts = ["routing-db.example.com"]         # Single routing database (use separate port field)
+#   hosts = ["routing-db.example.com:5432"]    # Single routing database (with port)
+#   hosts = ["route1.example.com", "route2.example.com"] # Multiple for HA
+hosts = ["localhost"]
+
+# Database port (alternative to including port in hosts)
+# Examples:
+#   port = 5432                      # Standard PostgreSQL port (default)
+#   port = 5433                      # Custom port
+port = 5432
 
 # Database username for prelookup connections
 # Examples:
@@ -1438,7 +1453,8 @@ db_error_threshold = "1m"
 [servers.pop3_proxy.prelookup]
 # Enable/disable database-driven user routing for POP3 proxy
 enabled = false
-hosts = ["localhost:5432"]
+hosts = ["localhost"]
+port = 5432
 user = "postgres"
 password = ""
 name = "routing_db"
@@ -1532,7 +1548,8 @@ db_error_threshold = "1m"
 [servers.managesieve_proxy.prelookup]
 # Enable/disable database-driven user routing for ManageSieve proxy
 enabled = false
-hosts = ["localhost:5432"]
+hosts = ["localhost"]
+port = 5432
 user = "postgres"
 password = ""
 name = "routing_db"
@@ -1584,7 +1601,8 @@ affinity_stickiness = 0.9
 [servers.lmtp_proxy.prelookup]
 # Enable/disable database-driven user routing for LMTP proxy
 enabled = false
-hosts = ["localhost:5432"]
+hosts = ["localhost"]
+port = 5432
 user = "postgres"
 password = ""
 name = "routing_db"

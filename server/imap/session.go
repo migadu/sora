@@ -30,6 +30,7 @@ type IMAPSession struct {
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
 
+	inboxWarmupDone atomic.Bool // Ensures warmup runs only once
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
 	sessionTracker  *imapserver.SessionTracker
@@ -258,4 +259,31 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 
 	// Use the helper method that assumes the caller holds the lock
 	return s.decodeNumSetLocked(numSet)
+}
+
+// triggerCacheWarmup starts the cache warmup process if configured.
+// It uses the server's warmup settings and ensures it only runs once per session.
+func (s *IMAPSession) triggerCacheWarmup() {
+	if s.IMAPUser == nil {
+		s.Log("warmup skipped: no user in session")
+		return // Should not happen if called after authentication
+	}
+
+	// Check if warmup is enabled on the server
+	if !s.server.enableWarmup {
+		return
+	}
+
+	// Ensure warmup runs only once per session
+	if !s.inboxWarmupDone.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Call the server's main warmup logic, which handles async execution
+	// Use server appCtx instead of session ctx so warmup continues even if connection drops
+	err := s.server.WarmupCache(s.server.appCtx, s.UserID(), s.server.warmupMailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
+	if err != nil {
+		// The WarmupCache method already logs its own errors, so just log a generic failure here.
+		s.Log("cache warmup trigger failed: %v", err)
+	}
 }

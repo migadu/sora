@@ -348,6 +348,14 @@ func (s *Session) connectToBackend() error {
 		s.backendReader = bufio.NewReader(s.backendConn)
 		s.backendWriter = bufio.NewWriter(s.backendConn)
 		
+		// Read greeting from backend
+		greeting, greetingErr := s.backendReader.ReadString('\n')
+		if greetingErr != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("failed to read backend greeting: %w", greetingErr)
+		}
+		log.Printf("[IMAP Proxy] Backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
+		
 		// Record successful connection for future affinity if enabled
 		if s.server.enableAffinity && s.accountID != 0 {
 			updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -458,7 +466,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 		return "", fmt.Errorf("failed to read auth response: %w", err)
 	}
 
-	if !strings.Contains(response, "A001 OK") {
+	if !strings.HasPrefix(strings.TrimSpace(response), "A001 OK") {
 		return "", fmt.Errorf("backend authentication failed: %s", response)
 	}
 

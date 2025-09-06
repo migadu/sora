@@ -100,10 +100,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
-					
+
 					// Trigger cache warmup for the authenticated user (if configured)
-					s.triggerCacheWarmup(userID)
-					
+					s.triggerCacheWarmup()
+
 					return nil
 				}
 			}
