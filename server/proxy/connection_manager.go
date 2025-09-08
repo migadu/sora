@@ -172,32 +172,79 @@ func (cm *ConnectionManager) dial(addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
 	defer cancel()
 
+	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
+
+	var conn net.Conn
+	var err error
 	if cm.remoteTLS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: !cm.remoteTLSVerify,
 		}
-		return tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
 
-	return dialer.DialContext(ctx, "tcp", addr)
-}
-
-func (cm *ConnectionManager) dialWithProxy(addr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, error) {
-	// First establish the connection
-	conn, err := cm.dial(addr)
 	if err != nil {
+		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
 		return nil, err
 	}
 
+	// Log the actual local and remote addresses of the established connection
+	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s", 
+		addr, conn.LocalAddr(), conn.RemoteAddr())
+
+	return conn, nil
+}
+
+func (cm *ConnectionManager) dialWithProxy(addr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, error) {
+	// For PROXY protocol, we need to establish plain TCP connection first
+	dialer := &net.Dialer{
+		Timeout: cm.connectTimeout,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
+	defer cancel()
+
+	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
+
+	// Always establish plain TCP connection first
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
+		return nil, err
+	}
+
+	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s", 
+		addr, conn.LocalAddr(), conn.RemoteAddr())
+
 	// If we have client IP information, send PROXY protocol header
 	if clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
-		// Import the server package dynamically to avoid circular imports
-		// We'll generate the PROXY v2 header manually here
+		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d", 
+			clientIP, clientPort, serverIP, serverPort)
 		err = cm.writeProxyV2Header(conn, clientIP, clientPort, serverIP, serverPort)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to send PROXY protocol header: %w", err)
 		}
+	} else {
+		log.Printf("[ConnectionManager] No PROXY header sent - clientIP=%s:%d serverIP=%s:%d", 
+			clientIP, clientPort, serverIP, serverPort)
+	}
+
+	// Now establish TLS if required
+	if cm.remoteTLS {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: !cm.remoteTLSVerify,
+		}
+		log.Printf("[ConnectionManager] Starting TLS handshake to %s", addr)
+		tlsConn := tls.Client(conn, tlsConfig)
+		err = tlsConn.Handshake()
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		return tlsConn, nil
 	}
 
 	return conn, nil

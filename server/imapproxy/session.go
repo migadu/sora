@@ -9,7 +9,6 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -108,16 +107,23 @@ func (s *Session) handleConnection() {
 			// Connect to backend
 			if err := s.connectToBackend(); err != nil {
 				log.Printf("[IMAP Proxy] Failed to connect to backend for %s: %v", username, err)
-				s.sendResponse(fmt.Sprintf("%s NO Backend connection failed", tag))
-				return
+				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", tag))
+				continue
 			}
 
 			// Authenticate to backend with master credentials
 			backendResponse, err := s.authenticateToBackend()
 			if err != nil {
 				log.Printf("[IMAP Proxy] Backend authentication failed for %s: %v", username, err)
-				s.sendResponse(fmt.Sprintf("%s NO [AUTHENTICATIONFAILED] Backend authentication failed", tag))
-				return
+				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", tag))
+				// Close the backend connection since authentication failed
+				if s.backendConn != nil {
+					s.backendConn.Close()
+					s.backendConn = nil
+					s.backendReader = nil
+					s.backendWriter = nil
+				}
+				continue
 			}
 
 			// Register connection
@@ -148,8 +154,10 @@ func (s *Session) handleConnection() {
 				var err error
 				saslLine, err = s.clientReader.ReadString('\n')
 				if err != nil {
-					log.Printf("[IMAP Proxy] Error reading SASL response: %v", err)
-					return
+					if err != io.EOF {
+						log.Printf("[IMAP Proxy] Error reading SASL response: %v", err)
+					}
+					return // Client connection error, can't continue
 				}
 				saslLine = strings.TrimRight(saslLine, "\r\n")
 			}
@@ -187,16 +195,23 @@ func (s *Session) handleConnection() {
 			// Connect to backend
 			if err := s.connectToBackend(); err != nil {
 				log.Printf("[IMAP Proxy] Failed to connect to backend for %s: %v", authnID, err)
-				s.sendResponse(fmt.Sprintf("%s NO Backend connection failed", tag))
-				return
+				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", tag))
+				continue
 			}
 
 			// Authenticate to backend with master credentials
 			backendResponse, err := s.authenticateToBackend()
 			if err != nil {
 				log.Printf("[IMAP Proxy] Backend authentication failed for %s: %v", authnID, err)
-				s.sendResponse(fmt.Sprintf("%s NO [AUTHENTICATIONFAILED] Backend authentication failed", tag))
-				return
+				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", tag))
+				// Close the backend connection since authentication failed
+				if s.backendConn != nil {
+					s.backendConn.Close()
+					s.backendConn = nil
+					s.backendReader = nil
+					s.backendWriter = nil
+				}
+				continue
 			}
 
 			// Register connection
@@ -327,27 +342,29 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	// First try user-based routing from prelookup database
 	var preferredAddr string
-	
+
 	// Try routing lookup first (takes precedence over affinity)
 	routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer routingCancel()
-	
+
+	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	conn, serverAddr, err := s.server.connManager.ConnectForUserWithProxy(
-		routingCtx, 
+		routingCtx,
 		s.username,
-		s.getClientHost(),
-		s.getClientPort(),
-		s.getServerHost(),
-		s.getServerPort(),
+		clientHost,
+		clientPort,
+		serverHost,
+		serverPort,
 	)
-	
+
 	if err == nil {
 		// Successfully connected using routing lookup or fallback
 		s.backendConn = conn
 		s.serverAddr = serverAddr
 		s.backendReader = bufio.NewReader(s.backendConn)
 		s.backendWriter = bufio.NewWriter(s.backendConn)
-		
+
 		// Read greeting from backend
 		greeting, greetingErr := s.backendReader.ReadString('\n')
 		if greetingErr != nil {
@@ -355,7 +372,7 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("failed to read backend greeting: %w", greetingErr)
 		}
 		log.Printf("[IMAP Proxy] Backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
-		
+
 		// Record successful connection for future affinity if enabled
 		if s.server.enableAffinity && s.accountID != 0 {
 			updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -364,14 +381,14 @@ func (s *Session) connectToBackend() error {
 				log.Printf("[IMAP Proxy] Failed to record server affinity for %s: %v", s.username, err)
 			}
 		}
-		
+
 		log.Printf("[IMAP Proxy] Connected to backend %s for user %s", serverAddr, s.username)
 		return nil
 	}
-	
+
 	// Fallback to original affinity-based logic if user routing fails completely
 	log.Printf("[IMAP Proxy] User-based routing failed for %s: %v, falling back to affinity", s.username, err)
-	
+
 	// Get preferred backend from affinity
 	preferredAddr, err = s.getPreferredBackend()
 	if err != nil {
@@ -388,26 +405,6 @@ func (s *Session) connectToBackend() error {
 
 	if preferredAddr != "" {
 		log.Printf("[IMAP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-	}
-
-	// Extract client connection information for PROXY protocol
-	clientHost, clientPortStr, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse client address: %w", err)
-	}
-	clientPort, err := strconv.Atoi(clientPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse client port: %w", err)
-	}
-
-	// Extract server connection information for PROXY protocol
-	serverHost, serverPortStr, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse server address: %w", err)
-	}
-	serverPort, err := strconv.Atoi(serverPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse server port: %w", err)
 	}
 
 	// Connect using the connection manager with PROXY protocol
@@ -656,45 +653,4 @@ func (s *Session) pollDatabaseDirectly(ctx context.Context) {
 
 func isClosingError(err error) bool {
 	return err == io.EOF || strings.Contains(err.Error(), "use of closed network connection")
-}
-
-// Helper methods for extracting connection information
-func (s *Session) getClientHost() string {
-	host, _, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
-	if err != nil {
-		return ""
-	}
-	return host
-}
-
-func (s *Session) getClientPort() int {
-	_, portStr, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
-	if err != nil {
-		return 0
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return 0
-	}
-	return port
-}
-
-func (s *Session) getServerHost() string {
-	host, _, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
-	if err != nil {
-		return ""
-	}
-	return host
-}
-
-func (s *Session) getServerPort() int {
-	_, portStr, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
-	if err != nil {
-		return 0
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return 0
-	}
-	return port
 }

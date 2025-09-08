@@ -9,7 +9,6 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -305,31 +304,13 @@ func (s *POP3ProxySession) connectToBackend() error {
 		log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
 	}
 
-	// Extract client connection information for PROXY protocol
-	clientHost, clientPortStr, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse client address: %w", err)
-	}
-	clientPort, err := strconv.Atoi(clientPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse client port: %w", err)
-	}
-
-	// Extract server connection information for PROXY protocol
-	serverHost, serverPortStr, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse server address: %w", err)
-	}
-	serverPort, err := strconv.Atoi(serverPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse server port: %w", err)
-	}
-
 	// Connect using the connection manager with user routing and PROXY protocol
 	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer routingCancel()
-	
+
 	var actualAddr string
+	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
 		routingCtx,
 		s.username, // User email for routing lookup

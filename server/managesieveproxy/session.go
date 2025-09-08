@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -139,8 +138,8 @@ func (s *Session) handleConnection() {
 			// Connect to backend and authenticate
 			if err := s.connectToBackendAndAuth(); err != nil {
 				log.Printf("[ManageSieve Proxy] Backend connection/auth failed for %s: %v", authnID, err)
-				s.sendResponse(`NO "Backend connection failed"`)
-				return
+				s.sendResponse(`NO "Backend server temporarily unavailable"`)
+				continue
 			}
 
 			// Register connection
@@ -243,32 +242,14 @@ func (s *Session) sendGreeting() {
 
 // connectToBackendAndAuth connects to backend and authenticates.
 func (s *Session) connectToBackendAndAuth() error {
-	// Extract client connection information for PROXY protocol
-	clientHost, clientPortStr, err := net.SplitHostPort(s.clientConn.RemoteAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse client address: %w", err)
-	}
-	clientPort, err := strconv.Atoi(clientPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse client port: %w", err)
-	}
-
-	// Extract server connection information for PROXY protocol
-	serverHost, serverPortStr, err := net.SplitHostPort(s.clientConn.LocalAddr().String())
-	if err != nil {
-		return fmt.Errorf("failed to parse server address: %w", err)
-	}
-	serverPort, err := strconv.Atoi(serverPortStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse server port: %w", err)
-	}
-
 	// Connect using the connection manager with user routing and PROXY protocol
 	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer routingCancel()
-	
+
 	var actualAddr string
-	s.backendConn, actualAddr, err = s.server.connManager.ConnectForUserWithProxy(
+	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
+	conn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
 		routingCtx,
 		s.username, // User email for routing lookup
 		clientHost, clientPort, serverHost, serverPort,
@@ -276,6 +257,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
+	s.backendConn = conn
 	s.serverAddr = actualAddr
 
 	// Read backend greeting and capabilities
