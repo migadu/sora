@@ -260,7 +260,7 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 				startParam := nextParam()
 				stopParam := nextParam()
 				args[startParam] = r.Start
-				
+
 				// Handle * wildcard: Stop=0 means "highest UID in mailbox"
 				stopValue := r.Stop
 				if r.Stop == 0 {
@@ -269,7 +269,7 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 					stopValue = 4294967295 // MaxUint32
 				}
 				args[stopParam] = stopValue
-				
+
 				conditions = append(conditions, fmt.Sprintf("%s BETWEEN @%s AND @%s", columnName, startParam, stopParam))
 			}
 		}
@@ -291,14 +291,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	const baseQuery = `
 	WITH message_seqs AS (
 		SELECT
+			m.id,
 			uid,
 			ROW_NUMBER() OVER (ORDER BY uid) AS seqnum, -- id is needed for ordering/seqnum
-			account_id, mailbox_id, m.content_hash, uploaded, flags, custom_flags,
+			account_id, mailbox_id, m.content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 			internal_date, size, body_structure,
 			created_modseq, updated_modseq, expunged_modseq,
-			subject,
-			sent_date,
-			message_id,
+			flags_changed_at, subject, sent_date, message_id,
 			in_reply_to,
 			recipients_json,
 			mc.text_body_tsv -- Select from message_contents
@@ -307,9 +306,9 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 	)
 	SELECT 
-		account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-		internal_date, size, body_structure,
-		created_modseq, updated_modseq, expunged_modseq, seqnum
+		id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+		internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+		flags_changed_at, subject, sent_date, message_id
 	FROM message_seqs`
 
 	paramCounter := 0
@@ -317,7 +316,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	if err != nil {
 		return nil, err
 	}
-	
+
 	whereArgs["mailboxID"] = mailboxID
 
 	if orderByClause == "" {

@@ -84,9 +84,9 @@ func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID
 	var newMsgUID imap.UID
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, content_hash, message_id, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, created_modseq)
+			(account_id, mailbox_id, mailbox_path, uid, content_hash, s3_domain, s3_localpart, message_id, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, created_modseq)
 		SELECT
-			account_id, $1, $2, $3, content_hash, message_id, flags | $6, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, nextval('messages_modseq')
+			account_id, $1, $2, $3, content_hash, s3_domain, s3_localpart, message_id, flags | $6, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, nextval('messages_modseq')
 		FROM
 			messages
 		WHERE
@@ -123,6 +123,8 @@ type InsertMessageOptions struct {
 	UserID      int64
 	MailboxID   int64
 	MailboxName string
+	S3Domain    string
+	S3Localpart string
 	ContentHash string
 	MessageID   string
 	// CustomFlags are handled by splitting options.Flags in InsertMessage
@@ -211,14 +213,16 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq)
+			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq)
 		VALUES
-			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'))
+			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'))
 		RETURNING id
 	`, pgx.NamedArgs{
 		"account_id":      options.UserID,
 		"mailbox_id":      options.MailboxID,
 		"mailbox_path":    options.MailboxName,
+		"s3_domain":       options.S3Domain,
+		"s3_localpart":    options.S3Localpart,
 		"uid":             highestUID,
 		"message_id":      saneMessageID,
 		"content_hash":    options.ContentHash,
@@ -401,14 +405,16 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq)
+			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq)
 		VALUES
-			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'))
+			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'))
 		RETURNING id
 	`, pgx.NamedArgs{
 		"account_id":      options.UserID,
 		"mailbox_id":      options.MailboxID,
 		"mailbox_path":    options.MailboxName,
+		"s3_domain":       options.S3Domain,
+		"s3_localpart":    options.S3Localpart,
 		"uid":             uidToUse,
 		"message_id":      saneMessageID,
 		"content_hash":    options.ContentHash,

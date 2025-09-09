@@ -126,8 +126,7 @@ func (db *Database) GetActiveConnections(ctx context.Context) ([]ConnectionInfo,
 			ac.should_terminate,
 			COALESCE(c.address, '') as email
 		FROM active_connections ac
-		LEFT JOIN credentials c ON ac.account_id = c.account_id AND c.primary_identity = true
-		ORDER BY ac.server_addr, ac.protocol, c.address`
+		LEFT JOIN credentials c ON ac.account_id = c.account_id AND c.primary_identity = true		ORDER BY ac.server_addr, ac.protocol, c.address`
 
 	rows, err := db.GetReadPool().Query(ctx, query)
 	if err != nil {
@@ -241,8 +240,7 @@ func (db *Database) GetUserConnections(ctx context.Context, email string) ([]Con
 			c.address as email
 		FROM active_connections ac
 		INNER JOIN credentials c ON ac.account_id = c.account_id
-		WHERE LOWER(c.address) = LOWER($1)
-		ORDER BY ac.protocol, ac.connected_at`
+		WHERE LOWER(c.address) = LOWER($1)		ORDER BY ac.protocol, ac.connected_at`
 
 	rows, err := db.GetReadPool().Query(ctx, query, email)
 	if err != nil {
@@ -280,7 +278,7 @@ func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria 
 
 	if criteria.Email != "" {
 		argCount++
-		query += fmt.Sprintf(" AND account_id IN (SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($%d))", argCount)
+		query += fmt.Sprintf(" AND account_id IN (SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($%d) AND deleted_at IS NULL)", argCount)
 		args = append(args, criteria.Email)
 	}
 
@@ -350,8 +348,7 @@ func (db *Database) GetTerminatedConnectionsByInstance(ctx context.Context, inst
 			ac.should_terminate,
 			COALESCE(c.address, '') as email
 		FROM active_connections ac
-		LEFT JOIN credentials c ON ac.account_id = c.account_id AND c.primary_identity = true
-		WHERE ac.instance_id = $1 AND ac.should_terminate = true`
+		LEFT JOIN credentials c ON ac.account_id = c.account_id AND c.primary_identity = true		WHERE ac.instance_id = $1 AND ac.should_terminate = true`
 
 	rows, err := db.GetReadPool().Query(ctx, query, instanceID)
 	if err != nil {

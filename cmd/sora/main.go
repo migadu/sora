@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server/cleaner"
+	"github.com/migadu/sora/server/httpapi"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/imapproxy"
 	"github.com/migadu/sora/server/lmtp"
@@ -461,7 +462,8 @@ func main() {
 	// Check if any server at all is configured to start.
 	anyServerStarted := storageServicesNeeded || cfg.Servers.ManageSieve.Start ||
 		cfg.Servers.IMAPProxy.Start || cfg.Servers.POP3Proxy.Start ||
-		cfg.Servers.ManageSieveProxy.Start || cfg.Servers.LMTPProxy.Start
+		cfg.Servers.ManageSieveProxy.Start || cfg.Servers.LMTPProxy.Start ||
+		cfg.Servers.HTTPAPI.Start
 
 	if !anyServerStarted {
 		errorHandler.ValidationError("servers", fmt.Errorf("no servers enabled. Please enable at least one server in your configuration"))
@@ -714,6 +716,11 @@ func main() {
 	}
 	if cfg.Servers.LMTPProxy.Start {
 		go startLMTPProxyServer(ctx, hostname, database, errChan, cfg)
+	}
+
+	// Start HTTP API server
+	if cfg.Servers.HTTPAPI.Start {
+		go startHTTPAPIServer(ctx, database, cacheInstance, errChan, cfg)
 	}
 
 	select {
@@ -1124,4 +1131,24 @@ func startMetricsServer(ctx context.Context, config MetricsConfig, errChan chan 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		errChan <- fmt.Errorf("metrics server failed: %w", err)
 	}
+}
+
+// startHTTPAPIServer starts the HTTP API server
+func startHTTPAPIServer(ctx context.Context, database *db.Database, cacheInstance *cache.Cache, errChan chan error, config Config) {
+	if config.Servers.HTTPAPI.APIKey == "" {
+		errChan <- fmt.Errorf("HTTP API server enabled but no API key configured")
+		return
+	}
+
+	options := httpapi.ServerOptions{
+		Addr:         config.Servers.HTTPAPI.Addr,
+		APIKey:       config.Servers.HTTPAPI.APIKey,
+		AllowedHosts: config.Servers.HTTPAPI.AllowedHosts,
+		Cache:        cacheInstance,
+		TLS:          config.Servers.HTTPAPI.TLS,
+		TLSCertFile:  config.Servers.HTTPAPI.TLSCertFile,
+		TLSKeyFile:   config.Servers.HTTPAPI.TLSKeyFile,
+	}
+
+	httpapi.Start(ctx, database, options, errChan)
 }

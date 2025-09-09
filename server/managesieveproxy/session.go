@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -494,5 +495,5 @@ func (s *Session) pollDatabaseDirectly(ctx context.Context) {
 }
 
 func isClosingError(err error) bool {
-	return err == io.EOF || strings.Contains(err.Error(), "use of closed network connection")
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 }

@@ -9,9 +9,11 @@ require (
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.21.3
 	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
+	github.com/gorilla/mux v1.8.1
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/k3a/html2text v1.2.1
 	github.com/minio/minio-go/v7 v7.0.89
+	github.com/prometheus/client_golang v1.23.0
 	golang.org/x/crypto v0.38.0
 	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.38.1
@@ -39,7 +41,6 @@ require (
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
-	github.com/prometheus/client_golang v1.23.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.65.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect

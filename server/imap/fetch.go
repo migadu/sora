@@ -499,12 +499,12 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3
 		s.Log("[FETCH] cache miss fetching UID %d from S3 (%s)", msg.UID, msg.ContentHash)
-		address, err := s.server.db.GetPrimaryEmailForAccount(s.ctx, msg.UserID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.UserID, err)
+		// Use the stored S3 key components from the message record to prevent race conditions
+		// if the user's primary email has changed since the message was stored.
+		if msg.S3Domain == "" || msg.S3Localpart == "" {
+			return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 		}
-
-		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
+		s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
 
 		reader, err := s.server.s3.Get(s3Key)
 		if err != nil {

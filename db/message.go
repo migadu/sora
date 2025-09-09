@@ -15,9 +15,12 @@ import (
 
 // Message struct to represent an email message
 type Message struct {
+	ID             int64     // ID of the message
 	UserID         int64     // ID of the user who owns the message
 	UID            imap.UID  // Unique identifier for the message
 	ContentHash    string    // Hash of the message content
+	S3Domain       string    // S3 domain for the message
+	S3Localpart    string    // S3 localpart for the message
 	MailboxID      int64     // ID of the mailbox the message belongs to
 	IsUploaded     bool      // Indicates if the message is uploaded to S3
 	Seq            uint32    // Sequence number of the message in the mailbox
@@ -140,18 +143,18 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		// Base query is the same for all cases
 		baseQuery := `
 			WITH numbered_messages AS (
-				SELECT 
-					account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-					internal_date, size, body_structure,
-					created_modseq, updated_modseq, expunged_modseq,
+				SELECT
+					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+					internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+					flags_changed_at, subject, sent_date, message_id,
 					row_number() OVER (ORDER BY uid) AS seqnum
 				FROM messages
 				WHERE mailbox_id = $1 AND expunged_at IS NULL
 			)
 			SELECT 
-				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-				internal_date, size, body_structure,
-				created_modseq, updated_modseq, expunged_modseq, seqnum
+				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+				flags_changed_at, subject, sent_date, message_id
 			FROM numbered_messages
 			WHERE uid >= $2
 		`
@@ -200,18 +203,18 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 		query := `
 			WITH numbered_messages AS (
-				SELECT 
-					account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-					internal_date, size, body_structure,
-					created_modseq, updated_modseq, expunged_modseq,
+				SELECT
+					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+					internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+					flags_changed_at, subject, sent_date, message_id,
 					row_number() OVER (ORDER BY uid) AS seqnum
 				FROM messages
 				WHERE mailbox_id = $1 AND expunged_at IS NULL
 			)
 			SELECT 
-				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-				internal_date, size, body_structure,
-				created_modseq, updated_modseq, expunged_modseq, seqnum
+				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+				flags_changed_at, subject, sent_date, message_id
 			FROM numbered_messages
 			WHERE seqnum >= $2 AND seqnum <= $3
 			ORDER BY seqnum
@@ -236,18 +239,18 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int64) ([]Message, error) {
 	query := `
 		WITH numbered_messages AS (
-			SELECT 
-				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-				internal_date, size, body_structure,
-				created_modseq, updated_modseq, expunged_modseq,
+			SELECT
+				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				flags_changed_at, subject, sent_date, message_id,
 				row_number() OVER (ORDER BY uid) AS seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
 		SELECT 
-			account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-			internal_date, size, body_structure,
-			created_modseq, updated_modseq, expunged_modseq, seqnum
+			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+			flags_changed_at, subject, sent_date, message_id
 		FROM numbered_messages
 		ORDER BY seqnum
 	`
@@ -267,9 +270,10 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		var bodyStructureBytes []byte
 		var customFlagsJSON []byte
 
-		if err := rows.Scan(&msg.UserID, &msg.UID, &msg.MailboxID, &msg.ContentHash, &msg.IsUploaded,
-			&msg.BitwiseFlags, &customFlagsJSON, &msg.InternalDate, &msg.Size, &bodyStructureBytes, &msg.CreatedModSeq,
-			&msg.UpdatedModSeq, &msg.ExpungedModSeq, &msg.Seq); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.UserID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
+			&msg.S3Domain, &msg.S3Localpart, &msg.IsUploaded, &msg.BitwiseFlags, &customFlagsJSON,
+			&msg.InternalDate, &msg.Size, &bodyStructureBytes, &msg.CreatedModSeq, &msg.UpdatedModSeq,
+			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %v", err)
 		}
 		bodyStructure, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes)
@@ -298,18 +302,18 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 	// It also calculates seqnum.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		WITH numbered_messages AS (
-			SELECT 
-				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-				internal_date, size, body_structure,
-				created_modseq, updated_modseq, expunged_modseq,
+			SELECT
+				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				flags_changed_at, subject, sent_date, message_id,
 				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND (flags & $2) != 0 AND expunged_at IS NULL
 		)
 		SELECT 
-			account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-			internal_date, size, body_structure,
-			created_modseq, updated_modseq, expunged_modseq, seqnum
+			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+			flags_changed_at, subject, sent_date, message_id
 		FROM numbered_messages
 	`, mailboxID, bitwiseFlag)
 	if err != nil {

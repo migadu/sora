@@ -1770,6 +1770,118 @@ batch_updates = true
 persist_to_db = true
 
 # =============================================================================
+# HTTP API SERVER CONFIGURATION
+# =============================================================================
+# REST API server for administrative operations, exposing sora-admin functionality
+# via HTTP endpoints for programmatic access and integration.
+
+[servers.http_api]
+# Enable/disable HTTP API server
+# Examples:
+#   start = false                              # Disable HTTP API (default)
+#   start = true                               # Enable HTTP API server
+start = false
+
+# Listen address and port for HTTP API server
+# Should be different from mail protocol ports to avoid conflicts
+# Examples:
+#   addr = ":8080"                             # Standard HTTP port
+#   addr = ":8888"                             # Alternative HTTP port
+#   addr = "127.0.0.1:8080"                    # Localhost only (secure)
+#   addr = "10.0.1.100:8080"                   # Specific interface
+addr = ":8080"
+
+# API authentication key (REQUIRED when HTTP API is enabled)
+# This key must be provided in the Authorization header as "Bearer <api_key>"
+# Examples:
+#   api_key = ""                               # Disabled (must be set to enable API)
+#   api_key = "your-secret-api-key-here"       # Strong random key (recommended)
+#   api_key = "sk-1234567890abcdef"            # Custom format
+api_key = ""
+
+# List of allowed client hosts/networks that can access the API
+# If empty, all hosts are allowed (not recommended for production)
+# Supports individual IPs and CIDR blocks
+# Examples:
+#   allowed_hosts = []                         # Allow all hosts (default)
+#   allowed_hosts = ["127.0.0.1"]              # Only localhost
+#   allowed_hosts = ["10.0.0.0/8", "192.168.1.0/24"]  # Private networks only
+#   allowed_hosts = ["203.0.113.45", "198.51.100.0/24"] # Specific IPs and networks
+allowed_hosts = []
+
+# --- TLS/SSL CONFIGURATION ---
+# Transport Layer Security for encrypted HTTP API connections
+# Enable TLS for HTTP API server (HTTPS)
+# Examples:
+#   tls = false                                # Plain HTTP (default)
+#   tls = true                                 # HTTPS with TLS encryption
+tls = false
+# TLS certificate file path (required when tls=true)
+# Examples:
+#   tls_cert_file = "/etc/ssl/certs/httpapi.crt"  # System certificate location
+#   tls_cert_file = "/opt/sora/certs/httpapi.pem" # Application certificate
+tls_cert_file = ""
+# TLS private key file path (required when tls=true)
+# Examples:
+#   tls_key_file = "/etc/ssl/private/httpapi.key" # Private key location
+#   tls_key_file = "/opt/sora/certs/httpapi.key"  # Application private key
+tls_key_file = ""
+# TLS certificate verification settings
+# Examples:
+#   tls_verify = true                          # Verify client certificates (if provided)
+#   tls_verify = false                         # Skip client cert verification (default)
+tls_verify = false
+
+# -----------------------------------------------------------------------------
+# HTTP API ENDPOINTS
+# -----------------------------------------------------------------------------
+# When enabled, the HTTP API server exposes the following REST endpoints:
+#
+# ACCOUNT MANAGEMENT:
+# POST   /api/v1/accounts                         - Create new account
+# GET    /api/v1/accounts/{email}                 - Get specific account details
+# PUT    /api/v1/accounts/{email}                 - Update account password
+# GET    /api/v1/accounts/{email}/exists          - Check if account exists
+# POST   /api/v1/accounts/{email}/credentials     - Add credential to account
+#
+# CONNECTION MANAGEMENT:
+# GET    /api/v1/connections                      - List active connections
+# GET    /api/v1/connections/stats                - Get connection statistics
+# POST   /api/v1/connections/kick                 - Terminate connections
+# GET    /api/v1/connections/user/{email}         - Get connections for specific user
+#
+# CACHE MANAGEMENT:
+# GET    /api/v1/cache/stats                      - Get cache statistics
+# GET    /api/v1/cache/metrics                    - Get cache performance metrics  
+# POST   /api/v1/cache/purge                      - Purge all cached data
+#
+# HEALTH MONITORING:
+# GET    /api/v1/health                           - Get health status (requires hostname param)
+# GET    /api/v1/health/overview                  - Get system health overview
+# GET    /api/v1/health/{hostname}                - Get health status for specific host
+# GET    /api/v1/health/{hostname}/{component}    - Get health status for specific component
+#
+# UPLOADER MONITORING:
+# GET    /api/v1/uploader/status                  - Get uploader queue status
+# GET    /api/v1/uploader/failed                  - Get failed upload details
+#
+# SYSTEM INFORMATION:
+# GET    /api/v1/auth/stats                       - Get authentication statistics
+# GET    /api/v1/config                           - Get API server configuration
+#
+# All endpoints require Bearer token authentication using the configured api_key.
+# Responses are in JSON format with appropriate HTTP status codes.
+#
+# Example usage with curl:
+# curl -H "Authorization: Bearer your-api-key" \
+#      -H "Content-Type: application/json" \
+#      -X POST http://localhost:8080/api/v1/accounts \
+#      -d '{"email": "user@example.com", "password": "securepass"}'
+#
+# Note: Import/Export operations are NOT available via HTTP API as they are
+# long-running processes. Use sora-admin CLI for maildir import/export operations.
+
+# =============================================================================
 # DEPLOYMENT SCENARIOS AND CONFIGURATION PATTERNS
 # =============================================================================
 # This section provides common deployment patterns and configuration examples

@@ -1209,6 +1209,8 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		&db.InsertMessageOptions{
 			UserID:               user.UserID(),
 			MailboxID:            mailbox.ID,
+			S3Domain:             address.Domain(),
+			S3Localpart:          address.LocalPart(),
 			MailboxName:          mailbox.Name,
 			ContentHash:          hash,
 			MessageID:            messageID,

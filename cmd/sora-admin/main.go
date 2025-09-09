@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/storage"
@@ -134,43 +136,171 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
-	case "create-account":
-		handleCreateAccount()
-	case "add-credential":
-		handleAddCredential()
-	case "update-account":
-		handleUpdateAccount()
-	case "list-credentials":
-		handleListCredentials()
-	case "import-maildir":
-		handleImportMaildir()
-	case "export-maildir":
-		handleExportMaildir()
-	case "cache-stats":
-		handleCacheStats()
-	case "cache-metrics":
-		handleCacheMetrics()
-	case "cache-purge":
-		handleCachePurge()
-	case "uploader-status":
-		handleUploaderStatus()
-	case "connection-stats":
-		handleConnectionStats()
-	case "kick-connections":
-		handleKickConnections()
-	case "auth-stats":
-		handleAuthStats()
-	case "health-status":
+	case "accounts":
+		handleAccountsCommand()
+	case "credentials":
+		handleCredentialsCommand()
+	case "cache":
+		handleCacheCommand()
+	case "stats":
+		handleStatsCommand()
+	case "connections":
+		handleConnectionsCommand()
+	case "health":
 		handleHealthStatus()
-	case "config-dump":
+	case "config":
 		handleConfigDump()
 	case "version":
 		printVersion()
+	case "import":
+		handleImportMaildir()
+	case "export":
+		handleExportMaildir()
+	case "uploader":
+		handleUploaderCommand()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)
 		printUsage()
+		os.Exit(1)
+	}
+}
+
+func handleAccountsCommand() {
+	if len(os.Args) < 3 {
+		printAccountsUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "create":
+		handleCreateAccount()
+	case "list":
+		handleListAccounts()
+	case "show":
+		handleShowAccount()
+	case "update":
+		handleUpdateAccount()
+	case "delete":
+		handleDeleteAccount()
+	case "restore":
+		handleRestoreAccount()
+	case "help", "--help", "-h":
+		printAccountsUsage()
+	default:
+		fmt.Printf("Unknown accounts subcommand: %s\n\n", subcommand)
+		printAccountsUsage()
+		os.Exit(1)
+	}
+}
+
+func handleCredentialsCommand() {
+	if len(os.Args) < 3 {
+		printCredentialsUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "add":
+		handleAddCredential()
+	case "list":
+		handleListCredentials()
+	case "show":
+		handleShowCredential()
+	case "delete":
+		handleDeleteCredential()
+	case "help", "--help", "-h":
+		printCredentialsUsage()
+	default:
+		fmt.Printf("Unknown credentials subcommand: %s\n\n", subcommand)
+		printCredentialsUsage()
+		os.Exit(1)
+	}
+}
+
+func handleCacheCommand() {
+	if len(os.Args) < 3 {
+		printCacheUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "stats":
+		handleCacheStats()
+	case "metrics":
+		handleCacheMetrics()
+	case "purge":
+		handleCachePurge()
+	case "help", "--help", "-h":
+		printCacheUsage()
+	default:
+		fmt.Printf("Unknown cache subcommand: %s\n\n", subcommand)
+		printCacheUsage()
+		os.Exit(1)
+	}
+}
+
+func handleStatsCommand() {
+	if len(os.Args) < 3 {
+		printStatsUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "auth":
+		handleAuthStats()
+	case "connection":
+		handleConnectionStats()
+	case "help", "--help", "-h":
+		printStatsUsage()
+	default:
+		fmt.Printf("Unknown stats subcommand: %s\n\n", subcommand)
+		printStatsUsage()
+		os.Exit(1)
+	}
+}
+
+func handleConnectionsCommand() {
+	if len(os.Args) < 3 {
+		printConnectionsUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "list":
+		handleListConnections()
+	case "kick":
+		handleKickConnections()
+	case "help", "--help", "-h":
+		printConnectionsUsage()
+	default:
+		fmt.Printf("Unknown connections subcommand: %s\n\n", subcommand)
+		printConnectionsUsage()
+		os.Exit(1)
+	}
+}
+
+func handleUploaderCommand() {
+	if len(os.Args) < 3 {
+		printUploaderUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "status":
+		handleUploaderStatus()
+	case "help", "--help", "-h":
+		printUploaderUsage()
+	default:
+		fmt.Printf("Unknown uploader subcommand: %s\n\n", subcommand)
+		printUploaderUsage()
 		os.Exit(1)
 	}
 }
@@ -183,49 +313,163 @@ func printUsage() {
 	fmt.Printf(`SORA Admin Tool
 
 Usage:
-  sora-admin <command> [options]
+  sora-admin <command> <subcommand> [options]
 
 Commands:
-  create-account    Create a new account
-  add-credential    Add a credential to an existing account
-  update-account    Update an existing account's password
-  list-credentials  List all credentials for an account
-  import-maildir    Import maildir from a given path
-  export-maildir    Export messages to maildir format
-  cache-stats       Show local cache size and object count
-  cache-metrics     Show cache hit/miss ratios and performance metrics
-  cache-purge       Clear all cached objects
-  uploader-status   Show uploader queue status and failed uploads
-  connection-stats  Show active proxy connections and statistics
-  kick-connections  Force disconnect proxy connections
-  auth-stats        Show authentication statistics and blocked IPs
-  health-status     Show system health status and component monitoring
-  config-dump       Dump the parsed configuration for debugging
-  version           Show version information
-  help              Show this help message
+  accounts      Manage user accounts
+  credentials   Manage account credentials
+  cache         Cache management operations
+  stats         System statistics and analytics
+  connections   Connection management
+  health        System health status
+  config        Configuration management
+  uploader      Upload queue management
+  import        Import maildir data
+  export        Export maildir data
+  version       Show version information
+  help          Show this help message
 
 Examples:
-  sora-admin create-account --email user@example.com --password mypassword
-  sora-admin add-credential --primary admin@example.com --email alias@example.com --password mypassword
-  sora-admin update-account --email user@example.com --password newpassword
-  sora-admin list-credentials --email user@example.com
-  sora-admin cache-stats --config /path/to/config.toml
-  sora-admin cache-metrics --config /path/to/config.toml
-  sora-admin auth-stats --window 1h --blocked
-  sora-admin cache-purge --config /path/to/config.toml
-  sora-admin uploader-status --config /path/to/config.toml
-  sora-admin connection-stats --config /path/to/config.toml
-  sora-admin kick-connections --user user@example.com
-  sora-admin config-dump --config /path/to/config.toml
-  sora-admin version
+  sora-admin accounts create --email user@example.com --password mypassword
+  sora-admin accounts list
+  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
+  sora-admin credentials list --email user@example.com
+  sora-admin cache stats
+  sora-admin stats auth --window 1h
+  sora-admin connections kick --user user@example.com
 
-Use 'sora-admin <command> --help' for more information about a command.
+Use 'sora-admin <command> --help' for more information about a command group.
+Use 'sora-admin <command> <subcommand> --help' for detailed help on specific commands.
+`)
+}
+
+func printAccountsUsage() {
+	fmt.Printf(`Account Management
+
+Usage:
+  sora-admin accounts <subcommand> [options]
+
+Subcommands:
+  create   Create a new account
+  list     List all accounts in the system
+  show     Show detailed information for a specific account
+  update   Update an existing account's password
+  delete   Delete an account (soft delete with grace period)
+  restore  Restore a soft-deleted account
+
+Examples:
+  sora-admin accounts create --email user@example.com --password mypassword
+  sora-admin accounts list
+  sora-admin accounts show --email user@example.com
+  sora-admin accounts update --email user@example.com --password newpassword
+  sora-admin accounts delete --email user@example.com --confirm
+  sora-admin accounts restore --email user@example.com
+
+Use 'sora-admin accounts <subcommand> --help' for detailed help.
+`)
+}
+
+func printCredentialsUsage() {
+	fmt.Printf(`Credential Management
+
+Usage:
+  sora-admin credentials <subcommand> [options]
+
+Subcommands:
+  add      Add a credential to an existing account
+  list     List all credentials for an account
+  show     Show detailed information for a specific credential
+  delete   Delete a specific credential from an account
+
+Examples:
+  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
+  sora-admin credentials list --email user@example.com
+  sora-admin credentials show --email user@example.com
+  sora-admin credentials delete --email alias@example.com
+
+Use 'sora-admin credentials <subcommand> --help' for detailed help.
+`)
+}
+
+func printCacheUsage() {
+	fmt.Printf(`Cache Management
+
+Usage:
+  sora-admin cache <subcommand> [options]
+
+Subcommands:
+  stats    Show local cache size and object count
+  metrics  Show cache hit/miss ratios and performance metrics
+  purge    Clear all cached objects
+
+Examples:
+  sora-admin cache stats
+  sora-admin cache metrics --since 1h
+  sora-admin cache purge
+
+Use 'sora-admin cache <subcommand> --help' for detailed help.
+`)
+}
+
+func printStatsUsage() {
+	fmt.Printf(`System Statistics
+
+Usage:
+  sora-admin stats <subcommand> [options]
+
+Subcommands:
+  auth        Show authentication statistics and blocked IPs
+  connection  Show active proxy connections and statistics
+
+Examples:
+  sora-admin stats auth --window 1h --blocked
+  sora-admin stats connection --user user@example.com
+
+Use 'sora-admin stats <subcommand> --help' for detailed help.
+`)
+}
+
+func printConnectionsUsage() {
+	fmt.Printf(`Connection Management
+
+Usage:
+  sora-admin connections <subcommand> [options]
+
+Subcommands:
+  list   List active proxy connections
+  kick   Force disconnect proxy connections
+
+Examples:
+  sora-admin connections list
+  sora-admin connections list --user user@example.com
+  sora-admin connections kick --user user@example.com
+  sora-admin connections kick --all
+
+Use 'sora-admin connections <subcommand> --help' for detailed help.
+`)
+}
+
+func printUploaderUsage() {
+	fmt.Printf(`Upload Queue Management
+
+Usage:
+  sora-admin uploader <subcommand> [options]
+
+Subcommands:
+  status   Show uploader queue status and failed uploads
+
+Examples:
+  sora-admin uploader status
+  sora-admin uploader status --show-failed=false
+  sora-admin uploader status --failed-limit 20
+
+Use 'sora-admin uploader <subcommand> --help' for detailed help.
 `)
 }
 
 func handleCreateAccount() {
-	// Parse create-account specific flags
-	fs := flag.NewFlagSet("create-account", flag.ExitOnError)
+	// Parse accounts create specific flags
+	fs := flag.NewFlagSet("accounts create", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the new account (required)")
@@ -236,7 +480,7 @@ func handleCreateAccount() {
 		fmt.Printf(`Create a new account
 
 Usage:
-  sora-admin create-account [options]
+  sora-admin accounts create [options]
 
 Options:
   --email string       Email address for the new account (required)
@@ -245,13 +489,13 @@ Options:
   --config string      Path to TOML configuration file (default: config.toml)
 
 Examples:
-  sora-admin create-account --email user@example.com --password mypassword
-  sora-admin create-account --email user@example.com --password mypassword --hash ssha512
+  sora-admin accounts create --email user@example.com --password mypassword
+  sora-admin accounts create --email user@example.com --password mypassword --hash ssha512
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -307,7 +551,7 @@ Examples:
 
 func handleAddCredential() {
 	// Parse add-credential specific flags
-	fs := flag.NewFlagSet("add-credential", flag.ExitOnError)
+	fs := flag.NewFlagSet("credentials add", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	primaryIdentity := fs.String("primary", "", "Primary identity of the account to add credential to (required)")
@@ -338,8 +582,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -424,9 +668,159 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 	return nil
 }
 
+func handleListConnections() {
+	// Parse connections list specific flags
+	fs := flag.NewFlagSet("connections list", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	userEmail := fs.String("user", "", "Filter connections by user email")
+	protocol := fs.String("protocol", "", "Filter connections by protocol (IMAP, POP3, LMTP)")
+	instanceID := fs.String("instance", "", "Filter connections by instance ID")
+
+	fs.Usage = func() {
+		fmt.Printf(`List active proxy connections
+
+Usage:
+  sora-admin connections list [options]
+
+Options:
+  --user string         Filter connections by user email
+  --protocol string     Filter connections by protocol (IMAP, POP3, LMTP)  
+  --instance string     Filter connections by instance ID
+  --config string       Path to TOML configuration file (default: config.toml)
+
+This command shows:
+  - Active connections with client and server addresses
+  - Protocol type and connection duration
+  - User email and instance information
+  - Connection activity status
+
+Examples:
+  sora-admin connections list
+  sora-admin connections list --user user@example.com
+  sora-admin connections list --protocol IMAP
+  sora-admin connections list --instance server1
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// List connections
+	if err := listConnections(cfg, *userEmail, *protocol, *instanceID); err != nil {
+		log.Fatalf("Failed to list connections: %v", err)
+	}
+}
+
+func listConnections(cfg AdminConfig, userEmail, protocol, instanceID string) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Get all active connections
+	connections, err := database.GetActiveConnections(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get active connections: %w", err)
+	}
+
+	// Apply filters
+	var filteredConnections []db.ConnectionInfo
+	for _, conn := range connections {
+		// Filter by user email
+		if userEmail != "" && !strings.Contains(strings.ToLower(conn.Email), strings.ToLower(userEmail)) {
+			continue
+		}
+		// Filter by protocol
+		if protocol != "" && !strings.EqualFold(conn.Protocol, protocol) {
+			continue
+		}
+		// Filter by instance ID
+		if instanceID != "" && !strings.Contains(conn.InstanceID, instanceID) {
+			continue
+		}
+		filteredConnections = append(filteredConnections, conn)
+	}
+
+	if len(filteredConnections) == 0 {
+		if userEmail != "" || protocol != "" || instanceID != "" {
+			fmt.Println("No active connections found matching the specified filters.")
+		} else {
+			fmt.Println("No active connections found.")
+		}
+		return nil
+	}
+
+	fmt.Printf("Found %d active connection(s):\n\n", len(filteredConnections))
+
+	// Print header
+	fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
+		"User", "Protocol", "Client", "Server", "Instance", "Connected", "Duration")
+	fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
+		"----", "--------", "------", "------", "--------", "---------", "--------")
+
+	// Print connection details
+	now := time.Now()
+	for _, conn := range filteredConnections {
+		email := conn.Email
+		if email == "" {
+			email = fmt.Sprintf("account-%d", conn.AccountID)
+		}
+
+		duration := now.Sub(conn.ConnectedAt)
+		durationStr := formatDuration(duration)
+
+		// Truncate long fields for better display
+		if len(email) > 24 {
+			email = email[:21] + "..."
+		}
+		if len(conn.ClientAddr) > 19 {
+			conn.ClientAddr = conn.ClientAddr[:16] + "..."
+		}
+		if len(conn.ServerAddr) > 19 {
+			conn.ServerAddr = conn.ServerAddr[:16] + "..."
+		}
+		if len(conn.InstanceID) > 14 {
+			conn.InstanceID = conn.InstanceID[:11] + "..."
+		}
+
+		fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
+			email,
+			conn.Protocol,
+			conn.ClientAddr,
+			conn.ServerAddr,
+			conn.InstanceID,
+			conn.ConnectedAt.Format("2006-01-02 15:04:05"),
+			durationStr)
+	}
+
+	fmt.Printf("\nTotal active connections: %d\n", len(filteredConnections))
+	return nil
+}
+
 func handleKickConnections() {
 	// Parse kick-connections specific flags
-	fs := flag.NewFlagSet("kick-connections", flag.ExitOnError)
+	fs := flag.NewFlagSet("connections kick", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	userEmail := fs.String("user", "", "Kick all connections for specific user email")
@@ -466,8 +860,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -632,16 +1026,22 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password string, mak
 	}
 	defer database.Close()
 
-	// Add credential using the new db operation
-	req := db.AddCredentialRequest{
-		PrimaryIdentity: primaryIdentity,
-		NewEmail:        email,
-		Password:        password,
-		IsPrimary:       makePrimary,
-		HashType:        hashType,
+	// Get the account ID for the primary identity
+	accountID, err := database.GetAccountIDByAddress(ctx, primaryIdentity)
+	if err != nil {
+		return fmt.Errorf("failed to find account with primary identity '%s': %w", primaryIdentity, err)
 	}
 
-	if err := database.AddCredential(ctx, req); err != nil {
+	// Add credential using the new db operation
+	req := db.AddCredentialRequest{
+		AccountID:   accountID,
+		NewEmail:    email,
+		NewPassword: password,
+		IsPrimary:   makePrimary,
+		NewHashType: hashType,
+	}
+
+	if err = database.AddCredential(ctx, req); err != nil {
 		return err
 	}
 
@@ -650,7 +1050,7 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password string, mak
 
 func handleUpdateAccount() {
 	// Parse update-account specific flags
-	fs := flag.NewFlagSet("update-account", flag.ExitOnError)
+	fs := flag.NewFlagSet("accounts update", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the account to update (required)")
@@ -681,8 +1081,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -743,6 +1143,94 @@ Examples:
 	}
 }
 
+func handleDeleteAccount() {
+	// Parse delete-account specific flags
+	fs := flag.NewFlagSet("accounts delete", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	email := fs.String("email", "", "Email address for the account to delete (required)")
+	confirm := fs.Bool("confirm", false, "Confirm account deletion (required)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Soft-delete an account
+
+This command soft-deletes an account by marking it for deletion. The account and
+its data will be permanently removed by a background worker after a configurable
+grace period.
+
+During the grace period, the account can be restored using the 'accounts restore' command.
+
+Usage:
+  sora-admin accounts delete [options]
+
+Options:
+  --email string      Email address for the account to delete (required)
+  --confirm           Confirm account soft-deletion (required for safety)
+  --config string     Path to TOML configuration file (default: config.toml)
+
+Examples:
+  sora-admin accounts delete --email user@example.com --confirm
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *email == "" {
+		fmt.Printf("Error: --email is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if !*confirm {
+		fmt.Printf("Error: --confirm is required for account deletion\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Delete the account
+	if err := deleteAccount(cfg, *email); err != nil {
+		log.Fatalf("Failed to delete account: %v", err)
+	}
+
+	fmt.Printf("Successfully soft-deleted account: %s. It will be permanently removed after the grace period.\n", *email)
+}
+
+func deleteAccount(cfg AdminConfig, email string) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Delete the account using the existing database function
+	if err := database.DeleteAccount(ctx, email); err != nil {
+		return fmt.Errorf("failed to delete account: %w", err)
+	}
+
+	return nil
+}
+
 func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
@@ -770,7 +1258,7 @@ func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, ha
 
 func handleListCredentials() {
 	// Parse list-credentials specific flags
-	fs := flag.NewFlagSet("list-credentials", flag.ExitOnError)
+	fs := flag.NewFlagSet("credentials list", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address associated with the account (required)")
@@ -793,8 +1281,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -859,6 +1347,506 @@ func listCredentials(cfg AdminConfig, email string) error {
 	return nil
 }
 
+func handleDeleteCredential() {
+	// Parse delete-credential specific flags
+	fs := flag.NewFlagSet("credentials delete", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	email := fs.String("email", "", "Email address of the credential to delete (required)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Delete a specific credential from an account
+
+This command removes a specific credential (email/password combination) from an account.
+
+Restrictions:
+- You cannot delete the primary credential. Use update-account to make another 
+  credential primary first, then delete the old one.
+- You cannot delete the last credential of an account. Use delete-account to 
+  remove the entire account and all its data.
+
+Usage:
+  sora-admin delete-credential [options]
+
+Options:
+  --email string      Email address of the credential to delete (required)
+  --config string     Path to TOML configuration file (default: config.toml)
+
+Examples:
+  sora-admin delete-credential --email alias@example.com
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *email == "" {
+		fmt.Printf("Error: --email is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Delete the credential
+	if err := deleteCredential(cfg, *email); err != nil {
+		log.Fatalf("Failed to delete credential: %v", err)
+	}
+
+	fmt.Printf("Successfully deleted credential: %s\n", *email)
+}
+
+func deleteCredential(cfg AdminConfig, email string) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Delete the credential using the database function
+	if err := database.DeleteCredential(ctx, email); err != nil {
+		return fmt.Errorf("failed to delete credential: %w", err)
+	}
+
+	return nil
+}
+
+func handleListAccounts() {
+	// Parse list-accounts specific flags
+	fs := flag.NewFlagSet("accounts list", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+
+	fs.Usage = func() {
+		fmt.Printf(`List all accounts in the system
+
+This command displays a summary of all accounts including:
+- Account ID and primary email address
+- Number of credentials (aliases) per account
+- Number of mailboxes per account
+- Total message count per account (excluding expunged messages)
+- Account creation date
+
+Usage:
+  sora-admin list-accounts [options]
+
+Options:
+  --config string     Path to TOML configuration file (default: config.toml)
+
+Examples:
+  sora-admin list-accounts
+  sora-admin list-accounts --config /path/to/config.toml
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// List accounts
+	if err := listAccounts(cfg); err != nil {
+		log.Fatalf("Failed to list accounts: %v", err)
+	}
+}
+
+func listAccounts(cfg AdminConfig) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// List accounts using the database function
+	accounts, err := database.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(accounts) == 0 {
+		fmt.Println("No accounts found in the system.")
+		return nil
+	}
+
+	fmt.Printf("Found %d account(s):\n\n", len(accounts))
+
+	// Print header
+	fmt.Printf("%-8s %-30s %-10s %-10s %-12s %-20s\n",
+		"ID", "Primary Email", "Credentials", "Mailboxes", "Messages", "Created")
+	fmt.Printf("%-8s %-30s %-10s %-10s %-12s %-20s\n",
+		"--", "-------------", "-----------", "---------", "--------", "-------")
+
+	// Print account details
+	for _, account := range accounts {
+		primaryEmail := account.PrimaryEmail
+		if primaryEmail == "" {
+			primaryEmail = "<no primary>"
+		}
+
+		fmt.Printf("%-8d %-30s %-10d %-10d %-12d %-20s\n",
+			account.AccountID,
+			primaryEmail,
+			account.CredentialCount,
+			account.MailboxCount,
+			account.MessageCount,
+			account.CreatedAt)
+	}
+
+	fmt.Printf("\nTotal accounts: %d\n", len(accounts))
+	return nil
+}
+
+func handleRestoreAccount() {
+	// Parse accounts restore specific flags
+	fs := flag.NewFlagSet("accounts restore", flag.ExitOnError)
+
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	email := fs.String("email", "", "Email address for the account to restore (required)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Restore a soft-deleted account
+
+This command restores an account that was previously deleted and is still within
+the grace period. The account and all its data (mailboxes, messages, credentials)
+will be restored to active status.
+
+Usage:
+  sora-admin accounts restore [options]
+
+Options:
+  --email string      Email address for the account to restore (required)
+  --config string     Path to TOML configuration file (default: config.toml)
+
+Examples:
+  sora-admin accounts restore --email user@example.com
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *email == "" {
+		fmt.Printf("Error: --email is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Restore the account
+	if err := restoreAccount(cfg, *email); err != nil {
+		log.Fatalf("Failed to restore account: %v", err)
+	}
+
+	fmt.Printf("Successfully restored account: %s\n", *email)
+}
+
+func handleShowAccount() {
+	// Parse show-account specific flags
+	fs := flag.NewFlagSet("accounts show", flag.ExitOnError)
+	email := fs.String("email", "", "Email address of the account to show")
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show detailed information for a specific account
+This command displays comprehensive information about an account including:
+- Account ID and status (active/deleted)
+- Primary email address and all credential aliases
+- Account creation date and deletion date (if soft-deleted)
+- Number of mailboxes and total message count
+- All associated email addresses with their status
+
+Usage:
+  sora-admin accounts show --email <email> [options]
+
+Options:
+  --email string      Email address of the account to show (required)
+  --config string     Path to TOML configuration file (default: config.toml)
+  --json             Output in JSON format instead of human-readable format
+
+Examples:
+  sora-admin accounts show --email user@example.com
+  sora-admin accounts show --email user@example.com --json
+  sora-admin accounts show --email user@example.com --config /path/to/config.toml
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	if *email == "" {
+		fmt.Println("Error: --email is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	var cfg AdminConfig
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		// Check if this is a file not found error and if so, be more flexible.
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show the account details
+	if err := showAccount(cfg, *email, *jsonOutput); err != nil {
+		log.Fatalf("Failed to show account: %v", err)
+	}
+}
+
+func restoreAccount(cfg AdminConfig, email string) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Restore the account using the database function
+	if err := database.RestoreAccount(ctx, email); err != nil {
+		return fmt.Errorf("failed to restore account: %w", err)
+	}
+
+	return nil
+}
+
+func showAccount(cfg AdminConfig, email string, jsonOutput bool) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Get detailed account information
+	accountDetails, err := database.GetAccountDetails(ctx, email)
+	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			return fmt.Errorf("account with email %s does not exist", email)
+		}
+		return fmt.Errorf("failed to get account details: %w", err)
+	}
+
+	// Output the results
+	if jsonOutput {
+		jsonData, err := json.MarshalIndent(accountDetails, "", "  ")
+		if err != nil {
+			return fmt.Errorf("error marshaling JSON: %w", err)
+		}
+		fmt.Println(string(jsonData))
+	} else {
+		// Human-readable output
+		fmt.Printf("Account Details:\n")
+		fmt.Printf("  Account ID:    %d\n", accountDetails.ID)
+		fmt.Printf("  Primary Email: %s\n", accountDetails.PrimaryEmail)
+		fmt.Printf("  Status:        %s\n", accountDetails.Status)
+		fmt.Printf("  Created:       %s\n", accountDetails.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+
+		if accountDetails.DeletedAt != nil {
+			fmt.Printf("  Deleted:       %s\n", accountDetails.DeletedAt.Format("2006-01-02 15:04:05 UTC"))
+		}
+
+		fmt.Printf("  Mailboxes:     %d\n", accountDetails.MailboxCount)
+		fmt.Printf("  Messages:      %d\n", accountDetails.MessageCount)
+
+		fmt.Printf("\nCredentials (%d):\n", len(accountDetails.Credentials))
+		for _, cred := range accountDetails.Credentials {
+			status := "alias"
+			if cred.PrimaryIdentity {
+				status = "primary"
+			}
+			fmt.Printf("  %-30s %-8s created: %s\n",
+				cred.Address,
+				status,
+				cred.CreatedAt.Format("2006-01-02 15:04:05"))
+		}
+	}
+
+	return nil
+}
+
+func handleShowCredential() {
+	// Parse show-credential specific flags
+	fs := flag.NewFlagSet("credentials show", flag.ExitOnError)
+	email := fs.String("email", "", "Email address (credential) to show details for")
+	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show detailed information for a specific credential
+
+This command displays comprehensive information about a specific credential including:
+- The email address and its account association
+- Whether it's a primary identity or alias
+- Creation and last update timestamps
+- Account status (active/deleted)
+- Associated account summary information
+
+Usage:
+  sora-admin credentials show --email <email> [options]
+
+Options:
+  --email string      Email address (credential) to show details for (required)
+  --config string     Path to TOML configuration file (default: config.toml)
+  --json             Output in JSON format instead of human-readable format
+
+Examples:
+  sora-admin credentials show --email user@example.com
+  sora-admin credentials show --email alias@example.com --json
+  sora-admin credentials show --email user@example.com --config /path/to/config.toml
+`)
+	}
+
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
+
+	if *email == "" {
+		fmt.Println("Error: --email is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	var cfg AdminConfig
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		// Check if this is a file not found error and if so, be more flexible.
+		if os.IsNotExist(err) {
+			if isFlagSet(fs, "config") {
+				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+			}
+		} else {
+			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show the credential details
+	if err := showCredential(cfg, *email, *jsonOutput); err != nil {
+		log.Fatalf("Failed to show credential: %v", err)
+	}
+}
+
+func showCredential(cfg AdminConfig, email string, jsonOutput bool) error {
+	ctx := context.Background()
+
+	// Connect to database
+	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer database.Close()
+
+	// Get credential details and associated account information
+	credentialDetails, err := database.GetCredentialDetails(ctx, email)
+	if err != nil {
+		return err // The error from the DB function is already descriptive
+	}
+
+	// Output the results
+	if jsonOutput {
+		jsonData, err := json.MarshalIndent(credentialDetails, "", "  ")
+		if err != nil {
+			return fmt.Errorf("error marshaling JSON: %w", err)
+		}
+		fmt.Println(string(jsonData))
+	} else {
+		// Human-readable output
+		fmt.Printf("Credential Details:\n")
+		fmt.Printf("  Email Address: %s\n", credentialDetails.Address)
+
+		roleType := "Alias"
+		if credentialDetails.PrimaryIdentity {
+			roleType = "Primary Identity"
+		}
+		fmt.Printf("  Role: %s\n", roleType)
+
+		fmt.Printf("  Created: %s\n", credentialDetails.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+		fmt.Printf("  Updated: %s\n", credentialDetails.UpdatedAt.Format("2006-01-02 15:04:05 UTC"))
+
+		fmt.Printf("\nAssociated Account:\n")
+		fmt.Printf("  Account ID: %d\n", credentialDetails.Account.ID)
+		fmt.Printf("  Status: %s\n", credentialDetails.Account.Status)
+		fmt.Printf("  Created: %s\n", credentialDetails.Account.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
+
+		if credentialDetails.Account.DeletedAt != nil {
+			fmt.Printf("  Deleted: %s\n", credentialDetails.Account.DeletedAt.Format("2006-01-02 15:04:05 UTC"))
+		}
+
+		fmt.Printf("  Total Credentials: %d\n", credentialDetails.Account.TotalCredentials)
+		fmt.Printf("  Mailboxes: %d\n", credentialDetails.Account.MailboxCount)
+		fmt.Printf("  Messages: %d\n", credentialDetails.Account.MessageCount)
+	}
+
+	return nil
+}
+
 // Helper function to check if a flag was explicitly set
 func isFlagSet(fs *flag.FlagSet, name string) bool {
 	isSet := false
@@ -872,7 +1860,7 @@ func isFlagSet(fs *flag.FlagSet, name string) bool {
 
 func handleImportMaildir() {
 	// Parse import-maildir specific flags
-	fs := flag.NewFlagSet("import-maildir", flag.ExitOnError)
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the account to import mail to (required)")
@@ -946,8 +1934,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1054,7 +2042,7 @@ Examples:
 
 func handleExportMaildir() {
 	// Parse export-maildir specific flags
-	fs := flag.NewFlagSet("export-maildir", flag.ExitOnError)
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the account to export mail from (required)")
@@ -1113,8 +2101,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1221,7 +2209,7 @@ Examples:
 
 func handleCacheStats() {
 	// Parse cache-stats specific flags
-	fs := flag.NewFlagSet("cache-stats", flag.ExitOnError)
+	fs := flag.NewFlagSet("cache stats", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 
@@ -1246,8 +2234,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1273,7 +2261,7 @@ Examples:
 
 func handleCachePurge() {
 	// Parse cache-purge specific flags
-	fs := flag.NewFlagSet("cache-purge", flag.ExitOnError)
+	fs := flag.NewFlagSet("cache purge", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	confirm := fs.Bool("confirm", false, "Confirm cache purge without interactive prompt")
@@ -1298,8 +2286,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1449,8 +2437,8 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 }
 
 func handleUploaderStatus() {
-	// Parse uploader-status specific flags
-	fs := flag.NewFlagSet("uploader-status", flag.ExitOnError)
+	// Parse uploader status specific flags
+	fs := flag.NewFlagSet("uploader status", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	showFailed := fs.Bool("show-failed", true, "Show failed uploads details")
@@ -1460,7 +2448,7 @@ func handleUploaderStatus() {
 		fmt.Printf(`Show uploader queue status and failed uploads
 
 Usage:
-  sora-admin uploader-status [options]
+  sora-admin uploader status [options]
 
 Options:
   --config string       Path to TOML configuration file (default: config.toml)
@@ -1474,15 +2462,15 @@ This command shows:
   - Details of failed uploads including content hashes and attempt counts
 
 Examples:
-  sora-admin uploader-status
-  sora-admin uploader-status --config /path/to/config.toml
-  sora-admin uploader-status --failed-limit 20
-  sora-admin uploader-status --show-failed=false
+  sora-admin uploader status
+  sora-admin uploader status --config /path/to/config.toml
+  sora-admin uploader status --failed-limit 20
+  sora-admin uploader status --show-failed=false
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1607,7 +2595,7 @@ func formatDuration(d time.Duration) string {
 
 func handleConnectionStats() {
 	// Parse connection-stats specific flags
-	fs := flag.NewFlagSet("connection-stats", flag.ExitOnError)
+	fs := flag.NewFlagSet("stats connection", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	userEmail := fs.String("user", "", "Show connections for specific user email")
@@ -1649,8 +2637,8 @@ Examples:
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -1814,7 +2802,7 @@ func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanu
 
 func handleAuthStats() {
 	// Parse auth-stats specific flags
-	fs := flag.NewFlagSet("auth-stats", flag.ExitOnError)
+	fs := flag.NewFlagSet("stats auth", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	windowDuration := fs.String("window", "15m", "Time window for statistics (e.g., '15m', '1h', '24h')")
 	showBlocked := fs.Bool("blocked", true, "Show currently blocked IPs and usernames")
@@ -1933,7 +2921,7 @@ Examples:
 }
 
 func handleHealthStatus() {
-	fs := flag.NewFlagSet("health-status", flag.ExitOnError)
+	fs := flag.NewFlagSet("health", flag.ExitOnError)
 
 	// Command-specific flags
 	hostname := fs.String("hostname", "", "Show health status for specific hostname")
@@ -2354,7 +3342,7 @@ func getStatusColor(status db.ComponentStatus) string {
 
 func handleCacheMetrics() {
 	// Parse cache-metrics specific flags
-	fs := flag.NewFlagSet("cache-metrics", flag.ExitOnError)
+	fs := flag.NewFlagSet("cache metrics", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	instanceID := fs.String("instance", "", "Show metrics for specific instance ID")
@@ -2367,7 +3355,7 @@ func handleCacheMetrics() {
 		fmt.Printf(`Show cache hit/miss ratios and performance metrics
 
 Usage:
-  sora-admin cache-metrics [options]
+  sora-admin cache metrics [options]
 
 Options:
   --instance string    Show metrics for specific instance ID
@@ -2384,15 +3372,15 @@ This command shows:
   - Historical trends when using --history flag
 
 Examples:
-  sora-admin cache-metrics
-  sora-admin cache-metrics --instance server1-cache
-  sora-admin cache-metrics --history --since 7d
-  sora-admin cache-metrics --json
+  sora-admin cache metrics
+  sora-admin cache metrics --instance server1-cache
+  sora-admin cache metrics --history --since 7d
+  sora-admin cache metrics --json
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -2642,10 +3630,10 @@ Examples:
 func printPrettyConfig(cfg AdminConfig) {
 	fmt.Println("=== SORA ADMIN CONFIGURATION ===")
 	fmt.Println()
-	
+
 	fmt.Println("DATABASE CONFIGURATION:")
 	fmt.Printf("  Log Queries: %t\n", cfg.Database.LogQueries)
-	
+
 	if cfg.Database.Write != nil {
 		fmt.Println("  Write Database:")
 		fmt.Printf("    Hosts: %v\n", cfg.Database.Write.Hosts)
@@ -2659,7 +3647,7 @@ func printPrettyConfig(cfg AdminConfig) {
 		fmt.Printf("    Max Connection Lifetime: %s\n", cfg.Database.Write.MaxConnLifetime)
 		fmt.Printf("    Max Connection Idle Time: %s\n", cfg.Database.Write.MaxConnIdleTime)
 	}
-	
+
 	if cfg.Database.Read != nil {
 		fmt.Println("  Read Database:")
 		fmt.Printf("    Hosts: %v\n", cfg.Database.Read.Hosts)
@@ -2673,7 +3661,7 @@ func printPrettyConfig(cfg AdminConfig) {
 		fmt.Printf("    Max Connection Lifetime: %s\n", cfg.Database.Read.MaxConnLifetime)
 		fmt.Printf("    Max Connection Idle Time: %s\n", cfg.Database.Read.MaxConnIdleTime)
 	}
-	
+
 	fmt.Println()
 	fmt.Println("S3 CONFIGURATION:")
 	fmt.Printf("  Endpoint: %s\n", cfg.S3.Endpoint)
@@ -2684,7 +3672,7 @@ func printPrettyConfig(cfg AdminConfig) {
 	fmt.Printf("  Trace: %t\n", cfg.S3.Trace)
 	fmt.Printf("  Encrypt: %t\n", cfg.S3.Encrypt)
 	fmt.Printf("  Encryption Key: %s\n", cfg.S3.EncryptionKey)
-	
+
 	fmt.Println()
 	fmt.Println("UPLOADER CONFIGURATION:")
 	fmt.Printf("  Path: %s\n", cfg.Uploader.Path)

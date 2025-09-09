@@ -103,6 +103,16 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		}
 	}
 
+	// --- Phase 0: Process soft-deleted accounts ---
+	// This prepares accounts for deletion by expunging their messages and removing
+	// associated data, making them ready for the subsequent cleanup phases.
+	deletedAccountCount, err := w.db.CleanupSoftDeletedAccounts(ctx, w.gracePeriod)
+	if err != nil {
+		log.Printf("[CLEANUP] failed to process soft-deleted accounts: %v", err)
+	} else if deletedAccountCount > 0 {
+		log.Printf("[CLEANUP] processed %d soft-deleted accounts for hard deletion", deletedAccountCount)
+	}
+
 	// Clean up old vacation responses
 	count, err := w.db.CleanupOldVacationResponses(ctx, w.gracePeriod)
 	if err != nil {
@@ -123,14 +133,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	if len(candidates) > 0 {
 		log.Printf("[CLEANUP] found %d user-scoped objects for S3 cleanup", len(candidates))
 		for _, candidate := range candidates {
-			address, err := w.db.GetPrimaryEmailForAccount(ctx, candidate.AccountID)
-			if err != nil {
-				log.Printf("[CLEANUP] failed to get primary address for account %d, skipping cleanup for hash %s: %v", candidate.AccountID, candidate.ContentHash, err)
-				continue
-			}
-
-			s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), candidate.ContentHash)
-			log.Printf("[CLEANUP] deleting user-scoped object: %s", s3Key)
+			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
+			log.Printf("[CLEANUP] deleting user-scoped object for account %d: %s", candidate.AccountID, s3Key)
 
 			cHash := candidate.ContentHash // Keep a local copy for logging
 			s3Err := w.s3.Delete(s3Key)
@@ -154,10 +158,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 				log.Printf("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", s3Key)
 			}
 
-			if err := w.db.DeleteExpungedMessagesByUserAndContentHash(ctx, candidate.AccountID, cHash); err != nil {
+			if err := w.db.DeleteExpungedMessagesByS3KeyParts(ctx, candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash); err != nil {
 				// Log the error but continue processing other candidates.
 				// The advisory lock is held, so we don't want to block. The next run will pick it up.
-				log.Printf("[CLEANUP] failed to delete DB message rows for account %d and hash %s: %v", candidate.AccountID, cHash, err)
+				log.Printf("[CLEANUP] failed to delete DB message rows for account %d and S3 key parts (%s/%s/%s): %v", candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash, err)
 				continue
 			}
 
@@ -195,6 +199,24 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		}
 	} else {
 		log.Println("[CLEANUP] no orphaned content hashes to clean up")
+	}
+
+	// --- Phase 3: Final account deletion ---
+	// After all associated data (S3 objects, messages, etc.) has been cleaned up,
+	// we can now safely delete the 'accounts' row itself.
+	danglingAccounts, err := w.db.GetDanglingAccountsForFinalDeletion(ctx, db.BATCH_PURGE_SIZE)
+	if err != nil {
+		log.Printf("[CLEANUP] failed to list dangling accounts for final deletion: %v", err)
+		return fmt.Errorf("failed to list dangling accounts for final deletion: %w", err)
+	}
+
+	if len(danglingAccounts) > 0 {
+		log.Printf("[CLEANUP] found %d dangling accounts for final deletion", len(danglingAccounts))
+		for _, accountID := range danglingAccounts {
+			if err := w.db.FinalizeAccountDeletion(ctx, accountID); err != nil {
+				log.Printf("[CLEANUP] failed to finalize deletion of account %d: %v", accountID, err)
+			}
+		}
 	}
 
 	return nil

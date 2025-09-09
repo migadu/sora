@@ -751,6 +751,8 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
 			MailboxID:     mailbox.ID,
+			S3Domain:      s.User.Address.Domain(),
+			S3Localpart:   s.User.Address.LocalPart(),
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,

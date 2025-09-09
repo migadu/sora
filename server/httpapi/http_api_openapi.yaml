@@ -1,0 +1,1307 @@
+openapi: 3.0.3
+info:
+  title: Sora HTTP API
+  description: HTTP API for managing and monitoring the Sora mail server.
+  version: v1
+servers:
+  - url: /api/v1
+    description: API version 1
+
+# Security scheme definition
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API Key
+      description: "API Key for authentication. Provide as 'Bearer <API_KEY>' in the Authorization header."
+
+  # Reusable schemas
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "An error message"
+      required:
+        - error
+
+    CreateAccountRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        password:
+          type: string
+          format: password
+          example: "s3cr3t_p4ssw0rd"
+      required:
+        - email
+        - password
+
+    UpdateAccountRequest:
+      type: object
+      properties:
+        password:
+          type: string
+          format: password
+          example: "new_s3cr3t_p4ssw0rd"
+      required:
+        - password
+
+    AddCredentialRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          description: "The new email address (alias) to add as a credential."
+          example: "alias@example.com"
+        password:
+          type: string
+          format: password
+          description: "The password for the new credential. It can be different from the primary account's password."
+          example: "s3cr3t_p4ssw0rd_for_alias"
+      required:
+        - email
+        - password
+
+    KickConnectionsRequest:
+      type: object
+      properties:
+        user_email:
+          type: string
+          format: email
+          description: "Terminate all connections for this user."
+          example: "user@example.com"
+        protocol:
+          type: string
+          description: "Terminate connections for this protocol (e.g., IMAP, POP3)."
+          example: "IMAP"
+        server_addr:
+          type: string
+          description: "Terminate connections to this backend server address."
+          example: "10.0.1.10:143"
+        client_addr:
+          type: string
+          description: "Terminate connections from this client IP address."
+          example: "192.168.1.100"
+        all:
+          type: boolean
+          description: "If true, terminates all connections. Use with caution."
+          example: false
+
+    Account:
+      type: object
+      properties:
+        account_id:
+          type: integer
+          format: int64
+          example: 123
+        created_at:
+          type: string
+          format: date-time
+          example: "2023-01-01T12:00:00Z"
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        primary_email:
+          type: string
+          format: email
+          example: "user@example.com"
+        status:
+          type: string
+          enum: [active, deleted]
+          example: "active"
+        credentials:
+          type: array
+          items:
+            type: object
+            properties:
+              address:
+                type: string
+                format: email
+                example: "user@example.com"
+              primary_identity:
+                type: boolean
+                example: true
+              created_at:
+                type: string
+                format: date-time
+                example: "2023-01-01T12:00:00Z"
+              updated_at:
+                type: string
+                format: date-time
+                example: "2023-01-01T12:00:00Z"
+        mailbox_count:
+          type: integer
+          format: int64
+          example: 5
+        message_count:
+          type: integer
+          format: int64
+          example: 42
+
+    AccountExists:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        exists:
+          type: boolean
+          example: true
+
+    ConnectionInfo:
+      type: object
+      properties:
+        ID:
+          type: integer
+          format: int64
+        AccountID:
+          type: integer
+          format: int64
+        Protocol:
+          type: string
+          example: "IMAP"
+        ClientAddr:
+          type: string
+          example: "192.168.1.100:54321"
+        ServerAddr:
+          type: string
+          example: "10.0.1.10:143"
+        InstanceID:
+          type: string
+          example: "sora-instance-1"
+        ConnectedAt:
+          type: string
+          format: date-time
+        LastActivity:
+          type: string
+          format: date-time
+        ShouldTerminate:
+          type: boolean
+        Email:
+          type: string
+          format: email
+          example: "user@example.com"
+
+    ConnectionStats:
+      type: object
+      properties:
+        TotalConnections:
+          type: integer
+          format: int64
+        ConnectionsByProtocol:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          example:
+            IMAP: 50
+            POP3: 10
+        ConnectionsByServer:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          example:
+            "10.0.1.10:143": 30
+            "10.0.1.11:143": 30
+        Users:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectionInfo'
+
+    CacheStats:
+      type: object
+      properties:
+        total_size:
+          type: integer
+          format: int64
+          description: "Total size of items in cache (bytes)."
+        items:
+          type: integer
+          format: int64
+          description: "Number of items in cache."
+        hits:
+          type: integer
+          format: int64
+        misses:
+          type: integer
+          format: int64
+        hit_rate:
+          type: number
+          format: float
+        capacity:
+          type: integer
+          format: int64
+          description: "Total cache capacity (bytes)."
+        path:
+          type: string
+          description: "Path to the cache directory."
+
+    CacheMetricsRecord:
+      type: object
+      properties:
+        instance_id:
+          type: string
+        server_hostname:
+          type: string
+        hits:
+          type: integer
+          format: int64
+        misses:
+          type: integer
+          format: int64
+        hit_rate:
+          type: number
+          format: float
+        total_operations:
+          type: integer
+          format: int64
+        uptime_seconds:
+          type: integer
+          format: int64
+        recorded_at:
+          type: string
+          format: date-time
+
+    HealthStatus:
+      type: object
+      properties:
+        component_name:
+          type: string
+          example: "database_write"
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy, unreachable]
+        last_check:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+          nullable: true
+        check_count:
+          type: integer
+        fail_count:
+          type: integer
+        metadata:
+          type: object
+          additionalProperties: true
+          example:
+            latency_ms: 5
+            pool_status: "OK"
+        server_hostname:
+          type: string
+          example: "sora-instance-1"
+        updated_at:
+          type: string
+          format: date-time
+
+    SystemHealthOverview:
+      type: object
+      properties:
+        overall_status:
+          type: string
+          enum: [healthy, degraded, unhealthy, unreachable]
+        component_count:
+          type: integer
+        healthy_count:
+          type: integer
+        degraded_count:
+          type: integer
+        unhealthy_count:
+          type: integer
+        unreachable_count:
+          type: integer
+        last_updated:
+          type: string
+          format: date-time
+
+    UploaderStats:
+      type: object
+      properties:
+        pending_count:
+          type: integer
+        failed_count:
+          type: integer
+        in_progress_count:
+          type: integer
+        total_processed:
+          type: integer
+        last_successful_upload:
+          type: string
+          format: date-time
+        last_failed_upload:
+          type: string
+          format: date-time
+
+    FailedUpload:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        content_hash:
+          type: string
+        account_id:
+          type: integer
+          format: int64
+        size:
+          type: integer
+          format: int64
+        attempts:
+          type: integer
+        last_attempt:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+
+    AuthStats:
+      type: object
+      description: "Statistics about authentication attempts."
+      properties:
+        total_attempts:
+          type: integer
+        successful_attempts:
+          type: integer
+        failed_attempts:
+          type: integer
+        unique_ips:
+          type: integer
+        unique_usernames:
+          type: integer
+        unique_protocols:
+          type: integer
+        window_duration:
+          type: string
+          example: "24h0m0s"
+
+    CredentialDetails:
+      type: object
+      description: "Detailed information about a specific credential including associated account details."
+      properties:
+        address:
+          type: string
+          format: email
+          example: "user@example.com"
+        primary_identity:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2023-01-01T12:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2023-01-01T12:00:00Z"
+        account:
+          type: object
+          properties:
+            account_id:
+              type: integer
+              format: int64
+              example: 123
+            account_created_at:
+              type: string
+              format: date-time
+              example: "2023-01-01T12:00:00Z"
+            account_deleted_at:
+              type: string
+              format: date-time
+              nullable: true
+              example: null
+            account_status:
+              type: string
+              enum: [active, deleted]
+              example: "active"
+            mailbox_count:
+              type: integer
+              format: int64
+              example: 5
+            message_count:
+              type: integer
+              format: int64
+              example: 42
+            total_credentials:
+              type: integer
+              example: 3
+
+# Global security requirement
+security:
+  - ApiKeyAuth: []
+
+# API Paths
+paths:
+  /accounts:
+    post:
+      tags:
+        - Account Management
+      summary: Create a new account
+      description: Creates a new primary account and its first credential.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+      responses:
+        '201':
+          description: Account created successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account_id:
+                    type: integer
+                    format: int64
+                  email:
+                    type: string
+                    format: email
+                  message:
+                    type: string
+        '400':
+          description: Invalid request body or parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Account with this email already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}:
+    get:
+      tags:
+        - Account Management
+      summary: Get detailed account information
+      description: Retrieves comprehensive details for an account including all credentials, mailbox/message counts, and status information. Works with both active and soft-deleted accounts.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: Account details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      tags:
+        - Account Management
+      summary: Update an account's password
+      description: Updates the password for a specific credential (email).
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountRequest'
+      responses:
+        '200':
+          description: Account updated successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+        '400':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Account Management
+      summary: Delete an account (soft delete)
+      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: Account soft-deleted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  message:
+                    type: string
+                    example: "Account soft-deleted successfully. It will be permanently removed after the grace period."
+        '400':
+          description: Account is already deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/restore:
+    post:
+      tags:
+        - Account Management
+      summary: Restore a deleted account
+      description: Restores a soft-deleted account, making it active again. Only works on accounts that are within the grace period.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: Account restored successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  message:
+                    type: string
+                    example: "Account restored successfully."
+        '400':
+          description: Account is not deleted or cannot be restored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/exists:
+    get:
+      tags:
+        - Account Management
+      summary: Check if an account exists
+      description: Checks if a credential with the given email address exists.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: Existence status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountExists'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/credentials:
+    post:
+      tags:
+        - Account Management
+      summary: Add a credential (alias) to an account
+      description: Adds a new credential (email alias) to an existing account. The account is identified by an existing email address (primary or alias) provided in the URL path.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "An existing email of the account to which the new credential will be added."
+          schema:
+            type: string
+            format: email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCredentialRequest'
+      responses:
+        '201':
+          description: Credential added successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                  message:
+                    type: string
+        '400':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /credentials/{email}:
+    get:
+      tags:
+        - Credential Management
+      summary: Get detailed information for a specific credential
+      description: Retrieves comprehensive information about a specific credential including the associated account details, role information, and account statistics.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+          description: The email address (credential) to get details for
+      responses:
+        '200':
+          description: Detailed credential information.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialDetails'
+        '404':
+          description: Credential not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Credential Management
+      summary: Delete a specific credential
+      description: >
+        Deletes a specific credential (email/password combination) from an account.
+        This operation will fail if you attempt to delete the primary credential or the last remaining credential for an account.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+          description: The email address of the credential to delete.
+      responses:
+        '200':
+          description: Credential deleted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                  message:
+                    type: string
+        '400':
+          description: Bad request. The credential is the primary or last credential for the account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Credential not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /connections:
+    get:
+      tags:
+        - Connection Management
+      summary: List all active connections
+      responses:
+        '200':
+          description: A list of active connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ConnectionInfo'
+                  count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /connections/stats:
+    get:
+      tags:
+        - Connection Management
+      summary: Get connection statistics
+      responses:
+        '200':
+          description: Aggregated connection statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionStats'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /connections/kick:
+    post:
+      tags:
+        - Connection Management
+      summary: Mark connections for termination
+      description: Marks connections matching the criteria to be terminated by the server.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KickConnectionsRequest'
+      responses:
+        '200':
+          description: Connections marked successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  connections_marked:
+                    type: integer
+        '400':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /connections/user/{email}:
+    get:
+      tags:
+        - Connection Management
+      summary: Get connections for a specific user
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: A list of connections for the user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                  connections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ConnectionInfo'
+                  count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /cache/stats:
+    get:
+      tags:
+        - Cache Management
+      summary: Get cache statistics
+      responses:
+        '200':
+          description: Cache statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheStats'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Cache is not available/enabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /cache/metrics:
+    get:
+      tags:
+        - Cache Management
+      summary: Get cache performance metrics
+      parameters:
+        - name: latest
+          in: query
+          schema:
+            type: boolean
+          description: "If true, returns only the latest metric record for each instance."
+        - name: instance_id
+          in: query
+          schema:
+            type: string
+          description: "Filter metrics by a specific instance ID."
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "Return metrics recorded after this timestamp (RFC3339). Defaults to 24 hours ago."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: "Maximum number of records to return."
+      responses:
+        '200':
+          description: A list of cache metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CacheMetricsRecord'
+                  count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /cache/purge:
+    post:
+      tags:
+        - Cache Management
+      summary: Purge the entire cache
+      responses:
+        '200':
+          description: Cache purged successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  stats_before:
+                    $ref: '#/components/schemas/CacheStats'
+                  stats_after:
+                    $ref: '#/components/schemas/CacheStats'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Cache is not available/enabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /uploader/status:
+    get:
+      tags:
+        - Uploader Monitoring
+      summary: Get uploader status
+      parameters:
+        - name: show_failed
+          in: query
+          schema:
+            type: boolean
+          description: "If true, includes a list of recently failed uploads in the response."
+        - name: max_attempts
+          in: query
+          schema:
+            type: integer
+            default: 5
+          description: "The failure threshold to consider when calculating failed counts."
+        - name: failed_limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+          description: "If show_failed is true, this limits the number of failed uploads returned."
+      responses:
+        '200':
+          description: Uploader status and statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    $ref: '#/components/schemas/UploaderStats'
+                  failed_uploads:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FailedUpload'
+                  failed_count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /uploader/failed:
+    get:
+      tags:
+        - Uploader Monitoring
+      summary: Get a list of failed uploads
+      parameters:
+        - name: max_attempts
+          in: query
+          schema:
+            type: integer
+            default: 5
+          description: "The failure threshold to consider when fetching failed uploads."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: "Maximum number of failed uploads to return."
+      responses:
+        '200':
+          description: A list of failed uploads.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  failed_uploads:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FailedUpload'
+                  count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/stats:
+    get:
+      tags:
+        - System Monitoring
+      summary: Get authentication statistics
+      parameters:
+        - name: window
+          in: query
+          schema:
+            type: string
+            default: "24h"
+          description: "Time window for statistics (e.g., '1h', '30m')."
+      responses:
+        '200':
+          description: Authentication statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    $ref: '#/components/schemas/AuthStats'
+                  window:
+                    type: string
+                  window_seconds:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health/overview:
+    get:
+      tags:
+        - Health Monitoring
+      summary: Get system health overview
+      parameters:
+        - name: hostname
+          in: query
+          schema:
+            type: string
+          description: "Optional. Filter overview for a specific server hostname."
+      responses:
+        '200':
+          description: System health overview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemHealthOverview'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health/servers/{hostname}:
+    get:
+      tags:
+        - Health Monitoring
+      summary: Get health status for a host
+      parameters:
+        - name: hostname
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Health statuses for the specified host.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hostname:
+                    type: string
+                  statuses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HealthStatus'
+                  count:
+                    type: integer
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health/servers/{hostname}/components/{component}:
+    get:
+      tags:
+        - Health Monitoring
+      summary: Get health status for a component
+      parameters:
+        - name: hostname
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: component
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: history
+          in: query
+          schema:
+            type: boolean
+          description: "If true, returns historical health data instead of the current status."
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: "If history=true, limit the number of historical records returned."
+      responses:
+        '200':
+          description: Current or historical health status for the component.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/HealthStatus'
+                  - type: object
+                    properties:
+                      hostname:
+                        type: string
+                      component:
+                        type: string
+                      history:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/HealthStatus'
+                      count:
+                        type: integer
+                      since:
+                        type: string
+                        format: date-time
+        '404':
+          description: Component health status not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /config:
+    get:
+      tags:
+        - System Information
+      summary: Get API configuration info
+      description: Returns basic information about the API and a list of available endpoints.
+      responses:
+        '200':
+          description: API configuration details.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_version:
+                    type: string
+                  server_type:
+                    type: string
+                  features_enabled:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+                  endpoints:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: string

@@ -15,6 +15,8 @@ const LOCK_TIMEOUT = 30 * time.Second
 type UserScopedObjectForCleanup struct {
 	AccountID   int64
 	ContentHash string
+	S3Domain    string
+	S3Localpart string
 }
 
 func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
@@ -66,9 +68,9 @@ func (d *Database) ExpungeOldMessages(ctx context.Context, olderThan time.Durati
 func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan time.Duration, limit int) ([]UserScopedObjectForCleanup, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
 	rows, err := d.GetReadPool().Query(ctx, `
-		SELECT account_id, content_hash
+		SELECT account_id, s3_domain, s3_localpart, content_hash
 		FROM messages
-		GROUP BY account_id, content_hash
+		GROUP BY account_id, s3_domain, s3_localpart, content_hash
 		HAVING bool_and(uploaded = TRUE AND expunged_at IS NOT NULL AND expunged_at < $1)
 		LIMIT $2;
 	`, threshold, limit)
@@ -80,7 +82,7 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 	var result []UserScopedObjectForCleanup
 	for rows.Next() {
 		var candidate UserScopedObjectForCleanup
-		if err := rows.Scan(&candidate.AccountID, &candidate.ContentHash); err != nil {
+		if err := rows.Scan(&candidate.AccountID, &candidate.S3Domain, &candidate.S3Localpart, &candidate.ContentHash); err != nil {
 			// Log and continue to process other rows
 			log.Printf("failed to scan user-scoped object for cleanup: %v", err)
 			continue
@@ -90,16 +92,16 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 	return result, nil
 }
 
-// DeleteExpungedMessagesByUserAndContentHash deletes all expunged message rows
-// from the database that match the given AccountID and ContentHash.
+// DeleteExpungedMessagesByS3KeyParts deletes all expunged message rows
+// from the database that match the given S3 key components.
 // It does NOT delete from message_contents, as the content may be shared.
-func (d *Database) DeleteExpungedMessagesByUserAndContentHash(ctx context.Context, accountID int64, contentHash string) error {
+func (d *Database) DeleteExpungedMessagesByS3KeyParts(ctx context.Context, accountID int64, s3Domain, s3Localpart, contentHash string) error {
 	_, err := d.GetWritePool().Exec(ctx, `
 		DELETE FROM messages
-		WHERE account_id = $1 AND content_hash = $2 AND expunged_at IS NOT NULL
-	`, accountID, contentHash)
+		WHERE account_id = $1 AND s3_domain = $2 AND s3_localpart = $3 AND content_hash = $4 AND expunged_at IS NOT NULL
+	`, accountID, s3Domain, s3Localpart, contentHash)
 	if err != nil {
-		return fmt.Errorf("failed to delete expunged messages for account %d and hash %s: %w", accountID, contentHash, err)
+		return fmt.Errorf("failed to delete expunged messages for account %d and S3 key parts (%s/%s/%s): %w", accountID, s3Domain, s3Localpart, contentHash, err)
 	}
 	return nil
 }
@@ -132,8 +134,8 @@ func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash s
 	return nil
 }
 
-// GetUnusedContentHashes finds content_hash values in message_contents that are no longer
-// referenced by any active (non-expunged) message. These are candidates for global cleanup.
+// GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
+// by any message row at all. These are candidates for global cleanup.
 func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]string, error) {
 	rows, err := d.GetReadPool().Query(ctx, `
 		SELECT mc.content_hash
@@ -141,7 +143,7 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 		WHERE NOT EXISTS (
 			SELECT 1
 			FROM messages m
-			WHERE m.content_hash = mc.content_hash AND m.expunged_at IS NULL
+			WHERE m.content_hash = mc.content_hash
 		)
 		LIMIT $1;
 	`, limit)
@@ -160,4 +162,117 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 		result = append(result, contentHash)
 	}
 	return result, nil
+}
+
+// CleanupSoftDeletedAccounts permanently deletes accounts that have been soft-deleted
+// for longer than the grace period
+func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+	threshold := time.Now().Add(-gracePeriod).UTC()
+
+	// Get accounts that have been soft-deleted longer than the grace period
+	rows, err := d.GetReadPool().Query(ctx, `
+		SELECT id 
+		FROM accounts 
+		WHERE deleted_at IS NOT NULL AND deleted_at < $1
+		ORDER BY deleted_at ASC
+		LIMIT 50
+	`, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query soft-deleted accounts: %w", err)
+	}
+	defer rows.Close()
+
+	var accountsToDelete []int64
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			log.Printf("failed to scan account ID: %v", err)
+			continue
+		}
+		accountsToDelete = append(accountsToDelete, accountID)
+	}
+
+	if len(accountsToDelete) == 0 {
+		return 0, nil
+	}
+
+	var totalDeleted int64
+	for _, accountID := range accountsToDelete {
+		if err := d.HardDeleteAccount(ctx, accountID); err != nil {
+			log.Printf("failed to hard delete account %d: %v", accountID, err)
+			continue
+		}
+		totalDeleted++
+	}
+
+	if totalDeleted > 0 {
+		log.Printf("cleaned up %d soft-deleted accounts that exceeded grace period", totalDeleted)
+	}
+
+	return totalDeleted, nil
+}
+
+// GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
+// messages left. Once all messages (and their corresponding S3 objects) are cleaned up,
+// the account's master record is safe to be permanently removed.
+func (d *Database) GetDanglingAccountsForFinalDeletion(ctx context.Context, limit int) ([]int64, error) {
+	rows, err := d.GetReadPool().Query(ctx, `
+		SELECT a.id
+		FROM accounts a
+		WHERE a.deleted_at IS NOT NULL
+		AND NOT EXISTS (SELECT 1 FROM messages WHERE account_id = a.id)
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query for dangling accounts: %w", err)
+	}
+	defer rows.Close()
+
+	var accountIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			// Log and continue to process other rows
+			log.Printf("failed to scan dangling account id: %v", err)
+			continue
+		}
+		accountIDs = append(accountIDs, id)
+	}
+	return accountIDs, nil
+}
+
+// FinalizeAccountDeletion permanently deletes an account and its credentials.
+// This should only be called on a dangling account that has no other dependencies.
+// The ON DELETE RESTRICT constraint on the messages table provides a final safety check.
+func (d *Database) FinalizeAccountDeletion(ctx context.Context, accountID int64) error {
+	tx, err := d.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for final account deletion: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// First, delete credentials associated with the account.
+	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = $1", accountID)
+	if err != nil {
+		return fmt.Errorf("failed to delete credentials during finalization for account %d: %w", accountID, err)
+	}
+
+	// Finally, delete the account itself.
+	result, err := tx.Exec(ctx, "DELETE FROM accounts WHERE id = $1", accountID)
+	if err != nil {
+		// The ON DELETE RESTRICT on messages should prevent this if messages still exist.
+		return fmt.Errorf("failed to finalize deletion of account %d: %w", accountID, err)
+	}
+
+	if result.RowsAffected() == 0 {
+		// This could happen in a race condition if another cleaner instance just deleted it.
+		// Not a critical error, but we can log it.
+		log.Printf("FinalizeAccountDeletion for account %d affected 0 rows. It may have already been deleted.", accountID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit final account deletion transaction for account %d: %w", accountID, err)
+	}
+
+	return nil
 }

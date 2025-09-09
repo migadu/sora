@@ -31,18 +31,18 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 	// Now query only the non-expunged messages
 	query := `
 		WITH numbered_messages AS (
-			SELECT 
-				account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-				internal_date, size, body_structure,
-				created_modseq, updated_modseq, expunged_modseq,
+			SELECT
+				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				flags_changed_at, subject, sent_date, message_id,
 				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
 		SELECT 
-			account_id, uid, mailbox_id, content_hash, uploaded, flags, custom_flags,
-			internal_date, size, body_structure,
-			created_modseq, updated_modseq, expunged_modseq, seqnum
+			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
+			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
+			flags_changed_at, subject, sent_date, message_id
 		FROM numbered_messages
 		ORDER BY uid` // Ordering by uid is fine, seqnum is derived based on id order
 

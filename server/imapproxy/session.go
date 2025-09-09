@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -325,7 +327,7 @@ func (s *Session) getPreferredBackend() (string, error) {
 	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
 	if err != nil {
 		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if err.Error() == "no server affinity found" {
+		if errors.Is(err, db.ErrNoServerAffinity) {
 			return "", nil
 		}
 		return "", err
@@ -652,5 +654,5 @@ func (s *Session) pollDatabaseDirectly(ctx context.Context) {
 }
 
 func isClosingError(err error) bool {
-	return err == io.EOF || strings.Contains(err.Error(), "use of closed network connection")
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
 }

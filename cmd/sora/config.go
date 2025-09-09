@@ -30,18 +30,18 @@ type CleanupConfig struct {
 
 // Local disk cache configuration.
 type LocalCacheConfig struct {
-	Capacity             string   `toml:"capacity"`
-	MaxObjectSize        string   `toml:"max_object_size"`
-	Path                 string   `toml:"path"`
-	MetricsInterval      string   `toml:"metrics_interval"`
-	MetricsRetention     string   `toml:"metrics_retention"`
-	PurgeInterval        string   `toml:"purge_interval"`
-	OrphanCleanupAge     string   `toml:"orphan_cleanup_age"`
-	EnableWarmup         bool     `toml:"enable_warmup"`
-	WarmupMessageCount   int      `toml:"warmup_message_count"`
-	WarmupMailboxes      []string `toml:"warmup_mailboxes"`
-	WarmupAsync          bool     `toml:"warmup_async"`
-	WarmupTimeout        string   `toml:"warmup_timeout"`
+	Capacity           string   `toml:"capacity"`
+	MaxObjectSize      string   `toml:"max_object_size"`
+	Path               string   `toml:"path"`
+	MetricsInterval    string   `toml:"metrics_interval"`
+	MetricsRetention   string   `toml:"metrics_retention"`
+	PurgeInterval      string   `toml:"purge_interval"`
+	OrphanCleanupAge   string   `toml:"orphan_cleanup_age"`
+	EnableWarmup       bool     `toml:"enable_warmup"`
+	WarmupMessageCount int      `toml:"warmup_message_count"`
+	WarmupMailboxes    []string `toml:"warmup_mailboxes"`
+	WarmupAsync        bool     `toml:"warmup_async"`
+	WarmupTimeout      string   `toml:"warmup_timeout"`
 }
 
 // IMAPServerConfig holds IMAP server configuration.
@@ -226,6 +226,17 @@ type MetricsConfig struct {
 	HashUsernames        bool   `toml:"hash_usernames"`         // Hash usernames for privacy
 }
 
+// HTTPAPIConfig holds HTTP API server configuration
+type HTTPAPIConfig struct {
+	Start        bool     `toml:"start"`
+	Addr         string   `toml:"addr"`
+	APIKey       string   `toml:"api_key"`
+	AllowedHosts []string `toml:"allowed_hosts"` // If empty, all hosts are allowed
+	TLS          bool     `toml:"tls"`
+	TLSCertFile  string   `toml:"tls_cert_file"`
+	TLSKeyFile   string   `toml:"tls_key_file"`
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	Debug              bool                         `toml:"debug"`
@@ -240,6 +251,7 @@ type ServersConfig struct {
 	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
 	RealIP             RealIPConfig                 `toml:"real_ip"`
 	Metrics            MetricsConfig                `toml:"metrics"`
+	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
 }
 
 // UploaderConfig holds upload worker configuration.
@@ -460,6 +472,15 @@ func newDefaultConfig() Config {
 				UserMetricsThreshold: 1000,
 				MaxTrackedUsers:      1000,
 				HashUsernames:        true,
+			},
+			HTTPAPI: HTTPAPIConfig{
+				Start:        false,
+				Addr:         ":8080",
+				APIKey:       "",
+				AllowedHosts: []string{},
+				TLS:          false,
+				TLSCertFile:  "",
+				TLSKeyFile:   "",
 			},
 		},
 		Uploader: UploaderConfig{

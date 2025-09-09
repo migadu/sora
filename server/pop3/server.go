@@ -3,10 +3,10 @@ package pop3
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -170,8 +170,8 @@ func (s *POP3Server) Start(errChan chan error) {
 			}
 
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
-			if strings.Contains(err.Error(), "PROXY protocol error") {
-				log.Printf("[POP3] PROXY protocol error, rejecting connection: %v", err)
+			if errors.Is(err, errProxyProtocol) {
+				log.Printf("[POP3] %v, rejecting connection", err)
 				continue // Continue accepting other connections
 			}
 
@@ -257,6 +257,8 @@ func (s *POP3Server) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
 }
 
+var errProxyProtocol = errors.New("PROXY protocol error")
+
 // proxyProtocolListener wraps a listener to handle PROXY protocol
 type proxyProtocolListener struct {
 	net.Listener
@@ -273,7 +275,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("PROXY protocol error: %w", err)
+		return nil, fmt.Errorf("%w: %v", errProxyProtocol, err)
 	}
 
 	// Wrap the connection with proxy info for later extraction

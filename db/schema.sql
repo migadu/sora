@@ -6,11 +6,15 @@ CREATE TABLE IF NOT EXISTS accounts (
 	id BIGSERIAL PRIMARY KEY,
 	last_server_addr VARCHAR(255),
 	last_server_time TIMESTAMP,
-	created_at TIMESTAMPTZ DEFAULT now() NOT NULL
+	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+	deleted_at TIMESTAMPTZ NULL -- Soft deletion timestamp
 );
 
 -- Create index for better performance
 CREATE INDEX IF NOT EXISTS idx_accounts_last_server ON accounts(last_server_addr);
+
+-- Index for soft deletion queries
+CREATE INDEX IF NOT EXISTS idx_accounts_deleted_at ON accounts(deleted_at);
 
 -- A table to store account passwords and identities
 CREATE TABLE IF NOT EXISTS credentials (
@@ -59,9 +63,12 @@ CREATE TABLE IF NOT EXISTS messages (
 	id BIGSERIAL PRIMARY KEY,       
 
     -- The account who owns the message
-	account_id BIGINT REFERENCES accounts(id) ON DELETE NO ACTION, 
+	account_id BIGINT REFERENCES accounts(id) ON DELETE RESTRICT, 
 
 	uid BIGINT NOT NULL,                -- The message UID in its mailbox
+	-- S3 key components, to ensure we can always find the object even if user email changes
+	s3_domain TEXT NOT NULL,
+	s3_localpart TEXT NOT NULL,
 	content_hash VARCHAR(64) NOT NULL,	-- Hash of the message content for deduplication
 	uploaded BOOLEAN DEFAULT FALSE,	    -- Flag to indicate if the message was uploaded to S3
 	recipients_json JSONB NOT NULL,	    -- JSONB field to store recipients
@@ -97,7 +104,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 -- Index for faster lookups by account_id and mailbox_id
-CREATE INDEX IF NOT EXISTS idx_messages_expunged_range ON messages (account_id, content_hash, expunged_at) WHERE expunged_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_expunged_range ON messages (account_id, s3_domain, s3_localpart, content_hash, expunged_at) WHERE expunged_at IS NOT NULL;
 
 -- Index to speed up message lookups by mailbox_id (for listing, searching)
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages (mailbox_id);

@@ -479,13 +479,12 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 		return nil
 	}
 
-	address, err := server.NewAddress(exporter.email)
-	if err != nil {
-		return fmt.Errorf("invalid email address format for S3 key: %w", err)
+	// Use the stored S3 key components from the message record to prevent issues
+	// if the user's primary email has changed since the message was stored.
+	if msg.S3Domain == "" || msg.S3Localpart == "" {
+		return fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}
-
-	// Construct S3 key
-	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
+	s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
 
 	// Download message content from S3
 	reader, err := exporter.s3.Get(s3Key)

@@ -144,6 +144,8 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
 			MailboxID:     mailbox.ID,
+			S3Domain:      s.IMAPUser.Address.Domain(),
+			S3Localpart:   s.IMAPUser.Address.LocalPart(),
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
