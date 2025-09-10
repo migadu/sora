@@ -138,8 +138,9 @@ type InsertMessageOptions struct {
 	BodyStructure        *imap.BodyStructure
 	Recipients           []helpers.Recipient
 	RawHeaders           string
-	PreservedUID         *uint32 // Optional: preserved UID from import
-	PreservedUIDValidity *uint32 // Optional: preserved UIDVALIDITY from import
+	PreservedUID         *uint32       // Optional: preserved UID from import
+	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
+	FTSRetention         time.Duration // Optional: FTS retention period to skip old messages
 }
 
 func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -274,14 +275,26 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	// Insert into message_contents, using the message's content_hash as the key.
 	// If a message_contents entry for this content_hash already exists, do nothing.
 	// This handles deduplication of text_body for messages with identical content_hash.
-	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-		VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
-		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
-	if err != nil {
-		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
-		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
+	// Skip FTS storage if message is older than retention period
+	shouldStoreFTS := true
+	if options.FTSRetention > 0 {
+		threshold := time.Now().Add(-options.FTSRetention)
+		if options.SentDate.Before(threshold) {
+			shouldStoreFTS = false
+			log.Printf("[DB] skipping FTS storage for old message (sent: %v, retention: %v)", options.SentDate, options.FTSRetention)
+		}
+	}
+
+	if shouldStoreFTS {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
+			VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
+			ON CONFLICT (content_hash) DO NOTHING
+		`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
+		if err != nil {
+			log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+			return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -466,14 +479,26 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 	// Insert into message_contents, using the message's content_hash as the key.
 	// If a message_contents entry for this content_hash already exists, do nothing.
 	// This handles deduplication of text_body for messages with identical content_hash.
-	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-		VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
-		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
-	if err != nil {
-		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
-		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
+	// Skip FTS storage if message is older than retention period
+	shouldStoreFTS := true
+	if options.FTSRetention > 0 {
+		threshold := time.Now().Add(-options.FTSRetention)
+		if options.SentDate.Before(threshold) {
+			shouldStoreFTS = false
+			log.Printf("[DB] skipping FTS storage for old message (sent: %v, retention: %v)", options.SentDate, options.FTSRetention)
+		}
+	}
+
+	if shouldStoreFTS {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
+			VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
+			ON CONFLICT (content_hash) DO NOTHING
+		`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
+		if err != nil {
+			log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+			return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

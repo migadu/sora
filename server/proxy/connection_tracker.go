@@ -188,19 +188,17 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	key := ct.makeKey(accountID, protocol, clientAddr)
 
-	var wasPersisted bool
 	ct.mu.Lock()
-	if conn, exists := ct.connections[key]; exists {
-		// If the connection was never persisted (isNew=true), we don't need to touch the DB.
-		wasPersisted = !conn.isNew
+	_, exists := ct.connections[key]
+	if exists {
 		delete(ct.connections, key)
 	}
 	ct.mu.Unlock()
 
-	// If not batching, write immediately
-	// If the connection existed in our tracker and was already persisted to the DB,
-	// unregister it from the DB immediately. This ensures external tools see the change right away.
-	if ct.persistToDB && wasPersisted {
+	// If persistence is enabled and the connection was tracked in memory,
+	// always attempt to unregister from the DB.
+	// The DB call is idempotent for non-existent rows.
+	if ct.persistToDB && exists {
 		return ct.db.UnregisterConnection(ctx, accountID, protocol, clientAddr)
 	}
 
@@ -401,44 +399,56 @@ func (ct *ConnectionTracker) flushChanges() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	ct.mu.Lock()
-	defer ct.mu.Unlock()
 
 	var (
-		toInsert []ConnectionInfo
-		toUpdate []ConnectionInfo
+		toInsert []db.ConnectionInfo
+		toUpdate []db.ConnectionInfo
 	)
 
 	// Collect changes
 	for _, conn := range ct.connections {
 		if conn.isNew {
-			toInsert = append(toInsert, *conn)
+			toInsert = append(toInsert, db.ConnectionInfo{
+				AccountID:  conn.AccountID,
+				Protocol:   conn.Protocol,
+				ClientAddr: conn.ClientAddr,
+				ServerAddr: conn.ServerAddr,
+				InstanceID: conn.InstanceID,
+			})
 			conn.isNew = false
 		} else if conn.isModified {
-			toUpdate = append(toUpdate, *conn)
+			toUpdate = append(toUpdate, db.ConnectionInfo{
+				AccountID:       conn.AccountID,
+				Protocol:        conn.Protocol,
+				ClientAddr:      conn.ClientAddr,
+				LastActivity:    conn.LastActivity,
+				ShouldTerminate: conn.ShouldTerminate,
+			})
 			conn.isModified = false
 		}
 	}
+	ct.mu.Unlock() // Release lock before making DB calls
 
-	// Apply changes to database
-	for _, conn := range toInsert {
-		if err := ct.db.RegisterConnection(ctx, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to insert connection: %v", ct.name, err)
-		}
+	if len(toInsert) == 0 && len(toUpdate) == 0 {
+		return
 	}
 
-	for _, conn := range toUpdate {
-		if err := ct.db.UpdateConnectionActivity(ctx, conn.AccountID, conn.Protocol, conn.ClientAddr); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to update connection: %v", ct.name, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Apply changes to database in real batches
+	if len(toInsert) > 0 {
+		// This requires a new method in the db package that uses pgx.Batch
+		if err := ct.db.BatchRegisterConnections(ctx, toInsert); err != nil {
+			log.Printf("[ConnectionTracker:%s] Failed to batch insert connections: %v", ct.name, err)
 		}
 	}
-
-	if len(toInsert) > 0 || len(toUpdate) > 0 {
-		log.Printf("[ConnectionTracker:%s] Batch update: %d inserts, %d updates",
-			ct.name, len(toInsert), len(toUpdate))
+	if len(toUpdate) > 0 {
+		// This requires a new method in the db package that uses pgx.Batch
+		if err := ct.db.BatchUpdateConnections(ctx, toUpdate); err != nil {
+			log.Printf("[ConnectionTracker:%s] Failed to batch update connections: %v", ct.name, err)
+		}
 	}
 }
 

@@ -134,6 +134,60 @@ func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash s
 	return nil
 }
 
+// CleanupFailedUploads deletes message rows and their corresponding pending_uploads
+// that are older than the grace period and were never successfully uploaded to S3.
+// This prevents orphaned message metadata from accumulating due to persistent upload failures.
+func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+	threshold := time.Now().Add(-gracePeriod).UTC()
+
+	// Use a CTE to identify and delete messages that were never uploaded, then
+	// use the result to delete the corresponding pending_uploads entries.
+	// We query for the count of deleted messages to return an accurate number for logging.
+	var deletedMessagesCount int64
+	err := d.GetWritePool().QueryRow(ctx, `
+		WITH deleted_messages AS (
+			DELETE FROM messages
+			WHERE uploaded = FALSE AND created_at < $1
+			RETURNING content_hash, account_id
+		),
+		deleted_pending_uploads AS (
+			DELETE FROM pending_uploads pu
+			USING deleted_messages dm
+			WHERE pu.content_hash = dm.content_hash AND pu.account_id = dm.account_id
+		)
+		SELECT count(*) FROM deleted_messages
+	`, threshold).Scan(&deletedMessagesCount)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
+	}
+
+	return deletedMessagesCount, nil
+}
+
+// CleanupOldMessageContents deletes message_contents rows for messages older than the retention period.
+// This is based on the newest (MAX) sent_date of all messages that reference a given content_hash.
+func (d *Database) CleanupOldMessageContents(ctx context.Context, retentionPeriod time.Duration) (int64, error) {
+	threshold := time.Now().Add(-retentionPeriod).UTC()
+
+	// Use DELETE ... USING, which is generally more efficient than a subquery with IN.
+	result, err := d.GetWritePool().Exec(ctx, `
+		DELETE FROM message_contents mc
+		USING (
+			SELECT content_hash
+			FROM messages
+			GROUP BY content_hash
+			HAVING MAX(sent_date) < $1
+		) AS to_delete
+		WHERE mc.content_hash = to_delete.content_hash
+	`, threshold)
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup old message contents: %w", err)
+	}
+
+	return result.RowsAffected(), nil
+}
+
 // GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
 // by any message row at all. These are candidates for global cleanup.
 func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]string, error) {

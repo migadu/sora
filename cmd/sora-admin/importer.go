@@ -47,6 +47,7 @@ type ImporterOptions struct {
 	ImportDelay   time.Duration // Delay between imports to control rate
 	SievePath     string        // Path to Sieve script file to import
 	PreserveUIDs  bool          // Preserve UIDs from dovecot-uidlist files
+	FTSRetention  time.Duration // FTS retention period to skip old messages
 }
 
 // Importer handles the maildir import process.
@@ -1226,6 +1227,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			RawHeaders:           rawHeadersText,
 			PreservedUID:         preservedUID,
 			PreservedUIDValidity: preservedUIDValidity,
+			FTSRetention:         i.options.FTSRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  hostname,

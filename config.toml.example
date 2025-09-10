@@ -418,28 +418,49 @@ retry_interval = "30s"
 [cleanup]
 # Grace period for deleted messages before permanent removal
 # Provides recovery window for accidentally deleted messages
+# Supports: h (hours), m (minutes), d (days)
 # Examples:
-#   grace_period = "7d"                        # Quick cleanup
-#   grace_period = "14d"                       # Standard grace period
-#   grace_period = "30d"                       # Extended recovery window
+#   grace_period = "2h"                        # 2 hours (minimal)
+#   grace_period = "24h"                       # 24 hours 
+#   grace_period = "7d"                        # 7 days (quick cleanup)
+#   grace_period = "14d"                       # 14 days (standard)
+#   grace_period = "30d"                       # 30 days (extended recovery)
 grace_period = "14d"
 
 # How often cleanup worker runs
 # Balance between cleanup responsiveness and system load
+# Supports: h (hours), m (minutes), d (days)
 # Examples:
+#   wake_interval = "15m"                      # Very frequent cleanup
 #   wake_interval = "30m"                      # Frequent cleanup
 #   wake_interval = "1h"                       # Standard cleanup
 #   wake_interval = "6h"                       # Infrequent cleanup
+#   wake_interval = "1d"                       # Daily cleanup
 wake_interval = "1h"
 
 # Maximum message age before automatic expungement (ephemeral storage)
 # Empty string = no age limit (messages kept indefinitely)
+# Supports: h (hours), m (minutes), d (days)
 # Examples:
 #   max_age_restriction = ""                   # No limit (default)
+#   max_age_restriction = "24h"                # 24 hours (very short)
+#   max_age_restriction = "7d"                 # 7 days retention
 #   max_age_restriction = "30d"                # 30 days retention
 #   max_age_restriction = "90d"                # 90 days retention
-#   max_age_restriction = "1y"                 # 1 year retention
+#   max_age_restriction = "365d"               # 1 year retention
 max_age_restriction = "" # Empty means no restriction
+
+# Full-text search (FTS) content retention period
+# Controls how long message text content is kept in the database for search functionality.
+# Older messages will have their searchable content removed but remain accessible.
+# This prevents the database from growing indefinitely while preserving search for recent messages.
+# Supports: h (hours), m (minutes), d (days)
+# Examples:
+#   fts_retention = "720h"                     # 30 days (1 month, aggressive)
+#   fts_retention = "90d"                      # 90 days (3 months)
+#   fts_retention = "365d"                     # 365 days (1 year)
+#   fts_retention = "730d"                     # 730 days (2 years, default)
+fts_retention = "730d" # 2 years default
 
 # =============================================================================
 # PROTOCOL SERVERS CONFIGURATION

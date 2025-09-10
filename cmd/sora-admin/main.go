@@ -27,12 +27,28 @@ var (
 	date    = "unknown"
 )
 
+// CleanupConfig holds cleanup configuration
+type CleanupConfig struct {
+	GracePeriod       string `toml:"grace_period"`
+	WakeInterval      string `toml:"wake_interval"`
+	MaxAgeRestriction string `toml:"max_age_restriction"`
+	FTSRetention      string `toml:"fts_retention"`
+}
+
+func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
+	if c.FTSRetention == "" {
+		return 730 * 24 * time.Hour, nil // 2 years default
+	}
+	return helpers.ParseDuration(c.FTSRetention)
+}
+
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
 	Database   config.DatabaseConfig `toml:"database"`
 	S3         S3Config              `toml:"s3"`
 	LocalCache LocalCacheConfig      `toml:"local_cache"`
 	Uploader   UploaderConfig        `toml:"uploader"`
+	Cleanup    CleanupConfig         `toml:"cleanup"`
 }
 
 // S3Config holds S3 configuration - copied from main config
@@ -117,6 +133,11 @@ func newDefaultAdminConfig() AdminConfig {
 			Concurrency:   10,
 			MaxAttempts:   5,
 			RetryInterval: "30s",
+		},
+		Cleanup: CleanupConfig{
+			GracePeriod:  "14d",     // 14 days
+			WakeInterval: "1h",      // 1 hour
+			FTSRetention: "730d",    // 2 years default
 		},
 	}
 }
@@ -2014,6 +2035,12 @@ Examples:
 		}
 	}
 
+	// Get FTS retention from config
+	ftsRetention, err := cfg.Cleanup.GetFTSRetention()
+	if err != nil {
+		log.Fatalf("Failed to parse FTS retention: %v", err)
+	}
+
 	// Create importer options
 	options := ImporterOptions{
 		DryRun:        *dryRun,
@@ -2028,6 +2055,7 @@ Examples:
 		ImportDelay:   *delay,
 		SievePath:     *sievePath,
 		PreserveUIDs:  *preserveUIDs || *dovecot,
+		FTSRetention:  ftsRetention,
 	}
 
 	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)

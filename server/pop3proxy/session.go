@@ -288,13 +288,34 @@ func (s *POP3ProxySession) getPreferredBackend() (string, error) {
 }
 
 func (s *POP3ProxySession) connectToBackend() error {
-	// Get preferred backend from affinity
-	preferredAddr, err := s.getPreferredBackend()
-	if err != nil {
-		log.Printf("[POP3PROXY %s] Could not get preferred backend for %s: %v", s.RemoteIP, s.username, err)
+	var preferredAddr string
+	var err error
+
+	// 1. Try routing lookup first
+	if s.server.connManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		routingCancel()
+		if lookupErr != nil {
+			log.Printf("[POP3PROXY %s] Routing lookup failed for %s: %v, falling back to affinity", s.RemoteIP, s.username, lookupErr)
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[POP3PROXY %s] Using routing lookup for %s: %s", s.RemoteIP, s.username, preferredAddr)
+		}
 	}
 
-	// Probabilistically ignore affinity to improve load balancing
+	// 2. If no routing info, try affinity
+	if preferredAddr == "" {
+		preferredAddr, err = s.getPreferredBackend()
+		if err != nil {
+			log.Printf("[POP3PROXY %s] Could not get preferred backend for %s: %v", s.RemoteIP, s.username, err)
+		}
+		if preferredAddr != "" {
+			log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
+		}
+	}
+
+	// 3. Apply stickiness to affinity/routing address
 	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[POP3PROXY %s] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.RemoteIP, s.username, s.server.affinityStickiness)
@@ -302,20 +323,15 @@ func (s *POP3ProxySession) connectToBackend() error {
 		}
 	}
 
-	if preferredAddr != "" {
-		log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
-	}
+	// 4. Connect using the determined address (or round-robin if empty)
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer connectCancel()
 
-	// Connect using the connection manager with user routing and PROXY protocol
-	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer routingCancel()
-
-	var actualAddr string
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
-	backendConn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
-		routingCtx,
-		s.username, // User email for routing lookup
+	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
+		connectCtx,
+		preferredAddr,
 		clientHost, clientPort, serverHost, serverPort,
 	)
 	if err != nil {
@@ -324,9 +340,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 	s.backendConn = backendConn
 	s.serverAddr = actualAddr
 
-	// Record successful connection for future affinity
+	// Record successful connection for future affinity if enabled
 	if s.server.enableAffinity && actualAddr != "" {
-		// Use a new, short-lived context for this update to avoid issues with the parent context's timeout.
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
@@ -439,12 +454,8 @@ func (s *POP3ProxySession) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if s.server.connTracker != nil {
+		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to unregister connection for %s: %v", s.RemoteIP, s.username, err)
-			}
-		} else {
-			if err := s.server.db.UnregisterConnection(ctx, s.accountID, "POP3", s.RemoteIP); err != nil {
 				log.Printf("[POP3PROXY %s] Failed to unregister connection for %s: %v", s.RemoteIP, s.username, err)
 			}
 		}
@@ -464,19 +475,17 @@ func (s *POP3ProxySession) registerConnection() error {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
-	if s.server.connTracker == nil {
-		// If no connection tracker, use direct database call
-		return s.server.db.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr, s.server.hostname)
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr)
 	}
-
-	return s.server.connTracker.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr)
+	return nil
 }
 
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
-	// If connection tracking is disabled, fall back to the old polling mechanism.
+	// If connection tracking is disabled, do nothing and wait for session to end.
 	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
-		s.pollDatabaseDirectly(ctx)
+		<-ctx.Done()
 		return
 	}
 
@@ -516,39 +525,6 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "POP3", s.RemoteIP); err != nil {
 				log.Printf("[POP3PROXY %s] Failed to update activity for %s: %v", s.RemoteIP, s.username, err)
-			}
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pollDatabaseDirectly is the legacy behavior for when connection tracking is disabled.
-func (s *POP3ProxySession) pollDatabaseDirectly(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-
-			// Update activity
-			if err := s.server.db.UpdateConnectionActivity(updateCtx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to update activity for %s: %v", s.RemoteIP, s.username, err)
-			}
-
-			// Check if connection should be terminated
-			shouldTerminate, err := s.server.db.CheckConnectionTermination(updateCtx, s.accountID, "POP3", s.RemoteIP)
-			if err != nil {
-				log.Printf("[POP3PROXY %s] Failed to check termination for %s: %v", s.RemoteIP, s.username, err)
-			} else if shouldTerminate {
-				log.Printf("[POP3PROXY %s] Connection marked for termination, disconnecting: %s", s.RemoteIP, s.username)
-				cancel()
-				s.clientConn.Close()
-				s.backendConn.Close()
-				return
 			}
 			cancel()
 		case <-ctx.Done():

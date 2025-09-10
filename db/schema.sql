@@ -110,7 +110,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_expunged_range ON messages (account_id, 
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages (mailbox_id);
 
 CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages (content_hash);
+
+-- Index for CleanupOldMessageContents: efficiently find the max sent_date per content_hash
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash_sent_date ON messages (content_hash, sent_date);
 CREATE INDEX IF NOT EXISTS idx_messages_expunged_content_hash ON messages (content_hash) WHERE expunged_at IS NOT NULL;
+
+-- Index for CleanupFailedUploads: efficiently find old messages that were never uploaded.
+CREATE INDEX IF NOT EXISTS idx_messages_uploaded_created_at ON messages (created_at) WHERE uploaded = FALSE;
 
 -- Index to speed up message lookups by message_id
 CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (LOWER(message_id));

@@ -3,7 +3,10 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ConnectionInfo represents an active connection
@@ -79,6 +82,69 @@ func (db *Database) UnregisterConnection(ctx context.Context, accountID int64, p
 	}
 
 	return nil
+}
+
+// BatchRegisterConnections registers multiple new active connections in a single batch.
+func (db *Database) BatchRegisterConnections(ctx context.Context, connections []ConnectionInfo) error {
+	if len(connections) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	query := `
+		INSERT INTO active_connections (account_id, protocol, client_addr, server_addr, instance_id)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (account_id, protocol, client_addr)
+		DO UPDATE SET server_addr = EXCLUDED.server_addr,
+		              instance_id = EXCLUDED.instance_id,
+		              last_activity = now()`
+
+	for _, conn := range connections {
+		batch.Queue(query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID)
+	}
+
+	br := db.GetWritePool().SendBatch(ctx, batch)
+	defer br.Close()
+
+	// We need to check the result of each queued command.
+	for i := 0; i < len(connections); i++ {
+		_, err := br.Exec()
+		if err != nil {
+			// Log the error for the specific failed insert/update but continue.
+			// A single failure shouldn't stop the whole batch.
+			log.Printf("[DB] BatchRegisterConnections: error processing item %d: %v", i, err)
+		}
+	}
+
+	return br.Close() // br.Close() will return the first error encountered if any.
+}
+
+// BatchUpdateConnections updates multiple connections in a single batch.
+func (db *Database) BatchUpdateConnections(ctx context.Context, connections []ConnectionInfo) error {
+	if len(connections) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	query := `
+		UPDATE active_connections
+		SET last_activity = now(), should_terminate = $4
+		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3`
+
+	for _, conn := range connections {
+		batch.Queue(query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ShouldTerminate)
+	}
+
+	br := db.GetWritePool().SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < len(connections); i++ {
+		if _, err := br.Exec(); err != nil {
+			log.Printf("[DB] BatchUpdateConnections: error processing item %d: %v", i, err)
+		}
+	}
+
+	return br.Close()
 }
 
 // CleanupStaleConnections removes connections that haven't been active for the specified duration

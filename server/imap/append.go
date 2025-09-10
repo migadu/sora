@@ -159,6 +159,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
 			RawHeaders:    rawHeadersText,
+			FTSRetention:  s.server.ftsRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  s.server.hostname,

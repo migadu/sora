@@ -101,7 +101,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid POP3 proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		log.Printf("WARNING: invalid LMTP proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
 		stickiness = 1.0
 	}
 

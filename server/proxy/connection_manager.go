@@ -63,16 +63,16 @@ func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remot
 
 // Connect attempts to connect to a remote server with round-robin and failover
 func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, error) {
-	return cm.ConnectWithProxy(preferredAddr, "", 0, "", 0)
+	return cm.ConnectWithProxy(context.Background(), preferredAddr, "", 0, "", 0)
 }
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
-func (cm *ConnectionManager) ConnectWithProxy(preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, error) {
+func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, error) {
 	// If we have a preferred address and it's in our list, try it first
 	if preferredAddr != "" {
 		for _, addr := range cm.remoteAddrs {
 			if addr == preferredAddr && cm.isHealthy(addr) {
-				conn, err := cm.dialWithProxy(addr, clientIP, clientPort, serverIP, serverPort)
+				conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort)
 				if err == nil {
 					return conn, addr, nil
 				}
@@ -97,7 +97,7 @@ func (cm *ConnectionManager) ConnectWithProxy(preferredAddr, clientIP string, cl
 			}
 		}
 
-		conn, err := cm.dialWithProxy(addr, clientIP, clientPort, serverIP, serverPort)
+		conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort)
 		if err == nil {
 			return conn, addr, nil
 		}
@@ -164,13 +164,10 @@ func (cm *ConnectionManager) ResolveAddresses() error {
 	return nil
 }
 
-func (cm *ConnectionManager) dial(addr string) (net.Conn, error) {
+func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
-	defer cancel()
 
 	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
 
@@ -191,20 +188,17 @@ func (cm *ConnectionManager) dial(addr string) (net.Conn, error) {
 	}
 
 	// Log the actual local and remote addresses of the established connection
-	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s", 
+	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
 		addr, conn.LocalAddr(), conn.RemoteAddr())
 
 	return conn, nil
 }
 
-func (cm *ConnectionManager) dialWithProxy(addr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, error) {
+func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, error) {
 	// For PROXY protocol, we need to establish plain TCP connection first
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
-	defer cancel()
 
 	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
 
@@ -215,12 +209,12 @@ func (cm *ConnectionManager) dialWithProxy(addr, clientIP string, clientPort int
 		return nil, err
 	}
 
-	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s", 
+	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
 		addr, conn.LocalAddr(), conn.RemoteAddr())
 
 	// If we have client IP information, send PROXY protocol header
 	if clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
-		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d", 
+		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d",
 			clientIP, clientPort, serverIP, serverPort)
 		err = cm.writeProxyV2Header(conn, clientIP, clientPort, serverIP, serverPort)
 		if err != nil {
@@ -228,7 +222,7 @@ func (cm *ConnectionManager) dialWithProxy(addr, clientIP string, clientPort int
 			return nil, fmt.Errorf("failed to send PROXY protocol header: %w", err)
 		}
 	} else {
-		log.Printf("[ConnectionManager] No PROXY header sent - clientIP=%s:%d serverIP=%s:%d", 
+		log.Printf("[ConnectionManager] No PROXY header sent - clientIP=%s:%d serverIP=%s:%d",
 			clientIP, clientPort, serverIP, serverPort)
 	}
 
@@ -374,7 +368,7 @@ func (cm *ConnectionManager) ConnectToSpecific(addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("address %s not in remote addresses list", addr)
 	}
 
-	return cm.dial(addr)
+	return cm.dial(context.Background(), addr)
 }
 
 // IsRemoteTLS returns whether remote connections use TLS
@@ -387,67 +381,15 @@ func (cm *ConnectionManager) IsRemoteTLSVerifyEnabled() bool {
 	return cm.remoteTLSVerify
 }
 
-// ConnectForUser attempts to connect to a server based on user routing lookup
-// If routing lookup fails or returns no result, falls back to default behavior
-func (cm *ConnectionManager) ConnectForUser(ctx context.Context, email string) (net.Conn, string, error) {
-	return cm.ConnectForUserWithProxy(ctx, email, "", 0, "", 0)
+// HasRouting returns true if a user routing lookup is configured.
+func (cm *ConnectionManager) HasRouting() bool {
+	return cm.routingLookup != nil
 }
 
-// ConnectForUserWithProxy attempts to connect to a server based on user routing lookup with PROXY protocol
-func (cm *ConnectionManager) ConnectForUserWithProxy(ctx context.Context, email, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, error) {
-	var preferredAddr string
-
-	// Try routing lookup if available
-	if cm.routingLookup != nil && email != "" {
-		routingInfo, err := cm.routingLookup.LookupUserRoute(ctx, email)
-		if err != nil {
-			log.Printf("[ConnectionManager] Routing lookup failed for user %s: %v, falling back to default", email, err)
-		} else {
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[ConnectionManager] User %s routed to server: %s", 
-				email, routingInfo.ServerAddress)
-		}
+// LookupUserRoute performs a user routing lookup if configured.
+func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) (*UserRoutingInfo, error) {
+	if !cm.HasRouting() || email == "" {
+		return nil, nil
 	}
-
-	// Use the preferred address if found, otherwise fall back to round-robin
-	return cm.ConnectWithProxy(preferredAddr, clientIP, clientPort, serverIP, serverPort)
-}
-
-// AuthenticateAndConnectForUserWithProxy performs authentication and routing in one step
-// Returns connection, server address, authentication result, and error
-func (cm *ConnectionManager) AuthenticateAndConnectForUserWithProxy(ctx context.Context, email, password, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, AuthResult, error) {
-	var preferredAddr string
-	authResult := AuthUserNotFound
-
-	// Try authentication and routing lookup if available
-	if cm.routingLookup != nil && email != "" {
-		routingInfo, result, authErr := cm.routingLookup.AuthenticateAndRoute(ctx, email, password)
-		
-		authResult = result
-		
-		switch result {
-		case AuthUserNotFound:
-			log.Printf("[ConnectionManager] User %s not found in prelookup DB, falling back to default routing", email)
-			// Continue with fallback
-			
-		case AuthSuccess:
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[ConnectionManager] User %s authenticated and routed to server: %s", 
-				email, routingInfo.ServerAddress)
-			// Continue with connection
-			
-		case AuthFailed:
-			log.Printf("[ConnectionManager] Authentication failed for user %s, rejecting connection", email)
-			return nil, "", authResult, fmt.Errorf("authentication failed for user: %s", email)
-		}
-		
-		// Log auth errors for debugging but don't fail unless it's AuthFailed
-		if authErr != nil && result != AuthUserNotFound {
-			log.Printf("[ConnectionManager] Auth error for user %s: %v", email, authErr)
-		}
-	}
-
-	// Connect using the preferred address if found, otherwise fall back to round-robin
-	conn, serverAddr, err := cm.ConnectWithProxy(preferredAddr, clientIP, clientPort, serverIP, serverPort)
-	return conn, serverAddr, authResult, err
+	return cm.routingLookup.LookupUserRoute(ctx, email)
 }

@@ -260,13 +260,35 @@ func (s *Session) getPreferredBackend() (string, error) {
 
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
-	// Get preferred backend from affinity
-	preferredAddr, err := s.getPreferredBackend()
-	if err != nil {
-		log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
+	var preferredAddr string
+	var err error
+
+	// 1. Try routing lookup first
+	// Note: For LMTP, we use the sender's email for routing. This could be enhanced.
+	if s.server.connManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.from)
+		routingCancel()
+		if lookupErr != nil {
+			log.Printf("[LMTP Proxy] Routing lookup failed for sender %s: %v, falling back to affinity", s.from, lookupErr)
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[LMTP Proxy] Using routing lookup for sender %s: %s", s.from, preferredAddr)
+		}
 	}
 
-	// Probabilistically ignore affinity to improve load balancing
+	// 2. If no routing info, try affinity
+	if preferredAddr == "" {
+		preferredAddr, err = s.getPreferredBackend()
+		if err != nil {
+			log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
+		}
+		if preferredAddr != "" {
+			log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
+		}
+	}
+
+	// 3. Apply stickiness to affinity/routing address
 	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
@@ -274,21 +296,15 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	if preferredAddr != "" {
-		log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-	}
+	// 4. Connect using the determined address (or round-robin if empty)
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer connectCancel()
 
-	// Connect using the connection manager with user routing and PROXY protocol
-	// Note: For LMTP, we need a recipient email for routing, but we'll use the sender for now
-	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer routingCancel()
-
-	var actualAddr string
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
-	backendConn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
-		routingCtx,
-		s.from, // Use sender email for routing lookup (could be enhanced to use recipient)
+	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
+		connectCtx,
+		preferredAddr,
 		clientHost, clientPort, serverHost, serverPort,
 	)
 	if err != nil {
@@ -306,7 +322,6 @@ func (s *Session) connectToBackend() error {
 
 	// Record successful connection for future affinity
 	if s.server.enableAffinity && actualAddr != "" {
-		// Use a new, short-lived context for this update to avoid issues with the parent context's timeout.
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err = s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
@@ -455,12 +470,8 @@ func (s *Session) close() {
 
 		clientAddr := s.clientConn.RemoteAddr().String()
 
-		if s.server.connTracker != nil {
+		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "LMTP", clientAddr); err != nil {
-				log.Printf("[LMTP Proxy] Failed to unregister connection for %s: %v", s.username, err)
-			}
-		} else {
-			if err := s.server.db.UnregisterConnection(ctx, s.accountID, "LMTP", clientAddr); err != nil {
 				log.Printf("[LMTP Proxy] Failed to unregister connection for %s: %v", s.username, err)
 			}
 		}
@@ -482,22 +493,21 @@ func (s *Session) registerConnection() error {
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 
-	if s.server.connTracker == nil {
-		return s.server.db.RegisterConnection(ctx, s.accountID, "LMTP", clientAddr, s.serverAddr, s.server.hostname)
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "LMTP", clientAddr, s.serverAddr)
 	}
-
-	return s.server.connTracker.RegisterConnection(ctx, s.accountID, "LMTP", clientAddr, s.serverAddr)
+	return nil
 }
 
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *Session) updateActivityPeriodically(ctx context.Context) {
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	// If connection tracking is disabled, fall back to the old polling mechanism.
+	// If connection tracking is disabled, do nothing and wait for session to end.
 	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
-		s.pollDatabaseDirectly(ctx)
+		<-ctx.Done()
 		return
 	}
+
+	clientAddr := s.clientConn.RemoteAddr().String()
 
 	// New mechanism: listen for kick notifications and only update activity periodically.
 	activityTicker := time.NewTicker(30 * time.Second)
@@ -534,38 +544,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "LMTP", clientAddr); err != nil {
 				log.Printf("[LMTP Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pollDatabaseDirectly is the legacy behavior for when connection tracking is disabled.
-func (s *Session) pollDatabaseDirectly(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	for {
-		select {
-		case <-ticker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-
-			if err := s.server.db.UpdateConnectionActivity(updateCtx, s.accountID, "LMTP", clientAddr); err != nil {
-				log.Printf("[LMTP Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-
-			shouldTerminate, err := s.server.db.CheckConnectionTermination(updateCtx, s.accountID, "LMTP", clientAddr)
-			if err != nil {
-				log.Printf("[LMTP Proxy] Failed to check termination for %s: %v", s.username, err)
-			} else if shouldTerminate {
-				log.Printf("[LMTP Proxy] Connection marked for termination, disconnecting: %s", s.username)
-				cancel()
-				s.clientConn.Close()
-				s.backendConn.Close()
-				return
 			}
 			cancel()
 		case <-ctx.Done():

@@ -342,62 +342,34 @@ func (s *Session) getPreferredBackend() (string, error) {
 
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
-	// First try user-based routing from prelookup database
 	var preferredAddr string
+	var err error
 
-	// Try routing lookup first (takes precedence over affinity)
-	routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-	defer routingCancel()
-
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
-	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
-	conn, serverAddr, err := s.server.connManager.ConnectForUserWithProxy(
-		routingCtx,
-		s.username,
-		clientHost,
-		clientPort,
-		serverHost,
-		serverPort,
-	)
-
-	if err == nil {
-		// Successfully connected using routing lookup or fallback
-		s.backendConn = conn
-		s.serverAddr = serverAddr
-		s.backendReader = bufio.NewReader(s.backendConn)
-		s.backendWriter = bufio.NewWriter(s.backendConn)
-
-		// Read greeting from backend
-		greeting, greetingErr := s.backendReader.ReadString('\n')
-		if greetingErr != nil {
-			s.backendConn.Close()
-			return fmt.Errorf("failed to read backend greeting: %w", greetingErr)
+	// 1. Try routing lookup first
+	if s.server.connManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		routingCancel()
+		if lookupErr != nil {
+			log.Printf("[IMAP Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 		}
-		log.Printf("[IMAP Proxy] Backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
-
-		// Record successful connection for future affinity if enabled
-		if s.server.enableAffinity && s.accountID != 0 {
-			updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer updateCancel()
-			if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, serverAddr); err != nil {
-				log.Printf("[IMAP Proxy] Failed to record server affinity for %s: %v", s.username, err)
-			}
-		}
-
-		log.Printf("[IMAP Proxy] Connected to backend %s for user %s", serverAddr, s.username)
-		return nil
 	}
 
-	// Fallback to original affinity-based logic if user routing fails completely
-	log.Printf("[IMAP Proxy] User-based routing failed for %s: %v, falling back to affinity", s.username, err)
-
-	// Get preferred backend from affinity
-	preferredAddr, err = s.getPreferredBackend()
-	if err != nil {
-		log.Printf("[IMAP Proxy] Could not get preferred backend for %s: %v", s.username, err)
+	// 2. If no routing info, try affinity
+	if preferredAddr == "" {
+		preferredAddr, err = s.getPreferredBackend()
+		if err != nil {
+			log.Printf("[IMAP Proxy] Could not get preferred backend for %s: %v", s.username, err)
+		}
+		if preferredAddr != "" {
+			log.Printf("[IMAP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
+		}
 	}
 
-	// Probabilistically ignore affinity to improve load balancing
+	// 3. Apply stickiness to affinity/routing address
 	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[IMAP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
@@ -405,13 +377,18 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	if preferredAddr != "" {
-		log.Printf("[IMAP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-	}
+	// 4. Connect using the determined address (or round-robin if empty)
+	// Create a new context for this connection attempt, respecting the overall session context.
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer connectCancel()
 
-	// Connect using the connection manager with PROXY protocol
-	var actualAddr string
-	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(preferredAddr, clientHost, clientPort, serverHost, serverPort)
+	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
+	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
+		connectCtx,
+		preferredAddr,
+		clientHost, clientPort, serverHost, serverPort,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
@@ -420,12 +397,11 @@ func (s *Session) connectToBackend() error {
 	s.backendReader = bufio.NewReader(s.backendConn)
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
-	// Record successful connection for future affinity
+	// Record successful connection for future affinity if enabled
 	if s.server.enableAffinity && actualAddr != "" {
-		// Use a new, short-lived context for this update to avoid issues with the parent context's timeout.
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
-		if err = s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
+		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[IMAP Proxy] Failed to update server affinity for %s: %v", s.username, err)
 		} else {
 			log.Printf("[IMAP Proxy] Updated server affinity for %s to %s", s.username, actualAddr)
@@ -534,12 +510,8 @@ func (s *Session) close() {
 
 		clientAddr := s.clientConn.RemoteAddr().String()
 
-		if s.server.connTracker != nil {
+		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "IMAP", clientAddr); err != nil {
-				log.Printf("[IMAP Proxy] Failed to unregister connection for %s: %v", s.username, err)
-			}
-		} else {
-			if err := s.server.db.UnregisterConnection(ctx, s.accountID, "IMAP", clientAddr); err != nil {
 				log.Printf("[IMAP Proxy] Failed to unregister connection for %s: %v", s.username, err)
 			}
 		}
@@ -561,22 +533,21 @@ func (s *Session) registerConnection() error {
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 
-	if s.server.connTracker == nil {
-		return s.server.db.RegisterConnection(ctx, s.accountID, "IMAP", clientAddr, s.serverAddr, s.server.hostname)
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "IMAP", clientAddr, s.serverAddr)
 	}
-
-	return s.server.connTracker.RegisterConnection(ctx, s.accountID, "IMAP", clientAddr, s.serverAddr)
+	return nil
 }
 
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *Session) updateActivityPeriodically(ctx context.Context) {
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	// If connection tracking is disabled, fall back to the old polling mechanism.
+	// If connection tracking is disabled, do nothing and wait for session to end.
 	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
-		s.pollDatabaseDirectly(ctx)
+		<-ctx.Done()
 		return
 	}
+
+	clientAddr := s.clientConn.RemoteAddr().String()
 
 	// New mechanism: listen for kick notifications and only update activity periodically.
 	activityTicker := time.NewTicker(30 * time.Second)
@@ -613,38 +584,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "IMAP", clientAddr); err != nil {
 				log.Printf("[IMAP Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pollDatabaseDirectly is the legacy behavior for when connection tracking is disabled.
-func (s *Session) pollDatabaseDirectly(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	for {
-		select {
-		case <-ticker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-
-			if err := s.server.db.UpdateConnectionActivity(updateCtx, s.accountID, "IMAP", clientAddr); err != nil {
-				log.Printf("[IMAP Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-
-			shouldTerminate, err := s.server.db.CheckConnectionTermination(updateCtx, s.accountID, "IMAP", clientAddr)
-			if err != nil {
-				log.Printf("[IMAP Proxy] Failed to check termination for %s: %v", s.username, err)
-			} else if shouldTerminate {
-				log.Printf("[IMAP Proxy] Connection marked for termination, disconnecting: %s", s.username)
-				cancel()
-				s.clientConn.Close()
-				s.backendConn.Close()
-				return
 			}
 			cancel()
 		case <-ctx.Done():

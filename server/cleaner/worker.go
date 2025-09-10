@@ -34,10 +34,11 @@ type CleanupWorker struct {
 	interval          time.Duration
 	gracePeriod       time.Duration
 	maxAgeRestriction time.Duration
+	ftsRetention      time.Duration
 }
 
 // New creates a new CleanupWorker.
-func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction time.Duration) *CleanupWorker {
+func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention time.Duration) *CleanupWorker {
 	return &CleanupWorker{
 		db:                db,
 		s3:                s3,
@@ -45,14 +46,15 @@ func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, g
 		interval:          interval,
 		gracePeriod:       gracePeriod,
 		maxAgeRestriction: maxAgeRestriction,
+		ftsRetention:      ftsRetention,
 	}
 }
 
 func (w *CleanupWorker) Start(ctx context.Context) {
 	if w.maxAgeRestriction > 0 {
-		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, max age restriction: %v", w.interval, w.gracePeriod, w.maxAgeRestriction)
+		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, max age restriction: %v, FTS retention: %v", w.interval, w.gracePeriod, w.maxAgeRestriction, w.ftsRetention)
 	} else {
-		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v", w.interval, w.gracePeriod)
+		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, FTS retention: %v", w.interval, w.gracePeriod, w.ftsRetention)
 	}
 	interval := w.interval
 
@@ -101,6 +103,16 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		} else if count > 0 {
 			log.Printf("[CLEANUP] expunged %d messages older than %v", count, w.maxAgeRestriction)
 		}
+	}
+
+	// --- Phase 0a: Cleanup of failed uploads ---
+	// This removes message metadata for messages that were never successfully uploaded to S3.
+	failedUploadsCount, err := w.db.CleanupFailedUploads(ctx, w.gracePeriod)
+	if err != nil {
+		// Log the error but continue, as other cleanup tasks can still proceed.
+		log.Printf("[CLEANUP] failed to clean up failed uploads: %v", err)
+	} else if failedUploadsCount > 0 {
+		log.Printf("[CLEANUP] cleaned up %d messages that failed to upload within the grace period", failedUploadsCount)
 	}
 
 	// --- Phase 0: Process soft-deleted accounts ---
@@ -171,7 +183,18 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		log.Println("[CLEANUP] no user-scoped objects to clean up")
 	}
 
-	// --- Phase 2: Global resource cleanup (message_contents and cache) ---
+	// --- Phase 2a: FTS Content cleanup (old message_contents) ---
+	if w.ftsRetention > 0 {
+		count, err := w.db.CleanupOldMessageContents(ctx, w.ftsRetention)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to clean up old message contents: %v", err)
+			// Continue with other cleanup tasks even if this fails
+		} else if count > 0 {
+			log.Printf("[CLEANUP] cleaned up %d old message_contents rows older than %v", count, w.ftsRetention)
+		}
+	}
+
+	// --- Phase 2b: Global resource cleanup (message_contents and cache) ---
 	orphanHashes, err := w.db.GetUnusedContentHashes(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to list unused content hashes for global cleanup: %v", err)

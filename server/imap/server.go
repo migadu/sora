@@ -41,6 +41,7 @@ type IMAPServer struct {
 	masterSASLUsername []byte
 	masterSASLPassword []byte
 	appendLimit        int64
+	ftsRetention       time.Duration
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -84,6 +85,7 @@ type IMAPServerOptions struct {
 	WarmupMailboxes      []string
 	WarmupAsync          bool
 	WarmupTimeout        string
+	FTSRetention         time.Duration
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -119,6 +121,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		uploader:           uploadWorker,
 		cache:              cache,
 		appendLimit:        options.AppendLimit,
+		ftsRetention:       options.FTSRetention,
 		limiter:            serverPkg.NewConnectionLimiter("IMAP", options.MaxConnections, options.MaxConnectionsPerIP),
 		authLimiter:        authLimiter,
 		proxyReader:        proxyReader,

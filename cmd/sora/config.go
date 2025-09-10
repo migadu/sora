@@ -26,6 +26,7 @@ type CleanupConfig struct {
 	GracePeriod       string `toml:"grace_period"`
 	WakeInterval      string `toml:"wake_interval"`
 	MaxAgeRestriction string `toml:"max_age_restriction"`
+	FTSRetention      string `toml:"fts_retention"`
 }
 
 // Local disk cache configuration.
@@ -177,6 +178,9 @@ type ManageSieveProxyServerConfig struct {
 	ConnectTimeout      string                       `toml:"connect_timeout"`
 	AuthRateLimit       server.AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup           *proxy.PreLookupConfig       `toml:"prelookup"`       // Database-driven user routing
+	EnableAffinity      bool                         `toml:"enable_affinity"`
+	AffinityStickiness  float64                      `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity    string                       `toml:"affinity_validity"`
 }
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
@@ -316,6 +320,7 @@ func newDefaultConfig() Config {
 		Cleanup: CleanupConfig{
 			GracePeriod:  "14d",
 			WakeInterval: "1h",
+			FTSRetention: "730d", // 2 years default
 		},
 		LocalCache: LocalCacheConfig{
 			Capacity:           "1gb",
@@ -424,6 +429,9 @@ func newDefaultConfig() Config {
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
 				AuthRateLimit:       server.DefaultAuthRateLimiterConfig(),
+				EnableAffinity:      true,
+				AffinityStickiness:  0.9,
+				AffinityValidity:    "24h",
 			},
 			LMTPProxy: LMTPProxyServerConfig{
 				Start:               false,
@@ -512,6 +520,13 @@ func (c *CleanupConfig) GetMaxAgeRestriction() (time.Duration, error) {
 		return 0, nil // 0 means no restriction
 	}
 	return helpers.ParseDuration(c.MaxAgeRestriction)
+}
+
+func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
+	if c.FTSRetention == "" {
+		return 730 * 24 * time.Hour, nil // 2 years default
+	}
+	return helpers.ParseDuration(c.FTSRetention)
 }
 
 func (c *LocalCacheConfig) GetCapacity() (int64, error) {
@@ -612,6 +627,14 @@ func (c *ManageSieveProxyServerConfig) GetConnectTimeout() (time.Duration, error
 		return 30 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.ConnectTimeout)
+}
+
+// GetAffinityValidity parses the affinity validity duration for ManageSieve proxy
+func (c *ManageSieveProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
+	if c.AffinityValidity == "" {
+		return 24 * time.Hour, nil
+	}
+	return helpers.ParseDuration(c.AffinityValidity)
 }
 
 // GetUpdateInterval parses the update interval duration for connection tracking

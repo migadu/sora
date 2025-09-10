@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/db"
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -241,18 +244,76 @@ func (s *Session) sendGreeting() {
 	s.clientWriter.Flush()
 }
 
+// getPreferredBackend fetches the preferred backend server for the user based on affinity.
+func (s *Session) getPreferredBackend() (string, error) {
+	if !s.server.enableAffinity {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+	defer cancel()
+
+	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	if err != nil {
+		if errors.Is(err, db.ErrNoServerAffinity) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
+		return lastAddr, nil
+	}
+
+	return "", nil
+}
+
 // connectToBackendAndAuth connects to backend and authenticates.
 func (s *Session) connectToBackendAndAuth() error {
-	// Connect using the connection manager with user routing and PROXY protocol
-	routingCtx, routingCancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer routingCancel()
+	var preferredAddr string
+	var err error
 
-	var actualAddr string
+	// 1. Try routing lookup first
+	if s.server.connManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		routingCancel()
+		if lookupErr != nil {
+			log.Printf("[ManageSieve Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			preferredAddr = routingInfo.ServerAddress
+			log.Printf("[ManageSieve Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
+		}
+	}
+
+	// 2. If no routing info, try affinity
+	if preferredAddr == "" {
+		preferredAddr, err = s.getPreferredBackend()
+		if err != nil {
+			log.Printf("[ManageSieve Proxy] Could not get preferred backend for %s: %v", s.username, err)
+		}
+		if preferredAddr != "" {
+			log.Printf("[ManageSieve Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
+		}
+	}
+
+	// 3. Apply stickiness to affinity/routing address
+	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+		if rand.Float64() > s.server.affinityStickiness {
+			log.Printf("[ManageSieve Proxy] Ignoring affinity/routing for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
+			preferredAddr = "" // This will cause the connection manager to use round-robin
+		}
+	}
+
+	// 4. Connect using the determined address (or round-robin if empty)
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer connectCancel()
+
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
-	conn, actualAddr, err := s.server.connManager.ConnectForUserWithProxy(
-		routingCtx,
-		s.username, // User email for routing lookup
+	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
+		connectCtx,
+		preferredAddr,
 		clientHost, clientPort, serverHost, serverPort,
 	)
 	if err != nil {
@@ -260,6 +321,17 @@ func (s *Session) connectToBackendAndAuth() error {
 	}
 	s.backendConn = conn
 	s.serverAddr = actualAddr
+
+	// Record successful connection for future affinity
+	if s.server.enableAffinity && actualAddr != "" {
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer updateCancel()
+		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
+			log.Printf("[ManageSieve Proxy] Failed to update server affinity for %s: %v", s.username, err)
+		} else {
+			log.Printf("[ManageSieve Proxy] Updated server affinity for %s to %s", s.username, actualAddr)
+		}
+	}
 
 	// Read backend greeting and capabilities
 	backendReader := bufio.NewReader(s.backendConn)
@@ -371,13 +443,8 @@ func (s *Session) close() {
 
 		clientAddr := s.clientConn.RemoteAddr().String()
 
-		// Use connection tracker if available
-		if s.server.connTracker != nil {
+		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "ManageSieve", clientAddr); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to unregister connection for %s: %v", s.username, err)
-			}
-		} else {
-			if err := s.server.db.UnregisterConnection(ctx, s.accountID, "ManageSieve", clientAddr); err != nil {
 				log.Printf("[ManageSieve Proxy] Failed to unregister connection for %s: %v", s.username, err)
 			}
 		}
@@ -399,28 +466,23 @@ func (s *Session) registerConnection() error {
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 
-	// Use connection tracker if available
-	if s.server.connTracker != nil {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "ManageSieve", clientAddr, s.serverAddr)
 	}
-
-	return s.server.db.RegisterConnection(ctx, s.accountID, "ManageSieve", clientAddr, s.serverAddr, s.server.hostname)
+	return nil
 }
 
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *Session) updateActivityPeriodically(ctx context.Context) {
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	// If connection tracking is disabled, fall back to the old polling mechanism.
+	// If connection tracking is disabled, do nothing and wait for session to end.
 	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
-		s.pollDatabaseDirectly(ctx)
+		<-ctx.Done()
 		return
 	}
 
-	// New mechanism: listen for kick notifications and only update activity periodically.
+	clientAddr := s.clientConn.RemoteAddr().String()
 	activityTicker := time.NewTicker(30 * time.Second)
 	defer activityTicker.Stop()
-
 	kickChan := s.server.connTracker.KickChannel()
 
 	checkAndTerminate := func() (terminated bool) {
@@ -452,40 +514,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "ManageSieve", clientAddr); err != nil {
 				log.Printf("[ManageSieve Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-			cancel()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// pollDatabaseDirectly is the legacy behavior for when connection tracking is disabled.
-func (s *Session) pollDatabaseDirectly(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	clientAddr := s.clientConn.RemoteAddr().String()
-
-	for {
-		select {
-		case <-ticker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-
-			// Update activity
-			if err := s.server.db.UpdateConnectionActivity(updateCtx, s.accountID, "ManageSieve", clientAddr); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to update activity for %s: %v", s.username, err)
-			}
-
-			// Check if connection should be terminated
-			shouldTerminate, err := s.server.db.CheckConnectionTermination(updateCtx, s.accountID, "ManageSieve", clientAddr)
-			if err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to check termination for %s: %v", s.username, err)
-			} else if shouldTerminate {
-				log.Printf("[ManageSieve Proxy] Connection marked for termination, disconnecting: %s", s.username)
-				cancel()
-				s.clientConn.Close()
-				s.backendConn.Close()
-				return
 			}
 			cancel()
 		case <-ctx.Done():

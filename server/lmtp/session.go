@@ -766,6 +766,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 			Recipients:    recipients,
 			Flags:         []imap.Flag{}, // Explicitly set empty flags to mark as unread
 			RawHeaders:    rawHeadersText,
+			FTSRetention:  s.backend.ftsRetention,
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,

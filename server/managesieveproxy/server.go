@@ -32,6 +32,9 @@ type Server struct {
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
+	enableAffinity     bool
+	affinityValidity   time.Duration
+	affinityStickiness float64
 	authLimiter        server.AuthLimiter
 }
 
@@ -48,6 +51,9 @@ type ServerOptions struct {
 	RemoteTLS          bool
 	RemoteTLSVerify    bool
 	ConnectTimeout     time.Duration
+	EnableAffinity     bool
+	AffinityValidity   time.Duration
+	AffinityStickiness float64
 	AuthRateLimit      server.AuthRateLimiterConfig
 	PreLookup          *proxy.PreLookupConfig
 }
@@ -99,6 +105,13 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		log.Printf("[ManageSieve Proxy] Failed to resolve addresses: %v", err)
 	}
 
+	// Validate affinity stickiness
+	stickiness := opts.AffinityStickiness
+	if stickiness < 0.0 || stickiness > 1.0 {
+		log.Printf("WARNING: invalid ManageSieve proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		stickiness = 1.0
+	}
+
 	// Initialize authentication rate limiter
 	authLimiter := server.NewAuthRateLimiter("SIEVE-PROXY", opts.AuthRateLimit, db)
 
@@ -115,6 +128,9 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 		connManager:        connManager,
 		ctx:                ctx,
 		cancel:             cancel,
+		enableAffinity:     opts.EnableAffinity,
+		affinityValidity:   opts.AffinityValidity,
+		affinityStickiness: stickiness,
 		authLimiter:        authLimiter,
 	}, nil
 }

@@ -654,7 +654,12 @@ func main() {
 			errorHandler.ValidationError("cleanup max_age_restriction duration", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		cleanupWorker = cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction)
+		ftsRetention, err := cfg.Cleanup.GetFTSRetention()
+		if err != nil {
+			errorHandler.ValidationError("cleanup fts_retention duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cleanupWorker = cleaner.New(database, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention)
 		cleanupWorker.Start(ctx)
 
 		// Initialize and start the upload worker
@@ -740,6 +745,12 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 		appendLimit = imap.DefaultAppendLimit
 	}
 
+	ftsRetention, err := config.Cleanup.GetFTSRetention()
+	if err != nil {
+		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
+		return
+	}
+
 	s, err := imap.New(ctx, hostname, addr, s3storage, database, uploadWorker, cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:               config.Servers.Debug,
@@ -761,6 +772,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 			WarmupMailboxes:     config.LocalCache.WarmupMailboxes,
 			WarmupAsync:         config.LocalCache.WarmupAsync,
 			WarmupTimeout:       config.LocalCache.WarmupTimeout,
+			FTSRetention:        ftsRetention,
 		})
 	if err != nil {
 		errChan <- err
@@ -779,6 +791,12 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 }
 
 func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, errChan chan error, config Config) {
+	ftsRetention, err := config.Cleanup.GetFTSRetention()
+	if err != nil {
+		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
+		return
+	}
+
 	lmtpServer, err := lmtp.New(ctx, hostname, addr, s3storage, database, uploadWorker, lmtp.LMTPServerOptions{
 		ExternalRelay:       config.Servers.LMTP.ExternalRelay,
 		TLSVerify:           config.Servers.LMTP.TLSVerify,
@@ -790,6 +808,7 @@ func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *stor
 		MaxConnections:      config.Servers.LMTP.MaxConnections,
 		MaxConnectionsPerIP: config.Servers.LMTP.MaxConnectionsPerIP,
 		ProxyProtocol:       config.Servers.LMTP.ProxyProtocol,
+		FTSRetention:        ftsRetention,
 	})
 
 	if err != nil {
@@ -874,11 +893,11 @@ func startManageSieveServer(ctx context.Context, hostname string, addr string, d
 	s.Start(errChan)
 }
 
-// startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol if affinity is enabled.
-func startConnectionTrackerForProxy(protocol string, database *db.Database, hostname string, trackingConfig *ConnectionTrackingConfig, affinityEnabled bool, server interface {
+// startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol.
+func startConnectionTrackerForProxy(protocol string, database *db.Database, hostname string, trackingConfig *ConnectionTrackingConfig, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
-	if !affinityEnabled || !trackingConfig.Enabled {
+	if !trackingConfig.Enabled {
 		return nil
 	}
 
@@ -888,7 +907,7 @@ func startConnectionTrackerForProxy(protocol string, database *db.Database, host
 		updateInterval = 10 * time.Second
 	}
 
-	log.Printf("[%s Proxy] Starting connection tracker for affinity.", protocol)
+	log.Printf("[%s Proxy] Starting connection tracker.", protocol)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		database,
@@ -952,8 +971,8 @@ func startIMAPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Start connection tracker if affinity is enabled for this proxy.
-	if tracker := startConnectionTrackerForProxy("IMAP", database, hostname, &config.Servers.ConnectionTracking, config.Servers.IMAPProxy.EnableAffinity, server); tracker != nil {
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("IMAP", database, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
@@ -1006,8 +1025,8 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Start connection tracker if affinity is enabled for this proxy.
-	if tracker := startConnectionTrackerForProxy("POP3", database, hostname, &config.Servers.ConnectionTracking, config.Servers.POP3Proxy.EnableAffinity, server); tracker != nil {
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("POP3", database, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
 	}
 
@@ -1028,6 +1047,13 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		connectTimeout = 30 * time.Second
 	}
 
+	// Parse affinity validity
+	affinityValidity, err := config.Servers.ManageSieveProxy.GetAffinityValidity()
+	if err != nil {
+		log.Printf("WARNING: invalid ManageSieve proxy affinity_validity '%s': %v. Using default.", config.Servers.ManageSieveProxy.AffinityValidity, err)
+		affinityValidity = 24 * time.Hour
+	}
+
 	server, err := managesieveproxy.New(ctx, database, hostname, managesieveproxy.ServerOptions{
 		Addr:               config.Servers.ManageSieveProxy.Addr,
 		RemoteAddrs:        config.Servers.ManageSieveProxy.RemoteAddrs,
@@ -1042,10 +1068,18 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, database 
 		ConnectTimeout:     connectTimeout,
 		AuthRateLimit:      config.Servers.ManageSieveProxy.AuthRateLimit,
 		PreLookup:          config.Servers.ManageSieveProxy.PreLookup,
+		EnableAffinity:     config.Servers.ManageSieveProxy.EnableAffinity,
+		AffinityStickiness: config.Servers.ManageSieveProxy.AffinityStickiness,
+		AffinityValidity:   affinityValidity,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
 		return
+	}
+
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("ManageSieve", database, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
+		defer tracker.Stop()
 	}
 
 	go func() {
@@ -1092,8 +1126,8 @@ func startLMTPProxyServer(ctx context.Context, hostname string, database *db.Dat
 		return
 	}
 
-	// Start connection tracker if affinity is enabled for this proxy.
-	if tracker := startConnectionTrackerForProxy("LMTP", database, hostname, &config.Servers.ConnectionTracking, config.Servers.LMTPProxy.EnableAffinity, server); tracker != nil {
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("LMTP", database, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
 	}
 

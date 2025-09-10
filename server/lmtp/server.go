@@ -32,6 +32,7 @@ type LMTPServerBackend struct {
 	externalRelay string
 	tlsConfig     *tls.Config
 	debug         bool
+	ftsRetention  time.Duration
 
 	// Connection counters
 	totalConnections atomic.Int64
@@ -58,6 +59,7 @@ type LMTPServerOptions struct {
 	MaxConnections      int
 	MaxConnectionsPerIP int
 	ProxyProtocol       server.ProxyProtocolConfig
+	FTSRetention        time.Duration
 }
 
 func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, db *db.Database, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -80,6 +82,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 		uploader:      uploadWorker,
 		externalRelay: options.ExternalRelay,
 		debug:         options.Debug,
+		ftsRetention:  options.FTSRetention,
 		limiter:       server.NewConnectionLimiter("LMTP", options.MaxConnections, options.MaxConnectionsPerIP),
 		proxyReader:   proxyReader,
 	}
