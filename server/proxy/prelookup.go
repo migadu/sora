@@ -3,16 +3,21 @@ package proxy
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/circuitbreaker"
+	"github.com/migadu/sora/pkg/retry"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -78,6 +83,7 @@ type PreLookupClient struct {
 	cacheMutex   sync.RWMutex
 	fallbackMode bool
 	stopJanitor  chan struct{}
+	breaker      *circuitbreaker.CircuitBreaker
 }
 
 // NewPreLookupClient creates a new PreLookupClient
@@ -143,7 +149,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	var connString string
 	if len(config.Hosts) > 0 {
 		host := config.Hosts[0] // Use first host for now, can be enhanced for multiple hosts
-		
+
 		// Handle host:port combination
 		// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
 		if !strings.Contains(host, ":") {
@@ -171,7 +177,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 			}
 			host = fmt.Sprintf("%s:%d", host, port)
 		}
-		
+
 		connString = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
 			config.User, config.Password, host, config.Name, tlsMode)
 	} else {
@@ -203,6 +209,16 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 
 	log.Printf("PreLookup database connected successfully")
 
+	// Initialize circuit breaker for prelookup database
+	breakerSettings := circuitbreaker.DefaultSettings("prelookup_db")
+	breakerSettings.OnStateChange = func(name string, from, to circuitbreaker.State) {
+		log.Printf("[PreLookup] Circuit breaker '%s' changed from %s to %s", name, from, to)
+	}
+	breakerSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
+		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+		return counts.Requests >= 5 && failureRatio >= 0.6
+	}
+
 	client := &PreLookupClient{
 		pool:         pool,
 		routingQuery: routingQuery,
@@ -213,10 +229,11 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		cache:        make(map[string]*cacheEntry),
 		fallbackMode: config.FallbackDefault,
 		stopJanitor:  make(chan struct{}),
+		breaker:      circuitbreaker.NewCircuitBreaker(breakerSettings),
 	}
 
 	// Log the configuration for debugging
-	log.Printf("[PreLookup] Initialized with auth_mode='%s', auth_method='%s', cache_ttl=%v", 
+	log.Printf("[PreLookup] Initialized with auth_mode='%s', auth_method='%s', cache_ttl=%v",
 		authMode, authMethod, cacheTTL)
 	log.Printf("[PreLookup] Routing query: %s", routingQuery)
 	if authQuery != "" {
@@ -245,23 +262,51 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	}
 	c.cacheMutex.RUnlock()
 
-	// Query database
-	log.Printf("[PreLookup] Executing routing query for user '%s': %s", email, c.routingQuery)
 	var serverAddress string
-	err := c.pool.QueryRow(ctx, c.routingQuery, email).Scan(&serverAddress)
-	if err != nil {
-		if err == pgx.ErrNoRows || err == sql.ErrNoRows {
-			log.Printf("[PreLookup] No routing found for user '%s'", email)
-			// Cache negative result
-			c.cacheMutex.Lock()
-			c.cache[email] = &cacheEntry{
-				info:      nil,
-				timestamp: time.Now(),
-				userFound: false,
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     3 * time.Second,
+		Multiplier:      1.8,
+		Jitter:          true,
+		MaxRetries:      3,
+	}
+
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := c.breaker.Execute(func() (interface{}, error) {
+			var addr string
+			err := c.pool.QueryRow(ctx, c.routingQuery, email).Scan(&addr)
+			if err != nil {
+				// For the circuit breaker, ErrNoRows is not a failure of the DB.
+				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+					return nil, err // Pass ErrNoRows up to be handled outside the breaker
+				}
+				return nil, err // Real DB error
 			}
-			c.cacheMutex.Unlock()
-			return nil, nil
+			return addr, nil
+		})
+
+		if cbErr != nil {
+			// Handle ErrNoRows: it's not a retryable error, it's a final result.
+			if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
+				serverAddress = ""       // Explicitly clear it
+				return retry.Stop(cbErr) // Stop retrying, but we'll handle this "error" below.
+			}
+			if isRetryableError(cbErr) {
+				log.Printf("[PreLookup] Retrying routing query for '%s' due to: %v", email, cbErr)
+				return cbErr // Signal to retry
+			}
+			return retry.Stop(cbErr) // Non-retryable error
 		}
+
+		if result != nil {
+			serverAddress = result.(string)
+		} else {
+			serverAddress = ""
+		}
+		return nil // Success
+	}, config)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, sql.ErrNoRows) {
 		log.Printf("[PreLookup] Database query failed for user '%s': %v", email, err)
 		return nil, fmt.Errorf("database query failed: %w", err)
 	}
@@ -269,6 +314,19 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
 	info := &UserRoutingInfo{
 		ServerAddress: serverAddress,
+	}
+
+	if serverAddress == "" {
+		log.Printf("[PreLookup] No routing found for user '%s'", email)
+		// Cache negative result
+		c.cacheMutex.Lock()
+		c.cache[email] = &cacheEntry{
+			info:      nil,
+			timestamp: time.Now(),
+			userFound: false,
+		}
+		c.cacheMutex.Unlock()
+		return nil, nil
 	}
 
 	// Cache the positive result
@@ -313,14 +371,38 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 
 			// User exists in cache, but we still need to verify password from DB
 			// (we never cache passwords for security)
-			// We must scan into dummy variables for the other columns.
-			var passwordHash, dummyAddr string
-			err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&passwordHash, &dummyAddr)
+			var passwordHash string
+			err := retry.WithRetry(ctx, func() error {
+				_, cbErr := c.breaker.Execute(func() (interface{}, error) {
+					var pHash, dummyAddr string
+					err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&pHash, &dummyAddr)
+					if err != nil {
+						if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+							return nil, err
+						}
+						return nil, err
+					}
+					passwordHash = pHash
+					return nil, nil
+				})
+
+				if cbErr != nil {
+					if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
+						return retry.Stop(cbErr)
+					}
+					if isRetryableError(cbErr) {
+						return cbErr
+					}
+					return retry.Stop(cbErr)
+				}
+				return nil
+			}, retry.DefaultBackoffConfig())
+
 			if err != nil {
-				if err == pgx.ErrNoRows || err == sql.ErrNoRows {
+				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 					return nil, AuthUserNotFound, nil
 				}
-				return nil, AuthUserNotFound, fmt.Errorf("database query failed: %w", err)
+				return nil, AuthUserNotFound, fmt.Errorf("database query failed for cached user: %w", err)
 			}
 
 			// Verify password
@@ -336,24 +418,64 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 	c.cacheMutex.RUnlock()
 
 	// Not in cache or expired - query database for everything
-	log.Printf("[PreLookup] Executing auth query for user '%s': %s", email, c.authQuery)
 	var passwordHash, serverAddress string
-	err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&passwordHash, &serverAddress)
-	if err != nil {
-		if err == pgx.ErrNoRows || err == sql.ErrNoRows {
-			log.Printf("[PreLookup] No auth record found for user '%s'", email)
-			// Cache negative result
-			c.cacheMutex.Lock()
-			c.cache[email] = &cacheEntry{
-				info:      nil,
-				timestamp: time.Now(),
-				userFound: false,
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     3 * time.Second,
+		Multiplier:      1.8,
+		Jitter:          true,
+		MaxRetries:      3,
+	}
+
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := c.breaker.Execute(func() (interface{}, error) {
+			var pHash, sAddr string
+			err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&pHash, &sAddr)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+					return nil, err
+				}
+				return nil, err
 			}
-			c.cacheMutex.Unlock()
-			return nil, AuthUserNotFound, nil
+			return []string{pHash, sAddr}, nil
+		})
+
+		if cbErr != nil {
+			if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
+				passwordHash, serverAddress = "", ""
+				return retry.Stop(cbErr)
+			}
+			if isRetryableError(cbErr) {
+				log.Printf("[PreLookup] Retrying auth query for '%s' due to: %v", email, cbErr)
+				return cbErr
+			}
+			return retry.Stop(cbErr)
 		}
+
+		if result != nil {
+			resSlice := result.([]string)
+			passwordHash = resSlice[0]
+			serverAddress = resSlice[1]
+		}
+		return nil
+	}, config)
+
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, sql.ErrNoRows) {
 		log.Printf("[PreLookup] Auth query failed for user '%s': %v", email, err)
 		return nil, AuthUserNotFound, fmt.Errorf("database query failed: %w", err)
+	}
+
+	if passwordHash == "" {
+		log.Printf("[PreLookup] No auth record found for user '%s'", email)
+		// Cache negative result
+		c.cacheMutex.Lock()
+		c.cache[email] = &cacheEntry{
+			info:      nil,
+			timestamp: time.Now(),
+			userFound: false,
+		}
+		c.cacheMutex.Unlock()
+		return nil, AuthUserNotFound, nil
 	}
 
 	log.Printf("[PreLookup] Auth query result for user '%s': found password hash and server_address='%s'", email, serverAddress)
@@ -443,6 +565,46 @@ func (c *PreLookupClient) Close() error {
 		c.pool.Close()
 	}
 	return nil
+}
+
+// isRetryableError checks if an error is transient and the operation can be retried.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Do not retry if the circuit breaker is open or the context is done.
+	if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) ||
+		errors.Is(err, circuitbreaker.ErrTooManyRequests) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// Check for PostgreSQL error codes that indicate transient issues.
+		// See: https://www.postgresql.org/docs/current/errcodes-appendix.html
+		switch pgErr.Code {
+		// Class 40: Transaction Rollback (e.g., deadlock, serialization failure)
+		case "40001", "40P01":
+			return true
+		// Class 53: Insufficient Resources (e.g., too many connections)
+		case "53300":
+			return true
+		// Class 08: Connection Exception
+		case "08000", "08001", "08003", "08004", "08006", "08007", "08P01":
+			return true
+		}
+	}
+
+	// Check for generic network errors that are temporary
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	return false
 }
 
 // GetCacheTTL returns the configured cache TTL duration

@@ -50,7 +50,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 
 		if checkMasterCredential(password, s.server.masterPassword) {
-			userID, err := s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+			userID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 			if err != nil {
 				return err
 			}
@@ -96,7 +96,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	s.Log("[LOGIN] authentication attempt with address %s", addressSt.FullAddress())
 
-	userID, err := s.server.db.Authenticate(s.ctx, addressSt.FullAddress(), password)
+	userID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.FullAddress(), password)
 	if err != nil {
 		s.Log("[LOGIN] authentication failed: %v", err)
 
@@ -115,7 +115,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	}
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-	err = s.server.db.CreateDefaultMailboxes(s.ctx, userID)
+	err = s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, userID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}

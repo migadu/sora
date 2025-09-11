@@ -29,7 +29,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 
 	// Database operations should be done outside of lock
 	// For LSUB, we need all mailboxes to find parents of subscribed ones
-	mboxes, err := s.server.db.GetMailboxes(readCtx, s.UserID(), false)
+	mboxes, err := s.server.rdb.GetMailboxesWithRetry(readCtx, s.UserID(), false)
 	if err != nil {
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}

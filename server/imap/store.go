@@ -36,27 +36,27 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Capture modseq before unlocking
 	modSeqSnapshot := s.currentHighestModSeq.Load()
-	
+
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	s.mutex.RUnlock()
 	cancel()
 
 	// Perform database operations outside of lock
-	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
-	
+
 	// Check if mailbox changed during our operation
 	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.Log("[STORE] WARNING: Mailbox changed during STORE operation (modseq %d -> %d)", 
+		s.Log("[STORE] WARNING: Mailbox changed during STORE operation (modseq %d -> %d)",
 			modSeqSnapshot, s.currentHighestModSeq.Load())
 		// For sequence sets, this could mean we're updating wrong messages
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
 			// Re-decode and re-fetch to ensure consistency
-			decodedNumSet = s.decodeNumSet(numSet)
-			messages, err = s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
+			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 			if err != nil {
 				return s.internalError("failed to retrieve messages: %v", err)
 			}
@@ -104,11 +104,11 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		var newModSeq int64
 		switch flags.Op {
 		case imap.StoreFlagsAdd:
-			newFlags, newModSeq, err = s.server.db.AddMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsDel:
-			newFlags, newModSeq, err = s.server.db.RemoveMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.RemoveMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		case imap.StoreFlagsSet:
-			newFlags, newModSeq, err = s.server.db.SetMessageFlags(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.SetMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
 		}
 
 		if err != nil {

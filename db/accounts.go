@@ -33,7 +33,7 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	// Check if there's an existing credential with this email (including soft-deleted accounts)
 	var existingAccountID int64
 	var deletedAt *time.Time
-	err = db.GetReadPool().QueryRow(ctx, `
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id 
@@ -43,9 +43,8 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	if err == nil {
 		if deletedAt != nil {
 			return fmt.Errorf("cannot create account with email %s: an account with this email is in deletion grace period", normalizedEmail)
-		} else {
-			return fmt.Errorf("account with email %s already exists", normalizedEmail)
 		}
+		return fmt.Errorf("account with email %s already exists", normalizedEmail)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("error checking for existing account: %w", err)
 	}

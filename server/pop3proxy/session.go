@@ -231,7 +231,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
-	accountID, err := s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
+	accountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
@@ -271,7 +271,7 @@ func (s *POP3ProxySession) getPreferredBackend() (string, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 	defer cancel()
 
-	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
 	if err != nil {
 		// Don't log ErrDBNotFound as an error, it's an expected case.
 		if errors.Is(err, db.ErrNoServerAffinity) {
@@ -344,7 +344,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	if s.server.enableAffinity && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
-		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
+		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[POP3PROXY %s] Failed to update server affinity for %s: %v", s.RemoteIP, s.username, err)
 		} else {
 			log.Printf("[POP3PROXY %s] Updated server affinity for %s to %s", s.RemoteIP, s.username, actualAddr)

@@ -76,7 +76,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					userID, err := s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+					userID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 					if err != nil {
 						s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
@@ -90,7 +90,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					s.IMAPUser = NewIMAPUser(address, userID)
 					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
-					if dbErr := s.server.db.CreateDefaultMailboxes(s.ctx, userID); dbErr != nil {
+					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, userID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 

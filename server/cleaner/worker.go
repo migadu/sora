@@ -22,13 +22,14 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 
 	"github.com/migadu/sora/storage"
 	"github.com/minio/minio-go/v7"
 )
 
 type CleanupWorker struct {
-	db                *db.Database
+	rdb               *resilient.ResilientDatabase
 	s3                *storage.S3Storage
 	cache             *cache.Cache
 	interval          time.Duration
@@ -38,9 +39,9 @@ type CleanupWorker struct {
 }
 
 // New creates a new CleanupWorker.
-func New(db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention time.Duration) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention time.Duration) *CleanupWorker {
 	return &CleanupWorker{
-		db:                db,
+		rdb:               rdb,
 		s3:                s3,
 		cache:             cache,
 		interval:          interval,
@@ -83,20 +84,24 @@ func (w *CleanupWorker) Start(ctx context.Context) {
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {
-	locked, err := w.db.AcquireCleanupLock(ctx)
+	locked, err := w.rdb.AcquireCleanupLockWithRetry(ctx)
 	if err != nil {
 		log.Println("[CLEANUP] failed to acquire advisory lock:", err)
 		return fmt.Errorf("failed to acquire advisory lock: %w", err)
 	}
 	if !locked {
-		log.Println("[CLEANUP] skipped: another instance is running it")
+		log.Println("[CLEANUP] skipped: another instance holds the cleanup lock")
 		return nil
 	}
-	defer w.db.ReleaseCleanupLock(ctx)
+	defer func() {
+		if err := w.rdb.ReleaseCleanupLockWithRetry(ctx); err != nil {
+			log.Printf("[CLEANUP] WARNING: failed to release advisory lock: %v", err)
+		}
+	}()
 
 	// First handle max age restriction if configured
 	if w.maxAgeRestriction > 0 {
-		count, err := w.db.ExpungeOldMessages(ctx, w.maxAgeRestriction)
+		count, err := w.rdb.ExpungeOldMessagesWithRetry(ctx, w.maxAgeRestriction)
 		if err != nil {
 			log.Printf("[CLEANUP] failed to expunge old messages: %v", err)
 			// Continue with other cleanup tasks even if this fails
@@ -107,7 +112,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	// --- Phase 0a: Cleanup of failed uploads ---
 	// This removes message metadata for messages that were never successfully uploaded to S3.
-	failedUploadsCount, err := w.db.CleanupFailedUploads(ctx, w.gracePeriod)
+	failedUploadsCount, err := w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod)
 	if err != nil {
 		// Log the error but continue, as other cleanup tasks can still proceed.
 		log.Printf("[CLEANUP] failed to clean up failed uploads: %v", err)
@@ -118,15 +123,15 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// --- Phase 0: Process soft-deleted accounts ---
 	// This prepares accounts for deletion by expunging their messages and removing
 	// associated data, making them ready for the subsequent cleanup phases.
-	deletedAccountCount, err := w.db.CleanupSoftDeletedAccounts(ctx, w.gracePeriod)
+	deletedAccountCount, err := w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to process soft-deleted accounts: %v", err)
 	} else if deletedAccountCount > 0 {
 		log.Printf("[CLEANUP] processed %d soft-deleted accounts for hard deletion", deletedAccountCount)
 	}
 
-	// Clean up old vacation responses
-	count, err := w.db.CleanupOldVacationResponses(ctx, w.gracePeriod)
+	// Clean up old vacation responses.
+	count, err := w.rdb.CleanupOldVacationResponsesWithRetry(ctx, w.gracePeriod)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to clean up old vacation responses: %v", err)
 		// Continue with S3 cleanup even if vacation cleanup fails
@@ -136,7 +141,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	// --- Phase 1: User-scoped cleanup (S3 objects and message references) ---
 	// Get objects to clean up, scoped by user, as S3 storage is user-scoped.
-	candidates, err := w.db.GetUserScopedObjectsForCleanup(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
+	candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to list user-scoped objects for cleanup: %v", err)
 		return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
@@ -170,7 +175,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 				log.Printf("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", s3Key)
 			}
 
-			if err := w.db.DeleteExpungedMessagesByS3KeyParts(ctx, candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash); err != nil {
+			if err := w.rdb.DeleteExpungedMessagesByS3KeyPartsWithRetry(ctx, candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash); err != nil {
 				// Log the error but continue processing other candidates.
 				// The advisory lock is held, so we don't want to block. The next run will pick it up.
 				log.Printf("[CLEANUP] failed to delete DB message rows for account %d and S3 key parts (%s/%s/%s): %v", candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash, err)
@@ -185,7 +190,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	// --- Phase 2a: FTS Content cleanup (old message_contents) ---
 	if w.ftsRetention > 0 {
-		count, err := w.db.CleanupOldMessageContents(ctx, w.ftsRetention)
+		count, err := w.rdb.CleanupOldMessageContentsWithRetry(ctx, w.ftsRetention)
 		if err != nil {
 			log.Printf("[CLEANUP] failed to clean up old message contents: %v", err)
 			// Continue with other cleanup tasks even if this fails
@@ -195,7 +200,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}
 
 	// --- Phase 2b: Global resource cleanup (message_contents and cache) ---
-	orphanHashes, err := w.db.GetUnusedContentHashes(ctx, db.BATCH_PURGE_SIZE)
+	orphanHashes, err := w.rdb.GetUnusedContentHashesWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to list unused content hashes for global cleanup: %v", err)
 		return fmt.Errorf("failed to list unused content hashes for global cleanup: %w", err)
@@ -207,7 +212,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			log.Printf("[CLEANUP] cleaning up global resources for hash %s", cHash)
 
 			// Delete from message_contents table
-			if err := w.db.DeleteMessageContentByHash(ctx, cHash); err != nil {
+			if err := w.rdb.DeleteMessageContentByHashWithRetry(ctx, cHash); err != nil {
 				log.Printf("[CLEANUP] failed to delete from message_contents for hash %s: %v", cHash, err)
 				// Continue to next hash, as this might be a transient error.
 				// The next cleanup run will pick it up again.
@@ -227,7 +232,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// --- Phase 3: Final account deletion ---
 	// After all associated data (S3 objects, messages, etc.) has been cleaned up,
 	// we can now safely delete the 'accounts' row itself.
-	danglingAccounts, err := w.db.GetDanglingAccountsForFinalDeletion(ctx, db.BATCH_PURGE_SIZE)
+	danglingAccounts, err := w.rdb.GetDanglingAccountsForFinalDeletionWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
 		log.Printf("[CLEANUP] failed to list dangling accounts for final deletion: %v", err)
 		return fmt.Errorf("failed to list dangling accounts for final deletion: %w", err)
@@ -236,7 +241,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	if len(danglingAccounts) > 0 {
 		log.Printf("[CLEANUP] found %d dangling accounts for final deletion", len(danglingAccounts))
 		for _, accountID := range danglingAccounts {
-			if err := w.db.FinalizeAccountDeletion(ctx, accountID); err != nil {
+			if err := w.rdb.FinalizeAccountDeletionWithRetry(ctx, accountID); err != nil {
 				log.Printf("[CLEANUP] failed to finalize deletion of account %d: %v", accountID, err)
 			}
 		}

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
@@ -18,7 +18,7 @@ import (
 type POP3ProxyServer struct {
 	addr               string
 	hostname           string
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	appCtx             context.Context
 	cancel             context.CancelFunc
 	tlsConfig          *tls.Config
@@ -52,7 +52,7 @@ type POP3ProxyServerOptions struct {
 	PreLookup          *proxy.PreLookupConfig
 }
 
-func New(appCtx context.Context, hostname, addr string, database *db.Database, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
+func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
@@ -102,12 +102,12 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 	}
 
 	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("POP3-PROXY", options.AuthRateLimit, database)
+	authLimiter := server.NewAuthRateLimiter("POP3-PROXY", options.AuthRateLimit, rdb)
 
 	server := &POP3ProxyServer{
 		hostname:           hostname,
 		addr:               addr,
-		db:                 database,
+		rdb:                rdb,
 		appCtx:             serverCtx,
 		cancel:             serverCancel,
 		masterSASLUsername: options.MasterSASLUsername,

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
@@ -18,7 +18,7 @@ import (
 // Server represents a ManageSieve proxy server.
 type Server struct {
 	listener           net.Listener
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	addr               string
 	hostname           string
 	masterSASLUsername []byte
@@ -59,7 +59,7 @@ type ServerOptions struct {
 }
 
 // New creates a new ManageSieve proxy server.
-func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOptions) (*Server, error) {
+func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname string, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
 	if len(opts.RemoteAddrs) == 0 {
@@ -113,10 +113,10 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	}
 
 	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("SIEVE-PROXY", opts.AuthRateLimit, db)
+	authLimiter := server.NewAuthRateLimiter("SIEVE-PROXY", opts.AuthRateLimit, rdb)
 
 	return &Server{
-		db:                 db,
+		rdb:                rdb,
 		addr:               opts.Addr,
 		hostname:           hostname,
 		masterSASLUsername: []byte(opts.MasterSASLUsername),

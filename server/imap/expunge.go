@@ -24,7 +24,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	s.mutex.RUnlock()
 
 	// Middle phase: Get messages to expunge (outside lock)
-	messages, err := s.server.db.GetMessagesByFlag(s.ctx, mailboxID, imap.FlagDeleted)
+	messages, err := s.server.rdb.GetMessagesByFlagWithRetry(s.ctx, mailboxID, imap.FlagDeleted)
 	if err != nil {
 		return s.internalError("failed to fetch deleted messages: %v", err)
 	}
@@ -62,7 +62,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// Database operation - no lock needed
-	newModSeq, err := s.server.db.ExpungeMessageUIDs(s.ctx, mailboxID, uidsToDelete...)
+	newModSeq, err := s.server.rdb.ExpungeMessageUIDsWithRetry(s.ctx, mailboxID, uidsToDelete...)
 	if err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}

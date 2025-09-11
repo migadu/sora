@@ -9,6 +9,7 @@ import (
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
 	"github.com/minio/minio-go/v7"
 )
@@ -16,11 +17,11 @@ import (
 // HealthIntegration manages health monitoring for the Sora server
 type HealthIntegration struct {
 	monitor  *HealthMonitor
-	database *db.Database
+	database *resilient.ResilientDatabase
 	hostname string
 }
 
-func NewHealthIntegration(database *db.Database) *HealthIntegration {
+func NewHealthIntegration(database *resilient.ResilientDatabase) *HealthIntegration {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
@@ -61,7 +62,7 @@ func (hi *HealthIntegration) registerStandardChecks() {
 		Critical: true,
 		Check: func(ctx context.Context) error {
 			// Simple ping to verify database connectivity
-			return hi.database.WritePool.Ping(ctx)
+			return hi.database.GetDatabase().WritePool.Ping(ctx)
 		},
 	}
 	hi.monitor.RegisterCheck(dbCheck)
@@ -73,7 +74,7 @@ func (hi *HealthIntegration) registerStandardChecks() {
 		Timeout:  10 * time.Second,
 		Critical: false,
 		Check: func(ctx context.Context) error {
-			return hi.database.ReadPool.Ping(ctx)
+			return hi.database.GetDatabase().ReadPool.Ping(ctx)
 		},
 	}
 	hi.monitor.RegisterCheck(dbReadCheck)
@@ -186,7 +187,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	}
 
 	// Store in database
-	err := hi.database.StoreHealthStatus(
+	err := hi.database.StoreHealthStatusWithRetry(
 		ctx,
 		hi.hostname,
 		componentName,

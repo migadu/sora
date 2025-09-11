@@ -9,6 +9,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 type Mailbox struct {
@@ -46,7 +47,7 @@ func getPermanentFlags() []imap.Flag {
 // This includes standard system flags, common keywords, and any custom flags
 // found to be in use within this specific mailbox.
 // This is used for the FLAGS response in SELECT/EXAMINE.
-func getDisplayFlags(ctx context.Context, dbInstance *db.Database, dbMbox *db.DBMailbox) []imap.Flag {
+func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox) []imap.Flag {
 	// Start with a base set of system flags and common keywords
 	// Using a map to ensure uniqueness
 	flagsMap := make(map[imap.Flag]struct{})
@@ -72,8 +73,8 @@ func getDisplayFlags(ctx context.Context, dbInstance *db.Database, dbMbox *db.DB
 
 	// Fetch custom flags actually used in this mailbox from the database
 	// m.DBMailbox is embedded, so m.ID gives the mailbox ID.
-	if dbInstance != nil && dbMbox.ID > 0 {
-		customFlagsFromDB, err := dbInstance.GetUniqueCustomFlagsForMailbox(ctx, dbMbox.ID)
+	if rdb != nil && dbMbox.ID > 0 {
+		customFlagsFromDB, err := rdb.GetUniqueCustomFlagsForMailboxWithRetry(ctx, dbMbox.ID)
 		if err != nil {
 			// Log the error, but don't fail the SELECT/EXAMINE.
 			// The client will still get the base set of flags.

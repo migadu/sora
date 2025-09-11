@@ -214,7 +214,7 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
-	accountID, err := s.server.db.Authenticate(ctx, address.FullAddress(), password)
+	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
@@ -253,7 +253,7 @@ func (s *Session) getPreferredBackend() (string, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 	defer cancel()
 
-	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
 	if err != nil {
 		if errors.Is(err, db.ErrNoServerAffinity) {
 			return "", nil
@@ -326,7 +326,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	if s.server.enableAffinity && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
-		if err := s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
+		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[ManageSieve Proxy] Failed to update server affinity for %s: %v", s.username, err)
 		} else {
 			log.Printf("[ManageSieve Proxy] Updated server affinity for %s to %s", s.username, actualAddr)

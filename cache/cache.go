@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/resilient"
 	_ "modernc.org/sqlite"
 )
 
@@ -31,7 +31,7 @@ type Cache struct {
 	orphanCleanupAge time.Duration
 	db               *sql.DB
 	mu               sync.Mutex
-	sourceDB         *db.Database
+	sourceDB         *resilient.ResilientDatabase
 	// Metrics - using atomic for thread-safe counters
 	cacheHits   int64
 	cacheMisses int64
@@ -47,7 +47,7 @@ func (c *Cache) Close() error {
 	return nil
 }
 
-func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval time.Duration, orphanCleanupAge time.Duration, sourceDb *db.Database) (*Cache, error) {
+func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval time.Duration, orphanCleanupAge time.Duration, sourceDb *resilient.ResilientDatabase) (*Cache, error) {
 	basePath = filepath.Clean(strings.TrimSpace(basePath))
 	if basePath == "" {
 		return nil, fmt.Errorf("cache base path cannot be empty")
@@ -437,7 +437,7 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 
 func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, paths []string) int {
 	dataDir := filepath.Join(c.basePath, DataDir)
-	existingDBHashes, err := c.sourceDB.FindExistingContentHashes(ctx, contentHashes) // This DB method needs to be created
+	existingDBHashes, err := c.sourceDB.FindExistingContentHashesWithRetry(ctx, contentHashes) // This DB method needs to be created
 	if err != nil {
 		log.Printf("[CACHE] error finding existing content hashes from sourceDB: %v", err)
 		return 0
@@ -665,5 +665,5 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 // GetRecentMessagesForWarmup is a helper method that delegates to the source database
 // This provides a convenient way for higher-level services to get warmup data through the cache
 func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return c.sourceDB.GetRecentMessagesForWarmup(ctx, userID, mailboxNames, messageCount)
+	return c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, userID, mailboxNames, messageCount)
 }

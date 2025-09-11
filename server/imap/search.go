@@ -51,7 +51,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	// Database operations outside of lock
-	messages, err := s.server.db.GetMessagesWithCriteria(s.ctx, selectedMailboxID, criteria)
+	messages, err := s.server.rdb.GetMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria)
 	if err != nil {
 		return nil, s.internalError("failed to search messages: %v", err)
 	}
@@ -104,7 +104,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
 			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
-			
+
 			// Include ALL for ESEARCH responses when there are results
 			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
 			if len(messages) > 0 {

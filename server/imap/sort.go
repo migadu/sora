@@ -17,7 +17,7 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 	}
 
 	// Pass both search criteria and sort criteria to the database layer
-	messages, err := s.server.db.GetMessagesSorted(s.ctx, s.selectedMailbox.ID, criteria, sortCriteria)
+	messages, err := s.server.rdb.GetMessagesSorted(s.ctx, s.selectedMailbox.ID, criteria, sortCriteria)
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}

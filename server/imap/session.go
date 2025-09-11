@@ -67,6 +67,7 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 	var errorType, severity string
 
 	if imapErr != nil {
+
 		// Classify based on IMAP error code and type
 		switch imapErr.Code {
 		case imap.ResponseCodeAuthenticationFailed:

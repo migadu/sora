@@ -85,7 +85,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	cancel()
 	s.mutex.RUnlock()
 
-	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -97,8 +97,8 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		// For sequence sets, this could mean we fetched wrong messages
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
 			// Re-decode and re-fetch to ensure consistency
-			decodedNumSet = s.decodeNumSet(numSet)
-			messages, err = s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
+			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 			if err != nil {
 				return s.internalError("failed to retrieve messages: %v", err)
 			}
@@ -190,7 +190,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 	if markSeen {
-		newFlagsComplete, _, err := s.server.db.AddMessageFlags(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+		newFlagsComplete, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 		if err != nil {
 			s.Log("[FETCH] failed to set \\Seen flag for message UID %d: %v", msg.UID, err)
 		} else {
@@ -293,7 +293,7 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 }
 
 func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUID imap.UID, mailboxID int64) error {
-	envelope, err := s.server.db.GetMessageEnvelope(s.ctx, messageUID, mailboxID)
+	envelope, err := s.server.rdb.GetMessageEnvelopeWithRetry(s.ctx, messageUID, mailboxID)
 	if err != nil {
 		return s.internalError("failed to retrieve envelope for message UID %d: %v", messageUID, err)
 	}
@@ -374,7 +374,7 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		isMainBodyTextRequest := section.Specifier == imap.PartSpecifierText && (len(section.Part) == 0)
 
 		if isHeaderFieldsRequest {
-			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
+			headersText, dbErr := s.server.rdb.GetMessageHeadersWithRetry(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
 				// Ensure headersText is a valid block for parsing, ending with \r\n if not empty.
 				headerBlockToParse := headersText
@@ -403,7 +403,7 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 				}
 			}
 		} else if isAllHeadersRequest {
-			headersText, dbErr := s.server.db.GetMessageHeaders(s.ctx, msg.UID, selectedMailboxID)
+			headersText, dbErr := s.server.rdb.GetMessageHeadersWithRetry(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
 				// headersText from DB is the block of headers.
 				// It might be "H1:V1" or "H1:V1\r\nH2:V2".
@@ -426,7 +426,7 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 			}
 		} else if isMainBodyTextRequest {
 			// Attempt to serve BODY[TEXT] from the pre-extracted text_body in the database.
-			textBody, dbErr := s.server.db.GetMessageTextBody(s.ctx, msg.UID, selectedMailboxID)
+			textBody, dbErr := s.server.rdb.GetMessageTextBodyWithRetry(s.ctx, msg.UID, selectedMailboxID)
 
 			if dbErr == nil { // DB fetch successful, textBody might be empty or populated.
 				isSuspectDueToEncoding := false

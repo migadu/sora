@@ -14,7 +14,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	s.mutex.RUnlock()
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[STATUS] mailbox '%s' does not exist", mboxName)
@@ -27,7 +27,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		return nil, s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
-	summary, err := s.server.db.GetMailboxSummary(s.ctx, mailbox.ID)
+	summary, err := s.server.rdb.GetMailboxSummaryWithRetry(s.ctx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get mailbox summary for '%s': %v", mboxName, err)
 	}

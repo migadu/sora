@@ -2,6 +2,7 @@ package retry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -67,6 +68,64 @@ func WithRetry(ctx context.Context, fn RetryableFunc, config BackoffConfig) erro
 
 		if err := fn(); err != nil {
 			lastErr = err
+			if attempt < config.MaxRetries {
+				continue
+			}
+		} else {
+			return nil
+		}
+	}
+	
+	return fmt.Errorf("operation failed after %d attempts: %w", config.MaxRetries+1, lastErr)
+}
+
+// StopError wraps an error to indicate that retries should stop immediately
+type StopError struct {
+	Err error
+}
+
+func (s StopError) Error() string {
+	return s.Err.Error()
+}
+
+func (s StopError) Unwrap() error {
+	return s.Err
+}
+
+// Stop wraps an error to indicate that retries should stop immediately
+func Stop(err error) error {
+	return StopError{Err: err}
+}
+
+// IsStopError checks if an error is a StopError
+func IsStopError(err error) bool {
+	var stopErr StopError
+	return errors.As(err, &stopErr)
+}
+
+// WithRetryAdvanced is like WithRetry but respects StopError to halt retries immediately
+func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConfig) error {
+	backoff := ExponentialBackoff(config)
+	
+	var lastErr error
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := backoff(attempt)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("retry cancelled by context: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		if err := fn(); err != nil {
+			lastErr = err
+			// Check if this is a StopError, which means we should not retry
+			if IsStopError(err) {
+				var stopErr StopError
+				errors.As(err, &stopErr)
+				return stopErr.Err
+			}
 			if attempt < config.MaxRetries {
 				continue
 			}

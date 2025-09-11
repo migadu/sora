@@ -16,6 +16,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
@@ -41,7 +42,7 @@ type Exporter struct {
 	jobs        int
 	db          *sql.DB
 	dbPath      string // Path to the SQLite database file
-	soraDB      *db.Database
+	rdb         *resilient.ResilientDatabase
 	s3          *storage.S3Storage
 	options     ExporterOptions
 
@@ -57,7 +58,7 @@ type Exporter struct {
 }
 
 // NewExporter creates a new Exporter instance.
-func NewExporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *storage.S3Storage, options ExporterOptions) (*Exporter, error) {
+func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ExporterOptions) (*Exporter, error) {
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
@@ -97,7 +98,7 @@ func NewExporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 		jobs:        jobs,
 		db:          db,
 		dbPath:      dbPath,
-		soraDB:      soraDB,
+		rdb:         rdb,
 		s3:          s3,
 		options:     options,
 		startTime:   time.Now(),
@@ -128,7 +129,7 @@ func (exporter *Exporter) Run() error {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := exporter.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	accountID, err := exporter.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
@@ -198,7 +199,7 @@ func (exporter *Exporter) performDryRun(ctx context.Context, userID int64, mailb
 		fmt.Printf("Mailbox: %s\n", mbox.Name)
 
 		// Get mailbox summary
-		summary, err := exporter.soraDB.GetMailboxSummary(ctx, mbox.ID)
+		summary, err := exporter.rdb.GetMailboxSummaryWithRetry(ctx, mbox.ID)
 		if err != nil {
 			fmt.Printf("   Error getting summary: %v\n", err)
 			continue
@@ -212,7 +213,7 @@ func (exporter *Exporter) performDryRun(ctx context.Context, userID int64, mailb
 		// Get all messages in the mailbox
 		seqSet := imap.SeqSet{}
 		seqSet.AddRange(1, 0) // 1:* means all messages
-		messages, err := exporter.soraDB.GetMessagesByNumSet(ctx, mbox.ID, seqSet)
+		messages, err := exporter.rdb.GetMessagesByNumSetWithRetry(ctx, mbox.ID, seqSet)
 		if err != nil {
 			fmt.Printf("   Error getting messages: %v\n", err)
 			continue
@@ -321,7 +322,7 @@ func formatSize(bytes int) string {
 // getMailboxesToExport returns the list of mailboxes to export based on filters
 func (exporter *Exporter) getMailboxesToExport(ctx context.Context, userID int64) ([]*db.DBMailbox, error) {
 	// Get all mailboxes for the user
-	allMailboxes, err := exporter.soraDB.GetMailboxes(ctx, userID, false)
+	allMailboxes, err := exporter.rdb.GetMailboxesWithRetry(ctx, userID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +390,7 @@ func (exporter *Exporter) createMailboxDirectory(mailboxName string) error {
 // exportMailbox exports all messages from a mailbox
 func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailbox) error {
 	// Get mailbox summary
-	summary, err := exporter.soraDB.GetMailboxSummary(ctx, mailbox.ID)
+	summary, err := exporter.rdb.GetMailboxSummaryWithRetry(ctx, mailbox.ID)
 	if err != nil {
 		return fmt.Errorf("failed to get mailbox summary: %w", err)
 	}
@@ -405,7 +406,7 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 	// Get all messages in the mailbox using a full sequence set
 	seqSet := imap.SeqSet{}
 	seqSet.AddRange(1, 0) // 1:* means all messages
-	messages, err := exporter.soraDB.GetMessagesByNumSet(ctx, mailbox.ID, seqSet)
+	messages, err := exporter.rdb.GetMessagesByNumSetWithRetry(ctx, mailbox.ID, seqSet)
 	if err != nil {
 		return fmt.Errorf("failed to get messages: %w", err)
 	}

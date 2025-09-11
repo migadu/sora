@@ -14,11 +14,12 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
 )
 
 type UploadWorker struct {
-	db            *db.Database
+	rdb           *resilient.ResilientDatabase
 	s3            *storage.S3Storage
 	cache         *cache.Cache
 	path          string
@@ -31,7 +32,7 @@ type UploadWorker struct {
 	errCh         chan<- error
 }
 
-func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, db *db.Database, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
+func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create local path %s: %w", path, err)
@@ -40,7 +41,7 @@ func New(ctx context.Context, path string, batchSize int, concurrency int, maxAt
 	notifyCh := make(chan struct{}, 1)
 
 	return &UploadWorker{
-		db:            db,
+		rdb:           rdb,
 		s3:            s3,
 		cache:         cache,
 		errCh:         errCh,
@@ -96,7 +97,7 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 	var wg sync.WaitGroup
 
 	for {
-		uploads, err := w.db.AcquireAndLeasePendingUploads(ctx, w.instanceID, w.batchSize, w.retryInterval, w.maxAttempts)
+		uploads, err := w.rdb.AcquireAndLeasePendingUploadsWithRetry(ctx, w.instanceID, w.batchSize, w.retryInterval, w.maxAttempts)
 		if err != nil {
 			return fmt.Errorf("failed to list pending uploads: %w", err)
 		}
@@ -138,10 +139,10 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	log.Printf("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
 
 	// Get primary address to construct S3 path
-	address, err := w.db.GetPrimaryEmailForAccount(ctx, upload.AccountID)
+	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
 	if err != nil {
 		log.Printf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
+		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		return
 	}
 
@@ -150,11 +151,11 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	filePath := w.FilePath(upload.ContentHash, upload.AccountID)
 
 	// Check if this content hash is already marked as uploaded by another worker for this user
-	isUploaded, err := w.db.IsContentHashUploaded(ctx, upload.ContentHash, upload.AccountID)
+	isUploaded, err := w.rdb.IsContentHashUploadedWithRetry(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
 		log.Printf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
 		// Mark attempt and let it be retried
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID) // Log error if this fails too?
+		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID) // Log error if this fails too?
 		return
 	}
 
@@ -162,7 +163,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		log.Printf("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
 		// Content is already in S3. Mark this specific message instance as uploaded
 		// and delete the pending upload record.
-		if err := w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID); err != nil {
+		if err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
 			log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
 		} else {
 			log.Printf("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
@@ -176,7 +177,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
+		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		log.Printf("[UPLOADER] could not read file %s: %v", filePath, err)
 		return // Cannot proceed without the file
 	}
@@ -185,7 +186,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	start := time.Now()
 	err = w.s3.Put(s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
-		w.db.MarkUploadAttempt(ctx, upload.ContentHash, upload.AccountID)
+		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
 
 		// Track upload failure
@@ -197,7 +198,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 
 	// Finalize the upload in the database. This is a transactional operation.
 	// It's critical to do this *before* removing the local source file.
-	err = w.db.CompleteS3Upload(ctx, upload.ContentHash, upload.AccountID)
+	err = w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
 		// If this fails, the S3 object might be orphaned temporarily, but the task is not lost.
 		// The task will be retried after the lease expires. Because the local file still

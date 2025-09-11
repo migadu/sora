@@ -43,7 +43,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	cancel()
 
 	// Perform database operations outside of lock
-	destMailbox, err := s.server.db.GetMailboxByName(s.ctx, s.UserID(), dest)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.UserID(), dest)
 	if err != nil {
 		s.Log("[MOVE] destination mailbox '%s' not found: %v", dest, err)
 		return &imap.Error{
@@ -62,7 +62,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
-	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -81,7 +81,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
-	messageUIDMap, err := s.server.db.MoveMessages(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, s.UserID())
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, s.UserID())
 	if err != nil {
 		return s.internalError("failed to move messages: %v", err)
 	}
@@ -113,7 +113,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		s.Log("[MOVE] automatically marking %d moved messages as seen in Trash folder", len(mappedDestUIDs))
 
 		for _, uid := range mappedDestUIDs {
-			_, _, err := s.server.db.AddMessageFlags(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
+			_, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
 			if err != nil {
 				s.Log("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
 				// Continue with other messages even if one fails

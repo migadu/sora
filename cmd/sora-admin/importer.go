@@ -24,6 +24,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
@@ -57,7 +58,7 @@ type Importer struct {
 	jobs        int
 	db          *sql.DB
 	dbPath      string // Path to the SQLite database file
-	soraDB      *db.Database
+	rdb         *resilient.ResilientDatabase
 	s3          *storage.S3Storage
 	options     ImporterOptions
 
@@ -75,7 +76,7 @@ type Importer struct {
 }
 
 // NewImporter creates a new Importer instance.
-func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *storage.S3Storage, options ImporterOptions) (*Importer, error) {
+func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ImporterOptions) (*Importer, error) {
 	// Create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	log.Printf("Using maildir database: %s", dbPath)
@@ -110,7 +111,7 @@ func NewImporter(maildirPath, email string, jobs int, soraDB *db.Database, s3 *s
 		jobs:            jobs,
 		db:              db,
 		dbPath:          dbPath,
-		soraDB:          soraDB,
+		rdb:             rdb,
 		s3:              s3,
 		options:         options,
 		startTime:       time.Now(),
@@ -265,14 +266,14 @@ func (i *Importer) processSubscriptions() error {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Ensure default mailboxes exist first
-	if err := i.soraDB.CreateDefaultMailboxes(ctx, user.UserID()); err != nil {
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
 		return fmt.Errorf("failed to create default mailboxes: %w", err)
 	}
 
@@ -280,16 +281,16 @@ func (i *Importer) processSubscriptions() error {
 	for _, folderName := range folders {
 
 		// Check if mailbox exists, create if needed
-		mailbox, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), folderName)
+		mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
 				log.Printf("Creating missing mailbox: %s", folderName)
-				if err := i.soraDB.CreateDefaultMailbox(ctx, user.UserID(), folderName, nil); err != nil {
+				if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), folderName, nil); err != nil {
 					log.Printf("Warning: Failed to create mailbox %s: %v", folderName, err)
 					continue
 				}
 				// Get the newly created mailbox
-				mailbox, err = i.soraDB.GetMailboxByName(ctx, user.UserID(), folderName)
+				mailbox, err = i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
 				if err != nil {
 					log.Printf("Warning: Failed to get newly created mailbox %s: %v", folderName, err)
 					continue
@@ -301,7 +302,7 @@ func (i *Importer) processSubscriptions() error {
 		}
 
 		// Subscribe the user to the folder
-		if err := i.soraDB.SetMailboxSubscribed(ctx, mailbox.ID, user.UserID(), true); err != nil {
+		if err := i.rdb.SetMailboxSubscribedWithRetry(ctx, mailbox.ID, user.UserID(), true); err != nil {
 			log.Printf("Warning: Failed to subscribe to mailbox %s: %v", folderName, err)
 		} else {
 			log.Printf("Successfully subscribed to mailbox: %s", folderName)
@@ -339,14 +340,14 @@ func (i *Importer) importSieveScript() error {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account ID: %w", err)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Check if user already has an active script
-	existingScript, err := i.soraDB.GetActiveScript(ctx, user.UserID())
+	existingScript, err := i.rdb.GetActiveScriptWithRetry(ctx, user.UserID())
 	if err != nil && err != consts.ErrDBNotFound {
 		return fmt.Errorf("failed to check for existing active script: %w", err)
 	}
@@ -359,18 +360,18 @@ func (i *Importer) importSieveScript() error {
 
 	// Create or update the script
 	var script *db.SieveScript
-	existingByName, err := i.soraDB.GetScriptByName(ctx, scriptName, user.UserID())
+	existingByName, err := i.rdb.GetScriptByNameWithRetry(ctx, scriptName, user.UserID())
 	switch err {
 	case nil:
 		// Script with this name exists, update it
-		script, err = i.soraDB.UpdateScript(ctx, existingByName.ID, user.UserID(), scriptName, string(scriptContent))
+		script, err = i.rdb.UpdateScriptWithRetry(ctx, existingByName.ID, user.UserID(), scriptName, string(scriptContent))
 		if err != nil {
 			return fmt.Errorf("failed to update existing Sieve script: %w", err)
 		}
 		log.Printf("Updated existing Sieve script '%s'", scriptName)
 	case consts.ErrDBNotFound:
 		// Create new script
-		script, err = i.soraDB.CreateScript(ctx, user.UserID(), scriptName, string(scriptContent))
+		script, err = i.rdb.CreateScriptWithRetry(ctx, user.UserID(), scriptName, string(scriptContent))
 		if err != nil {
 			return fmt.Errorf("failed to create Sieve script: %w", err)
 		}
@@ -380,7 +381,7 @@ func (i *Importer) importSieveScript() error {
 	}
 
 	// Activate the script
-	if err := i.soraDB.SetScriptActive(ctx, script.ID, user.UserID(), true); err != nil {
+	if err := i.rdb.SetScriptActiveWithRetry(ctx, script.ID, user.UserID(), true); err != nil {
 		return fmt.Errorf("failed to activate Sieve script: %w", err)
 	}
 
@@ -450,7 +451,7 @@ func (i *Importer) performDryRun() error {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
@@ -507,7 +508,7 @@ func (i *Importer) performDryRun() error {
 		}
 
 		// Check if message already exists in Sora
-		mailboxObj, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), mailbox)
+		mailboxObj, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailbox)
 		var alreadyExists bool
 		if err == nil {
 			if !i.options.ForceReimport {
@@ -757,7 +758,7 @@ func (i *Importer) shouldImportMailbox(mailboxName string) bool {
 // isMessageAlreadyImported checks if a message with the given hash already exists in the Sora database.
 func (i *Importer) isMessageAlreadyImported(ctx context.Context, hash string, mailboxID int64) (bool, error) {
 	var count int
-	err := i.soraDB.GetReadPool().QueryRow(ctx,
+	err := i.rdb.QueryRowWithRetry(ctx,
 		"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
 		hash, mailboxID).Scan(&count)
 	if err != nil {
@@ -1092,21 +1093,21 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.soraDB.GetAccountIDByAddress(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 	user := server.NewUser(address, accountID)
 	log.Printf("Processing for user: email=%s, accountID=%d, userID=%d", address.FullAddress(), accountID, user.UserID())
 
-	mailbox, err := i.soraDB.GetMailboxByName(ctx, user.UserID(), mailboxName)
+	mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
 	if err != nil {
 		log.Printf("Mailbox '%s' not found for user %d, creating it", mailboxName, user.UserID())
 		// Create mailbox if it doesn't exist
-		if err := i.soraDB.CreateMailbox(ctx, user.UserID(), mailboxName, nil); err != nil {
+		if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), mailboxName, nil); err != nil {
 			return fmt.Errorf("failed to create mailbox '%s': %w", mailboxName, err)
 		}
-		mailbox, err = i.soraDB.GetMailboxByName(ctx, user.UserID(), mailboxName)
+		mailbox, err = i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
 		if err != nil {
 			return fmt.Errorf("failed to get mailbox '%s' after creation: %w", mailboxName, err)
 		}
@@ -1130,7 +1131,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 		// ForceReimport is true: delete the existing message before proceeding.
 		// This requires a `DeleteMessageByHashAndMailbox` method in the db package.
-		deleted, err := i.soraDB.DeleteMessageByHashAndMailbox(ctx, user.UserID(), mailbox.ID, hash)
+		deleted, err := i.rdb.DeleteMessageByHashAndMailboxWithRetry(ctx, user.UserID(), mailbox.ID, hash)
 		if err != nil {
 			return fmt.Errorf("failed to delete existing message for re-import: %w", err)
 		}
@@ -1206,7 +1207,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// that creates the message metadata and a pending_uploads record. This is the
 	// "commit point" for the message's existence.
 	hostname, _ := os.Hostname()
-	msgID, uid, err := i.soraDB.InsertMessage(ctx,
+	msgID, uid, err := i.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			UserID:               user.UserID(),
 			MailboxID:            mailbox.ID,
@@ -1257,7 +1258,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	}
 
 	// Step 3: Finalize the upload in the database.
-	err = i.soraDB.CompleteS3Upload(ctx, hash, user.UserID())
+	err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
 	if err != nil {
 		// The S3 object exists, but we failed to mark it as complete in the DB.
 		// The message remains in the 'pending_uploads' queue and can be retried.

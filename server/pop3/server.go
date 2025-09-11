@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
@@ -22,7 +22,7 @@ import (
 type POP3Server struct {
 	addr               string
 	hostname           string
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	s3                 *storage.S3Storage
 	appCtx             context.Context
 	cancel             context.CancelFunc // Cancel function for the app context
@@ -60,7 +60,7 @@ type POP3ServerOptions struct {
 	AuthRateLimit       serverPkg.AuthRateLimiterConfig
 }
 
-func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
+func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
@@ -76,13 +76,13 @@ func New(appCtx context.Context, hostname, popAddr string, storage *storage.S3St
 	}
 
 	// Initialize authentication rate limiter
-	authLimiter := serverPkg.NewAuthRateLimiter("POP3", options.AuthRateLimit, database)
+	authLimiter := serverPkg.NewAuthRateLimiter("POP3", options.AuthRateLimit, rdb)
 
 	server := &POP3Server{
 		hostname:           hostname,
 		addr:               popAddr,
-		db:                 database,
-		s3:                 storage,
+		rdb:                rdb,
+		s3:                 s3,
 		appCtx:             serverCtx,
 		cancel:             serverCancel,
 		uploader:           uploadWorker,

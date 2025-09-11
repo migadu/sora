@@ -39,7 +39,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	decodedNumSet := s.decodeNumSet(numSet)
 
 	// Middle phase: Database operations outside lock
-	destMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
@@ -52,7 +52,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to fetch destination mailbox '%s': %v", mboxName, err)
 	}
 
-	messages, err := s.server.db.GetMessagesByNumSet(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return nil, s.internalError("failed to retrieve messages for copy: %v", err)
 	}
@@ -66,7 +66,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 
 	for _, msg := range messages {
 		sourceUIDs.AddNum(msg.UID)
-		copiedUID, err := s.server.db.InsertMessageCopy(s.ctx, msg.UID, msg.MailboxID, destMailbox.ID, destMailbox.Name)
+		copiedUID, err := s.server.rdb.InsertMessageCopyWithRetry(s.ctx, msg.UID, msg.MailboxID, destMailbox.ID, destMailbox.Name)
 		if err != nil {
 			return nil, s.internalError("failed to insert copied message: %v", err)
 		}

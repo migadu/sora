@@ -192,7 +192,7 @@ func GenerateBcryptHash(password string) (string, error) {
 
 // verifyPassword checks if the provided password matches the stored password hash
 // It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings
-func verifyPassword(hashedPassword, password string) error {
+func VerifyPassword(hashedPassword, password string) error {
 	switch {
 	case strings.HasPrefix(hashedPassword, ssha512PrefixB64),
 		strings.HasPrefix(hashedPassword, ssha512PrefixB64Explicit),
@@ -223,7 +223,7 @@ func verifyPassword(hashedPassword, password string) error {
 }
 
 // needsRehash checks if a bcrypt hash needs to be rehashed with the current default cost
-func needsRehash(hash string) bool {
+func NeedsRehash(hash string) bool {
 	// Only check bcrypt hashes
 	hash = strings.TrimPrefix(hash, "{BLF-CRYPT}")
 
@@ -259,10 +259,9 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 		return errors.New("address cannot be empty")
 	}
 
-	err := db.TimedExec(ctx, "update_password",
+	_, err := db.GetWritePool().Exec(ctx,
 		"UPDATE credentials SET password = $1 WHERE address = $2",
 		newHashedPassword, normalizedAddress)
-
 	if err != nil {
 		log.Printf("[DB] error updating password for address %s: %v", normalizedAddress, err)
 		return fmt.Errorf("database error updating password: %w", err)
@@ -271,70 +270,28 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 	return nil
 }
 
-// Authenticate verifies the provided address and password against the records
-// in the `credentials` table. If successful, it returns the associated `account_id`.
-// If the password's hash cost is different from the default, it will be re-hashed and updated.
-func (db *Database) Authenticate(ctx context.Context, address string, password string) (int64, error) {
-	var hashedPassword string
-	var accountID int64
-
+// GetCredentialForAuth retrieves the account ID and hashed password for a given address.
+// It does not perform any password verification.
+func (db *Database) GetCredentialForAuth(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
 	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
 	if normalizedAddress == "" {
-		return 0, errors.New("address cannot be empty")
-	}
-	if password == "" {
-		return 0, errors.New("password cannot be empty")
+		return 0, "", errors.New("address cannot be empty")
 	}
 
-	err := db.TimedQueryRow(ctx, "authenticate",
-		"SELECT account_id, password FROM credentials WHERE address = $1",
-		normalizedAddress).Scan(&accountID, &hashedPassword)
+	row := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT account_id, password FROM credentials WHERE address = $1 AND (SELECT deleted_at FROM accounts WHERE id = credentials.account_id) IS NULL", normalizedAddress)
+	err = row.Scan(&accountID, &hashedPassword)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Address (identity) not found in the credentials table
-			return 0, consts.ErrUserNotFound
+			return 0, "", consts.ErrUserNotFound
 		}
 		// Log other unexpected database errors
 		log.Printf("[DB] error fetching credentials for address %s: %v", normalizedAddress, err)
-		return 0, fmt.Errorf("database error during authentication: %w", err)
+		return 0, "", fmt.Errorf("database error during authentication: %w", err)
 	}
 
-	if err := verifyPassword(hashedPassword, password); err != nil {
-		// Password does not match
-		return 0, errors.New("invalid password")
-	}
-
-	// Authentication successful
-
-	// Check if the password needs to be rehashed (bcrypt cost changed)
-	if needsRehash(hashedPassword) {
-		// Generate a new hash with the current default cost
-		newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-		if err != nil {
-			log.Printf("[DB] WARNING: failed to rehash password for address %s: %v", normalizedAddress, err)
-			// Continue even if rehashing fails
-		} else {
-			// If it's a BLF-CRYPT format, preserve the prefix
-			var newHashedPassword string
-			if strings.HasPrefix(hashedPassword, "{BLF-CRYPT}") {
-				newHashedPassword = "{BLF-CRYPT}" + string(newHash)
-			} else {
-				newHashedPassword = string(newHash)
-			}
-
-			// Update the stored password
-			err = db.UpdatePassword(ctx, normalizedAddress, newHashedPassword)
-			if err != nil {
-				log.Printf("[DB] WARNING: failed to update rehashed password for address %s: %v", normalizedAddress, err)
-				// Continue even if update fails
-			} else {
-				log.Printf("[DB] rehashed password with new cost for address %s", normalizedAddress)
-			}
-		}
-	}
-
-	return accountID, nil
+	return accountID, hashedPassword, nil
 }
 
 // GetAccountIDByAddress retrieves the main user ID associated with a given identity (address)

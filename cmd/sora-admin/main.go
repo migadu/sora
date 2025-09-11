@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
 )
 
@@ -135,9 +136,9 @@ func newDefaultAdminConfig() AdminConfig {
 			RetryInterval: "30s",
 		},
 		Cleanup: CleanupConfig{
-			GracePeriod:  "14d",     // 14 days
-			WakeInterval: "1h",      // 1 hour
-			FTSRetention: "730d",    // 2 years default
+			GracePeriod:  "14d",  // 14 days
+			WakeInterval: "1h",   // 1 hour
+			FTSRetention: "730d", // 2 years default
 		},
 	}
 }
@@ -667,12 +668,12 @@ Examples:
 func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hashType string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Create account using the new db operation
 	req := db.CreateAccountRequest{
@@ -682,7 +683,7 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 		HashType:  hashType,
 	}
 
-	if err := database.CreateAccount(ctx, req); err != nil {
+	if err := rdb.CreateAccountWithRetry(ctx, req); err != nil {
 		return err
 	}
 
@@ -752,15 +753,15 @@ Examples:
 func listConnections(cfg AdminConfig, userEmail, protocol, instanceID string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Get all active connections
-	connections, err := database.GetActiveConnections(ctx)
+	connections, err := rdb.GetActiveConnectionsWithRetry(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get active connections: %w", err)
 	}
@@ -934,12 +935,12 @@ Examples:
 func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Build criteria
 	criteria := db.TerminationCriteria{
@@ -950,7 +951,7 @@ func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAdd
 	}
 
 	// Get preview of what will be kicked
-	stats, err := database.GetConnectionStats(ctx)
+	stats, err := rdb.GetConnectionStatsWithRetry(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get connection stats: %w", err)
 	}
@@ -1000,7 +1001,7 @@ func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAdd
 	}
 
 	// Mark connections for termination
-	affected, err := database.MarkConnectionsForTermination(ctx, criteria)
+	affected, err := rdb.MarkConnectionsForTerminationWithRetry(ctx, criteria)
 	if err != nil {
 		return fmt.Errorf("failed to mark connections for termination: %w", err)
 	}
@@ -1040,15 +1041,16 @@ func matches(conn db.ConnectionInfo, criteria db.TerminationCriteria, all bool) 
 func addCredential(cfg AdminConfig, primaryIdentity, email, password string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Get the account ID for the primary identity
-	accountID, err := database.GetAccountIDByAddress(ctx, primaryIdentity)
+	// This read operation also needs resilience.
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, primaryIdentity)
 	if err != nil {
 		return fmt.Errorf("failed to find account with primary identity '%s': %w", primaryIdentity, err)
 	}
@@ -1062,7 +1064,7 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password string, mak
 		NewHashType: hashType,
 	}
 
-	if err = database.AddCredential(ctx, req); err != nil {
+	if err = rdb.AddCredentialWithRetry(ctx, req); err != nil {
 		return err
 	}
 
@@ -1237,15 +1239,15 @@ Examples:
 func deleteAccount(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Delete the account using the existing database function
-	if err := database.DeleteAccount(ctx, email); err != nil {
+	if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil {
 		return fmt.Errorf("failed to delete account: %w", err)
 	}
 
@@ -1255,12 +1257,12 @@ func deleteAccount(cfg AdminConfig, email string) error {
 func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Update account using the new db operation
 	req := db.UpdateAccountRequest{
@@ -1270,7 +1272,7 @@ func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, ha
 		MakePrimary: makePrimary,
 	}
 
-	if err := database.UpdateAccount(ctx, req); err != nil {
+	if err := rdb.UpdateAccountWithRetry(ctx, req); err != nil {
 		return err
 	}
 
@@ -1337,15 +1339,15 @@ Examples:
 func listCredentials(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// List credentials using the new db operation
-	credentials, err := database.ListCredentials(ctx, email)
+	credentials, err := rdb.ListCredentialsWithRetry(ctx, email)
 	if err != nil {
 		return err
 	}
@@ -1435,15 +1437,15 @@ Examples:
 func deleteCredential(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Delete the credential using the database function
-	if err := database.DeleteCredential(ctx, email); err != nil {
+	if err := rdb.DeleteCredentialWithRetry(ctx, email); err != nil {
 		return fmt.Errorf("failed to delete credential: %w", err)
 	}
 
@@ -1506,15 +1508,15 @@ Examples:
 func listAccounts(cfg AdminConfig) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// List accounts using the database function
-	accounts, err := database.ListAccounts(ctx)
+	accounts, err := rdb.ListAccountsWithRetry(ctx)
 	if err != nil {
 		return err
 	}
@@ -1678,15 +1680,15 @@ Examples:
 func restoreAccount(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Restore the account using the database function
-	if err := database.RestoreAccount(ctx, email); err != nil {
+	if err := rdb.RestoreAccountWithRetry(ctx, email); err != nil {
 		return fmt.Errorf("failed to restore account: %w", err)
 	}
 
@@ -1696,15 +1698,15 @@ func restoreAccount(cfg AdminConfig, email string) error {
 func showAccount(cfg AdminConfig, email string, jsonOutput bool) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Get detailed account information
-	accountDetails, err := database.GetAccountDetails(ctx, email)
+	accountDetails, err := rdb.GetAccountDetailsWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			return fmt.Errorf("account with email %s does not exist", email)
@@ -1817,15 +1819,15 @@ Examples:
 func showCredential(cfg AdminConfig, email string, jsonOutput bool) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Get credential details and associated account information
-	credentialDetails, err := database.GetCredentialDetails(ctx, email)
+	credentialDetails, err := rdb.GetCredentialDetailsWithRetry(ctx, email)
 	if err != nil {
 		return err // The error from the DB function is already descriptive
 	}
@@ -2017,12 +2019,13 @@ Examples:
 		}
 	}
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(context.Background(), &cfg.Database)
+	// Connect to resilient database
+	ctx := context.Background()
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Connect to S3
 	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
@@ -2058,7 +2061,7 @@ Examples:
 		FTSRetention:  ftsRetention,
 	}
 
-	importer, err := NewImporter(*maildirPath, *email, *jobs, database, s3, options)
+	importer, err := NewImporter(*maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
 		log.Fatalf("Failed to create importer: %v", err)
 	}
@@ -2191,12 +2194,13 @@ Examples:
 		}
 	}
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(context.Background(), &cfg.Database)
+	// Connect to resilient database
+	ctx := context.Background()
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Connect to S3
 	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
@@ -2225,7 +2229,7 @@ Examples:
 		ExportUIDList:  exportUIDListEnabled,
 	}
 
-	exporter, err := NewExporter(*maildirPath, *email, *jobs, database, s3, options)
+	exporter, err := NewExporter(*maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
 		log.Fatalf("Failed to create exporter: %v", err)
 	}
@@ -2363,14 +2367,14 @@ func showCacheStats(cfg AdminConfig) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, database)
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, rdb)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
@@ -2434,14 +2438,17 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
-	defer database.Close()
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	if err != nil {
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
+	}
+	defer rdb.Close()
 
 	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, database)
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, rdb)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}
@@ -2525,11 +2532,11 @@ Examples:
 func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error {
 	// Connect to database
 	ctx := context.Background()
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Validate retry interval parsing (for config validation)
 	_, err = helpers.ParseDuration(cfg.Uploader.RetryInterval)
@@ -2538,7 +2545,7 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 	}
 
 	// Get uploader statistics
-	stats, err := database.GetUploaderStats(ctx, cfg.Uploader.MaxAttempts)
+	stats, err := rdb.GetUploaderStatsWithRetry(ctx, cfg.Uploader.MaxAttempts)
 	if err != nil {
 		return fmt.Errorf("failed to get uploader stats: %w", err)
 	}
@@ -2572,7 +2579,7 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 		fmt.Printf("%-10s %-10s %-64s %-8s %-12s %-19s %s\n", "ID", "Account ID", "Content Hash", "Size", "Attempts", "Created", "Instance ID")
 		fmt.Printf("%s\n", strings.Repeat("-", 141))
 
-		failedUploads, err := database.GetFailedUploads(ctx, cfg.Uploader.MaxAttempts, failedLimit)
+		failedUploads, err := rdb.GetFailedUploadsWithRetry(ctx, cfg.Uploader.MaxAttempts, failedLimit)
 		if err != nil {
 			return fmt.Errorf("failed to get failed uploads: %w", err)
 		}
@@ -2693,17 +2700,17 @@ Examples:
 func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanupStale bool, staleMinutes int, showDetail bool) error {
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	// Cleanup stale connections if requested
 	if cleanupStale {
 		staleDuration := time.Duration(staleMinutes) * time.Minute
-		removed, err := database.CleanupStaleConnections(ctx, staleDuration)
+		removed, err := rdb.CleanupStaleConnectionsWithRetry(ctx, staleDuration)
 		if err != nil {
 			return fmt.Errorf("failed to cleanup stale connections: %w", err)
 		}
@@ -2714,7 +2721,7 @@ func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanu
 	var stats *db.ConnectionStats
 	if userEmail != "" {
 		// Get connections for specific user
-		connections, err := database.GetUserConnections(ctx, userEmail)
+		connections, err := rdb.GetUserConnectionsWithRetry(ctx, userEmail)
 		if err != nil {
 			return fmt.Errorf("failed to get user connections: %w", err)
 		}
@@ -2734,7 +2741,7 @@ func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanu
 		}
 	} else {
 		// Get all connection statistics
-		stats, err = database.GetConnectionStats(ctx)
+		stats, err = rdb.GetConnectionStatsWithRetry(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get connection stats: %w", err)
 		}
@@ -2881,12 +2888,12 @@ Examples:
 	// Create context for database operations
 	ctx := context.Background()
 
-	// Connect to database
-	database, err := db.NewDatabaseFromConfig(ctx, &adminConfig.Database)
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	fmt.Printf("Authentication Statistics and Blocked IPs\n")
 	fmt.Printf("Window: %s\n", window)
@@ -2894,7 +2901,7 @@ Examples:
 
 	// Show general auth statistics
 	if *showStats {
-		stats, err := database.GetAuthAttemptsStats(ctx, window)
+		stats, err := rdb.GetAuthAttemptsStatsWithRetry(ctx, window)
 		if err != nil {
 			log.Printf("Failed to get auth statistics: %v", err)
 		} else {
@@ -2911,7 +2918,7 @@ Examples:
 
 	// Show currently blocked IPs and usernames
 	if *showBlocked {
-		blocked, err := database.GetBlockedIPs(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
+		blocked, err := rdb.GetBlockedIPsWithRetry(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
 		if err != nil {
 			log.Printf("Failed to get blocked IPs: %v", err)
 		} else {
@@ -3035,32 +3042,32 @@ Examples:
 		}
 	}
 
-	// Connect to database
+	// Connect to resilient database
 	ctx := context.Background()
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	if *jsonOutput {
-		if err := showHealthStatusJSON(ctx, database, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+		if err := showHealthStatusJSON(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
 			log.Fatalf("Failed to show health status: %v", err)
 		}
 	} else {
-		if err := showHealthStatus(ctx, database, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+		if err := showHealthStatus(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
 			log.Fatalf("Failed to show health status: %v", err)
 		}
 	}
 }
 
-func showHealthStatus(ctx context.Context, database *db.Database, hostname, component string, detailed, history bool, sinceTime time.Time) error {
+func showHealthStatus(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed, history bool, sinceTime time.Time) error {
 	if history && component != "" {
-		return showComponentHistory(ctx, database, hostname, component, sinceTime)
+		return showComponentHistory(ctx, rdb, hostname, component, sinceTime)
 	}
 
 	// Show overview first
-	overview, err := database.GetSystemHealthOverview(ctx, hostname)
+	overview, err := rdb.GetSystemHealthOverviewWithRetry(ctx, hostname)
 	if err != nil {
 		return fmt.Errorf("failed to get system health overview: %w", err)
 	}
@@ -3095,7 +3102,7 @@ func showHealthStatus(ctx context.Context, database *db.Database, hostname, comp
 	fmt.Printf("\n")
 
 	// Get detailed component status
-	statuses, err := database.GetAllHealthStatuses(ctx, hostname)
+	statuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
 	if err != nil {
 		return fmt.Errorf("failed to get health statuses: %w", err)
 	}
@@ -3184,10 +3191,10 @@ func showHealthStatus(ctx context.Context, database *db.Database, hostname, comp
 	return nil
 }
 
-func showComponentHistory(ctx context.Context, database *db.Database, hostname, component string, sinceTime time.Time) error {
+func showComponentHistory(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, sinceTime time.Time) error {
 	if hostname == "" {
 		// Get all hostnames for this component
-		allStatuses, err := database.GetAllHealthStatuses(ctx, "")
+		allStatuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, "")
 		if err != nil {
 			return fmt.Errorf("failed to get health statuses: %w", err)
 		}
@@ -3209,7 +3216,7 @@ func showComponentHistory(ctx context.Context, database *db.Database, hostname, 
 			fmt.Printf("Component Health History: %s on %s\n", component, hn)
 			fmt.Printf("%s\n", strings.Repeat("=", 40+len(component)+len(hn)))
 
-			history, err := database.GetHealthHistory(ctx, hn, component, sinceTime, 50)
+			history, err := rdb.GetHealthHistoryWithRetry(ctx, hn, component, sinceTime, 50)
 			if err != nil {
 				fmt.Printf("Error getting history for %s: %v\n\n", hn, err)
 				continue
@@ -3222,7 +3229,7 @@ func showComponentHistory(ctx context.Context, database *db.Database, hostname, 
 		fmt.Printf("Component Health History: %s on %s\n", component, hostname)
 		fmt.Printf("%s\n", strings.Repeat("=", 40+len(component)+len(hostname)))
 
-		history, err := database.GetHealthHistory(ctx, hostname, component, sinceTime, 50)
+		history, err := rdb.GetHealthHistoryWithRetry(ctx, hostname, component, sinceTime, 50)
 		if err != nil {
 			return fmt.Errorf("failed to get health history: %w", err)
 		}
@@ -3263,7 +3270,7 @@ func showHistoryTable(history []*db.HealthStatus) {
 	}
 }
 
-func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, component string, detailed, history bool, sinceTime time.Time) error {
+func showHealthStatusJSON(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed, history bool, sinceTime time.Time) error {
 	type JSONHealthOutput struct {
 		Overview   *db.SystemHealthOverview `json:"overview"`
 		Components []*db.HealthStatus       `json:"components,omitempty"`
@@ -3285,7 +3292,7 @@ func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, 
 	}
 
 	// Get overview
-	overview, err := database.GetSystemHealthOverview(ctx, hostname)
+	overview, err := rdb.GetSystemHealthOverviewWithRetry(ctx, hostname)
 	if err != nil {
 		return fmt.Errorf("failed to get system health overview: %w", err)
 	}
@@ -3295,14 +3302,14 @@ func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, 
 		// Get history for specific component
 		if hostname == "" {
 			// Get all hostnames for this component first
-			allStatuses, err := database.GetAllHealthStatuses(ctx, "")
+			allStatuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, "")
 			if err != nil {
 				return fmt.Errorf("failed to get health statuses: %w", err)
 			}
 
 			for _, status := range allStatuses {
 				if status.ComponentName == component {
-					hist, err := database.GetHealthHistory(ctx, status.ServerHostname, component, sinceTime, 50)
+					hist, err := rdb.GetHealthHistoryWithRetry(ctx, status.ServerHostname, component, sinceTime, 50)
 					if err != nil {
 						continue
 					}
@@ -3310,7 +3317,7 @@ func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, 
 				}
 			}
 		} else {
-			hist, err := database.GetHealthHistory(ctx, hostname, component, sinceTime, 50)
+			hist, err := rdb.GetHealthHistoryWithRetry(ctx, hostname, component, sinceTime, 50)
 			if err != nil {
 				return fmt.Errorf("failed to get health history: %w", err)
 			}
@@ -3318,7 +3325,7 @@ func showHealthStatusJSON(ctx context.Context, database *db.Database, hostname, 
 		}
 	} else {
 		// Get current component status
-		statuses, err := database.GetAllHealthStatuses(ctx, hostname)
+		statuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
 		if err != nil {
 			return fmt.Errorf("failed to get health statuses: %w", err)
 		}
@@ -3441,30 +3448,30 @@ Examples:
 func showCacheMetrics(cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
 	// Connect to database
 	ctx := context.Background()
-	database, err := db.NewDatabaseFromConfig(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
-	defer database.Close()
+	defer rdb.Close()
 
 	if showHistory {
-		return showHistoricalCacheMetrics(ctx, database, instanceID, sinceDuration, limit, jsonOutput)
+		return showHistoricalCacheMetrics(ctx, rdb, instanceID, sinceDuration, limit, jsonOutput)
 	}
 
-	return showLatestCacheMetrics(ctx, database, instanceID, jsonOutput)
+	return showLatestCacheMetrics(ctx, rdb, instanceID, jsonOutput)
 }
 
-func showLatestCacheMetrics(ctx context.Context, database *db.Database, instanceID string, jsonOutput bool) error {
+func showLatestCacheMetrics(ctx context.Context, rdb *resilient.ResilientDatabase, instanceID string, jsonOutput bool) error {
 	var metrics []*db.CacheMetricsRecord
 	var err error
 
 	if instanceID != "" {
 		// Get metrics for specific instance
 		// Get the single most recent metric for the instance, regardless of age.
-		metrics, err = database.GetCacheMetrics(ctx, instanceID, time.Time{}, 1)
+		metrics, err = rdb.GetCacheMetricsWithRetry(ctx, instanceID, time.Time{}, 1)
 	} else {
 		// Get latest metrics for all instances
-		metrics, err = database.GetLatestCacheMetrics(ctx)
+		metrics, err = rdb.GetLatestCacheMetricsWithRetry(ctx)
 	}
 
 	if err != nil {
@@ -3532,9 +3539,9 @@ func showLatestCacheMetrics(ctx context.Context, database *db.Database, instance
 	return nil
 }
 
-func showHistoricalCacheMetrics(ctx context.Context, database *db.Database, instanceID string, sinceDuration time.Duration, limit int, jsonOutput bool) error {
+func showHistoricalCacheMetrics(ctx context.Context, rdb *resilient.ResilientDatabase, instanceID string, sinceDuration time.Duration, limit int, jsonOutput bool) error {
 	since := time.Now().Add(-sinceDuration)
-	metrics, err := database.GetCacheMetrics(ctx, instanceID, since, limit)
+	metrics, err := rdb.GetCacheMetricsWithRetry(ctx, instanceID, since, limit)
 	if err != nil {
 		return fmt.Errorf("failed to get cache metrics: %w", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 // ConnectionInfo represents an active connection in memory
@@ -27,7 +28,7 @@ type ConnectionInfo struct {
 
 // ConnectionTracker manages connection tracking with in-memory caching
 type ConnectionTracker struct {
-	db             *db.Database
+	rdb            *resilient.ResilientDatabase
 	name           string // e.g. "IMAP", "POP3"
 	instanceID     string
 	connections    map[string]*ConnectionInfo // key: "accountID:protocol:clientAddr"
@@ -42,9 +43,9 @@ type ConnectionTracker struct {
 }
 
 // NewConnectionTracker creates a new connection tracker
-func NewConnectionTracker(name string, database *db.Database, instanceID string, updateInterval time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
+func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
 	tracker := &ConnectionTracker{
-		db:             database,
+		rdb:            rdb,
 		name:           name,
 		instanceID:     instanceID,
 		connections:    make(map[string]*ConnectionInfo),
@@ -79,33 +80,11 @@ func (ct *ConnectionTracker) Start() {
 		defer cancel()
 
 		// Cleanup stale connections for this instance on startup
-		removed, err := ct.db.CleanupConnectionsByInstanceID(ctx, ct.instanceID)
+		removed, err := ct.rdb.CleanupConnectionsByInstanceIDWithRetry(ctx, ct.instanceID)
 		if err != nil {
 			log.Printf("[ConnectionTracker:%s] WARNING: Failed to cleanup stale connections for instance %s: %v", ct.name, ct.instanceID, err)
 		} else if removed > 0 {
 			log.Printf("[ConnectionTracker:%s] Cleaned up %d stale connections for instance %s", ct.name, removed, ct.instanceID)
-		}
-
-		connections, err := ct.db.GetActiveConnections(ctx)
-		if err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to load existing connections: %v", ct.name, err)
-		} else {
-			ct.mu.Lock()
-			for _, conn := range connections {
-				key := ct.makeKey(conn.AccountID, conn.Protocol, conn.ClientAddr)
-				ct.connections[key] = &ConnectionInfo{
-					AccountID:       conn.AccountID,
-					Protocol:        conn.Protocol,
-					ClientAddr:      conn.ClientAddr,
-					ServerAddr:      conn.ServerAddr,
-					InstanceID:      conn.InstanceID,
-					ConnectedAt:     conn.ConnectedAt,
-					LastActivity:    conn.LastActivity,
-					ShouldTerminate: conn.ShouldTerminate,
-				}
-			}
-			ct.mu.Unlock()
-			log.Printf("[ConnectionTracker:%s] Loaded %d existing connections from other instances", ct.name, len(connections))
 		}
 	}
 }
@@ -149,7 +128,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 
 	// If not batching, write immediately
 	if ct.persistToDB && !ct.batchUpdates {
-		return ct.db.RegisterConnection(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID)
+		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID)
 	}
 
 	return nil
@@ -174,7 +153,7 @@ func (ct *ConnectionTracker) UpdateActivity(ctx context.Context, accountID int64
 
 	// If not batching, write immediately
 	if ct.persistToDB && !ct.batchUpdates {
-		return ct.db.UpdateConnectionActivity(ctx, accountID, protocol, clientAddr)
+		return ct.rdb.UpdateConnectionActivityWithRetry(ctx, accountID, protocol, clientAddr)
 	}
 
 	return nil
@@ -199,7 +178,7 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	// always attempt to unregister from the DB.
 	// The DB call is idempotent for non-existent rows.
 	if ct.persistToDB && exists {
-		return ct.db.UnregisterConnection(ctx, accountID, protocol, clientAddr)
+		return ct.rdb.UnregisterConnectionWithRetry(ctx, accountID, protocol, clientAddr)
 	}
 
 	return nil
@@ -224,7 +203,7 @@ func (ct *ConnectionTracker) CheckTermination(ctx context.Context, accountID int
 
 	// If not in memory and we're persisting, check database
 	if ct.persistToDB {
-		return ct.db.CheckConnectionTermination(ctx, accountID, protocol, clientAddr)
+		return ct.rdb.CheckConnectionTerminationWithRetry(ctx, accountID, protocol, clientAddr)
 	}
 
 	return false, nil
@@ -318,17 +297,6 @@ func (ct *ConnectionTracker) MarkConnectionsForTermination(ctx context.Context, 
 			conn.isModified = true
 			marked++
 		}
-	}
-
-	// If email criteria is specified and we're persisting, also update database
-	if criteria.Email != "" && ct.persistToDB {
-		dbMarked, err := ct.db.MarkConnectionsForTermination(ctx, criteria)
-		if err != nil {
-			return marked, err
-		}
-		// Reload affected connections
-		ct.reloadTerminatedConnections(ctx)
-		return dbMarked, nil
 	}
 
 	return marked, nil
@@ -440,13 +408,13 @@ func (ct *ConnectionTracker) flushChanges() {
 	// Apply changes to database in real batches
 	if len(toInsert) > 0 {
 		// This requires a new method in the db package that uses pgx.Batch
-		if err := ct.db.BatchRegisterConnections(ctx, toInsert); err != nil {
+		if err := ct.rdb.BatchRegisterConnectionsWithRetry(ctx, toInsert); err != nil {
 			log.Printf("[ConnectionTracker:%s] Failed to batch insert connections: %v", ct.name, err)
 		}
 	}
 	if len(toUpdate) > 0 {
 		// This requires a new method in the db package that uses pgx.Batch
-		if err := ct.db.BatchUpdateConnections(ctx, toUpdate); err != nil {
+		if err := ct.rdb.BatchUpdateConnectionsWithRetry(ctx, toUpdate); err != nil {
 			log.Printf("[ConnectionTracker:%s] Failed to batch update connections: %v", ct.name, err)
 		}
 	}
@@ -455,7 +423,7 @@ func (ct *ConnectionTracker) flushChanges() {
 // reloadTerminatedConnections reloads connections that may have been marked for termination in the database
 func (ct *ConnectionTracker) reloadTerminatedConnections(ctx context.Context) (int, error) {
 	// Get all connections for this instance that have been marked for termination
-	terminatedConns, err := ct.db.GetTerminatedConnectionsByInstance(ctx, ct.instanceID)
+	terminatedConns, err := ct.rdb.GetTerminatedConnectionsByInstanceWithRetry(ctx, ct.instanceID)
 	if err != nil {
 		log.Printf("[ConnectionTracker:%s] Failed to get terminated connections: %v", ct.name, err)
 		return 0, err

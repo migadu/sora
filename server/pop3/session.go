@@ -244,7 +244,7 @@ func (s *POP3Session) handleConnection() {
 					s.Log("[PASS] Master password authentication successful for '%s'", userAddress.FullAddress())
 					authSuccess = true
 					// For master password, we need to get the user ID
-					userID, err = s.server.db.GetAccountIDByAddress(ctx, userAddress.FullAddress())
+					userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.FullAddress())
 					if err != nil {
 						s.Log("[PASS] Failed to get account ID for master user '%s': %v", userAddress.FullAddress(), err)
 						// Record failed attempt
@@ -263,7 +263,7 @@ func (s *POP3Session) handleConnection() {
 
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
-				userID, err = s.server.db.Authenticate(ctx, userAddress.FullAddress(), parts[1])
+				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.FullAddress(), parts[1])
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -290,7 +290,7 @@ func (s *POP3Session) handleConnection() {
 
 			// This is a potential write operation.
 			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.db.CreateDefaultMailboxes(ctx, userID)
+			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, userID)
 			if err != nil {
 				s.Log("USER error creating default mailboxes: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -303,7 +303,7 @@ func (s *POP3Session) handleConnection() {
 			// Create a context that signals to the DB layer to use the master connection.
 			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 
-			inboxMailboxID, err := s.server.db.GetMailboxByName(readCtx, userID, consts.MailboxInbox)
+			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, userID, consts.MailboxInbox)
 			if err != nil {
 				s.Log("USER error getting INBOX: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -381,7 +381,7 @@ func (s *POP3Session) handleConnection() {
 			s.mutex.RUnlock()
 			cancel()
 
-			messagesCount, size, err := s.server.db.GetMailboxMessageCountAndSizeSum(readCtx, mailboxID)
+			messagesCount, size, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(readCtx, mailboxID)
 			if err != nil {
 				s.Log("STAT error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -436,7 +436,7 @@ func (s *POP3Session) handleConnection() {
 				readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 			}
 
-			messages, err := s.server.db.ListMessages(readCtx, mailboxID)
+			messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 			if err != nil {
 				s.Log("LIST error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -520,7 +520,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				messages, err := s.server.db.ListMessages(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.Log("UIDL error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -684,7 +684,7 @@ func (s *POP3Session) handleConnection() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
 
-				messages, err := s.server.db.ListMessages(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.Log("TOP error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -921,7 +921,7 @@ func (s *POP3Session) handleConnection() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
 
-				messages, err := s.server.db.ListMessages(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.Log("RETR error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -1113,7 +1113,7 @@ func (s *POP3Session) handleConnection() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
 
-				messages, err := s.server.db.ListMessages(readCtx, s.inboxMailboxID)
+				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, s.inboxMailboxID)
 				if err != nil {
 					s.Log("DELE error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
@@ -1296,7 +1296,7 @@ func (s *POP3Session) handleConnection() {
 						continue
 					}
 
-					userID, err = s.server.db.GetAccountIDByAddress(ctx, address.FullAddress())
+					userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 					if err != nil {
 						s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
 						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
@@ -1347,7 +1347,7 @@ func (s *POP3Session) handleConnection() {
 					}
 				}
 
-				userID, err = s.server.db.Authenticate(ctx, address.FullAddress(), password)
+				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -1370,7 +1370,7 @@ func (s *POP3Session) handleConnection() {
 
 			// This is a potential write operation.
 			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.db.CreateDefaultMailboxes(ctx, userID)
+			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, userID)
 			if err != nil {
 				s.Log("AUTH error creating default mailboxes: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -1384,7 +1384,7 @@ func (s *POP3Session) handleConnection() {
 			// Create a context that signals to the DB layer to use the master connection.
 			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 
-			inboxMailboxID, err := s.server.db.GetMailboxByName(readCtx, userID, consts.MailboxInbox)
+			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, userID, consts.MailboxInbox)
 			if err != nil {
 				s.Log("AUTH error getting INBOX: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
@@ -1561,7 +1561,7 @@ func (s *POP3Session) handleConnection() {
 
 			if len(expungeUIDs) > 0 {
 				s.Log("expunging %d messages from mailbox %d: %v", len(expungeUIDs), mailboxID, expungeUIDs)
-				_, err = s.server.db.ExpungeMessageUIDs(ctx, mailboxID, expungeUIDs...)
+				_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, expungeUIDs...)
 				if err != nil {
 					s.Log("error expunging messages from mailbox %d: %v", mailboxID, err)
 				} else {
@@ -1701,7 +1701,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3
 		log.Printf("[CACHE] miss for UID %d, fetching from S3 (%s)", msg.UID, msg.ContentHash)
-		address, err := s.server.db.GetPrimaryEmailForAccount(s.ctx, msg.UserID)
+		address, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, msg.UserID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.UserID, err)
 		}

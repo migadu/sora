@@ -9,15 +9,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/proxy"
 )
 
 // Server represents an LMTP proxy server.
 type Server struct {
 	listener           net.Listener
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	addr               string
 	hostname           string
 	connManager        *proxy.ConnectionManager
@@ -52,7 +52,7 @@ type ServerOptions struct {
 }
 
 // New creates a new LMTP proxy server.
-func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOptions) (*Server, error) {
+func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname string, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
 	if len(opts.RemoteAddrs) == 0 {
@@ -106,7 +106,7 @@ func New(appCtx context.Context, db *db.Database, hostname string, opts ServerOp
 	}
 
 	return &Server{
-		db:                 db,
+		rdb:                rdb,
 		addr:               opts.Addr,
 		hostname:           hostname,
 		connManager:        connManager,

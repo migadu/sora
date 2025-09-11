@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 )
@@ -22,7 +22,7 @@ const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 type ManageSieveServer struct {
 	addr               string
 	hostname           string
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	appCtx             context.Context
 	cancel             context.CancelFunc
 	tlsConfig          *tls.Config
@@ -63,7 +63,7 @@ type ManageSieveServerOptions struct {
 	AuthRateLimit       server.AuthRateLimiterConfig
 }
 
-func New(appCtx context.Context, hostname, addr string, database *db.Database, options ManageSieveServerOptions) (*ManageSieveServer, error) {
+func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
 	// Initialize PROXY protocol reader if enabled
@@ -78,12 +78,12 @@ func New(appCtx context.Context, hostname, addr string, database *db.Database, o
 	}
 
 	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("ManageSieve", options.AuthRateLimit, database)
+	authLimiter := server.NewAuthRateLimiter("ManageSieve", options.AuthRateLimit, rdb)
 
 	serverInstance := &ManageSieveServer{
 		hostname:           hostname,
 		addr:               addr,
-		db:                 database,
+		rdb:                rdb,
 		appCtx:             serverCtx,
 		cancel:             serverCancel,
 		useStartTLS:        options.TLSUseStartTLS,

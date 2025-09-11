@@ -90,7 +90,7 @@ func TestNeedsRehash(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			hash := tt.hashCreator()
-			result := needsRehash(hash)
+			result := NeedsRehash(hash)
 			if result != tt.needsRehash {
 				t.Errorf("needsRehash(%q) = %v, want %v", hash, result, tt.needsRehash)
 			}
@@ -155,7 +155,7 @@ func TestRehashOperation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			needsRehashing := needsRehash(tt.hash)
+			needsRehashing := NeedsRehash(tt.hash)
 			if needsRehashing != tt.expectedRehash {
 				t.Errorf("needsRehash(%q) = %v, want %v", tt.hash, needsRehashing, tt.expectedRehash)
 			}
@@ -173,7 +173,7 @@ func TestRehashOperation(t *testing.T) {
 				}
 
 				// New hash should not need rehashing
-				if needsRehash(newHash) {
+				if NeedsRehash(newHash) {
 					t.Errorf("Newly generated hash still needs rehashing: %s", newHash)
 				}
 			}

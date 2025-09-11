@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -143,10 +144,16 @@ func (s *Session) handleConnection() {
 
 			// Use base address (without detail part) for lookup
 			lookupAddress := address.BaseAddress()
-			accountID, err := s.server.db.GetAccountIDByAddress(s.ctx, lookupAddress)
+			var accountID int64
+			row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", lookupAddress)
+			err = row.Scan(&accountID)
 			if err != nil {
-				log.Printf("[LMTP Proxy] User not found for %s: %v", lookupAddress, err)
-				s.sendResponse("550 5.1.1 User unknown")
+				if errors.Is(err, pgx.ErrNoRows) {
+					log.Printf("[LMTP Proxy] User not found for %s", lookupAddress)
+				} else {
+					log.Printf("[LMTP Proxy] User lookup failed for %s: %v", lookupAddress, err)
+				}
+				s.sendResponse("550 5.1.1 User unknown") // Generic error for security
 				continue
 			}
 
@@ -242,7 +249,7 @@ func (s *Session) getPreferredBackend() (string, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
 	defer cancel()
 
-	lastAddr, lastTime, err := s.server.db.GetLastServerAddress(ctx, s.accountID)
+	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
 	if err != nil {
 		// Don't log ErrDBNotFound as an error, it's an expected case.
 		if errors.Is(err, db.ErrNoServerAffinity) {
@@ -324,7 +331,7 @@ func (s *Session) connectToBackend() error {
 	if s.server.enableAffinity && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
-		if err = s.server.db.UpdateLastServerAddress(updateCtx, s.accountID, actualAddr); err != nil {
+		if err = s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
 			log.Printf("[LMTP Proxy] Failed to update server affinity for %s: %v", s.username, err)
 		} else {
 			log.Printf("[LMTP Proxy] Updated server affinity for %s to %s", s.username, actualAddr)

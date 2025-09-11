@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/emersion/go-smtp"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/sieveengine"
@@ -24,7 +24,7 @@ import (
 type LMTPServerBackend struct {
 	addr          string
 	hostname      string
-	db            *db.Database
+	rdb           *resilient.ResilientDatabase
 	s3            *storage.S3Storage
 	uploader      *uploader.UploadWorker
 	server        *smtp.Server
@@ -62,11 +62,12 @@ type LMTPServerOptions struct {
 	FTSRetention        time.Duration
 }
 
-func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, db *db.Database, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
+func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
 	if options.ProxyProtocol.Enabled {
 		var err error
+
 		proxyReader, err = server.NewProxyProtocolReader("LMTP", options.ProxyProtocol)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
@@ -77,7 +78,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, d
 		addr:          addr,
 		appCtx:        appCtx,
 		hostname:      hostname,
-		db:            db,
+		rdb:           rdb,
 		s3:            s3,
 		uploader:      uploadWorker,
 		externalRelay: options.ExternalRelay,

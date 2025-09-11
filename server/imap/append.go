@@ -39,7 +39,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	mailbox, err := s.server.db.GetMailboxByName(readCtx, s.UserID(), mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, s.UserID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[APPEND] mailbox '%s' does not exist", mboxName)
@@ -140,7 +140,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	copy(appendFlags, options.Flags)
 	appendFlags = append(appendFlags, imap.Flag("\\Recent"))
 
-	_, messageUID, err := s.server.db.InsertMessage(s.ctx, // This method must use the write pool.
+	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
 			MailboxID:     mailbox.ID,

@@ -14,9 +14,9 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/cache"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
@@ -27,7 +27,7 @@ const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
 
 type IMAPServer struct {
 	addr               string
-	db                 *db.Database
+	rdb                *resilient.ResilientDatabase
 	hostname           string
 	s3                 *storage.S3Storage
 	server             *imapserver.Server
@@ -55,7 +55,7 @@ type IMAPServer struct {
 
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
-	
+
 	// Cache warmup configuration
 	enableWarmup       bool
 	warmupMessageCount int
@@ -80,15 +80,15 @@ type IMAPServerOptions struct {
 	ProxyProtocol       serverPkg.ProxyProtocolConfig
 	AuthRateLimit       serverPkg.AuthRateLimiterConfig
 	// Cache warmup configuration
-	EnableWarmup         bool
-	WarmupMessageCount   int
-	WarmupMailboxes      []string
-	WarmupAsync          bool
-	WarmupTimeout        string
-	FTSRetention         time.Duration
+	EnableWarmup       bool
+	WarmupMessageCount int
+	WarmupMailboxes    []string
+	WarmupAsync        bool
+	WarmupTimeout      string
+	FTSRetention       time.Duration
 }
 
-func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3Storage, database *db.Database, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
+func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
 	if options.ProxyProtocol.Enabled {
@@ -100,7 +100,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 	}
 
 	// Initialize authentication rate limiter
-	authLimiter := serverPkg.NewAuthRateLimiter("IMAP", options.AuthRateLimit, database)
+	authLimiter := serverPkg.NewAuthRateLimiter("IMAP", options.AuthRateLimit, rdb)
 
 	// Parse warmup timeout with default fallback
 	warmupTimeout := 5 * time.Minute // Default timeout
@@ -116,8 +116,7 @@ func New(appCtx context.Context, hostname, imapAddr string, storage *storage.S3S
 		hostname:           hostname,
 		appCtx:             appCtx,
 		addr:               imapAddr,
-		db:                 database,
-		s3:                 storage,
+		rdb:                rdb,
 		uploader:           uploadWorker,
 		cache:              cache,
 		appendLimit:        options.AppendLimit,
@@ -345,7 +344,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		return nil
 	}
 
-	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)", 
+	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)",
 		userID, messageCount, mailboxNames, async, s.warmupTimeout)
 
 	warmupFunc := func() {
@@ -371,7 +370,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		}
 
 		// Get user's primary email for S3 key construction
-		address, err := s.db.GetPrimaryEmailForAccount(warmupCtx, userID)
+		address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, userID)
 		if err != nil {
 			log.Printf("[IMAP] warmup: failed to get primary address for account %d: %v", userID, err)
 			return
@@ -407,7 +406,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				// Build S3 key and fetch from S3 with retry logic
 				s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
 				var data []byte
-				
+
 				// Retry S3 operations up to 3 times with exponential backoff
 				maxRetries := 3
 				var fetchErr error
@@ -458,7 +457,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 			}
 		}
 
-		log.Printf("[IMAP] warmup completed for user %d: %d messages cached, %d skipped (already cached)", 
+		log.Printf("[IMAP] warmup completed for user %d: %d messages cached, %d skipped (already cached)",
 			userID, warmedCount, skippedCount)
 	}
 

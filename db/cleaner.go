@@ -139,26 +139,54 @@ func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash s
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
 func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
-
-	// Use a CTE to identify and delete messages that were never uploaded, then
-	// use the result to delete the corresponding pending_uploads entries.
-	// We query for the count of deleted messages to return an accurate number for logging.
-	var deletedMessagesCount int64
-	err := d.GetWritePool().QueryRow(ctx, `
-		WITH deleted_messages AS (
-			DELETE FROM messages
-			WHERE uploaded = FALSE AND created_at < $1
-			RETURNING content_hash, account_id
-		),
-		deleted_pending_uploads AS (
-			DELETE FROM pending_uploads pu
-			USING deleted_messages dm
-			WHERE pu.content_hash = dm.content_hash AND pu.account_id = dm.account_id
-		)
-		SELECT count(*) FROM deleted_messages
-	`, threshold).Scan(&deletedMessagesCount)
+	tx, err := d.BeginTx(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
+		return 0, fmt.Errorf("failed to begin transaction for failed upload cleanup: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Step 1: Delete messages that were never uploaded and are older than the grace period,
+	// returning the identifiers of the deleted messages.
+	rows, err := tx.Query(ctx, `
+		DELETE FROM messages
+		WHERE uploaded = FALSE AND created_at < $1
+		RETURNING content_hash, account_id
+	`, threshold)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete messages for failed uploads: %w", err)
+	}
+
+	var deletedMessagesCount int64
+	var contentHashes []string
+	var accountIDs []int64
+
+	for rows.Next() {
+		var hash string
+		var accountID int64
+		if err := rows.Scan(&hash, &accountID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan deleted message info: %w", err)
+		}
+		contentHashes = append(contentHashes, hash)
+		accountIDs = append(accountIDs, accountID)
+		deletedMessagesCount++
+	}
+	rows.Close()
+
+	if deletedMessagesCount > 0 {
+		// Step 2: Delete the corresponding entries from pending_uploads in a single batch.
+		_, err = tx.Exec(ctx, `
+			DELETE FROM pending_uploads pu
+			USING unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
+			WHERE pu.content_hash = d.content_hash AND pu.account_id = d.account_id
+		`, contentHashes, accountIDs)
+		if err != nil {
+			return 0, fmt.Errorf("failed to delete from pending_uploads: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit failed upload cleanup: %w", err)
 	}
 
 	return deletedMessagesCount, nil

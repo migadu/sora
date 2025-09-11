@@ -24,7 +24,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 
 	// Middle phase: Database operations outside lock
-	oldMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, existingName)
+	oldMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, existingName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[RENAME] mailbox '%s' does not exist", existingName)
@@ -37,7 +37,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		return s.internalError("failed to fetch mailbox '%s': %v", existingName, err)
 	}
 
-	_, err = s.server.db.GetMailboxByName(s.ctx, userID, newName)
+	_, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, newName)
 	if err == nil {
 		s.Log("[RENAME] mailbox '%s' already exists", newName)
 		return &imap.Error{
@@ -56,7 +56,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
 	if len(newParts) > 1 {
 		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
-		newParentMailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, newParentPath)
+		newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, newParentPath)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
 				s.Log("[RENAME] new parent mailbox '%s' for '%s' does not exist", newParentPath, newName)
@@ -71,7 +71,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 	// If len(newParts) <= 1, newParentMailboxID remains nil, which is correct for a top-level mailbox.
 
-	err = s.server.db.RenameMailbox(s.ctx, oldMailbox.ID, userID, newName, newParentMailboxID)
+	err = s.server.rdb.RenameMailboxWithRetry(s.ctx, oldMailbox.ID, userID, newName, newParentMailboxID)
 	if err != nil {
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}

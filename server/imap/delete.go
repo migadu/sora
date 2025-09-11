@@ -27,7 +27,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.db.GetMailboxByName(s.ctx, userID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[DELETE] mailbox '%s' not found", mboxName)
@@ -51,7 +51,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Final phase: actual deletion - no locks needed as it's a DB operation
-	err = s.server.db.DeleteMailbox(s.ctx, mailbox.ID, userID)
+	err = s.server.rdb.DeleteMailboxWithRetry(s.ctx, mailbox.ID, userID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}

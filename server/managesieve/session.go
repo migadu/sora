@@ -141,7 +141,7 @@ func (s *ManageSieveSession) handleConnection() {
 					s.Log("[LOGIN] Master password authentication successful for '%s'", address.FullAddress())
 					authSuccess = true
 					// For master password, we need to get the user ID
-					userID, err = s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+					userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 					if err != nil {
 						s.Log("[LOGIN] Failed to get account ID for master user '%s': %v", address.FullAddress(), err)
 						// Record failed attempt
@@ -158,7 +158,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
-				userID, err = s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
+				userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -471,7 +471,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	scripts, err := s.server.db.GetUserScripts(readCtx, userID)
+	scripts, err := s.server.rdb.GetUserScriptsWithRetry(readCtx, userID)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
@@ -517,7 +517,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.db.GetScriptByName(readCtx, name, userID)
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, userID)
 	if err != nil {
 		s.sendResponse("NO No such script\r\n")
 		return false
@@ -560,7 +560,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
 	if err != nil {
 		if err != consts.ErrDBNotFound {
 			s.sendResponse("NO Internal server error\r\n")
@@ -568,7 +568,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		}
 	}
 	if script != nil {
-		_, err := s.server.db.UpdateScript(s.ctx, script.ID, s.UserID(), name, content)
+		_, err := s.server.rdb.UpdateScriptWithRetry(s.ctx, script.ID, s.UserID(), name, content)
 		if err != nil {
 			s.sendResponse("NO Internal server error\r\n")
 			return false
@@ -590,7 +590,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		return true
 	}
 
-	_, err = s.server.db.CreateScript(s.ctx, s.UserID(), name, content)
+	_, err = s.server.rdb.CreateScriptWithRetry(s.ctx, s.UserID(), name, content)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
@@ -629,7 +629,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n")
@@ -648,7 +648,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		return false
 	}
 
-	err = s.server.db.SetScriptActive(s.ctx, script.ID, s.UserID(), true)
+	err = s.server.rdb.SetScriptActiveWithRetry(s.ctx, script.ID, s.UserID(), true)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
@@ -682,7 +682,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.db.GetScriptByName(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n") // RFC uses NO for "No such script"
@@ -692,7 +692,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		return false
 	}
 
-	err = s.server.db.DeleteScript(s.ctx, script.ID, s.UserID())
+	err = s.server.rdb.DeleteScriptWithRetry(s.ctx, script.ID, s.UserID())
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
@@ -850,7 +850,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 				return false
 			}
 
-			userID, err = s.server.db.GetAccountIDByAddress(s.ctx, address.FullAddress())
+			userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 			if err != nil {
 				s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
 				s.sendResponse("NO Impersonation target user not found\r\n")
@@ -894,7 +894,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			}
 		}
 
-		userID, err = s.server.db.Authenticate(s.ctx, address.FullAddress(), password)
+		userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
 		if err != nil {
 			// Record failed attempt
 			if s.server.authLimiter != nil {

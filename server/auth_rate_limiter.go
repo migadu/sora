@@ -78,9 +78,9 @@ type AuthAttempt struct {
 
 // AuthDatabase interface for rate limiting database operations
 type AuthDatabase interface {
-	RecordAuthAttempt(ctx context.Context, ipAddress, username, protocol string, success bool) error
-	GetFailedAttemptsCountSeparateWindows(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error)
-	CleanupOldAuthAttempts(ctx context.Context, maxAge time.Duration) (int64, error)
+	RecordAuthAttemptWithRetry(ctx context.Context, ipAddress, username, protocol string, success bool) error
+	GetFailedAttemptsCountSeparateWindowsWithRetry(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error)
+	CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error)
 	GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error)
 }
 
@@ -138,14 +138,14 @@ type IPFailureInfo struct {
 }
 
 // NewAuthRateLimiter creates a new authentication rate limiter.
-func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig, database AuthDatabase) *AuthRateLimiter {
+func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig, rdb AuthDatabase) *AuthRateLimiter {
 	if !config.Enabled {
 		return nil
 	}
 
 	limiter := &AuthRateLimiter{
 		config:           config,
-		db:               database,
+		db:               rdb,
 		protocol:         protocol,
 		blockedIPs:       make(map[string]*BlockedIPInfo),
 		ipFailureCounts:  make(map[string]*IPFailureInfo),
@@ -194,7 +194,7 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 
 	// Regular rate limiting check (database if healthy, otherwise allow)
 	if a.shouldCheckDatabase() {
-		ipCount, usernameCount, err := a.db.GetFailedAttemptsCountSeparateWindows(
+		ipCount, usernameCount, err := a.db.GetFailedAttemptsCountSeparateWindowsWithRetry(
 			ctx, ip, username, a.config.IPWindowDuration, a.config.UsernameWindowDuration)
 
 		if err != nil {
@@ -366,7 +366,7 @@ func (a *AuthRateLimiter) syncPendingRecords() {
 	defer cancel()
 
 	for i, record := range records {
-		if err := a.db.RecordAuthAttempt(ctx, record.IP, record.Username, a.protocol, record.Success); err != nil {
+		if err := a.db.RecordAuthAttemptWithRetry(ctx, record.IP, record.Username, a.protocol, record.Success); err != nil {
 			log.Printf("[%s-AUTH-LIMITER] Warning: failed to sync auth attempt: %v", a.protocol, err)
 			a.markDBUnhealthy()
 			// Re-queue failed records

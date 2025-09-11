@@ -8,7 +8,19 @@ import (
 
 // DatabaseEndpointConfig holds configuration for a single database endpoint
 type DatabaseEndpointConfig struct {
-	Hosts           []string    `toml:"hosts"` // List of database hosts (e.g., ["db1", "db2"] or ["db1:5432", "db2:5432"])
+	// List of database hosts for runtime failover/load balancing
+	// Examples:
+	//   Single host: ["db.example.com"] - hostname with DNS-based IP redundancy
+	//   Multiple hosts: ["db1", "db2", "db3"] - for connection pools, proxies, or clusters
+	//   With ports: ["db1:5432", "db2:5433"] - explicit port specification
+	// 
+	// WRITE HOSTS: Use single host unless you have:
+	//   - Multi-master setup (BDR, Postgres-XL)
+	//   - Multiple connection pool/proxy instances (PgBouncer, HAProxy)
+	//   - Service discovery endpoints (Consul, K8s services)
+	//
+	// READ HOSTS: Multiple hosts are common for read replica load balancing
+	Hosts           []string    `toml:"hosts"`
 	Port            interface{} `toml:"port"`  // Database port (default: "5432"), can be string or integer
 	User            string      `toml:"user"`
 	Password        string      `toml:"password"`

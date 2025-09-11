@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-smtp"
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -176,19 +178,25 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	userId, err := s.backend.db.GetAccountIDByAddress(readCtx, lookupAddress)
+	var userId int64
+	row := s.backend.rdb.QueryRowWithRetry(readCtx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", lookupAddress)
+	err = row.Scan(&userId)
 	if err != nil {
-		s.Log("failed to get user ID by address: %v", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.Log("user not found for address: %s", lookupAddress)
+		} else {
+			s.Log("failed to get user ID by address: %v", err)
+		}
 		return &smtp.SMTPError{
 			Code:         550,
-			EnhancedCode: smtp.EnhancedCode{5, 0, 2},
+			EnhancedCode: smtp.EnhancedCode{5, 1, 1},
 			Message:      "No such user here",
 		}
 	}
 
 	// This is a potential write operation, so it must use the main context.
-	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-	err = s.backend.db.CreateDefaultMailboxes(s.ctx, userId)
+	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist. Use the resilient method.
+	err = s.backend.rdb.CreateDefaultMailboxesWithRetry(s.ctx, userId)
 	if err != nil {
 		return s.InternalError("failed to create default mailboxes: %v", err)
 	}
@@ -323,15 +331,13 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	activeScript, err := s.backend.db.GetActiveScript(readCtx, s.UserID())
+	activeScript, err := s.backend.rdb.GetActiveScriptWithRetry(readCtx, s.UserID())
 	var result sieveengine.Result
 	var mailboxName string
 
 	// Create an adapter for the VacationOracle interface
 	sieveVacOracle := &dbVacationOracle{
-		db:     *s.backend.db,
-		userID: s.UserID(),
-		// s.sender is available if needed, but Sieve's VacationResponseAllowed gets originalSender
+		rdb: s.backend.rdb,
 	}
 
 	// Create the sieve context (used for both default and user scripts)
@@ -732,11 +738,11 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	mailbox, err := s.backend.db.GetMailboxByName(readCtx, s.UserID(), mailboxName)
+	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.UserID(), mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("WARNING: mailbox '%s' not found, falling back to INBOX", mailboxName)
-			mailbox, err = s.backend.db.GetMailboxByName(readCtx, s.UserID(), consts.MailboxInbox)
+			mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.UserID(), consts.MailboxInbox)
 			if err != nil {
 				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
 			}
@@ -747,7 +753,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 
 	size := int64(len(fullMessageBytes))
 
-	_, messageUID, err := s.backend.db.InsertMessage(s.ctx,
+	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
 			UserID:        s.UserID(),
 			MailboxID:     mailbox.ID,

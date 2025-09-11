@@ -34,7 +34,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Phase 2: Database operations outside lock
-	mailbox, err := s.server.db.GetMailboxByName(readCtx, userID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, userID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("[SELECT] mailbox '%s' does not exist for user %d", mboxName, s.UserID())
@@ -48,7 +48,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to fetch mailbox '%s' for user %d: %v", mboxName, s.UserID(), err)
 	}
 
-	currentSummary, err := s.server.db.GetMailboxSummary(readCtx, mailbox.ID)
+	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
 	}
@@ -85,7 +85,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		s.Log("[SELECT] mailbox %s reselected", mboxName)
 		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
 		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
-		count, dbErr := s.server.db.CountMessagesGreaterThanUID(readCtx, mailbox.ID, uidToCompareAgainst)
+		count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, uidToCompareAgainst)
 		if dbErr != nil {
 			s.Log("[SELECT] Error counting messages greater than UID %d for mailbox %d: %v. Defaulting RECENT to total.", uidToCompareAgainst, mailbox.ID, dbErr)
 			numRecent = uint32(currentSummary.NumMessages) // Fallback
@@ -144,7 +144,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d FirstUnseenSeq=%d",
 		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent, s.firstUnseenSeqNum.Load())
-	
+
 	// Track domain and user command activity
 	if s.IMAPUser != nil {
 		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "SELECT")
@@ -153,7 +153,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
-		Flags: getDisplayFlags(readCtx, s.server.db, mailbox),
+		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox),
 		// Flags that can be changed, including \* for custom
 		PermanentFlags:    getPermanentFlags(),
 		NumMessages:       s.currentNumMessages.Load(),

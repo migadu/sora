@@ -37,7 +37,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	poll, err := s.server.db.PollMailbox(readCtx, mailboxID, highestModSeqToPollFrom)
+	poll, err := s.server.rdb.PollMailboxWithRetry(readCtx, mailboxID, highestModSeqToPollFrom)
 	if err != nil {
 		return s.internalError("failed to poll mailbox: %v", err)
 	}

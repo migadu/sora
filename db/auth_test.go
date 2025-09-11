@@ -18,12 +18,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Fatalf("Failed to generate bcrypt hash: %v", err)
 	}
 
-	err = verifyPassword(string(bcryptHash), password)
+	err = VerifyPassword(string(bcryptHash), password)
 	if err != nil {
 		t.Errorf("bcrypt verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(string(bcryptHash), "wrongPassword")
+	err = VerifyPassword(string(bcryptHash), "wrongPassword")
 	if err == nil {
 		t.Error("bcrypt verification should fail for incorrect password")
 	}
@@ -38,12 +38,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Errorf("BLF-CRYPT hash doesn't have the correct prefix: %s", blfCryptHash)
 	}
 
-	err = verifyPassword(blfCryptHash, password)
+	err = VerifyPassword(blfCryptHash, password)
 	if err != nil {
 		t.Errorf("BLF-CRYPT verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(blfCryptHash, "wrongPassword")
+	err = VerifyPassword(blfCryptHash, "wrongPassword")
 	if err == nil {
 		t.Error("BLF-CRYPT verification should fail for incorrect password")
 	}
@@ -58,12 +58,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Errorf("SSHA512 hash doesn't have the correct prefix: %s", ssha512Hash)
 	}
 
-	err = verifyPassword(ssha512Hash, password)
+	err = VerifyPassword(ssha512Hash, password)
 	if err != nil {
 		t.Errorf("SSHA512 verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(ssha512Hash, "wrongPassword")
+	err = VerifyPassword(ssha512Hash, "wrongPassword")
 	if err == nil {
 		t.Error("SSHA512 verification should fail for incorrect password")
 	}
@@ -78,12 +78,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Errorf("SSHA512.HEX hash doesn't have the correct prefix: %s", ssha512HexHash)
 	}
 
-	err = verifyPassword(ssha512HexHash, password)
+	err = VerifyPassword(ssha512HexHash, password)
 	if err != nil {
 		t.Errorf("SSHA512.HEX verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(ssha512HexHash, "wrongPassword")
+	err = VerifyPassword(ssha512HexHash, "wrongPassword")
 	if err == nil {
 		t.Error("SSHA512.HEX verification should fail for incorrect password")
 	}
@@ -94,12 +94,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Errorf("SHA512 hash doesn't have the correct prefix: %s", sha512Hash)
 	}
 
-	err = verifyPassword(sha512Hash, password)
+	err = VerifyPassword(sha512Hash, password)
 	if err != nil {
 		t.Errorf("SHA512 verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(sha512Hash, "wrongPassword")
+	err = VerifyPassword(sha512Hash, "wrongPassword")
 	if err == nil {
 		t.Error("SHA512 verification should fail for incorrect password")
 	}
@@ -110,18 +110,18 @@ func TestVerifyPassword(t *testing.T) {
 		t.Errorf("SHA512.HEX hash doesn't have the correct prefix: %s", sha512HexHash)
 	}
 
-	err = verifyPassword(sha512HexHash, password)
+	err = VerifyPassword(sha512HexHash, password)
 	if err != nil {
 		t.Errorf("SHA512.HEX verification failed for correct password: %v", err)
 	}
 
-	err = verifyPassword(sha512HexHash, "wrongPassword")
+	err = VerifyPassword(sha512HexHash, "wrongPassword")
 	if err == nil {
 		t.Error("SHA512.HEX verification should fail for incorrect password")
 	}
 
 	// Test with malformed hash
-	err = verifyPassword("unknown_scheme_hash", password)
+	err = VerifyPassword("unknown_scheme_hash", password)
 	if err == nil {
 		t.Error("Verification should fail for unknown hash scheme")
 	}
@@ -286,14 +286,14 @@ func TestManuallyCreatedHashes(t *testing.T) {
 
 	// Encode with base64
 	b64Hash := "{SHA512}" + base64.StdEncoding.EncodeToString(hash)
-	err := verifyPassword(b64Hash, password)
+	err := VerifyPassword(b64Hash, password)
 	if err != nil {
 		t.Errorf("Manually created SHA512 base64 hash verification failed: %v", err)
 	}
 
 	// Encode with hex
 	hexHash := "{SHA512.HEX}" + hex.EncodeToString(hash)
-	err = verifyPassword(hexHash, password)
+	err = VerifyPassword(hexHash, password)
 	if err != nil {
 		t.Errorf("Manually created SHA512 hex hash verification failed: %v", err)
 	}
@@ -308,14 +308,14 @@ func TestManuallyCreatedHashes(t *testing.T) {
 	// Combine hash and salt, then encode with base64
 	combined := append(sshaHash, salt...)
 	b64SSHA := "{SSHA512}" + base64.StdEncoding.EncodeToString(combined)
-	err = verifyPassword(b64SSHA, password)
+	err = VerifyPassword(b64SSHA, password)
 	if err != nil {
 		t.Errorf("Manually created SSHA512 base64 hash verification failed: %v", err)
 	}
 
 	// Combine hash and salt, then encode with hex
 	hexSSHA := "{SSHA512.HEX}" + hex.EncodeToString(combined)
-	err = verifyPassword(hexSSHA, password)
+	err = VerifyPassword(hexSSHA, password)
 	if err != nil {
 		t.Errorf("Manually created SSHA512 hex hash verification failed: %v", err)
 	}
