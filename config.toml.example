@@ -1334,44 +1334,52 @@ cache_ttl = "10m"
 #   cache_size = 50000                         # Large cache
 cache_size = 10000
 
-# --- PRELOOKUP QUERY CONFIGURATION ---
-# Customize SQL queries for routing decisions
+# --- PRELOOKUP CONFIGURATION ---
+# Auto-detection based on query results - no manual mode selection needed!
+# The system automatically detects authentication mode based on the query results:
+# ┌─────────────────────┬────────────────────────────────────────────────────┐
+# │ Query Returns       │ Mode                                               │
+# ├─────────────────────┼────────────────────────────────────────────────────┤
+# │ 1 column            │ Routing-only (authentication handled by backend)  │
+# │ 2+ columns          │ Authentication + routing (password verified here)  │
+# └─────────────────────┴────────────────────────────────────────────────────┘
+#
+# Simply configure one 'query' below - no need to set separate auth/routing modes!
+# The system will automatically determine the correct behavior based on your query.
 
-# SQL query to determine user routing
-# The query should return (server_address) for the given email
-# Default query assumes a 'user_routing' table with email, server_address, and active columns
-# Examples:
-#   routing_query = "SELECT server_addr FROM users WHERE email = $1"
-#   routing_query = "SELECT backend_host FROM routing WHERE user_email = $1 AND enabled = true"
-routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
-
-# --- PRELOOKUP AUTHENTICATION MODE ---
-# Control whether prelookup also handles authentication or just routing
-
-# Authentication mode for prelookup
+# Authentication method for password verification (only used in auth+route mode)
 # Options:
-#   "routing_only"     - Only perform routing lookups, authentication handled by backend
-#   "auth_and_route"   - Perform both authentication and routing in prelookup database
-# Examples:
-#   auth_mode = "routing_only"                 # Separate auth and routing
-#   auth_mode = "auth_and_route"               # Combined auth and routing
-auth_mode = "routing_only"
-
-# Authentication method when auth_mode = "auth_and_route"
-# Options:
-#   "bcrypt"    - bcrypt password hashing (recommended)
-#   "plain"     - plain text passwords (insecure, testing only)
-# Examples:
-#   auth_method = "bcrypt"                     # Secure password hashing
-#   auth_method = "plain"                      # Plain text (development only)
+#   "bcrypt" - bcrypt password hashing (recommended for production)
+#   "plain"  - plain text passwords (insecure, testing/development only)
 auth_method = "bcrypt"
 
-# SQL query for authentication and routing (used when auth_mode = "auth_and_route")
-# The query should return (password_hash, server_address) for the given email
+# Main query for user lookup (auto-detects authentication mode based on columns returned)
+# ROUTING-ONLY (1 column):    Returns server_address - authentication handled by backend
+# AUTH+ROUTE (2+ columns):    Returns password_hash, server_address [, account_id] - authentication handled here
+# This field is REQUIRED if prelookup is enabled.
+# 
+# Column patterns supported:
+#   1 column:   server_address
+#   2 columns:  password_hash, server_address  
+#   3+ columns: account_id, password_hash, server_address (account_id first, server_address last)
+#
 # Examples:
-#   auth_query = "SELECT pass_hash, server_addr FROM users WHERE email = $1 AND active = true"
-#   auth_query = "SELECT password, backend_host FROM user_auth WHERE user_email = $1 AND enabled = true"
-auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+#   query = "SELECT server_address FROM users WHERE email = $1"                               # Routing-only
+#   query = "SELECT password_hash, server_address FROM users WHERE email = $1"               # Auth+route  
+#   query = "SELECT account_id, bcrypt_hash, backend_server FROM accounts WHERE email = $1"  # Auth+route with ID
+#   query = "SELECT id, pass_hash, host, extra FROM routing WHERE email = $1"                # Auth+route (server = last column)
+query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+
+# --- PRELOOKUP BACKEND TLS CONFIGURATION ---
+# TLS settings for connections to backend servers returned by the prelookup query.
+# These settings override the proxy's main remote_tls settings when a server
+# is determined via prelookup.
+
+# Enable TLS for connections to backend servers found via prelookup.
+remote_tls = false
+
+# Verify backend server certificates. It is strongly recommended to keep this true.
+remote_tls_verify = true
 
 # --- PRELOOKUP FALLBACK BEHAVIOR ---
 # Control what happens when prelookup fails or user is not found
@@ -1486,11 +1494,12 @@ max_conn_lifetime = "1h"
 max_conn_idle_time = "30m"
 cache_ttl = "10m"
 cache_size = 10000
-routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
-auth_mode = "routing_only"
 auth_method = "bcrypt"
-auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+# The 'query' field is REQUIRED if prelookup is enabled.
+query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
 fallback_to_default = true
+remote_tls = false
+remote_tls_verify = true
 
 # =============================================================================
 # MANAGESIEVE PROXY CONFIGURATION
@@ -1581,11 +1590,12 @@ max_conn_lifetime = "1h"
 max_conn_idle_time = "30m"
 cache_ttl = "10m"
 cache_size = 10000
-routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
-auth_mode = "routing_only"
 auth_method = "bcrypt"
-auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+# The 'query' field is REQUIRED if prelookup is enabled.
+query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
 fallback_to_default = true
+remote_tls = false
+remote_tls_verify = true
 
 # =============================================================================
 # LMTP PROXY CONFIGURATION
@@ -1634,11 +1644,12 @@ max_conn_lifetime = "1h"
 max_conn_idle_time = "30m"
 cache_ttl = "10m"
 cache_size = 10000
-routing_query = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
-auth_mode = "routing_only"
 auth_method = "bcrypt"
-auth_query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
+# The 'query' field is REQUIRED if prelookup is enabled.
+query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
 fallback_to_default = true
+remote_tls = false
+remote_tls_verify = true
 
 # =============================================================================
 # PROMETHEUS METRICS CONFIGURATION
@@ -1777,6 +1788,14 @@ enabled = true
 #   update_interval = "15s"                    # Standard updates
 #   update_interval = "30s"                    # Infrequent updates
 update_interval = "15s"
+
+# How often to check for connections marked for termination
+# Lower values provide faster response to termination requests but increase DB load
+# Examples:
+#   termination_poll_interval = "10s"         # Fast response, higher DB load
+#   termination_poll_interval = "30s"         # Balanced (default)
+#   termination_poll_interval = "60s"         # Slower response, lower DB load
+termination_poll_interval = "30s"
 
 # Batch multiple connection updates together for efficiency
 # Examples:

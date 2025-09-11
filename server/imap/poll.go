@@ -10,8 +10,14 @@ import (
 )
 
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	// If the session is closing, don't try to poll.
+	if s.ctx.Err() != nil {
+		s.Log("[POLL] Session context is cancelled, skipping poll.")
+		return nil
+	}
+
 	// First phase: Read state with read lock
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[POLL] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -22,14 +28,12 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	}
 
 	if s.selectedMailbox == nil || s.mailboxTracker == nil || s.sessionTracker == nil {
-		s.mutex.RUnlock()
-		cancel()
+		release()
 		return nil
 	}
 	mailboxID := s.selectedMailbox.ID
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
-	s.mutex.RUnlock()
-	cancel()
+	release()
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := s.ctx
@@ -42,7 +46,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return s.internalError("failed to poll mailbox: %v", err)
 	}
 
-	acquired, cancel = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[POLL] Failed to acquire write lock within timeout")
 		return &imap.Error{
@@ -51,12 +55,9 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 			Text: "Server busy, please try again",
 		}
 	}
-	defer func() {
-		s.mutex.Unlock()
-		cancel()
-	}()
 
 	if s.selectedMailbox == nil || s.selectedMailbox.ID != mailboxID || s.mailboxTracker == nil || s.sessionTracker == nil {
+		release()
 		return nil
 	}
 
@@ -136,6 +137,8 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		}
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, nil)
 	}
+
+	release() // Release lock before writing to the network
 
 	return s.sessionTracker.Poll(w, allowExpunge)
 }

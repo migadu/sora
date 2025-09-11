@@ -358,3 +358,34 @@ func (d *Database) FinalizeAccountDeletion(ctx context.Context, accountID int64)
 
 	return nil
 }
+
+// CleanupOldAuthAttempts removes authentication attempts older than the specified duration
+func (d *Database) CleanupOldAuthAttempts(ctx context.Context, maxAge time.Duration) (int64, error) {
+	cutoffTime := time.Now().Add(-maxAge)
+
+	query := `DELETE FROM auth_attempts WHERE attempted_at < $1`
+
+	result, err := d.GetWritePool().Exec(ctx, query, cutoffTime)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup old auth attempts: %w", err)
+	}
+
+	rowsAffected := result.RowsAffected()
+	return rowsAffected, nil
+}
+
+// CleanupOldHealthStatuses removes health status records that haven't been updated
+// for longer than the specified retention period. This is useful for removing
+// records of decommissioned servers.
+func (d *Database) CleanupOldHealthStatuses(ctx context.Context, retention time.Duration) (int64, error) {
+	cutoffTime := time.Now().Add(-retention)
+
+	query := `DELETE FROM health_status WHERE updated_at < $1`
+
+	result, err := d.GetWritePool().Exec(ctx, query, cutoffTime)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup old health statuses: %w", err)
+	}
+
+	return result.RowsAffected(), nil
+}

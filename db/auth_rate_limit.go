@@ -13,68 +13,68 @@ func (d *Database) RecordAuthAttempt(ctx context.Context, ipAddress, username, p
 	query := `
 		INSERT INTO auth_attempts (ip_address, username, protocol, success, attempted_at)
 		VALUES ($1, $2, $3, $4, now())`
-	
+
 	var usernameParam interface{}
 	if username == "" {
 		usernameParam = nil
 	} else {
 		usernameParam = username
 	}
-	
+
 	_, err := d.GetWritePool().Exec(ctx, query, ipAddress, usernameParam, protocol, success)
 	if err != nil {
 		return fmt.Errorf("failed to record auth attempt: %w", err)
 	}
-	
+
 	return nil
 }
 
 // GetFailedAttemptsCount counts failed authentication attempts within a time window
 func (d *Database) GetFailedAttemptsCount(ctx context.Context, ipAddress, username string, windowDuration time.Duration) (ipCount, usernameCount int, err error) {
 	cutoffTime := time.Now().Add(-windowDuration)
-	
+
 	// Count IP-based failed attempts
 	ipQuery := `
 		SELECT COUNT(*) 
 		FROM auth_attempts 
 		WHERE ip_address = $1 AND success = false AND attempted_at > $2`
-	
+
 	err = d.GetReadPool().QueryRow(ctx, ipQuery, ipAddress, cutoffTime).Scan(&ipCount)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to count IP-based failed attempts: %w", err)
 	}
-	
+
 	// Count username-based failed attempts (if username provided)
 	if username != "" {
 		usernameQuery := `
 			SELECT COUNT(*) 
 			FROM auth_attempts 
 			WHERE username = $1 AND success = false AND attempted_at > $2`
-		
+
 		err = d.GetReadPool().QueryRow(ctx, usernameQuery, username, cutoffTime).Scan(&usernameCount)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to count username-based failed attempts: %w", err)
 		}
 	}
-	
+
 	return ipCount, usernameCount, nil
 }
 
 // GetFailedAttemptsCountSeparateWindows counts failed authentication attempts with separate time windows for IP and username
 func (d *Database) GetFailedAttemptsCountSeparateWindows(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error) {
 	ipCutoffTime := time.Now().Add(-ipWindowDuration)
-	
+
 	// Count IP-based failed attempts
 	ipQuery := `
 		SELECT COUNT(*) 
 		FROM auth_attempts 
 		WHERE ip_address = $1 AND success = false AND attempted_at > $2`
-	
+
 	err = d.GetReadPool().QueryRow(ctx, ipQuery, ipAddress, ipCutoffTime).Scan(&ipCount)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to count IP-based failed attempts: %w", err)
 	}
-	
+
 	// Count username-based failed attempts (if username provided)
 	if username != "" {
 		usernameCutoffTime := time.Now().Add(-usernameWindowDuration)
@@ -82,35 +82,20 @@ func (d *Database) GetFailedAttemptsCountSeparateWindows(ctx context.Context, ip
 			SELECT COUNT(*) 
 			FROM auth_attempts 
 			WHERE username = $1 AND success = false AND attempted_at > $2`
-		
+
 		err = d.GetReadPool().QueryRow(ctx, usernameQuery, username, usernameCutoffTime).Scan(&usernameCount)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to count username-based failed attempts: %w", err)
 		}
 	}
-	
-	return ipCount, usernameCount, nil
-}
 
-// CleanupOldAuthAttempts removes authentication attempts older than the specified duration
-func (d *Database) CleanupOldAuthAttempts(ctx context.Context, maxAge time.Duration) (int64, error) {
-	cutoffTime := time.Now().Add(-maxAge)
-	
-	query := `DELETE FROM auth_attempts WHERE attempted_at < $1`
-	
-	result, err := d.GetWritePool().Exec(ctx, query, cutoffTime)
-	if err != nil {
-		return 0, fmt.Errorf("failed to cleanup old auth attempts: %w", err)
-	}
-	
-	rowsAffected := result.RowsAffected()
-	return rowsAffected, nil
+	return ipCount, usernameCount, nil
 }
 
 // GetAuthAttemptsStats returns statistics about authentication attempts
 func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
 	cutoffTime := time.Now().Add(-windowDuration)
-	
+
 	query := `
 		SELECT 
 			COUNT(*) as total_attempts,
@@ -121,7 +106,7 @@ func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time
 			COUNT(DISTINCT protocol) as unique_protocols
 		FROM auth_attempts 
 		WHERE attempted_at > $1`
-	
+
 	var stats struct {
 		TotalAttempts      int64
 		SuccessfulAttempts int64
@@ -130,7 +115,7 @@ func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time
 		UniqueUsernames    int64
 		UniqueProtocols    int64
 	}
-	
+
 	err := d.GetReadPool().QueryRow(ctx, query, cutoffTime).Scan(
 		&stats.TotalAttempts,
 		&stats.SuccessfulAttempts,
@@ -142,7 +127,7 @@ func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time
 	if err != nil && err != pgx.ErrNoRows {
 		return nil, fmt.Errorf("failed to get auth attempts stats: %w", err)
 	}
-	
+
 	return map[string]interface{}{
 		"total_attempts":      stats.TotalAttempts,
 		"successful_attempts": stats.SuccessfulAttempts,
@@ -204,7 +189,7 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 		FROM username_failures
 		ORDER BY last_failure DESC
 	`
-	
+
 	rows, err := d.GetReadPool().Query(ctx, query, ipWindowDuration, maxAttemptsPerIP, usernameWindowDuration, maxAttemptsPerUsername)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get blocked IPs: %w", err)
@@ -217,26 +202,26 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 		var username *string
 		var failureCount int
 		var firstFailure, lastFailure time.Time
-		
+
 		err := rows.Scan(&blockType, &identifier, &failureCount, &firstFailure, &lastFailure, &username)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan blocked IP row: %w", err)
 		}
-		
+
 		result := map[string]interface{}{
-			"block_type":     blockType,
-			"identifier":     identifier,
-			"failure_count":  failureCount,
-			"first_failure":  firstFailure,
-			"last_failure":   lastFailure,
+			"block_type":    blockType,
+			"identifier":    identifier,
+			"failure_count": failureCount,
+			"first_failure": firstFailure,
+			"last_failure":  lastFailure,
 		}
-		
+
 		if username != nil {
 			result["username"] = *username
 		}
-		
+
 		results = append(results, result)
 	}
-	
+
 	return results, nil
 }

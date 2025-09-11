@@ -571,6 +571,12 @@ func (db *Database) HardDeleteAccount(ctx context.Context, accountID int64) erro
 	// Note: Some tables have CASCADE deletes, but we'll be explicit for clarity
 
 	// Delete active connections
+	_, err = tx.Exec(ctx, "DELETE FROM server_affinity WHERE account_id = $1", accountID)
+	if err != nil {
+		return fmt.Errorf("failed to delete server affinity: %w", err)
+	}
+
+	// Delete active connections
 	_, err = tx.Exec(ctx, "DELETE FROM active_connections WHERE account_id = $1", accountID)
 	if err != nil {
 		return fmt.Errorf("failed to delete active connections: %w", err)

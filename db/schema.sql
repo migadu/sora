@@ -4,17 +4,24 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS accounts (
 	id BIGSERIAL PRIMARY KEY,
-	last_server_addr VARCHAR(255),
-	last_server_time TIMESTAMP,
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
 	deleted_at TIMESTAMPTZ NULL -- Soft deletion timestamp
 );
 
--- Create index for better performance
-CREATE INDEX IF NOT EXISTS idx_accounts_last_server ON accounts(last_server_addr);
-
 -- Index for soft deletion queries
 CREATE INDEX IF NOT EXISTS idx_accounts_deleted_at ON accounts(deleted_at);
+
+-- Table for tracking server affinity for proxy connections
+CREATE TABLE IF NOT EXISTS server_affinity (
+    account_id BIGINT NOT NULL,
+    is_prelookup_account BOOLEAN NOT NULL DEFAULT FALSE,
+    last_server_addr VARCHAR(255) NOT NULL,
+    last_server_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (account_id, is_prelookup_account)
+);
+
+-- Index for faster lookups by last_server_addr (e.g., for maintenance)
+CREATE INDEX IF NOT EXISTS idx_server_affinity_last_server_addr ON server_affinity(last_server_addr);
 
 -- A table to store account passwords and identities
 CREATE TABLE IF NOT EXISTS credentials (
@@ -273,7 +280,8 @@ CREATE TABLE IF NOT EXISTS locks (
 -- Table for tracking active proxy connections
 CREATE TABLE IF NOT EXISTS active_connections (
     id BIGSERIAL PRIMARY KEY,
-    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    account_id BIGINT NOT NULL,
+    is_prelookup_account BOOLEAN NOT NULL DEFAULT FALSE,
 	instance_id VARCHAR(255) NOT NULL,
     protocol VARCHAR(20) NOT NULL,
     client_addr VARCHAR(255) NOT NULL,
@@ -281,14 +289,14 @@ CREATE TABLE IF NOT EXISTS active_connections (
     connected_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     last_activity TIMESTAMP WITH TIME ZONE DEFAULT now(),
     should_terminate BOOLEAN DEFAULT false,
-    UNIQUE(account_id, protocol, client_addr)
+    UNIQUE(account_id, is_prelookup_account, protocol, client_addr)
 );
 
 -- It's a good idea to add an index for faster cleanup on startup.
 CREATE INDEX IF NOT EXISTS idx_active_connections_instance_id ON active_connections(instance_id);
 
 -- Index for faster lookups by account_id
-CREATE INDEX IF NOT EXISTS idx_active_connections_account_id ON active_connections (account_id);
+CREATE INDEX IF NOT EXISTS idx_active_connections_account_id ON active_connections (account_id, is_prelookup_account);
 
 -- Index for faster lookups by server_addr
 CREATE INDEX IF NOT EXISTS idx_active_connections_server_addr ON active_connections (server_addr);

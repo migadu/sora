@@ -16,6 +16,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
@@ -49,7 +50,7 @@ func main() {
 	flag.BoolVar(showVersion, "version", false, "Show version information and exit")
 
 	errorHandler := errors.NewErrorHandler()
-	cfg := newDefaultConfig()
+	cfg := config.NewDefaultConfig()
 
 	// --- Define Command-Line Flags ---
 	// Note: The version flag is defined above to be handled before other flags are parsed
@@ -622,7 +623,7 @@ func main() {
 				if len(errorMessages) > 0 {
 					// Returning an error marks the component as unhealthy/degraded.
 					// The error message itself will be stored in the `last_error` column.
-					return fmt.Errorf(strings.Join(errorMessages, "; "))
+					return fmt.Errorf("%s", strings.Join(errorMessages, "; "))
 				}
 
 				return nil
@@ -690,7 +691,17 @@ func main() {
 			errorHandler.ValidationError("cleanup fts_retention duration", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		cleanupWorker = cleaner.New(resilientDB, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention)
+		authAttemptsRetention, err := cfg.Cleanup.GetAuthAttemptsRetention()
+		if err != nil {
+			errorHandler.ValidationError("cleanup auth_attempts_retention duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		healthStatusRetention, err := cfg.Cleanup.GetHealthStatusRetention()
+		if err != nil {
+			errorHandler.ValidationError("cleanup health_status_retention duration", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		cleanupWorker = cleaner.New(resilientDB, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
 		cleanupWorker.Start(ctx)
 
 		// Initialize and start the upload worker
@@ -768,7 +779,7 @@ func main() {
 	}
 }
 
-func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
+func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
 
 	appendLimit, err := config.Servers.IMAP.GetAppendLimit()
 	if err != nil {
@@ -821,7 +832,7 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 	}
 }
 
-func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, errChan chan error, config Config) {
+func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, errChan chan error, config config.Config) {
 	ftsRetention, err := config.Cleanup.GetFTSRetention()
 	if err != nil {
 		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
@@ -858,7 +869,7 @@ func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *stor
 	lmtpServer.Start(errChan)
 }
 
-func startPOP3Server(ctx context.Context, hostname string, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config Config) {
+func startPOP3Server(ctx context.Context, hostname string, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
 	s, err := pop3.New(ctx, hostname, addr, s3storage, resilientDB, uploadWorker, cacheInstance, pop3.POP3ServerOptions{
 		Debug:               config.Servers.Debug,
 		TLS:                 config.Servers.POP3.TLS,
@@ -887,7 +898,7 @@ func startPOP3Server(ctx context.Context, hostname string, addr string, s3storag
 	s.Start(errChan)
 }
 
-func startManageSieveServer(ctx context.Context, hostname string, addr string, resilientDB *resilient.ResilientDatabase, errChan chan error, config Config) {
+func startManageSieveServer(ctx context.Context, hostname string, addr string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
 	maxSize, err := config.Servers.ManageSieve.GetMaxScriptSize()
 	if err != nil {
 		log.Printf("WARNING: invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
@@ -925,7 +936,7 @@ func startManageSieveServer(ctx context.Context, hostname string, addr string, r
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol.
-func startConnectionTrackerForProxy(protocol string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *ConnectionTrackingConfig, server interface {
+func startConnectionTrackerForProxy(protocol string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *config.ConnectionTrackingConfig, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
 	if !trackingConfig.Enabled {
@@ -938,12 +949,19 @@ func startConnectionTrackerForProxy(protocol string, rdb *resilient.ResilientDat
 		updateInterval = 10 * time.Second
 	}
 
+	terminationPollInterval, err := trackingConfig.GetTerminationPollInterval()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s': %v. Using default.", trackingConfig.TerminationPollInterval, err)
+		terminationPollInterval = 30 * time.Second
+	}
+
 	log.Printf("[%s Proxy] Starting connection tracker.", protocol)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		rdb,
 		hostname,
 		updateInterval,
+		terminationPollInterval,
 		trackingConfig.PersistToDB,
 		trackingConfig.BatchUpdates,
 		trackingConfig.Enabled,
@@ -964,7 +982,7 @@ func isFlagSet(name string) bool {
 	return isSet
 }
 
-func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config Config) {
+func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
 	// Parse connection timeout
 	connectTimeout, err := config.Servers.IMAPProxy.GetConnectTimeout()
 	if err != nil {
@@ -1018,7 +1036,7 @@ func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *res
 	}
 }
 
-func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config Config) {
+func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
 	// Parse connection timeout
 	connectTimeout, err := config.Servers.POP3Proxy.GetConnectTimeout()
 	if err != nil {
@@ -1070,7 +1088,7 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *res
 	server.Start()
 }
 
-func startManageSieveProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config Config) {
+func startManageSieveProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
 	// Parse connection timeout
 	connectTimeout, err := config.Servers.ManageSieveProxy.GetConnectTimeout()
 	if err != nil {
@@ -1122,7 +1140,7 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, resilient
 	server.Start()
 }
 
-func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config Config) {
+func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
 	// Parse connection timeout
 	connectTimeout, err := config.Servers.LMTPProxy.GetConnectTimeout()
 	if err != nil {
@@ -1172,7 +1190,7 @@ func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *res
 }
 
 // startMetricsServer starts the Prometheus metrics HTTP server
-func startMetricsServer(ctx context.Context, config MetricsConfig, errChan chan error) {
+func startMetricsServer(ctx context.Context, config config.MetricsConfig, errChan chan error) {
 	log.Printf("Starting metrics server on %s%s", config.Addr, config.Path)
 
 	mux := http.NewServeMux()
@@ -1199,7 +1217,7 @@ func startMetricsServer(ctx context.Context, config MetricsConfig, errChan chan 
 }
 
 // startHTTPAPIServer starts the HTTP API server
-func startHTTPAPIServer(ctx context.Context, rdb *resilient.ResilientDatabase, cacheInstance *cache.Cache, errChan chan error, config Config) {
+func startHTTPAPIServer(ctx context.Context, rdb *resilient.ResilientDatabase, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
 	if config.Servers.HTTPAPI.APIKey == "" {
 		errChan <- fmt.Errorf("HTTP API server enabled but no API key configured")
 		return

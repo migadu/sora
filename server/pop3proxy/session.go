@@ -17,20 +17,23 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 type POP3ProxySession struct {
-	server        *POP3ProxyServer
-	clientConn    net.Conn
-	backendConn   net.Conn
-	ctx           context.Context
-	cancel        context.CancelFunc
-	RemoteIP      string
-	username      string
-	accountID     int64
-	serverAddr    string
-	authenticated bool
-	mutex         sync.Mutex
+	server             *POP3ProxyServer
+	clientConn         net.Conn
+	backendConn        net.Conn
+	ctx                context.Context
+	cancel             context.CancelFunc
+	RemoteIP           string
+	username           string
+	accountID          int64
+	isPrelookupAccount bool
+	routingInfo        *proxy.UserRoutingInfo
+	serverAddr         string
+	authenticated      bool
+	mutex              sync.Mutex
 }
 
 func (s *POP3ProxySession) handleConnection() {
@@ -52,9 +55,9 @@ func (s *POP3ProxySession) handleConnection() {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				log.Printf("[POP3PROXY %s] client dropped connection", s.RemoteIP)
+				log.Printf("[POP3 Proxy] client %s dropped connection", s.RemoteIP)
 			} else {
-				log.Printf("[POP3PROXY %s] read error: %v", s.RemoteIP, err)
+				log.Printf("[POP3 Proxy] client %s read error: %v", s.RemoteIP, err)
 			}
 			return
 		}
@@ -101,7 +104,7 @@ func (s *POP3ProxySession) handleConnection() {
 			if err := s.authenticate(s.username, password); err != nil {
 				writer.WriteString("-ERR Authentication failed\r\n")
 				writer.Flush()
-				log.Printf("[POP3PROXY %s] authentication failed for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] authentication failed for %s: %v", s.RemoteIP, s.username, err)
 				continue
 			}
 
@@ -110,7 +113,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to register connection for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] Failed to register connection for %s: %v", s.RemoteIP, s.username, err)
 			}
 
 			// Start proxying
@@ -187,7 +190,7 @@ func (s *POP3ProxySession) handleConnection() {
 			if err := s.authenticate(authnID, password); err != nil {
 				writer.WriteString("-ERR Authentication failed\r\n")
 				writer.Flush()
-				log.Printf("[POP3PROXY %s] SASL authentication failed for %s: %v", s.RemoteIP, authnID, err)
+				log.Printf("[POP3 Proxy] SASL authentication failed for %s: %v", s.RemoteIP, authnID, err)
 				continue
 			}
 
@@ -196,7 +199,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to register connection for %s: %v", s.RemoteIP, authnID, err)
+				log.Printf("[POP3 Proxy] Failed to register connection for %s: %v", s.RemoteIP, authnID, err)
 			}
 
 			// Start proxying
@@ -216,43 +219,87 @@ func (s *POP3ProxySession) handleConnection() {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+
 	remoteAddr := s.clientConn.RemoteAddr()
 
 	// Check if the authentication attempt is allowed by the rate limiter.
-	if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, username); err != nil {
-		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+	if err := s.server.authLimiter.CanAttemptAuth(ctx, remoteAddr, username); err != nil {
+		s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 		return err
 	}
 
-	// Authenticate against the database
 	address, err := server.NewAddress(username)
 	if err != nil {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
-	accountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
+	// Try prelookup authentication/routing first if configured
+	if s.server.connManager.HasRouting() {
+		log.Printf("[POP3 Proxy] Attempting authentication for user %s via prelookup", username)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
+
+		if err != nil {
+			log.Printf("[POP3 Proxy] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", username, err)
+			// Fallthrough to main DB auth
+		} else {
+			switch authResult {
+			case proxy.AuthSuccess:
+				// Prelookup auth was successful.
+				log.Printf("[POP3 Proxy] Prelookup authentication successful for %s, AccountID: %d (prelookup)", username, routingInfo.AccountID)
+				s.accountID = routingInfo.AccountID
+				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
+				s.routingInfo = routingInfo
+				s.username = address.FullAddress()
+				s.authenticated = true
+				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, true)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
+				metrics.TrackDomainConnection("pop3_proxy", address.Domain())
+				metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
+
+				// Connect to backend
+				if err := s.connectToBackend(); err != nil {
+					return fmt.Errorf("failed to connect to backend: %w", err)
+				}
+				return nil // Authentication complete
+
+			case proxy.AuthFailed:
+				// User found in prelookup, but password was wrong. Reject immediately.
+				log.Printf("[POP3 Proxy] Prelookup authentication failed for %s (bad password)", username)
+				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+				return fmt.Errorf("authentication failed")
+
+			case proxy.AuthUserNotFound:
+				// User not in prelookup DB. Fallthrough to main DB auth.
+				log.Printf("[POP3 Proxy] User '%s' not found in prelookup. Falling back to main DB.", username)
+			}
+		}
+	}
+
+	// Fallback to main DB
+	log.Printf("[POP3 Proxy] Authenticating user %s via main database", username)
+	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
-		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
-	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
-	// Store user details on the session
-	s.mutex.Lock()
+	s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
-
-	// Track domain and user connection activity for the login event.
 	metrics.TrackDomainConnection("pop3_proxy", address.Domain())
 	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
 
+	// Store user details on the session
 	s.authenticated = true
 	s.username = address.FullAddress()
 	s.accountID = accountID
-	s.mutex.Unlock()
+	s.isPrelookupAccount = false // Authenticated against the main DB
 
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
@@ -264,7 +311,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 // getPreferredBackend fetches the preferred backend server for the user based on affinity.
 func (s *POP3ProxySession) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity {
+	if !s.server.enableAffinity || s.isPrelookupAccount {
 		return "", nil
 	}
 
@@ -290,49 +337,50 @@ func (s *POP3ProxySession) getPreferredBackend() (string, error) {
 func (s *POP3ProxySession) connectToBackend() error {
 	var preferredAddr string
 	var err error
+	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
 
-	// 1. Try routing lookup first
-	if s.server.connManager.HasRouting() {
+	// 1. Try routing lookup first, only if not already available from auth
+	if routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		var lookupErr error
+		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
-			log.Printf("[POP3PROXY %s] Routing lookup failed for %s: %v, falling back to affinity", s.RemoteIP, s.username, lookupErr)
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[POP3PROXY %s] Using routing lookup for %s: %s", s.RemoteIP, s.username, preferredAddr)
+			log.Printf("[POP3 Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
 		}
+	}
+
+	if routingInfo != nil && routingInfo.ServerAddress != "" {
+		preferredAddr = routingInfo.ServerAddress
+		log.Printf("[POP3 Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
 
 	// 2. If no routing info, try affinity
 	if preferredAddr == "" {
 		preferredAddr, err = s.getPreferredBackend()
 		if err != nil {
-			log.Printf("[POP3PROXY %s] Could not get preferred backend for %s: %v", s.RemoteIP, s.username, err)
+			log.Printf("[POP3 Proxy] Could not get preferred backend for %s: %v", s.username, err)
 		}
 		if preferredAddr != "" {
-			log.Printf("[POP3PROXY %s] Using server affinity for %s: %s", s.RemoteIP, s.username, preferredAddr)
+			log.Printf("[POP3 Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 		}
 	}
 
 	// 3. Apply stickiness to affinity/routing address
 	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
-			log.Printf("[POP3PROXY %s] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.RemoteIP, s.username, s.server.affinityStickiness)
+			log.Printf("[POP3 Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
 		}
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
-	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer connectCancel()
-
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
-		connectCtx,
+		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort,
+		clientHost, clientPort, serverHost, serverPort, routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -341,13 +389,13 @@ func (s *POP3ProxySession) connectToBackend() error {
 	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity if enabled
-	if s.server.enableAffinity && actualAddr != "" {
+	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
-			log.Printf("[POP3PROXY %s] Failed to update server affinity for %s: %v", s.RemoteIP, s.username, err)
+			log.Printf("[POP3 Proxy] Failed to update server affinity for %s: %v", s.username, err)
 		} else {
-			log.Printf("[POP3PROXY %s] Updated server affinity for %s to %s", s.RemoteIP, s.username, actualAddr)
+			log.Printf("[POP3 Proxy] Updated server affinity for %s to %s", s.username, actualAddr)
 		}
 	}
 
@@ -386,19 +434,19 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("backend authentication failed: %s", authResp)
 	}
 
-	log.Printf("[POP3PROXY %s] authenticated to backend as %s", s.RemoteIP, s.username)
+	log.Printf("[POP3 Proxy] authenticated to backend as %s", s.username)
 	return nil
 }
 
 func (s *POP3ProxySession) startProxying() {
 	if s.backendConn == nil {
-		log.Printf("[POP3PROXY %s] backend connection not established", s.RemoteIP)
+		log.Printf("[POP3 Proxy] backend connection not established for %s", s.username)
 		return
 	}
 
 	defer s.backendConn.Close()
 
-	log.Printf("[POP3PROXY %s] starting bidirectional proxy for %s", s.RemoteIP, s.username)
+	log.Printf("[POP3 Proxy] starting bidirectional proxy for %s", s.username)
 
 	var wg sync.WaitGroup
 
@@ -423,7 +471,7 @@ func (s *POP3ProxySession) startProxying() {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			log.Printf("[POP3PROXY %s] error copying backend to client: %v", s.RemoteIP, err)
+			log.Printf("[POP3 Proxy] error copying backend to client for %s: %v", s.username, err)
 		}
 		s.clientConn.Close() // Close client to unblock the other io.Copy
 		s.backendConn.Close()
@@ -437,7 +485,7 @@ func (s *POP3ProxySession) startProxying() {
 	}()
 
 	wg.Wait() // Wait for both copy operations to finish
-	log.Printf("[POP3PROXY %s] proxy session ended for %s", s.RemoteIP, s.username)
+	log.Printf("[POP3 Proxy] proxy session ended for %s", s.username)
 }
 
 // close closes all connections and unregisters from tracking.
@@ -456,7 +504,7 @@ func (s *POP3ProxySession) close() {
 
 		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to unregister connection for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] Failed to unregister connection for %s: %v", s.username, err)
 			}
 		}
 	}
@@ -502,11 +550,11 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 
 		shouldTerminate, err := s.server.connTracker.CheckTermination(checkCtx, s.accountID, "POP3", s.RemoteIP)
 		if err != nil {
-			log.Printf("[POP3PROXY %s] Failed to check termination for %s: %v", s.RemoteIP, s.username, err)
+			log.Printf("[POP3 Proxy] Failed to check termination for %s: %v", s.username, err)
 			return false
 		}
 		if shouldTerminate {
-			log.Printf("[POP3PROXY %s] Connection marked for termination, disconnecting: %s", s.RemoteIP, s.username)
+			log.Printf("[POP3 Proxy] Connection marked for termination, disconnecting: %s", s.username)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return true
@@ -517,14 +565,14 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			log.Printf("[POP3PROXY %s] Received kick notification for %s", s.RemoteIP, s.username)
+			log.Printf("[POP3 Proxy] Received kick notification for %s", s.username)
 			if checkAndTerminate() {
 				return
 			}
 		case <-activityTicker.C:
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("[POP3PROXY %s] Failed to update activity for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] Failed to update activity for %s: %v", s.username, err)
 			}
 			cancel()
 		case <-ctx.Done():
@@ -554,7 +602,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF && !isClosingError(err) {
-				log.Printf("[POP3PROXY %s] error reading from client: %v", s.RemoteIP, err)
+				log.Printf("[POP3 Proxy] error reading from client for %s: %v", s.username, err)
 			}
 			return
 		}
@@ -577,14 +625,14 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		totalBytesIn += int64(n)
 		if err != nil {
 			if !isClosingError(err) {
-				log.Printf("[POP3PROXY %s] error writing to backend: %v", s.RemoteIP, err)
+				log.Printf("[POP3 Proxy] error writing to backend for %s: %v", s.username, err)
 			}
 			return
 		}
 
 		if err := writer.Flush(); err != nil {
 			if !isClosingError(err) {
-				log.Printf("[POP3PROXY %s] error flushing to backend: %v", s.RemoteIP, err)
+				log.Printf("[POP3 Proxy] error flushing to backend for %s: %v", s.username, err)
 			}
 			return
 		}

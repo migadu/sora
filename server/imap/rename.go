@@ -10,9 +10,13 @@ import (
 
 func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
 	// First phase: Read validation with read lock
-	s.mutex.RLock()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[RENAME] Failed to acquire read lock")
+		return s.internalError("failed to acquire lock for rename")
+	}
 	userID := s.UserID()
-	s.mutex.RUnlock()
+	release()
 
 	if existingName == newName {
 		s.Log("[RENAME] the new mailbox name is the same as the current one.")

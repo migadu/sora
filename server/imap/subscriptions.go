@@ -17,9 +17,13 @@ func (s *IMAPSession) Unsubscribe(mailboxName string) error {
 // Helper function to handle both subscribe and unsubscribe logic
 func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe bool) error {
 	// First phase: Read validation with read lock
-	s.mutex.RLock()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SUBSCRIBE/UNSUBSCRIBE] Failed to acquire read lock")
+		return s.internalError("failed to acquire lock for subscription update")
+	}
 	userID := s.UserID()
-	s.mutex.RUnlock()
+	release()
 
 	// Middle phase: Database operations outside lock
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mailboxName)

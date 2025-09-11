@@ -61,18 +61,26 @@ func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remot
 	}, nil
 }
 
+// AuthenticateAndRoute delegates to the routing lookup if available
+func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
+	if cm.routingLookup == nil {
+		return nil, AuthUserNotFound, fmt.Errorf("no routing lookup configured")
+	}
+	return cm.routingLookup.AuthenticateAndRoute(ctx, email, password)
+}
+
 // Connect attempts to connect to a remote server with round-robin and failover
 func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, error) {
-	return cm.ConnectWithProxy(context.Background(), preferredAddr, "", 0, "", 0)
+	return cm.ConnectWithProxy(context.Background(), preferredAddr, "", 0, "", 0, nil)
 }
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
-func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, string, error) {
+func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
 	// If we have a preferred address and it's in our list, try it first
 	if preferredAddr != "" {
 		for _, addr := range cm.remoteAddrs {
 			if addr == preferredAddr && cm.isHealthy(addr) {
-				conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort)
+				conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 				if err == nil {
 					return conn, addr, nil
 				}
@@ -97,7 +105,7 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			}
 		}
 
-		conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort)
+		conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if err == nil {
 			return conn, addr, nil
 		}
@@ -194,7 +202,7 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	return conn, nil
 }
 
-func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP string, clientPort int, serverIP string, serverPort int) (net.Conn, error) {
+func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, error) {
 	// For PROXY protocol, we need to establish plain TCP connection first
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
@@ -226,10 +234,21 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			clientIP, clientPort, serverIP, serverPort)
 	}
 
+	// Determine TLS settings. Default to the connection manager's global settings.
+	remoteTLS := cm.remoteTLS
+	remoteTLSVerify := cm.remoteTLSVerify
+
+	// If routingInfo is provided and this connection is for that specific server,
+	// override the TLS settings with the ones from the prelookup config.
+	if routingInfo != nil && routingInfo.ServerAddress == addr {
+		remoteTLS = routingInfo.RemoteTLS
+		remoteTLSVerify = routingInfo.RemoteTLSVerify
+	}
+
 	// Now establish TLS if required
-	if cm.remoteTLS {
+	if remoteTLS {
 		tlsConfig := &tls.Config{
-			InsecureSkipVerify: !cm.remoteTLSVerify,
+			InsecureSkipVerify: !remoteTLSVerify,
 		}
 		log.Printf("[ConnectionManager] Starting TLS handshake to %s", addr)
 		tlsConn := tls.Client(conn, tlsConfig)

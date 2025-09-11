@@ -107,10 +107,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		return l[i].Mailbox < l[j].Mailbox
 	})
 
-	// We only need read locks when accessing server capabilities
-	s.mutex.RLock()
 	hasListStatusCap := s.server.caps.Has(imap.CapListStatus)
-	s.mutex.RUnlock()
 
 	// Now handle STATUS returns if needed - after we've processed all mailboxes
 	// This avoids the deadlock when Status() tries to acquire a write lock

@@ -54,7 +54,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[FETCH] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -65,7 +65,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	if s.selectedMailbox == nil {
-		s.mutex.RUnlock()
+		release()
 		s.Log("[FETCH] no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -82,8 +82,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	// Use our helper method that assumes the mutex is held (read lock is sufficient here)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
-	cancel()
-	s.mutex.RUnlock()
+	release()
 
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {

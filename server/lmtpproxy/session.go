@@ -13,29 +13,31 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // Session represents an LMTP proxy session.
 type Session struct {
-	server        *Server
-	clientConn    net.Conn
-	backendConn   net.Conn
-	backendReader *bufio.Reader
-	backendWriter *bufio.Writer
-	clientReader  *bufio.Reader
-	clientWriter  *bufio.Writer
-	from          string
-	to            string
-	username      string
-	accountID     int64
-	serverAddr    string
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	server             *Server
+	clientConn         net.Conn
+	backendConn        net.Conn
+	backendReader      *bufio.Reader
+	backendWriter      *bufio.Writer
+	clientReader       *bufio.Reader
+	clientWriter       *bufio.Writer
+	from               string
+	to                 string
+	username           string
+	isPrelookupAccount bool
+	routingInfo        *proxy.UserRoutingInfo
+	accountID          int64
+	serverAddr         string
+	mu                 sync.Mutex
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // newSession creates a new LMTP proxy session.
@@ -134,32 +136,11 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Look up user by email address
-			address, err := server.NewAddress(to)
-			if err != nil {
-				log.Printf("[LMTP Proxy] Invalid address format: %v", err)
+			if err := s.handleRecipient(to); err != nil {
+				log.Printf("[LMTP Proxy] Recipient %s rejected: %v", to, err)
 				s.sendResponse("550 5.1.1 User unknown")
 				continue
 			}
-
-			// Use base address (without detail part) for lookup
-			lookupAddress := address.BaseAddress()
-			var accountID int64
-			row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", lookupAddress)
-			err = row.Scan(&accountID)
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					log.Printf("[LMTP Proxy] User not found for %s", lookupAddress)
-				} else {
-					log.Printf("[LMTP Proxy] User lookup failed for %s: %v", lookupAddress, err)
-				}
-				s.sendResponse("550 5.1.1 User unknown") // Generic error for security
-				continue
-			}
-
-			s.to = to
-			s.username = lookupAddress
-			s.accountID = accountID
 
 			// Now connect to backend
 			if err := s.connectToBackend(); err != nil {
@@ -240,9 +221,45 @@ func (s *Session) extractAddress(param string) string {
 	return param
 }
 
+// handleRecipient looks up the recipient, determines routing, and sets session state.
+func (s *Session) handleRecipient(to string) error {
+	address, err := server.NewAddress(to)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %w", err)
+	}
+
+	s.to = to
+	s.username = address.BaseAddress()
+
+	// 1. Try prelookup first
+	if s.server.connManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer routingCancel()
+
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		if lookupErr != nil {
+			log.Printf("[LMTP Proxy] Prelookup for %s failed: %v. Falling back to main DB for affinity check.", s.username, lookupErr)
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			log.Printf("[LMTP Proxy] Routing %s to %s via prelookup", s.username, routingInfo.ServerAddress)
+			s.routingInfo = routingInfo
+			s.isPrelookupAccount = true
+			s.accountID = routingInfo.AccountID // May be 0, that's fine
+			return nil
+		}
+	}
+
+	// 2. Fallback to main DB to get account ID for affinity
+	s.isPrelookupAccount = false
+	row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", s.username)
+	if err := row.Scan(&s.accountID); err != nil {
+		return fmt.Errorf("user not found in main database: %w", err)
+	}
+	return nil
+}
+
 // getPreferredBackend fetches the preferred backend server for the user based on affinity.
 func (s *Session) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity {
+	if !s.server.enableAffinity || s.isPrelookupAccount {
 		return "", nil
 	}
 
@@ -269,23 +286,13 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	var preferredAddr string
 	var err error
+	routingInfo := s.routingInfo
 
-	// 1. Try routing lookup first
-	// Note: For LMTP, we use the sender's email for routing. This could be enhanced.
-	if s.server.connManager.HasRouting() {
-		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.from)
-		routingCancel()
-		if lookupErr != nil {
-			log.Printf("[LMTP Proxy] Routing lookup failed for sender %s: %v, falling back to affinity", s.from, lookupErr)
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[LMTP Proxy] Using routing lookup for sender %s: %s", s.from, preferredAddr)
-		}
-	}
-
-	// 2. If no routing info, try affinity
-	if preferredAddr == "" {
+	// 1. Use prelookup result if available
+	if routingInfo != nil && routingInfo.ServerAddress != "" {
+		preferredAddr = routingInfo.ServerAddress
+	} else {
+		// 2. If no prelookup route, try affinity
 		preferredAddr, err = s.getPreferredBackend()
 		if err != nil {
 			log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
@@ -295,7 +302,7 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	// 3. Apply stickiness to affinity/routing address
+	// 3. Apply stickiness
 	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
@@ -304,15 +311,12 @@ func (s *Session) connectToBackend() error {
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
-	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer connectCancel()
-
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
-		connectCtx,
+		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort,
+		clientHost, clientPort, serverHost, serverPort, routingInfo,
 	)
 	if err != nil {
 		// Track backend connection failure
@@ -328,7 +332,7 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Record successful connection for future affinity
-	if s.server.enableAffinity && actualAddr != "" {
+	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err = s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {

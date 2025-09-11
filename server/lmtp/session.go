@@ -122,8 +122,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	// Acquire write lock to update sender
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("failed to acquire write lock for Mail command")
 		return &smtp.SMTPError{
@@ -132,9 +131,9 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 			Message:      "Server busy, try again later",
 		}
 	}
+	defer release()
 
 	s.sender = &fromAddress
-	s.mutex.Unlock()
 
 	success = true
 	s.Log("mail from=%s accepted", fromAddress.FullAddress())
@@ -202,8 +201,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	// Acquire write lock to update User
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("failed to acquire write lock for Rcpt command")
 		return &smtp.SMTPError{
@@ -212,10 +210,10 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 			Message:      "Server busy, try again later",
 		}
 	}
+	defer release()
 	s.User = server.NewUser(toAddress, userId) // Use the original address (with detail part)
 	// Pin the session to the master DB to prevent reading stale data from a replica.
 	s.useMasterDB = true
-	s.mutex.Unlock()
 
 	success = true
 	s.Log("recipient accepted: %s (UserID: %d)", fullAddress, userId)
@@ -236,8 +234,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}()
 
 	// Acquire write lock for accessing session state and potentially updating it (useMasterDB)
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("failed to acquire write lock for Data command")
 		return &smtp.SMTPError{
@@ -246,7 +243,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			Message:      "Server busy, try again later",
 		}
 	}
-	defer s.mutex.Unlock()
+	defer release()
 
 	// Check if we have a valid sender and recipient
 	if s.sender == nil || s.User == nil {
@@ -565,16 +562,15 @@ func (s *LMTPSession) Reset() {
 	}()
 
 	// Acquire write lock to reset session state
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire write lock for Reset command")
 		return
 	}
+	defer release()
 
 	s.User = nil
 	s.sender = nil
-	s.mutex.Unlock()
 
 	s.Log("session reset")
 }
@@ -588,14 +584,13 @@ func (s *LMTPSession) Logout() error {
 	}
 
 	// Acquire write lock for logout operations
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire write lock for Logout command")
 		// Continue with logout even if we can't get the lock
 	} else {
+		defer release()
 		// Clean up any session state if needed
-		s.mutex.Unlock()
 	}
 
 	// Release connection from limiter

@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 	"time"
-	
+
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -31,78 +31,62 @@ func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string
 
 // AcquireReadLockWithTimeout attempts to acquire a read lock with a timeout.
 // It returns true if the lock was successfully acquired, false otherwise.
-// The caller must call the returned cancel function when done with the lock,
-// after calling RUnlock() themselves.
-func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, context.CancelFunc) {
+// The caller MUST call the returned release function to unlock the mutex.
+func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, func()) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
-	lockChan := make(chan struct{})
+	defer cancel()
 
+	lockChan := make(chan struct{}, 1)
 	go func() {
 		h.mutex.RLock()
-		close(lockChan)
+		lockChan <- struct{}{}
 	}()
 
 	select {
 	case <-lockChan:
-		// Lock acquired successfully
 		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
-		return true, cancel
+		return true, h.mutex.RUnlock
 	case <-ctx.Done():
-		// Lock acquisition timed out or context was canceled
 		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "read").Inc()
 		metrics.MailboxLockDuration.WithLabelValues(h.name, "read", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
-			select {
-			case <-lockChan:
-				// If we got the lock after timing out, release it
-				h.mutex.RUnlock()
-			case <-time.After(time.Second):
-				// If we can't get the lock after waiting another second,
-				// something is seriously wrong, but we can't do much about it
-				h.log("[%s][MUTEX] Critical warning: Failed to clean up read lock after timeout", h.name)
-			}
+			<-lockChan
+			// If we got the lock after timing out, release it immediately
+			h.mutex.RUnlock()
 		}()
-		return false, cancel
+		return false, func() {} // Return a no-op function
 	}
 }
 
 // AcquireWriteLockWithTimeout attempts to acquire a write lock with a timeout.
 // It returns true if the lock was successfully acquired, false otherwise.
-// The caller must call the returned cancel function when done with the lock,
-// after calling Unlock() themselves.
-func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, context.CancelFunc) {
+// The caller MUST call the returned release function to unlock the mutex.
+func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, func()) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
-	lockChan := make(chan struct{})
+	defer cancel()
 
+	lockChan := make(chan struct{}, 1)
 	go func() {
 		h.mutex.Lock()
-		close(lockChan)
+		lockChan <- struct{}{}
 	}()
 
 	select {
 	case <-lockChan:
-		// Lock acquired successfully
 		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
-		return true, cancel
+		return true, h.mutex.Unlock
 	case <-ctx.Done():
-		// Lock acquisition timed out or context was canceled
 		metrics.MailboxLockTimeouts.WithLabelValues(h.name, "write").Inc()
 		metrics.MailboxLockDuration.WithLabelValues(h.name, "write", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
 			// Wait for the lock attempt to complete to avoid leaking goroutines
-			select {
-			case <-lockChan:
-				// If we got the lock after timing out, release it
-				h.mutex.Unlock()
-			case <-time.After(time.Second):
-				// If we can't get the lock after waiting another second,
-				// something is seriously wrong, but we can't do much about it
-				h.log("[%s][MUTEX] WARNING: failed to clean up write lock after timeout", h.name)
-			}
+			<-lockChan
+			// If we got the lock after timing out, release it immediately
+			h.mutex.Unlock()
 		}()
-		return false, cancel
+		return false, func() {} // Return a no-op function
 	}
 }

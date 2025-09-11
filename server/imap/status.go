@@ -9,9 +9,13 @@ import (
 
 func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	// First phase: Read validation with read lock
-	s.mutex.RLock()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[STATUS] Failed to acquire read lock")
+		return nil, s.internalError("failed to acquire lock for status")
+	}
 	userID := s.UserID()
-	s.mutex.RUnlock()
+	release()
 
 	// Middle phase: Database operations outside lock
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)

@@ -16,8 +16,22 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 		return []uint32{}, nil
 	}
 
+	// Acquire a read lock to safely get a snapshot of the session tracker.
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[SORT] Failed to acquire read lock for session tracker")
+		return nil, s.internalError("failed to acquire lock for sort")
+	}
+	sessionTrackerSnapshot := s.sessionTracker
+	selectedMailboxID := s.selectedMailbox.ID
+	release()
+
+	if sessionTrackerSnapshot == nil {
+		return nil, s.internalError("no session tracker available for sort")
+	}
+
 	// Pass both search criteria and sort criteria to the database layer
-	messages, err := s.server.rdb.GetMessagesSorted(s.ctx, s.selectedMailbox.ID, criteria, sortCriteria)
+	messages, err := s.server.rdb.GetMessagesSorted(s.ctx, selectedMailboxID, criteria, sortCriteria)
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}
@@ -28,7 +42,7 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 		if numKind == imapserver.NumKindUID {
 			nums = append(nums, uint32(msg.UID))
 		} else {
-			nums = append(nums, s.sessionTracker.EncodeSeqNum(msg.Seq))
+			nums = append(nums, sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
 		}
 	}
 

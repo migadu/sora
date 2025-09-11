@@ -11,9 +11,13 @@ import (
 // Create a new mailbox
 func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	// First phase: validation and mailbox lookup using read lock
-	s.mutex.RLock()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[CREATE] Failed to acquire read lock")
+		return s.internalError("failed to acquire lock for create")
+	}
 	userID := s.UserID()
-	s.mutex.RUnlock()
+	release()
 
 	// Check if mailbox already exists
 	_, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, name)

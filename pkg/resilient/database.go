@@ -2185,6 +2185,24 @@ func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Co
 	return count, err
 }
 
+func (rd *ResilientDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
+	var count int64
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+			return rd.getOperationalDatabase().CleanupOldHealthStatuses(ctx, retention)
+		})
+		if cbErr != nil {
+			if !rd.isRetryableError(cbErr) {
+				return retry.Stop(cbErr)
+			}
+			return cbErr
+		}
+		count = result.(int64)
+		return nil
+	}, cleanupRetryConfig)
+	return count, err
+}
+
 func (rd *ResilientDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, batchSize int) ([]db.UserScopedObjectForCleanup, error) {
 	var candidates []db.UserScopedObjectForCleanup
 	err := retry.WithRetryAdvanced(ctx, func() error {

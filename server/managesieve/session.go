@@ -42,13 +42,23 @@ func (s *ManageSieveSession) sendRawLine(line string) {
 }
 
 func (s *ManageSieveSession) sendCapabilities() {
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("WARNING: failed to acquire read lock for sendCapabilities")
+		// Send minimal capabilities if lock fails
+		s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
+		s.sendRawLine("\"SIEVE\" \"fileinto vacation\"")
+		return
+	}
+	defer release()
+
 	s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
 	s.sendRawLine("\"SIEVE\" \"fileinto vacation\"")
 
 	if s.server.tlsConfig != nil && s.server.useStartTLS && !s.isTLS {
 		s.sendRawLine("\"STARTTLS\"")
 	}
-	if !s.isTLS && s.server.insecureAuth {
+	if !s.isTLS && s.server.insecureAuth { // This check is safe under the read lock
 		s.sendRawLine("\"AUTH=PLAIN\"")
 	}
 	if s.server.maxScriptSize > 0 {
@@ -178,18 +188,23 @@ func (s *ManageSieveSession) handleConnection() {
 				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
 			}
 
+			// Check if the context was cancelled during authentication logic
+			if s.ctx.Err() != nil {
+				s.Log("[LOGIN] context cancelled, aborting session update")
+				continue
+			}
+
 			// Acquire write lock for updating session authentication state
-			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-			defer cancel()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("WARNING: failed to acquire write lock for Login command")
 				s.sendResponse("NO Server busy, try again later\r\n")
 				continue
 			}
+			defer release()
 
 			s.authenticated = true
 			s.User = server.NewUser(address, userID)
-			s.mutex.Unlock()
 
 			// Increment authenticated connections counter
 			authCount := s.server.authenticatedConnections.Add(1)
@@ -364,21 +379,26 @@ func (s *ManageSieveSession) handleConnection() {
 				continue
 			}
 
+			// Check if context was cancelled during handshake
+			if s.ctx.Err() != nil {
+				s.Log("[STARTTLS] context cancelled after handshake, aborting session update")
+				return
+			}
+
 			// Acquire write lock for updating connection state
-			acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-			defer cancel()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
 				s.Log("failed to acquire write lock for STARTTLS command")
 				s.sendResponse("NO Server busy, try again later\r\n")
 				continue
 			}
+			defer release()
 
 			// Replace the connection and readers/writers
 			*s.conn = tlsConn
 			s.reader = bufio.NewReader(tlsConn)
 			s.writer = bufio.NewWriter(tlsConn)
 			s.isTLS = true
-			s.mutex.Unlock()
 
 			s.Log("TLS negotiation successful")
 			success = true
@@ -449,22 +469,26 @@ func (s *ManageSieveSession) handleCapability() bool {
 }
 
 func (s *ManageSieveSession) handleListScripts() bool {
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.Log("[LISTSCRIPTS] context cancelled, aborting command")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
 	// Acquire a read lock only to get the necessary session state.
 	// A write lock is not needed for a read-only command.
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire read lock for ListScripts command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
-
 	// Copy the necessary state under lock.
 	userID := s.UserID()
 	useMaster := s.useMasterDB
+	release() // Release lock before DB call
 
-	// Release the lock before the database call.
-	s.mutex.RUnlock()
-	cancel()
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
 	if useMaster {
@@ -495,21 +519,24 @@ func (s *ManageSieveSession) handleListScripts() bool {
 }
 
 func (s *ManageSieveSession) handleGetScript(name string) bool {
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.Log("[GETSCRIPT] context cancelled, aborting command")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
 	// Acquire a read lock only to get the necessary session state.
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire read lock for GetScript command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
-
 	// Copy the necessary state under lock.
 	userID := s.UserID()
 	useMaster := s.useMasterDB
-
-	// Release the lock before the database call.
-	s.mutex.RUnlock()
-	cancel()
+	release() // Release lock before DB call
 
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
@@ -531,16 +558,25 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 
 func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	start := time.Now()
-	// Acquire write lock for accessing database
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.Log("[PUTSCRIPT] context cancelled, aborting command")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	// Phase 1: Read session state
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for PutScript command")
+		s.Log("WARNING: failed to acquire read lock for PutScript command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
-	defer s.mutex.Unlock()
+	userID := s.UserID()
+	useMaster := s.useMasterDB
+	release()
 
+	// Phase 2: Validate and perform DB operations
 	if s.server.maxScriptSize > 0 && int64(len(content)) > s.server.maxScriptSize {
 		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", len(content), s.server.maxScriptSize))
 		return false
@@ -556,25 +592,25 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if useMaster {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, userID)
 	if err != nil {
 		if err != consts.ErrDBNotFound {
 			s.sendResponse("NO Internal server error\r\n")
 			return false
 		}
 	}
+
+	var responseMsg string
 	if script != nil {
-		_, err := s.server.rdb.UpdateScriptWithRetry(s.ctx, script.ID, s.UserID(), name, content)
+		_, err := s.server.rdb.UpdateScriptWithRetry(s.ctx, script.ID, userID, name, content)
 		if err != nil {
 			s.sendResponse("NO Internal server error\r\n")
 			return false
 		}
-		// Pin this session to the master DB to ensure read-your-writes consistency
-		s.useMasterDB = true
 
 		// Track script upload/update
 		metrics.ManageSieveScriptsUploaded.Inc()
@@ -586,17 +622,24 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 			metrics.TrackUserActivity("managesieve", s.FullAddress(), "command", 1)
 		}
 
-		s.sendResponse("OK Script updated\r\n")
-		return true
+		responseMsg = "OK Script updated\r\n"
+	} else {
+		_, err = s.server.rdb.CreateScriptWithRetry(s.ctx, userID, name, content)
+		if err != nil {
+			s.sendResponse("NO Internal server error\r\n")
+			return false
+		}
+		responseMsg = "OK Script stored\r\n"
 	}
 
-	_, err = s.server.rdb.CreateScriptWithRetry(s.ctx, s.UserID(), name, content)
-	if err != nil {
-		s.sendResponse("NO Internal server error\r\n")
-		return false
+	// Phase 3: Update session state
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("WARNING: failed to acquire write lock for PutScript command to pin session")
+	} else {
+		s.useMasterDB = true
+		release()
 	}
-	// Pin this session to the master DB to ensure read-your-writes consistency
-	s.useMasterDB = true
 
 	// Track script upload/create
 	metrics.ManageSieveScriptsUploaded.Inc()
@@ -607,29 +650,37 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		metrics.TrackDomainCommand("managesieve", s.Domain(), "PUTSCRIPT")
 		metrics.TrackUserActivity("managesieve", s.FullAddress(), "command", 1)
 	}
-	s.sendResponse("OK Script stored\r\n")
+	s.sendResponse(responseMsg)
 	return true
 }
 
 func (s *ManageSieveSession) handleSetActive(name string) bool {
 	start := time.Now()
-	// Acquire write lock for accessing database
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.Log("[SETACTIVE] context cancelled, aborting command")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	// Phase 1: Read session state
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for SetActive command")
+		s.Log("WARNING: failed to acquire read lock for SetActive command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
-	defer s.mutex.Unlock()
+	userID := s.UserID()
+	useMaster := s.useMasterDB
+	release()
 
-	// Create a context for read operations that respects session pinning
+	// Phase 2: DB operations
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if useMaster {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, userID)
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n")
@@ -648,14 +699,20 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		return false
 	}
 
-	err = s.server.rdb.SetScriptActiveWithRetry(s.ctx, script.ID, s.UserID(), true)
+	err = s.server.rdb.SetScriptActiveWithRetry(s.ctx, script.ID, userID, true)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
 	}
 
-	// Pin this session to the master DB to ensure read-your-writes consistency
-	s.useMasterDB = true
+	// Phase 3: Update session state
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("WARNING: failed to acquire write lock for SetActive command to pin session")
+	} else {
+		s.useMasterDB = true
+		release()
+	}
 
 	// Track script activation
 	metrics.ManageSieveScriptsActivated.Inc()
@@ -666,23 +723,31 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 }
 
 func (s *ManageSieveSession) handleDeleteScript(name string) bool {
-	// Acquire write lock for accessing database
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.Log("[DELETESCRIPT] context cancelled, aborting command")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	// Phase 1: Read session state
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for DeleteScript command")
+		s.Log("WARNING: failed to acquire read lock for DeleteScript command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
-	defer s.mutex.Unlock()
+	userID := s.UserID()
+	useMaster := s.useMasterDB
+	release()
 
-	// Create a context for read operations that respects session pinning
+	// Phase 2: DB operations
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if useMaster {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, s.UserID())
+	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, userID)
 	if err != nil {
 		if err == consts.ErrDBNotFound {
 			s.sendResponse("NO No such script\r\n") // RFC uses NO for "No such script"
@@ -692,26 +757,32 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		return false
 	}
 
-	err = s.server.rdb.DeleteScriptWithRetry(s.ctx, script.ID, s.UserID())
+	err = s.server.rdb.DeleteScriptWithRetry(s.ctx, script.ID, userID)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false
 	}
-	// Pin this session to the master DB to ensure read-your-writes consistency
-	s.useMasterDB = true
+
+	// Phase 3: Update session state
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("WARNING: failed to acquire write lock for DeleteScript command to pin session")
+	} else {
+		s.useMasterDB = true
+		release()
+	}
 	s.sendResponse("OK Script deleted\r\n")
 	return true
 }
 
 func (s *ManageSieveSession) Close() error {
 	// Acquire write lock for cleanup
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire write lock for Close operation")
 		// Continue with close even if we can't get the lock
 	} else {
-		defer s.mutex.Unlock()
+		defer release()
 	}
 
 	// Observe connection duration
@@ -915,18 +986,23 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		targetAddress = &address
 	}
 
+	// Check if the context was cancelled during authentication logic
+	if s.ctx.Err() != nil {
+		s.Log("[AUTH] context cancelled, aborting session update")
+		return false
+	}
+
 	// Acquire write lock for updating session authentication state
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
-	defer cancel()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("WARNING: failed to acquire write lock for Authenticate command")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
+	defer release()
 
 	s.authenticated = true
 	s.User = server.NewUser(*targetAddress, userID)
-	s.mutex.Unlock()
 
 	// Increment authenticated connections counter
 	authCount := s.server.authenticatedConnections.Add(1)

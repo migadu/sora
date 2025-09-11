@@ -15,37 +15,23 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/migadu/sora/config"
 )
 
-// PreLookupConfig holds configuration for database-driven user routing
-type PreLookupConfig struct {
-	Enabled         bool        `toml:"enabled"`
-	Hosts           []string    `toml:"hosts"`
-	Port            interface{} `toml:"port"` // Database port (default: "5432"), can be string or integer
-	User            string      `toml:"user"`
-	Password        string      `toml:"password"`
-	Name            string      `toml:"name"`
-	TLS             bool        `toml:"tls"`
-	MaxConns        int         `toml:"max_conns"`
-	MinConns        int         `toml:"min_conns"`
-	MaxConnLifetime string      `toml:"max_conn_lifetime"`
-	MaxConnIdleTime string      `toml:"max_conn_idle_time"`
-	CacheTTL        string      `toml:"cache_ttl"`
-	CacheSize       int         `toml:"cache_size"`
-	RoutingQuery    string      `toml:"routing_query"`
-	FallbackDefault bool        `toml:"fallback_to_default"`
-	AuthMode        string      `toml:"auth_mode"`   // "routing_only" or "auth_and_route"
-	AuthMethod      string      `toml:"auth_method"` // "bcrypt", "plain", etc.
-	AuthQuery       string      `toml:"auth_query"`  // Query to get password hash
-}
+// PreLookupConfig is an alias for config.PreLookupConfig for compatibility
+type PreLookupConfig = config.PreLookupConfig
 
 // UserRoutingInfo represents routing information for a user
 type UserRoutingInfo struct {
-	ServerAddress string
+	ServerAddress      string
+	AccountID          int64
+	IsPrelookupAccount bool
+	RemoteTLS          bool
+	RemoteTLSVerify    bool
 }
 
 // AuthResult represents the result of authentication
@@ -73,17 +59,17 @@ type cacheEntry struct {
 
 // PreLookupClient implements UserRoutingLookup with database queries and caching
 type PreLookupClient struct {
-	pool         *pgxpool.Pool
-	routingQuery string
-	authQuery    string
-	authMode     string
-	authMethod   string
-	cacheTTL     time.Duration
-	cache        map[string]*cacheEntry
-	cacheMutex   sync.RWMutex
-	fallbackMode bool
-	stopJanitor  chan struct{}
-	breaker      *circuitbreaker.CircuitBreaker
+	pool            *pgxpool.Pool
+	query           string
+	authMethod      string
+	cacheTTL        time.Duration
+	cache           map[string]*cacheEntry
+	cacheMutex      sync.RWMutex
+	fallbackMode    bool
+	remoteTLS       bool
+	remoteTLSVerify bool
+	stopJanitor     chan struct{}
+	breaker         *circuitbreaker.CircuitBreaker
 }
 
 // NewPreLookupClient creates a new PreLookupClient
@@ -119,25 +105,22 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		config.CacheSize = 10000
 	}
 
-	// Default queries if not specified
-	routingQuery := config.RoutingQuery
-	if routingQuery == "" {
-		routingQuery = "SELECT server_address FROM user_routing WHERE email = $1 AND active = true"
-	}
-
-	authQuery := config.AuthQuery
-	if authQuery == "" && config.AuthMode == "auth_and_route" {
-		authQuery = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
-	}
-
-	authMode := config.AuthMode
-	if authMode == "" {
-		authMode = "routing_only" // Default to routing only
+	// Use a single query that can handle both routing-only and auth+route modes.
+	// The system will auto-detect the mode based on the number of columns returned.
+	query := config.Query
+	if query == "" {
+		return nil, errors.New("prelookup query is not configured")
 	}
 
 	authMethod := config.AuthMethod
 	if authMethod == "" {
 		authMethod = "bcrypt" // Default to bcrypt
+	}
+
+	// Handle TLS settings for prelookup-routed connections
+	remoteTLSVerify := true
+	if config.RemoteTLSVerify != nil {
+		remoteTLSVerify = *config.RemoteTLSVerify
 	}
 
 	// Build connection string
@@ -220,25 +203,21 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	}
 
 	client := &PreLookupClient{
-		pool:         pool,
-		routingQuery: routingQuery,
-		authQuery:    authQuery,
-		authMode:     authMode,
-		authMethod:   authMethod,
-		cacheTTL:     cacheTTL,
-		cache:        make(map[string]*cacheEntry),
-		fallbackMode: config.FallbackDefault,
-		stopJanitor:  make(chan struct{}),
-		breaker:      circuitbreaker.NewCircuitBreaker(breakerSettings),
+		pool:            pool,
+		query:           query,
+		authMethod:      authMethod,
+		cacheTTL:        cacheTTL,
+		cache:           make(map[string]*cacheEntry),
+		fallbackMode:    config.FallbackDefault,
+		remoteTLS:       config.RemoteTLS,
+		remoteTLSVerify: remoteTLSVerify,
+		stopJanitor:     make(chan struct{}),
+		breaker:         circuitbreaker.NewCircuitBreaker(breakerSettings),
 	}
 
 	// Log the configuration for debugging
-	log.Printf("[PreLookup] Initialized with auth_mode='%s', auth_method='%s', cache_ttl=%v",
-		authMode, authMethod, cacheTTL)
-	log.Printf("[PreLookup] Routing query: %s", routingQuery)
-	if authQuery != "" {
-		log.Printf("[PreLookup] Auth query: %s", authQuery)
-	}
+	log.Printf("[PreLookup] Initialized with auto-detect mode, auth_method='%s', cache_ttl=%v", authMethod, cacheTTL)
+	log.Printf("[PreLookup] Query: %s", query)
 
 	client.startCacheJanitor()
 	return client, nil
@@ -273,16 +252,58 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := c.breaker.Execute(func() (interface{}, error) {
-			var addr string
-			err := c.pool.QueryRow(ctx, c.routingQuery, email).Scan(&addr)
+			// Try to execute query and auto-detect the format based on columns
+			rows, err := c.pool.Query(ctx, c.query, email)
 			if err != nil {
-				// For the circuit breaker, ErrNoRows is not a failure of the DB.
 				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-					return nil, err // Pass ErrNoRows up to be handled outside the breaker
+					return nil, err
 				}
-				return nil, err // Real DB error
+				return nil, err
 			}
-			return addr, nil
+			defer rows.Close()
+
+			if !rows.Next() {
+				return nil, pgx.ErrNoRows
+			}
+
+			// Get field descriptions to determine the number of columns
+			fieldDescs := rows.FieldDescriptions()
+			numCols := len(fieldDescs)
+
+			if numCols == 1 {
+				// Single column: server_address only (routing-only mode)
+				var addr string
+				err := rows.Scan(&addr)
+				if err != nil {
+					return nil, err
+				}
+				return addr, nil
+			} else if numCols >= 2 {
+				// Multiple columns: assume it includes password_hash (auth+route mode)
+				// For routing-only lookup, we just need the server address (assume it's the last column)
+				values := make([]interface{}, numCols)
+				valuePtrs := make([]interface{}, numCols)
+				for i := range values {
+					valuePtrs[i] = &values[i]
+				}
+
+				err := rows.Scan(valuePtrs...)
+				if err != nil {
+					return nil, err
+				}
+
+				// Return the last column as server address for routing purposes
+				if values[numCols-1] != nil {
+					addr, ok := values[numCols-1].(string)
+					if !ok {
+						return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
+					}
+					return addr, nil
+				}
+				return "", nil
+			}
+
+			return nil, fmt.Errorf("unexpected number of columns: %d", numCols)
 		})
 
 		if cbErr != nil {
@@ -313,7 +334,9 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 
 	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
 	info := &UserRoutingInfo{
-		ServerAddress: serverAddress,
+		ServerAddress:   serverAddress,
+		RemoteTLS:       c.remoteTLS,
+		RemoteTLSVerify: c.remoteTLSVerify,
 	}
 
 	if serverAddress == "" {
@@ -342,83 +365,23 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 }
 
 // AuthenticateAndRoute performs both authentication and routing lookup
+// Auto-detects mode based on query results: 1 column = routing only, 2+ columns = auth+route
 func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
-	// If in routing-only mode, just do routing lookup
-	if c.authMode == "routing_only" {
-		log.Printf("[PreLookup] Using routing-only mode for user '%s'", email)
-		info, err := c.LookupUserRoute(ctx, email)
-		if err != nil {
-			return nil, AuthUserNotFound, fmt.Errorf("routing lookup failed: %w", err)
-		}
-		if info != nil {
-			log.Printf("[PreLookup] Routing-only mode found server for user '%s': %s", email, info.ServerAddress)
-		} else {
-			log.Printf("[PreLookup] Routing-only mode: no server found for user '%s'", email)
-		}
-		return info, AuthSuccess, nil
-	}
-
-	// Check cache first - we cache the routing info and "user found" status
+	// Check cache first - but never cache passwords for security
 	c.cacheMutex.RLock()
-	if entry, exists := c.cache[email]; exists {
-		if time.Since(entry.timestamp) < c.cacheTTL {
-			c.cacheMutex.RUnlock()
-
-			if !entry.userFound {
-				// User was previously not found - still not found
-				return nil, AuthUserNotFound, nil
-			}
-
-			// User exists in cache, but we still need to verify password from DB
-			// (we never cache passwords for security)
-			var passwordHash string
-			err := retry.WithRetry(ctx, func() error {
-				_, cbErr := c.breaker.Execute(func() (interface{}, error) {
-					var pHash, dummyAddr string
-					err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&pHash, &dummyAddr)
-					if err != nil {
-						if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-							return nil, err
-						}
-						return nil, err
-					}
-					passwordHash = pHash
-					return nil, nil
-				})
-
-				if cbErr != nil {
-					if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
-						return retry.Stop(cbErr)
-					}
-					if isRetryableError(cbErr) {
-						return cbErr
-					}
-					return retry.Stop(cbErr)
-				}
-				return nil
-			}, retry.DefaultBackoffConfig())
-
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-					return nil, AuthUserNotFound, nil
-				}
-				return nil, AuthUserNotFound, fmt.Errorf("database query failed for cached user: %w", err)
-			}
-
-			// Verify password
-			if !c.verifyPassword(password, passwordHash) {
-				log.Printf("[PreLookup] Authentication failed for user: %s", email)
-				return nil, AuthFailed, nil
-			}
-
-			// Return cached routing info
-			return entry.info, AuthSuccess, nil
+	cachedEntry, hasCached := c.cache[email]
+	if hasCached && time.Since(cachedEntry.timestamp) < c.cacheTTL {
+		c.cacheMutex.RUnlock()
+		if !cachedEntry.userFound {
+			return nil, AuthUserNotFound, nil
 		}
+		// We have cached routing info, but still need to verify password from DB
+		// Fall through to query the database for password verification
+	} else {
+		c.cacheMutex.RUnlock()
 	}
-	c.cacheMutex.RUnlock()
 
-	// Not in cache or expired - query database for everything
-	var passwordHash, serverAddress string
+	// Query database and auto-detect mode
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     3 * time.Second,
@@ -427,22 +390,138 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 		MaxRetries:      3,
 	}
 
+	var routingInfo *UserRoutingInfo
+	var authResult AuthResult
+
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := c.breaker.Execute(func() (interface{}, error) {
-			var pHash, sAddr string
-			err := c.pool.QueryRow(ctx, c.authQuery, email).Scan(&pHash, &sAddr)
+			rows, err := c.pool.Query(ctx, c.query, email)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
 					return nil, err
 				}
 				return nil, err
 			}
-			return []string{pHash, sAddr}, nil
+			defer rows.Close()
+
+			if !rows.Next() {
+				return nil, pgx.ErrNoRows
+			}
+
+			// Auto-detect mode based on number of columns
+			fieldDescs := rows.FieldDescriptions()
+			numCols := len(fieldDescs)
+
+			if numCols == 1 {
+				// Single column: routing-only mode - just server address
+				var serverAddr string
+				err := rows.Scan(&serverAddr)
+				if err != nil {
+					return nil, err
+				}
+
+				log.Printf("[PreLookup] Auto-detected routing-only mode for user '%s'", email)
+				info := &UserRoutingInfo{
+					ServerAddress:      serverAddr,
+					IsPrelookupAccount: true,
+					RemoteTLS:          c.remoteTLS,
+					RemoteTLSVerify:    c.remoteTLSVerify,
+				}
+				return map[string]interface{}{
+					"mode":   "routing_only",
+					"info":   info,
+					"result": AuthSuccess,
+				}, nil
+
+			} else if numCols >= 2 {
+				// Multiple columns: auth+route mode
+				values := make([]interface{}, numCols)
+				valuePtrs := make([]interface{}, numCols)
+				for i := range values {
+					valuePtrs[i] = &values[i]
+				}
+
+				err := rows.Scan(valuePtrs...)
+				if err != nil {
+					return nil, err
+				}
+
+				log.Printf("[PreLookup] Auto-detected auth+route mode for user '%s' (%d columns)", email, numCols)
+
+				// Extract values - assume common patterns:
+				// 2 cols: password_hash, server_address
+				// 3+ cols: account_id, password_hash, server_address (last is server)
+				var accountID int64
+				var passwordHash, serverAddress string
+				var ok bool
+
+				if numCols == 2 {
+					if values[0] != nil {
+						passwordHash, ok = values[0].(string)
+						if !ok {
+							return nil, fmt.Errorf("prelookup query: expected column 1 (password_hash) to be a string, but got %T", values[0])
+						}
+					}
+					if values[1] != nil {
+						serverAddress, ok = values[1].(string)
+						if !ok {
+							return nil, fmt.Errorf("prelookup query: expected column 2 (server_address) to be a string, but got %T", values[1])
+						}
+					}
+				} else { // 3+ columns
+					if values[0] != nil {
+						accountID, ok = values[0].(int64)
+						if !ok {
+							return nil, fmt.Errorf("prelookup query: expected column 1 (account_id) to be an int64, but got %T", values[0])
+						}
+					}
+					if values[1] != nil {
+						passwordHash, ok = values[1].(string)
+						if !ok {
+							return nil, fmt.Errorf("prelookup query: expected column 2 (password_hash) to be a string, but got %T", values[1])
+						}
+					}
+					if values[numCols-1] != nil {
+						serverAddress, ok = values[numCols-1].(string)
+						if !ok {
+							return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
+						}
+					}
+				}
+
+				// Verify password
+				if !c.verifyPassword(password, passwordHash) {
+					log.Printf("[PreLookup] Authentication failed for user: %s", email)
+					return map[string]interface{}{
+						"mode":   "auth_and_route",
+						"info":   nil,
+						"result": AuthFailed,
+					}, nil
+				}
+
+				log.Printf("[PreLookup] Authentication successful for user '%s'", email)
+				info := &UserRoutingInfo{
+					ServerAddress:      serverAddress,
+					AccountID:          accountID,
+					IsPrelookupAccount: true,
+					RemoteTLS:          c.remoteTLS,
+					RemoteTLSVerify:    c.remoteTLSVerify,
+				}
+
+				return map[string]interface{}{
+					"mode":   "auth_and_route",
+					"info":   info,
+					"result": AuthSuccess,
+				}, nil
+			}
+
+			return nil, fmt.Errorf("unexpected number of columns: %d", numCols)
 		})
 
 		if cbErr != nil {
 			if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
-				passwordHash, serverAddress = "", ""
+				routingInfo = nil
+				authResult = AuthUserNotFound
 				return retry.Stop(cbErr)
 			}
 			if isRetryableError(cbErr) {
@@ -453,56 +532,36 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 		}
 
 		if result != nil {
-			resSlice := result.([]string)
-			passwordHash = resSlice[0]
-			serverAddress = resSlice[1]
+			resultMap := result.(map[string]interface{})
+			routingInfo = resultMap["info"].(*UserRoutingInfo)
+			authResult = resultMap["result"].(AuthResult)
 		}
 		return nil
 	}, config)
 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, sql.ErrNoRows) {
-		log.Printf("[PreLookup] Auth query failed for user '%s': %v", email, err)
+		log.Printf("[PreLookup] Query failed for user '%s': %v", email, err)
 		return nil, AuthUserNotFound, fmt.Errorf("database query failed: %w", err)
 	}
 
-	if passwordHash == "" {
-		log.Printf("[PreLookup] No auth record found for user '%s'", email)
-		// Cache negative result
-		c.cacheMutex.Lock()
+	// Cache the result
+	c.cacheMutex.Lock()
+	if authResult == AuthUserNotFound {
 		c.cache[email] = &cacheEntry{
 			info:      nil,
 			timestamp: time.Now(),
 			userFound: false,
 		}
-		c.cacheMutex.Unlock()
-		return nil, AuthUserNotFound, nil
-	}
-
-	log.Printf("[PreLookup] Auth query result for user '%s': found password hash and server_address='%s'", email, serverAddress)
-
-	// User exists, now verify password
-	if !c.verifyPassword(password, passwordHash) {
-		log.Printf("[PreLookup] Authentication failed for user: %s", email)
-		return nil, AuthFailed, nil
-	}
-
-	log.Printf("[PreLookup] Authentication successful for user '%s'", email)
-
-	// Authentication successful, prepare routing info
-	info := &UserRoutingInfo{
-		ServerAddress: serverAddress,
-	}
-
-	// Cache the result (routing info and positive user found status)
-	c.cacheMutex.Lock()
-	c.cache[email] = &cacheEntry{
-		info:      info,
-		timestamp: time.Now(),
-		userFound: true,
+	} else if routingInfo != nil {
+		c.cache[email] = &cacheEntry{
+			info:      routingInfo,
+			timestamp: time.Now(),
+			userFound: true,
+		}
 	}
 	c.cacheMutex.Unlock()
 
-	return info, AuthSuccess, nil
+	return routingInfo, authResult, nil
 }
 
 // verifyPassword verifies a password against a hash using the configured method
@@ -605,30 +664,6 @@ func isRetryableError(err error) bool {
 	}
 
 	return false
-}
-
-// GetCacheTTL returns the configured cache TTL duration
-func (c *PreLookupConfig) GetCacheTTL() (time.Duration, error) {
-	if c.CacheTTL == "" {
-		return 10 * time.Minute, nil
-	}
-	return helpers.ParseDuration(c.CacheTTL)
-}
-
-// GetMaxConnLifetime returns the configured max connection lifetime
-func (c *PreLookupConfig) GetMaxConnLifetime() (time.Duration, error) {
-	if c.MaxConnLifetime == "" {
-		return time.Hour, nil
-	}
-	return helpers.ParseDuration(c.MaxConnLifetime)
-}
-
-// GetMaxConnIdleTime returns the configured max connection idle time
-func (c *PreLookupConfig) GetMaxConnIdleTime() (time.Duration, error) {
-	if c.MaxConnIdleTime == "" {
-		return 30 * time.Minute, nil
-	}
-	return helpers.ParseDuration(c.MaxConnIdleTime)
 }
 
 // InitializePrelookup is a helper function to create and configure the prelookup client.

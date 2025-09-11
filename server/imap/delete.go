@@ -10,9 +10,13 @@ import (
 
 func (s *IMAPSession) Delete(mboxName string) error {
 	// First phase: Read-only validation with read lock
-	s.mutex.RLock()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.Log("[DELETE] Failed to acquire read lock")
+		return s.internalError("failed to acquire lock for delete")
+	}
 	userID := s.UserID()
-	s.mutex.RUnlock()
+	release()
 
 	// Check if special mailbox - no lock needed
 	for _, specialMailbox := range consts.DefaultMailboxes {

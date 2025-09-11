@@ -247,16 +247,19 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 // It safely acquires the read mutex to protect access to session state.
 func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	// Acquire read mutex with timeout to protect access to session state
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	if s.ctx.Err() != nil {
+		s.Log("[DECODE] Session context is cancelled, skipping decodeNumSet.")
+		// Return unmodified set if context is cancelled
+		return numSet
+	}
+
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[DECODE] Failed to acquire read lock for decodeNumSet within timeout")
 		// Return unmodified set if we can't acquire the lock
 		return numSet
 	}
-	defer func() {
-		s.mutex.RUnlock()
-		cancel()
-	}()
+	defer release()
 
 	// Use the helper method that assumes the caller holds the lock
 	return s.decodeNumSetLocked(numSet)

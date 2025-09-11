@@ -10,9 +10,7 @@ import (
 var idlePollInterval = 15 * time.Second
 
 func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) error {
-	s.mutex.RLock()
 	s.Log("client entered IDLE mode")
-	s.mutex.RUnlock()
 
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()

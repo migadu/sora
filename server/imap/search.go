@@ -12,8 +12,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	var currentNumMessages uint32
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 
+	// If the session is closing, don't try to search.
+	if s.ctx.Err() != nil {
+		s.Log("[SEARCH] Session context is cancelled, skipping search.")
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
+	}
+
 	// Acquire read mutex to safely read session state
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SEARCH] Failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -24,8 +30,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	if s.selectedMailbox == nil {
-		s.mutex.RUnlock()
-		cancel()
+		release() // Release read lock
 		s.Log("[SEARCH] no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -36,8 +41,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	selectedMailboxID = s.selectedMailbox.ID
 	currentNumMessages = s.currentNumMessages.Load()
 	sessionTrackerSnapshot = s.sessionTracker
-	s.mutex.RUnlock()
-	cancel()
+	release() // Release read lock
 
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
@@ -210,16 +214,19 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 
 // decodeSearchCriteria safely acquires the read mutex and translates sequence numbers in search criteria.
 func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	if s.ctx.Err() != nil {
+		s.Log("[SEARCH] Session context is cancelled, skipping decodeSearchCriteria.")
+		// Return unmodified criteria if context is cancelled
+		return criteria
+	}
+
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[SEARCH] Failed to acquire read lock for decodeSearchCriteria within timeout")
 		// Return unmodified criteria if we can't acquire the lock
 		return criteria
 	}
-	defer func() {
-		s.mutex.RUnlock()
-		cancel()
-	}()
+	defer release()
 
 	return s.decodeSearchCriteriaLocked(criteria)
 }

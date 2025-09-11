@@ -15,7 +15,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
-	acquired, cancel := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.Log("[MOVE] Failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -26,8 +26,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	if s.selectedMailbox == nil {
-		s.mutex.RUnlock()
-		cancel()
+		release() // Release read lock
 		s.Log("[MOVE] no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -39,8 +38,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Use our helper method that assumes the mutex is held (read lock is sufficient)
 	decodedNumSet = s.decodeNumSetLocked(numSet)
-	s.mutex.RUnlock()
-	cancel()
+	release() // Release read lock
 
 	// Perform database operations outside of lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.UserID(), dest)

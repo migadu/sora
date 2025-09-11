@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
 // StringAddr implements net.Addr interface for string addresses
@@ -22,50 +24,12 @@ func (s *StringAddr) Network() string {
 	return "tcp"
 }
 
-// AuthRateLimiterConfig holds authentication rate limiting configuration
-type AuthRateLimiterConfig struct {
-	Enabled                bool          `toml:"enabled"`                   // Enable/disable rate limiting
-	MaxAttemptsPerIP       int           `toml:"max_attempts_per_ip"`       // Max failed attempts per IP before DB-based block
-	MaxAttemptsPerUsername int           `toml:"max_attempts_per_username"` // Max failed attempts per username before DB-based block
-	IPWindowDuration       time.Duration `toml:"ip_window_duration"`        // Time window for IP-based limiting
-	UsernameWindowDuration time.Duration `toml:"username_window_duration"`  // Time window for username-based limiting
-	CleanupInterval        time.Duration `toml:"cleanup_interval"`          // How often to clean up old DB entries
+// AuthRateLimiterConfig is an alias for config.AuthRateLimiterConfig for compatibility
+type AuthRateLimiterConfig = config.AuthRateLimiterConfig
 
-	// Enhanced Features (for EnhancedAuthRateLimiter)
-	FastBlockThreshold   int           `toml:"fast_block_threshold"`   // Failed attempts before in-memory fast block
-	FastBlockDuration    time.Duration `toml:"fast_block_duration"`    // How long to fast block an IP in-memory
-	DelayStartThreshold  int           `toml:"delay_start_threshold"`  // Failed attempts before progressive delays start
-	InitialDelay         time.Duration `toml:"initial_delay"`          // First delay duration
-	MaxDelay             time.Duration `toml:"max_delay"`              // Maximum delay duration
-	DelayMultiplier      float64       `toml:"delay_multiplier"`       // Delay increase factor
-	CacheCleanupInterval time.Duration `toml:"cache_cleanup_interval"` // How often to clean in-memory cache
-	DBSyncInterval       time.Duration `toml:"db_sync_interval"`       // How often to sync attempt batches to database
-	MaxPendingBatch      int           `toml:"max_pending_batch"`      // Max records before a forced batch sync
-	DBErrorThreshold     time.Duration `toml:"db_error_threshold"`     // Wait time before retrying DB after an error
-}
-
-// DefaultAuthRateLimiterConfig returns sensible defaults
+// DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
 func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
-	return AuthRateLimiterConfig{
-		MaxAttemptsPerIP:       10,               // 10 failed attempts per IP
-		MaxAttemptsPerUsername: 5,                // 5 failed attempts per username
-		IPWindowDuration:       15 * time.Minute, // 15 minute window for IP
-		UsernameWindowDuration: 30 * time.Minute, // 30 minute window for username
-		CleanupInterval:        5 * time.Minute,  // Clean up every 5 minutes
-		Enabled:                false,            // Disabled by default
-
-		// Enhanced Defaults
-		FastBlockThreshold:   10,               // Block IP after 10 failures
-		FastBlockDuration:    5 * time.Minute,  // Block for 5 minutes
-		DelayStartThreshold:  2,                // Start delays after 2 failures
-		InitialDelay:         2 * time.Second,  // 2 second initial delay
-		MaxDelay:             30 * time.Second, // Max 30 second delay
-		DelayMultiplier:      2.0,              // Double delay each time
-		CacheCleanupInterval: 1 * time.Minute,  // Clean cache every minute
-		DBSyncInterval:       30 * time.Second, // Sync to DB every 30 seconds
-		MaxPendingBatch:      100,              // Batch up to 100 records
-		DBErrorThreshold:     1 * time.Minute,  // Wait 1 minute after DB error
-	}
+	return config.DefaultAuthRateLimiterConfig()
 }
 
 // AuthAttempt represents a single authentication attempt

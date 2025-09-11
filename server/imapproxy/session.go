@@ -17,23 +17,26 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // Session represents an IMAP proxy session.
 type Session struct {
-	server        *Server
-	clientConn    net.Conn
-	backendConn   net.Conn
-	backendReader *bufio.Reader
-	backendWriter *bufio.Writer
-	clientReader  *bufio.Reader
-	clientWriter  *bufio.Writer
-	username      string
-	accountID     int64
-	serverAddr    string
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	server             *Server
+	clientConn         net.Conn
+	backendConn        net.Conn
+	backendReader      *bufio.Reader
+	backendWriter      *bufio.Writer
+	clientReader       *bufio.Reader
+	clientWriter       *bufio.Writer
+	username           string
+	accountID          int64
+	isPrelookupAccount bool
+	routingInfo        *proxy.UserRoutingInfo
+	serverAddr         string
+	mu                 sync.Mutex
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // newSession creates a new IMAP proxy session.
@@ -277,14 +280,13 @@ func (s *Session) unquoteString(str string) string {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
 	remoteAddr := s.clientConn.RemoteAddr()
 
 	// Check if the authentication attempt is allowed by the rate limiter.
 	if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, username); err != nil {
-		// Record the failed attempt before returning the error.
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 		return err
@@ -295,6 +297,44 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
+	// Try prelookup authentication/routing first if configured
+	if s.server.connManager.HasRouting() {
+		log.Printf("[IMAP Proxy] Attempting authentication for user %s via prelookup", username)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
+
+		if err != nil {
+			log.Printf("[IMAP Proxy] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", username, err)
+			// Fallthrough to main DB auth
+		} else {
+			switch authResult {
+			case proxy.AuthSuccess:
+				// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
+				log.Printf("[IMAP Proxy] Prelookup authentication successful for %s, AccountID: %d (prelookup)", username, routingInfo.AccountID)
+				s.accountID = routingInfo.AccountID
+				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
+				s.routingInfo = routingInfo
+				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
+				metrics.TrackDomainConnection("imap_proxy", address.Domain())
+				metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+				return nil // Authentication complete
+
+			case proxy.AuthFailed:
+				// User found in prelookup, but password was wrong. Reject immediately.
+				log.Printf("[IMAP Proxy] Prelookup authentication failed for %s (bad password)", username)
+				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
+				return fmt.Errorf("authentication failed")
+
+			case proxy.AuthUserNotFound:
+				// User not in prelookup DB. Fallthrough to main DB auth.
+				log.Printf("[IMAP Proxy] User '%s' not found in prelookup. Falling back to main DB.", username)
+			}
+		}
+	}
+
+	// Fallback to main DB
+	log.Printf("[IMAP Proxy] Authenticating user %s via main database", username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
@@ -302,8 +342,9 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
-	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 	s.accountID = accountID
+	s.isPrelookupAccount = false // Authenticated against the main DB
+	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
@@ -317,7 +358,7 @@ func (s *Session) authenticateUser(username, password string) error {
 
 // getPreferredBackend fetches the preferred backend server for the user based on affinity.
 func (s *Session) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity {
+	if !s.server.enableAffinity || s.isPrelookupAccount {
 		return "", nil
 	}
 
@@ -344,21 +385,25 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	var preferredAddr string
 	var err error
+	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
 
-	// 1. Try routing lookup first
-	if s.server.connManager.HasRouting() {
+	// 1. Try routing lookup first, only if not already available from auth
+	if routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		var lookupErr error
+		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
 			log.Printf("[IMAP Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 		}
 	}
 
-	// 2. If no routing info, try affinity
+	if routingInfo != nil && routingInfo.ServerAddress != "" {
+		preferredAddr = routingInfo.ServerAddress
+		log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
+	}
+
+	// 2. If no routing info from prelookup, try affinity
 	if preferredAddr == "" {
 		preferredAddr, err = s.getPreferredBackend()
 		if err != nil {
@@ -387,7 +432,7 @@ func (s *Session) connectToBackend() error {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort,
+		clientHost, clientPort, serverHost, serverPort, routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -398,7 +443,7 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Record successful connection for future affinity if enabled
-	if s.server.enableAffinity && actualAddr != "" {
+	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {

@@ -192,7 +192,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	// Update the session's message count and notify the tracker if needed
-	acquired, cancel := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.Log("[APPEND] Failed to acquire write lock within timeout, returning success without session state update")
 		success = true
@@ -201,10 +201,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			UIDValidity: mailbox.UIDValidity,
 		}, nil
 	}
-	defer func() {
-		s.mutex.Unlock()
-		cancel()
-	}()
+	defer release()
 
 	// Pin this session to the master DB to ensure read-your-writes consistency.
 	s.useMasterDB = true

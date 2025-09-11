@@ -8,14 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
-// ProxyProtocolConfig holds PROXY protocol configuration
-type ProxyProtocolConfig struct {
-	Enabled        bool     `toml:"enabled"`         // Enable PROXY protocol support
-	TrustedProxies []string `toml:"trusted_proxies"` // CIDR blocks of trusted proxies
-	Timeout        string   `toml:"timeout"`         // Timeout for reading PROXY header
-}
+// ProxyProtocolConfig is an alias for config.ProxyProtocolConfig for compatibility
+type ProxyProtocolConfig = config.ProxyProtocolConfig
 
 // ProxyProtocolInfo contains information extracted from PROXY protocol header
 type ProxyProtocolInfo struct {

@@ -28,33 +28,35 @@ type ConnectionInfo struct {
 
 // ConnectionTracker manages connection tracking with in-memory caching
 type ConnectionTracker struct {
-	rdb            *resilient.ResilientDatabase
-	name           string // e.g. "IMAP", "POP3"
-	instanceID     string
-	connections    map[string]*ConnectionInfo // key: "accountID:protocol:clientAddr"
-	mu             sync.RWMutex
-	updateInterval time.Duration
-	persistToDB    bool
-	batchUpdates   bool
-	enabled        bool
-	kickCh         chan struct{}
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
+	rdb                   *resilient.ResilientDatabase
+	name                  string // e.g. "IMAP", "POP3"
+	instanceID            string
+	connections           map[string]*ConnectionInfo // key: "accountID:protocol:clientAddr"
+	mu                    sync.RWMutex
+	updateInterval        time.Duration
+	terminationPollInterval time.Duration
+	persistToDB           bool
+	batchUpdates          bool
+	enabled               bool
+	kickCh                chan struct{}
+	stopCh                chan struct{}
+	wg                    sync.WaitGroup
 }
 
 // NewConnectionTracker creates a new connection tracker
-func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
+func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
 	tracker := &ConnectionTracker{
-		rdb:            rdb,
-		name:           name,
-		instanceID:     instanceID,
-		connections:    make(map[string]*ConnectionInfo),
-		updateInterval: updateInterval,
-		persistToDB:    persistToDB,
-		batchUpdates:   batchUpdates,
-		enabled:        enabled,
-		kickCh:         make(chan struct{}),
-		stopCh:         make(chan struct{}),
+		rdb:                   rdb,
+		name:                  name,
+		instanceID:            instanceID,
+		connections:           make(map[string]*ConnectionInfo),
+		updateInterval:        updateInterval,
+		terminationPollInterval: terminationPollInterval,
+		persistToDB:           persistToDB,
+		batchUpdates:          batchUpdates,
+		enabled:               enabled,
+		kickCh:                make(chan struct{}),
+		stopCh:                make(chan struct{}),
 	}
 
 	if enabled && persistToDB {
@@ -315,7 +317,7 @@ func (ct *ConnectionTracker) startTerminationPoller() {
 	go func() {
 		defer ct.wg.Done()
 		// This is more reliable than LISTEN/NOTIFY in a replicated DB environment.
-		ticker := time.NewTicker(2 * time.Second) // Poll every 2 seconds.
+		ticker := time.NewTicker(ct.terminationPollInterval)
 		defer ticker.Stop()
 
 		for {

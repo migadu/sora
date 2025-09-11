@@ -19,25 +19,25 @@ const (
 )
 
 type HealthStatus struct {
-	ComponentName    string          `json:"component_name"`
-	Status           ComponentStatus `json:"status"`
-	LastCheck        time.Time              `json:"last_check"`
-	LastError        *string                `json:"last_error,omitempty"`
-	CheckCount       int                    `json:"check_count"`
-	FailCount        int                    `json:"fail_count"`
-	Metadata         map[string]interface{} `json:"metadata,omitempty"`
-	ServerHostname   string                 `json:"server_hostname"`
-	UpdatedAt        time.Time              `json:"updated_at"`
+	ComponentName  string                 `json:"component_name"`
+	Status         ComponentStatus        `json:"status"`
+	LastCheck      time.Time              `json:"last_check"`
+	LastError      *string                `json:"last_error,omitempty"`
+	CheckCount     int                    `json:"check_count"`
+	FailCount      int                    `json:"fail_count"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	ServerHostname string                 `json:"server_hostname"`
+	UpdatedAt      time.Time              `json:"updated_at"`
 }
 
 type SystemHealthOverview struct {
-	OverallStatus      ComponentStatus `json:"overall_status"`
-	ComponentCount     int                    `json:"component_count"`
-	HealthyCount       int                    `json:"healthy_count"`
-	DegradedCount      int                    `json:"degraded_count"`
-	UnhealthyCount     int                    `json:"unhealthy_count"`
-	UnreachableCount   int                    `json:"unreachable_count"`
-	LastUpdated        time.Time              `json:"last_updated"`
+	OverallStatus    ComponentStatus `json:"overall_status"`
+	ComponentCount   int             `json:"component_count"`
+	HealthyCount     int             `json:"healthy_count"`
+	DegradedCount    int             `json:"degraded_count"`
+	UnhealthyCount   int             `json:"unhealthy_count"`
+	UnreachableCount int             `json:"unreachable_count"`
+	LastUpdated      time.Time       `json:"last_updated"`
 }
 
 // StoreHealthStatus stores or updates the health status for a component
@@ -241,9 +241,9 @@ func (db *Database) GetSystemHealthOverview(ctx context.Context, hostname string
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return &SystemHealthOverview{
-				OverallStatus:      StatusUnreachable,
-				ComponentCount:     0,
-				LastUpdated:        time.Now(),
+				OverallStatus:  StatusUnreachable,
+				ComponentCount: 0,
+				LastUpdated:    time.Now(),
 			}, nil
 		}
 		return nil, err
@@ -261,22 +261,6 @@ func (db *Database) GetSystemHealthOverview(ctx context.Context, hostname string
 	}
 
 	return &overview, nil
-}
-
-// CleanupOldHealthStatuses removes health status records older than the specified duration
-func (db *Database) CleanupOldHealthStatuses(ctx context.Context, maxAge time.Duration) (int64, error) {
-	query := `
-		DELETE FROM health_status 
-		WHERE updated_at < $1
-	`
-
-	cutoffTime := time.Now().Add(-maxAge)
-	result, err := db.WritePool.Exec(ctx, query, cutoffTime)
-	if err != nil {
-		return 0, err
-	}
-
-	return result.RowsAffected(), nil
 }
 
 // GetHealthHistory gets health status changes over time for a component

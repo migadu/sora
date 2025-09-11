@@ -18,21 +18,24 @@ import (
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/proxy"
 )
 
 // Session represents a ManageSieve proxy session.
 type Session struct {
-	server       *Server
-	clientConn   net.Conn
-	backendConn  net.Conn
-	clientReader *bufio.Reader
-	clientWriter *bufio.Writer
-	username     string
-	accountID    int64
-	serverAddr   string
-	mu           sync.Mutex
-	ctx          context.Context
-	cancel       context.CancelFunc
+	server             *Server
+	clientConn         net.Conn
+	backendConn        net.Conn
+	clientReader       *bufio.Reader
+	clientWriter       *bufio.Writer
+	username           string
+	accountID          int64
+	isPrelookupAccount bool
+	routingInfo        *proxy.UserRoutingInfo
+	serverAddr         string
+	mu                 sync.Mutex
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // newSession creates a new ManageSieve proxy session.
@@ -214,6 +217,42 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
+	// Try prelookup authentication/routing first if configured
+	log.Printf("[ManageSieve Proxy] Attempting authentication for user %s via prelookup", username)
+	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
+
+	if err != nil {
+		log.Printf("[ManageSieve Proxy] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", username, err)
+		// Fallthrough to main DB auth
+	} else {
+		switch authResult {
+		case proxy.AuthSuccess:
+			// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
+			log.Printf("[ManageSieve Proxy] Prelookup authentication successful for %s, AccountID: %d (prelookup)", username, routingInfo.AccountID)
+			s.accountID = routingInfo.AccountID
+			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
+			s.routingInfo = routingInfo
+			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+			metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
+			metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
+			return nil // Authentication complete
+
+		case proxy.AuthFailed:
+			// User found in prelookup, but password was wrong. Reject immediately.
+			log.Printf("[ManageSieve Proxy] Prelookup authentication failed for %s (bad password)", username)
+			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			return fmt.Errorf("authentication failed")
+
+		case proxy.AuthUserNotFound:
+			// User not in prelookup DB. Fallthrough to main DB auth.
+			log.Printf("[ManageSieve Proxy] User '%s' not found in prelookup. Falling back to main DB.", username)
+		}
+	}
+
+	// Fallback/default: Authenticate against the main database.
+	log.Printf("[ManageSieve Proxy] Authenticating user %s via main database", username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
@@ -221,16 +260,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
-	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 	s.accountID = accountID
-
-	// Track successful authentication.
+	s.isPrelookupAccount = false // Authenticated against the main DB
+	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
-
-	// Track domain and user connection activity for the login event.
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
-
 	return nil
 }
 
@@ -246,7 +281,7 @@ func (s *Session) sendGreeting() {
 
 // getPreferredBackend fetches the preferred backend server for the user based on affinity.
 func (s *Session) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity {
+	if !s.server.enableAffinity || s.isPrelookupAccount {
 		return "", nil
 	}
 
@@ -272,18 +307,22 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackendAndAuth() error {
 	var preferredAddr string
 	var err error
+	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
 
-	// 1. Try routing lookup first
-	if s.server.connManager.HasRouting() {
+	// 1. Try routing lookup first, only if not already available from auth
+	if routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		var lookupErr error
+		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
 			log.Printf("[ManageSieve Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			preferredAddr = routingInfo.ServerAddress
-			log.Printf("[ManageSieve Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 		}
+	}
+
+	if routingInfo != nil && routingInfo.ServerAddress != "" {
+		preferredAddr = routingInfo.ServerAddress
+		log.Printf("[ManageSieve Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
 
 	// 2. If no routing info, try affinity
@@ -314,7 +353,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort,
+		clientHost, clientPort, serverHost, serverPort, routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -323,7 +362,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity
-	if s.server.enableAffinity && actualAddr != "" {
+	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {

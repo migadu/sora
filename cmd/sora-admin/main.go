@@ -28,63 +28,14 @@ var (
 	date    = "unknown"
 )
 
-// CleanupConfig holds cleanup configuration
-type CleanupConfig struct {
-	GracePeriod       string `toml:"grace_period"`
-	WakeInterval      string `toml:"wake_interval"`
-	MaxAgeRestriction string `toml:"max_age_restriction"`
-	FTSRetention      string `toml:"fts_retention"`
-}
-
-func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
-	if c.FTSRetention == "" {
-		return 730 * 24 * time.Hour, nil // 2 years default
-	}
-	return helpers.ParseDuration(c.FTSRetention)
-}
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database   config.DatabaseConfig `toml:"database"`
-	S3         S3Config              `toml:"s3"`
-	LocalCache LocalCacheConfig      `toml:"local_cache"`
-	Uploader   UploaderConfig        `toml:"uploader"`
-	Cleanup    CleanupConfig         `toml:"cleanup"`
-}
-
-// S3Config holds S3 configuration - copied from main config
-type S3Config struct {
-	Endpoint      string `toml:"endpoint"`
-	DisableTLS    bool   `toml:"disable_tls"`
-	AccessKey     string `toml:"access_key"`
-	SecretKey     string `toml:"secret_key"`
-	Bucket        string `toml:"bucket"`
-	Trace         bool   `toml:"trace"`
-	Encrypt       bool   `toml:"encrypt"`
-	EncryptionKey string `toml:"encryption_key"`
-}
-
-// LocalCacheConfig holds cache configuration - copied from main config
-type LocalCacheConfig struct {
-	Path               string   `toml:"path"`
-	Capacity           string   `toml:"capacity"`
-	MaxObjectSize      string   `toml:"max_object_size"`
-	MetricsInterval    string   `toml:"metrics_interval"`
-	PurgeInterval      string   `toml:"purge_interval"`
-	OrphanCleanupAge   string   `toml:"orphan_cleanup_age"`
-	EnableWarmup       bool     `toml:"enable_warmup"`
-	WarmupMessageCount int      `toml:"warmup_message_count"`
-	WarmupMailboxes    []string `toml:"warmup_mailboxes"`
-	WarmupAsync        bool     `toml:"warmup_async"`
-}
-
-// UploaderConfig holds uploader configuration - copied from main config
-type UploaderConfig struct {
-	Path          string `toml:"path"`
-	BatchSize     int    `toml:"batch_size"`
-	Concurrency   int    `toml:"concurrency"`
-	MaxAttempts   int    `toml:"max_attempts"`
-	RetryInterval string `toml:"retry_interval"`
+	Database   config.DatabaseConfig   `toml:"database"`
+	S3         config.S3Config         `toml:"s3"`
+	LocalCache config.LocalCacheConfig `toml:"local_cache"`
+	Uploader   config.UploaderConfig   `toml:"uploader"`
+	Cleanup    config.CleanupConfig    `toml:"cleanup"`
 }
 
 func newDefaultAdminConfig() AdminConfig {
@@ -108,7 +59,7 @@ func newDefaultAdminConfig() AdminConfig {
 				TLSMode:  false,
 			},
 		},
-		S3: S3Config{
+		S3: config.S3Config{
 			Endpoint:      "",
 			AccessKey:     "",
 			SecretKey:     "",
@@ -116,7 +67,7 @@ func newDefaultAdminConfig() AdminConfig {
 			Encrypt:       false,
 			EncryptionKey: "",
 		},
-		LocalCache: LocalCacheConfig{
+		LocalCache: config.LocalCacheConfig{
 			Path:               "/tmp/sora/cache",
 			Capacity:           "1gb",
 			MaxObjectSize:      "5mb",
@@ -128,17 +79,19 @@ func newDefaultAdminConfig() AdminConfig {
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
 		},
-		Uploader: UploaderConfig{
+		Uploader: config.UploaderConfig{
 			Path:          "/tmp/sora/uploads",
 			BatchSize:     20,
 			Concurrency:   10,
 			MaxAttempts:   5,
 			RetryInterval: "30s",
 		},
-		Cleanup: CleanupConfig{
-			GracePeriod:  "14d",  // 14 days
-			WakeInterval: "1h",   // 1 hour
-			FTSRetention: "730d", // 2 years default
+		Cleanup: config.CleanupConfig{
+			GracePeriod:           "14d",  // 14 days
+			WakeInterval:          "1h",   // 1 hour
+			FTSRetention:          "730d", // 2 years default
+			AuthAttemptsRetention: "7d",   // 7 days
+			HealthStatusRetention: "30d",  // 30 days
 		},
 	}
 }

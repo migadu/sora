@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/migadu/sora/cache"
@@ -29,34 +30,44 @@ import (
 )
 
 type CleanupWorker struct {
-	rdb               *resilient.ResilientDatabase
-	s3                *storage.S3Storage
-	cache             *cache.Cache
-	interval          time.Duration
-	gracePeriod       time.Duration
-	maxAgeRestriction time.Duration
-	ftsRetention      time.Duration
+	rdb                   *resilient.ResilientDatabase
+	s3                    *storage.S3Storage
+	cache                 *cache.Cache
+	interval              time.Duration
+	gracePeriod           time.Duration
+	maxAgeRestriction     time.Duration
+	ftsRetention          time.Duration
+	authAttemptsRetention time.Duration
+	healthStatusRetention time.Duration
 }
 
 // New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention time.Duration) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention time.Duration) *CleanupWorker {
 	return &CleanupWorker{
-		rdb:               rdb,
-		s3:                s3,
-		cache:             cache,
-		interval:          interval,
-		gracePeriod:       gracePeriod,
-		maxAgeRestriction: maxAgeRestriction,
-		ftsRetention:      ftsRetention,
+		rdb:                   rdb,
+		s3:                    s3,
+		cache:                 cache,
+		interval:              interval,
+		gracePeriod:           gracePeriod,
+		maxAgeRestriction:     maxAgeRestriction,
+		ftsRetention:          ftsRetention,
+		authAttemptsRetention: authAttemptsRetention,
+		healthStatusRetention: healthStatusRetention,
 	}
 }
 
 func (w *CleanupWorker) Start(ctx context.Context) {
+	var logParts []string
+	logParts = append(logParts, fmt.Sprintf("interval: %v", w.interval))
+	logParts = append(logParts, fmt.Sprintf("grace period: %v", w.gracePeriod))
 	if w.maxAgeRestriction > 0 {
-		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, max age restriction: %v, FTS retention: %v", w.interval, w.gracePeriod, w.maxAgeRestriction, w.ftsRetention)
-	} else {
-		log.Printf("[CLEANUP] worker starting with interval: %v, grace period: %v, FTS retention: %v", w.interval, w.gracePeriod, w.ftsRetention)
+		logParts = append(logParts, fmt.Sprintf("max age restriction: %v", w.maxAgeRestriction))
 	}
+	logParts = append(logParts, fmt.Sprintf("FTS retention: %v", w.ftsRetention))
+	logParts = append(logParts, fmt.Sprintf("auth attempts retention: %v", w.authAttemptsRetention))
+	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
+
+	log.Printf("[CLEANUP] worker starting with %s", strings.Join(logParts, ", "))
 	interval := w.interval
 
 	const minAllowedInterval = time.Minute
@@ -137,6 +148,26 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// Continue with S3 cleanup even if vacation cleanup fails
 	} else if count > 0 {
 		log.Printf("[CLEANUP] deleted %d old vacation responses", count)
+	}
+
+	// --- Cleanup of old auth attempts ---
+	if w.authAttemptsRetention > 0 {
+		authCount, err := w.rdb.CleanupOldAuthAttemptsWithRetry(ctx, w.authAttemptsRetention)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to clean up old auth attempts: %v", err)
+		} else if authCount > 0 {
+			log.Printf("[CLEANUP] deleted %d old auth attempts older than %v", authCount, w.authAttemptsRetention)
+		}
+	}
+
+	// --- Cleanup of old health statuses ---
+	if w.healthStatusRetention > 0 {
+		healthCount, err := w.rdb.CleanupOldHealthStatusesWithRetry(ctx, w.healthStatusRetention)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to clean up old health statuses: %v", err)
+		} else if healthCount > 0 {
+			log.Printf("[CLEANUP] deleted %d old health statuses older than %v", healthCount, w.healthStatusRetention)
+		}
 	}
 
 	// --- Phase 1: User-scoped cleanup (S3 objects and message references) ---
