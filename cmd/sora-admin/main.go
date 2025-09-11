@@ -2438,9 +2438,6 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
