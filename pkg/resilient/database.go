@@ -32,7 +32,6 @@ type DatabasePool struct {
 	isHealthy   atomic.Bool
 	lastFailure atomic.Int64 // Unix timestamp
 	failCount   atomic.Int64
-	mu          sync.RWMutex
 }
 
 // RuntimeFailoverManager manages multiple database pools and handles failover
@@ -473,7 +472,7 @@ func (rd *ResilientDatabase) GetLastServerAddressWithRetry(ctx context.Context, 
 		})
 
 		if cbErr != nil {
-			if errors.Is(cbErr, db.ErrNoServerAffinity) {
+			if errors.Is(cbErr, consts.ErrNoServerAffinity) {
 				return retry.Stop(cbErr) // Not a retryable error.
 			}
 			if !rd.isRetryableError(cbErr) {
@@ -1050,12 +1049,12 @@ func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context
 
 // --- Mailbox Management Wrappers ---
 
-func (rd *ResilientDatabase) InsertMessageCopyWithRetry(ctx context.Context, srcMessageUID imap.UID, srcMailboxID int64, destMailboxID int64, destMailboxName string) (imap.UID, error) {
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
 	config := retry.BackoffConfig{MaxRetries: 2}
-	var newUID imap.UID
+	var uidMap map[imap.UID]imap.UID
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().InsertMessageCopy(ctx, srcMessageUID, srcMailboxID, destMailboxID, destMailboxName)
+			return rd.getOperationalDatabase().CopyMessages(ctx, uids, srcMailboxID, destMailboxID, userID)
 		})
 		if cbErr != nil {
 			if errors.Is(cbErr, consts.ErrDBUniqueViolation) {
@@ -1066,10 +1065,10 @@ func (rd *ResilientDatabase) InsertMessageCopyWithRetry(ctx context.Context, src
 			}
 			return cbErr
 		}
-		newUID = result.(imap.UID)
+		uidMap = result.(map[imap.UID]imap.UID)
 		return nil
 	}, config)
-	return newUID, err
+	return uidMap, err
 }
 
 func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, userID int64, name string, parentID *int64) error {
@@ -2232,26 +2231,11 @@ func (rd *ResilientDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context
 	return candidates, err
 }
 
-func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsWithRetry(ctx context.Context, accountID int64, s3Domain, s3Localpart, contentHash string) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteExpungedMessagesByS3KeyParts(ctx, accountID, s3Domain, s3Localpart, contentHash)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, cleanupRetryConfig)
-}
-
-func (rd *ResilientDatabase) CleanupOldMessageContentsWithRetry(ctx context.Context, ftsRetention time.Duration) (int64, error) {
+func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
 	var count int64
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupOldMessageContents(ctx, ftsRetention)
+			return rd.getOperationalDatabase().PruneOldMessageBodies(ctx, retention)
 		})
 		if cbErr != nil {
 			if !rd.isRetryableError(cbErr) {
@@ -2287,21 +2271,6 @@ func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context
 	return hashes, err
 }
 
-func (rd *ResilientDatabase) DeleteMessageContentByHashWithRetry(ctx context.Context, hash string) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteMessageContentByHash(ctx, hash)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, cleanupRetryConfig)
-}
-
 func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int) ([]int64, error) {
 	var accounts []int64
 	err := retry.WithRetryAdvanced(ctx, func() error {
@@ -2324,10 +2293,11 @@ func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx co
 	return accounts, err
 }
 
-func (rd *ResilientDatabase) FinalizeAccountDeletionWithRetry(ctx context.Context, accountID int64) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().FinalizeAccountDeletion(ctx, accountID)
+func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int64, error) {
+	var count int64
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+			return rd.getOperationalDatabase().DeleteExpungedMessagesByS3KeyPartsBatch(ctx, candidates)
 		})
 		if cbErr != nil {
 			if !rd.isRetryableError(cbErr) {
@@ -2335,8 +2305,46 @@ func (rd *ResilientDatabase) FinalizeAccountDeletionWithRetry(ctx context.Contex
 			}
 			return cbErr
 		}
+		count = result.(int64)
 		return nil
 	}, cleanupRetryConfig)
+	return count, err
+}
+
+func (rd *ResilientDatabase) DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
+	var count int64
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+			return rd.getOperationalDatabase().DeleteMessageContentsByHashBatch(ctx, hashes)
+		})
+		if cbErr != nil {
+			if !rd.isRetryableError(cbErr) {
+				return retry.Stop(cbErr)
+			}
+			return cbErr
+		}
+		count = result.(int64)
+		return nil
+	}, cleanupRetryConfig)
+	return count, err
+}
+
+func (rd *ResilientDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error) {
+	var count int64
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+			return rd.getOperationalDatabase().FinalizeAccountDeletions(ctx, accountIDs)
+		})
+		if cbErr != nil {
+			if !rd.isRetryableError(cbErr) {
+				return retry.Stop(cbErr)
+			}
+			return cbErr
+		}
+		count = result.(int64)
+		return nil
+	}, cleanupRetryConfig)
+	return count, err
 }
 
 // --- Cache Metrics Wrappers ---
@@ -2483,7 +2491,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// Create database pools for all read hosts
 	if config.Read != nil && len(config.Read.Hosts) > 0 {
 		for i, host := range config.Read.Hosts {
-			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", runMigrations)
+			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", false)
 			if err != nil {
 				log.Printf("[RESILIENT-FAILOVER] Failed to create read pool for host %s: %v", host, err)
 				continue

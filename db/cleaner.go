@@ -92,18 +92,39 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 	return result, nil
 }
 
-// DeleteExpungedMessagesByS3KeyParts deletes all expunged message rows
-// from the database that match the given S3 key components.
+// DeleteExpungedMessagesByS3KeyPartsBatch deletes all expunged message rows
+// from the database that match the given batches of S3 key components.
 // It does NOT delete from message_contents, as the content may be shared.
-func (d *Database) DeleteExpungedMessagesByS3KeyParts(ctx context.Context, accountID int64, s3Domain, s3Localpart, contentHash string) error {
-	_, err := d.GetWritePool().Exec(ctx, `
-		DELETE FROM messages
-		WHERE account_id = $1 AND s3_domain = $2 AND s3_localpart = $3 AND content_hash = $4 AND expunged_at IS NOT NULL
-	`, accountID, s3Domain, s3Localpart, contentHash)
-	if err != nil {
-		return fmt.Errorf("failed to delete expunged messages for account %d and S3 key parts (%s/%s/%s): %w", accountID, s3Domain, s3Localpart, contentHash, err)
+func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, candidates []UserScopedObjectForCleanup) (int64, error) {
+	if len(candidates) == 0 {
+		return 0, nil
 	}
-	return nil
+
+	accountIDs := make([]int64, len(candidates))
+	s3Domains := make([]string, len(candidates))
+	s3Localparts := make([]string, len(candidates))
+	contentHashes := make([]string, len(candidates))
+
+	for i, c := range candidates {
+		accountIDs[i] = c.AccountID
+		s3Domains[i] = c.S3Domain
+		s3Localparts[i] = c.S3Localpart
+		contentHashes[i] = c.ContentHash
+	}
+
+	tag, err := d.GetWritePool().Exec(ctx, `
+		DELETE FROM messages m
+		USING unnest($1::bigint[], $2::text[], $3::text[], $4::text[]) AS d(account_id, s3_domain, s3_localpart, content_hash)
+		WHERE m.account_id = d.account_id
+		  AND m.s3_domain = d.s3_domain
+		  AND m.s3_localpart = d.s3_localpart
+		  AND m.content_hash = d.content_hash
+		  AND m.expunged_at IS NOT NULL
+	`, accountIDs, s3Domains, s3Localparts, contentHashes)
+	if err != nil {
+		return 0, fmt.Errorf("failed to batch delete expunged messages: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // DeleteMessageByHashAndMailbox deletes message rows from the database that match
@@ -121,17 +142,17 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, accountID 
 	return tag.RowsAffected(), nil
 }
 
-// DeleteMessageContentByHash deletes a row from the message_contents table.
-// This should only be called after confirming the hash is no longer in use by any message.
-func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash string) error {
-	tag, err := d.GetWritePool().Exec(ctx, `DELETE FROM message_contents WHERE content_hash = $1`, contentHash)
+// DeleteMessageContentsByHashBatch deletes multiple rows from the message_contents table.
+// This should only be called after confirming the hashes are no longer in use by any message.
+func (d *Database) DeleteMessageContentsByHashBatch(ctx context.Context, contentHashes []string) (int64, error) {
+	if len(contentHashes) == 0 {
+		return 0, nil
+	}
+	tag, err := d.GetWritePool().Exec(ctx, `DELETE FROM message_contents WHERE content_hash = ANY($1)`, contentHashes)
 	if err != nil {
-		return fmt.Errorf("failed to delete from message_contents for hash %s: %w", contentHash, err)
+		return 0, fmt.Errorf("failed to batch delete from message_contents: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		log.Printf("[DB] no rows deleted from message_contents for hash %s (may have been already deleted or never created)", contentHash)
-	}
-	return nil
+	return tag.RowsAffected(), nil
 }
 
 // CleanupFailedUploads deletes message rows and their corresponding pending_uploads
@@ -139,81 +160,65 @@ func (d *Database) DeleteMessageContentByHash(ctx context.Context, contentHash s
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
 func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
-	tx, err := d.BeginTx(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction for failed upload cleanup: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
-	// Step 1: Delete messages that were never uploaded and are older than the grace period,
-	// returning the identifiers of the deleted messages.
-	rows, err := tx.Query(ctx, `
-		DELETE FROM messages
-		WHERE uploaded = FALSE AND created_at < $1
-		RETURNING content_hash, account_id
-	`, threshold)
-	if err != nil {
-		return 0, fmt.Errorf("failed to delete messages for failed uploads: %w", err)
-	}
-
-	var deletedMessagesCount int64
-	var contentHashes []string
-	var accountIDs []int64
-
-	for rows.Next() {
-		var hash string
-		var accountID int64
-		if err := rows.Scan(&hash, &accountID); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("failed to scan deleted message info: %w", err)
-		}
-		contentHashes = append(contentHashes, hash)
-		accountIDs = append(accountIDs, accountID)
-		deletedMessagesCount++
-	}
-	rows.Close()
-
-	if deletedMessagesCount > 0 {
-		// Step 2: Delete the corresponding entries from pending_uploads in a single batch.
-		_, err = tx.Exec(ctx, `
+	// This single query uses a Common Table Expression (CTE) to perform both deletions
+	// in one atomic operation, which is more efficient than two separate queries.
+	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages and returns their keys.
+	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
+	//    entries from `pending_uploads`.
+	// The final SELECT returns the count of messages that were deleted.
+	query := `
+		WITH deleted_messages AS (
+			DELETE FROM messages
+			WHERE uploaded = FALSE AND created_at < $1
+			RETURNING content_hash, account_id
+		),
+		deleted_pending AS (
 			DELETE FROM pending_uploads pu
-			USING unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
-			WHERE pu.content_hash = d.content_hash AND pu.account_id = d.account_id
-		`, contentHashes, accountIDs)
-		if err != nil {
-			return 0, fmt.Errorf("failed to delete from pending_uploads: %w", err)
-		}
+			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
+		)
+		SELECT count(*) FROM deleted_messages
+	`
+
+	var deletedCount int64
+	err := d.GetWritePool().QueryRow(ctx, query, threshold).Scan(&deletedCount)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("failed to commit failed upload cleanup: %w", err)
-	}
-
-	return deletedMessagesCount, nil
+	return deletedCount, nil
 }
 
-// CleanupOldMessageContents deletes message_contents rows for messages older than the retention period.
-// This is based on the newest (MAX) sent_date of all messages that reference a given content_hash.
-func (d *Database) CleanupOldMessageContents(ctx context.Context, retentionPeriod time.Duration) (int64, error) {
-	threshold := time.Now().Add(-retentionPeriod).UTC()
-
-	// Use DELETE ... USING, which is generally more efficient than a subquery with IN.
-	result, err := d.GetWritePool().Exec(ctx, `
-		DELETE FROM message_contents mc
-		USING (
+// PruneOldMessageBodies sets the text_body to NULL for message contents
+// where all associated non-expunged messages are older than the given retention period.
+// This saves storage while preserving the text_body_tsv for full-text search.
+func (d *Database) PruneOldMessageBodies(ctx context.Context, retention time.Duration) (int64, error) {
+	// This query is optimized to use a NOT EXISTS clause, which is generally more
+	// efficient than a subquery with GROUP BY and MAX(). It finds content hashes
+	// that have not been pruned yet (text_body IS NOT NULL) and for which no
+	// active, recent message exists.
+	query := `
+		UPDATE message_contents
+		SET 
+			text_body = NULL,
+			updated_at = now()
+		WHERE content_hash IN (
 			SELECT content_hash
-			FROM messages
-			GROUP BY content_hash
-			HAVING MAX(sent_date) < $1
-		) AS to_delete
-		WHERE mc.content_hash = to_delete.content_hash
-	`, threshold)
-
+			FROM message_contents
+			WHERE text_body IS NOT NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.content_hash = message_contents.content_hash
+				  AND m.expunged_at IS NULL
+				  AND m.sent_date >= (now() - $1)
+			  )
+		)
+	`
+	tag, err := d.GetWritePool().Exec(ctx, query, retention)
 	if err != nil {
-		return 0, fmt.Errorf("failed to cleanup old message contents: %w", err)
+		return 0, fmt.Errorf("failed to prune old message bodies: %w", err)
 	}
-
-	return result.RowsAffected(), nil
+	return tag.RowsAffected(), nil
 }
 
 // GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
@@ -274,24 +279,74 @@ func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, gracePeriod t
 		accountsToDelete = append(accountsToDelete, accountID)
 	}
 
+	rows.Close() // Close rows before proceeding
+
 	if len(accountsToDelete) == 0 {
 		return 0, nil
 	}
 
-	var totalDeleted int64
-	for _, accountID := range accountsToDelete {
-		if err := d.HardDeleteAccount(ctx, accountID); err != nil {
-			log.Printf("failed to hard delete account %d: %v", accountID, err)
-			continue
-		}
-		totalDeleted++
+	// Perform the first stage of deletion in a single batch transaction
+	if err := d.HardDeleteAccounts(ctx, accountsToDelete); err != nil {
+		// If the batch fails, we can't be sure which accounts were processed.
+		// Log the error and return. The next run will pick them up.
+		log.Printf("failed to hard delete account batch: %v", err)
+		return 0, err
 	}
+
+	totalDeleted := int64(len(accountsToDelete))
 
 	if totalDeleted > 0 {
 		log.Printf("cleaned up %d soft-deleted accounts that exceeded grace period", totalDeleted)
 	}
 
 	return totalDeleted, nil
+}
+
+// HardDeleteAccounts performs the first stage of permanent deletion for a batch of accounts.
+// It expunges all their messages and deletes associated data like mailboxes, sieve scripts, etc.
+// It does NOT delete the account or credential rows themselves, as they are needed for S3 cleanup.
+func (d *Database) HardDeleteAccounts(ctx context.Context, accountIDs []int64) error {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+
+	tx, err := d.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for batch account deletion: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Use = ANY($1) for efficient batch operations
+	batchOps := []struct {
+		tableName string
+		query     string
+	}{
+		{"server_affinity", "DELETE FROM server_affinity WHERE account_id = ANY($1)"},
+		{"active_connections", "DELETE FROM active_connections WHERE account_id = ANY($1)"},
+		{"vacation_responses", "DELETE FROM vacation_responses WHERE account_id = ANY($1)"},
+		{"sieve_scripts", "DELETE FROM sieve_scripts WHERE account_id = ANY($1)"},
+		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1)"},
+		{"mailboxes", "DELETE FROM mailboxes WHERE account_id = ANY($1)"},
+	}
+
+	for _, op := range batchOps {
+		if _, err := tx.Exec(ctx, op.query, accountIDs); err != nil {
+			return fmt.Errorf("failed to batch delete from %s: %w", op.tableName, err)
+		}
+	}
+
+	// Mark all messages for the deleted accounts as expunged.
+	// This signals the next phase of the cleanup worker to remove the S3 objects.
+	_, err = tx.Exec(ctx, `
+		UPDATE messages 
+		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
+		WHERE account_id = ANY($1) AND expunged_at IS NULL
+	`, accountIDs)
+	if err != nil {
+		return fmt.Errorf("failed to expunge messages for batch deletion: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
@@ -323,40 +378,34 @@ func (d *Database) GetDanglingAccountsForFinalDeletion(ctx context.Context, limi
 	return accountIDs, nil
 }
 
-// FinalizeAccountDeletion permanently deletes an account and its credentials.
-// This should only be called on a dangling account that has no other dependencies.
-// The ON DELETE RESTRICT constraint on the messages table provides a final safety check.
-func (d *Database) FinalizeAccountDeletion(ctx context.Context, accountID int64) error {
+// FinalizeAccountDeletions permanently deletes a batch of accounts and their credentials.
+// This should only be called on dangling accounts that have no other dependencies.
+func (d *Database) FinalizeAccountDeletions(ctx context.Context, accountIDs []int64) (int64, error) {
+	if len(accountIDs) == 0 {
+		return 0, nil
+	}
+
 	tx, err := d.BeginTx(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction for final account deletion: %w", err)
+		return 0, fmt.Errorf("failed to begin transaction for final account deletion batch: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// First, delete credentials associated with the account.
-	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = $1", accountID)
+	// First, delete credentials associated with the accounts.
+	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", accountIDs)
 	if err != nil {
-		return fmt.Errorf("failed to delete credentials during finalization for account %d: %w", accountID, err)
+		return 0, fmt.Errorf("failed to batch delete credentials during finalization: %w", err)
 	}
 
-	// Finally, delete the account itself.
-	result, err := tx.Exec(ctx, "DELETE FROM accounts WHERE id = $1", accountID)
+	// Finally, delete the accounts themselves.
+	// The ON DELETE RESTRICT on messages provides a final safety check.
+	result, err := tx.Exec(ctx, "DELETE FROM accounts WHERE id = ANY($1)", accountIDs)
 	if err != nil {
-		// The ON DELETE RESTRICT on messages should prevent this if messages still exist.
-		return fmt.Errorf("failed to finalize deletion of account %d: %w", accountID, err)
+		return 0, fmt.Errorf("failed to finalize batch deletion of accounts: %w", err)
 	}
 
-	if result.RowsAffected() == 0 {
-		// This could happen in a race condition if another cleaner instance just deleted it.
-		// Not a critical error, but we can log it.
-		log.Printf("FinalizeAccountDeletion for account %d affected 0 rows. It may have already been deleted.", accountID)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit final account deletion transaction for account %d: %w", accountID, err)
-	}
-
-	return nil
+	err = tx.Commit(ctx)
+	return result.RowsAffected(), err
 }
 
 // CleanupOldAuthAttempts removes authentication attempts older than the specified duration

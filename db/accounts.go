@@ -36,8 +36,8 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
-		JOIN credentials c ON a.id = c.account_id 
-		WHERE c.address = $1
+		JOIN credentials c ON a.id = c.account_id
+		WHERE LOWER(c.address) = $1
 	`, normalizedEmail).Scan(&existingAccountID, &deletedAt)
 
 	if err == nil {
@@ -263,14 +263,14 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 		// Update password and/or set as primary
 		if updatePassword {
 			_, err = tx.Exec(ctx,
-				"UPDATE credentials SET password = $1, primary_identity = true, updated_at = now() WHERE account_id = $2 AND address = $3",
+				"UPDATE credentials SET password = $1, primary_identity = true, updated_at = now() WHERE account_id = $2 AND LOWER(address) = $3",
 				hashedPassword, accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to update account password and set primary: %w", err)
 			}
 		} else {
 			_, err = tx.Exec(ctx,
-				"UPDATE credentials SET primary_identity = true, updated_at = now() WHERE account_id = $1 AND address = $2",
+				"UPDATE credentials SET primary_identity = true, updated_at = now() WHERE account_id = $1 AND LOWER(address) = $2",
 				accountID, normalizedEmail)
 			if err != nil {
 				return fmt.Errorf("failed to set credential as primary: %w", err)
@@ -284,7 +284,7 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 	} else {
 		// Just update password without changing primary status
 		_, err = db.GetWritePool().Exec(ctx,
-			"UPDATE credentials SET password = $1, updated_at = now() WHERE account_id = $2 AND address = $3",
+			"UPDATE credentials SET password = $1, updated_at = now() WHERE account_id = $2 AND LOWER(address) = $3",
 			hashedPassword, accountID, normalizedEmail)
 		if err != nil {
 			return fmt.Errorf("failed to update account password: %w", err)
@@ -364,43 +364,49 @@ func (db *Database) DeleteCredential(ctx context.Context, email string) error {
 
 	normalizedEmail := address.FullAddress()
 
-	// Check if credential exists and get account info
-	var accountID int64
-	var isPrimary bool
-	var credentialCount int
+	// Use a single atomic DELETE statement with conditions to prevent race conditions.
+	// This is more efficient and safer than a separate SELECT then DELETE.
+	var deletedID int64
+	err = db.GetWritePool().QueryRow(ctx, `
+		DELETE FROM credentials
+		WHERE
+			LOWER(address) = $1
+		AND
+			-- Condition: Do not delete the primary credential.
+			primary_identity = false
+		AND
+			-- Condition: Do not delete the last credential for the account.
+			(SELECT COUNT(*) FROM credentials WHERE account_id = (SELECT account_id FROM credentials WHERE LOWER(address) = $1)) > 1
+		RETURNING id
+	`, normalizedEmail).Scan(&deletedID)
 
-	err = db.GetReadPool().QueryRow(ctx, `
-		SELECT c.account_id, c.primary_identity,
-		       (SELECT COUNT(*) FROM credentials WHERE account_id = c.account_id)
-		FROM credentials c 
-		WHERE c.address = $1
-	`, normalizedEmail).Scan(&accountID, &isPrimary, &credentialCount)
-
+	// If the DELETE returned no rows, it means one of the conditions failed.
+	// We now perform a read-only query to find out why and return a specific error.
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("credential with email %s not found: %w", normalizedEmail, consts.ErrUserNotFound)
+			var isPrimary bool
+			var credentialCount int
+			errCheck := db.GetReadPool().QueryRow(ctx, `
+				SELECT c.primary_identity, (SELECT COUNT(*) FROM credentials WHERE account_id = c.account_id)
+				FROM credentials c WHERE LOWER(c.address) = $1
+			`, normalizedEmail).Scan(&isPrimary, &credentialCount)
+
+			if errCheck != nil {
+				if errors.Is(errCheck, pgx.ErrNoRows) {
+					return fmt.Errorf("credential with email %s not found: %w", normalizedEmail, consts.ErrUserNotFound)
+				}
+				return fmt.Errorf("error checking credential status after failed delete: %w", errCheck)
+			}
+
+			if isPrimary {
+				return ErrCannotDeletePrimaryCredential
+			}
+			if credentialCount <= 1 {
+				return ErrCannotDeleteLastCredential
+			}
+			return fmt.Errorf("failed to delete credential for an unknown reason, possibly a concurrent modification")
 		}
-		return fmt.Errorf("error finding credential: %w", err)
-	}
-
-	// Prevent deletion of the last credential
-	if credentialCount <= 1 {
-		return ErrCannotDeleteLastCredential
-	}
-
-	// Prevent deletion of the primary credential
-	if isPrimary {
-		return ErrCannotDeletePrimaryCredential
-	}
-
-	// Delete the credential (no transaction needed since it's a single operation)
-	result, err := db.GetWritePool().Exec(ctx, "DELETE FROM credentials WHERE address = $1", normalizedEmail)
-	if err != nil {
 		return fmt.Errorf("failed to delete credential: %w", err)
-	}
-
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("credential with email %s not found during deletion: %w", normalizedEmail, consts.ErrUserNotFound)
 	}
 
 	return nil
@@ -422,8 +428,8 @@ func (db *Database) AccountExists(ctx context.Context, email string) (bool, erro
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
-		JOIN credentials c ON a.id = c.account_id 
-		WHERE c.address = $1
+		JOIN credentials c ON a.id = c.account_id
+		WHERE LOWER(c.address) = $1
 	`, normalizedEmail).Scan(&accountID, &deletedAt)
 
 	if err != nil {
@@ -438,7 +444,6 @@ func (db *Database) AccountExists(ctx context.Context, email string) (bool, erro
 }
 
 var (
-	ErrNoServerAffinity      = errors.New("no server affinity found")
 	ErrAccountAlreadyDeleted = errors.New("account is already deleted")
 	ErrAccountNotDeleted     = errors.New("account is not deleted")
 )
@@ -460,7 +465,7 @@ func (db *Database) DeleteAccount(ctx context.Context, email string) error {
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
-		WHERE c.address = $1
+		WHERE LOWER(c.address) = $1
 	`, normalizedEmail).Scan(&accountID, &deletedAt)
 
 	if err != nil {
@@ -526,7 +531,7 @@ func (db *Database) RestoreAccount(ctx context.Context, email string) error {
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
-		WHERE c.address = $1
+		WHERE LOWER(c.address) = $1
 	`, normalizedEmail).Scan(&accountID, &deletedAt)
 
 	if err != nil {
@@ -557,90 +562,6 @@ func (db *Database) RestoreAccount(ctx context.Context, email string) error {
 	return nil
 }
 
-// HardDeleteAccount permanently deletes an account and all associated data
-// This should only be called by the cleaner after the grace period
-func (db *Database) HardDeleteAccount(ctx context.Context, accountID int64) error {
-	// Begin transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Delete in order to respect foreign key constraints
-	// Note: Some tables have CASCADE deletes, but we'll be explicit for clarity
-
-	// Delete active connections
-	_, err = tx.Exec(ctx, "DELETE FROM server_affinity WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete server affinity: %w", err)
-	}
-
-	// Delete active connections
-	_, err = tx.Exec(ctx, "DELETE FROM active_connections WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete active connections: %w", err)
-	}
-
-	// Delete vacation responses
-	_, err = tx.Exec(ctx, "DELETE FROM vacation_responses WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete vacation responses: %w", err)
-	}
-
-	// Delete SIEVE scripts
-	_, err = tx.Exec(ctx, "DELETE FROM sieve_scripts WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete SIEVE scripts: %w", err)
-	}
-
-	// Delete pending_uploads entries
-	_, err = tx.Exec(ctx, "DELETE FROM pending_uploads WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete pending uploads entries: %w", err)
-	}
-
-	// First, get the account's deleted_at timestamp to use for expunging messages
-	var deletedAt time.Time
-	err = tx.QueryRow(ctx, "SELECT deleted_at FROM accounts WHERE id = $1", accountID).Scan(&deletedAt)
-	if err != nil {
-		return fmt.Errorf("failed to get account deleted_at timestamp: %w", err)
-	}
-
-	// Mark all messages as expunged with the account's deletion timestamp.
-	// This signals the cleaner to start the S3 cleanup process for these messages.
-	// The message rows themselves will be deleted by the cleaner after S3 objects are gone.
-	// The account row is preserved until all messages are cleaned up to prevent orphaning S3 objects.
-	_, err = tx.Exec(ctx, `
-		UPDATE messages 
-		SET expunged_at = $2
-		WHERE account_id = $1 AND expunged_at IS NULL
-	`, accountID, deletedAt)
-	if err != nil {
-		return fmt.Errorf("failed to expunge messages: %w", err)
-	}
-
-	// Delete mailboxes
-	_, err = tx.Exec(ctx, "DELETE FROM mailboxes WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to delete mailboxes: %w", err)
-	}
-
-	// The account row itself is NOT deleted here.
-	// Credentials are also NOT deleted here. They are required by the cleaner's next phase
-	// to look up the user's email address for S3 object deletion.
-	// The cleaner worker will perform the final deletion of the 'accounts' row
-	// and 'credentials' after all associated messages and S3 objects have been cleaned up.
-	// This prevents orphaning S3 objects, as the account's email is needed to construct S3 keys.
-
-	// Commit transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit account data cleanup transaction: %w", err)
-	}
-
-	return nil
-}
-
 // CredentialDetails holds comprehensive information about a single credential and its account.
 type CredentialDetails struct {
 	Address         string    `json:"address"`
@@ -662,18 +583,14 @@ type CredentialDetails struct {
 func (db *Database) GetCredentialDetails(ctx context.Context, email string) (*CredentialDetails, error) {
 	var details CredentialDetails
 	err := db.GetReadPool().QueryRow(ctx, `
-		SELECT
-			c.address, c.primary_identity, c.created_at, c.updated_at,
-			a.id, a.created_at, a.deleted_at,
-			COALESCE(cc.credential_count, 0),
-			COALESCE(mc.mailbox_count, 0),
-			COALESCE(msgc.message_count, 0)
+		SELECT c.address, c.primary_identity, c.created_at, c.updated_at,
+			   a.id, a.created_at, a.deleted_at,
+			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS total_credentials,
+			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   (SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL) AS message_count
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
-		LEFT JOIN (SELECT account_id, COUNT(*) as credential_count FROM credentials GROUP BY account_id) cc ON a.id = cc.account_id
-		LEFT JOIN (SELECT account_id, COUNT(*) as mailbox_count FROM mailboxes GROUP BY account_id) mc ON a.id = mc.account_id
-		LEFT JOIN (SELECT account_id, COUNT(*) as message_count FROM messages WHERE expunged_at IS NULL GROUP BY account_id) msgc ON a.id = msgc.account_id
-		WHERE c.address = $1
+		WHERE LOWER(c.address) = LOWER($1)
 	`, email).Scan(
 		&details.Address, &details.PrimaryIdentity, &details.CreatedAt, &details.UpdatedAt,
 		&details.Account.ID, &details.Account.CreatedAt, &details.Account.DeletedAt,
@@ -724,34 +641,17 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	}
 	normalizedEmail := address.FullAddress()
 
-	// First, find the account ID from the provided email.
-	var accountID int64
-	err = db.GetReadPool().QueryRow(ctx, `
-		SELECT account_id FROM credentials WHERE address = $1
-	`, normalizedEmail).Scan(&accountID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, consts.ErrUserNotFound
-		}
-		return nil, fmt.Errorf("error finding account by email: %w", err)
-	}
-
-	// Now, fetch all details for that account ID.
+	// Fetch all details for the account associated with the email.
+	// This combines fetching the account and its statistics in one query.
 	var details AccountDetails
 	err = db.GetReadPool().QueryRow(ctx, `
-		SELECT
-			a.id, a.created_at, a.deleted_at,
-			COALESCE(mc.mailbox_count, 0),
-			COALESCE(msgc.message_count, 0)
+		SELECT a.id, a.created_at, a.deleted_at,
+			   (SELECT count(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   (SELECT count(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL) AS message_count
 		FROM accounts a
-		LEFT JOIN (
-			SELECT account_id, COUNT(*) as mailbox_count FROM mailboxes GROUP BY account_id
-		) mc ON a.id = mc.account_id
-		LEFT JOIN (
-			SELECT account_id, COUNT(*) as message_count FROM messages WHERE expunged_at IS NULL GROUP BY account_id
-		) msgc ON a.id = msgc.account_id
-		WHERE a.id = $1
-	`, accountID).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.MailboxCount, &details.MessageCount)
+		JOIN credentials c ON a.id = c.account_id
+		WHERE LOWER(c.address) = $1
+	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.MailboxCount, &details.MessageCount)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -770,7 +670,7 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT address, primary_identity, created_at, updated_at
 		FROM credentials WHERE account_id = $1 ORDER BY primary_identity DESC, address ASC
-	`, accountID)
+	`, details.ID)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching credentials: %w", err)
 	}
@@ -804,31 +704,14 @@ type AccountSummary struct {
 // ListAccounts returns a summary of all accounts in the system
 func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) {
 	query := `
-		SELECT 
-			a.id,
-			a.created_at,
-			COALESCE(pc.address, '') as primary_email,
-			COALESCE(cc.credential_count, 0) as credential_count,
-			COALESCE(mc.mailbox_count, 0) as mailbox_count,
-			COALESCE(msgc.message_count, 0) as message_count
+		SELECT a.id,
+			   a.created_at,
+			   COALESCE(pc.address, '') AS primary_email,
+			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
+			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   (SELECT COUNT(*) FROM messages WHERE expunged_at IS NULL AND account_id = a.id) AS message_count
 		FROM accounts a
-		LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = true
-		LEFT JOIN (
-			SELECT account_id, COUNT(*) as credential_count
-			FROM credentials
-			GROUP BY account_id
-		) cc ON a.id = cc.account_id
-		LEFT JOIN (
-			SELECT account_id, COUNT(*) as mailbox_count
-			FROM mailboxes
-			GROUP BY account_id
-		) mc ON a.id = mc.account_id
-		LEFT JOIN (
-			SELECT account_id, COUNT(*) as message_count
-			FROM messages
-			WHERE expunged_at IS NULL
-			GROUP BY account_id
-		) msgc ON a.id = msgc.account_id
+				 LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = TRUE
 		WHERE a.deleted_at IS NULL
 		ORDER BY a.created_at DESC`
 

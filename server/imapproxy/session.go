@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -368,7 +368,7 @@ func (s *Session) getPreferredBackend() (string, error) {
 	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
 	if err != nil {
 		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if errors.Is(err, db.ErrNoServerAffinity) {
+		if errors.Is(err, consts.ErrNoServerAffinity) {
 			return "", nil
 		}
 		return "", err

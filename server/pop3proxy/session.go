@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -104,7 +104,7 @@ func (s *POP3ProxySession) handleConnection() {
 			if err := s.authenticate(s.username, password); err != nil {
 				writer.WriteString("-ERR Authentication failed\r\n")
 				writer.Flush()
-				log.Printf("[POP3 Proxy] authentication failed for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] authentication failed for user %s from %s: %v", s.username, s.RemoteIP, err)
 				continue
 			}
 
@@ -113,7 +113,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("[POP3 Proxy] Failed to register connection for %s: %v", s.RemoteIP, s.username, err)
+				log.Printf("[POP3 Proxy] Failed to register connection for user %s from %s: %v", s.username, s.RemoteIP, err)
 			}
 
 			// Start proxying
@@ -190,7 +190,7 @@ func (s *POP3ProxySession) handleConnection() {
 			if err := s.authenticate(authnID, password); err != nil {
 				writer.WriteString("-ERR Authentication failed\r\n")
 				writer.Flush()
-				log.Printf("[POP3 Proxy] SASL authentication failed for %s: %v", s.RemoteIP, authnID, err)
+				log.Printf("[POP3 Proxy] SASL authentication failed for user %s from %s: %v", authnID, s.RemoteIP, err)
 				continue
 			}
 
@@ -199,7 +199,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("[POP3 Proxy] Failed to register connection for %s: %v", s.RemoteIP, authnID, err)
+				log.Printf("[POP3 Proxy] Failed to register connection for user %s from %s: %v", authnID, s.RemoteIP, err)
 			}
 
 			// Start proxying
@@ -267,7 +267,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
-				log.Printf("[POP3 Proxy] Prelookup authentication failed for %s (bad password)", username)
+				log.Printf("[POP3 Proxy] Prelookup authentication failed for user %s from %s (bad password)", username, s.RemoteIP)
 				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
@@ -321,7 +321,7 @@ func (s *POP3ProxySession) getPreferredBackend() (string, error) {
 	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
 	if err != nil {
 		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if errors.Is(err, db.ErrNoServerAffinity) {
+		if errors.Is(err, consts.ErrNoServerAffinity) {
 			return "", nil
 		}
 		return "", err

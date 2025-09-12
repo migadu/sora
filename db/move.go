@@ -20,9 +20,9 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	}
 
 	// Ensure the destination mailbox exists
-	_, err := db.GetMailbox(ctx, destMailboxID, userID)
+	destMailbox, err := db.GetMailbox(ctx, destMailboxID, userID)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to fetch mailbox %d: %v", destMailboxID, err)
+		log.Printf("[DB] ERROR: failed to fetch destination mailbox %d: %v", destMailboxID, err)
 		return nil, consts.ErrMailboxNotFound
 	}
 
@@ -34,35 +34,10 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	}
 	defer tx.Rollback(ctx) // Rollback if any error occurs
 
-	// Get the count of messages to move
-	var messageCount int
-	err = tx.QueryRow(ctx, "SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND uid = ANY($2)", srcMailboxID, ids).Scan(&messageCount)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to count messages to move: %v", err)
-		return nil, consts.ErrInternalError
-	}
-
-	if messageCount == 0 {
-		log.Printf("[DB] WARNING: no messages found to move from mailbox %d", srcMailboxID)
-		return messageUIDMap, nil
-	}
-
-	// Lock the destination mailbox and get the current highest UID
-	var highestUID int64
-	err = tx.QueryRow(ctx, `
-		SELECT highest_uid 
-		FROM mailboxes 
-		WHERE id = $1 
-		FOR UPDATE;`, destMailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to fetch highest UID: %v", err)
-		return nil, consts.ErrDBQueryFailed
-	}
-
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `
 		SELECT id, uid FROM messages 
-		WHERE mailbox_id = $1 AND uid = ANY($2)
+		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
 		ORDER BY uid
 	`, srcMailboxID, ids)
 	if err != nil {
@@ -71,9 +46,9 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	}
 	defer rows.Close()
 
-	// Collect message IDs and assign new UIDs
+	// Collect message IDs and source UIDs
 	var messageIDs []int64
-	var newUIDs []int64
+	var sourceUIDsForMap []imap.UID
 	for rows.Next() {
 		var messageID int64
 		var sourceUID imap.UID
@@ -81,83 +56,61 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 			return nil, fmt.Errorf("failed to scan message ID and UID: %v", err)
 		}
 		messageIDs = append(messageIDs, messageID)
-
-		highestUID++
-		newUIDs = append(newUIDs, highestUID)
-		messageUIDMap[sourceUID] = imap.UID(highestUID)
+		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 	}
-
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating through source messages: %v", err)
 	}
 
-	// Update the highest UID in the destination mailbox
-	_, err = tx.Exec(ctx, `
-		UPDATE mailboxes 
-		SET highest_uid = $1 
-		WHERE id = $2
-	`, highestUID, destMailboxID)
+	if len(messageIDs) == 0 {
+		log.Printf("[DB] WARNING: no messages found to move from mailbox %d", srcMailboxID)
+		return messageUIDMap, nil
+	}
+
+	// Atomically increment highest_uid for the number of messages being moved.
+	var newHighestUID int64
+	numToMove := int64(len(messageIDs))
+	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToMove, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to update highest UID: %v", err)
 		return nil, consts.ErrDBUpdateFailed
 	}
 
-	// Move each message individually with its assigned UID
-	for i, messageID := range messageIDs {
-		newUID := newUIDs[i]
+	// Calculate the new UIDs for the moved messages.
+	var newUIDs []int64
+	startUID := newHighestUID - numToMove + 1
+	for i, sourceUID := range sourceUIDsForMap {
+		newUID := startUID + int64(i)
+		newUIDs = append(newUIDs, newUID)
+		messageUIDMap[sourceUID] = imap.UID(newUID)
+	}
 
-		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (
-				account_id,
-				s3_domain,
-				s3_localpart,
-				content_hash, 
-				uploaded,
-				message_id, 
-				in_reply_to, 
-				subject, 
-				sent_date, 
-				internal_date, 
-				flags, 
-				custom_flags,
-				size, 
-				body_structure, 
-				recipients_json,
-				mailbox_id, 
-				mailbox_path, 
-				flags_changed_at,
-				created_modseq,
-				uid
-			)
-			SELECT 
-				account_id,
-				s3_domain,
-				s3_localpart,
-				content_hash, 
-				uploaded,
-				message_id, 
-				in_reply_to, 
-				subject, 
-				sent_date, 
-				internal_date, 
-				flags, 
-				custom_flags,
-				size, 
-				body_structure, 
-				recipients_json,
-				$1 AS mailbox_id,  -- Assign to the new mailbox
-				mailbox_path, 
-				NOW() AS flags_changed_at,
-				nextval('messages_modseq'),
-				$2 -- Assign the new UID
-			FROM messages
-			WHERE id = $3 AND mailbox_id = $4
-		`, destMailboxID, newUID, messageID, srcMailboxID)
-
-		if err != nil {
-			log.Printf("[DB] ERROR: failed to insert message %d into destination mailbox: %v", messageID, err)
-			return nil, fmt.Errorf("failed to move message %d: %v", messageID, err)
-		}
+	// Batch insert the moved messages into the destination mailbox.
+	// This single query is much more efficient than inserting in a loop.
+	// It also fixes a bug where s3_domain, s3_localpart, and the correct
+	// mailbox_path were not being copied to the new message rows.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO messages (
+			account_id, content_hash, uploaded, message_id, in_reply_to, 
+			subject, sent_date, internal_date, flags, custom_flags, size, 
+			body_structure, recipients_json, s3_domain, s3_localpart, 
+			mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+		)
+		SELECT 
+			m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+			m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
+			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+			$1 AS mailbox_id,
+			$2 AS mailbox_path,
+			NOW() AS flags_changed_at,
+			nextval('messages_modseq'),
+			d.new_uid
+		FROM messages m
+		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+	`, destMailboxID, destMailbox.Name, messageIDs, newUIDs)
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to batch insert messages into destination mailbox: %v", err)
+		return nil, fmt.Errorf("failed to move messages: %w", err)
 	}
 
 	// Mark the original messages as expunged in the source mailbox

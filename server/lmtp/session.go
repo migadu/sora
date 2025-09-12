@@ -178,8 +178,12 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	var userId int64
-	row := s.backend.rdb.QueryRowWithRetry(readCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", lookupAddress)
-	err = row.Scan(&userId)
+	err = s.backend.rdb.QueryRowWithRetry(readCtx, `
+		SELECT c.account_id 
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, lookupAddress).Scan(&userId)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.Log("user not found for address: %s", lookupAddress)

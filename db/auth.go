@@ -260,7 +260,7 @@ func (db *Database) UpdatePassword(ctx context.Context, address string, newHashe
 	}
 
 	_, err := db.GetWritePool().Exec(ctx,
-		"UPDATE credentials SET password = $1 WHERE address = $2",
+		"UPDATE credentials SET password = $1 WHERE LOWER(address) = $2",
 		newHashedPassword, normalizedAddress)
 	if err != nil {
 		log.Printf("[DB] error updating password for address %s: %v", normalizedAddress, err)
@@ -278,8 +278,12 @@ func (db *Database) GetCredentialForAuth(ctx context.Context, address string) (a
 		return 0, "", errors.New("address cannot be empty")
 	}
 
-	row := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT account_id, password FROM credentials WHERE address = $1 AND (SELECT deleted_at FROM accounts WHERE id = credentials.account_id) IS NULL", normalizedAddress)
-	err = row.Scan(&accountID, &hashedPassword)
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT c.account_id, c.password
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, normalizedAddress).Scan(&accountID, &hashedPassword)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -305,7 +309,7 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 	}
 
 	// Query the credentials table for the account_id associated with the address
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT account_id FROM credentials WHERE address = $1", normalizedAddress).Scan(&accountID)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT account_id FROM credentials WHERE LOWER(address) = $1", normalizedAddress).Scan(&accountID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Identity (address) not found in the credentials table

@@ -48,8 +48,8 @@ func (d *Database) GetFailedAttemptsCount(ctx context.Context, ipAddress, userna
 	if username != "" {
 		usernameQuery := `
 			SELECT COUNT(*) 
-			FROM auth_attempts 
-			WHERE username = $1 AND success = false AND attempted_at > $2`
+			FROM auth_attempts
+			WHERE LOWER(username) = LOWER($1) AND success = false AND attempted_at > $2`
 
 		err = d.GetReadPool().QueryRow(ctx, usernameQuery, username, cutoffTime).Scan(&usernameCount)
 		if err != nil {
@@ -80,8 +80,8 @@ func (d *Database) GetFailedAttemptsCountSeparateWindows(ctx context.Context, ip
 		usernameCutoffTime := time.Now().Add(-usernameWindowDuration)
 		usernameQuery := `
 			SELECT COUNT(*) 
-			FROM auth_attempts 
-			WHERE username = $1 AND success = false AND attempted_at > $2`
+			FROM auth_attempts
+			WHERE LOWER(username) = LOWER($1) AND success = false AND attempted_at > $2`
 
 		err = d.GetReadPool().QueryRow(ctx, usernameQuery, username, usernameCutoffTime).Scan(&usernameCount)
 		if err != nil {
@@ -157,17 +157,17 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 		),
 		username_failures AS (
 			SELECT 
-				username,
+				LOWER(username) as lower_username,
 				COUNT(*) as failure_count,
 				MAX(attempted_at) as last_failure,
 				MIN(attempted_at) as first_failure
 			FROM auth_attempts 
 			WHERE 
-				success = false 
+				success = false
 				AND attempted_at >= NOW() - $3::interval
 				AND username IS NOT NULL 
 				AND username != ''
-			GROUP BY username
+			GROUP BY lower_username
 			HAVING COUNT(*) >= $4
 		)
 		SELECT 
@@ -181,11 +181,11 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 		UNION ALL
 		SELECT 
 			'username' as block_type,
-			username as identifier,
+			lower_username as identifier,
 			failure_count,
 			first_failure,
 			last_failure,
-			username
+			lower_username as username
 		FROM username_failures
 		ORDER BY last_failure DESC
 	`

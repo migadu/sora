@@ -50,35 +50,40 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to fetch destination mailbox '%s': %v", mboxName, err)
 	}
 
+	// Get the messages to determine their UIDs
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return nil, s.internalError("failed to retrieve messages for copy: %v", err)
 	}
 
-	var sourceUIDs imap.UIDSet
-	var destUIDs imap.UIDSet
-
 	if len(messages) == 0 {
 		return nil, nil
 	}
 
+	// Collect source UIDs
+	var sourceUIDs []imap.UID
 	for _, msg := range messages {
-		sourceUIDs.AddNum(msg.UID)
-		copiedUID, err := s.server.rdb.InsertMessageCopyWithRetry(s.ctx, msg.UID, msg.MailboxID, destMailbox.ID, destMailbox.Name)
-		if err != nil {
-			return nil, s.internalError("failed to insert copied message: %v", err)
-		}
-		destUIDs.AddNum(imap.UID(copiedUID))
+		sourceUIDs = append(sourceUIDs, msg.UID)
 	}
 
-	if len(sourceUIDs) == 0 || len(destUIDs) == 0 {
-		return nil, nil
+	// Perform the batch copy operation
+	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, userID)
+	if err != nil {
+		return nil, s.internalError("failed to copy messages: %v", err)
+	}
+
+	// The uidMap contains the mapping of original UIDs to new UIDs.
+	// We need to construct the UID sets for the response.
+	var sourceUIDSet, destUIDSet imap.UIDSet
+	for oldUID, newUID := range uidMap {
+		sourceUIDSet.AddNum(oldUID)
+		destUIDSet.AddNum(newUID)
 	}
 
 	copyData := &imap.CopyData{
 		UIDValidity: destMailbox.UIDValidity,
-		SourceUIDs:  sourceUIDs,
-		DestUIDs:    destUIDs,
+		SourceUIDs:  sourceUIDSet,
+		DestUIDs:    destUIDSet,
 	}
 
 	s.Log("[COPY] messages copied from %s to %s", selectedMailboxName, mboxName)

@@ -75,22 +75,29 @@ func (db *Database) GetScriptByName(ctx context.Context, name string, userID int
 }
 
 func (db *Database) CreateScript(ctx context.Context, userID int64, name, script string) (*SieveScript, error) {
-	var scriptID int64
-	err := db.GetWritePool().QueryRow(ctx, "INSERT INTO sieve_scripts (account_id, name, script) VALUES ($1, $2, $3) RETURNING id", userID, name, script).Scan(&scriptID)
+	var s SieveScript
+	err := db.GetWritePool().QueryRow(ctx, `
+		INSERT INTO sieve_scripts (account_id, name, script, active) 
+		VALUES ($1, $2, $3, false) 
+		RETURNING id, account_id, name, script, active, updated_at
+	`, userID, name, script).Scan(&s.ID, &s.UserID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-
-	return db.GetScript(ctx, scriptID, userID)
+	return &s, nil
 }
 
 func (db *Database) UpdateScript(ctx context.Context, scriptID, userID int64, name, script string) (*SieveScript, error) {
-	_, err := db.GetWritePool().Exec(ctx, "UPDATE sieve_scripts SET name = $1, script = $2 WHERE id = $3", name, script, scriptID)
+	var s SieveScript
+	err := db.GetWritePool().QueryRow(ctx, `
+		UPDATE sieve_scripts SET name = $1, script = $2, updated_at = now() 
+		WHERE id = $3 AND account_id = $4
+		RETURNING id, account_id, name, script, active, updated_at
+	`, name, script, scriptID, userID).Scan(&s.ID, &s.UserID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-
-	return db.GetScript(ctx, scriptID, userID)
+	return &s, nil
 }
 
 func (db *Database) DeleteScript(ctx context.Context, scriptID, userID int64) error {

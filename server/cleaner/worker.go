@@ -179,54 +179,55 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}
 
 	if len(candidates) > 0 {
-		log.Printf("[CLEANUP] found %d user-scoped objects for S3 cleanup", len(candidates))
+		log.Printf("[CLEANUP] found %d user-scoped object groups for S3 cleanup", len(candidates))
+
+		var successfulDeletes []db.UserScopedObjectForCleanup
+		var failedS3Keys []string
+
 		for _, candidate := range candidates {
 			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
-			log.Printf("[CLEANUP] deleting user-scoped object for account %d: %s", candidate.AccountID, s3Key)
-
-			cHash := candidate.ContentHash // Keep a local copy for logging
 			s3Err := w.s3.Delete(s3Key)
 
-			// Check if the error indicates the object was not found (HTTP 404)
 			isS3ObjectNotFoundError := false
 			var minioErr minio.ErrorResponse
 			if s3Err != nil && errors.As(s3Err, &minioErr) {
-				if minioErr.StatusCode == 404 {
-					isS3ObjectNotFoundError = true
-				}
+				isS3ObjectNotFoundError = (minioErr.StatusCode == 404)
 			}
 
-			// If S3 deletion failed AND it was NOT a 'not found' error, log and skip DB delete.
 			if s3Err != nil && !isS3ObjectNotFoundError {
 				log.Printf("[CLEANUP] failed to delete S3 object %s: %v", s3Key, s3Err)
+				failedS3Keys = append(failedS3Keys, s3Key)
 				continue // Skip to the next candidate
 			}
 
 			if isS3ObjectNotFoundError {
 				log.Printf("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", s3Key)
 			}
+			successfulDeletes = append(successfulDeletes, candidate)
+		}
 
-			if err := w.rdb.DeleteExpungedMessagesByS3KeyPartsWithRetry(ctx, candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash); err != nil {
-				// Log the error but continue processing other candidates.
-				// The advisory lock is held, so we don't want to block. The next run will pick it up.
-				log.Printf("[CLEANUP] failed to delete DB message rows for account %d and S3 key parts (%s/%s/%s): %v", candidate.AccountID, candidate.S3Domain, candidate.S3Localpart, cHash, err)
-				continue
+		if len(successfulDeletes) > 0 {
+			deletedCount, err := w.rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, successfulDeletes)
+			if err != nil {
+				log.Printf("[CLEANUP] failed to batch delete DB message rows: %v", err)
+			} else {
+				log.Printf("[CLEANUP] successfully cleaned up %d user-scoped message rows in the database.", deletedCount)
 			}
-
-			log.Printf("[CLEANUP] successfully cleaned up user-scoped resources for account %d and hash %s", candidate.AccountID, cHash)
 		}
 	} else {
 		log.Println("[CLEANUP] no user-scoped objects to clean up")
 	}
 
-	// --- Phase 2a: FTS Content cleanup (old message_contents) ---
+	// --- Phase 2a: FTS Body Pruning (for old messages) ---
 	if w.ftsRetention > 0 {
-		count, err := w.rdb.CleanupOldMessageContentsWithRetry(ctx, w.ftsRetention)
+		// This prunes the text_body of old messages to save space, but keeps the
+		// text_body_tsv so that full-text search on the body continues to work.
+		count, err := w.rdb.PruneOldMessageBodiesWithRetry(ctx, w.ftsRetention)
 		if err != nil {
-			log.Printf("[CLEANUP] failed to clean up old message contents: %v", err)
+			log.Printf("[CLEANUP] failed to prune old message bodies: %v", err)
 			// Continue with other cleanup tasks even if this fails
 		} else if count > 0 {
-			log.Printf("[CLEANUP] cleaned up %d old message_contents rows older than %v", count, w.ftsRetention)
+			log.Printf("[CLEANUP] pruned text_body for %d message contents older than %v", count, w.ftsRetention)
 		}
 	}
 
@@ -238,22 +239,21 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}
 
 	if len(orphanHashes) > 0 {
-		log.Printf("[CLEANUP] found %d orphaned content hashes for global cleanup", len(orphanHashes))
+		log.Printf("[CLEANUP] found %d orphaned content hashes for global cleanup.", len(orphanHashes))
+
+		// Batch delete from message_contents table
+		deletedCount, err := w.rdb.DeleteMessageContentsByHashBatchWithRetry(ctx, orphanHashes)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to batch delete from message_contents: %v. Will be retried on next run.", err)
+		} else if deletedCount > 0 {
+			log.Printf("[CLEANUP] deleted %d rows from message_contents.", deletedCount)
+		}
+
+		// Delete from local cache one by one. This is a local filesystem operation, so looping is fine.
 		for _, cHash := range orphanHashes {
-			log.Printf("[CLEANUP] cleaning up global resources for hash %s", cHash)
-
-			// Delete from message_contents table
-			if err := w.rdb.DeleteMessageContentByHashWithRetry(ctx, cHash); err != nil {
-				log.Printf("[CLEANUP] failed to delete from message_contents for hash %s: %v", cHash, err)
-				// Continue to next hash, as this might be a transient error.
-				// The next cleanup run will pick it up again.
-				continue
-			}
-
-			// Delete from local cache
 			if err := w.cache.Delete(cHash); err != nil {
 				// This is not critical, as the cache has its own TTL and eviction policies.
-				log.Printf("[CLEANUP] failed to delete from cache for hash %s: %v", cHash, err)
+				log.Printf("[CLEANUP] WARNING: failed to delete from cache for hash %s: %v", cHash, err)
 			}
 		}
 	} else {
@@ -271,10 +271,11 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	if len(danglingAccounts) > 0 {
 		log.Printf("[CLEANUP] found %d dangling accounts for final deletion", len(danglingAccounts))
-		for _, accountID := range danglingAccounts {
-			if err := w.rdb.FinalizeAccountDeletionWithRetry(ctx, accountID); err != nil {
-				log.Printf("[CLEANUP] failed to finalize deletion of account %d: %v", accountID, err)
-			}
+		deletedCount, err := w.rdb.FinalizeAccountDeletionsWithRetry(ctx, danglingAccounts)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to finalize deletion of account batch: %v", err)
+		} else if deletedCount > 0 {
+			log.Printf("[CLEANUP] finalized deletion of %d dangling accounts", deletedCount)
 		}
 	}
 

@@ -27,15 +27,21 @@ CREATE INDEX IF NOT EXISTS idx_server_affinity_last_server_addr ON server_affini
 CREATE TABLE IF NOT EXISTS credentials (
 	id BIGSERIAL PRIMARY KEY,
 	account_id BIGINT REFERENCES accounts(id),
-	address TEXT UNIQUE NOT NULL, 	
+	address TEXT NOT NULL,
 	password TEXT NOT NULL,
 	primary_identity BOOLEAN DEFAULT FALSE, -- Flag to indicate if this is the primary identity
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
 	updated_at TIMESTAMPTZ DEFAULT now() NOT NULL
 );
 
+-- Index for case-insensitive, unique address lookups.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_lower_address ON credentials (LOWER(address));
+
 -- Index to ensure that an account can have at most one primary identity.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_account_id_one_primary ON credentials (account_id) WHERE primary_identity IS TRUE;
+
+-- Index for faster lookups by account_id (e.g., listing all credentials for an account)
+CREATE INDEX IF NOT EXISTS idx_credentials_account_id ON credentials (account_id);
 
 CREATE TABLE IF NOT EXISTS mailboxes (
 	id BIGSERIAL PRIMARY KEY,	
@@ -56,8 +62,8 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_lower_name ON mailboxes (account_id, LO
 -- Index for faster mailbox lookups by account_id and subscription status
 CREATE INDEX IF NOT EXISTS idx_mailboxes_account_subscribed ON mailboxes (account_id, subscribed);
 
--- Index for efficient path-based hierarchy lookups
-CREATE INDEX IF NOT EXISTS idx_mailboxes_path ON mailboxes (path);
+-- Index for faster lookups by account_id (e.g., for account detail views)
+CREATE INDEX IF NOT EXISTS idx_mailboxes_account_id ON mailboxes (account_id);
 
 -- Index for path prefix searches (finding descendants)
 -- Composite index with account_id first to reduce search scope
@@ -66,13 +72,13 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_path_prefix ON mailboxes (account_id, p
 CREATE SEQUENCE IF NOT EXISTS messages_modseq;
 
 CREATE TABLE IF NOT EXISTS messages (
-	-- Unique message ID, also the UID of messages in a mailbox
+	-- Unique identifier for the message row in the database
 	id BIGSERIAL PRIMARY KEY,       
 
     -- The account who owns the message
 	account_id BIGINT REFERENCES accounts(id) ON DELETE RESTRICT, 
 
-	uid BIGINT NOT NULL,                -- The message UID in its mailbox
+	uid BIGINT NOT NULL,                -- The IMAP message UID within its mailbox
 	-- S3 key components, to ensure we can always find the object even if user email changes
 	s3_domain TEXT NOT NULL,
 	s3_localpart TEXT NOT NULL,
@@ -110,20 +116,31 @@ CREATE TABLE IF NOT EXISTS messages (
 	CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50) -- Limit to 50 custom flags
 );
 
+-- Index for faster lookups by account_id, supporting various cleanup and query operations
+CREATE INDEX IF NOT EXISTS idx_messages_account_id ON messages (account_id);
+
 -- Index for faster lookups by account_id and mailbox_id
 CREATE INDEX IF NOT EXISTS idx_messages_expunged_range ON messages (account_id, s3_domain, s3_localpart, content_hash, expunged_at) WHERE expunged_at IS NOT NULL;
 
--- Index to speed up message lookups by mailbox_id (for listing, searching)
-CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages (mailbox_id);
-
 CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages (content_hash);
 
--- Index for CleanupOldMessageContents: efficiently find the max sent_date per content_hash
-CREATE INDEX IF NOT EXISTS idx_messages_content_hash_sent_date ON messages (content_hash, sent_date);
-CREATE INDEX IF NOT EXISTS idx_messages_expunged_content_hash ON messages (content_hash) WHERE expunged_at IS NOT NULL;
+-- Index for faster lookups by content_hash and account_id (e.g., for upload worker)
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash_account_id ON messages (content_hash, account_id);
+
+-- Index for DeleteMessageByHashAndMailbox (importer --force-reimport)
+CREATE INDEX IF NOT EXISTS idx_messages_account_mailbox_hash ON messages (account_id, mailbox_id, content_hash);
 
 -- Index for CleanupFailedUploads: efficiently find old messages that were never uploaded.
 CREATE INDEX IF NOT EXISTS idx_messages_uploaded_created_at ON messages (created_at) WHERE uploaded = FALSE;
+
+-- Index for ExpungeOldMessages: efficiently find non-expunged messages by created_at
+CREATE INDEX IF NOT EXISTS idx_messages_expunged_null_created_at ON messages (created_at) WHERE expunged_at IS NULL;
+
+-- Index for GetUserScopedObjectsForCleanup: efficiently find uploaded, expunged messages by expunged_at and grouping fields
+CREATE INDEX IF NOT EXISTS idx_messages_cleanup_grouping ON messages (account_id, s3_domain, s3_localpart, content_hash, expunged_at) WHERE uploaded = TRUE AND expunged_at IS NOT NULL;
+
+-- Index to optimize the GROUP BY in GetUserScopedObjectsForCleanup, allowing for fast index-only scans to find candidate groups.
+CREATE INDEX IF NOT EXISTS idx_messages_s3_key_parts ON messages (account_id, s3_domain, s3_localpart, content_hash);
 
 -- Index to speed up message lookups by message_id
 CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (LOWER(message_id));
@@ -131,21 +148,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (LOWER(message_id
 -- Index to speed up message lookups by in_reply_to
 CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to ON messages (LOWER(in_reply_to));
 
--- Index to speed up message lookups by mailbox_id and uid
+-- Unique index to enforce UID uniqueness per mailbox and speed up lookups.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mailbox_id_uid ON messages (mailbox_id, uid);
-
--- Index to quickly search messages by internal_date (for date-based queries)
-CREATE INDEX IF NOT EXISTS idx_messages_internal_date ON messages (internal_date);
-CREATE INDEX IF NOT EXISTS idx_messages_sent_date ON messages (sent_date);
-CREATE INDEX IF NOT EXISTS idx_messages_flags_changed_at ON messages (flags_changed_at);
-CREATE INDEX IF NOT EXISTS idx_messages_expunged_at ON messages (expunged_at);
-
--- Index for flags to speed up searches for seen messages
-CREATE INDEX IF NOT EXISTS idx_messages_flag_seen ON messages ((flags & 1)) WHERE (flags & 1) != 0;
 
 -- Modseq index for fast lookups
 CREATE INDEX IF NOT EXISTS idx_messages_created_modseq ON messages (created_modseq);
 CREATE INDEX IF NOT EXISTS idx_messages_updated_modseq ON messages (updated_modseq);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_created_modseq ON messages (mailbox_id, created_modseq);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_updated_modseq ON messages (mailbox_id, updated_modseq);
 CREATE INDEX IF NOT EXISTS idx_messages_expunged_modseq ON messages (expunged_modseq);
 
 -- Index for PollMailbox: efficiently count non-expunged messages per mailbox
@@ -154,8 +164,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_expunged_at_is_null ON messag
 -- Index for PollMailbox: efficiently filter messages by mailbox_id and expunged_modseq
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_expunged_modseq ON messages (mailbox_id, expunged_modseq);
 
--- Index for GetUnusedContentHashes: efficiently find active messages for a given content hash
-CREATE INDEX IF NOT EXISTS idx_messages_content_hash_active ON messages (content_hash) WHERE expunged_at IS NULL;
+-- Index for PruneOldMessageBodies and GetUnusedContentHashes: efficiently find active messages for a given content hash.
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash_active_sent_date ON messages (content_hash, sent_date) WHERE expunged_at IS NULL;
 
 -- Index for faster searches on the subject field
 CREATE INDEX IF NOT EXISTS idx_messages_subject_trgm ON messages USING gin (LOWER(subject) gin_trgm_ops);
@@ -167,10 +177,23 @@ CREATE INDEX IF NOT EXISTS idx_messages_custom_flags ON messages USING GIN (cust
 -- This index uses the jsonb_path_ops for efficient querying
 CREATE INDEX IF NOT EXISTS idx_messages_recipients_json ON messages USING GIN (recipients_json jsonb_path_ops);
 
+-- For fast flag-only searches (common IMAP operations like SEARCH UNSEEN)
+-- This index on the expression `(flags & 1)` allows for fast filtering on the \Seen flag (for both SEEN and UNSEEN searches).
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_seen_flag_uid ON messages (mailbox_id, (flags & 1), uid) WHERE expunged_at IS NULL;
+
+-- For date range searches (SEARCH SINCE, SEARCH BEFORE)
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_dates_uid ON messages (mailbox_id, internal_date, sent_date, uid) WHERE expunged_at IS NULL;
+
+-- For size-based searches (SEARCH LARGER, SEARCH SMALLER)  
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_size_uid ON messages (mailbox_id, size, uid) WHERE expunged_at IS NULL;
+
+-- Compound index for mailbox + multiple common search fields
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_common_search ON messages (mailbox_id, (flags & 1), internal_date, size, uid) WHERE expunged_at IS NULL;
+
 -- Table to store message bodies, separated for performance
 CREATE TABLE IF NOT EXISTS message_contents (
 	content_hash VARCHAR(64) PRIMARY KEY, -- This is the same content_hash as in the messages table
-	text_body TEXT NOT NULL, 			  -- Text body of the message
+	text_body TEXT, 			  		  -- Text body of the message, can be NULL for old messages to save space
 	text_body_tsv tsvector,			   	  -- Full-text search index for text_body
 	headers TEXT DEFAULT '' NOT NULL,     -- Raw message headers
 	headers_tsv tsvector,			      -- Full-text search index for headers
@@ -179,6 +202,9 @@ CREATE TABLE IF NOT EXISTS message_contents (
 	-- No direct FK to messages.id. The link is implicit:
 	-- messages.content_hash = message_contents.content_hash
 );
+
+-- Index for PruneOldMessageBodies: efficiently find rows that have not been pruned yet.
+CREATE INDEX IF NOT EXISTS idx_message_contents_text_body_not_null ON message_contents (content_hash) WHERE text_body IS NOT NULL;
 
 -- Index for full-text search on the text_body field in message_contents
 CREATE INDEX IF NOT EXISTS idx_message_contents_text_body_tsv ON message_contents USING GIN (text_body_tsv);
@@ -198,20 +224,11 @@ CREATE TABLE IF NOT EXISTS pending_uploads (
 	UNIQUE (content_hash, account_id)
 );
 
--- Index for retry loop: ordered by creation time
-CREATE INDEX IF NOT EXISTS idx_pending_uploads_created_at ON pending_uploads (created_at);
-
 -- Index to support the primary query in ListPendingUploads
 CREATE INDEX IF NOT EXISTS idx_pending_uploads_instance_id_created_at ON pending_uploads (instance_id, created_at);
 
 -- Index for retry attempts (if you ever query by attempt count or want to exclude "too many attempts")
 CREATE INDEX IF NOT EXISTS idx_pending_uploads_attempts ON pending_uploads (attempts);
-
--- Index to quickly check retries by file age
-CREATE INDEX IF NOT EXISTS idx_pending_uploads_last_attempt ON pending_uploads (last_attempt);
-
--- Index on content_hash to speed up lookups for file deletion checks
-CREATE INDEX IF NOT EXISTS idx_pending_uploads_content_hash ON pending_uploads (content_hash);
 
 --
 -- SIEVE scripts
@@ -261,14 +278,11 @@ CREATE TABLE IF NOT EXISTS auth_attempts (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Indexes for efficient rate limiting queries
-CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip_time ON auth_attempts (ip_address, attempted_at);
-CREATE INDEX IF NOT EXISTS idx_auth_attempts_username_time ON auth_attempts (username, attempted_at) WHERE username IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_auth_attempts_cleanup ON auth_attempts (attempted_at);
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_cleanup ON auth_attempts (attempted_at); -- For cleaning up old rows
 
 -- Partial indexes for failed attempts only (most common rate limiting case)
 CREATE INDEX IF NOT EXISTS idx_auth_attempts_ip_failed ON auth_attempts (ip_address, attempted_at) WHERE success = false;
-CREATE INDEX IF NOT EXISTS idx_auth_attempts_username_failed ON auth_attempts (username, attempted_at) WHERE success = false AND username IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_username_lower_failed ON auth_attempts (LOWER(username), attempted_at) WHERE success = false AND username IS NOT NULL;
 
 -- Table-based locks for coordinating background workers
 CREATE TABLE IF NOT EXISTS locks (
@@ -301,6 +315,9 @@ CREATE INDEX IF NOT EXISTS idx_active_connections_account_id ON active_connectio
 -- Index for faster lookups by server_addr
 CREATE INDEX IF NOT EXISTS idx_active_connections_server_addr ON active_connections (server_addr);
 
+-- Index for GetTerminatedConnectionsByInstance: efficiently find connections to terminate.
+CREATE INDEX IF NOT EXISTS idx_active_connections_term_instance ON active_connections (instance_id) WHERE should_terminate = true;
+
 -- Index for cleanup of stale connections
 CREATE INDEX IF NOT EXISTS idx_active_connections_last_activity ON active_connections (last_activity);
 
@@ -330,9 +347,6 @@ CREATE INDEX IF NOT EXISTS idx_health_status_status ON health_status (status);
 -- Index for faster health status cleanup by updated_at
 CREATE INDEX IF NOT EXISTS idx_health_status_updated_at ON health_status (updated_at);
 
--- Index for faster health status lookups by component and server
-CREATE INDEX IF NOT EXISTS idx_health_status_component_server ON health_status (component_name, server_hostname);
-
 -- Cache metrics tracking for hit/miss ratios per instance
 CREATE TABLE IF NOT EXISTS cache_metrics (
     instance_id VARCHAR(255) NOT NULL,
@@ -345,12 +359,6 @@ CREATE TABLE IF NOT EXISTS cache_metrics (
     recorded_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     PRIMARY KEY (instance_id, server_hostname, recorded_at)
 );
-
--- Index for faster cache metrics lookups by instance
-CREATE INDEX IF NOT EXISTS idx_cache_metrics_instance ON cache_metrics (instance_id);
-
--- Index for faster cache metrics lookups by server
-CREATE INDEX IF NOT EXISTS idx_cache_metrics_server ON cache_metrics (server_hostname);
 
 -- Index for faster cache metrics cleanup by recorded_at
 CREATE INDEX IF NOT EXISTS idx_cache_metrics_recorded_at ON cache_metrics (recorded_at);

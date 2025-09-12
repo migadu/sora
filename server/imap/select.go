@@ -141,9 +141,6 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 
-	s.Log("[SELECT] mailbox '%s' (ID: %d) NumMessages=%d HighestModSeqForPolling=%d UIDNext=%d UIDValidity=%d ReportedHighestModSeq=%d NumRecentCalculated=%d FirstUnseenSeq=%d",
-		mboxName, mailbox.ID, s.currentNumMessages.Load(), s.currentHighestModSeq.Load(), currentSummary.UIDNext, s.selectedMailbox.UIDValidity, currentSummary.HighestModSeq, numRecent, s.firstUnseenSeqNum.Load())
-
 	// Track domain and user command activity
 	if s.IMAPUser != nil {
 		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "SELECT")

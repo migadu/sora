@@ -56,7 +56,7 @@ func (db *Database) UpdateConnectionActivity(ctx context.Context, accountID int6
 	query := `
 		UPDATE active_connections
 		SET last_activity = now()
-		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3`
+		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
 	result, err := db.GetWritePool().Exec(ctx, query, accountID, protocol, clientAddr)
 	if err != nil {
@@ -74,7 +74,7 @@ func (db *Database) UpdateConnectionActivity(ctx context.Context, accountID int6
 func (db *Database) UnregisterConnection(ctx context.Context, accountID int64, protocol, clientAddr string) error {
 	query := `
 		DELETE FROM active_connections
-		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3`
+		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
 	_, err := db.GetWritePool().Exec(ctx, query, accountID, protocol, clientAddr)
 	if err != nil {
@@ -129,7 +129,7 @@ func (db *Database) BatchUpdateConnections(ctx context.Context, connections []Co
 	query := `
 		UPDATE active_connections
 		SET last_activity = now(), should_terminate = $4
-		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3`
+		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
 	for _, conn := range connections {
 		batch.Queue(query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ShouldTerminate)
@@ -220,68 +220,24 @@ func (db *Database) GetActiveConnections(ctx context.Context) ([]ConnectionInfo,
 
 // GetConnectionStats retrieves aggregated connection statistics
 func (db *Database) GetConnectionStats(ctx context.Context) (*ConnectionStats, error) {
-	// Get total count
-	var totalCount int64
-	countQuery := `SELECT COUNT(*) FROM active_connections`
-	err := db.GetReadPool().QueryRow(ctx, countQuery).Scan(&totalCount)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get total connection count: %w", err)
-	}
-
-	// Get counts by protocol
-	protocolQuery := `
-		SELECT protocol, COUNT(*) as count
-		FROM active_connections
-		GROUP BY protocol`
-
-	protocolRows, err := db.GetReadPool().Query(ctx, protocolQuery)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get protocol counts: %w", err)
-	}
-	defer protocolRows.Close()
-
-	protocolMap := make(map[string]int64)
-	for protocolRows.Next() {
-		var protocol string
-		var count int64
-		err := protocolRows.Scan(&protocol, &count)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan protocol count: %w", err)
-		}
-		protocolMap[protocol] = count
-	}
-
-	// Get counts by server
-	serverQuery := `
-		SELECT server_addr, COUNT(*) as count
-		FROM active_connections
-		GROUP BY server_addr`
-
-	serverRows, err := db.GetReadPool().Query(ctx, serverQuery)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get server counts: %w", err)
-	}
-	defer serverRows.Close()
-
-	serverMap := make(map[string]int64)
-	for serverRows.Next() {
-		var serverAddr string
-		var count int64
-		err := serverRows.Scan(&serverAddr, &count)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan server count: %w", err)
-		}
-		serverMap[serverAddr] = count
-	}
-
 	// Get all connection details
 	connections, err := db.GetActiveConnections(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	// Derive all stats from the single list of connections.
+	// This is more efficient than running multiple separate aggregate queries.
+	protocolMap := make(map[string]int64)
+	serverMap := make(map[string]int64)
+
+	for _, conn := range connections {
+		protocolMap[conn.Protocol]++
+		serverMap[conn.ServerAddr]++
+	}
+
 	stats := &ConnectionStats{
-		TotalConnections:      totalCount,
+		TotalConnections:      int64(len(connections)),
 		ConnectionsByProtocol: protocolMap,
 		ConnectionsByServer:   serverMap,
 		Users:                 connections,
@@ -371,14 +327,7 @@ func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria 
 		return 0, fmt.Errorf("failed to mark connections for termination: %w", err)
 	}
 
-	rowsAffected := result.RowsAffected()
-	if rowsAffected > 0 {
-		log.Printf("[ConnectionKicker] Marked %d connection(s) for termination with criteria: %+v", rowsAffected, criteria)
-	} else {
-		log.Printf("[ConnectionKicker] No connections found matching criteria: %+v", criteria)
-	}
-
-	return rowsAffected, nil
+	return result.RowsAffected(), nil
 }
 
 // CheckConnectionTermination checks if a specific connection should be terminated
@@ -386,7 +335,7 @@ func (db *Database) CheckConnectionTermination(ctx context.Context, accountID in
 	query := `
 		SELECT should_terminate
 		FROM active_connections
-		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3`
+		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
 	var shouldTerminate bool
 	err := db.GetReadPool().QueryRow(ctx, query, accountID, protocol, clientAddr).Scan(&shouldTerminate)

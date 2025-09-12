@@ -47,11 +47,12 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	criteria = s.decodeSearchCriteria(criteria)
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
-		s.Log("[SEARCH] skipping UID SEARCH because mailbox is empty")
-		return &imap.SearchData{
-			All:   imap.UIDSet{},
-			Count: 0,
-		}, nil
+		s.Log("[SEARCH] skipping SEARCH because mailbox is empty")
+		if numKind == imapserver.NumKindUID {
+			return &imap.SearchData{All: imap.UIDSet{}, Count: 0}, nil
+		} else {
+			return &imap.SearchData{All: imap.SeqSet{}, Count: 0}, nil
+		}
 	}
 
 	// Database operations outside of lock
@@ -85,7 +86,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					uids.AddNum(msg.UID)
 					// Use our snapshot of sessionTracker which is thread-safe
 					if sessionTrackerSnapshot != nil {
-						seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
+						seqNums.AddNum(encodedSeq)
 					} else {
 						// Fallback to just using the sequence number if session tracker isn't available
 						seqNums.AddNum(msg.Seq)
@@ -95,6 +97,15 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					searchData.All = uids
 				} else {
 					searchData.All = seqNums
+				}
+			} else {
+				// When client explicitly requests ALL, we must provide empty sets
+				if options.ReturnAll {
+					if numKind == imapserver.NumKindUID {
+						searchData.All = imap.UIDSet{}
+					} else {
+						searchData.All = imap.SeqSet{}
+					}
 				}
 			}
 			// When empty, go-imap will output "ESEARCH (TAG ...) UID" without ALL
@@ -117,7 +128,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
 					if sessionTrackerSnapshot != nil {
-						seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
+						seqNums.AddNum(encodedSeq)
 					} else {
 						seqNums.AddNum(msg.Seq)
 					}
@@ -127,27 +139,39 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				} else {
 					searchData.All = seqNums
 				}
+			} else {
+				// For default ESEARCH behavior, we should provide ALL even when empty
+				if numKind == imapserver.NumKindUID {
+					searchData.All = imap.UIDSet{}
+				} else {
+					searchData.All = imap.SeqSet{}
+				}
 			}
 		}
 	} else { // Standard SEARCH command (options == nil)
 		s.Log("[SEARCH] Standard SEARCH, returning ALL and COUNT.")
-		var uids imap.UIDSet
-		var seqNums imap.SeqSet
-		for _, msg := range messages {
-			uids.AddNum(msg.UID)
-			// Use our snapshot of sessionTracker which is thread-safe
-			if sessionTrackerSnapshot != nil {
-				seqNums.AddNum(sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
-			} else {
-				// Fallback to just using the sequence number if session tracker isn't available
-				seqNums.AddNum(msg.Seq)
+		// Only populate the 'All' field if there are results, as the imap
+		// library can have issues encoding an empty (but non-nil) NumSet.
+		if len(messages) > 0 {
+			var uids imap.UIDSet
+			var seqNums imap.SeqSet
+			for _, msg := range messages {
+				uids.AddNum(msg.UID)
+				// Use our snapshot of sessionTracker which is thread-safe
+				if sessionTrackerSnapshot != nil {
+					encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
+					seqNums.AddNum(encodedSeq)
+				} else {
+					// Fallback to just using the sequence number if session tracker isn't available
+					seqNums.AddNum(msg.Seq)
+				}
 			}
-		}
 
-		if numKind == imapserver.NumKindUID {
-			searchData.All = uids
-		} else {
-			searchData.All = seqNums
+			if numKind == imapserver.NumKindUID {
+				searchData.All = uids
+			} else {
+				searchData.All = seqNums
+			}
 		}
 	}
 

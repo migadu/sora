@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 )
 
 func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Message, error) {
@@ -25,24 +24,21 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 		return nil, fmt.Errorf("failed to count messages: %v", err)
 	}
 
-	log.Printf("[DB] mailbox %d has %d total messages, %d expunged, %d active",
-		mailboxID, totalCount, expungedCount, totalCount-expungedCount)
-
 	// Now query only the non-expunged messages
 	query := `
 		WITH numbered_messages AS (
 			SELECT
 				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
 				flags_changed_at, subject, sent_date, message_id,
 				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM messages m
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		)
 		SELECT 
 			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id
+			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 		FROM numbered_messages
 		ORDER BY uid` // Ordering by uid is fine, seqnum is derived based on id order
 
@@ -55,6 +51,5 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 		return nil, fmt.Errorf("ListMessages: failed to scan messages: %w", err)
 	}
 
-	log.Printf("[DB] returning %d messages for mailbox %d", len(messages), mailboxID)
 	return messages, nil
 }

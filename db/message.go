@@ -15,26 +15,28 @@ import (
 
 // Message struct to represent an email message
 type Message struct {
-	ID             int64     // ID of the message
-	UserID         int64     // ID of the user who owns the message
-	UID            imap.UID  // Unique identifier for the message
-	ContentHash    string    // Hash of the message content
-	S3Domain       string    // S3 domain for the message
-	S3Localpart    string    // S3 localpart for the message
-	MailboxID      int64     // ID of the mailbox the message belongs to
-	IsUploaded     bool      // Indicates if the message is uploaded to S3
-	Seq            uint32    // Sequence number of the message in the mailbox
-	BitwiseFlags   int       // Bitwise flags for the message (e.g., \Seen, \Flagged)
-	CustomFlags    []string  // Custom flags for the message
+	ID             int64      // ID of the message
+	UserID         int64      // ID of the user who owns the message
+	UID            imap.UID   // Unique identifier for the message
+	ContentHash    string     // Hash of the message content
+	S3Domain       string     // S3 domain for the message
+	S3Localpart    string     // S3 localpart for the message
+	MailboxID      int64      // ID of the mailbox the message belongs to
+	IsUploaded     bool       // Indicates if the message is uploaded to S3
+	Seq            uint32     // Sequence number of the message in the mailbox
+	BitwiseFlags   int        // Bitwise flags for the message (e.g., \Seen, \Flagged)
+	CustomFlags    []string   // Custom flags for the message
 	FlagsChangedAt *time.Time // Time when the flags were last changed
-	Subject        string    // Subject of the message
-	InternalDate   time.Time // The internal date the message was received
-	SentDate       time.Time // The date the message was sent
-	Size           int       // Size of the message in bytes
-	MessageID      string    // Unique Message-ID from the message headers
+	Subject        string     // Subject of the message
+	InternalDate   time.Time  // The internal date the message was received
+	SentDate       time.Time  // The date the message was sent
+	Size           int        // Size of the message in bytes
+	MessageID      string     // Unique Message-ID from the message headers
 	BodyStructure  imap.BodyStructure
 	CreatedModSeq  int64
 	UpdatedModSeq  *int64
+	InReplyTo      string
+	RecipientsJSON []byte
 	ExpungedModSeq *int64
 }
 
@@ -145,16 +147,16 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			WITH numbered_messages AS (
 				SELECT
 					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-					internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+					internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
 					flags_changed_at, subject, sent_date, message_id,
 					row_number() OVER (ORDER BY uid) AS seqnum
-				FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM messages m
+				WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 			)
 			SELECT 
 				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-				flags_changed_at, subject, sent_date, message_id
+				flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 			FROM numbered_messages
 			WHERE uid >= $2
 		`
@@ -205,16 +207,16 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 			WITH numbered_messages AS (
 				SELECT
 					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-					internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+					internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
 					flags_changed_at, subject, sent_date, message_id,
 					row_number() OVER (ORDER BY uid) AS seqnum
-				FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM messages m
+				WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 			)
 			SELECT 
 				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-				flags_changed_at, subject, sent_date, message_id
+				flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 			FROM numbered_messages
 			WHERE seqnum >= $2 AND seqnum <= $3
 			ORDER BY seqnum
@@ -241,16 +243,16 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 		WITH numbered_messages AS (
 			SELECT
 				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
 				flags_changed_at, subject, sent_date, message_id,
 				row_number() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			FROM messages m
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		)
 		SELECT 
 			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id
+			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 		FROM numbered_messages
 		ORDER BY seqnum
 	`
@@ -269,22 +271,24 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		var msg Message
 		var bodyStructureBytes []byte
 		var customFlagsJSON []byte
+		var recipientsJSON []byte
 
 		if err := rows.Scan(&msg.ID, &msg.UserID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
 			&msg.S3Domain, &msg.S3Localpart, &msg.IsUploaded, &msg.BitwiseFlags, &customFlagsJSON,
 			&msg.InternalDate, &msg.Size, &bodyStructureBytes, &msg.CreatedModSeq, &msg.UpdatedModSeq,
-			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID); err != nil {
+			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID,
+			&msg.InReplyTo, &recipientsJSON); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %v", err)
 		}
 		var bodyStructure *imap.BodyStructure
-		
+
 		// Always attempt to deserialize, but fall back to default on any error
 		if len(bodyStructureBytes) > 0 {
 			if bs, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes); err == nil {
 				bodyStructure = bs
 			}
 		}
-		
+
 		// If deserialization failed or data was empty, create a safe default
 		if bodyStructure == nil {
 			log.Printf("[DB] WARNING: UID %d has invalid or empty body_structure, using default", msg.UID)
@@ -299,6 +303,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
 			log.Printf("[DB] ERROR: failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))
 		}
+		msg.RecipientsJSON = recipientsJSON
 		msg.BodyStructure = *bodyStructure
 		messages = append(messages, msg)
 	}
@@ -320,16 +325,16 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 		WITH numbered_messages AS (
 			SELECT
 				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq,
+				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
 				flags_changed_at, subject, sent_date, message_id,
 				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND (flags & $2) != 0 AND expunged_at IS NULL
+			FROM messages m
+			WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
 		)
 		SELECT 
 			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
 			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id
+			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 		FROM numbered_messages
 	`, mailboxID, bitwiseFlag)
 	if err != nil {

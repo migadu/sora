@@ -16,107 +16,97 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-func (d *Database) InsertMessageCopy(ctx context.Context, srcMessageUID imap.UID, srcMailboxID int64, destMailboxID int64, destMailboxName string) (imap.UID, error) {
-	tx, err := d.BeginTx(ctx)
+// CopyMessages copies multiple messages from a source mailbox to a destination mailbox in a single transaction.
+// It returns a map of old UIDs to new UIDs. It is analogous to MoveMessages but does not expunge the source.
+func (db *Database) CopyMessages(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
+	messageUIDMap := make(map[imap.UID]imap.UID)
+	if srcMailboxID == destMailboxID {
+		return nil, fmt.Errorf("source and destination mailboxes cannot be the same")
+	}
+
+	destMailbox, err := db.GetMailbox(ctx, destMailboxID, userID)
 	if err != nil {
-		log.Printf("[DB] failed to begin transaction: %v", err)
-		return 0, consts.ErrDBBeginTransactionFailed
+		return nil, consts.ErrMailboxNotFound
+	}
+
+	tx, err := db.BeginTx(ctx)
+	if err != nil {
+		return nil, consts.ErrDBBeginTransactionFailed
 	}
 	defer tx.Rollback(ctx)
 
-	// Lock the message row for update
-	_, err = tx.Exec(ctx, `
-		SELECT FROM 
-			messages 
-		WHERE 
-			uid = $1 AND
-			mailbox_id = $2
-		FOR UPDATE;`, srcMessageUID, srcMailboxID)
+	// Get the source message IDs and UIDs
+	rows, err := tx.Query(ctx, `SELECT id, uid FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
-		log.Printf("[DB] failed to lock message row: %v", err)
-		return 0, consts.ErrDBQueryFailed
+		return nil, consts.ErrInternalError
 	}
+	defer rows.Close()
 
-	var highestUID int64
-	// Lock the mailbox row for update
-	err = tx.QueryRow(ctx, `
-		SELECT 
-			highest_uid 
-		FROM 
-			mailboxes 
-		WHERE 
-			id = $1 
-		FOR UPDATE;`, destMailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to fetch highest UID: %v", err)
-		return 0, consts.ErrDBQueryFailed
-	}
-
-	// Update the highest UID
-	err = tx.QueryRow(ctx, `
-		UPDATE 
-			mailboxes 
-		SET 
-			highest_uid = highest_uid + 1 
-		WHERE 
-			id = $1 
-		RETURNING highest_uid`, destMailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to update highest UID: %v", err)
-		return 0, consts.ErrDBUpdateFailed
-	}
-
-	// Log the destination mailbox name for debugging
-	log.Printf("[DB] copying message to mailbox '%s'", destMailboxName)
-
-	// Get the updated_modseq of the source message to use for the created_modseq of the copy
-	var srcUpdatedModSeq int64 // This variable is fetched but not directly used for created_modseq in the INSERT below.
-	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(updated_modseq, created_modseq) 
-		FROM messages 
-		WHERE mailbox_id = $1 AND uid = $2
-	`, srcMailboxID, srcMessageUID).Scan(&srcUpdatedModSeq)
-	if err != nil {
-		log.Printf("[DB] failed to get source message modseq: %v", err)
-		return 0, consts.ErrDBQueryFailed
-	}
-
-	var newMsgUID imap.UID
-	err = tx.QueryRow(ctx, `
-		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, content_hash, s3_domain, s3_localpart, message_id, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, created_modseq)
-		SELECT
-			account_id, $1, $2, $3, content_hash, s3_domain, s3_localpart, message_id, flags | $6, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, uploaded, recipients_json, nextval('messages_modseq')
-		FROM
-			messages
-		WHERE
-			mailbox_id = $4 AND
-			uid = $5
-		RETURNING uid
-	`, destMailboxID, destMailboxName, highestUID, srcMailboxID, srcMessageUID, FlagRecent).Scan(&newMsgUID)
-
-	// TODO: this should not be a fatal error
-	if err != nil {
-		// If unique constraint violation, return an error
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
-			log.Print("[DB] message with same id already exists in mailbox")
-			return 0, consts.ErrDBUniqueViolation
+	var messageIDs []int64
+	var sourceUIDsForMap []imap.UID
+	for rows.Next() {
+		var messageID int64
+		var sourceUID imap.UID
+		if err := rows.Scan(&messageID, &sourceUID); err != nil {
+			return nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
-		log.Printf("[DB] failed to insert message into database: %v", err)
-		return 0, consts.ErrDBInsertFailed
+		messageIDs = append(messageIDs, messageID)
+		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating through source messages: %w", err)
 	}
 
-	// No explicit copy into message_contents is needed here.
-	// Since content_hash is the same, the entry in message_contents (if it exists for this hash)
-	// would have been created by the original InsertMessage (or a previous copy)
-	// due to the ON CONFLICT (content_hash) DO NOTHING clause in InsertMessage.
+	if len(messageIDs) == 0 {
+		return messageUIDMap, nil // No messages to copy
+	}
+
+	// Atomically increment highest_uid for the number of messages being copied.
+	var newHighestUID int64
+	numToCopy := int64(len(messageIDs))
+	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToCopy, destMailboxID).Scan(&newHighestUID)
+	if err != nil {
+		return nil, consts.ErrDBUpdateFailed
+	}
+
+	// Calculate the new UIDs for the copied messages.
+	var newUIDs []int64
+	startUID := newHighestUID - numToCopy + 1
+	for i, sourceUID := range sourceUIDsForMap {
+		newUID := startUID + int64(i)
+		newUIDs = append(newUIDs, newUID)
+		messageUIDMap[sourceUID] = imap.UID(newUID)
+	}
+
+	// Batch insert the copied messages
+	_, err = tx.Exec(ctx, `
+		INSERT INTO messages (
+			account_id, content_hash, uploaded, message_id, in_reply_to, 
+			subject, sent_date, internal_date, flags, custom_flags, size, 
+			body_structure, recipients_json, s3_domain, s3_localpart, 
+			mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+		)
+		SELECT 
+			m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+			m.subject, m.sent_date, m.internal_date, m.flags | $5, m.custom_flags, m.size,
+			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+			$1 AS mailbox_id,
+			$2 AS mailbox_path,
+			NOW() AS flags_changed_at,
+			nextval('messages_modseq'),
+			d.new_uid
+		FROM messages m
+		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+	`, destMailboxID, destMailbox.Name, messageIDs, newUIDs, FlagRecent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to batch copy messages: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] failed to commit transaction: %v", err)
-		return 0, consts.ErrDBCommitTransactionFailed
+		return nil, consts.ErrDBCommitTransactionFailed
 	}
 
-	return newMsgUID, nil
+	return messageUIDMap, nil
 }
 
 type InsertMessageOptions struct {
@@ -169,15 +159,7 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	defer tx.Rollback(ctx)
 
 	var highestUID int64
-
-	// Lock mailbox and get current UID
-	err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to fetch highest UID: %v", err)
-		return 0, 0, consts.ErrDBQueryFailed
-	}
-
-	// Bump UID
+	// Atomically increment and get the new highest UID for the mailbox.
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 	if err != nil {
 		log.Printf("[DB] failed to update highest UID: %v", err)
@@ -272,29 +254,23 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
-	// Insert into message_contents, using the message's content_hash as the key.
-	// If a message_contents entry for this content_hash already exists, do nothing.
-	// This handles deduplication of text_body for messages with identical content_hash.
-	// Skip FTS storage if message is older than retention period
-	shouldStoreFTS := true
-	if options.FTSRetention > 0 {
-		threshold := time.Now().Add(-options.FTSRetention)
-		if options.SentDate.Before(threshold) {
-			shouldStoreFTS = false
-			log.Printf("[DB] skipping FTS storage for old message (sent: %v, retention: %v)", options.SentDate, options.FTSRetention)
-		}
+	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
+	// We always store headers for FTS. For the body, if the message is older than the FTS
+	// retention period, we store NULL to save space but still generate the TSV for searching.
+	var textBodyArg any = sanePlaintextBody
+	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+		textBodyArg = nil
 	}
 
-	if shouldStoreFTS {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-			VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
-			ON CONFLICT (content_hash) DO NOTHING
-		`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
-		if err != nil {
-			log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
-			return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
-		}
+	// For old messages, textBodyArg is NULL, but sanePlaintextBody is used for TSV generation.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
+		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
+		ON CONFLICT (content_hash) DO NOTHING
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, options.RawHeaders)
+	if err != nil {
+		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -372,14 +348,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 			}
 		}
 	} else {
-		// Lock mailbox and get current UID
-		err = tx.QueryRow(ctx, `SELECT highest_uid FROM mailboxes WHERE id = $1 FOR UPDATE;`, options.MailboxID).Scan(&highestUID)
-		if err != nil {
-			log.Printf("[DB] failed to fetch highest UID: %v", err)
-			return 0, 0, consts.ErrDBQueryFailed
-		}
-
-		// Bump UID
+		// Atomically increment and get the new highest UID for the mailbox.
+		// The UPDATE statement implicitly locks the row, making a prior SELECT FOR UPDATE redundant.
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
 			log.Printf("[DB] failed to update highest UID: %v", err)
@@ -476,29 +446,23 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
-	// Insert into message_contents, using the message's content_hash as the key.
-	// If a message_contents entry for this content_hash already exists, do nothing.
-	// This handles deduplication of text_body for messages with identical content_hash.
-	// Skip FTS storage if message is older than retention period
-	shouldStoreFTS := true
-	if options.FTSRetention > 0 {
-		threshold := time.Now().Add(-options.FTSRetention)
-		if options.SentDate.Before(threshold) {
-			shouldStoreFTS = false
-			log.Printf("[DB] skipping FTS storage for old message (sent: %v, retention: %v)", options.SentDate, options.FTSRetention)
-		}
+	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
+	// We always store headers for FTS. For the body, if the message is older than the FTS
+	// retention period, we store NULL to save space but still generate the TSV for searching.
+	var textBodyArg interface{} = sanePlaintextBody
+	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+		textBodyArg = nil
 	}
 
-	if shouldStoreFTS {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-			VALUES ($1, $2, to_tsvector('simple', $2), $3, to_tsvector('simple', $3))
-			ON CONFLICT (content_hash) DO NOTHING
-		`, options.ContentHash, sanePlaintextBody, options.RawHeaders)
-		if err != nil {
-			log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
-			return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
-		}
+	// For old messages, textBodyArg is NULL, but sanePlaintextBody is used for TSV generation.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
+		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
+		ON CONFLICT (content_hash) DO NOTHING
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, options.RawHeaders)
+	if err != nil {
+		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
 	if err := tx.Commit(ctx); err != nil {
