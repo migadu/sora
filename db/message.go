@@ -26,7 +26,7 @@ type Message struct {
 	Seq            uint32    // Sequence number of the message in the mailbox
 	BitwiseFlags   int       // Bitwise flags for the message (e.g., \Seen, \Flagged)
 	CustomFlags    []string  // Custom flags for the message
-	FlagsChangedAt time.Time // Time when the flags were last changed
+	FlagsChangedAt *time.Time // Time when the flags were last changed
 	Subject        string    // Subject of the message
 	InternalDate   time.Time // The internal date the message was received
 	SentDate       time.Time // The date the message was sent
@@ -276,9 +276,25 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %v", err)
 		}
-		bodyStructure, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize BodyStructure: %v", err)
+		var bodyStructure *imap.BodyStructure
+		
+		// Always attempt to deserialize, but fall back to default on any error
+		if len(bodyStructureBytes) > 0 {
+			if bs, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes); err == nil {
+				bodyStructure = bs
+			}
+		}
+		
+		// If deserialization failed or data was empty, create a safe default
+		if bodyStructure == nil {
+			log.Printf("[DB] WARNING: UID %d has invalid or empty body_structure, using default", msg.UID)
+			defaultBS := &imap.BodyStructureSinglePart{
+				Type:    "text",
+				Subtype: "plain",
+				Size:    uint32(msg.Size), // Use the actual message size
+			}
+			var bs imap.BodyStructure = defaultBS
+			bodyStructure = &bs
 		}
 		if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
 			log.Printf("[DB] ERROR: failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))

@@ -65,7 +65,7 @@ type ResilientDatabase struct {
 	writeBreaker *circuitbreaker.CircuitBreaker
 }
 
-func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig) (*ResilientDatabase, error) {
+func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
 	// Create circuit breakers
 	querySettings := circuitbreaker.DefaultSettings("database_query")
 	querySettings.MaxRequests = 5
@@ -92,7 +92,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig) (*
 	}
 
 	// Create failover manager
-	failoverManager, err := newRuntimeFailoverManager(ctx, config)
+	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create failover manager: %w", err)
 	}
@@ -103,8 +103,10 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig) (*
 		writeBreaker:    circuitbreaker.NewCircuitBreaker(writeSettings),
 	}
 
-	// Start background health checking
-	go rdb.startRuntimeHealthChecking(ctx)
+	// Start background health checking if enabled
+	if enableHealthCheck {
+		go rdb.startRuntimeHealthChecking(ctx)
+	}
 
 	return rdb, nil
 }
@@ -1951,8 +1953,8 @@ func (rd *ResilientDatabase) AddCredentialWithRetry(ctx context.Context, req db.
 	}, adminRetryConfig)
 }
 
-func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email string) ([]*db.CredentialDetails, error) {
-	var credentials []*db.CredentialDetails
+func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email string) ([]db.Credential, error) {
+	var credentials []db.Credential
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
 			return rd.getOperationalDatabase().ListCredentials(ctx, email)
@@ -1964,7 +1966,7 @@ func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email
 			return cbErr
 		}
 		if result != nil {
-			credentials = result.([]*db.CredentialDetails)
+			credentials = result.([]db.Credential)
 		} else {
 			credentials = nil
 		}
@@ -2052,7 +2054,12 @@ func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.A
 			return cbErr
 		}
 		if result != nil {
-			accounts = result.([]*db.AccountSummary)
+			// Convert []AccountSummary to []*AccountSummary
+			summaries := result.([]db.AccountSummary)
+			accounts = make([]*db.AccountSummary, len(summaries))
+			for i := range summaries {
+				accounts[i] = &summaries[i]
+			}
 		} else {
 			accounts = nil
 		}
@@ -2441,7 +2448,7 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 // --- Runtime Failover Implementation ---
 
 // newRuntimeFailoverManager creates a new runtime failover manager with separate read/write pools
-func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfig) (*RuntimeFailoverManager, error) {
+func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfig, runMigrations bool) (*RuntimeFailoverManager, error) {
 	manager := &RuntimeFailoverManager{
 		writePools:      make([]*DatabasePool, 0),
 		readPools:       make([]*DatabasePool, 0),
@@ -2452,7 +2459,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// Create database pools for all write hosts
 	if config.Write != nil && len(config.Write.Hosts) > 0 {
 		for i, host := range config.Write.Hosts {
-			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write")
+			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write", runMigrations)
 			if err != nil {
 				log.Printf("[RESILIENT-FAILOVER] Failed to create write pool for host %s: %v", host, err)
 				continue
@@ -2476,7 +2483,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// Create database pools for all read hosts
 	if config.Read != nil && len(config.Read.Hosts) > 0 {
 		for i, host := range config.Read.Hosts {
-			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read")
+			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", runMigrations)
 			if err != nil {
 				log.Printf("[RESILIENT-FAILOVER] Failed to create read pool for host %s: %v", host, err)
 				continue
@@ -2514,7 +2521,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 }
 
 // createDatabasePool creates a single database connection pool
-func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string) (*db.Database, error) {
+func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool) (*db.Database, error) {
 	// Create a temporary config for this single host
 	tempConfig := &config.DatabaseConfig{
 		LogQueries: logQueries,
@@ -2532,7 +2539,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 		},
 	}
 
-	database, err := db.NewDatabaseFromConfig(ctx, tempConfig)
+	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s database pool for %s: %w", poolType, host, err)
 	}

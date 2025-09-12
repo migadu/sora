@@ -518,7 +518,7 @@ func main() {
 	// Initialize the resilient database with runtime failover
 	log.Printf("Connecting to database with resilient failover configuration")
 
-	resilientDB, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	resilientDB, err := resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 	if err != nil {
 		log.Printf("Failed to initialize resilient database: %v", err)
 		os.Exit(1)

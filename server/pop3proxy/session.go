@@ -554,7 +554,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 			return false
 		}
 		if shouldTerminate {
-			log.Printf("[POP3 Proxy] Connection marked for termination, disconnecting: %s", s.username)
+			log.Printf("[POP3 Proxy] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.username, s.RemoteIP, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return true

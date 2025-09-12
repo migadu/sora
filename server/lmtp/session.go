@@ -178,7 +178,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	var userId int64
-	row := s.backend.rdb.QueryRowWithRetry(readCtx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", lookupAddress)
+	row := s.backend.rdb.QueryRowWithRetry(readCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", lookupAddress)
 	err = row.Scan(&userId)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

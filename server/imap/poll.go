@@ -138,7 +138,14 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, nil)
 	}
 
+	// Store sessionTracker reference before releasing lock to avoid race condition
+	sessionTracker := s.sessionTracker
 	release() // Release lock before writing to the network
 
-	return s.sessionTracker.Poll(w, allowExpunge)
+	// Check if sessionTracker is still valid after releasing lock
+	if sessionTracker == nil {
+		return nil
+	}
+
+	return sessionTracker.Poll(w, allowExpunge)
 }

@@ -89,6 +89,14 @@ type IMAPServerOptions struct {
 }
 
 func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
+	// Validate required dependencies
+	if s3 == nil {
+		return nil, fmt.Errorf("S3 storage is required for IMAP server")
+	}
+	if rdb == nil {
+		return nil, fmt.Errorf("database is required for IMAP server")
+	}
+	
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
 	if options.ProxyProtocol.Enabled {
@@ -117,6 +125,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 		appCtx:             appCtx,
 		addr:               imapAddr,
 		rdb:                rdb,
+		s3:                 s3,
 		uploader:           uploadWorker,
 		cache:              cache,
 		appendLimit:        options.AppendLimit,

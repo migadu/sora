@@ -622,7 +622,7 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -707,7 +707,7 @@ func listConnections(cfg AdminConfig, userEmail, protocol, instanceID string) er
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -889,7 +889,7 @@ func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAdd
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -995,7 +995,7 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password string, mak
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1193,7 +1193,7 @@ func deleteAccount(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1211,7 +1211,7 @@ func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, ha
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1293,7 +1293,7 @@ func listCredentials(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1391,7 +1391,7 @@ func deleteCredential(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1462,7 +1462,7 @@ func listAccounts(cfg AdminConfig) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1634,7 +1634,7 @@ func restoreAccount(cfg AdminConfig, email string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1652,7 +1652,7 @@ func showAccount(cfg AdminConfig, email string, jsonOutput bool) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1773,7 +1773,7 @@ func showCredential(cfg AdminConfig, email string, jsonOutput bool) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -1974,7 +1974,7 @@ Examples:
 
 	// Connect to resilient database
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -2149,7 +2149,7 @@ Examples:
 
 	// Connect to resilient database
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -2320,7 +2320,7 @@ func showCacheStats(cfg AdminConfig) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -2391,7 +2391,7 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -2482,7 +2482,7 @@ Examples:
 func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error {
 	// Connect to database
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -2651,7 +2651,7 @@ func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanu
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -2839,7 +2839,7 @@ Examples:
 	ctx := context.Background()
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database, false, false)
 	if err != nil {
 		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -2994,7 +2994,7 @@ Examples:
 
 	// Connect to resilient database
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		log.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -3398,7 +3398,7 @@ Examples:
 func showCacheMetrics(cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
 	// Connect to database
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

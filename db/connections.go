@@ -34,9 +34,9 @@ type ConnectionStats struct {
 // RegisterConnection registers a new active connection
 func (db *Database) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
 	query := `
-		INSERT INTO active_connections (account_id, protocol, client_addr, server_addr, instance_id)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (account_id, protocol, client_addr)
+		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
+		VALUES ($1, false, $2, $3, $4, $5)
+		ON CONFLICT (account_id, is_prelookup_account, protocol, client_addr)
 		DO UPDATE SET server_addr = EXCLUDED.server_addr,
 		              instance_id = EXCLUDED.instance_id,
 		              last_activity = now()
@@ -92,9 +92,9 @@ func (db *Database) BatchRegisterConnections(ctx context.Context, connections []
 
 	batch := &pgx.Batch{}
 	query := `
-		INSERT INTO active_connections (account_id, protocol, client_addr, server_addr, instance_id)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (account_id, protocol, client_addr)
+		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
+		VALUES ($1, false, $2, $3, $4, $5)
+		ON CONFLICT (account_id, is_prelookup_account, protocol, client_addr)
 		DO UPDATE SET server_addr = EXCLUDED.server_addr,
 		              instance_id = EXCLUDED.instance_id,
 		              last_activity = now()`
@@ -344,7 +344,7 @@ func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria 
 
 	if criteria.Email != "" {
 		argCount++
-		query += fmt.Sprintf(" AND account_id IN (SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($%d) AND deleted_at IS NULL)", argCount)
+		query += fmt.Sprintf(" AND account_id IN (SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE LOWER(c.address) = LOWER($%d) AND a.deleted_at IS NULL)", argCount)
 		args = append(args, criteria.Email)
 	}
 
@@ -371,7 +371,14 @@ func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria 
 		return 0, fmt.Errorf("failed to mark connections for termination: %w", err)
 	}
 
-	return result.RowsAffected(), nil
+	rowsAffected := result.RowsAffected()
+	if rowsAffected > 0 {
+		log.Printf("[ConnectionKicker] Marked %d connection(s) for termination with criteria: %+v", rowsAffected, criteria)
+	} else {
+		log.Printf("[ConnectionKicker] No connections found matching criteria: %+v", criteria)
+	}
+
+	return rowsAffected, nil
 }
 
 // CheckConnectionTermination checks if a specific connection should be terminated

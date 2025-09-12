@@ -250,7 +250,7 @@ func (s *Session) handleRecipient(to string) error {
 
 	// 2. Fallback to main DB to get account ID for affinity
 	s.isPrelookupAccount = false
-	row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT account_id FROM credentials WHERE address = $1 AND deleted_at IS NULL", s.username)
+	row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
 	if err := row.Scan(&s.accountID); err != nil {
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
@@ -536,7 +536,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			return false
 		}
 		if shouldTerminate {
-			log.Printf("[LMTP Proxy] Connection marked for termination, disconnecting: %s", s.username)
+			log.Printf("[LMTP Proxy] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.username, clientAddr, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return true

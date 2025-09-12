@@ -71,10 +71,10 @@ type DatabasePoolConfig struct {
 
 // NewDatabase initializes a new SQL database connection using default pool settings.
 func NewDatabase(ctx context.Context, host, port, user, password, dbname string, tlsMode bool, logQueries bool) (*Database, error) {
-	return NewDatabaseWithPoolConfig(ctx, host, port, user, password, dbname, tlsMode, logQueries, nil)
+	return NewDatabaseWithPoolConfig(ctx, host, port, user, password, dbname, tlsMode, logQueries, nil, true)
 }
 
-func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, dbname string, tlsMode bool, logQueries bool, poolConfig *DatabasePoolConfig) (*Database, error) {
+func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, dbname string, tlsMode bool, logQueries bool, poolConfig *DatabasePoolConfig, runMigrations bool) (*Database, error) {
 	sslMode := "disable"
 	if tlsMode {
 		sslMode = "require"
@@ -116,8 +116,10 @@ func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, 
 		ReadPool:  dbPool, // Default to same pool if no read/write split
 	}
 
-	if err := db.migrate(ctx); err != nil {
-		return nil, err
+	if runMigrations {
+		if err := db.migrate(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	return db, nil
@@ -354,7 +356,7 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 }
 
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
-func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig) (*Database, error) {
+func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
 	if dbConfig.Write == nil {
 		return nil, fmt.Errorf("write database configuration is required")
 	}
@@ -390,9 +392,11 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig)
 		ReadFailover:  readFailover,
 	}
 
-	if err := db.migrate(ctx); err != nil {
-		db.Close()
-		return nil, err
+	if runMigrations {
+		if err := db.migrate(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 
 	return db, nil

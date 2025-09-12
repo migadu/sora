@@ -534,7 +534,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			return false
 		}
 		if shouldTerminate {
-			log.Printf("[ManageSieve Proxy] Connection marked for termination, disconnecting: %s", s.username)
+			log.Printf("[ManageSieve Proxy] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.username, clientAddr, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return true
