@@ -253,13 +253,13 @@ func NeedsRehash(hash string) bool {
 }
 
 // UpdatePassword updates the stored password for a user
-func (db *Database) UpdatePassword(ctx context.Context, address string, newHashedPassword string) error {
+func (db *Database) UpdatePassword(ctx context.Context, tx pgx.Tx, address string, newHashedPassword string) error {
 	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
 	if normalizedAddress == "" {
 		return errors.New("address cannot be empty")
 	}
 
-	_, err := db.GetWritePool().Exec(ctx,
+	_, err := tx.Exec(ctx,
 		"UPDATE credentials SET password = $1 WHERE LOWER(address) = $2",
 		newHashedPassword, normalizedAddress)
 	if err != nil {

@@ -145,19 +145,12 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 	return &mailbox, nil
 }
 
-func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
 		log.Printf("[DB] ERROR: attempted to create mailbox with invalid characters: %q for user %d", name, userID)
 		return consts.ErrMailboxInvalidName
 	}
-
-	// Start a transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
 	// Avoid low uid_validity which may cause issues with some IMAP clients
 	uidValidity := uint32(time.Now().Unix())
@@ -180,7 +173,7 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 
 	// Insert the mailbox
 	var mailboxID int64
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
 		VALUES ($1, $2, $3, $4, '')
 		RETURNING id
@@ -214,15 +207,10 @@ func (db *Database) CreateMailbox(ctx context.Context, userID int64, name string
 		return fmt.Errorf("failed to update mailbox path: %w", err)
 	}
 
-	// Commit the transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
 	return nil
 }
 
-func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name string, parentID *int64) error {
+func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
 		log.Printf("[DB] ERROR: attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
@@ -230,12 +218,6 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 	}
 
 	// Start a transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	uidValidity := uint32(time.Now().Unix())
 
 	// Determine the parent path if parentID is provided
@@ -253,7 +235,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 
 	// Try to insert the mailbox into the database
 	var mailboxID int64
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
 		VALUES ($1, $2, $3, $4, '')
 		ON CONFLICT (account_id, name) DO NOTHING
@@ -292,7 +274,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 	if mailboxID > 0 {
 		// Update the path
 		mailboxPath := helpers.GetMailboxPath(parentPath, mailboxID)
-		_, err = tx.Exec(ctx, `
+		_, err := tx.Exec(ctx, `
 			UPDATE mailboxes SET path = $1 WHERE id = $2 AND (path = '' OR path IS NULL)
 		`, mailboxPath, mailboxID)
 
@@ -301,28 +283,21 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, userID int64, name
 		}
 	}
 
-	// Commit the transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
 	return nil
 }
 
 // DeleteMailbox deletes a mailbox for a specific user by id
-func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID int64) error {
-	mbox, err := db.GetMailbox(ctx, mailboxID, userID)
+func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64) error {
+	// The resilient wrapper will fetch the mailbox path before calling this.
+	// For now, we need to fetch it inside the transaction.
+	var mboxPath string
+	err := tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxPath)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to fetch mailbox %d: %v", mailboxID, err)
-		return consts.ErrMailboxNotFound
+		if err == pgx.ErrNoRows {
+			return consts.ErrMailboxNotFound
+		}
+		return fmt.Errorf("failed to fetch mailbox path for deletion: %w", err)
 	}
-
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
-		return consts.ErrInternalError
-	}
-	defer tx.Rollback(ctx) // Ensure the transaction is rolled back if an error occurs
 
 	// Before deleting the mailboxes, update all messages within them (the one
 	// being deleted and all its children) to preserve their mailbox path.
@@ -335,7 +310,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 		WHERE m.mailbox_id = mb.id
 		  AND mb.account_id = $1
 		  AND (mb.id = $2 OR mb.path LIKE $3 || '%')
-	`, userID, mailboxID, mbox.Path)
+	`, userID, mailboxID, mboxPath)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
@@ -345,7 +320,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 	result, err := tx.Exec(ctx, `
 		DELETE FROM mailboxes 
 		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '%')
-	`, userID, mailboxID, mbox.Path)
+	`, userID, mailboxID, mboxPath)
 
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to delete mailbox %d and its children: %v", mailboxID, err)
@@ -358,21 +333,10 @@ func (db *Database) DeleteMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrInternalError
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] ERROR: failed to commit transaction: %v\n", err)
-		return consts.ErrInternalError
-	}
-
 	return nil
 }
 
-func (db *Database) CreateDefaultMailboxes(ctx context.Context, userId int64) error {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction for creating default mailboxes: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, userId int64) error {
 	for _, mailboxName := range consts.DefaultMailboxes {
 		var mailboxID int64
 		uidValidity := uint32(time.Now().UnixNano())
@@ -398,7 +362,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, userId int64) er
 			return fmt.Errorf("failed to update path for default mailbox '%s': %w", mailboxName, err)
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 type MailboxSummary struct {
@@ -493,24 +457,20 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 }
 
 // SetSubscribed updates the subscription status of a mailbox, but ignores unsubscribing for root folders.
-func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, userID int64, subscribed bool) error {
+func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64, subscribed bool) error {
 	// Update the subscription status only if the mailbox is not a root folder
-	mailbox, err := db.GetMailbox(ctx, mailboxID, userID)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to fetch mailbox %d: %v", mailboxID, err)
-		return consts.ErrMailboxNotFound
-	}
-	// Check if this is a root folder based on path length (8 chars = root)
-	if len(mailbox.Path) == 8 {
+	var mboxName string
+	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxName)
+	if err == nil {
 		for _, rootFolder := range consts.DefaultMailboxes {
-			if strings.EqualFold(mailbox.Name, rootFolder) {
-				log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mailbox.Name)
+			if strings.EqualFold(mboxName, rootFolder) {
+				log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mboxName)
 				return nil
 			}
 		}
 	}
 
-	_, err = db.GetWritePool().Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2
 	`, subscribed, mailboxID)
 	if err != nil {
@@ -520,7 +480,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, mailboxID int64, u
 	return nil
 }
 
-func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID int64, newName string, newParentID *int64) error {
+func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64, newName string, newParentID *int64) error {
 	if newName == "" {
 		return consts.ErrMailboxInvalidName
 	}
@@ -531,16 +491,9 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID i
 		return consts.ErrMailboxInvalidName
 	}
 
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to begin transaction for rename: %v", err)
-		return consts.ErrDBBeginTransactionFailed
-	}
-	defer tx.Rollback(ctx)
-
 	// Check if the new name already exists within the same transaction to prevent race conditions.
 	var existingID int64
-	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
+	err := tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists
@@ -632,12 +585,6 @@ func (db *Database) RenameMailbox(ctx context.Context, mailboxID int64, userID i
 		if err != nil {
 			return fmt.Errorf("failed to update child mailboxes: %w", err)
 		}
-	}
-
-	// Commit the transaction
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] ERROR: failed to commit transaction for rename: %v", err)
-		return consts.ErrDBCommitTransactionFailed
 	}
 
 	return nil

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const CLEANUP_LOCK_NAME = "cleanup_worker"
@@ -19,12 +21,12 @@ type UserScopedObjectForCleanup struct {
 	S3Localpart string
 }
 
-func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
+func (d *Database) AcquireCleanupLock(ctx context.Context, tx pgx.Tx) (bool, error) {
 	// Try to acquire lock by inserting a row, or updating if expired
 	now := time.Now().UTC()
 	expiresAt := now.Add(LOCK_TIMEOUT)
 
-	result, err := d.GetWritePool().Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		INSERT INTO locks (lock_name, acquired_at, expires_at) 
 		VALUES ($1, $2, $3)
 		ON CONFLICT (lock_name) DO UPDATE SET
@@ -41,16 +43,17 @@ func (d *Database) AcquireCleanupLock(ctx context.Context) (bool, error) {
 	return result.RowsAffected() > 0, nil
 }
 
-func (d *Database) ReleaseCleanupLock(ctx context.Context) {
-	_, _ = d.GetWritePool().Exec(ctx, `DELETE FROM locks WHERE lock_name = $1`, CLEANUP_LOCK_NAME)
+func (d *Database) ReleaseCleanupLock(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `DELETE FROM locks WHERE lock_name = $1`, CLEANUP_LOCK_NAME)
+	return err
 }
 
 // ExpungeOldMessages marks messages older than the specified duration as expunged
 // This enables automatic cleanup of old messages based on age restriction
-func (d *Database) ExpungeOldMessages(ctx context.Context, olderThan time.Duration) (int64, error) {
+func (d *Database) ExpungeOldMessages(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
 
-	result, err := d.GetWritePool().Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE messages
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
 		WHERE created_at < $1 AND expunged_at IS NULL
@@ -83,19 +86,17 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 	for rows.Next() {
 		var candidate UserScopedObjectForCleanup
 		if err := rows.Scan(&candidate.AccountID, &candidate.S3Domain, &candidate.S3Localpart, &candidate.ContentHash); err != nil {
-			// Log and continue to process other rows
-			log.Printf("failed to scan user-scoped object for cleanup: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to scan user-scoped object for cleanup: %w", err)
 		}
 		result = append(result, candidate)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // DeleteExpungedMessagesByS3KeyPartsBatch deletes all expunged message rows
 // from the database that match the given batches of S3 key components.
 // It does NOT delete from message_contents, as the content may be shared.
-func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, candidates []UserScopedObjectForCleanup) (int64, error) {
+func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, tx pgx.Tx, candidates []UserScopedObjectForCleanup) (int64, error) {
 	if len(candidates) == 0 {
 		return 0, nil
 	}
@@ -112,7 +113,7 @@ func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, 
 		contentHashes[i] = c.ContentHash
 	}
 
-	tag, err := d.GetWritePool().Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM messages m
 		USING unnest($1::bigint[], $2::text[], $3::text[], $4::text[]) AS d(account_id, s3_domain, s3_localpart, content_hash)
 		WHERE m.account_id = d.account_id
@@ -131,8 +132,8 @@ func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, 
 // the given AccountID, MailboxID, and ContentHash. This is a hard delete used
 // by the importer for the --force-reimport option.
 // It returns the number of messages deleted.
-func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, accountID int64, mailboxID int64, contentHash string) (int64, error) {
-	tag, err := d.GetWritePool().Exec(ctx, `
+func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx, accountID int64, mailboxID int64, contentHash string) (int64, error) {
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM messages
 		WHERE account_id = $1 AND mailbox_id = $2 AND content_hash = $3
 	`, accountID, mailboxID, contentHash)
@@ -144,11 +145,11 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, accountID 
 
 // DeleteMessageContentsByHashBatch deletes multiple rows from the message_contents table.
 // This should only be called after confirming the hashes are no longer in use by any message.
-func (d *Database) DeleteMessageContentsByHashBatch(ctx context.Context, contentHashes []string) (int64, error) {
+func (d *Database) DeleteMessageContentsByHashBatch(ctx context.Context, tx pgx.Tx, contentHashes []string) (int64, error) {
 	if len(contentHashes) == 0 {
 		return 0, nil
 	}
-	tag, err := d.GetWritePool().Exec(ctx, `DELETE FROM message_contents WHERE content_hash = ANY($1)`, contentHashes)
+	tag, err := tx.Exec(ctx, `DELETE FROM message_contents WHERE content_hash = ANY($1)`, contentHashes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete from message_contents: %w", err)
 	}
@@ -158,7 +159,7 @@ func (d *Database) DeleteMessageContentsByHashBatch(ctx context.Context, content
 // CleanupFailedUploads deletes message rows and their corresponding pending_uploads
 // that are older than the grace period and were never successfully uploaded to S3.
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
-func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePeriod time.Duration) (int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
 	// This single query uses a Common Table Expression (CTE) to perform both deletions
@@ -181,7 +182,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Du
 	`
 
 	var deletedCount int64
-	err := d.GetWritePool().QueryRow(ctx, query, threshold).Scan(&deletedCount)
+	err := tx.QueryRow(ctx, query, threshold).Scan(&deletedCount)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
 	}
@@ -192,7 +193,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, gracePeriod time.Du
 // PruneOldMessageBodies sets the text_body to NULL for message contents
 // where all associated non-expunged messages are older than the given retention period.
 // This saves storage while preserving the text_body_tsv for full-text search.
-func (d *Database) PruneOldMessageBodies(ctx context.Context, retention time.Duration) (int64, error) {
+func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
 	// This query is optimized to use a NOT EXISTS clause, which is generally more
 	// efficient than a subquery with GROUP BY and MAX(). It finds content hashes
 	// that have not been pruned yet (text_body IS NOT NULL) and for which no
@@ -214,7 +215,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, retention time.Dur
 			  )
 		)
 	`
-	tag, err := d.GetWritePool().Exec(ctx, query, retention)
+	tag, err := tx.Exec(ctx, query, retention)
 	if err != nil {
 		return 0, fmt.Errorf("failed to prune old message bodies: %w", err)
 	}
@@ -243,21 +244,20 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 	for rows.Next() {
 		var contentHash string
 		if err := rows.Scan(&contentHash); err != nil {
-			log.Printf("failed to scan unused content hash: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to scan unused content hash: %w", err)
 		}
 		result = append(result, contentHash)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // CleanupSoftDeletedAccounts permanently deletes accounts that have been soft-deleted
 // for longer than the grace period
-func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, tx pgx.Tx, gracePeriod time.Duration) (int64, error) {
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
 	// Get accounts that have been soft-deleted longer than the grace period
-	rows, err := d.GetReadPool().Query(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT id 
 		FROM accounts 
 		WHERE deleted_at IS NOT NULL AND deleted_at < $1
@@ -273,20 +273,22 @@ func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, gracePeriod t
 	for rows.Next() {
 		var accountID int64
 		if err := rows.Scan(&accountID); err != nil {
-			log.Printf("failed to scan account ID: %v", err)
-			continue
+			return 0, fmt.Errorf("failed to scan account ID for cleanup: %w", err)
 		}
 		accountsToDelete = append(accountsToDelete, accountID)
 	}
 
-	rows.Close() // Close rows before proceeding
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("error iterating soft-deleted accounts: %w", err)
+	}
 
 	if len(accountsToDelete) == 0 {
 		return 0, nil
 	}
 
 	// Perform the first stage of deletion in a single batch transaction
-	if err := d.HardDeleteAccounts(ctx, accountsToDelete); err != nil {
+	if err := d.HardDeleteAccounts(ctx, tx, accountsToDelete); err != nil {
 		// If the batch fails, we can't be sure which accounts were processed.
 		// Log the error and return. The next run will pick them up.
 		log.Printf("failed to hard delete account batch: %v", err)
@@ -305,16 +307,10 @@ func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, gracePeriod t
 // HardDeleteAccounts performs the first stage of permanent deletion for a batch of accounts.
 // It expunges all their messages and deletes associated data like mailboxes, sieve scripts, etc.
 // It does NOT delete the account or credential rows themselves, as they are needed for S3 cleanup.
-func (d *Database) HardDeleteAccounts(ctx context.Context, accountIDs []int64) error {
+func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	if len(accountIDs) == 0 {
 		return nil
 	}
-
-	tx, err := d.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction for batch account deletion: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
 	// Use = ANY($1) for efficient batch operations
 	batchOps := []struct {
@@ -337,7 +333,7 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, accountIDs []int64) e
 
 	// Mark all messages for the deleted accounts as expunged.
 	// This signals the next phase of the cleanup worker to remove the S3 objects.
-	_, err = tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		UPDATE messages 
 		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
 		WHERE account_id = ANY($1) AND expunged_at IS NULL
@@ -346,7 +342,7 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, accountIDs []int64) e
 		return fmt.Errorf("failed to expunge messages for batch deletion: %w", err)
 	}
 
-	return tx.Commit(ctx)
+	return nil
 }
 
 // GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
@@ -369,30 +365,22 @@ func (d *Database) GetDanglingAccountsForFinalDeletion(ctx context.Context, limi
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			// Log and continue to process other rows
-			log.Printf("failed to scan dangling account id: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to scan dangling account id: %w", err)
 		}
 		accountIDs = append(accountIDs, id)
 	}
-	return accountIDs, nil
+	return accountIDs, rows.Err()
 }
 
 // FinalizeAccountDeletions permanently deletes a batch of accounts and their credentials.
 // This should only be called on dangling accounts that have no other dependencies.
-func (d *Database) FinalizeAccountDeletions(ctx context.Context, accountIDs []int64) (int64, error) {
+func (d *Database) FinalizeAccountDeletions(ctx context.Context, tx pgx.Tx, accountIDs []int64) (int64, error) {
 	if len(accountIDs) == 0 {
 		return 0, nil
 	}
 
-	tx, err := d.BeginTx(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction for final account deletion batch: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	// First, delete credentials associated with the accounts.
-	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", accountIDs)
+	_, err := tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", accountIDs)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete credentials during finalization: %w", err)
 	}
@@ -404,17 +392,16 @@ func (d *Database) FinalizeAccountDeletions(ctx context.Context, accountIDs []in
 		return 0, fmt.Errorf("failed to finalize batch deletion of accounts: %w", err)
 	}
 
-	err = tx.Commit(ctx)
-	return result.RowsAffected(), err
+	return result.RowsAffected(), nil
 }
 
 // CleanupOldAuthAttempts removes authentication attempts older than the specified duration
-func (d *Database) CleanupOldAuthAttempts(ctx context.Context, maxAge time.Duration) (int64, error) {
+func (d *Database) CleanupOldAuthAttempts(ctx context.Context, tx pgx.Tx, maxAge time.Duration) (int64, error) {
 	cutoffTime := time.Now().Add(-maxAge)
 
 	query := `DELETE FROM auth_attempts WHERE attempted_at < $1`
 
-	result, err := d.GetWritePool().Exec(ctx, query, cutoffTime)
+	result, err := tx.Exec(ctx, query, cutoffTime)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup old auth attempts: %w", err)
 	}
@@ -426,12 +413,12 @@ func (d *Database) CleanupOldAuthAttempts(ctx context.Context, maxAge time.Durat
 // CleanupOldHealthStatuses removes health status records that haven't been updated
 // for longer than the specified retention period. This is useful for removing
 // records of decommissioned servers.
-func (d *Database) CleanupOldHealthStatuses(ctx context.Context, retention time.Duration) (int64, error) {
+func (d *Database) CleanupOldHealthStatuses(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
 	cutoffTime := time.Now().Add(-retention)
 
 	query := `DELETE FROM health_status WHERE updated_at < $1`
 
-	result, err := d.GetWritePool().Exec(ctx, query, cutoffTime)
+	result, err := tx.Exec(ctx, query, cutoffTime)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup old health statuses: %w", err)
 	}

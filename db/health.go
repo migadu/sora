@@ -41,7 +41,7 @@ type SystemHealthOverview struct {
 }
 
 // StoreHealthStatus stores or updates the health status for a component
-func (db *Database) StoreHealthStatus(ctx context.Context, hostname string, componentName string, status ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]interface{}) error {
+func (db *Database) StoreHealthStatus(ctx context.Context, tx pgx.Tx, hostname string, componentName string, status ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]interface{}) error {
 	var errorStr *string
 	if lastError != nil {
 		errStr := lastError.Error()
@@ -73,7 +73,7 @@ func (db *Database) StoreHealthStatus(ctx context.Context, hostname string, comp
 			updated_at = EXCLUDED.updated_at
 	`
 
-	_, err := db.WritePool.Exec(ctx, query,
+	_, err := tx.Exec(ctx, query,
 		componentName,
 		hostname,
 		string(status),

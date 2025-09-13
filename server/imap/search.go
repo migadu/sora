@@ -55,9 +55,12 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
-	// Database operations outside of lock
+	// The configured search_timeout is now automatically applied by the resilient DB layer.
 	messages, err := s.server.rdb.GetMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria)
 	if err != nil {
+		// The resilient layer already logs retry attempts. We just log the final error.
+		s.Log("[SEARCH] final error after retries: %v", err)
+		s.classifyAndTrackError("SEARCH", err, nil)
 		return nil, s.internalError("failed to search messages: %v", err)
 	}
 

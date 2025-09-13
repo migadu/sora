@@ -15,11 +15,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
-	"golang.org/x/crypto/bcrypt"
-
-	"github.com/migadu/sora/config"
 )
 
 // PreLookupConfig is an alias for config.PreLookupConfig for compatibility
@@ -61,7 +60,6 @@ type cacheEntry struct {
 type PreLookupClient struct {
 	pool            *pgxpool.Pool
 	query           string
-	authMethod      string
 	cacheTTL        time.Duration
 	cache           map[string]*cacheEntry
 	cacheMutex      sync.RWMutex
@@ -110,11 +108,6 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	query := config.Query
 	if query == "" {
 		return nil, errors.New("prelookup query is not configured")
-	}
-
-	authMethod := config.AuthMethod
-	if authMethod == "" {
-		authMethod = "bcrypt" // Default to bcrypt
 	}
 
 	// Handle TLS settings for prelookup-routed connections
@@ -205,7 +198,6 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	client := &PreLookupClient{
 		pool:            pool,
 		query:           query,
-		authMethod:      authMethod,
 		cacheTTL:        cacheTTL,
 		cache:           make(map[string]*cacheEntry),
 		fallbackMode:    config.FallbackDefault,
@@ -216,7 +208,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	}
 
 	// Log the configuration for debugging
-	log.Printf("[PreLookup] Initialized with auto-detect mode, auth_method='%s', cache_ttl=%v", authMethod, cacheTTL)
+	log.Printf("[PreLookup] Initialized with auto-detect mode, unified auth (supports SSHA512, SHA512, bcrypt, BLF-CRYPT), cache_ttl=%v", cacheTTL)
 	log.Printf("[PreLookup] Query: %s", query)
 
 	client.startCacheJanitor()
@@ -533,7 +525,11 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 
 		if result != nil {
 			resultMap := result.(map[string]interface{})
-			routingInfo = resultMap["info"].(*UserRoutingInfo)
+			if resultMap["info"] != nil {
+				routingInfo = resultMap["info"].(*UserRoutingInfo)
+			} else {
+				routingInfo = nil
+			}
 			authResult = resultMap["result"].(AuthResult)
 		}
 		return nil
@@ -564,21 +560,14 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 	return routingInfo, authResult, nil
 }
 
-// verifyPassword verifies a password against a hash using the configured method
+// verifyPassword verifies a password against a hash using the same auth mechanisms as the main server
 func (c *PreLookupClient) verifyPassword(password, hash string) bool {
-	switch c.authMethod {
-	case "bcrypt":
-		err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-		if err != nil && err != bcrypt.ErrMismatchedHashAndPassword {
-			log.Printf("[PreLookup] bcrypt verification error for hash '%s': %v", hash, err)
-		}
-		return err == nil
-	case "plain":
-		return password == hash
-	default:
-		log.Printf("[PreLookup] Unknown auth method: %s", c.authMethod)
+	err := db.VerifyPassword(hash, password)
+	if err != nil {
+		log.Printf("[PreLookup] Password verification failed for hash '%s': %v", hash, err)
 		return false
 	}
+	return true
 }
 
 // startCacheJanitor runs a background goroutine to clean up expired cache entries.

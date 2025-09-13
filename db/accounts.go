@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,7 +22,7 @@ type CreateAccountRequest struct {
 }
 
 // CreateAccount creates a new account with the specified email and password
-func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest) error {
+func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAccountRequest) error {
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
@@ -33,7 +34,7 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 	// Check if there's an existing credential with this email (including soft-deleted accounts)
 	var existingAccountID int64
 	var deletedAt *time.Time
-	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
@@ -72,13 +73,6 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 		return fmt.Errorf("unsupported hash type: %s", req.HashType)
 	}
 
-	// Begin transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	// Create account
 	var accountID int64
 	err = tx.QueryRow(ctx, "INSERT INTO accounts (created_at) VALUES (now()) RETURNING id").Scan(&accountID)
@@ -98,11 +92,6 @@ func (db *Database) CreateAccount(ctx context.Context, req CreateAccountRequest)
 		return fmt.Errorf("failed to create credential: %w", err)
 	}
 
-	// Commit transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
 	return nil
 }
 
@@ -116,7 +105,7 @@ type AddCredentialRequest struct {
 }
 
 // AddCredential adds a new credential to an existing account identified by its primary identity
-func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest) error {
+func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredentialRequest) error {
 	if req.AccountID <= 0 {
 		return fmt.Errorf("a valid AccountID is required")
 	}
@@ -152,13 +141,6 @@ func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest)
 		return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
 	}
 
-	// Begin transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	// If this should be the new primary identity, unset the current primary
 	if req.IsPrimary {
 		_, err = tx.Exec(ctx,
@@ -181,11 +163,6 @@ func (db *Database) AddCredential(ctx context.Context, req AddCredentialRequest)
 		return fmt.Errorf("failed to create new credential: %w", err)
 	}
 
-	// Commit transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
 	return nil
 }
 
@@ -198,7 +175,7 @@ type UpdateAccountRequest struct {
 }
 
 // UpdateAccount updates an existing account's password and/or makes it primary
-func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest) error {
+func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAccountRequest) error {
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(req.Email)
 	if err != nil {
@@ -213,7 +190,7 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 	}
 
 	// Check if account exists
-	accountID, err := db.GetAccountIDByAddress(ctx, normalizedEmail)
+	accountID, err := db.getAccountIDByAddressInTx(ctx, tx, normalizedEmail)
 	if err != nil {
 		if err == consts.ErrUserNotFound {
 			return fmt.Errorf("account with email %s does not exist", normalizedEmail)
@@ -246,12 +223,6 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
-		tx, err := db.BeginTx(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to begin transaction: %w", err)
-		}
-		defer tx.Rollback(ctx)
-
 		// First, unset any existing primary identity for this account
 		_, err = tx.Exec(ctx,
 			"UPDATE credentials SET primary_identity = false WHERE account_id = $1 AND primary_identity = true",
@@ -277,13 +248,9 @@ func (db *Database) UpdateAccount(ctx context.Context, req UpdateAccountRequest)
 			}
 		}
 
-		// Commit transaction
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("failed to commit transaction: %w", err)
-		}
 	} else {
 		// Just update password without changing primary status
-		_, err = db.GetWritePool().Exec(ctx,
+		_, err = tx.Exec(ctx,
 			"UPDATE credentials SET password = $1, updated_at = now() WHERE account_id = $2 AND LOWER(address) = $3",
 			hashedPassword, accountID, normalizedEmail)
 		if err != nil {
@@ -355,7 +322,7 @@ var (
 )
 
 // DeleteCredential deletes a specific credential from an account
-func (db *Database) DeleteCredential(ctx context.Context, email string) error {
+func (db *Database) DeleteCredential(ctx context.Context, tx pgx.Tx, email string) error {
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(email)
 	if err != nil {
@@ -367,7 +334,7 @@ func (db *Database) DeleteCredential(ctx context.Context, email string) error {
 	// Use a single atomic DELETE statement with conditions to prevent race conditions.
 	// This is more efficient and safer than a separate SELECT then DELETE.
 	var deletedID int64
-	err = db.GetWritePool().QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		DELETE FROM credentials
 		WHERE
 			LOWER(address) = $1
@@ -386,7 +353,7 @@ func (db *Database) DeleteCredential(ctx context.Context, email string) error {
 		if errors.Is(err, pgx.ErrNoRows) {
 			var isPrimary bool
 			var credentialCount int
-			errCheck := db.GetReadPool().QueryRow(ctx, `
+			errCheck := tx.QueryRow(ctx, `
 				SELECT c.primary_identity, (SELECT COUNT(*) FROM credentials WHERE account_id = c.account_id)
 				FROM credentials c WHERE LOWER(c.address) = $1
 			`, normalizedEmail).Scan(&isPrimary, &credentialCount)
@@ -449,7 +416,7 @@ var (
 )
 
 // DeleteAccount soft deletes an account by marking it as deleted
-func (db *Database) DeleteAccount(ctx context.Context, email string) error {
+func (db *Database) DeleteAccount(ctx context.Context, tx pgx.Tx, email string) error {
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(email)
 	if err != nil {
@@ -461,7 +428,7 @@ func (db *Database) DeleteAccount(ctx context.Context, email string) error {
 	// Check if account exists and is not already deleted
 	var accountID int64
 	var deletedAt *time.Time
-	err = db.GetReadPool().QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
@@ -478,13 +445,6 @@ func (db *Database) DeleteAccount(ctx context.Context, email string) error {
 	if deletedAt != nil {
 		return ErrAccountAlreadyDeleted
 	}
-
-	// Begin transaction for soft delete
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
 	// Soft delete the account by setting deleted_at timestamp
 	result, err := tx.Exec(ctx, `
@@ -506,16 +466,11 @@ func (db *Database) DeleteAccount(ctx context.Context, email string) error {
 		return fmt.Errorf("failed to disconnect active connections: %w", err)
 	}
 
-	// Commit transaction
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit account soft deletion transaction: %w", err)
-	}
-
 	return nil
 }
 
 // RestoreAccount restores a soft-deleted account
-func (db *Database) RestoreAccount(ctx context.Context, email string) error {
+func (db *Database) RestoreAccount(ctx context.Context, tx pgx.Tx, email string) error {
 	// Validate email address format using server.NewAddress
 	address, err := server.NewAddress(email)
 	if err != nil {
@@ -527,7 +482,7 @@ func (db *Database) RestoreAccount(ctx context.Context, email string) error {
 	// Check if account exists and is deleted
 	var accountID int64
 	var deletedAt *time.Time
-	err = db.GetReadPool().QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
@@ -546,7 +501,7 @@ func (db *Database) RestoreAccount(ctx context.Context, email string) error {
 	}
 
 	// Restore the account by clearing deleted_at
-	result, err := db.GetWritePool().Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE accounts 
 		SET deleted_at = NULL 
 		WHERE id = $1 AND deleted_at IS NOT NULL
@@ -560,6 +515,28 @@ func (db *Database) RestoreAccount(ctx context.Context, email string) error {
 	}
 
 	return nil
+}
+
+// getAccountIDByAddressInTx retrieves the main user ID associated with a given identity (address)
+// within a transaction.
+func (db *Database) getAccountIDByAddressInTx(ctx context.Context, tx pgx.Tx, address string) (int64, error) {
+	var accountID int64
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+
+	if normalizedAddress == "" {
+		return 0, errors.New("address cannot be empty")
+	}
+
+	// Query the credentials table for the account_id associated with the address
+	err := tx.QueryRow(ctx, "SELECT account_id FROM credentials WHERE LOWER(address) = $1", normalizedAddress).Scan(&accountID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Identity (address) not found in the credentials table
+			return 0, consts.ErrUserNotFound
+		}
+		return 0, fmt.Errorf("database error fetching account ID: %w", err)
+	}
+	return accountID, nil
 }
 
 // CredentialDetails holds comprehensive information about a single credential and its account.

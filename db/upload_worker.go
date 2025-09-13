@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type PendingUpload struct {
@@ -23,13 +25,7 @@ type PendingUpload struct {
 // locks them to prevent concurrent processing by other workers, and updates their
 // last_attempt timestamp to "lease" them to the current worker.
 // This is the recommended method for workers to fetch tasks.
-func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]PendingUpload, error) {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, tx pgx.Tx, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]PendingUpload, error) {
 	retryTasksLastAttemptBefore := time.Now().Add(-retryInterval)
 
 	rows, err := tx.Query(ctx, `
@@ -62,10 +58,6 @@ func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, instanceI
 	}
 
 	if len(uploads) == 0 {
-		// No uploads to process. Commit the (empty) transaction.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("failed to commit transaction when no uploads found: %w", err)
-		}
 		return nil, nil // No error, no uploads
 	}
 
@@ -87,17 +79,13 @@ func (db *Database) AcquireAndLeasePendingUploads(ctx context.Context, instanceI
 		return nil, fmt.Errorf("mismatch in rows updated for lease: expected %d, got %d", len(acquiredIDs), tag.RowsAffected())
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction after acquiring uploads: %w", err)
-	}
-
 	return uploads, nil
 }
 
 // MarkUploadAttempt increments the attempt count for a pending upload.
 // This is called when an upload attempt fails.
-func (db *Database) MarkUploadAttempt(ctx context.Context, contentHash string, accountID int64) error {
-	_, err := db.GetWritePool().Exec(ctx, `
+func (db *Database) MarkUploadAttempt(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) error {
+	_, err := tx.Exec(ctx, `
 		UPDATE pending_uploads
 		SET attempts = attempts + 1, last_attempt = now()
 		WHERE content_hash = $1 AND account_id = $2`, contentHash, accountID)
@@ -107,15 +95,9 @@ func (db *Database) MarkUploadAttempt(ctx context.Context, contentHash string, a
 // CompleteS3Upload marks all messages with the given content hash as uploaded
 // and deletes the specific pending upload record.
 // Called by an upload worker after successfully uploading the content hash.
-func (db *Database) CompleteS3Upload(ctx context.Context, contentHash string, accountID int64) error {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
+func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) error {
 	// Only mark messages for the specific account as uploaded.
-	_, err = tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		UPDATE messages 
 		SET uploaded = TRUE
 		WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
@@ -133,7 +115,7 @@ func (db *Database) CompleteS3Upload(ctx context.Context, contentHash string, ac
 		return err
 	}
 
-	return tx.Commit(ctx)
+	return nil
 }
 
 // IsContentHashUploaded checks if any message with the given content hash is already marked as uploaded.

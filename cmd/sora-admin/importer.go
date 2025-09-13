@@ -133,10 +133,14 @@ func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 // Close cleans up resources used by the importer.
 func (i *Importer) Close() error {
 	if i.db != nil {
-		i.db.Close()
+		if err := i.db.Close(); err != nil {
+			return fmt.Errorf("failed to close maildir database: %w", err)
+		}
 		if i.options.CleanupDB {
 			log.Printf("Cleaning up import database: %s", i.dbPath)
-			os.Remove(i.dbPath)
+			if err := os.Remove(i.dbPath); err != nil {
+				return fmt.Errorf("failed to remove maildir database file: %w", err)
+			}
 		} else {
 			log.Printf("Maildir database saved at: %s", i.dbPath)
 		}

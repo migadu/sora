@@ -32,7 +32,7 @@ type ConnectionStats struct {
 }
 
 // RegisterConnection registers a new active connection
-func (db *Database) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
+func (db *Database) RegisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
 	query := `
 		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
 		VALUES ($1, false, $2, $3, $4, $5)
@@ -43,7 +43,7 @@ func (db *Database) RegisterConnection(ctx context.Context, accountID int64, pro
 		RETURNING id`
 
 	var id int64
-	err := db.GetWritePool().QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID).Scan(&id)
+	err := tx.QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("failed to register connection: %w", err)
 	}
@@ -52,13 +52,13 @@ func (db *Database) RegisterConnection(ctx context.Context, accountID int64, pro
 }
 
 // UpdateConnectionActivity updates the last activity time for a connection
-func (db *Database) UpdateConnectionActivity(ctx context.Context, accountID int64, protocol, clientAddr string) error {
+func (db *Database) UpdateConnectionActivity(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr string) error {
 	query := `
 		UPDATE active_connections
 		SET last_activity = now()
 		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
-	result, err := db.GetWritePool().Exec(ctx, query, accountID, protocol, clientAddr)
+	result, err := tx.Exec(ctx, query, accountID, protocol, clientAddr)
 	if err != nil {
 		return fmt.Errorf("failed to update connection activity: %w", err)
 	}
@@ -71,12 +71,12 @@ func (db *Database) UpdateConnectionActivity(ctx context.Context, accountID int6
 }
 
 // UnregisterConnection removes an active connection
-func (db *Database) UnregisterConnection(ctx context.Context, accountID int64, protocol, clientAddr string) error {
+func (db *Database) UnregisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr string) error {
 	query := `
 		DELETE FROM active_connections
 		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
-	_, err := db.GetWritePool().Exec(ctx, query, accountID, protocol, clientAddr)
+	_, err := tx.Exec(ctx, query, accountID, protocol, clientAddr)
 	if err != nil {
 		return fmt.Errorf("failed to unregister connection: %w", err)
 	}
@@ -85,12 +85,11 @@ func (db *Database) UnregisterConnection(ctx context.Context, accountID int64, p
 }
 
 // BatchRegisterConnections registers multiple new active connections in a single batch.
-func (db *Database) BatchRegisterConnections(ctx context.Context, connections []ConnectionInfo) error {
+func (db *Database) BatchRegisterConnections(ctx context.Context, tx pgx.Tx, connections []ConnectionInfo) error {
 	if len(connections) == 0 {
 		return nil
 	}
 
-	batch := &pgx.Batch{}
 	query := `
 		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
 		VALUES ($1, false, $2, $3, $4, $5)
@@ -100,61 +99,47 @@ func (db *Database) BatchRegisterConnections(ctx context.Context, connections []
 		              last_activity = now()`
 
 	for _, conn := range connections {
-		batch.Queue(query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID)
-	}
-
-	br := db.GetWritePool().SendBatch(ctx, batch)
-	defer br.Close()
-
-	// We need to check the result of each queued command.
-	for i := 0; i < len(connections); i++ {
-		_, err := br.Exec()
+		_, err := tx.Exec(ctx, query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID)
 		if err != nil {
 			// Log the error for the specific failed insert/update but continue.
 			// A single failure shouldn't stop the whole batch.
-			log.Printf("[DB] BatchRegisterConnections: error processing item %d: %v", i, err)
+			log.Printf("[DB] BatchRegisterConnections: error processing item for account %d: %v", conn.AccountID, err)
+			return fmt.Errorf("failed to register connection for account %d: %w", conn.AccountID, err)
 		}
 	}
 
-	return br.Close() // br.Close() will return the first error encountered if any.
+	return nil
 }
 
 // BatchUpdateConnections updates multiple connections in a single batch.
-func (db *Database) BatchUpdateConnections(ctx context.Context, connections []ConnectionInfo) error {
+func (db *Database) BatchUpdateConnections(ctx context.Context, tx pgx.Tx, connections []ConnectionInfo) error {
 	if len(connections) == 0 {
 		return nil
 	}
 
-	batch := &pgx.Batch{}
 	query := `
 		UPDATE active_connections
 		SET last_activity = now(), should_terminate = $4
 		WHERE account_id = $1 AND protocol = $2 AND client_addr = $3 AND is_prelookup_account = false`
 
 	for _, conn := range connections {
-		batch.Queue(query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ShouldTerminate)
-	}
-
-	br := db.GetWritePool().SendBatch(ctx, batch)
-	defer br.Close()
-
-	for i := 0; i < len(connections); i++ {
-		if _, err := br.Exec(); err != nil {
-			log.Printf("[DB] BatchUpdateConnections: error processing item %d: %v", i, err)
+		if _, err := tx.Exec(ctx, query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ShouldTerminate); err != nil {
+			log.Printf("[DB] BatchUpdateConnections: error processing item for account %d: %v", conn.AccountID, err)
+			return fmt.Errorf("failed to update connection for account %d: %w", conn.AccountID, err)
 		}
 	}
 
-	return br.Close()
+	return nil
 }
 
 // CleanupStaleConnections removes connections that haven't been active for the specified duration
-func (db *Database) CleanupStaleConnections(ctx context.Context, staleAfter time.Duration) (int64, error) {
+func (db *Database) CleanupStaleConnections(ctx context.Context, tx pgx.Tx, staleAfter time.Duration) (int64, error) {
 	query := `
 		DELETE FROM active_connections
 		WHERE last_activity < $1`
 
 	cutoff := time.Now().Add(-staleAfter)
-	result, err := db.GetWritePool().Exec(ctx, query, cutoff)
+	result, err := tx.Exec(ctx, query, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup stale connections: %w", err)
 	}
@@ -164,12 +149,12 @@ func (db *Database) CleanupStaleConnections(ctx context.Context, staleAfter time
 
 // CleanupConnectionsByInstanceID removes all connections for a specific instance ID.
 // This is useful to call on server startup to clear stale connections from a previous run.
-func (db *Database) CleanupConnectionsByInstanceID(ctx context.Context, instanceID string) (int64, error) {
+func (db *Database) CleanupConnectionsByInstanceID(ctx context.Context, tx pgx.Tx, instanceID string) (int64, error) {
 	query := `
 		DELETE FROM active_connections
 		WHERE instance_id = $1`
 
-	result, err := db.GetWritePool().Exec(ctx, query, instanceID)
+	result, err := tx.Exec(ctx, query, instanceID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup connections for instance %s: %w", instanceID, err)
 	}
@@ -289,7 +274,7 @@ func (db *Database) GetUserConnections(ctx context.Context, email string) ([]Con
 }
 
 // MarkConnectionsForTermination marks connections for termination based on various criteria
-func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria TerminationCriteria) (int64, error) {
+func (db *Database) MarkConnectionsForTermination(ctx context.Context, tx pgx.Tx, criteria TerminationCriteria) (int64, error) {
 	query := `
 		UPDATE active_connections
 		SET should_terminate = true
@@ -322,7 +307,7 @@ func (db *Database) MarkConnectionsForTermination(ctx context.Context, criteria 
 		args = append(args, criteria.ClientAddr)
 	}
 
-	result, err := db.GetWritePool().Exec(ctx, query, args...)
+	result, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to mark connections for termination: %w", err)
 	}

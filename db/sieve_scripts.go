@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -33,7 +34,7 @@ func (db *Database) GetUserScripts(ctx context.Context, userID int64) ([]*SieveS
 		scripts = append(scripts, &script)
 	}
 
-	return scripts, nil
+	return scripts, rows.Err()
 }
 
 func (db *Database) GetScript(ctx context.Context, scriptID, userID int64) (*SieveScript, error) {
@@ -74,9 +75,9 @@ func (db *Database) GetScriptByName(ctx context.Context, name string, userID int
 	return &script, nil
 }
 
-func (db *Database) CreateScript(ctx context.Context, userID int64, name, script string) (*SieveScript, error) {
+func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, userID int64, name, script string) (*SieveScript, error) {
 	var s SieveScript
-	err := db.GetWritePool().QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO sieve_scripts (account_id, name, script, active) 
 		VALUES ($1, $2, $3, false) 
 		RETURNING id, account_id, name, script, active, updated_at
@@ -87,9 +88,9 @@ func (db *Database) CreateScript(ctx context.Context, userID int64, name, script
 	return &s, nil
 }
 
-func (db *Database) UpdateScript(ctx context.Context, scriptID, userID int64, name, script string) (*SieveScript, error) {
+func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, userID int64, name, script string) (*SieveScript, error) {
 	var s SieveScript
-	err := db.GetWritePool().QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		UPDATE sieve_scripts SET name = $1, script = $2, updated_at = now() 
 		WHERE id = $3 AND account_id = $4
 		RETURNING id, account_id, name, script, active, updated_at
@@ -100,27 +101,22 @@ func (db *Database) UpdateScript(ctx context.Context, scriptID, userID int64, na
 	return &s, nil
 }
 
-func (db *Database) DeleteScript(ctx context.Context, scriptID, userID int64) error {
-	_, err := db.GetWritePool().Exec(ctx, "DELETE FROM sieve_scripts WHERE id = $1 AND account_id = $2", scriptID, userID)
+func (db *Database) DeleteScript(ctx context.Context, tx pgx.Tx, scriptID, userID int64) error {
+	_, err := tx.Exec(ctx, "DELETE FROM sieve_scripts WHERE id = $1 AND account_id = $2", scriptID, userID)
 	return err
 }
 
-func (db *Database) SetScriptActive(ctx context.Context, scriptID, userID int64, active bool) error {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, "UPDATE sieve_scripts SET active = false WHERE id != $1 AND account_id = $2", scriptID, userID)
-	if err != nil {
-		return err
+func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, userID int64, active bool) error {
+	// If we are activating a script, we must first deactivate all other scripts for this user
+	// to ensure the UNIQUE index on (account_id, active=true) is not violated.
+	if active {
+		_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = false WHERE account_id = $1 AND active = true", userID)
+		if err != nil {
+			return fmt.Errorf("failed to deactivate other scripts: %w", err)
+		}
 	}
 
-	_, err = tx.Exec(ctx, "UPDATE sieve_scripts SET active = true WHERE id = $1 AND account_id = $2", scriptID, userID)
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+	// Now, set the active status for the target script.
+	_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = $1, updated_at = now() WHERE id = $2 AND account_id = $3", active, scriptID, userID)
+	return err
 }

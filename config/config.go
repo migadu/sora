@@ -30,13 +30,17 @@ type DatabaseEndpointConfig struct {
 	MinConns        int         `toml:"min_conns"`          // Minimum number of connections in the pool
 	MaxConnLifetime string      `toml:"max_conn_lifetime"`  // Maximum lifetime of a connection
 	MaxConnIdleTime string      `toml:"max_conn_idle_time"` // Maximum idle time before a connection is closed
+	QueryTimeout    string      `toml:"query_timeout"`      // Per-endpoint timeout for individual database queries (e.g., "30s")
 }
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
 type DatabaseConfig struct {
-	LogQueries bool                    `toml:"log_queries"` // Global setting for query logging
-	Write      *DatabaseEndpointConfig `toml:"write"`       // Write database configuration
-	Read       *DatabaseEndpointConfig `toml:"read"`        // Read database configuration (can have multiple hosts for load balancing)
+	LogQueries    bool                    `toml:"log_queries"`    // Global setting for query logging
+	QueryTimeout  string                  `toml:"query_timeout"`  // Default timeout for all database queries (default: "30s")
+	SearchTimeout string                  `toml:"search_timeout"` // Specific timeout for complex search queries (default: "60s")
+	WriteTimeout  string                  `toml:"write_timeout"`  // Timeout for write operations (default: "10s")
+	Write         *DatabaseEndpointConfig `toml:"write"`          // Write database configuration
+	Read          *DatabaseEndpointConfig `toml:"read"`           // Read database configuration (can have multiple hosts for load balancing)
 }
 
 // GetMaxConnLifetime parses the max connection lifetime duration for an endpoint
@@ -53,6 +57,38 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 		return 30 * time.Minute, nil
 	}
 	return helpers.ParseDuration(e.MaxConnIdleTime)
+}
+
+// GetQueryTimeout parses the query timeout duration for an endpoint.
+func (e *DatabaseEndpointConfig) GetQueryTimeout() (time.Duration, error) {
+	if e.QueryTimeout == "" {
+		return 0, nil // Return zero duration if not set, caller handles default.
+	}
+	return helpers.ParseDuration(e.QueryTimeout)
+}
+
+// GetQueryTimeout parses the general query timeout duration.
+func (d *DatabaseConfig) GetQueryTimeout() (time.Duration, error) {
+	if d.QueryTimeout == "" {
+		return 30 * time.Second, nil // Default 30 second timeout for general queries
+	}
+	return helpers.ParseDuration(d.QueryTimeout)
+}
+
+// GetSearchTimeout parses the search timeout duration
+func (d *DatabaseConfig) GetSearchTimeout() (time.Duration, error) {
+	if d.SearchTimeout == "" {
+		return 60 * time.Second, nil // Default 60 second timeout for complex search operations
+	}
+	return helpers.ParseDuration(d.SearchTimeout)
+}
+
+// GetWriteTimeout parses the write timeout duration
+func (d *DatabaseConfig) GetWriteTimeout() (time.Duration, error) {
+	if d.WriteTimeout == "" {
+		return 10 * time.Second, nil // Default 10 second timeout for write operations
+	}
+	return helpers.ParseDuration(d.WriteTimeout)
 }
 
 // S3Config holds S3 configuration.
@@ -535,7 +571,10 @@ func NewDefaultConfig() Config {
 	return Config{
 		LogOutput: "syslog",
 		Database: DatabaseConfig{
-			LogQueries: false,
+			QueryTimeout:  "30s",
+			SearchTimeout: "1m",
+			WriteTimeout:  "15s",
+			LogQueries:    false,
 			Write: &DatabaseEndpointConfig{
 				Hosts:           []string{"localhost"},
 				Port:            "5432",
@@ -547,6 +586,7 @@ func NewDefaultConfig() Config {
 				MinConns:        10,
 				MaxConnLifetime: "1h",
 				MaxConnIdleTime: "30m",
+				QueryTimeout:    "30s",
 			},
 			Read: &DatabaseEndpointConfig{
 				Hosts:           []string{"localhost"},
@@ -559,6 +599,7 @@ func NewDefaultConfig() Config {
 				MinConns:        10,
 				MaxConnLifetime: "1h",
 				MaxConnIdleTime: "30m",
+				QueryTimeout:    "30s",
 			},
 		},
 		S3: S3Config{

@@ -2,30 +2,23 @@ package db
 
 import (
 	"context"
-	"fmt"
 	"log"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/jackc/pgx/v5"
 )
 
-func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uids ...imap.UID) (int64, error) {
+func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID int64, uids ...imap.UID) (int64, error) {
 	if len(uids) == 0 {
 		log.Printf("[DB] no UIDs to expunge for mailbox %d", mailboxID)
 		return 0, nil
 	}
 
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction for ExpungeMessageUIDs: %w", err)
-	}
-	// Defer rollback in case of errors. Commit will be called explicitly on success.
-	defer tx.Rollback(ctx)
-
 	log.Printf("[DB] expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
 
 	var currentModSeq int64
 	var rowsAffected int64
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		WITH updated AS (
 			UPDATE messages
 			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
@@ -42,12 +35,5 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, mailboxID int64, uid
 	}
 
 	log.Printf("[DB] successfully expunged %d messages from mailbox %d, current modseq: %d", rowsAffected, mailboxID, currentModSeq)
-
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] FAILED to commit expunge transaction for mailbox %d: %v", mailboxID, err)
-		return 0, fmt.Errorf("failed to commit transaction for ExpungeMessageUIDs: %w", err)
-	}
-
-	log.Printf("[DB] transaction committed successfully for expunge of %d messages from mailbox %d", rowsAffected, mailboxID)
 	return currentModSeq, nil
 }

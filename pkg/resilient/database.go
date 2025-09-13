@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -21,8 +19,6 @@ import (
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
-	"github.com/migadu/sora/server"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // DatabasePool represents a single database connection pool with health tracking
@@ -62,6 +58,9 @@ type ResilientDatabase struct {
 	// Circuit breakers (per-operation type)
 	queryBreaker *circuitbreaker.CircuitBreaker
 	writeBreaker *circuitbreaker.CircuitBreaker
+
+	// Database configuration for timeouts
+	config *config.DatabaseConfig
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
@@ -100,6 +99,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 		failoverManager: failoverManager,
 		queryBreaker:    circuitbreaker.NewCircuitBreaker(querySettings),
 		writeBreaker:    circuitbreaker.NewCircuitBreaker(writeSettings),
+		config:          config,
 	}
 
 	// Start background health checking if enabled
@@ -108,6 +108,80 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	}
 
 	return rdb, nil
+}
+
+// timeoutType defines the type of database operation.
+type timeoutType int
+
+const (
+	timeoutRead timeoutType = iota
+	timeoutWrite
+	timeoutSearch
+	timeoutAuth  // Authentication operations (rate limiting, password verification)
+	timeoutAdmin // Administrative operations (user creation, imports, exports)
+)
+
+// withTimeout creates a new context with the appropriate timeout.
+func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType) (context.Context, context.CancelFunc) {
+	var timeout time.Duration
+	var err error
+
+	// Determine the base timeout from the global config.
+	switch opType {
+	case timeoutWrite:
+		timeout, err = rd.config.GetWriteTimeout()
+		if err != nil {
+			log.Printf("WARN: Invalid global write_timeout, using default 10s: %v", err)
+			timeout = 15 * time.Second
+		}
+	case timeoutSearch:
+		timeout, err = rd.config.GetSearchTimeout()
+		if err != nil {
+			log.Printf("WARN: Invalid global search_timeout, using default: %v", err)
+			timeout = 60 * time.Second
+		}
+	case timeoutAuth:
+		// Auth operations should be fast - use write timeout as base, but shorter
+		timeout, err = rd.config.GetWriteTimeout()
+		if err != nil {
+			log.Printf("WARN: Invalid global write_timeout for auth, using default 10s: %v", err)
+			timeout = 10 * time.Second
+		} else if timeout > 10*time.Second {
+			// Cap auth timeout to be reasonably fast
+			timeout = 10 * time.Second
+		}
+	case timeoutAdmin:
+		// Admin operations can be longer (imports, user creation)
+		timeout, err = rd.config.GetSearchTimeout() // Use search timeout as base
+		if err != nil {
+			log.Printf("WARN: Invalid global search_timeout for admin, using default 45s: %v", err)
+			timeout = 45 * time.Second
+		}
+		timeout = time.Duration(float64(timeout) * 0.75) // Admin ops get 75% of search timeout
+	default: // timeoutRead
+		timeout, err = rd.config.GetQueryTimeout()
+		if err != nil {
+			log.Printf("WARN: Invalid global query_timeout, using default: %v", err)
+			timeout = 30 * time.Second
+		}
+
+		// For reads, check for an endpoint-specific override.
+		endpointConfig := rd.config.Read
+		if endpointConfig == nil {
+			endpointConfig = rd.config.Write // Fallback to write if no read config
+		}
+
+		if endpointConfig != nil {
+			endpointTimeout, endpointErr := endpointConfig.GetQueryTimeout()
+			if endpointErr != nil {
+				log.Printf("WARN: Invalid endpoint query_timeout, using global/default: %v", endpointErr)
+			} else if endpointTimeout > 0 {
+				timeout = endpointTimeout // Override with endpoint-specific timeout
+			}
+		}
+	}
+
+	return context.WithTimeout(ctx, timeout)
 }
 
 func (rd *ResilientDatabase) GetDatabase() *db.Database {
@@ -179,8 +253,11 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 
 	var rows pgx.Rows
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
+		defer cancel()
+
 		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			r, queryErr := pool.Query(ctx, sql, args...)
+			r, queryErr := pool.Query(queryCtx, sql, args...)
 			return r, queryErr
 		})
 
@@ -218,6 +295,9 @@ func (r *resilientRow) Scan(dest ...interface{}) error {
 
 	// The retry logic will re-execute this function upon failure.
 	retryErr := retry.WithRetryAdvanced(r.ctx, func() error {
+		queryCtx, cancel := r.rd.withTimeout(r.ctx, timeoutRead)
+		defer cancel()
+
 		// The circuit breaker protects each individual attempt.
 		_, cbErr := r.rd.queryBreaker.Execute(func() (interface{}, error) {
 			var pool *pgxpool.Pool
@@ -231,7 +311,7 @@ func (r *resilientRow) Scan(dest ...interface{}) error {
 				pool = db.ReadPool
 			}
 
-			scanErr = pool.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
+			scanErr = pool.QueryRow(queryCtx, r.sql, r.args...).Scan(dest...)
 
 			// pgx.ErrNoRows is an expected outcome, not a system failure.
 			// We treat it as a success for the circuit breaker so it doesn't trip.
@@ -286,8 +366,11 @@ func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args
 
 	var tag pgconn.CommandTag
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			t, execErr := rd.getOperationalDatabase().WritePool.Exec(ctx, sql, args...)
+			t, execErr := rd.getOperationalDatabaseForOperation(true).WritePool.Exec(writeCtx, sql, args...)
 			return t, execErr
 		})
 
@@ -317,8 +400,11 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 
 	var tx pgx.Tx
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			t, txErr := rd.getOperationalDatabase().WritePool.BeginTx(ctx, txOptions)
+			t, txErr := rd.getOperationalDatabaseForOperation(true).BeginTx(writeCtx, txOptions)
 			return t, txErr
 		})
 
@@ -337,94 +423,6 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 	return tx, err
 }
 
-// AuthenticateWithRetry handles the full authentication flow with resilience.
-// It fetches credentials, verifies the password, and triggers a rehash if necessary.
-func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      2, // Auth retries should be limited
-	}
-
-	var hashedPassword string
-	err = retry.WithRetry(ctx, func() error {
-		// Define a struct to hold the multiple return values from GetCredentialForAuth
-		type credResult struct {
-			ID   int64
-			Hash string
-		}
-
-		// Authentication is a critical read path. Use queryBreaker.
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			id, hash, dbErr := rd.getOperationalDatabase().GetCredentialForAuth(ctx, address)
-			if dbErr != nil {
-				return nil, dbErr
-			}
-			return credResult{ID: id, Hash: hash}, nil
-		})
-
-		if cbErr != nil {
-			// Don't retry on auth errors (user not found), only on connection errors.
-			if errors.Is(cbErr, consts.ErrUserNotFound) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			log.Printf("Retrying credential fetch for %s due to retryable error: %v", address, cbErr)
-			return cbErr
-		}
-
-		// Unpack results
-		cred := result.(credResult)
-		accountID = cred.ID
-		hashedPassword = cred.Hash
-		return nil
-	}, config)
-
-	if err != nil {
-		return 0, err // Return error from fetching credentials
-	}
-
-	// Verify password
-	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		return 0, err // Invalid password
-	}
-
-	// Asynchronously rehash if needed
-	if db.NeedsRehash(hashedPassword) {
-		go func() {
-			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-			if hashErr != nil {
-				log.Printf("[REHASH] Failed to generate new hash for %s: %v", address, hashErr)
-				return
-			}
-
-			// If it's a BLF-CRYPT format, preserve the prefix
-			var newHashedPassword string
-			if strings.HasPrefix(hashedPassword, "{BLF-CRYPT}") {
-				newHashedPassword = "{BLF-CRYPT}" + string(newHash)
-			} else {
-				newHashedPassword = string(newHash)
-			}
-
-			updateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			// Use a new resilient call for the update
-			if err := rd.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
-				log.Printf("[REHASH] Failed to update password for %s: %v", address, err)
-			} else {
-				log.Printf("[REHASH] Successfully rehashed and updated password for %s", address)
-			}
-		}()
-	}
-
-	return accountID, nil
-}
-
 // UpdatePasswordWithRetry updates a user's password with resilience.
 func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, address, newHashedPassword string) error {
 	config := retry.BackoffConfig{
@@ -435,8 +433,20 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		MaxRetries:      2,
 	}
 	return retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().UpdatePassword(ctx, address, newHashedPassword)
+			return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(writeCtx, tx, address, newHashedPassword)
 		})
 		if cbErr != nil {
 			if !rd.isRetryableError(cbErr) {
@@ -444,6 +454,11 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 			}
 			return cbErr
 		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+
 		return nil
 	}, config)
 }
@@ -462,9 +477,12 @@ func (rd *ResilientDatabase) GetLastServerAddressWithRetry(ctx context.Context, 
 	var lastTime time.Time
 
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
+		defer cancel()
+
 		// This is a read operation.
 		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			addr, t, err := rd.getOperationalDatabase().GetLastServerAddress(ctx, accountID)
+			addr, t, err := rd.getOperationalDatabaseForOperation(false).GetLastServerAddress(readCtx, accountID)
 			if err != nil {
 				return nil, err
 			}
@@ -502,9 +520,21 @@ func (rd *ResilientDatabase) UpdateLastServerAddressWithRetry(ctx context.Contex
 	}
 
 	return retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		// This is a write operation.
 		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().UpdateLastServerAddress(ctx, accountID, serverAddr)
+			return nil, rd.getOperationalDatabaseForOperation(true).UpdateLastServerAddress(writeCtx, tx, accountID, serverAddr)
 		})
 
 		if cbErr != nil {
@@ -513,6 +543,11 @@ func (rd *ResilientDatabase) UpdateLastServerAddressWithRetry(ctx context.Contex
 			}
 			log.Printf("Retrying UpdateLastServerAddress for account %d due to retryable error: %v", accountID, cbErr)
 			return cbErr
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			log.Printf("Retrying UpdateLastServerAddress for account %d due to retryable commit error: %v", accountID, err)
+			return err
 		}
 
 		return nil
@@ -549,959 +584,6 @@ func (rd *ResilientDatabase) GetWriteBreakerState() circuitbreaker.State {
 	return rd.writeBreaker.State()
 }
 
-// --- AuthRateLimiter Wrappers ---
-
-func (rd *ResilientDatabase) RecordAuthAttemptWithRetry(ctx context.Context, ipAddress, username, protocol string, success bool) error {
-	// This is a high-frequency write operation. Retries should be short.
-	config := retry.BackoffConfig{
-		InitialInterval: 100 * time.Millisecond,
-		MaxInterval:     500 * time.Millisecond,
-		MaxRetries:      2,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().RecordAuthAttempt(ctx, ipAddress, username, protocol, success)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error) {
-	// This is a read operation used for security checks. Retries should be short.
-	config := retry.BackoffConfig{
-		InitialInterval: 100 * time.Millisecond,
-		MaxInterval:     500 * time.Millisecond,
-		MaxRetries:      2,
-	}
-	err = retry.WithRetry(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			ip, user, dbErr := rd.getOperationalDatabase().GetFailedAttemptsCountSeparateWindows(ctx, ipAddress, username, ipWindowDuration, usernameWindowDuration)
-			if dbErr != nil {
-				return nil, dbErr
-			}
-			return []int{ip, user}, nil
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		counts := result.([]int)
-		ipCount = counts[0]
-		usernameCount = counts[1]
-		return nil
-	}, config)
-	return ipCount, usernameCount, err
-}
-
-// GetAuthAttemptsStats is not performance-critical and can be called directly for now.
-// If it were used in a hot path, it would also be wrapped.
-func (rd *ResilientDatabase) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
-	return rd.getOperationalDatabase().GetAuthAttemptsStats(ctx, windowDuration)
-}
-
-func (rd *ResilientDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error) {
-	// This is a background cleanup task, low priority, no retries needed.
-	config := retry.BackoffConfig{MaxRetries: 1}
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupOldAuthAttempts(ctx, maxAge)
-		})
-		if cbErr != nil {
-			return retry.Stop(cbErr)
-		}
-		count = result.(int64)
-		return nil
-	}, config)
-	return count, err
-}
-
-// --- Mailbox and Message Wrappers ---
-
-func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, userID int64, name string) (*db.DBMailbox, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var mailbox *db.DBMailbox
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMailboxByName(ctx, userID, name)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		mailbox = result.(*db.DBMailbox)
-		return nil
-	}, config)
-	return mailbox, err
-}
-
-func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
-	config := retry.BackoffConfig{MaxRetries: 2} // Writes are less safe to retry automatically
-	err = retry.WithRetry(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			messageID, uid, err = rd.getOperationalDatabase().InsertMessage(ctx, options, upload)
-			return nil, err
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-	return messageID, uid, err
-}
-
-func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet) ([]db.Message, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var messages []db.Message
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessagesByNumSet(ctx, mailboxID, numSet)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		messages = result.([]db.Message)
-		return nil
-	}, config)
-	return messages, err
-}
-
-func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mailboxID int64) (*db.MailboxSummary, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var summary *db.MailboxSummary
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMailboxSummary(ctx, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		summary = result.(*db.MailboxSummary)
-		return nil
-	}, config)
-	return summary, err
-}
-
-func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, userID int64, subscribed bool) ([]*db.DBMailbox, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var mailboxes []*db.DBMailbox
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMailboxes(ctx, userID, subscribed)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		mailboxes = result.([]*db.DBMailbox)
-		return nil
-	}, config)
-	return mailboxes, err
-}
-
-func (rd *ResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var accountID int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetAccountIDByAddress(ctx, address)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		accountID = result.(int64)
-		return nil
-	}, config)
-	return accountID, err
-}
-
-func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, userID int64) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().CreateDefaultMailboxes(ctx, userID)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) PollMailboxWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*db.MailboxPoll, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var poll *db.MailboxPoll
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().PollMailbox(ctx, mailboxID, sinceModSeq)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		poll = result.(*db.MailboxPoll)
-		return nil
-	}, config)
-	return poll, err
-}
-
-func (rd *ResilientDatabase) GetMessagesByFlagWithRetry(ctx context.Context, mailboxID int64, flag imap.Flag) ([]db.Message, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var messages []db.Message
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessagesByFlag(ctx, mailboxID, flag)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		messages = result.([]db.Message)
-		return nil
-	}, config)
-	return messages, err
-}
-
-func (rd *ResilientDatabase) ExpungeMessageUIDsWithRetry(ctx context.Context, mailboxID int64, uids ...imap.UID) (int64, error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	var modSeq int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().ExpungeMessageUIDs(ctx, mailboxID, uids...)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		modSeq = result.(int64)
-		return nil
-	}, config)
-	return modSeq, err
-}
-
-func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var address server.Address
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetPrimaryEmailForAccount(ctx, accountID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		address = result.(server.Address)
-		return nil
-	}, config)
-	return address, err
-}
-
-// --- Connection Tracker Wrappers ---
-
-func (rd *ResilientDatabase) RegisterConnectionWithRetry(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      3,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().RegisterConnection(ctx, accountID, protocol, clientAddr, serverAddr, instanceID)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) UpdateConnectionActivityWithRetry(ctx context.Context, accountID int64, protocol, clientAddr string) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     1 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      2,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().UpdateConnectionActivity(ctx, accountID, protocol, clientAddr)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) UnregisterConnectionWithRetry(ctx context.Context, accountID int64, protocol, clientAddr string) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     1 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      2,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().UnregisterConnection(ctx, accountID, protocol, clientAddr)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) CheckConnectionTerminationWithRetry(ctx context.Context, accountID int64, protocol, clientAddr string) (bool, error) {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     1 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      2,
-	}
-	var shouldTerminate bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CheckConnectionTermination(ctx, accountID, protocol, clientAddr)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		shouldTerminate = result.(bool)
-		return nil
-	}, config)
-	return shouldTerminate, err
-}
-
-func (rd *ResilientDatabase) BatchRegisterConnectionsWithRetry(ctx context.Context, connections []db.ConnectionInfo) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 500 * time.Millisecond,
-		MaxInterval:     5 * time.Second,
-		Multiplier:      2.0,
-		Jitter:          true,
-		MaxRetries:      3,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().BatchRegisterConnections(ctx, connections)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) BatchUpdateConnectionsWithRetry(ctx context.Context, connections []db.ConnectionInfo) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 500 * time.Millisecond,
-		MaxInterval:     5 * time.Second,
-		Multiplier:      2.0,
-		Jitter:          true,
-		MaxRetries:      3,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().BatchUpdateConnections(ctx, connections)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) CleanupConnectionsByInstanceIDWithRetry(ctx context.Context, instanceID string) (int64, error) {
-	config := retry.BackoffConfig{MaxRetries: 1} // No retries for cleanup
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupConnectionsByInstanceID(ctx, instanceID)
-		})
-		if cbErr != nil {
-			return retry.Stop(cbErr)
-		}
-		count = result.(int64)
-		return nil
-	}, config)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetTerminatedConnectionsByInstanceWithRetry(ctx context.Context, instanceID string) ([]db.ConnectionInfo, error) {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      3,
-	}
-	var connections []db.ConnectionInfo
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetTerminatedConnectionsByInstance(ctx, instanceID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		connections = result.([]db.ConnectionInfo)
-		return nil
-	}, config)
-	return connections, err
-}
-
-// --- Sieve and Vacation Wrappers ---
-
-func (rd *ResilientDatabase) GetActiveScriptWithRetry(ctx context.Context, userID int64) (*db.SieveScript, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var script *db.SieveScript
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetActiveScript(ctx, userID)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrDBNotFound) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		script = result.(*db.SieveScript)
-		return nil
-	}, config)
-	return script, err
-}
-
-func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Context, userID int64, senderAddress string, duration time.Duration) (bool, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var hasRecent bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().HasRecentVacationResponse(ctx, userID, senderAddress, duration)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		hasRecent = result.(bool)
-		return nil
-	}, config)
-	return hasRecent, err
-}
-
-func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context, userID int64, senderAddress string) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().RecordVacationResponse(ctx, userID, senderAddress)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-}
-
-// --- Mailbox Management Wrappers ---
-
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	var uidMap map[imap.UID]imap.UID
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CopyMessages(ctx, uids, srcMailboxID, destMailboxID, userID)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrDBUniqueViolation) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		uidMap = result.(map[imap.UID]imap.UID)
-		return nil
-	}, config)
-	return uidMap, err
-}
-
-func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, userID int64, name string, parentID *int64) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().CreateMailbox(ctx, userID, name, parentID)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrDBUniqueViolation) || errors.Is(cbErr, consts.ErrMailboxInvalidName) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-}
-
-func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailboxID int64, userID int64) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteMailbox(ctx, mailboxID, userID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-}
-
-func (rd *ResilientDatabase) RenameMailboxWithRetry(ctx context.Context, mailboxID int64, userID int64, newName string, newParentID *int64) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().RenameMailbox(ctx, mailboxID, userID, newName, newParentID)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrMailboxAlreadyExists) || errors.Is(cbErr, consts.ErrMailboxInvalidName) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-}
-
-func (rd *ResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, mailboxID int64, userID int64, subscribed bool) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().SetMailboxSubscribed(ctx, mailboxID, userID, subscribed)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-}
-
-func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var count uint32
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CountMessagesGreaterThanUID(ctx, mailboxID, minUID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(uint32)
-		return nil
-	}, config)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetUniqueCustomFlagsForMailboxWithRetry(ctx context.Context, mailboxID int64) ([]string, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var flags []string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUniqueCustomFlagsForMailbox(ctx, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		flags = result.([]string)
-		return nil
-	}, config)
-	return flags, err
-}
-
-// --- Flag Management Wrappers ---
-
-func (rd *ResilientDatabase) AddMessageFlagsWithRetry(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	err = retry.WithRetry(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			updatedFlags, modSeq, err = rd.getOperationalDatabase().AddMessageFlags(ctx, messageUID, mailboxID, newFlags)
-			return nil, err
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-	return
-}
-
-func (rd *ResilientDatabase) RemoveMessageFlagsWithRetry(ctx context.Context, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	err = retry.WithRetry(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			updatedFlags, modSeq, err = rd.getOperationalDatabase().RemoveMessageFlags(ctx, messageUID, mailboxID, flagsToRemove)
-			return nil, err
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-	return
-}
-
-func (rd *ResilientDatabase) SetMessageFlagsWithRetry(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	err = retry.WithRetry(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			updatedFlags, modSeq, err = rd.getOperationalDatabase().SetMessageFlags(ctx, messageUID, mailboxID, newFlags)
-			return nil, err
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, config)
-	return
-}
-
-// --- Fetch Wrappers ---
-
-func (rd *ResilientDatabase) GetMessageEnvelopeWithRetry(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var envelope *imap.Envelope
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessageEnvelope(ctx, UID, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		envelope = result.(*imap.Envelope)
-		return nil
-	}, config)
-	return envelope, err
-}
-
-func (rd *ResilientDatabase) GetMessageHeadersWithRetry(ctx context.Context, messageUID imap.UID, mailboxID int64) (string, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var headers string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessageHeaders(ctx, messageUID, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		headers = result.(string)
-		return nil
-	}, config)
-	return headers, err
-}
-
-func (rd *ResilientDatabase) GetMessageTextBodyWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var body string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessageTextBody(ctx, uid, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		body = result.(string)
-		return nil
-	}, config)
-	return body, err
-}
-
-func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]db.Message, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var messages []db.Message
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		messages = result.([]db.Message)
-		return nil
-	}, config)
-	return messages, err
-}
-
-func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	var uidMap map[imap.UID]imap.UID
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().MoveMessages(ctx, ids, srcMailboxID, destMailboxID, userID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		uidMap = result.(map[imap.UID]imap.UID)
-		return nil
-	}, config)
-	return uidMap, err
-}
-
-// --- Sieve Script Management Wrappers ---
-
-func (rd *ResilientDatabase) GetUserScriptsWithRetry(ctx context.Context, userID int64) ([]*db.SieveScript, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var scripts []*db.SieveScript
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUserScripts(ctx, userID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		scripts = result.([]*db.SieveScript)
-		return nil
-	}, config)
-	return scripts, err
-}
-
-func (rd *ResilientDatabase) GetScriptByNameWithRetry(ctx context.Context, name string, userID int64) (*db.SieveScript, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var script *db.SieveScript
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetScriptByName(ctx, name, userID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		script = result.(*db.SieveScript)
-		return nil
-	}, config)
-	return script, err
-}
-
-func (rd *ResilientDatabase) CreateScriptWithRetry(ctx context.Context, userID int64, name, script string) (*db.SieveScript, error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	var createdScript *db.SieveScript
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CreateScript(ctx, userID, name, script)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		createdScript = result.(*db.SieveScript)
-		return nil
-	}, config)
-	return createdScript, err
-}
-
-func (rd *ResilientDatabase) UpdateScriptWithRetry(ctx context.Context, scriptID, userID int64, name, script string) (*db.SieveScript, error) {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	var updatedScript *db.SieveScript
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().UpdateScript(ctx, scriptID, userID, name, script)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		updatedScript = result.(*db.SieveScript)
-		return nil
-	}, config)
-	return updatedScript, err
-}
-
-func (rd *ResilientDatabase) DeleteScriptWithRetry(ctx context.Context, scriptID, userID int64) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteScript(ctx, scriptID, userID)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) SetScriptActiveWithRetry(ctx context.Context, scriptID, userID int64, active bool) error {
-	config := retry.BackoffConfig{MaxRetries: 2}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().SetScriptActive(ctx, scriptID, userID, active)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-// --- POP3 and Message List Wrappers ---
-
-func (rd *ResilientDatabase) GetMailboxMessageCountAndSizeSumWithRetry(ctx context.Context, mailboxID int64) (int, int64, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var count int
-	var sizeSum int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			c, s, err := rd.getOperationalDatabase().GetMailboxMessageCountAndSizeSum(ctx, mailboxID)
-			if err != nil {
-				return nil, err
-			}
-			return []interface{}{c, s}, nil
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		resSlice := result.([]interface{})
-		count = resSlice[0].(int)
-		sizeSum = resSlice[1].(int64)
-		return nil
-	}, config)
-	return count, sizeSum, err
-}
-
-func (rd *ResilientDatabase) ListMessagesWithRetry(ctx context.Context, mailboxID int64) ([]db.Message, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var messages []db.Message
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().ListMessages(ctx, mailboxID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		messages = result.([]db.Message)
-		return nil
-	}, config)
-	return messages, err
-}
-
-func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]db.Message, error) {
-	config := retry.BackoffConfig{MaxRetries: 3}
-	var messages []db.Message
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetMessagesWithCriteria(ctx, mailboxID, criteria)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		messages = result.([]db.Message)
-		return nil
-	}, config)
-	return messages, err
-}
-
 // --- Importer/Exporter Wrappers ---
 
 var importExportRetryConfig = retry.BackoffConfig{
@@ -1515,8 +597,20 @@ var importExportRetryConfig = retry.BackoffConfig{
 func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, userID, mailboxID int64, hash string) (int64, error) {
 	var count int64
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().DeleteMessageByHashAndMailbox(ctx, userID, mailboxID, hash)
+			return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(writeCtx, tx, userID, mailboxID, hash)
 		})
 		if cbErr != nil {
 			if !rd.isRetryableError(cbErr) {
@@ -1524,6 +618,11 @@ func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.
 			}
 			return cbErr
 		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+
 		count = result.(int64)
 		return nil
 	}, importExportRetryConfig)
@@ -1532,8 +631,20 @@ func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.
 
 func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64) error {
 	return retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().CompleteS3Upload(ctx, hash, accountID)
+			return nil, rd.getOperationalDatabaseForOperation(true).CompleteS3Upload(writeCtx, tx, hash, accountID)
 		})
 		if cbErr != nil {
 			if !rd.isRetryableError(cbErr) {
@@ -1541,895 +652,13 @@ func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash
 			}
 			return cbErr
 		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+
 		return nil
 	}, importExportRetryConfig)
-}
-
-// --- Cleanup Worker Wrappers ---
-
-// cleanupRetryConfig provides a default retry strategy for background cleanup tasks.
-var cleanupRetryConfig = retry.BackoffConfig{
-	InitialInterval: 1 * time.Second,
-	MaxInterval:     30 * time.Second,
-	Multiplier:      2.0,
-	Jitter:          true,
-	MaxRetries:      3,
-}
-
-func (rd *ResilientDatabase) AcquireCleanupLockWithRetry(ctx context.Context) (bool, error) {
-	var locked bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().AcquireCleanupLock(ctx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		locked = result.(bool)
-		return nil
-	}, cleanupRetryConfig)
-	return locked, err
-}
-
-func (rd *ResilientDatabase) ReleaseCleanupLockWithRetry(ctx context.Context) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			rd.getOperationalDatabase().ReleaseCleanupLock(ctx)
-			return nil, nil
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, cleanupRetryConfig)
-}
-
-func (rd *ResilientDatabase) ExpungeOldMessagesWithRetry(ctx context.Context, maxAge time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().ExpungeOldMessages(ctx, maxAge)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-// --- HTTP API Wrappers ---
-
-// apiRetryConfig provides a default retry strategy for HTTP API handlers.
-var apiRetryConfig = retry.BackoffConfig{
-	InitialInterval: 200 * time.Millisecond,
-	MaxInterval:     2 * time.Second,
-	Multiplier:      1.8,
-	Jitter:          true,
-	MaxRetries:      3,
-}
-
-func (rd *ResilientDatabase) AccountExistsWithRetry(ctx context.Context, email string) (bool, error) {
-	var exists bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().AccountExists(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		exists = result.(bool)
-		return nil
-	}, apiRetryConfig)
-	return exists, err
-}
-
-func (rd *ResilientDatabase) GetActiveConnectionsWithRetry(ctx context.Context) ([]db.ConnectionInfo, error) {
-	var connections []db.ConnectionInfo
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetActiveConnections(ctx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			connections = result.([]db.ConnectionInfo)
-		}
-		return nil
-	}, apiRetryConfig)
-	return connections, err
-}
-
-func (rd *ResilientDatabase) MarkConnectionsForTerminationWithRetry(ctx context.Context, criteria db.TerminationCriteria) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().MarkConnectionsForTermination(ctx, criteria)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, apiRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetConnectionStatsWithRetry(ctx context.Context) (*db.ConnectionStats, error) {
-	var stats *db.ConnectionStats
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetConnectionStats(ctx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(*db.ConnectionStats)
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
-}
-
-func (rd *ResilientDatabase) GetUserConnectionsWithRetry(ctx context.Context, email string) ([]db.ConnectionInfo, error) {
-	var connections []db.ConnectionInfo
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUserConnections(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			connections = result.([]db.ConnectionInfo)
-		}
-		return nil
-	}, apiRetryConfig)
-	return connections, err
-}
-
-func (rd *ResilientDatabase) GetLatestCacheMetricsWithRetry(ctx context.Context) ([]*db.CacheMetricsRecord, error) {
-	var metrics []*db.CacheMetricsRecord
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetLatestCacheMetrics(ctx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			metrics = result.([]*db.CacheMetricsRecord)
-		}
-		return nil
-	}, apiRetryConfig)
-	return metrics, err
-}
-
-func (rd *ResilientDatabase) GetCacheMetricsWithRetry(ctx context.Context, instanceID string, since time.Time, limit int) ([]*db.CacheMetricsRecord, error) {
-	var metrics []*db.CacheMetricsRecord
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetCacheMetrics(ctx, instanceID, since, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			metrics = result.([]*db.CacheMetricsRecord)
-		}
-		return nil
-	}, apiRetryConfig)
-	return metrics, err
-}
-
-func (rd *ResilientDatabase) GetSystemHealthOverviewWithRetry(ctx context.Context, hostname string) (*db.SystemHealthOverview, error) {
-	var overview *db.SystemHealthOverview
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetSystemHealthOverview(ctx, hostname)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			overview = result.(*db.SystemHealthOverview)
-		}
-		return nil
-	}, apiRetryConfig)
-	return overview, err
-}
-
-func (rd *ResilientDatabase) GetAllHealthStatusesWithRetry(ctx context.Context, hostname string) ([]*db.HealthStatus, error) {
-	var statuses []*db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetAllHealthStatuses(ctx, hostname)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			statuses = result.([]*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return statuses, err
-}
-
-func (rd *ResilientDatabase) GetHealthHistoryWithRetry(ctx context.Context, hostname, component string, since time.Time, limit int) ([]*db.HealthStatus, error) {
-	var history []*db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetHealthHistory(ctx, hostname, component, since, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			history = result.([]*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return history, err
-}
-
-func (rd *ResilientDatabase) GetHealthStatusWithRetry(ctx context.Context, hostname, component string) (*db.HealthStatus, error) {
-	var status *db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetHealthStatus(ctx, hostname, component)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			status = result.(*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return status, err
-}
-
-func (rd *ResilientDatabase) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
-	var stats *db.UploaderStats
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUploaderStats(ctx, maxAttempts)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(*db.UploaderStats)
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
-}
-
-func (rd *ResilientDatabase) GetFailedUploadsWithRetry(ctx context.Context, maxAttempts, limit int) ([]db.PendingUpload, error) {
-	var uploads []db.PendingUpload
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetFailedUploads(ctx, maxAttempts, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			uploads = result.([]db.PendingUpload)
-		}
-		return nil
-	}, apiRetryConfig)
-	return uploads, err
-}
-
-func (rd *ResilientDatabase) GetAuthAttemptsStatsWithRetry(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
-	var stats map[string]interface{}
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetAuthAttemptsStats(ctx, windowDuration)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(map[string]interface{})
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
-}
-
-func (rd *ResilientDatabase) CleanupStaleConnectionsWithRetry(ctx context.Context, staleDuration time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupStaleConnections(ctx, staleDuration)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, adminRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetBlockedIPsWithRetry(ctx context.Context, ipWindow, usernameWindow time.Duration, maxAttemptsIP, maxAttemptsUsername int) ([]map[string]interface{}, error) {
-	var blocked []map[string]interface{}
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetBlockedIPs(ctx, ipWindow, usernameWindow, maxAttemptsIP, maxAttemptsUsername)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			blocked = result.([]map[string]interface{})
-		} else {
-			blocked = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return blocked, err
-}
-
-// --- Admin Credentials Wrappers ---
-
-func (rd *ResilientDatabase) AddCredentialWithRetry(ctx context.Context, req db.AddCredentialRequest) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().AddCredential(ctx, req)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email string) ([]db.Credential, error) {
-	var credentials []db.Credential
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().ListCredentials(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			credentials = result.([]db.Credential)
-		} else {
-			credentials = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return credentials, err
-}
-
-func (rd *ResilientDatabase) DeleteCredentialWithRetry(ctx context.Context, email string) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteCredential(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) GetCredentialDetailsWithRetry(ctx context.Context, email string) (*db.CredentialDetails, error) {
-	var details *db.CredentialDetails
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetCredentialDetails(ctx, email)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrUserNotFound) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			details = result.(*db.CredentialDetails)
-		} else {
-			details = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return details, err
-}
-
-// --- Admin Tool Wrappers ---
-
-// adminRetryConfig provides a default retry strategy for short-lived admin CLI commands.
-var adminRetryConfig = retry.BackoffConfig{
-	InitialInterval: 250 * time.Millisecond,
-	MaxInterval:     3 * time.Second,
-	Multiplier:      1.8,
-	Jitter:          true,
-	MaxRetries:      3,
-}
-
-func (rd *ResilientDatabase) CreateAccountWithRetry(ctx context.Context, req db.CreateAccountRequest) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().CreateAccount(ctx, req)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.AccountSummary, error) {
-	var accounts []*db.AccountSummary
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().ListAccounts(ctx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			// Convert []AccountSummary to []*AccountSummary
-			summaries := result.([]db.AccountSummary)
-			accounts = make([]*db.AccountSummary, len(summaries))
-			for i := range summaries {
-				accounts[i] = &summaries[i]
-			}
-		} else {
-			accounts = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return accounts, err
-}
-
-func (rd *ResilientDatabase) GetAccountDetailsWithRetry(ctx context.Context, email string) (*db.AccountDetails, error) {
-	var details *db.AccountDetails
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetAccountDetails(ctx, email)
-		})
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrUserNotFound) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			details = result.(*db.AccountDetails)
-		} else {
-			details = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return details, err
-}
-
-func (rd *ResilientDatabase) UpdateAccountWithRetry(ctx context.Context, req db.UpdateAccountRequest) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().UpdateAccount(ctx, req)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) DeleteAccountWithRetry(ctx context.Context, email string) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().DeleteAccount(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) RestoreAccountWithRetry(ctx context.Context, email string) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().RestoreAccount(ctx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, adminRetryConfig)
-}
-
-func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupFailedUploads(ctx, gracePeriod)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupSoftDeletedAccounts(ctx, gracePeriod)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupOldVacationResponses(ctx, gracePeriod)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupOldHealthStatuses(ctx, retention)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, batchSize int) ([]db.UserScopedObjectForCleanup, error) {
-	var candidates []db.UserScopedObjectForCleanup
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUserScopedObjectsForCleanup(ctx, gracePeriod, batchSize)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			candidates = result.([]db.UserScopedObjectForCleanup)
-		} else {
-			candidates = nil
-		}
-		return nil
-	}, cleanupRetryConfig)
-	return candidates, err
-}
-
-func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().PruneOldMessageBodies(ctx, retention)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
-	var hashes []string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetUnusedContentHashes(ctx, batchSize)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			hashes = result.([]string)
-		} else {
-			hashes = nil
-		}
-		return nil
-	}, cleanupRetryConfig)
-	return hashes, err
-}
-
-func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int) ([]int64, error) {
-	var accounts []int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetDanglingAccountsForFinalDeletion(ctx, batchSize)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			accounts = result.([]int64)
-		} else {
-			accounts = nil
-		}
-		return nil
-	}, cleanupRetryConfig)
-	return accounts, err
-}
-
-func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().DeleteExpungedMessagesByS3KeyPartsBatch(ctx, candidates)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().DeleteMessageContentsByHashBatch(ctx, hashes)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-func (rd *ResilientDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().FinalizeAccountDeletions(ctx, accountIDs)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-// --- Cache Metrics Wrappers ---
-
-func (rd *ResilientDatabase) StoreCacheMetricsWithRetry(ctx context.Context, instanceID, serverHostname string, hits, misses int64, uptimeSeconds int64) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      2,
-	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().StoreCacheMetrics(ctx, instanceID, serverHostname, hits, misses, uptimeSeconds)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-		return cbErr
-	}, config)
-}
-
-func (rd *ResilientDatabase) CleanupOldCacheMetricsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().CleanupOldCacheMetrics(ctx, olderThan)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		count = result.(int64)
-		return nil
-	}, cleanupRetryConfig)
-	return count, err
-}
-
-// --- Cache Helper Wrappers ---
-
-func (rd *ResilientDatabase) FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error) {
-	var existingHashes []string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().FindExistingContentHashes(ctx, hashes)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			existingHashes = result.([]string)
-		} else {
-			existingHashes = nil
-		}
-		return nil
-	}, cleanupRetryConfig) // Use cleanup config as this is for background maintenance
-	return existingHashes, err
-}
-
-func (rd *ResilientDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	var messages map[string][]string
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().GetRecentMessagesForWarmup(ctx, userID, mailboxNames, messageCount)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			messages = result.(map[string][]string)
-		} else {
-			messages = nil
-		}
-		return nil
-	}, apiRetryConfig) // Use api config as this is for interactive performance
-	return messages, err
 }
 
 // --- Health Status Wrappers ---
@@ -2443,12 +672,29 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 		MaxRetries:      2,
 	}
 	return retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+		defer cancel()
+
 		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().StoreHealthStatus(ctx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
+			return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(writeCtx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
 		})
 		if cbErr != nil && !rd.isRetryableError(cbErr) {
 			return retry.Stop(cbErr)
 		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+
 		return cbErr
 	}, config)
 }
@@ -2594,11 +840,6 @@ func (rd *ResilientDatabase) getCurrentDatabaseForOperation(isWrite bool) *db.Da
 		// Fallback to first read pool
 		return rd.failoverManager.readPools[0].database
 	}
-}
-
-// getOperationalDatabase returns the database to use for operations, with runtime failover
-func (rd *ResilientDatabase) getOperationalDatabase() *db.Database {
-	return rd.getOperationalDatabaseForOperation(true) // Default to write for backward compatibility
 }
 
 // getOperationalDatabaseForOperation returns the database to use for operations, with runtime failover
@@ -2912,61 +1153,4 @@ func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType st
 
 	log.Printf("[RESILIENT-FAILOVER] %s pools health: %d total conns, %d idle, %d in-use across %d pools",
 		poolType, totalConns, idleConns, acquiredConns, len(pools))
-}
-
-// --- Uploader Worker Wrappers ---
-
-func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
-	var uploads []db.PendingUpload
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().AcquireAndLeasePendingUploads(ctx, instanceId, limit, retryInterval, maxAttempts)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			uploads = result.([]db.PendingUpload)
-		} else {
-			uploads = nil
-		}
-		return nil
-	}, cleanupRetryConfig)
-	return uploads, err
-}
-
-func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabase().MarkUploadAttempt(ctx, contentHash, accountID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		return nil
-	}, cleanupRetryConfig)
-}
-
-func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
-	var isUploaded bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabase().IsContentHashUploaded(ctx, contentHash, accountID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		isUploaded = result.(bool)
-		return nil
-	}, cleanupRetryConfig)
-	return isUploaded, err
 }

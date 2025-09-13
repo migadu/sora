@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // VacationResponse represents a record of a vacation auto-response sent to a sender
@@ -15,9 +17,9 @@ type VacationResponse struct {
 }
 
 // RecordVacationResponse records that a vacation response was sent to a specific sender
-func (db *Database) RecordVacationResponse(ctx context.Context, userID int64, senderAddress string) error {
+func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, userID int64, senderAddress string) error {
 	now := time.Now()
-	_, err := db.GetWritePool().Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		INSERT INTO vacation_responses (account_id, sender_address, response_date, created_at)
 		VALUES ($1, $2, $3, $4)
 	`, userID, senderAddress, now, now)
@@ -43,10 +45,10 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, userID int64,
 }
 
 // CleanupOldVacationResponses removes vacation response records older than the specified duration
-func (db *Database) CleanupOldVacationResponses(ctx context.Context, olderThan time.Duration) (int64, error) {
+func (db *Database) CleanupOldVacationResponses(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	cutoffTime := time.Now().Add(-olderThan)
 
-	result, err := db.GetWritePool().Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		DELETE FROM vacation_responses
 		WHERE response_date < $1
 	`, cutoffTime)

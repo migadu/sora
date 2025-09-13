@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (d *Database) FindExistingContentHashes(ctx context.Context, ids []string) ([]string, error) {
@@ -22,7 +24,8 @@ func (d *Database) FindExistingContentHashes(ctx context.Context, ids []string) 
 	for rows.Next() {
 		var chash string
 		if err := rows.Scan(&chash); err != nil {
-			continue // log or ignore individual scan errors
+			log.Printf("WARNING: failed to scan content hash: %v", err)
+			continue
 		}
 		result = append(result, chash)
 	}
@@ -43,14 +46,14 @@ type CacheMetricsRecord struct {
 }
 
 // StoreCacheMetrics stores cache metrics in the database
-func (d *Database) StoreCacheMetrics(ctx context.Context, instanceID, serverHostname string, hits, misses int64, uptimeSeconds int64) error {
+func (d *Database) StoreCacheMetrics(ctx context.Context, tx pgx.Tx, instanceID, serverHostname string, hits, misses int64, uptimeSeconds int64) error {
 	totalOps := hits + misses
 	var hitRate float64
 	if totalOps > 0 {
 		hitRate = float64(hits) / float64(totalOps) * 100
 	}
 
-	_, err := d.GetWritePool().Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 		INSERT INTO cache_metrics (instance_id, server_hostname, hits, misses, hit_rate, total_operations, uptime_seconds)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		instanceID, serverHostname, hits, misses, hitRate, totalOps, uptimeSeconds)
@@ -98,7 +101,7 @@ func (d *Database) GetCacheMetrics(ctx context.Context, instanceID string, since
 		metrics = append(metrics, &m)
 	}
 
-	return metrics, nil
+	return metrics, rows.Err()
 }
 
 // GetLatestCacheMetrics retrieves the latest cache metrics for all instances
@@ -129,14 +132,14 @@ func (d *Database) GetLatestCacheMetrics(ctx context.Context) ([]*CacheMetricsRe
 		metrics = append(metrics, &m)
 	}
 
-	return metrics, nil
+	return metrics, rows.Err()
 }
 
 // CleanupOldCacheMetrics removes cache metrics older than the specified duration
-func (d *Database) CleanupOldCacheMetrics(ctx context.Context, olderThan time.Duration) (int64, error) {
+func (d *Database) CleanupOldCacheMetrics(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-olderThan)
 
-	result, err := d.GetWritePool().Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		DELETE FROM cache_metrics WHERE recorded_at < $1`, cutoff)
 	if err != nil {
 		return 0, err

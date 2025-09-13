@@ -9,7 +9,7 @@ import (
 )
 
 // RecordAuthAttempt records an authentication attempt in the database
-func (d *Database) RecordAuthAttempt(ctx context.Context, ipAddress, username, protocol string, success bool) error {
+func (d *Database) RecordAuthAttempt(ctx context.Context, tx pgx.Tx, ipAddress, username, protocol string, success bool) error {
 	query := `
 		INSERT INTO auth_attempts (ip_address, username, protocol, success, attempted_at)
 		VALUES ($1, $2, $3, $4, now())`
@@ -21,7 +21,7 @@ func (d *Database) RecordAuthAttempt(ctx context.Context, ipAddress, username, p
 		usernameParam = username
 	}
 
-	_, err := d.GetWritePool().Exec(ctx, query, ipAddress, usernameParam, protocol, success)
+	_, err := tx.Exec(ctx, query, ipAddress, usernameParam, protocol, success)
 	if err != nil {
 		return fmt.Errorf("failed to record auth attempt: %w", err)
 	}
@@ -223,5 +223,5 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 		results = append(results, result)
 	}
 
-	return results, nil
+	return results, rows.Err()
 }

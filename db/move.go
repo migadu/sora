@@ -6,10 +6,11 @@ import (
 	"log"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 )
 
-func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
+func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
 	// Map to store the original UID to new UID mapping
 	messageUIDMap := make(map[imap.UID]imap.UID)
 
@@ -18,21 +19,6 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		log.Printf("[DB] WARNING: source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
 		return nil, fmt.Errorf("cannot move messages within the same mailbox")
 	}
-
-	// Ensure the destination mailbox exists
-	destMailbox, err := db.GetMailbox(ctx, destMailboxID, userID)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to fetch destination mailbox %d: %v", destMailboxID, err)
-		return nil, consts.ErrMailboxNotFound
-	}
-
-	// Begin a transaction
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		log.Printf("[DB] ERROR: failed to begin transaction: %v", err)
-		return nil, consts.ErrInternalError
-	}
-	defer tx.Rollback(ctx) // Rollback if any error occurs
 
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `
@@ -85,6 +71,12 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
+	// Fetch destination mailbox name within the same transaction
+	var destMailboxName string
+	if err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1", destMailboxID).Scan(&destMailboxName); err != nil {
+		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
+	}
+
 	// Batch insert the moved messages into the destination mailbox.
 	// This single query is much more efficient than inserting in a loop.
 	// It also fixes a bug where s3_domain, s3_localpart, and the correct
@@ -107,7 +99,7 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 			d.new_uid
 		FROM messages m
 		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
-	`, destMailboxID, destMailbox.Name, messageIDs, newUIDs)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to batch insert messages into destination mailbox: %v", err)
 		return nil, fmt.Errorf("failed to move messages: %w", err)
@@ -123,12 +115,6 @@ func (db *Database) MoveMessages(ctx context.Context, ids *[]imap.UID, srcMailbo
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to mark original messages as expunged: %v", err)
 		return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
-	}
-
-	// Commit the transaction
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] ERROR: failed to commit transaction: %v", err)
-		return nil, consts.ErrInternalError
 	}
 
 	return messageUIDMap, nil

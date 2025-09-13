@@ -230,7 +230,9 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
 		
-		object = result.(*minio.Object)
+		if result != nil {
+			object = result.(*minio.Object)
+		}
 		return nil
 	}, config)
 

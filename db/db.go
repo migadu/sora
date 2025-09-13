@@ -134,7 +134,6 @@ func (db *Database) Close() {
 	}
 }
 
-
 // GetWritePool returns the connection pool for write operations
 func (db *Database) GetWritePool() *pgxpool.Pool {
 	return db.WritePool
@@ -187,15 +186,11 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 		constructingConns := float64(stats.ConstructingConns())
 
 		result["write"].IsHealthy = true
-		if acquiredConns/maxConns > 0.90 {
+		if maxConns > 0 && acquiredConns/maxConns > 0.90 {
 			result["write"].IsHealthy = false
 			log.Printf("[DB-HEALTH] Write pool unhealthy: high utilization (%.1f%%)", (acquiredConns/maxConns)*100)
 		}
-		if stats.AcquireDuration() > 5*time.Second {
-			result["write"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Write pool unhealthy: slow acquire duration (%v)", stats.AcquireDuration())
-		}
-		if constructingConns/maxConns > 0.20 {
+		if maxConns > 0 && constructingConns/maxConns > 0.20 {
 			result["write"].IsHealthy = false
 			log.Printf("[DB-HEALTH] Write pool unhealthy: too many constructing connections (%.1f%%)", (constructingConns/maxConns)*100)
 		}
@@ -221,15 +216,11 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 		constructingConns := float64(stats.ConstructingConns())
 
 		result["read"].IsHealthy = true
-		if acquiredConns/maxConns > 0.90 {
+		if maxConns > 0 && acquiredConns/maxConns > 0.90 {
 			result["read"].IsHealthy = false
 			log.Printf("[DB-HEALTH] Read pool unhealthy: high utilization (%.1f%%)", (acquiredConns/maxConns)*100)
 		}
-		if stats.AcquireDuration() > 5*time.Second {
-			result["read"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Read pool unhealthy: slow acquire duration (%v)", stats.AcquireDuration())
-		}
-		if constructingConns/maxConns > 0.20 {
+		if maxConns > 0 && constructingConns/maxConns > 0.20 {
 			result["read"].IsHealthy = false
 			log.Printf("[DB-HEALTH] Read pool unhealthy: too many constructing connections (%.1f%%)", (constructingConns/maxConns)*100)
 		}
@@ -237,7 +228,6 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 
 	return result
 }
-
 
 // GetWriteFailoverStats returns failover statistics for write operations
 func (db *Database) GetWriteFailoverStats() []map[string]interface{} {
@@ -343,7 +333,9 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 		fm.MarkHostUnhealthy(host.Host, fmt.Errorf("health check failed: %w", err))
 		return
 	}
-	defer conn.Close(checkCtx)
+	defer func() {
+		_ = conn.Close(checkCtx) // Log or ignore error on close
+	}()
 	// Simple ping query
 	var result int
 	err = conn.QueryRow(checkCtx, "SELECT 1").Scan(&result)
@@ -654,8 +646,8 @@ type measuredTx struct {
 }
 
 // BeginTx starts a new transaction and wraps it for metric collection.
-func (db *Database) BeginTx(ctx context.Context) (pgx.Tx, error) {
-	tx, err := db.GetWritePool().Begin(ctx)
+func (db *Database) BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := db.GetWritePool().BeginTx(ctx, txOptions)
 	if err != nil {
 		return nil, err
 	}

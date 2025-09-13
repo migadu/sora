@@ -96,7 +96,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 	if rdb == nil {
 		return nil, fmt.Errorf("database is required for IMAP server")
 	}
-	
+
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
 	if options.ProxyProtocol.Enabled {
@@ -278,6 +278,9 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		log.Printf("* IMAP listening on %s", imapAddr)
 	}
 	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
 
 	// Wrap listener with PROXY protocol support if enabled
 	if s.proxyReader != nil {

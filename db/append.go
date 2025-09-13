@@ -16,24 +16,15 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-// CopyMessages copies multiple messages from a source mailbox to a destination mailbox in a single transaction.
-// It returns a map of old UIDs to new UIDs. It is analogous to MoveMessages but does not expunge the source.
-func (db *Database) CopyMessages(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
+// CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
+// It returns a map of old UIDs to new UIDs.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if srcMailboxID == destMailboxID {
 		return nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
 
-	destMailbox, err := db.GetMailbox(ctx, destMailboxID, userID)
-	if err != nil {
-		return nil, consts.ErrMailboxNotFound
-	}
-
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return nil, consts.ErrDBBeginTransactionFailed
-	}
-	defer tx.Rollback(ctx)
+	// The caller is responsible for beginning and committing/rolling back the transaction.
 
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `SELECT id, uid FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
@@ -78,6 +69,12 @@ func (db *Database) CopyMessages(ctx context.Context, uids *[]imap.UID, srcMailb
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
+	// Fetch destination mailbox name within the same transaction
+	var destMailboxName string
+	if err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1", destMailboxID).Scan(&destMailboxName); err != nil {
+		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
+	}
+
 	// Batch insert the copied messages
 	_, err = tx.Exec(ctx, `
 		INSERT INTO messages (
@@ -91,19 +88,15 @@ func (db *Database) CopyMessages(ctx context.Context, uids *[]imap.UID, srcMailb
 			m.subject, m.sent_date, m.internal_date, m.flags | $5, m.custom_flags, m.size,
 			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
 			$1 AS mailbox_id,
-			$2 AS mailbox_path,
+			$2 AS mailbox_path, -- Use the fetched destination mailbox name
 			NOW() AS flags_changed_at,
 			nextval('messages_modseq'),
 			d.new_uid
 		FROM messages m
 		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
-	`, destMailboxID, destMailbox.Name, messageIDs, newUIDs, FlagRecent)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, FlagRecent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch copy messages: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, consts.ErrDBCommitTransactionFailed
 	}
 
 	return messageUIDMap, nil
@@ -133,7 +126,7 @@ type InsertMessageOptions struct {
 	FTSRetention         time.Duration // Optional: FTS retention period to skip old messages
 }
 
-func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
+func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
 		log.Printf("[DB] messageID is empty after sanitization, generating a new one without modifying the message.")
@@ -150,13 +143,6 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
-
-	tx, err := d.BeginTx(ctx)
-	if err != nil {
-		log.Printf("[DB] failed to begin transaction: %v", err)
-		return 0, 0, consts.ErrDBBeginTransactionFailed
-	}
-	defer tx.Rollback(ctx)
 
 	var highestUID int64
 	// Atomically increment and get the new highest UID for the mailbox.
@@ -282,16 +268,15 @@ func (d *Database) InsertMessage(ctx context.Context, options *InsertMessageOpti
 		time.Now(),
 		upload.AccountID,
 	)
-
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] failed to commit transaction: %v", err)
-		return 0, 0, consts.ErrDBCommitTransactionFailed
+	if err != nil {
+		log.Printf("[DB] failed to insert into pending_uploads for content_hash %s: %v", upload.ContentHash, err)
+		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
 	return messageRowId, highestUID, nil
 }
 
-func (d *Database) InsertMessageFromImporter(ctx context.Context, options *InsertMessageOptions) (messageID int64, uid int64, err error) {
+func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions) (messageID int64, uid int64, err error) {
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
 		log.Printf("[DB] messageID is empty after sanitization, generating a new one without modifying the message.")
@@ -308,13 +293,6 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
-
-	tx, err := d.BeginTx(ctx)
-	if err != nil {
-		log.Printf("[DB] failed to begin transaction: %v", err)
-		return 0, 0, consts.ErrDBBeginTransactionFailed
-	}
-	defer tx.Rollback(ctx)
 
 	var highestUID int64
 	var uidToUse int64
@@ -463,11 +441,6 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, options *Inser
 	if err != nil {
 		log.Printf("[DB] failed to insert message content for content_hash %s: %v", options.ContentHash, err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		log.Printf("[DB] failed to commit transaction: %v", err)
-		return 0, 0, consts.ErrDBCommitTransactionFailed
 	}
 
 	return messageRowId, uidToUse, nil

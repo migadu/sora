@@ -80,13 +80,7 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	return allFlags, nil
 }
 
-func (db *Database) SetMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to begin transaction for SetMessageFlags: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// Ensure modSeq is initialized in case of early error returns before it's set.
+func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
@@ -109,19 +103,10 @@ func (db *Database) SetMessageFlags(ctx context.Context, messageUID imap.UID, ma
 		return nil, 0, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, fmt.Errorf("failed to commit transaction for SetMessageFlags: %w", err)
-	}
 	return currentFlags, modSeq, nil
 }
 
-func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to begin transaction for AddMessageFlags: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
 	var currentModSeq sql.NullInt64 // Use sql.NullInt64 to handle potential NULL from RETURNING if no rows updated
 
@@ -170,19 +155,10 @@ func (db *Database) AddMessageFlags(ctx context.Context, messageUID imap.UID, ma
 		return nil, 0, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, fmt.Errorf("failed to commit transaction for AddMessageFlags: %w", err)
-	}
 	return currentFlags, modSeq, nil
 }
 
-func (db *Database) RemoveMessageFlags(ctx context.Context, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
-	tx, err := db.BeginTx(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to begin transaction for RemoveMessageFlags: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
+func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
 	var currentModSeq sql.NullInt64
 
@@ -227,9 +203,6 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, messageUID imap.UID,
 		return nil, 0, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, fmt.Errorf("failed to commit transaction for RemoveMessageFlags: %w", err)
-	}
 	return currentFlags, modSeq, nil
 }
 
