@@ -20,7 +20,7 @@ import (
 
 type UploadWorker struct {
 	rdb           *resilient.ResilientDatabase
-	s3            *storage.S3Storage
+	s3            *resilient.ResilientS3Storage  // Use resilient S3 with circuit breakers
 	cache         *cache.Cache
 	path          string
 	batchSize     int
@@ -33,6 +33,9 @@ type UploadWorker struct {
 }
 
 func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
+	// Wrap S3 storage with resilient patterns including circuit breakers
+	resilientS3 := resilient.NewResilientS3Storage(s3)
+	
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create local path %s: %w", path, err)
@@ -42,7 +45,7 @@ func New(ctx context.Context, path string, batchSize int, concurrency int, maxAt
 
 	return &UploadWorker{
 		rdb:           rdb,
-		s3:            s3,
+		s3:            resilientS3,  // Use resilient S3 wrapper
 		cache:         cache,
 		errCh:         errCh,
 		path:          path,
@@ -73,7 +76,7 @@ func (w *UploadWorker) Start(ctx context.Context) {
 					select {
 					case w.errCh <- err:
 					default:
-						log.Printf("[UPLOADER[] worker error (no listener): %v", err)
+						log.Printf("[UPLOADER] worker error (no listener): %v", err)
 					}
 				}
 			case <-w.notifyCh:
@@ -136,7 +139,22 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 }
 
 func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) {
+	// Early validation of upload data
+	if !isValidContentHash(upload.ContentHash) {
+		log.Printf("[UPLOADER] ERROR: invalid content hash in upload record: %s", upload.ContentHash)
+		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		return
+	}
+	
 	log.Printf("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
+
+	// Check for context cancellation early
+	select {
+	case <-ctx.Done():
+		log.Printf("[UPLOADER] context cancelled during upload of hash %s", upload.ContentHash)
+		return
+	default:
+	}
 
 	// Get primary address to construct S3 path
 	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
@@ -182,9 +200,10 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return // Cannot proceed without the file
 	}
 
-	// Attempt to upload to S3. The storage layer should handle checking for existence.
+	// Attempt to upload to S3 using resilient wrapper with circuit breakers and retries.
+	// The storage layer should handle checking for existence.
 	start := time.Now()
-	err = w.s3.Put(s3Key, bytes.NewReader(data), upload.Size)
+	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
 		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
@@ -227,8 +246,29 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 }
 
 func (w *UploadWorker) FilePath(contentHash string, accountID int64) string {
+	// Validate content hash to prevent path traversal attacks
+	if !isValidContentHash(contentHash) {
+		log.Printf("[UPLOADER] WARNING: invalid content hash attempted: %s", contentHash)
+		// Return a safe fallback path that will fail cleanly
+		return filepath.Join(w.path, "invalid", "invalid")
+	}
 	// Scope the local file by account ID to prevent conflicts and simplify cleanup.
 	return filepath.Join(w.path, fmt.Sprintf("%d", accountID), contentHash)
+}
+
+// isValidContentHash validates that a content hash contains only safe characters
+// and is the expected length for BLAKE3 hashes (64 hex characters)
+func isValidContentHash(hash string) bool {
+	if len(hash) != 64 {
+		return false
+	}
+	// Check that all characters are valid hex digits
+	for _, r := range hash {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {

@@ -1656,7 +1656,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
 
-		reader, err := s.server.s3.Get(s3Key)
+		reader, err := s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve message UID %d from S3: %v", msg.UID, err)
 		}

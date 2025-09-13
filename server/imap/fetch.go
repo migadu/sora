@@ -505,7 +505,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		}
 		s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
 
-		reader, err := s.server.s3.Get(s3Key)
+		reader, err := s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve message UID %d from S3: %v", msg.UID, err)
 		}

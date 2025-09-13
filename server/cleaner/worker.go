@@ -31,7 +31,7 @@ import (
 
 type CleanupWorker struct {
 	rdb                   *resilient.ResilientDatabase
-	s3                    *storage.S3Storage
+	s3                    *resilient.ResilientS3Storage  // Use resilient S3 with circuit breakers
 	cache                 *cache.Cache
 	interval              time.Duration
 	gracePeriod           time.Duration
@@ -43,9 +43,12 @@ type CleanupWorker struct {
 
 // New creates a new CleanupWorker.
 func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention time.Duration) *CleanupWorker {
+	// Wrap S3 storage with resilient patterns including circuit breakers
+	resilientS3 := resilient.NewResilientS3Storage(s3)
+	
 	return &CleanupWorker{
 		rdb:                   rdb,
-		s3:                    s3,
+		s3:                    resilientS3,  // Use resilient S3 wrapper
 		cache:                 cache,
 		interval:              interval,
 		gracePeriod:           gracePeriod,
@@ -185,8 +188,23 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		var failedS3Keys []string
 
 		for _, candidate := range candidates {
+			// Validate candidate data before processing
+			if candidate.ContentHash == "" || candidate.S3Domain == "" || candidate.S3Localpart == "" {
+				log.Printf("[CLEANUP] WARNING: invalid candidate data - hash:%s domain:%s localpart:%s", 
+					candidate.ContentHash, candidate.S3Domain, candidate.S3Localpart)
+				continue
+			}
+			
+			// Check for context cancellation in the loop
+			select {
+			case <-ctx.Done():
+				log.Println("[CLEANUP] context cancelled during S3 cleanup")
+				return fmt.Errorf("context cancelled during S3 cleanup")
+			default:
+			}
+			
 			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
-			s3Err := w.s3.Delete(s3Key)
+			s3Err := w.s3.DeleteWithRetry(ctx, s3Key)
 
 			isS3ObjectNotFoundError := false
 			var minioErr minio.ErrorResponse

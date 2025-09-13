@@ -23,7 +23,7 @@ type POP3Server struct {
 	addr               string
 	hostname           string
 	rdb                *resilient.ResilientDatabase
-	s3                 *storage.S3Storage
+	s3                 *resilient.ResilientS3Storage
 	appCtx             context.Context
 	cancel             context.CancelFunc // Cancel function for the app context
 	uploader           *uploader.UploadWorker
@@ -61,6 +61,9 @@ type POP3ServerOptions struct {
 }
 
 func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
+	// Wrap S3 storage with resilient patterns including circuit breakers
+	resilientS3 := resilient.NewResilientS3Storage(s3)
+	
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
@@ -82,7 +85,7 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 		hostname:           hostname,
 		addr:               popAddr,
 		rdb:                rdb,
-		s3:                 s3,
+		s3:                 resilientS3,
 		appCtx:             serverCtx,
 		cancel:             serverCancel,
 		uploader:           uploadWorker,

@@ -29,7 +29,7 @@ type IMAPServer struct {
 	addr               string
 	rdb                *resilient.ResilientDatabase
 	hostname           string
-	s3                 *storage.S3Storage
+	s3                 *resilient.ResilientS3Storage
 	server             *imapserver.Server
 	uploader           *uploader.UploadWorker
 	cache              *cache.Cache
@@ -96,6 +96,9 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 	if rdb == nil {
 		return nil, fmt.Errorf("database is required for IMAP server")
 	}
+	
+	// Wrap S3 storage with resilient patterns including circuit breakers
+	resilientS3 := resilient.NewResilientS3Storage(s3)
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
@@ -125,7 +128,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 		appCtx:             appCtx,
 		addr:               imapAddr,
 		rdb:                rdb,
-		s3:                 s3,
+		s3:                 resilientS3,
 		uploader:           uploadWorker,
 		cache:              cache,
 		appendLimit:        options.AppendLimit,
@@ -435,7 +438,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 						log.Printf("[IMAP] warmup: retrying S3 fetch for %s (attempt %d/%d)", contentHash, attempt+1, maxRetries)
 					}
 
-					reader, err := s.s3.Get(s3Key)
+					reader, err := s.s3.GetWithRetry(ctx, s3Key)
 					if err != nil {
 						fetchErr = err
 						continue

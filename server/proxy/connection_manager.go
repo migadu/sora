@@ -76,16 +76,32 @@ func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, er
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
-	// If we have a preferred address and it's in our list, try it first
+	// If we have a preferred address (from affinity or prelookup), try it first.
 	if preferredAddr != "" {
+		// Check if the preferred address is in our managed list of servers.
+		isInList := false
 		for _, addr := range cm.remoteAddrs {
-			if addr == preferredAddr && cm.isHealthy(addr) {
-				conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort, routingInfo)
-				if err == nil {
-					return conn, addr, nil
-				}
-				// Mark as unhealthy if connection failed
-				cm.markUnhealthy(addr)
+			if addr == preferredAddr {
+				isInList = true
+				break
+			}
+		}
+
+		// Only try the preferred address if it's not in the list,
+		// or if it is in the list and is currently marked as healthy.
+		if !isInList || cm.isHealthy(preferredAddr) {
+			conn, err := cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+			if err == nil {
+				// Success, return the connection.
+				return conn, preferredAddr, nil
+			}
+
+			// If the connection failed...
+			log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
+
+			// If it was a server from our list, mark it as unhealthy.
+			if isInList {
+				cm.markUnhealthy(preferredAddr)
 			}
 		}
 	}
