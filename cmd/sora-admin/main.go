@@ -474,6 +474,9 @@ Examples:
   
   # Create account with multiple credentials
   sora-admin accounts create --credentials '[{"email":"user@example.com","password":"pass1","is_primary":true},{"email":"alias@example.com","password":"pass2","is_primary":false}]'
+  
+  # Create account with mixed credentials (password and password_hash)
+  sora-admin accounts create --credentials '[{"email":"user@example.com","password":"pass1","is_primary":true},{"email":"alias@example.com","password_hash":"$2a$12$xyz...","is_primary":false}]'
 `)
 	}
 

@@ -504,25 +504,16 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              description: "Request to create an account. Use top-level fields for a single credential, or the 'credentials' array for multiple."
-              properties:
-                email:
-                  type: string
-                  format: email
-                  description: "For single credential creation. Ignored if 'credentials' array is present."
-                password:
-                  type: string
-                  format: password
-                  description: "For single credential creation. Ignored if 'credentials' array is present."
-                password_hash:
-                  type: string
-                  description: "For single credential creation. Ignored if 'credentials' array is present."
-                credentials:
-                  type: array
-                  description: "For multi-credential creation. If present, top-level email/password fields are ignored."
-                  items:
-                    $ref: '#/components/schemas/CreateCredentialSpec'
+              oneOf:
+                - $ref: '#/components/schemas/CreateAccountRequest'
+                - type: object
+                  properties:
+                    credentials:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/CreateCredentialSpec'
+                  required:
+                    - credentials
             examples:
               with_password:
                 summary: Create account with plain text password
