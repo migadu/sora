@@ -28,7 +28,6 @@ var (
 	date    = "unknown"
 )
 
-
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
 	Database   config.DatabaseConfig   `toml:"database"`
@@ -447,10 +446,11 @@ func handleCreateAccount() {
 	fs := flag.NewFlagSet("accounts create", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
-	email := fs.String("email", "", "Email address for the new account (required)")
-	password := fs.String("password", "", "Password for the new account (required unless --password-hash is provided)")
+	email := fs.String("email", "", "Email address for the new account (required unless --credentials is provided)")
+	password := fs.String("password", "", "Password for the new account (required unless --password-hash or --credentials is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
+	credentials := fs.String("credentials", "", "JSON string containing multiple credentials (alternative to single email/password)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Create a new account
@@ -459,16 +459,21 @@ Usage:
   sora-admin accounts create [options]
 
 Options:
-  --email string         Email address for the new account (required)
-  --password string      Password for the new account (required unless --password-hash is provided)
+  --email string         Email address for the new account (required unless --credentials is provided)
+  --password string      Password for the new account (required unless --password-hash or --credentials is provided)
   --password-hash string Pre-computed password hash (alternative to --password)
   --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --credentials string   JSON string containing multiple credentials (alternative to single email/password)
   --config string        Path to TOML configuration file (default: config.toml)
 
 Examples:
+  # Create account with single credential
   sora-admin accounts create --email user@example.com --password mypassword
   sora-admin accounts create --email user@example.com --password mypassword --hash ssha512
   sora-admin accounts create --email user@example.com --password-hash '$2a$12$xyz...'
+  
+  # Create account with multiple credentials
+  sora-admin accounts create --credentials '[{"email":"user@example.com","password":"pass1","is_primary":true},{"email":"alias@example.com","password":"pass2","is_primary":false}]'
 `)
 	}
 
@@ -478,22 +483,30 @@ Examples:
 	}
 
 	// Validate required arguments
-	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+	if *credentials == "" && *email == "" {
+		fmt.Printf("Error: either --email or --credentials is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
-	if *password == "" && *passwordHash == "" {
-		fmt.Printf("Error: either --password or --password-hash is required\n\n")
+	if *credentials != "" && (*email != "" || *password != "" || *passwordHash != "") {
+		fmt.Printf("Error: cannot specify --credentials with --email, --password, or --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
-	if *password != "" && *passwordHash != "" {
-		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
-		fs.Usage()
-		os.Exit(1)
+	if *credentials == "" {
+		if *password == "" && *passwordHash == "" {
+			fmt.Printf("Error: either --password or --password-hash is required\n\n")
+			fs.Usage()
+			os.Exit(1)
+		}
+
+		if *password != "" && *passwordHash != "" {
+			fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+			fs.Usage()
+			os.Exit(1)
+		}
 	}
 
 	// Validate hash type
@@ -525,12 +538,20 @@ Examples:
 		}
 	}
 
-	// Create the account (always as primary identity)
-	if err := createAccount(cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
-		log.Fatalf("Failed to create account: %v", err)
+	// Create the account
+	if *credentials != "" {
+		// Create account with multiple credentials
+		if err := createAccountWithCredentials(cfg, *credentials); err != nil {
+			log.Fatalf("Failed to create account with credentials: %v", err)
+		}
+		fmt.Printf("Successfully created account with multiple credentials\n")
+	} else {
+		// Create account with single credential (always as primary identity)
+		if err := createAccount(cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
+			log.Fatalf("Failed to create account: %v", err)
+		}
+		fmt.Printf("Successfully created account: %s\n", *email)
 	}
-
-	fmt.Printf("Successfully created account: %s\n", *email)
 }
 
 func handleAddCredential() {
@@ -659,6 +680,67 @@ func createAccount(cfg AdminConfig, email, password, passwordHash string, isPrim
 		return err
 	}
 
+	return nil
+}
+
+// CredentialInput represents a credential input from JSON
+type CredentialInput struct {
+	Email        string `json:"email"`
+	Password     string `json:"password,omitempty"`
+	PasswordHash string `json:"password_hash,omitempty"`
+	IsPrimary    bool   `json:"is_primary"`
+	HashType     string `json:"hash_type,omitempty"`
+}
+
+func createAccountWithCredentials(cfg AdminConfig, credentialsJSON string) error {
+	ctx := context.Background()
+
+	// Parse credentials JSON
+	var credentialInputs []CredentialInput
+	if err := json.Unmarshal([]byte(credentialsJSON), &credentialInputs); err != nil {
+		return fmt.Errorf("invalid credentials JSON: %w", err)
+	}
+
+	if len(credentialInputs) == 0 {
+		return fmt.Errorf("at least one credential must be provided")
+	}
+
+	// Convert to db.CredentialSpec
+	credentials := make([]db.CredentialSpec, len(credentialInputs))
+	for i, input := range credentialInputs {
+		// Set default hash type if not specified
+		hashType := input.HashType
+		if hashType == "" {
+			hashType = "bcrypt"
+		}
+
+		credentials[i] = db.CredentialSpec{
+			Email:        input.Email,
+			Password:     input.Password,
+			PasswordHash: input.PasswordHash,
+			IsPrimary:    input.IsPrimary,
+			HashType:     hashType,
+		}
+	}
+
+	// Connect to resilient database
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	if err != nil {
+		return fmt.Errorf("failed to initialize resilient database: %w", err)
+	}
+	defer rdb.Close()
+
+	// Create account with multiple credentials
+	req := db.CreateAccountWithCredentialsRequest{
+		Credentials: credentials,
+	}
+
+	accountID, err := rdb.CreateAccountWithCredentialsWithRetry(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Created account with ID %d and %d credentials", accountID, len(credentials))
 	return nil
 }
 

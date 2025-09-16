@@ -281,9 +281,18 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 // Request/Response types
 
 type CreateAccountRequest struct {
+	Email        string                      `json:"email"`
+	Password     string                      `json:"password"`
+	PasswordHash string                      `json:"password_hash"`
+	Credentials  []CreateCredentialSpec      `json:"credentials,omitempty"`
+}
+
+type CreateCredentialSpec struct {
 	Email        string `json:"email"`
 	Password     string `json:"password"`
 	PasswordHash string `json:"password_hash"`
+	IsPrimary    bool   `json:"is_primary"`
+	HashType     string `json:"hash_type"`
 }
 
 type UpdateAccountRequest struct {
@@ -317,57 +326,124 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" {
-		s.writeError(w, http.StatusBadRequest, "Email is required")
-		return
-	}
-
-	if req.Password == "" && req.PasswordHash == "" {
-		s.writeError(w, http.StatusBadRequest, "Either password or password_hash is required")
-		return
-	}
-
-	if req.Password != "" && req.PasswordHash != "" {
-		s.writeError(w, http.StatusBadRequest, "Cannot specify both password and password_hash")
-		return
-	}
-
 	ctx := r.Context()
 
-	// Create account using the database's method
-	createReq := db.CreateAccountRequest{
-		Email:        req.Email,
-		Password:     req.Password,
-		PasswordHash: req.PasswordHash,
-		IsPrimary:    true,
-		HashType:     "bcrypt",
-	}
-
-	err := s.rdb.CreateAccountWithRetry(ctx, createReq)
-	if err != nil {
-		// Rely on the DB unique constraint to handle duplicates atomically.
-		if errors.Is(err, consts.ErrDBUniqueViolation) {
-			s.writeError(w, http.StatusConflict, "Account already exists")
+	// Check if credentials array is provided for multi-credential creation
+	if len(req.Credentials) > 0 {
+		// Multi-credential creation
+		if req.Email != "" || req.Password != "" || req.PasswordHash != "" {
+			s.writeError(w, http.StatusBadRequest, "Cannot specify email, password, or password_hash when using credentials array")
 			return
 		}
-		log.Printf("HTTP API: Error creating account: %v", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to create account")
-		return
-	}
 
-	// Get the created account ID
-	accountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, req.Email)
-	if err != nil {
-		log.Printf("HTTP API: Error getting new account ID: %v", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve new account ID")
-		return
-	}
+		// Convert API types to database types
+		dbCredentials := make([]db.CredentialSpec, len(req.Credentials))
+		for i, cred := range req.Credentials {
+			if cred.Email == "" {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Credential %d: email is required", i+1))
+				return
+			}
+			if cred.Password == "" && cred.PasswordHash == "" {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Credential %d: either password or password_hash is required", i+1))
+				return
+			}
+			if cred.Password != "" && cred.PasswordHash != "" {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Credential %d: cannot specify both password and password_hash", i+1))
+				return
+			}
 
-	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"account_id": accountID,
-		"email":      req.Email,
-		"message":    "Account created successfully",
-	})
+			hashType := cred.HashType
+			if hashType == "" {
+				hashType = "bcrypt"
+			}
+
+			dbCredentials[i] = db.CredentialSpec{
+				Email:        cred.Email,
+				Password:     cred.Password,
+				PasswordHash: cred.PasswordHash,
+				IsPrimary:    cred.IsPrimary,
+				HashType:     hashType,
+			}
+		}
+
+		// Create account with multiple credentials
+		createReq := db.CreateAccountWithCredentialsRequest{
+			Credentials: dbCredentials,
+		}
+
+		accountID, err := s.rdb.CreateAccountWithCredentialsWithRetry(ctx, createReq)
+		if err != nil {
+			if errors.Is(err, consts.ErrDBUniqueViolation) {
+				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
+				return
+			}
+			log.Printf("HTTP API: Error creating account with credentials: %v", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
+			return
+		}
+
+		// Prepare response with all created credentials
+		var createdCredentials []string
+		for _, cred := range req.Credentials {
+			createdCredentials = append(createdCredentials, cred.Email)
+		}
+
+		s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"account_id":  accountID,
+			"credentials": createdCredentials,
+			"message":     "Account created successfully with multiple credentials",
+		})
+	} else {
+		// Single credential creation (backward compatibility)
+		if req.Email == "" {
+			s.writeError(w, http.StatusBadRequest, "Email is required")
+			return
+		}
+
+		if req.Password == "" && req.PasswordHash == "" {
+			s.writeError(w, http.StatusBadRequest, "Either password or password_hash is required")
+			return
+		}
+
+		if req.Password != "" && req.PasswordHash != "" {
+			s.writeError(w, http.StatusBadRequest, "Cannot specify both password and password_hash")
+			return
+		}
+
+		// Create account using the existing single-credential method
+		createReq := db.CreateAccountRequest{
+			Email:        req.Email,
+			Password:     req.Password,
+			PasswordHash: req.PasswordHash,
+			IsPrimary:    true,
+			HashType:     "bcrypt",
+		}
+
+		err := s.rdb.CreateAccountWithRetry(ctx, createReq)
+		if err != nil {
+			if errors.Is(err, consts.ErrDBUniqueViolation) {
+				s.writeError(w, http.StatusConflict, "Account already exists")
+				return
+			}
+			log.Printf("HTTP API: Error creating account: %v", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
+			return
+		}
+
+		// Get the created account ID
+		accountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, req.Email)
+		if err != nil {
+			log.Printf("HTTP API: Error getting new account ID: %v", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve new account ID")
+			return
+		}
+
+		s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"account_id": accountID,
+			"email":      req.Email,
+			"message":    "Account created successfully",
+		})
+	}
 }
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {

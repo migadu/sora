@@ -155,9 +155,13 @@ func (s *Session) handleConnection() {
 				log.Printf("[LMTP Proxy] Failed to register connection for %s: %v", s.username, err)
 			}
 
-			// Start proxying
-			log.Printf("[LMTP Proxy] Starting proxy for recipient %s (account ID: %d)", s.to, s.accountID)
-			s.startProxy(line)
+			// Start proxying only if backend connection was successful
+			if s.backendConn != nil {
+				log.Printf("[LMTP Proxy] Starting proxy for recipient %s (account ID: %d)", s.to, s.accountID)
+				s.startProxy(line)
+			} else {
+				log.Printf("[LMTP Proxy] Cannot start proxy for recipient %s: no backend connection", s.to)
+			}
 			return
 
 		case "RSET":
@@ -290,13 +294,26 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	var preferredAddr string
 	var err error
+	routingMethod := "roundrobin" // Default to round-robin
 	isPrelookupRoute := false
 	routingInfo := s.routingInfo
 
 	// 1. Use prelookup result if available
 	if routingInfo != nil && routingInfo.ServerAddress != "" {
 		isPrelookupRoute = true
-		preferredAddr = routingInfo.ServerAddress
+		routingMethod = "prelookup"
+		address := routingInfo.ServerAddress
+		// If the address from prelookup doesn't contain a port,
+		// use the new RemotePort field if it's available.
+		_, _, splitErr := net.SplitHostPort(address)
+		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
+		if portErr != nil {
+			log.Printf("[LMTP Proxy] Invalid remote_port in prelookup config: %v", portErr)
+		}
+		if splitErr != nil && remotePort > 0 {
+			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
+		}
+		preferredAddr = address
 	} else {
 		// 2. If no prelookup route, try affinity
 		preferredAddr, err = s.getPreferredBackend()
@@ -304,6 +321,7 @@ func (s *Session) connectToBackend() error {
 			log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
 		}
 		if preferredAddr != "" {
+			routingMethod = "affinity"
 			log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 		}
 	}
@@ -313,10 +331,14 @@ func (s *Session) connectToBackend() error {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
+			routingMethod = "roundrobin"
 		}
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
+	// Track which routing method was used for this connection.
+	metrics.ProxyRoutingMethod.WithLabelValues("lmtp", routingMethod).Inc()
+
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
@@ -328,6 +350,15 @@ func (s *Session) connectToBackend() error {
 		// Track backend connection failure
 		metrics.ProxyBackendConnections.WithLabelValues("lmtp", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
+	}
+
+	if isPrelookupRoute && actualAddr != preferredAddr {
+		// The prelookup route specified a server, but we connected to a different one.
+		// This means the preferred server failed and the connection manager fell back.
+		// For prelookup routes, this is a hard failure.
+		backendConn.Close()
+		metrics.ProxyBackendConnections.WithLabelValues("lmtp", "failure").Inc()
+		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
 	}
 
 	// Track backend connection success
@@ -435,6 +466,12 @@ func (s *Session) connectToBackend() error {
 // startProxy starts bidirectional proxying between client and backend.
 // initialCommand is the RCPT TO command that triggered the proxy.
 func (s *Session) startProxy(initialCommand string) {
+	if s.backendConn == nil {
+		log.Printf("[LMTP Proxy] backend connection not established for %s", s.username)
+		s.sendResponse("451 4.4.2 Backend connection not available")
+		return
+	}
+
 	// First, send the RCPT TO command that triggered proxying
 	_, err := s.backendWriter.WriteString(initialCommand + "\r\n")
 	if err != nil {
@@ -465,22 +502,28 @@ func (s *Session) startProxy(initialCommand string) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(s.backendConn, s.clientConn); err != nil && !isClosingError(err) {
+		// If this copy returns, it means the client has closed the connection or there was an error.
+		// We must close the backend connection to unblock the other copy operation.
+		defer s.backendConn.Close()
+		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
+		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(bytesIn))
+		if err != nil && !isClosingError(err) {
 			log.Printf("[LMTP Proxy] Error copying from client to backend: %v", err)
 		}
-		s.backendConn.Close()
-		s.clientConn.Close()
 	}()
 
 	// Backend to client
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(s.clientConn, s.backendConn); err != nil && !isClosingError(err) {
+		// If this copy returns, it means the backend has closed the connection or there was an error.
+		// We must close the client connection to unblock the other copy operation.
+		defer s.clientConn.Close()
+		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "out").Add(float64(bytesOut))
+		if err != nil && !isClosingError(err) {
 			log.Printf("[LMTP Proxy] Error copying from backend to client: %v", err)
 		}
-		s.clientConn.Close()
-		s.backendConn.Close()
 	}()
 
 	go func() {

@@ -32,7 +32,8 @@ type POP3ProxyServer struct {
 	affinityStickiness float64
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remoteUseXCLIENT   bool     // Whether backend supports XCLIENT command for forwarding
+	prelookupConfig    *proxy.PreLookupConfig
+	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 }
 
 type POP3ProxyServerOptions struct {
@@ -60,6 +61,11 @@ type POP3ProxyServerOptions struct {
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
+
+	// Ensure PreLookup config has a default value to avoid nil panics.
+	if options.PreLookup == nil {
+		options.PreLookup = &proxy.PreLookupConfig{}
+	}
 
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
@@ -124,6 +130,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		affinityStickiness: stickiness,
 		authLimiter:        authLimiter,
 		trustedProxies:     options.TrustedProxies,
+		prelookupConfig:    options.PreLookup,
 		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
 	}
 

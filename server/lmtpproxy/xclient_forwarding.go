@@ -26,6 +26,12 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 		forwardingParams.Variables["proxy-user"] = s.username
 	}
 
+	// Also forward the proxy's source IP address for this specific backend connection.
+	// This helps the backend log both the client IP and the proxy IP, even if it
+	// overwrites its session's remote address with the client's IP.
+	proxySrcIP, _ := server.GetHostPortFromAddr(s.backendConn.LocalAddr())
+	forwardingParams.Variables["proxy-source-ip"] = proxySrcIP
+
 	// Convert to LMTP XCLIENT format
 	xclientParams := forwardingParams.ToLMTPXCLIENT()
 

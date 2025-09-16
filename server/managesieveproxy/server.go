@@ -37,7 +37,8 @@ type Server struct {
 	affinityStickiness float64
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remoteUseXCLIENT   bool     // Whether backend supports XCLIENT command for forwarding
+	prelookupConfig    *proxy.PreLookupConfig
+	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
@@ -76,6 +77,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	connectTimeout := opts.ConnectTimeout
 	if connectTimeout == 0 {
 		connectTimeout = 10 * time.Second
+	}
+
+	// Ensure PreLookup config has a default value to avoid nil panics.
+	if opts.PreLookup == nil {
+		opts.PreLookup = &proxy.PreLookupConfig{}
 	}
 
 	// Initialize prelookup client if configured
@@ -138,6 +144,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		affinityStickiness: stickiness,
 		authLimiter:        authLimiter,
 		trustedProxies:     opts.TrustedProxies,
+		prelookupConfig:    opts.PreLookup,
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 	}, nil
 }

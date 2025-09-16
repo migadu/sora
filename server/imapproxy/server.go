@@ -37,7 +37,8 @@ type Server struct {
 	cancel             context.CancelFunc
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remoteUseIDCommand bool     // Whether backend supports IMAP ID command for forwarding
+	prelookupConfig    *proxy.PreLookupConfig
+	remoteUseIDCommand bool // Whether backend supports IMAP ID command for forwarding
 }
 
 // ServerOptions holds options for creating a new IMAP proxy server.
@@ -78,9 +79,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connectTimeout = 10 * time.Second
 	}
 
+	// Ensure PreLookup config has a default value to avoid nil panics.
+	if opts.PreLookup == nil {
+		opts.PreLookup = &proxy.PreLookupConfig{}
+	}
+
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup != nil && opts.PreLookup.Enabled {
+	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
 		if err != nil {
 			log.Printf("[IMAP Proxy] Failed to initialize prelookup client: %v", err)
@@ -138,6 +144,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		cancel:             cancel,
 		authLimiter:        authLimiter,
 		trustedProxies:     opts.TrustedProxies,
+		prelookupConfig:    opts.PreLookup,
 		remoteUseIDCommand: opts.RemoteUseIDCommand,
 	}, nil
 }

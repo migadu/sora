@@ -179,6 +179,46 @@ func (rd *ResilientDatabase) CreateAccountWithRetry(ctx context.Context, req db.
 	}, adminRetryConfig)
 }
 
+func (rd *ResilientDatabase) CreateAccountWithCredentialsWithRetry(ctx context.Context, req db.CreateAccountWithCredentialsRequest) (int64, error) {
+	var accountID int64
+	err := retry.WithRetryAdvanced(ctx, func() error {
+		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		if err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+		defer tx.Rollback(ctx)
+
+		adminCtx, cancel := rd.withTimeout(ctx, timeoutAdmin)
+		defer cancel()
+
+		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+			return rd.getOperationalDatabaseForOperation(true).CreateAccountWithCredentials(adminCtx, tx, req)
+		})
+		if cbErr != nil {
+			if !rd.isRetryableError(cbErr) {
+				return retry.Stop(cbErr)
+			}
+			return cbErr
+		}
+
+		accountID = result.(int64)
+
+		if err := tx.Commit(ctx); err != nil {
+			if rd.isRetryableError(err) {
+				return err
+			}
+			return retry.Stop(err)
+		}
+
+		return nil
+	}, adminRetryConfig)
+	
+	return accountID, err
+}
+
 func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.AccountSummary, error) {
 	var accounts []*db.AccountSummary
 	err := retry.WithRetryAdvanced(ctx, func() error {

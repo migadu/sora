@@ -105,7 +105,12 @@ func (s *POP3ProxySession) handleConnection() {
 			password := parts[1]
 
 			if err := s.authenticate(s.username, password); err != nil {
-				writer.WriteString("-ERR Authentication failed\r\n")
+				// Check if the error is due to a backend connection failure.
+				if strings.Contains(err.Error(), "failed to connect to backend") {
+					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
+				} else {
+					writer.WriteString("-ERR Authentication failed\r\n")
+				}
 				writer.Flush()
 				log.Printf("[POP3 Proxy] authentication failed for user %s from %s: %v", s.username, s.RemoteIP, err)
 				continue
@@ -191,7 +196,12 @@ func (s *POP3ProxySession) handleConnection() {
 			}
 
 			if err := s.authenticate(authnID, password); err != nil {
-				writer.WriteString("-ERR Authentication failed\r\n")
+				// Check if the error is due to a backend connection failure.
+				if strings.Contains(err.Error(), "failed to connect to backend") {
+					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
+				} else {
+					writer.WriteString("-ERR Authentication failed\r\n")
+				}
 				writer.Flush()
 				log.Printf("[POP3 Proxy] SASL authentication failed for user %s from %s: %v", authnID, s.RemoteIP, err)
 				continue
@@ -342,6 +352,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	var err error
 	// Use s.routingInfo directly. If it's nil from authentication,
 	// we'll try to populate it here.
+	routingMethod := "roundrobin" // Default to round-robin
 	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
@@ -357,7 +368,19 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 
 	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
-		preferredAddr = s.routingInfo.ServerAddress
+		address := s.routingInfo.ServerAddress
+		// If the address from prelookup doesn't contain a port,
+		// use the new RemotePort field if it's available.
+		_, _, splitErr := net.SplitHostPort(address)
+		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
+		if portErr != nil {
+			log.Printf("[POP3 Proxy] Invalid remote_port in prelookup config: %v", portErr)
+		}
+		if splitErr != nil && remotePort > 0 {
+			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
+		}
+		preferredAddr = address
+		routingMethod = "prelookup"
 		isPrelookupRoute = true
 		log.Printf("[POP3 Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
@@ -369,6 +392,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 			log.Printf("[POP3 Proxy] Could not get preferred backend for %s: %v", s.username, err)
 		}
 		if preferredAddr != "" {
+			routingMethod = "affinity"
 			log.Printf("[POP3 Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 		}
 	}
@@ -378,10 +402,14 @@ func (s *POP3ProxySession) connectToBackend() error {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[POP3 Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
+			routingMethod = "roundrobin"
 		}
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
+	// Track which routing method was used for this connection.
+	metrics.ProxyRoutingMethod.WithLabelValues("pop3", routingMethod).Inc()
+
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
@@ -390,8 +418,19 @@ func (s *POP3ProxySession) connectToBackend() error {
 		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
+		metrics.ProxyBackendConnections.WithLabelValues("pop3", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
+	if isPrelookupRoute && actualAddr != preferredAddr {
+		// The prelookup route specified a server, but we connected to a different one.
+		// This means the preferred server failed and the connection manager fell back.
+		// For prelookup routes, this is a hard failure.
+		backendConn.Close()
+		metrics.ProxyBackendConnections.WithLabelValues("pop3", "failure").Inc()
+		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
+	}
+
+	metrics.ProxyBackendConnections.WithLabelValues("pop3", "success").Inc()
 	s.backendConn = backendConn
 	s.serverAddr = actualAddr
 
@@ -486,22 +525,24 @@ func (s *POP3ProxySession) startProxying() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the client has closed the connection or there was an error.
+		// We must close the backend connection to unblock the other copy operation.
+		defer s.backendConn.Close()
 		s.filteredCopyClientToBackend()
-		s.backendConn.Close() // Close backend to unblock the other io.Copy
-		s.clientConn.Close()
 	}()
 
 	// Copy from backend to client
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the backend has closed the connection or there was an error.
+		// We must close the client connection to unblock the other copy operation.
+		defer s.clientConn.Close()
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			log.Printf("[POP3 Proxy] error copying backend to client for %s: %v", s.username, err)
 		}
-		s.clientConn.Close() // Close client to unblock the other io.Copy
-		s.backendConn.Close()
 	}()
 
 	// This goroutine will unblock the io.Copy operations when the session context is cancelled.

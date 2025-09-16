@@ -1422,6 +1422,15 @@ remote_tls = false
 # Verify backend server certificates. It is strongly recommended to keep this true.
 remote_tls_verify = true
 
+# Default port for backend servers returned by prelookup (when no port is specified)
+# If the prelookup query returns a hostname without a port, this port will be appended.
+# Examples:
+#   remote_port = 993                            # IMAPS default port
+#   remote_port = 143                            # IMAP default port  
+#   remote_port = 10993                          # Custom secure port
+# If not specified, addresses from prelookup are used as-is
+# remote_port = 143
+
 # Use PROXY protocol for backend connections found via prelookup
 # When enabled, PROXY protocol v2 headers are sent to preserve real client IP addresses
 # Examples:
@@ -1565,6 +1574,8 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+# Default port for backend servers returned by prelookup (when no port is specified)
+# remote_port = 110
 remote_use_proxy_protocol = true
 
 # Use XCLIENT command for forwarding client connection info to prelookup backends
@@ -1679,6 +1690,8 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+# Default port for backend servers returned by prelookup (when no port is specified)
+# remote_port = 4190
 remote_use_proxy_protocol = true
 
 # Use XCLIENT command for forwarding client connection info to prelookup backends
@@ -1751,6 +1764,8 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+# Default port for backend servers returned by prelookup (when no port is specified)  
+# remote_port = 24
 remote_use_proxy_protocol = true
 
 # Use XCLIENT command for forwarding client connection info to prelookup backends

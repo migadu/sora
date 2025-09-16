@@ -33,7 +33,8 @@ type Server struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remoteUseXCLIENT   bool     // Whether backend supports XCLIENT command for forwarding
+	prelookupConfig    *proxy.PreLookupConfig
+	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -71,9 +72,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connectTimeout = 10 * time.Second
 	}
 
+	// Ensure PreLookup config has a default value to avoid nil panics.
+	if opts.PreLookup == nil {
+		opts.PreLookup = &proxy.PreLookupConfig{}
+	}
+
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup != nil && opts.PreLookup.Enabled {
+	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
 		if err != nil {
 			log.Printf("[LMTP Proxy] Failed to initialize prelookup client: %v", err)
@@ -125,6 +131,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		ctx:                ctx,
 		cancel:             cancel,
 		trustedProxies:     opts.TrustedProxies,
+		prelookupConfig:    opts.PreLookup,
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 	}, nil
 }

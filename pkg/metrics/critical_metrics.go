@@ -217,6 +217,14 @@ var (
 		},
 		[]string{"protocol"},
 	)
+
+	ProxyRoutingMethod = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_proxy_routing_method_total",
+			Help: "Total number of backend connections by routing method.",
+		},
+		[]string{"protocol", "method"}, // e.g., protocol="imap", method="prelookup"
+	)
 )
 
 // Business metrics - Actually useful for operations

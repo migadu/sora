@@ -80,6 +80,9 @@ func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, er
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
 	// If we have a preferred address (from affinity or prelookup), try it first.
 	if preferredAddr != "" {
+		// Check if this is a prelookup-routed connection
+		isPrelookupRoute := routingInfo != nil && routingInfo.IsPrelookupAccount && routingInfo.ServerAddress == preferredAddr
+		
 		// Check if the preferred address is in our managed list of servers.
 		isInList := false
 		for _, addr := range cm.remoteAddrs {
@@ -99,12 +102,27 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			}
 
 			// If the connection failed...
+			if isPrelookupRoute {
+				// For prelookup routes, do NOT fall back to round-robin
+				log.Printf("[ConnectionManager] Failed to connect to prelookup-designated server %s: %v. NOT falling back to round-robin as prelookup result is definitive.", preferredAddr, err)
+				if isInList {
+					cm.markUnhealthy(preferredAddr)
+				}
+				return nil, "", fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
+			}
+			
+			// For affinity-based connections, fall back to round-robin
 			log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
 
 			// If it was a server from our list, mark it as unhealthy.
 			if isInList {
 				cm.markUnhealthy(preferredAddr)
 			}
+		} else if isPrelookupRoute {
+			// If the prelookup server is in our list but marked as unhealthy, we should still fail
+			// rather than falling back to round-robin, because prelookup results are definitive
+			log.Printf("[ConnectionManager] Prelookup-designated server %s is marked as unhealthy. NOT falling back to round-robin as prelookup result is definitive.", preferredAddr)
+			return nil, "", fmt.Errorf("prelookup-designated server %s is marked as unhealthy", preferredAddr)
 		}
 	}
 

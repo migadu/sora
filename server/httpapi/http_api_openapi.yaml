@@ -49,6 +49,29 @@ components:
         - required: ["password"]
         - required: ["password_hash"]
 
+    CreateCredentialSpec:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+        password_hash:
+          type: string
+        is_primary:
+          type: boolean
+        hash_type:
+          type: string
+          description: "Password hash type (bcrypt, ssha512, sha512). Defaults to bcrypt if not provided."
+      required:
+        - email
+        - is_primary
+      anyOf:
+        - required: ["password"]
+        - required: ["password_hash"]
+
     UpdateAccountRequest:
       type: object
       properties:
@@ -465,21 +488,41 @@ paths:
     post:
       tags:
         - Account Management
-      summary: Create a new account
+      summary: Create a new account with one or more credentials
       description: |
-        Creates a new primary account and its first credential.
+        Creates a new account. This endpoint supports two modes:
         
-        You can provide either a plain text password or a pre-computed password hash:
-        - Use `password` for plain text passwords (will be hashed using bcrypt)
-        - Use `password_hash` for pre-computed hashes (bcrypt, SSHA512, SHA512)
+        **1. Single Credential (Legacy):**
+        Provide `email` and `password` (or `password_hash`) at the top level of the request body. This creates an account with a single, primary credential.
         
-        **Note**: You cannot specify both `password` and `password_hash` in the same request.
+        **2. Multiple Credentials:**
+        Provide a `credentials` array. Each object in the array defines a credential with its own email, password/hash, and primary status.
+        - Exactly one credential in the array must have `is_primary: true`.
+        - When using the `credentials` array, the top-level `email`, `password`, and `password_hash` fields must be omitted.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateAccountRequest'
+              type: object
+              description: "Request to create an account. Use top-level fields for a single credential, or the 'credentials' array for multiple."
+              properties:
+                email:
+                  type: string
+                  format: email
+                  description: "For single credential creation. Ignored if 'credentials' array is present."
+                password:
+                  type: string
+                  format: password
+                  description: "For single credential creation. Ignored if 'credentials' array is present."
+                password_hash:
+                  type: string
+                  description: "For single credential creation. Ignored if 'credentials' array is present."
+                credentials:
+                  type: array
+                  description: "For multi-credential creation. If present, top-level email/password fields are ignored."
+                  items:
+                    $ref: '#/components/schemas/CreateCredentialSpec'
             examples:
               with_password:
                 summary: Create account with plain text password
@@ -491,6 +534,19 @@ paths:
                 value:
                   email: "user@example.com" 
                   password_hash: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
+              with_multiple_credentials:
+                summary: Create account with multiple credentials
+                value:
+                  credentials:
+                    - email: "primary@example.com"
+                      password: "password1"
+                      is_primary: true
+                    - email: "alias1@example.com"
+                      password: "password2"
+                      is_primary: false
+                    - email: "alias2@example.com"
+                      password_hash: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
+                      is_primary: false
       responses:
         '201':
           description: Account created successfully.
@@ -507,6 +563,11 @@ paths:
                     format: email
                   message:
                     type: string
+                  credentials:
+                    type: array
+                    description: "List of created credential emails, returned for multi-credential creation."
+                    items:
+                      type: string
         '400':
           description: |
             Invalid request body or parameters. Common causes:

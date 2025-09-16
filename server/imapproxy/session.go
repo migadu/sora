@@ -206,9 +206,13 @@ func (s *Session) handleConnection() {
 		}
 	}
 
-	// Start proxying
-	log.Printf("[IMAP Proxy] Starting proxy for user %s", s.username)
-	s.startProxy()
+	// Start proxying only if backend connection was successful
+	if s.backendConn != nil {
+		log.Printf("[IMAP Proxy] Starting proxy for user %s", s.username)
+		s.startProxy()
+	} else {
+		log.Printf("[IMAP Proxy] Cannot start proxy for user %s: no backend connection", s.username)
+	}
 }
 
 // sendGreeting sends the IMAP greeting.
@@ -339,6 +343,7 @@ func (s *Session) connectToBackend() error {
 	var err error
 	// Use s.routingInfo directly. If it's nil from authentication,
 	// we'll try to populate it here.
+	routingMethod := "roundrobin" // Default to round-robin
 	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
@@ -354,7 +359,19 @@ func (s *Session) connectToBackend() error {
 	}
 
 	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
-		preferredAddr = s.routingInfo.ServerAddress
+		address := s.routingInfo.ServerAddress
+		// If the address from prelookup doesn't contain a port,
+		// use the new RemotePort field if it's available.
+		_, _, splitErr := net.SplitHostPort(address)
+		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
+		if portErr != nil {
+			log.Printf("[IMAP Proxy] Invalid remote_port in prelookup config: %v", portErr)
+		}
+		if splitErr != nil && remotePort > 0 {
+			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
+		}
+		preferredAddr = address
+		routingMethod = "prelookup"
 		isPrelookupRoute = true
 		log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
@@ -366,6 +383,7 @@ func (s *Session) connectToBackend() error {
 			log.Printf("[IMAP Proxy] Could not get preferred backend for %s: %v", s.username, err)
 		}
 		if preferredAddr != "" {
+			routingMethod = "affinity"
 			log.Printf("[IMAP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 		}
 	}
@@ -375,11 +393,15 @@ func (s *Session) connectToBackend() error {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[IMAP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
+			routingMethod = "roundrobin"
 		}
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
 	// Create a new context for this connection attempt, respecting the overall session context.
+	// Track which routing method was used for this connection.
+	metrics.ProxyRoutingMethod.WithLabelValues("imap", routingMethod).Inc()
+
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer connectCancel()
 
@@ -391,8 +413,21 @@ func (s *Session) connectToBackend() error {
 		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
+		metrics.ProxyBackendConnections.WithLabelValues("imap", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
+	if isPrelookupRoute && actualAddr != preferredAddr {
+		// The prelookup route specified a server, but we connected to a different one.
+		// This means the preferred server failed and the connection manager fell back.
+		// For prelookup routes, this is a hard failure.
+		backendConn.Close()
+		metrics.ProxyBackendConnections.WithLabelValues("imap", "failure").Inc()
+		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
+	}
+
+	// Track backend connection success
+	metrics.ProxyBackendConnections.WithLabelValues("imap", "success").Inc()
+
 	s.backendConn = backendConn
 	s.serverAddr = actualAddr
 	s.backendReader = bufio.NewReader(s.backendConn)
@@ -538,6 +573,11 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 
 // startProxy starts bidirectional proxying between client and backend.
 func (s *Session) startProxy() {
+	if s.backendConn == nil {
+		log.Printf("[IMAP Proxy] backend connection not established for %s", s.username)
+		return
+	}
+
 	var wg sync.WaitGroup
 
 	// Start activity updater
@@ -549,26 +589,28 @@ func (s *Session) startProxy() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the client has closed the connection or there was an error.
+		// We must close the backend connection to unblock the other copy operation.
+		defer s.backendConn.Close()
 		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			log.Printf("[IMAP Proxy] Error copying from client to backend: %v", err)
 		}
-		s.backendConn.Close()
-		s.clientConn.Close()
 	}()
 
 	// Backend to client
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the backend has closed the connection or there was an error.
+		// We must close the client connection to unblock the other copy operation.
+		defer s.clientConn.Close()
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			log.Printf("[IMAP Proxy] Error copying from backend to client: %v", err)
 		}
-		s.clientConn.Close()
-		s.backendConn.Close()
 	}()
 
 	go func() {

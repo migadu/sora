@@ -69,11 +69,29 @@ type PreLookupClient struct {
 	fallbackMode           bool
 	remoteTLS              bool
 	remoteTLSVerify        bool
+	remotePort             int
 	remoteUseProxyProtocol bool
 	remoteUseIDCommand     bool
 	remoteUseXCLIENT       bool
 	stopJanitor            chan struct{}
 	breaker                *circuitbreaker.CircuitBreaker
+}
+
+// normalizeServerAddress adds the default port to a server address if no port is specified
+func (c *PreLookupClient) normalizeServerAddress(addr string) string {
+	if addr == "" || c.remotePort == 0 {
+		return addr
+	}
+	
+	// If the address already contains a port, return as-is
+	if strings.Contains(addr, ":") {
+		return addr
+	}
+	
+	// Add the default port
+	normalized := fmt.Sprintf("%s:%d", addr, c.remotePort)
+	log.Printf("[PreLookup] Normalized server address '%s' to '%s' using default port %d", addr, normalized, c.remotePort)
+	return normalized
 }
 
 // NewPreLookupClient creates a new PreLookupClient
@@ -120,6 +138,12 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	remoteTLSVerify := true
 	if config.RemoteTLSVerify != nil {
 		remoteTLSVerify = *config.RemoteTLSVerify
+	}
+
+	// Get remote port for prelookup results
+	remotePort, err := config.GetRemotePort()
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote_port: %w", err)
 	}
 
 	// Build connection string
@@ -209,6 +233,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		fallbackMode:           config.FallbackDefault,
 		remoteTLS:              config.RemoteTLS,
 		remoteTLSVerify:        remoteTLSVerify,
+		remotePort:             remotePort,
 		remoteUseProxyProtocol: config.RemoteUseProxyProtocol,
 		remoteUseIDCommand:     config.RemoteUseIDCommand,
 		remoteUseXCLIENT:       config.RemoteUseXCLIENT,
@@ -334,8 +359,9 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	}
 
 	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
+	normalizedAddr := c.normalizeServerAddress(serverAddress)
 	info := &UserRoutingInfo{
-		ServerAddress:          serverAddress,
+		ServerAddress:          normalizedAddr,
 		RemoteTLS:              c.remoteTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,
 		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
@@ -425,8 +451,9 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 				}
 
 				log.Printf("[PreLookup] Auto-detected routing-only mode for user '%s'", email)
+				normalizedAddr := c.normalizeServerAddress(serverAddr)
 				info := &UserRoutingInfo{
-					ServerAddress:          serverAddr,
+					ServerAddress:          normalizedAddr,
 					IsPrelookupAccount:     true,
 					RemoteTLS:              c.remoteTLS,
 					RemoteTLSVerify:        c.remoteTLSVerify,
@@ -507,8 +534,9 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 				}
 
 				log.Printf("[PreLookup] Authentication successful for user '%s'", email)
+				normalizedAddr := c.normalizeServerAddress(serverAddress)
 				info := &UserRoutingInfo{
-					ServerAddress:          serverAddress,
+					ServerAddress:          normalizedAddr,
 					AccountID:              accountID,
 					IsPrelookupAccount:     true,
 					RemoteTLS:              c.remoteTLS,

@@ -61,7 +61,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 		if req.Password == "" {
 			return fmt.Errorf("either password or password_hash must be provided")
 		}
-		
+
 		switch req.HashType {
 		case "ssha512":
 			hashedPassword, err = GenerateSSHA512Hash(req.Password)
@@ -735,4 +735,142 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 	}
 
 	return accounts, nil
+}
+
+// CredentialSpec represents a credential specification for account creation
+type CredentialSpec struct {
+	Email        string `json:"email"`
+	Password     string `json:"password,omitempty"`
+	PasswordHash string `json:"password_hash,omitempty"` // If provided, Password is ignored and this hash is used directly
+	IsPrimary    bool   `json:"is_primary"`              // Only one credential should be marked as primary
+	HashType     string `json:"hash_type,omitempty"`
+}
+
+// CreateAccountWithCredentialsRequest represents the parameters for creating a new account with multiple credentials
+type CreateAccountWithCredentialsRequest struct {
+	Credentials []CredentialSpec
+}
+
+// CreateAccountWithCredentials creates a new account with multiple credentials atomically
+func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx, req CreateAccountWithCredentialsRequest) (int64, error) {
+	if len(req.Credentials) == 0 {
+		return 0, fmt.Errorf("at least one credential must be provided")
+	}
+
+	// Validate credentials and ensure exactly one primary
+	var primaryCount int
+	for i, cred := range req.Credentials {
+		if cred.IsPrimary {
+			primaryCount++
+		}
+		if cred.Email == "" {
+			return 0, fmt.Errorf("credential %d: email is required", i+1)
+		}
+		if cred.Password == "" && cred.PasswordHash == "" {
+			return 0, fmt.Errorf("credential %d: either password or password_hash must be provided", i+1)
+		}
+		if cred.Password != "" && cred.PasswordHash != "" {
+			return 0, fmt.Errorf("credential %d: cannot specify both password and password_hash", i+1)
+		}
+		if cred.HashType == "" {
+			req.Credentials[i].HashType = "bcrypt" // Default hash type
+		}
+	}
+
+	// Ensure exactly one primary credential
+	if primaryCount == 0 {
+		return 0, fmt.Errorf("exactly one credential must be marked as primary")
+	}
+	if primaryCount > 1 {
+		return 0, fmt.Errorf("only one credential can be marked as primary")
+	}
+
+	// Validate and normalize all email addresses
+	normalizedEmails := make([]string, len(req.Credentials))
+	for i, cred := range req.Credentials {
+		address, err := server.NewAddress(cred.Email)
+		if err != nil {
+			return 0, fmt.Errorf("credential %d: invalid email address: %w", i+1, err)
+		}
+		normalizedEmails[i] = address.FullAddress()
+	}
+
+	// Check for duplicate emails in the request
+	emailSet := make(map[string]bool)
+	for i, email := range normalizedEmails {
+		if emailSet[email] {
+			return 0, fmt.Errorf("credential %d: duplicate email address: %s", i+1, email)
+		}
+		emailSet[email] = true
+	}
+
+	// Check if any of the emails already exist (including soft-deleted accounts)
+	for i, email := range normalizedEmails {
+		var existingAccountID int64
+		var deletedAt *time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT a.id, a.deleted_at 
+			FROM accounts a
+			JOIN credentials c ON a.id = c.account_id
+			WHERE LOWER(c.address) = $1
+		`, email).Scan(&existingAccountID, &deletedAt)
+
+		if err == nil {
+			if deletedAt != nil {
+				return 0, fmt.Errorf("credential %d: cannot create account with email %s: an account with this email is in deletion grace period", i+1, email)
+			}
+			return 0, fmt.Errorf("credential %d: account with email %s already exists", i+1, email)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("credential %d: error checking for existing account: %w", i+1, err)
+		}
+	}
+
+	// Create account
+	var accountID int64
+	err := tx.QueryRow(ctx, "INSERT INTO accounts (created_at) VALUES (now()) RETURNING id").Scan(&accountID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create account: %w", err)
+	}
+
+	// Create all credentials
+	for i, cred := range req.Credentials {
+		// Generate password hash or use provided hash
+		var hashedPassword string
+		if cred.PasswordHash != "" {
+			// Use provided hash directly
+			hashedPassword = cred.PasswordHash
+		} else {
+			// Generate hash from password
+			switch cred.HashType {
+			case "ssha512":
+				hashedPassword, err = GenerateSSHA512Hash(cred.Password)
+				if err != nil {
+					return 0, fmt.Errorf("credential %d: failed to generate SSHA512 hash: %w", i+1, err)
+				}
+			case "sha512":
+				hashedPassword = GenerateSHA512Hash(cred.Password)
+			case "bcrypt":
+				hashedPassword, err = GenerateBcryptHash(cred.Password)
+				if err != nil {
+					return 0, fmt.Errorf("credential %d: failed to generate bcrypt hash: %w", i+1, err)
+				}
+			default:
+				return 0, fmt.Errorf("credential %d: unsupported hash type: %s", i+1, cred.HashType)
+			}
+		}
+
+		// Create credential
+		_, err = tx.Exec(ctx,
+			"INSERT INTO credentials (account_id, address, password, primary_identity, created_at, updated_at) VALUES ($1, $2, $3, $4, now(), now())",
+			accountID, normalizedEmails[i], hashedPassword, cred.IsPrimary)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+				return 0, consts.ErrDBUniqueViolation
+			}
+			return 0, fmt.Errorf("credential %d: failed to create credential: %w", i+1, err)
+		}
+	}
+
+	return accountID, nil
 }

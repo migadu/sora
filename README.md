@@ -222,16 +222,16 @@ Create new email accounts:
 
 ```bash
 # Basic account creation
-./sora-admin create-account --email user@example.com --password secretpassword
+./sora-admin accounts create --email user@example.com --password secretpassword
 
 # Create account with specific hash type
-./sora-admin create-account --email user@example.com --password secretpassword --hash ssha512
+./sora-admin accounts create --email user@example.com --password secretpassword --hash ssha512
 
-# Create account and mark as primary identity
-./sora-admin create-account --email user@example.com --password secretpassword --primary
+# Create account with multiple credentials
+./sora-admin accounts create --credentials '[{"email":"primary@example.com","password":"pass1","is_primary":true},{"email":"alias@example.com","password":"pass2"}]'
 
 # Use custom database connection (overriding config file)
-./sora-admin create-account --email user@example.com --password secretpassword \
+./sora-admin accounts create --email user@example.com --password secretpassword \
   --dbhost localhost --dbport 5432 --dbuser postgres --dbname sora_db
 ```
 

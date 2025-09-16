@@ -176,9 +176,13 @@ func (s *Session) handleConnection() {
 		}
 	}
 
-	// Start proxying
-	log.Printf("[ManageSieve Proxy] Starting proxy for user %s", s.username)
-	s.startProxy()
+	// Start proxying only if backend connection was successful
+	if s.backendConn != nil {
+		log.Printf("[ManageSieve Proxy] Starting proxy for user %s", s.username)
+		s.startProxy()
+	} else {
+		log.Printf("[ManageSieve Proxy] Cannot start proxy for user %s: no backend connection", s.username)
+	}
 }
 
 // sendResponse sends a response to the client.
@@ -312,6 +316,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	var err error
 	// Use s.routingInfo directly. If it's nil from authentication,
 	// we'll try to populate it here.
+	routingMethod := "roundrobin" // Default to round-robin
 	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
@@ -327,7 +332,19 @@ func (s *Session) connectToBackendAndAuth() error {
 	}
 
 	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
-		preferredAddr = s.routingInfo.ServerAddress
+		address := s.routingInfo.ServerAddress
+		// If the address from prelookup doesn't contain a port,
+		// use the new RemotePort field if it's available.
+		_, _, splitErr := net.SplitHostPort(address)
+		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
+		if portErr != nil {
+			log.Printf("[ManageSieve Proxy] Invalid remote_port in prelookup config: %v", portErr)
+		}
+		if splitErr != nil && remotePort > 0 {
+			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
+		}
+		preferredAddr = address
+		routingMethod = "prelookup"
 		isPrelookupRoute = true
 		log.Printf("[ManageSieve Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
@@ -339,6 +356,7 @@ func (s *Session) connectToBackendAndAuth() error {
 			log.Printf("[ManageSieve Proxy] Could not get preferred backend for %s: %v", s.username, err)
 		}
 		if preferredAddr != "" {
+			routingMethod = "affinity"
 			log.Printf("[ManageSieve Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
 		}
 	}
@@ -348,10 +366,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[ManageSieve Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
+			routingMethod = "roundrobin"
 		}
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
+	// Track which routing method was used for this connection.
+	metrics.ProxyRoutingMethod.WithLabelValues("managesieve", routingMethod).Inc()
+
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer connectCancel()
 
@@ -363,8 +385,19 @@ func (s *Session) connectToBackendAndAuth() error {
 		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
+		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
+	if isPrelookupRoute && actualAddr != preferredAddr {
+		// The prelookup route specified a server, but we connected to a different one.
+		// This means the preferred server failed and the connection manager fell back.
+		// For prelookup routes, this is a hard failure.
+		conn.Close()
+		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
+		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
+	}
+
+	metrics.ProxyBackendConnections.WithLabelValues("managesieve", "success").Inc()
 	s.backendConn = conn
 	s.serverAddr = actualAddr
 
@@ -449,6 +482,11 @@ func (s *Session) authenticateToBackend() error {
 
 // startProxy starts bidirectional proxying between client and backend.
 func (s *Session) startProxy() {
+	if s.backendConn == nil {
+		log.Printf("[ManageSieve Proxy] backend connection not established for %s", s.username)
+		return
+	}
+
 	var wg sync.WaitGroup
 
 	// Start activity updater
@@ -460,26 +498,28 @@ func (s *Session) startProxy() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the client has closed the connection or there was an error.
+		// We must close the backend connection to unblock the other copy operation.
+		defer s.backendConn.Close()
 		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
 		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			log.Printf("[ManageSieve Proxy] Error copying from client to backend: %v", err)
 		}
-		s.backendConn.Close() // Close backend to unblock the other io.Copy
-		s.clientConn.Close()
 	}()
 
 	// Backend to client
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// If this copy returns, it means the backend has closed the connection or there was an error.
+		// We must close the client connection to unblock the other copy operation.
+		defer s.clientConn.Close()
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			log.Printf("[ManageSieve Proxy] Error copying from backend to client: %v", err)
 		}
-		s.clientConn.Close() // Close client to unblock the other io.Copy
-		s.backendConn.Close()
 	}()
 
 	go func() {
@@ -602,6 +642,12 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	forwardingParams.SessionID = s.generateSessionID()
 	forwardingParams.Variables["proxy-server"] = s.server.hostname
 	forwardingParams.Variables["proxy-user"] = s.username
+
+	// Also forward the proxy's source IP address for this specific backend connection.
+	// This helps the backend log both the client IP and the proxy IP, even if it
+	// overwrites its session's remote address with the client's IP.
+	proxySrcIP, _ := server.GetHostPortFromAddr(s.backendConn.LocalAddr())
+	forwardingParams.Variables["proxy-source-ip"] = proxySrcIP
 
 	// Convert to a generic key-value format for a custom XCLIENT-like command.
 	// ManageSieve does not have a standard XCLIENT, so this assumes a custom implementation.
