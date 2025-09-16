@@ -19,6 +19,9 @@ type Session struct {
 	HostName string
 	Protocol string
 	Stats    ConnectionStatsProvider
+	
+	// Parameter forwarding support (Dovecot-style)
+	ForwardingParams *ForwardingParams // Forwarded connection parameters
 }
 
 func (s *Session) Log(format string, args ...interface{}) {

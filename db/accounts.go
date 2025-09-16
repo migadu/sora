@@ -15,10 +15,11 @@ import (
 
 // CreateAccountRequest represents the parameters for creating a new account
 type CreateAccountRequest struct {
-	Email     string
-	Password  string
-	IsPrimary bool
-	HashType  string
+	Email        string
+	Password     string
+	PasswordHash string // If provided, Password is ignored and this hash is used directly
+	IsPrimary    bool
+	HashType     string
 }
 
 // CreateAccount creates a new account with the specified email and password
@@ -50,27 +51,33 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 		return fmt.Errorf("error checking for existing account: %w", err)
 	}
 
-	if req.Password == "" {
-		return fmt.Errorf("password cannot be empty")
-	}
-
-	// Generate password hash
+	// Generate password hash or use provided hash
 	var hashedPassword string
-	switch req.HashType {
-	case "ssha512":
-		hashedPassword, err = GenerateSSHA512Hash(req.Password)
-		if err != nil {
-			return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
+	if req.PasswordHash != "" {
+		// Use provided hash directly
+		hashedPassword = req.PasswordHash
+	} else {
+		// Generate hash from password
+		if req.Password == "" {
+			return fmt.Errorf("either password or password_hash must be provided")
 		}
-	case "sha512":
-		hashedPassword = GenerateSHA512Hash(req.Password)
-	case "bcrypt":
-		hashedPassword, err = GenerateBcryptHash(req.Password)
-		if err != nil {
-			return fmt.Errorf("failed to generate bcrypt hash: %w", err)
+		
+		switch req.HashType {
+		case "ssha512":
+			hashedPassword, err = GenerateSSHA512Hash(req.Password)
+			if err != nil {
+				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
+			}
+		case "sha512":
+			hashedPassword = GenerateSHA512Hash(req.Password)
+		case "bcrypt":
+			hashedPassword, err = GenerateBcryptHash(req.Password)
+			if err != nil {
+				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported hash type: %s", req.HashType)
 		}
-	default:
-		return fmt.Errorf("unsupported hash type: %s", req.HashType)
 	}
 
 	// Create account
@@ -97,11 +104,12 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 
 // AddCredentialRequest represents the parameters for adding a credential to an existing account
 type AddCredentialRequest struct {
-	AccountID   int64  // The ID of the account to add the credential to
-	NewEmail    string // The new email address to add
-	NewPassword string
-	IsPrimary   bool // Whether to make this the new primary identity
-	NewHashType string
+	AccountID       int64  // The ID of the account to add the credential to
+	NewEmail        string // The new email address to add
+	NewPassword     string
+	NewPasswordHash string // If provided, NewPassword is ignored and this hash is used directly
+	IsPrimary       bool   // Whether to make this the new primary identity
+	NewHashType     string
 }
 
 // AddCredential adds a new credential to an existing account identified by its primary identity
@@ -117,28 +125,33 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 	}
 	normalizedNewEmail := newAddress.FullAddress()
 
-	if req.NewPassword == "" {
-		return fmt.Errorf("password cannot be empty")
-	}
-
-	// Generate password hash
+	// Generate password hash or use provided hash
 	var hashedPassword string
+	if req.NewPasswordHash != "" {
+		// Use provided hash directly
+		hashedPassword = req.NewPasswordHash
+	} else {
+		// Generate hash from password
+		if req.NewPassword == "" {
+			return fmt.Errorf("either new_password or new_password_hash must be provided")
+		}
 
-	switch req.NewHashType {
-	case "ssha512":
-		hashedPassword, err = GenerateSSHA512Hash(req.NewPassword)
-		if err != nil {
-			return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
+		switch req.NewHashType {
+		case "ssha512":
+			hashedPassword, err = GenerateSSHA512Hash(req.NewPassword)
+			if err != nil {
+				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
+			}
+		case "sha512":
+			hashedPassword = GenerateSHA512Hash(req.NewPassword)
+		case "bcrypt":
+			hashedPassword, err = GenerateBcryptHash(req.NewPassword)
+			if err != nil {
+				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
 		}
-	case "sha512":
-		hashedPassword = GenerateSHA512Hash(req.NewPassword)
-	case "bcrypt":
-		hashedPassword, err = GenerateBcryptHash(req.NewPassword)
-		if err != nil {
-			return fmt.Errorf("failed to generate bcrypt hash: %w", err)
-		}
-	default:
-		return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
 	}
 
 	// If this should be the new primary identity, unset the current primary
@@ -168,10 +181,11 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 
 // UpdateAccountRequest represents the parameters for updating an account
 type UpdateAccountRequest struct {
-	Email       string
-	Password    string
-	HashType    string
-	MakePrimary bool // Whether to make this credential the primary identity
+	Email        string
+	Password     string
+	PasswordHash string // If provided, Password is ignored and this hash is used directly
+	HashType     string
+	MakePrimary  bool // Whether to make this credential the primary identity
 }
 
 // UpdateAccount updates an existing account's password and/or makes it primary
@@ -185,8 +199,8 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	normalizedEmail := address.FullAddress()
 
 	// Validate that we have at least one operation to perform
-	if req.Password == "" && !req.MakePrimary {
-		return fmt.Errorf("either password or make-primary must be specified")
+	if req.Password == "" && req.PasswordHash == "" && !req.MakePrimary {
+		return fmt.Errorf("either password, password_hash, or make-primary must be specified")
 	}
 
 	// Check if account exists
@@ -198,10 +212,15 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 		return fmt.Errorf("error checking account: %w", err)
 	}
 
-	// Generate password hash if password is provided
+	// Generate password hash or use provided hash
 	var hashedPassword string
 	var updatePassword bool
-	if req.Password != "" {
+	if req.PasswordHash != "" {
+		// Use provided hash directly
+		hashedPassword = req.PasswordHash
+		updatePassword = true
+	} else if req.Password != "" {
+		// Generate hash from password
 		updatePassword = true
 		switch req.HashType {
 		case "ssha512":

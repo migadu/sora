@@ -448,7 +448,8 @@ func handleCreateAccount() {
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the new account (required)")
-	password := fs.String("password", "", "Password for the new account (required)")
+	password := fs.String("password", "", "Password for the new account (required unless --password-hash is provided)")
+	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
 	fs.Usage = func() {
@@ -458,14 +459,16 @@ Usage:
   sora-admin accounts create [options]
 
 Options:
-  --email string       Email address for the new account (required)
-  --password string    Password for the new account (required)
-  --hash string        Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
-  --config string      Path to TOML configuration file (default: config.toml)
+  --email string         Email address for the new account (required)
+  --password string      Password for the new account (required unless --password-hash is provided)
+  --password-hash string Pre-computed password hash (alternative to --password)
+  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --config string        Path to TOML configuration file (default: config.toml)
 
 Examples:
   sora-admin accounts create --email user@example.com --password mypassword
   sora-admin accounts create --email user@example.com --password mypassword --hash ssha512
+  sora-admin accounts create --email user@example.com --password-hash '$2a$12$xyz...'
 `)
 	}
 
@@ -481,8 +484,14 @@ Examples:
 		os.Exit(1)
 	}
 
-	if *password == "" {
-		fmt.Printf("Error: --password is required\n\n")
+	if *password == "" && *passwordHash == "" {
+		fmt.Printf("Error: either --password or --password-hash is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *password != "" && *passwordHash != "" {
+		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -517,7 +526,7 @@ Examples:
 	}
 
 	// Create the account (always as primary identity)
-	if err := createAccount(cfg, *email, *password, true, *hashType); err != nil {
+	if err := createAccount(cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
 		log.Fatalf("Failed to create account: %v", err)
 	}
 
@@ -531,7 +540,8 @@ func handleAddCredential() {
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	primaryIdentity := fs.String("primary", "", "Primary identity of the account to add credential to (required)")
 	email := fs.String("email", "", "New email address to add as credential (required)")
-	password := fs.String("password", "", "Password for the new credential (required)")
+	password := fs.String("password", "", "Password for the new credential (required unless --password-hash is provided)")
+	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	makePrimary := fs.Bool("make-primary", false, "Make this the new primary identity for the account")
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
@@ -541,19 +551,21 @@ func handleAddCredential() {
 		fmt.Printf(`Add a credential to an existing account
 
 Usage:
-  sora-admin add-credential [options]
+  sora-admin credentials add [options]
 
 Options:
-  --primary string      Primary identity of the account to add credential to (required)
-  --email string        New email address to add as credential (required)
-  --password string     Password for the new credential (required)
-  --make-primary        Make this the new primary identity for the account
-  --hash string         Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
-  --config string       Path to TOML configuration file (default: config.toml)
+  --primary string       Primary identity of the account to add credential to (required)
+  --email string         New email address to add as credential (required)
+  --password string      Password for the new credential (required unless --password-hash is provided)
+  --password-hash string Pre-computed password hash (alternative to --password)
+  --make-primary         Make this the new primary identity for the account
+  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --config string        Path to TOML configuration file (default: config.toml)
 
 Examples:
-  sora-admin add-credential --primary admin@example.com --email alias@example.com --password mypassword
-  sora-admin add-credential --primary admin@example.com --email newalias@example.com --password mypassword --make-primary
+  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
+  sora-admin credentials add --primary admin@example.com --email newalias@example.com --password mypassword --make-primary
+  sora-admin credentials add --primary admin@example.com --email alias@example.com --password-hash '$2a$12$xyz...'
 `)
 	}
 
@@ -575,8 +587,14 @@ Examples:
 		os.Exit(1)
 	}
 
-	if *password == "" && !*makePrimary {
-		fmt.Printf("Error: either --password or --make-primary must be specified\n\n")
+	if *password == "" && *passwordHash == "" {
+		fmt.Printf("Error: either --password or --password-hash is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *password != "" && *passwordHash != "" {
+		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -611,14 +629,14 @@ Examples:
 	}
 
 	// Add the credential
-	if err := addCredential(cfg, *primaryIdentity, *email, *password, *makePrimary, *hashType); err != nil {
+	if err := addCredential(cfg, *primaryIdentity, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
 		log.Fatalf("Failed to add credential: %v", err)
 	}
 
 	fmt.Printf("Successfully added credential: %s to account with primary identity: %s\n", *email, *primaryIdentity)
 }
 
-func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hashType string) error {
+func createAccount(cfg AdminConfig, email, password, passwordHash string, isPrimary bool, hashType string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
@@ -630,10 +648,11 @@ func createAccount(cfg AdminConfig, email, password string, isPrimary bool, hash
 
 	// Create account using the new db operation
 	req := db.CreateAccountRequest{
-		Email:     email,
-		Password:  password,
-		IsPrimary: isPrimary,
-		HashType:  hashType,
+		Email:        email,
+		Password:     password,
+		PasswordHash: passwordHash,
+		IsPrimary:    isPrimary,
+		HashType:     hashType,
 	}
 
 	if err := rdb.CreateAccountWithRetry(ctx, req); err != nil {
@@ -991,7 +1010,7 @@ func matches(conn db.ConnectionInfo, criteria db.TerminationCriteria, all bool) 
 	return criteria.Email != "" || criteria.Protocol != "" || criteria.ServerAddr != "" || criteria.ClientAddr != ""
 }
 
-func addCredential(cfg AdminConfig, primaryIdentity, email, password string, makePrimary bool, hashType string) error {
+func addCredential(cfg AdminConfig, primaryIdentity, email, password, passwordHash string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
@@ -1010,11 +1029,12 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password string, mak
 
 	// Add credential using the new db operation
 	req := db.AddCredentialRequest{
-		AccountID:   accountID,
-		NewEmail:    email,
-		NewPassword: password,
-		IsPrimary:   makePrimary,
-		NewHashType: hashType,
+		AccountID:       accountID,
+		NewEmail:        email,
+		NewPassword:     password,
+		NewPasswordHash: passwordHash,
+		IsPrimary:       makePrimary,
+		NewHashType:     hashType,
 	}
 
 	if err = rdb.AddCredentialWithRetry(ctx, req); err != nil {
@@ -1030,7 +1050,8 @@ func handleUpdateAccount() {
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	email := fs.String("email", "", "Email address for the account to update (required)")
-	password := fs.String("password", "", "New password for the account (required)")
+	password := fs.String("password", "", "New password for the account (optional if --password-hash or --make-primary is provided)")
+	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	makePrimary := fs.Bool("make-primary", false, "Make this credential the primary identity for the account")
 	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
 
@@ -1040,20 +1061,22 @@ func handleUpdateAccount() {
 		fmt.Printf(`Update an existing account's password and/or primary status
 
 Usage:
-  sora-admin update-account [options]
+  sora-admin accounts update [options]
 
 Options:
-  --email string        Email address for the account to update (required)
-  --password string     New password for the account (optional with --make-primary)
-  --make-primary        Make this credential the primary identity for the account
-  --hash string        Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
-  --config string      Path to TOML configuration file (default: config.toml)
+  --email string         Email address for the account to update (required)
+  --password string      New password for the account (optional if --password-hash or --make-primary is provided)
+  --password-hash string Pre-computed password hash (alternative to --password)
+  --make-primary         Make this credential the primary identity for the account
+  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --config string        Path to TOML configuration file (default: config.toml)
 
 Examples:
-  sora-admin update-account --email user@example.com --password newpassword
-  sora-admin update-account --email user@example.com --password newpassword --make-primary
-  sora-admin update-account --email user@example.com --make-primary
-  sora-admin update-account --email user@example.com --password newpassword --hash ssha512
+  sora-admin accounts update --email user@example.com --password newpassword
+  sora-admin accounts update --email user@example.com --password newpassword --make-primary
+  sora-admin accounts update --email user@example.com --make-primary
+  sora-admin accounts update --email user@example.com --password newpassword --hash ssha512
+  sora-admin accounts update --email user@example.com --password-hash '$2a$12$xyz...'
 `)
 	}
 
@@ -1069,8 +1092,14 @@ Examples:
 		os.Exit(1)
 	}
 
-	if *password == "" && !*makePrimary {
-		fmt.Printf("Error: either --password or --make-primary must be specified\n\n")
+	if *password == "" && *passwordHash == "" && !*makePrimary {
+		fmt.Printf("Error: either --password, --password-hash, or --make-primary must be specified\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if *password != "" && *passwordHash != "" {
+		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -1105,14 +1134,14 @@ Examples:
 	}
 
 	// Update the account
-	if err := updateAccount(cfg, *email, *password, *makePrimary, *hashType); err != nil {
+	if err := updateAccount(cfg, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
 		log.Fatalf("Failed to update account: %v", err)
 	}
 
 	// Print appropriate success message based on what was updated
-	if *password != "" && *makePrimary {
+	if (*password != "" || *passwordHash != "") && *makePrimary {
 		fmt.Printf("Successfully updated password and set as primary for account: %s\n", *email)
-	} else if *password != "" {
+	} else if *password != "" || *passwordHash != "" {
 		fmt.Printf("Successfully updated password for account: %s\n", *email)
 	} else if *makePrimary {
 		fmt.Printf("Successfully set as primary identity for account: %s\n", *email)
@@ -1207,7 +1236,7 @@ func deleteAccount(cfg AdminConfig, email string) error {
 	return nil
 }
 
-func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, hashType string) error {
+func updateAccount(cfg AdminConfig, email, password, passwordHash string, makePrimary bool, hashType string) error {
 	ctx := context.Background()
 
 	// Connect to resilient database
@@ -1219,10 +1248,11 @@ func updateAccount(cfg AdminConfig, email, password string, makePrimary bool, ha
 
 	// Update account using the new db operation
 	req := db.UpdateAccountRequest{
-		Email:       email,
-		Password:    password,
-		HashType:    hashType,
-		MakePrimary: makePrimary,
+		Email:        email,
+		Password:     password,
+		PasswordHash: passwordHash,
+		HashType:     hashType,
+		MakePrimary:  makePrimary,
 	}
 
 	if err := rdb.UpdateAccountWithRetry(ctx, req); err != nil {

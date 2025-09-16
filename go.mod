@@ -22,7 +22,7 @@ require (
 // Use forked versions until upstreams are updated
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25
 
-replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250807225942-274104cec413
+replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250916132813-07d69cfbad94
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

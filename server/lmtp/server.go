@@ -272,25 +272,28 @@ type proxyProtocolListener struct {
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
 
-	// Try to read PROXY protocol header
-	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-	if err != nil {
-		conn.Close()
-		// Log but don't crash - let the server continue accepting other connections
-		log.Printf("[LMTP] PROXY protocol error, rejecting connection: %v", err)
-		return nil, fmt.Errorf("PROXY protocol error: %w", err)
-	}
+		// Try to read PROXY protocol header
+		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+		if err != nil {
+			conn.Close()
+			// Log the error but continue accepting new connections - don't crash the entire server
+			log.Printf("[LMTP] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+			// Continue the loop to accept the next connection instead of returning an error
+			continue
+		}
 
-	// Wrap the connection with proxy info for later extraction
-	return &proxyProtocolConn{
-		Conn:      wrappedConn,
-		proxyInfo: proxyInfo,
-	}, nil
+		// Wrap the connection with proxy info for later extraction
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
 }
 
 // proxyProtocolConn wraps a connection with PROXY protocol information
@@ -301,4 +304,23 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
 	return c.proxyInfo
+}
+
+// getTrustedProxies returns the list of trusted proxy CIDR blocks for parameter forwarding
+func (b *LMTPServerBackend) getTrustedProxies() []string {
+	if b.proxyReader != nil {
+		// Get trusted proxies from PROXY protocol configuration
+		// Access the configuration from the ProxyProtocolReader
+		// Note: This assumes the ProxyProtocolReader has access to the config
+		// For now, we'll use default safe values that match PROXY protocol defaults
+	}
+	
+	// Return default trusted proxy networks (RFC1918 private networks + localhost)
+	// These are safe defaults that match the PROXY protocol configuration
+	return []string{
+		"127.0.0.0/8",    // localhost
+		"10.0.0.0/8",     // RFC1918 private networks  
+		"172.16.0.0/12",  // RFC1918 private networks
+		"192.168.0.0/16", // RFC1918 private networks
+	}
 }

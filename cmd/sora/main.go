@@ -751,6 +751,7 @@ func main() {
 		go startMetricsServer(ctx, cfg.Servers.Metrics, errChan)
 	}
 
+
 	// Start proxy servers
 	if cfg.Servers.IMAPProxy.Start {
 		go startIMAPProxyServer(ctx, hostname, resilientDB, errChan, cfg)
@@ -998,16 +999,17 @@ func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *res
 	}
 
 	server, err := imapproxy.New(ctx, resilientDB, hostname, imapproxy.ServerOptions{
-		Addr:               config.Servers.IMAPProxy.Addr,
-		RemoteAddrs:        config.Servers.IMAPProxy.RemoteAddrs,
-		MasterSASLUsername: config.Servers.IMAPProxy.MasterSASLUsername,
-		MasterSASLPassword: config.Servers.IMAPProxy.MasterSASLPassword,
-		TLS:                config.Servers.IMAPProxy.TLS,
-		TLSCertFile:        config.Servers.IMAPProxy.TLSCertFile,
-		TLSKeyFile:         config.Servers.IMAPProxy.TLSKeyFile,
-		TLSVerify:          config.Servers.IMAPProxy.TLSVerify,
-		RemoteTLS:          config.Servers.IMAPProxy.RemoteTLS,
-		RemoteTLSVerify:    config.Servers.IMAPProxy.RemoteTLSVerify,
+		Addr:                   config.Servers.IMAPProxy.Addr,
+		RemoteAddrs:            config.Servers.IMAPProxy.RemoteAddrs,
+		MasterSASLUsername:     config.Servers.IMAPProxy.MasterSASLUsername,
+		MasterSASLPassword:     config.Servers.IMAPProxy.MasterSASLPassword,
+		TLS:                    config.Servers.IMAPProxy.TLS,
+		TLSCertFile:            config.Servers.IMAPProxy.TLSCertFile,
+		TLSKeyFile:             config.Servers.IMAPProxy.TLSKeyFile,
+		TLSVerify:              config.Servers.IMAPProxy.TLSVerify,
+		RemoteTLS:              config.Servers.IMAPProxy.RemoteTLS,
+		RemoteTLSVerify:        config.Servers.IMAPProxy.RemoteTLSVerify,
+		RemoteUseProxyProtocol: config.Servers.IMAPProxy.RemoteUseProxyProtocol,
 		ConnectTimeout:     connectTimeout,
 		EnableAffinity:     config.Servers.IMAPProxy.EnableAffinity,
 		AffinityStickiness: config.Servers.IMAPProxy.AffinityStickiness,
@@ -1052,15 +1054,16 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *res
 	}
 
 	server, err := pop3proxy.New(ctx, hostname, config.Servers.POP3Proxy.Addr, resilientDB, pop3proxy.POP3ProxyServerOptions{
-		RemoteAddrs:        config.Servers.POP3Proxy.RemoteAddrs,
-		MasterSASLUsername: config.Servers.POP3Proxy.MasterSASLUsername,
-		MasterSASLPassword: config.Servers.POP3Proxy.MasterSASLPassword,
-		TLS:                config.Servers.POP3Proxy.TLS,
-		TLSCertFile:        config.Servers.POP3Proxy.TLSCertFile,
-		TLSKeyFile:         config.Servers.POP3Proxy.TLSKeyFile,
-		TLSVerify:          config.Servers.POP3Proxy.TLSVerify,
-		RemoteTLS:          config.Servers.POP3Proxy.RemoteTLS,
-		RemoteTLSVerify:    config.Servers.POP3Proxy.RemoteTLSVerify,
+		RemoteAddrs:            config.Servers.POP3Proxy.RemoteAddrs,
+		MasterSASLUsername:     config.Servers.POP3Proxy.MasterSASLUsername,
+		MasterSASLPassword:     config.Servers.POP3Proxy.MasterSASLPassword,
+		TLS:                    config.Servers.POP3Proxy.TLS,
+		TLSCertFile:            config.Servers.POP3Proxy.TLSCertFile,
+		TLSKeyFile:             config.Servers.POP3Proxy.TLSKeyFile,
+		TLSVerify:              config.Servers.POP3Proxy.TLSVerify,
+		RemoteTLS:              config.Servers.POP3Proxy.RemoteTLS,
+		RemoteTLSVerify:        config.Servers.POP3Proxy.RemoteTLSVerify,
+		RemoteUseProxyProtocol: config.Servers.POP3Proxy.RemoteUseProxyProtocol,
 		ConnectTimeout:     connectTimeout,
 		Debug:              config.Servers.Debug,
 		EnableAffinity:     config.Servers.POP3Proxy.EnableAffinity,
@@ -1104,16 +1107,17 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, resilient
 	}
 
 	server, err := managesieveproxy.New(ctx, resilientDB, hostname, managesieveproxy.ServerOptions{
-		Addr:               config.Servers.ManageSieveProxy.Addr,
-		RemoteAddrs:        config.Servers.ManageSieveProxy.RemoteAddrs,
-		MasterSASLUsername: config.Servers.ManageSieveProxy.MasterSASLUsername,
-		MasterSASLPassword: config.Servers.ManageSieveProxy.MasterSASLPassword,
-		TLS:                config.Servers.ManageSieveProxy.TLS,
-		TLSCertFile:        config.Servers.ManageSieveProxy.TLSCertFile,
-		TLSKeyFile:         config.Servers.ManageSieveProxy.TLSKeyFile,
-		TLSVerify:          config.Servers.ManageSieveProxy.TLSVerify,
-		RemoteTLS:          config.Servers.ManageSieveProxy.RemoteTLS,
-		RemoteTLSVerify:    config.Servers.ManageSieveProxy.RemoteTLSVerify,
+		Addr:                   config.Servers.ManageSieveProxy.Addr,
+		RemoteAddrs:            config.Servers.ManageSieveProxy.RemoteAddrs,
+		MasterSASLUsername:     config.Servers.ManageSieveProxy.MasterSASLUsername,
+		MasterSASLPassword:     config.Servers.ManageSieveProxy.MasterSASLPassword,
+		TLS:                    config.Servers.ManageSieveProxy.TLS,
+		TLSCertFile:            config.Servers.ManageSieveProxy.TLSCertFile,
+		TLSKeyFile:             config.Servers.ManageSieveProxy.TLSKeyFile,
+		TLSVerify:              config.Servers.ManageSieveProxy.TLSVerify,
+		RemoteTLS:              config.Servers.ManageSieveProxy.RemoteTLS,
+		RemoteTLSVerify:        config.Servers.ManageSieveProxy.RemoteTLSVerify,
+		RemoteUseProxyProtocol: config.Servers.ManageSieveProxy.RemoteUseProxyProtocol,
 		ConnectTimeout:     connectTimeout,
 		AuthRateLimit:      config.Servers.ManageSieveProxy.AuthRateLimit,
 		PreLookup:          config.Servers.ManageSieveProxy.PreLookup,
@@ -1156,14 +1160,15 @@ func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *res
 	}
 
 	server, err := lmtpproxy.New(ctx, resilientDB, hostname, lmtpproxy.ServerOptions{
-		Addr:               config.Servers.LMTPProxy.Addr,
-		RemoteAddrs:        config.Servers.LMTPProxy.RemoteAddrs,
-		TLS:                config.Servers.LMTPProxy.TLS,
-		TLSCertFile:        config.Servers.LMTPProxy.TLSCertFile,
-		TLSKeyFile:         config.Servers.LMTPProxy.TLSKeyFile,
-		TLSVerify:          config.Servers.LMTPProxy.TLSVerify,
-		RemoteTLS:          config.Servers.LMTPProxy.RemoteTLS,
-		RemoteTLSVerify:    config.Servers.LMTPProxy.RemoteTLSVerify,
+		Addr:                   config.Servers.LMTPProxy.Addr,
+		RemoteAddrs:            config.Servers.LMTPProxy.RemoteAddrs,
+		TLS:                    config.Servers.LMTPProxy.TLS,
+		TLSCertFile:            config.Servers.LMTPProxy.TLSCertFile,
+		TLSKeyFile:             config.Servers.LMTPProxy.TLSKeyFile,
+		TLSVerify:              config.Servers.LMTPProxy.TLSVerify,
+		RemoteTLS:              config.Servers.LMTPProxy.RemoteTLS,
+		RemoteTLSVerify:        config.Servers.LMTPProxy.RemoteTLSVerify,
+		RemoteUseProxyProtocol: config.Servers.LMTPProxy.RemoteUseProxyProtocol,
 		ConnectTimeout:     connectTimeout,
 		EnableAffinity:     config.Servers.LMTPProxy.EnableAffinity,
 		AffinityStickiness: config.Servers.LMTPProxy.AffinityStickiness,

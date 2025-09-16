@@ -28,7 +28,8 @@ type Session struct {
 	backendWriter      *bufio.Writer
 	clientReader       *bufio.Reader
 	clientWriter       *bufio.Writer
-	from               string
+	sender             string
+	mailFromReceived   bool
 	to                 string
 	username           string
 	isPrelookupAccount bool
@@ -82,19 +83,21 @@ func (s *Session) handleConnection() {
 		line = strings.TrimRight(line, "\r\n")
 		log.Printf("[LMTP Proxy] Client %s: %s", clientAddr, line)
 
-		// Parse command
-		parts := strings.Fields(strings.ToUpper(line))
-		if len(parts) == 0 {
-			s.sendResponse("500 5.5.2 Syntax error")
+		// Use the shared command parser. LMTP commands do not have tags.
+		_, command, args, err := server.ParseLine(line, false)
+		if err != nil {
+			s.sendResponse(fmt.Sprintf("500 5.5.2 Syntax error: %s", err.Error()))
 			continue
 		}
 
-		command := parts[0]
+		if command == "" {
+			continue // Ignore empty lines
+		}
 
 		switch command {
 		case "HELO", "EHLO", "LHLO":
 			// LHLO is LMTP-specific greeting
-			if len(parts) < 2 {
+			if len(args) < 1 {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
 			}
@@ -111,26 +114,24 @@ func (s *Session) handleConnection() {
 			}
 
 		case "MAIL":
-			// MAIL FROM:<sender>
-			if len(line) < 10 || !strings.HasPrefix(strings.ToUpper(line), "MAIL FROM:") {
-				s.sendResponse("501 5.5.4 Syntax error in MAIL command")
+			fromParam, found := findParameter(args, "FROM:")
+			if !found {
+				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
 			}
-			from := s.extractAddress(line[10:])
-			if from == "" {
-				s.sendResponse("501 5.1.7 Bad sender address syntax")
-				continue
-			}
-			s.from = from
+			// Note: extractAddress can return an empty string for a null sender "<>", which is valid.
+			sender := s.extractAddress(fromParam)
+			s.sender = sender
+			s.mailFromReceived = true
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
-			// RCPT TO:<recipient>
-			if len(line) < 8 || !strings.HasPrefix(strings.ToUpper(line), "RCPT TO:") {
-				s.sendResponse("501 5.5.4 Syntax error in RCPT command")
+			toParam, found := findParameter(args, "TO:")
+			if !found {
+				s.sendResponse("501 5.5.4 Syntax error in RCPT command (missing TO)")
 				continue
 			}
-			to := s.extractAddress(line[8:])
+			to := s.extractAddress(toParam)
 			if to == "" {
 				s.sendResponse("501 5.1.3 Bad recipient address syntax")
 				continue
@@ -160,8 +161,9 @@ func (s *Session) handleConnection() {
 			return
 
 		case "RSET":
-			s.from = ""
+			s.sender = ""
 			s.to = ""
+			s.mailFromReceived = false
 			s.sendResponse("250 2.0.0 Ok")
 
 		case "NOOP":
@@ -198,12 +200,14 @@ func (s *Session) sendResponse(response string) error {
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
 func (s *Session) extractAddress(param string) string {
-	param = strings.TrimSpace(param)
+	// The parameter value might be quoted, so unquote it first.
+	param = server.UnquoteString(strings.TrimSpace(param))
+
 	if len(param) < 2 {
 		return ""
 	}
 
-	// Handle <address> format
+	// Handle <address> format, which is the most common.
 	if param[0] == '<' && param[len(param)-1] == '>' {
 		return param[1 : len(param)-1]
 	}
@@ -286,10 +290,12 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	var preferredAddr string
 	var err error
+	isPrelookupRoute := false
 	routingInfo := s.routingInfo
 
 	// 1. Use prelookup result if available
 	if routingInfo != nil && routingInfo.ServerAddress != "" {
+		isPrelookupRoute = true
 		preferredAddr = routingInfo.ServerAddress
 	} else {
 		// 2. If no prelookup route, try affinity
@@ -302,8 +308,8 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	// 3. Apply stickiness
-	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
+	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
@@ -380,9 +386,27 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
+	// Send forwarding parameters via XCLIENT if enabled
+	useXCLIENT := s.server.remoteUseXCLIENT
+	// Override with routing-specific setting if available
+	if s.routingInfo != nil {
+		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
+	}
+	// The proxy's role is to forward the original client's information if enabled.
+	// It is the backend server's responsibility to verify if the connection
+	// (from this proxy) is from a trusted IP before processing forwarded parameters.
+	// The `isFromTrustedProxy()` check is for proxy-chaining, where a backend
+	// needs to validate if the client connecting to it is another trusted proxy.
+	if useXCLIENT {
+		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); err != nil {
+			log.Printf("[LMTP Proxy] Failed to send forwarding parameters for %s: %v", s.username, err)
+			// Continue without forwarding parameters rather than failing
+		}
+	}
+
 	// Send MAIL FROM to backend
-	if s.from != "" {
-		mailCmd := fmt.Sprintf("MAIL FROM:<%s>\r\n", s.from)
+	if s.mailFromReceived {
+		mailCmd := fmt.Sprintf("MAIL FROM:<%s>\r\n", s.sender)
 		_, err = s.backendWriter.WriteString(mailCmd)
 		if err != nil {
 			s.backendConn.Close()
@@ -565,4 +589,25 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 func isClosingError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+}
+
+// findParameter searches for a parameter with a given prefix in a list of arguments.
+// It is case-insensitive and supports prefixes like "FROM:" or "TO:".
+// It handles both "KEY:value" and "KEY: value" formats.
+func findParameter(args []string, prefix string) (string, bool) {
+	for i, arg := range args {
+		// Handle "KEY: value" format where KEY: is a standalone token.
+		if strings.ToUpper(arg) == prefix {
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", false // Found prefix but no value.
+		}
+
+		// Handle "KEY:value" format where it's a single token.
+		if strings.HasPrefix(strings.ToUpper(arg), prefix) {
+			return arg[len(prefix):], true
+		}
+	}
+	return "", false
 }

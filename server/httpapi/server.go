@@ -281,17 +281,20 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 // Request/Response types
 
 type CreateAccountRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	PasswordHash string `json:"password_hash"`
 }
 
 type UpdateAccountRequest struct {
-	Password string `json:"password"`
+	Password     string `json:"password"`
+	PasswordHash string `json:"password_hash"`
 }
 
 type AddCredentialRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	PasswordHash string `json:"password_hash"`
 }
 
 type KickConnectionsRequest struct {
@@ -314,8 +317,18 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || req.Password == "" {
-		s.writeError(w, http.StatusBadRequest, "Email and password are required")
+	if req.Email == "" {
+		s.writeError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	if req.Password == "" && req.PasswordHash == "" {
+		s.writeError(w, http.StatusBadRequest, "Either password or password_hash is required")
+		return
+	}
+
+	if req.Password != "" && req.PasswordHash != "" {
+		s.writeError(w, http.StatusBadRequest, "Cannot specify both password and password_hash")
 		return
 	}
 
@@ -323,10 +336,11 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	// Create account using the database's method
 	createReq := db.CreateAccountRequest{
-		Email:     req.Email,
-		Password:  req.Password,
-		IsPrimary: true,
-		HashType:  "bcrypt",
+		Email:        req.Email,
+		Password:     req.Password,
+		PasswordHash: req.PasswordHash,
+		IsPrimary:    true,
+		HashType:     "bcrypt",
 	}
 
 	err := s.rdb.CreateAccountWithRetry(ctx, createReq)
@@ -421,8 +435,13 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Password == "" {
-		s.writeError(w, http.StatusBadRequest, "Password is required")
+	if req.Password == "" && req.PasswordHash == "" {
+		s.writeError(w, http.StatusBadRequest, "Either password or password_hash is required")
+		return
+	}
+
+	if req.Password != "" && req.PasswordHash != "" {
+		s.writeError(w, http.StatusBadRequest, "Cannot specify both password and password_hash")
 		return
 	}
 
@@ -430,9 +449,10 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	// Update account using the database's method
 	updateReq := db.UpdateAccountRequest{
-		Email:    email,
-		Password: req.Password,
-		HashType: "bcrypt",
+		Email:        email,
+		Password:     req.Password,
+		PasswordHash: req.PasswordHash,
+		HashType:     "bcrypt",
 	}
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
@@ -512,8 +532,18 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || req.Password == "" {
-		s.writeError(w, http.StatusBadRequest, "Email and password are required")
+	if req.Email == "" {
+		s.writeError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	if req.Password == "" && req.PasswordHash == "" {
+		s.writeError(w, http.StatusBadRequest, "Either password or password_hash is required")
+		return
+	}
+
+	if req.Password != "" && req.PasswordHash != "" {
+		s.writeError(w, http.StatusBadRequest, "Cannot specify both password and password_hash")
 		return
 	}
 
@@ -534,10 +564,11 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	// 2. Add the new credential to the existing account.
 	// This assumes a new database method `AddCredential` exists.
 	addReq := db.AddCredentialRequest{
-		AccountID:   accountID,
-		NewEmail:    req.Email,
-		NewPassword: req.Password,
-		NewHashType: "bcrypt",
+		AccountID:       accountID,
+		NewEmail:        req.Email,
+		NewPassword:     req.Password,
+		NewPasswordHash: req.PasswordHash,
+		NewHashType:     "bcrypt",
 	}
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)

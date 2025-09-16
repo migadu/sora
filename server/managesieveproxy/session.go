@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -74,29 +75,31 @@ func (s *Session) handleConnection() {
 		}
 
 		line = strings.TrimRight(line, "\r\n")
-		log.Printf("[ManageSieve Proxy] Client %s: %s", clientAddr, line)
 
-		// Parse command
-		parts := strings.Fields(line)
-		if len(parts) < 1 {
-			s.sendResponse(`NO "Invalid command"`)
+		// Use the shared command parser. ManageSieve commands do not have tags.
+		_, command, args, err := server.ParseLine(line, false)
+		if err != nil {
+			s.sendResponse(fmt.Sprintf(`NO "%s"`, err.Error()))
 			continue
 		}
 
-		command := strings.ToUpper(parts[0])
+		if command == "" { // Empty line
+			continue
+		}
 
+		log.Printf("[ManageSieve Proxy] Client %s: %s", clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 		switch command {
 		case "AUTHENTICATE":
-			if len(parts) < 2 || strings.ToUpper(parts[1]) != "PLAIN" {
+			if len(args) < 1 || strings.ToUpper(server.UnquoteString(args[0])) != "PLAIN" {
 				s.sendResponse(`NO "AUTHENTICATE PLAIN is the only supported mechanism"`)
 				continue
 			}
 
 			// Check if initial response is included
 			var saslLine string
-			if len(parts) >= 3 {
+			if len(args) >= 2 {
 				// Initial response provided
-				saslLine = parts[2]
+				saslLine = server.UnquoteString(args[1])
 			} else {
 				// Send continuation and wait for response
 				s.sendContinuation()
@@ -107,7 +110,8 @@ func (s *Session) handleConnection() {
 					log.Printf("[ManageSieve Proxy] Error reading SASL response: %v", err)
 					return
 				}
-				saslLine = strings.TrimRight(saslLine, "\r\n")
+				// The response to a continuation can also be a quoted string.
+				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
 			}
 
 			// Handle cancellation
@@ -306,21 +310,25 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackendAndAuth() error {
 	var preferredAddr string
 	var err error
-	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
+	// Use s.routingInfo directly. If it's nil from authentication,
+	// we'll try to populate it here.
+	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
-	if routingInfo == nil && s.server.connManager.HasRouting() {
+	if s.routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
 		var lookupErr error
-		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		// Update the session's routingInfo so it's available for later steps.
+		s.routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
 			log.Printf("[ManageSieve Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
 		}
 	}
 
-	if routingInfo != nil && routingInfo.ServerAddress != "" {
-		preferredAddr = routingInfo.ServerAddress
+	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
+		preferredAddr = s.routingInfo.ServerAddress
+		isPrelookupRoute = true
 		log.Printf("[ManageSieve Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
 
@@ -335,10 +343,10 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 	}
 
-	// 3. Apply stickiness to affinity/routing address
-	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
+	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
-			log.Printf("[ManageSieve Proxy] Ignoring affinity/routing for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
+			log.Printf("[ManageSieve Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
 		}
 	}
@@ -352,7 +360,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -395,6 +403,24 @@ func (s *Session) connectToBackendAndAuth() error {
 func (s *Session) authenticateToBackend() error {
 	backendWriter := bufio.NewWriter(s.backendConn)
 	backendReader := bufio.NewReader(s.backendConn)
+
+	// Send forwarding parameters via XCLIENT if enabled
+	useXCLIENT := s.server.remoteUseXCLIENT
+	// Override with routing-specific setting if available
+	if s.routingInfo != nil {
+		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
+	}
+
+	// The proxy's role is to forward the original client's information if enabled.
+	// It is the backend server's responsibility to verify if the connection
+	// (from this proxy) is from a trusted IP before processing forwarded parameters.
+	// The `isFromTrustedProxy()` check is for proxy-chaining, which is handled separately.
+	if useXCLIENT {
+		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
+			log.Printf("[ManageSieve Proxy] Failed to send forwarding parameters for %s: %v", s.username, err)
+			// Continue without forwarding parameters rather than failing
+		}
+	}
 
 	// Send AUTHENTICATE PLAIN command with impersonation
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
@@ -562,4 +588,72 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 func isClosingError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+}
+
+// sendForwardingParametersToBackend sends an XCLIENT-style command to the backend server
+// with forwarding parameters containing the real client information.
+// NOTE: This function was added for review completeness, based on pop3proxy.
+func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader *bufio.Reader) error {
+	// The session does not have proxyInfo, so we pass nil.
+	// NewForwardingParams will extract IPs from the connection itself.
+	forwardingParams := server.NewForwardingParams(s.clientConn, nil)
+
+	// Add session-specific details not handled by NewForwardingParams
+	forwardingParams.SessionID = s.generateSessionID()
+	forwardingParams.Variables["proxy-server"] = s.server.hostname
+	forwardingParams.Variables["proxy-user"] = s.username
+
+	// Convert to a generic key-value format for a custom XCLIENT-like command.
+	// ManageSieve does not have a standard XCLIENT, so this assumes a custom implementation.
+	xclientParams := forwardingParams.ToPOP3XCLIENT()
+
+	// Send XCLIENT command to backend
+	xclientCommand := fmt.Sprintf("XCLIENT %s\r\n", xclientParams)
+
+	if _, err := writer.WriteString(xclientCommand); err != nil {
+		return fmt.Errorf("failed to write XCLIENT command: %v", err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush XCLIENT command: %v", err)
+	}
+
+	// Set a deadline for reading the response to prevent hanging.
+	readTimeout := s.server.connManager.GetConnectTimeout()
+	if err := s.backendConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return fmt.Errorf("failed to set read deadline for XCLIENT response: %w", err)
+	}
+	// Ensure the deadline is cleared when the function returns.
+	defer func() {
+		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("[ManageSieve Proxy] Warning: failed to clear read deadline after XCLIENT response: %v", err)
+		}
+	}()
+
+	// Read backend response (we expect an OK response)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read XCLIENT response: %v", err)
+	}
+
+	response = strings.TrimRight(response, "\r\n")
+
+	if strings.HasPrefix(response, "OK") {
+		log.Printf("[ManageSieve Proxy] XCLIENT forwarding completed successfully for %s: %s", s.username, xclientParams)
+	} else if strings.HasPrefix(response, "NO") || strings.HasPrefix(response, "BAD") {
+		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
+	} else {
+		// Unexpected response - log but don't fail
+		log.Printf("[ManageSieve Proxy] Unexpected XCLIENT response from backend: %s", response)
+	}
+
+	return nil
+}
+
+// generateSessionID creates a unique session identifier for this proxy session.
+func (s *Session) generateSessionID() string {
+	// Generate a unique session ID for tracking.
+	// A combination of protocol, hostname, username, and a random number
+	// provides a reasonably unique identifier for logging and debugging.
+	return fmt.Sprintf("managesieve-proxy-%s-%s-%d", s.server.hostname, s.username, rand.Intn(1000000))
 }

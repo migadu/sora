@@ -63,7 +63,10 @@ func (s *POP3ProxySession) handleConnection() {
 		}
 
 		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, " ", 2)
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue // Ignore empty lines
+		}
 		cmd := strings.ToUpper(parts[0])
 
 		switch cmd {
@@ -337,21 +340,25 @@ func (s *POP3ProxySession) getPreferredBackend() (string, error) {
 func (s *POP3ProxySession) connectToBackend() error {
 	var preferredAddr string
 	var err error
-	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
+	// Use s.routingInfo directly. If it's nil from authentication,
+	// we'll try to populate it here.
+	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
-	if routingInfo == nil && s.server.connManager.HasRouting() {
+	if s.routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
 		var lookupErr error
-		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		// Update the session's routingInfo so it's available for later steps.
+		s.routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
 			log.Printf("[POP3 Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
 		}
 	}
 
-	if routingInfo != nil && routingInfo.ServerAddress != "" {
-		preferredAddr = routingInfo.ServerAddress
+	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
+		preferredAddr = s.routingInfo.ServerAddress
+		isPrelookupRoute = true
 		log.Printf("[POP3 Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
 
@@ -366,8 +373,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 		}
 	}
 
-	// 3. Apply stickiness to affinity/routing address
-	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
+	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[POP3 Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
@@ -380,7 +387,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -412,15 +419,34 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("unexpected backend greeting: %s", greeting)
 	}
 
-	// Authenticate to backend using master SASL credentials
 	backendWriter := bufio.NewWriter(s.backendConn)
 
-	// Use AUTH PLAIN with master credentials
+	// Send XCLIENT command to backend with forwarding parameters if enabled.
+	// This MUST be done before authenticating.
+	useXCLIENT := s.server.remoteUseXCLIENT
+	// Override with routing-specific setting if available
+	if s.routingInfo != nil {
+		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
+	}
+	if useXCLIENT {
+		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
+			log.Printf("[POP3 Proxy] Failed to send forwarding parameters to backend: %v", err)
+			// Continue anyway - forwarding parameters are not critical for functionality
+		}
+	}
+
+	// Authenticate to backend using master SASL credentials via AUTH PLAIN
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, s.server.masterSASLUsername, s.server.masterSASLPassword)
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
-	backendWriter.WriteString(fmt.Sprintf("AUTH PLAIN %s\r\n", encoded))
-	backendWriter.Flush()
+	if _, err := backendWriter.WriteString(fmt.Sprintf("AUTH PLAIN %s\r\n", encoded)); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("failed to send AUTH PLAIN to backend: %w", err)
+	}
+	if err := backendWriter.Flush(); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("failed to flush AUTH PLAIN to backend: %w", err)
+	}
 
 	// Read auth response
 	authResp, err := backendReader.ReadString('\n')
@@ -435,6 +461,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 
 	log.Printf("[POP3 Proxy] authenticated to backend as %s", s.username)
+
 	return nil
 }
 

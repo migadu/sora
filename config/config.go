@@ -297,24 +297,27 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 
 // PreLookupConfig holds configuration for database-driven user routing
 type PreLookupConfig struct {
-	Enabled         bool        `toml:"enabled"`
-	Hosts           []string    `toml:"hosts"`
-	Port            interface{} `toml:"port"` // Database port (default: "5432"), can be string or integer
-	User            string      `toml:"user"`
-	Password        string      `toml:"password"`
-	Name            string      `toml:"name"`
-	TLS             bool        `toml:"tls"`
-	MaxConns        int         `toml:"max_conns"`
-	MinConns        int         `toml:"min_conns"`
-	MaxConnLifetime string      `toml:"max_conn_lifetime"`
-	MaxConnIdleTime string      `toml:"max_conn_idle_time"`
-	CacheTTL        string      `toml:"cache_ttl"`
-	CacheSize       int         `toml:"cache_size"`
-	FallbackDefault bool        `toml:"fallback_to_default"`
-	AuthMethod      string      `toml:"auth_method"`       // "bcrypt", "plain", etc.
-	Query           string      `toml:"query"`             // Main query (auto-detects mode based on columns returned)
-	RemoteTLS       bool        `toml:"remote_tls"`        // Use TLS for backend connections from prelookup
-	RemoteTLSVerify *bool       `toml:"remote_tls_verify"` // Verify backend TLS certificate
+	Enabled              bool        `toml:"enabled"`
+	Hosts                []string    `toml:"hosts"`
+	Port                 interface{} `toml:"port"` // Database port (default: "5432"), can be string or integer
+	User                 string      `toml:"user"`
+	Password             string      `toml:"password"`
+	Name                 string      `toml:"name"`
+	TLS                  bool        `toml:"tls"`
+	MaxConns             int         `toml:"max_conns"`
+	MinConns             int         `toml:"min_conns"`
+	MaxConnLifetime      string      `toml:"max_conn_lifetime"`
+	MaxConnIdleTime      string      `toml:"max_conn_idle_time"`
+	CacheTTL             string      `toml:"cache_ttl"`
+	CacheSize            int         `toml:"cache_size"`
+	FallbackDefault      bool        `toml:"fallback_to_default"`
+	AuthMethod           string      `toml:"auth_method"`             // "bcrypt", "plain", etc.
+	Query                string      `toml:"query"`                   // Main query (auto-detects mode based on columns returned)
+	RemoteTLS            bool        `toml:"remote_tls"`              // Use TLS for backend connections from prelookup
+	RemoteTLSVerify      *bool       `toml:"remote_tls_verify"`       // Verify backend TLS certificate
+	RemoteUseProxyProtocol bool      `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections from prelookup
+	RemoteUseIDCommand   bool        `toml:"remote_use_id_command"`   // Use IMAP ID command for forwarding from prelookup (IMAP only)
+	RemoteUseXCLIENT     bool        `toml:"remote_use_xclient"`      // Use XCLIENT command for forwarding from prelookup (POP3/LMTP/ManageSieve)
 }
 
 // GetCacheTTL returns the configured cache TTL duration
@@ -425,6 +428,7 @@ type IMAPProxyServerConfig struct {
 	TLSVerify           bool                  `toml:"tls_verify"`
 	RemoteTLS           bool                  `toml:"remote_tls"`
 	RemoteTLSVerify     bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol bool               `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout      string                `toml:"connect_timeout"`
 	EnableAffinity      bool                  `toml:"enable_affinity"`
 	AffinityStickiness  float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
@@ -448,6 +452,7 @@ type POP3ProxyServerConfig struct {
 	TLSVerify           bool                  `toml:"tls_verify"`
 	RemoteTLS           bool                  `toml:"remote_tls"`
 	RemoteTLSVerify     bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol bool               `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout      string                `toml:"connect_timeout"`
 	EnableAffinity      bool                  `toml:"enable_affinity"`
 	AffinityStickiness  float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
@@ -471,6 +476,7 @@ type ManageSieveProxyServerConfig struct {
 	TLSVerify           bool                  `toml:"tls_verify"`
 	RemoteTLS           bool                  `toml:"remote_tls"`
 	RemoteTLSVerify     bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol bool               `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout      string                `toml:"connect_timeout"`
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup           *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
@@ -492,6 +498,7 @@ type LMTPProxyServerConfig struct {
 	TLSVerify           bool             `toml:"tls_verify"`
 	RemoteTLS           bool             `toml:"remote_tls"`
 	RemoteTLSVerify     bool             `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol bool          `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout      string           `toml:"connect_timeout"`
 	EnableAffinity      bool             `toml:"enable_affinity"`
 	AffinityStickiness  float64          `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
@@ -694,6 +701,7 @@ func NewDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
+				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
 				EnableAffinity:      true,
 				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
@@ -708,6 +716,7 @@ func NewDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
+				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
 				EnableAffinity:      true,
 				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",
@@ -723,6 +732,7 @@ func NewDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
+				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
 				AuthRateLimit:       DefaultAuthRateLimiterConfig(),
 				EnableAffinity:      true,
 				AffinityStickiness:  0.9,
@@ -736,6 +746,7 @@ func NewDefaultConfig() Config {
 				TLS:                 false,
 				RemoteTLS:           false,
 				RemoteTLSVerify:     true,
+				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
 				EnableAffinity:      true,
 				AffinityStickiness:  0.9,
 				AffinityValidity:    "24h",

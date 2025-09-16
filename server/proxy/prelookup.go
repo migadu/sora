@@ -26,11 +26,14 @@ type PreLookupConfig = config.PreLookupConfig
 
 // UserRoutingInfo represents routing information for a user
 type UserRoutingInfo struct {
-	ServerAddress      string
-	AccountID          int64
-	IsPrelookupAccount bool
-	RemoteTLS          bool
-	RemoteTLSVerify    bool
+	ServerAddress          string
+	AccountID              int64
+	IsPrelookupAccount     bool
+	RemoteTLS              bool
+	RemoteTLSVerify        bool
+	RemoteUseProxyProtocol bool
+	RemoteUseIDCommand     bool // Use IMAP ID command for forwarding (IMAP only)
+	RemoteUseXCLIENT       bool // Use XCLIENT command for forwarding (POP3/LMTP/ManageSieve)
 }
 
 // AuthResult represents the result of authentication
@@ -58,16 +61,19 @@ type cacheEntry struct {
 
 // PreLookupClient implements UserRoutingLookup with database queries and caching
 type PreLookupClient struct {
-	pool            *pgxpool.Pool
-	query           string
-	cacheTTL        time.Duration
-	cache           map[string]*cacheEntry
-	cacheMutex      sync.RWMutex
-	fallbackMode    bool
-	remoteTLS       bool
-	remoteTLSVerify bool
-	stopJanitor     chan struct{}
-	breaker         *circuitbreaker.CircuitBreaker
+	pool                   *pgxpool.Pool
+	query                  string
+	cacheTTL               time.Duration
+	cache                  map[string]*cacheEntry
+	cacheMutex             sync.RWMutex
+	fallbackMode           bool
+	remoteTLS              bool
+	remoteTLSVerify        bool
+	remoteUseProxyProtocol bool
+	remoteUseIDCommand     bool
+	remoteUseXCLIENT       bool
+	stopJanitor            chan struct{}
+	breaker                *circuitbreaker.CircuitBreaker
 }
 
 // NewPreLookupClient creates a new PreLookupClient
@@ -196,15 +202,18 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	}
 
 	client := &PreLookupClient{
-		pool:            pool,
-		query:           query,
-		cacheTTL:        cacheTTL,
-		cache:           make(map[string]*cacheEntry),
-		fallbackMode:    config.FallbackDefault,
-		remoteTLS:       config.RemoteTLS,
-		remoteTLSVerify: remoteTLSVerify,
-		stopJanitor:     make(chan struct{}),
-		breaker:         circuitbreaker.NewCircuitBreaker(breakerSettings),
+		pool:                   pool,
+		query:                  query,
+		cacheTTL:               cacheTTL,
+		cache:                  make(map[string]*cacheEntry),
+		fallbackMode:           config.FallbackDefault,
+		remoteTLS:              config.RemoteTLS,
+		remoteTLSVerify:        remoteTLSVerify,
+		remoteUseProxyProtocol: config.RemoteUseProxyProtocol,
+		remoteUseIDCommand:     config.RemoteUseIDCommand,
+		remoteUseXCLIENT:       config.RemoteUseXCLIENT,
+		stopJanitor:            make(chan struct{}),
+		breaker:                circuitbreaker.NewCircuitBreaker(breakerSettings),
 	}
 
 	// Log the configuration for debugging
@@ -326,9 +335,12 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 
 	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
 	info := &UserRoutingInfo{
-		ServerAddress:   serverAddress,
-		RemoteTLS:       c.remoteTLS,
-		RemoteTLSVerify: c.remoteTLSVerify,
+		ServerAddress:          serverAddress,
+		RemoteTLS:              c.remoteTLS,
+		RemoteTLSVerify:        c.remoteTLSVerify,
+		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
+		RemoteUseIDCommand:     c.remoteUseIDCommand,
+		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
 	}
 
 	if serverAddress == "" {
@@ -414,10 +426,13 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 
 				log.Printf("[PreLookup] Auto-detected routing-only mode for user '%s'", email)
 				info := &UserRoutingInfo{
-					ServerAddress:      serverAddr,
-					IsPrelookupAccount: true,
-					RemoteTLS:          c.remoteTLS,
-					RemoteTLSVerify:    c.remoteTLSVerify,
+					ServerAddress:          serverAddr,
+					IsPrelookupAccount:     true,
+					RemoteTLS:              c.remoteTLS,
+					RemoteTLSVerify:        c.remoteTLSVerify,
+					RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
+					RemoteUseIDCommand:     c.remoteUseIDCommand,
+					RemoteUseXCLIENT:       c.remoteUseXCLIENT,
 				}
 				return map[string]interface{}{
 					"mode":   "routing_only",
@@ -493,11 +508,14 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 
 				log.Printf("[PreLookup] Authentication successful for user '%s'", email)
 				info := &UserRoutingInfo{
-					ServerAddress:      serverAddress,
-					AccountID:          accountID,
-					IsPrelookupAccount: true,
-					RemoteTLS:          c.remoteTLS,
-					RemoteTLSVerify:    c.remoteTLSVerify,
+					ServerAddress:          serverAddress,
+					AccountID:              accountID,
+					IsPrelookupAccount:     true,
+					RemoteTLS:              c.remoteTLS,
+					RemoteTLSVerify:        c.remoteTLSVerify,
+					RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
+					RemoteUseIDCommand:     c.remoteUseIDCommand,
+					RemoteUseXCLIENT:       c.remoteUseXCLIENT,
 				}
 
 				return map[string]interface{}{

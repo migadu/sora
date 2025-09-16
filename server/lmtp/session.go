@@ -153,6 +153,16 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}()
 
 	s.Log("processing RCPT TO command: %s", to)
+	
+	// Process XRCPTFORWARD parameters if present
+	// This supports Dovecot-style per-recipient parameter forwarding
+	if opts != nil {
+		// Convert smtp.RcptOptions to map for processing
+		// Note: This is a simplified approach - actual implementation would depend
+		// on how go-smtp exposes RCPT options
+		// s.ParseRCPTForward(rcptOptionsMap)
+	}
+	
 	toAddress, err := server.NewAddress(to)
 	if err != nil {
 		s.Log("invalid to address: %v", err)

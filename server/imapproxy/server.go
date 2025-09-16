@@ -36,26 +36,31 @@ type Server struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	authLimiter        server.AuthLimiter
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remoteUseIDCommand bool     // Whether backend supports IMAP ID command for forwarding
 }
 
 // ServerOptions holds options for creating a new IMAP proxy server.
 type ServerOptions struct {
-	Addr               string
-	RemoteAddrs        []string
-	MasterSASLUsername string
-	MasterSASLPassword string
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	RemoteTLS          bool
-	RemoteTLSVerify    bool
-	ConnectTimeout     time.Duration
-	EnableAffinity     bool
-	AffinityValidity   time.Duration
-	AffinityStickiness float64
-	AuthRateLimit      server.AuthRateLimiterConfig
-	PreLookup          *proxy.PreLookupConfig
+	Addr                   string
+	RemoteAddrs            []string
+	MasterSASLUsername     string
+	MasterSASLPassword     string
+	TLS                    bool
+	TLSCertFile            string
+	TLSKeyFile             string
+	TLSVerify              bool
+	RemoteTLS              bool
+	RemoteTLSVerify        bool
+	RemoteUseProxyProtocol bool
+	ConnectTimeout         time.Duration
+	EnableAffinity         bool
+	AffinityValidity       time.Duration
+	AffinityStickiness     float64
+	AuthRateLimit          server.AuthRateLimiterConfig
+	PreLookup              *proxy.PreLookupConfig
+	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
 }
 
 // New creates a new IMAP proxy server.
@@ -91,7 +96,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout, routingLookup)
+	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()
@@ -132,6 +137,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		ctx:                ctx,
 		cancel:             cancel,
 		authLimiter:        authLimiter,
+		trustedProxies:     opts.TrustedProxies,
+		remoteUseIDCommand: opts.RemoteUseIDCommand,
 	}, nil
 }
 
@@ -182,6 +189,12 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[IMAP Proxy] Session panic recovered: %v", r)
+					conn.Close()
+				}
+			}()
 
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("imap_proxy").Inc()

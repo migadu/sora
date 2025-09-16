@@ -14,6 +14,7 @@ import (
 
 	"github.com/foxcpp/go-sieve"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -89,6 +90,11 @@ func (s *ManageSieveSession) handleConnection() {
 
 		parts := strings.SplitN(line, " ", 3)
 		command := strings.ToUpper(parts[0])
+
+		// If debug logging is active, it might log the raw command.
+		// This ensures that if any such logging exists, it will be of a masked line.
+		// This is a defensive change as the direct logging is not visible in this file.
+		s.Log(helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
 		switch command {
 		case "CAPABILITY":

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -79,27 +80,39 @@ func (s *Session) handleConnection() {
 		}
 
 		line = strings.TrimRight(line, "\r\n")
-		log.Printf("[IMAP Proxy] Client %s: %s", clientAddr, line)
 
-		// Parse command
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			s.sendResponse("* BAD Invalid command")
+		// Use the shared command parser. IMAP commands have tags.
+		tag, command, args, err := server.ParseLine(line, true)
+		if err != nil {
+			// This would be a malformed line, e.g., unclosed quote.
+			// Send a tagged BAD response if we have a tag.
+			if tag != "" {
+				s.sendResponse(fmt.Sprintf("%s BAD %s", tag, err.Error()))
+			} else {
+				s.sendResponse(fmt.Sprintf("* BAD %s", err.Error()))
+			}
 			continue
 		}
 
-		tag := parts[0]
-		command := strings.ToUpper(parts[1])
+		if tag == "" { // Empty line
+			continue
+		}
+		if command == "" { // Tag only
+			s.sendResponse(fmt.Sprintf("%s BAD Command is missing", tag))
+			continue
+		}
+
+		log.Printf("[IMAP Proxy] Client %s: %s", clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
 		switch command {
 		case "LOGIN":
-			if len(parts) < 4 {
+			if len(args) < 2 {
 				s.sendResponse(fmt.Sprintf("%s NO LOGIN requires username and password", tag))
 				continue
 			}
 
-			username := s.unquoteString(parts[2])
-			password := s.unquoteString(parts[3])
+			username := server.UnquoteString(args[0])
+			password := server.UnquoteString(args[1])
 
 			if err := s.authenticateUser(username, password); err != nil {
 				log.Printf("[IMAP Proxy] Authentication failed for %s: %v", username, err)
@@ -108,49 +121,19 @@ func (s *Session) handleConnection() {
 			}
 
 			s.username = username
-
-			// Connect to backend
-			if err := s.connectToBackend(); err != nil {
-				log.Printf("[IMAP Proxy] Failed to connect to backend for %s: %v", username, err)
-				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", tag))
-				continue
-			}
-
-			// Authenticate to backend with master credentials
-			backendResponse, err := s.authenticateToBackend()
-			if err != nil {
-				log.Printf("[IMAP Proxy] Backend authentication failed for %s: %v", username, err)
-				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", tag))
-				// Close the backend connection since authentication failed
-				if s.backendConn != nil {
-					s.backendConn.Close()
-					s.backendConn = nil
-					s.backendReader = nil
-					s.backendWriter = nil
-				}
-				continue
-			}
-
-			// Register connection
-			if err := s.registerConnection(); err != nil {
-				log.Printf("[IMAP Proxy] Failed to register connection for %s: %v", username, err)
-			}
-
-			// Forward the backend's success response, replacing the tag.
-			responsePayload := strings.TrimPrefix(backendResponse, "A001 ")
-			s.sendResponse(fmt.Sprintf("%s %s", tag, responsePayload))
+			s.postAuthenticationSetup(tag)
 			authenticated = true
 
 		case "AUTHENTICATE":
-			if len(parts) < 3 || strings.ToUpper(parts[2]) != "PLAIN" {
+			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
 				s.sendResponse(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag))
 				continue
 			}
 
 			var saslLine string
-			if len(parts) > 3 {
+			if len(args) > 1 {
 				// Initial response was provided with the command
-				saslLine = parts[3]
+				saslLine = server.UnquoteString(args[1])
 			} else {
 				// No initial response, send continuation request
 				s.sendResponse("+")
@@ -164,7 +147,8 @@ func (s *Session) handleConnection() {
 					}
 					return // Client connection error, can't continue
 				}
-				saslLine = strings.TrimRight(saslLine, "\r\n")
+				// The response to a continuation can also be a quoted string.
+				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
 			}
 
 			if saslLine == "*" {
@@ -196,37 +180,7 @@ func (s *Session) handleConnection() {
 			}
 
 			s.username = authnID
-
-			// Connect to backend
-			if err := s.connectToBackend(); err != nil {
-				log.Printf("[IMAP Proxy] Failed to connect to backend for %s: %v", authnID, err)
-				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", tag))
-				continue
-			}
-
-			// Authenticate to backend with master credentials
-			backendResponse, err := s.authenticateToBackend()
-			if err != nil {
-				log.Printf("[IMAP Proxy] Backend authentication failed for %s: %v", authnID, err)
-				s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", tag))
-				// Close the backend connection since authentication failed
-				if s.backendConn != nil {
-					s.backendConn.Close()
-					s.backendConn = nil
-					s.backendReader = nil
-					s.backendWriter = nil
-				}
-				continue
-			}
-
-			// Register connection
-			if err := s.registerConnection(); err != nil {
-				log.Printf("[IMAP Proxy] Failed to register connection for %s: %v", authnID, err)
-			}
-
-			// Forward the backend's success response, replacing the tag.
-			responsePayload := strings.TrimPrefix(backendResponse, "A001 ")
-			s.sendResponse(fmt.Sprintf("%s %s", tag, responsePayload))
+			s.postAuthenticationSetup(tag)
 			authenticated = true
 
 		case "LOGOUT":
@@ -237,6 +191,12 @@ func (s *Session) handleConnection() {
 		case "CAPABILITY":
 			s.sendResponse("* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN")
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
+
+		case "ID":
+			// Handle ID command - this is where we add forwarding parameter support
+			// For now, just respond with a basic server ID
+			s.sendResponse("* ID (\"name\" \"Sora-Proxy\" \"version\" \"1.0\")")
+			s.sendResponse(fmt.Sprintf("%s OK ID completed", tag))
 
 		case "NOOP":
 			s.sendResponse(fmt.Sprintf("%s OK NOOP completed", tag))
@@ -268,14 +228,6 @@ func (s *Session) sendResponse(response string) error {
 		return err
 	}
 	return s.clientWriter.Flush()
-}
-
-// unquoteString removes quotes from a string if present.
-func (s *Session) unquoteString(str string) string {
-	if len(str) >= 2 && str[0] == '"' && str[len(str)-1] == '"' {
-		return str[1 : len(str)-1]
-	}
-	return str
 }
 
 // authenticateUser authenticates the user against the database.
@@ -385,21 +337,25 @@ func (s *Session) getPreferredBackend() (string, error) {
 func (s *Session) connectToBackend() error {
 	var preferredAddr string
 	var err error
-	var routingInfo *proxy.UserRoutingInfo = s.routingInfo
+	// Use s.routingInfo directly. If it's nil from authentication,
+	// we'll try to populate it here.
+	isPrelookupRoute := false
 
 	// 1. Try routing lookup first, only if not already available from auth
-	if routingInfo == nil && s.server.connManager.HasRouting() {
+	if s.routingInfo == nil && s.server.connManager.HasRouting() {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
 		var lookupErr error
-		routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		// Update the session's routingInfo so it's available for later steps.
+		s.routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		routingCancel()
 		if lookupErr != nil {
 			log.Printf("[IMAP Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
 		}
 	}
 
-	if routingInfo != nil && routingInfo.ServerAddress != "" {
-		preferredAddr = routingInfo.ServerAddress
+	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
+		preferredAddr = s.routingInfo.ServerAddress
+		isPrelookupRoute = true
 		log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
 	}
 
@@ -414,8 +370,8 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	// 3. Apply stickiness to affinity/routing address
-	if preferredAddr != "" && s.server.affinityStickiness < 1.0 {
+	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
+	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
 		if rand.Float64() > s.server.affinityStickiness {
 			log.Printf("[IMAP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
 			preferredAddr = "" // This will cause the connection manager to use round-robin
@@ -432,7 +388,7 @@ func (s *Session) connectToBackend() error {
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -453,14 +409,28 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
+	// Set a deadline for reading the greeting to prevent hanging
+	readTimeout := s.server.connManager.GetConnectTimeout()
+	if err := s.backendConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		s.backendConn.Close()
+		log.Printf("[IMAP Proxy] Failed to set read deadline for backend greeting from %s: %v", s.serverAddr, err)
+		return fmt.Errorf("failed to set read deadline for greeting: %w", err)
+	}
+
 	// Read greeting from backend
 	greeting, err := s.backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
+		log.Printf("[IMAP Proxy] Failed to read backend greeting from %s for user %s: %v", s.serverAddr, s.username, err)
 		return fmt.Errorf("failed to read backend greeting: %w", err)
 	}
 
-	log.Printf("[IMAP Proxy] Backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
+	// Clear the read deadline after successful greeting
+	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("[IMAP Proxy] Warning: failed to clear read deadline for %s: %v", s.serverAddr, err)
+	}
+
+	log.Printf("[IMAP Proxy] Backend greeting from %s: %s", s.serverAddr, strings.TrimRight(greeting, "\r\n"))
 
 	return nil
 }
@@ -472,10 +442,19 @@ func (s *Session) authenticateToBackend() (string, error) {
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
+	// Set a deadline for the authentication process
+	authTimeout := s.server.connManager.GetConnectTimeout()
+	if err := s.backendConn.SetDeadline(time.Now().Add(authTimeout)); err != nil {
+		log.Printf("[IMAP Proxy] Failed to set auth deadline for %s: %v", s.serverAddr, err)
+		return "", fmt.Errorf("failed to set auth deadline: %w", err)
+	}
+
+	tag := fmt.Sprintf("p%d", rand.Intn(10000))
 	// Send AUTHENTICATE PLAIN with initial response
-	authCmd := fmt.Sprintf("A001 AUTHENTICATE PLAIN %s\r\n", encoded)
+	authCmd := fmt.Sprintf("%s AUTHENTICATE PLAIN %s\r\n", tag, encoded)
 	_, err := s.backendWriter.WriteString(authCmd)
 	if err != nil {
+		log.Printf("[IMAP Proxy] Failed to send AUTHENTICATE command to %s: %v", s.serverAddr, err)
 		return "", fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
 	}
 	s.backendWriter.Flush()
@@ -483,16 +462,78 @@ func (s *Session) authenticateToBackend() (string, error) {
 	// Read authentication response
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
+		log.Printf("[IMAP Proxy] Failed to read auth response from %s: %v", s.serverAddr, err)
 		return "", fmt.Errorf("failed to read auth response: %w", err)
 	}
 
-	if !strings.HasPrefix(strings.TrimSpace(response), "A001 OK") {
+	// Clear the deadline after successful authentication
+	if err := s.backendConn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("[IMAP Proxy] Warning: failed to clear auth deadline for %s: %v", s.serverAddr, err)
+	}
+
+	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
 		return "", fmt.Errorf("backend authentication failed: %s", response)
 	}
 
 	log.Printf("[IMAP Proxy] Backend authentication successful for user %s", s.username)
 
 	return strings.TrimRight(response, "\r\n"), nil
+}
+
+// postAuthenticationSetup handles the common tasks after a user is successfully authenticated.
+func (s *Session) postAuthenticationSetup(clientTag string) {
+	// Connect to backend
+	if err := s.connectToBackend(); err != nil {
+		log.Printf("[IMAP Proxy] Failed to connect to backend for %s: %v", s.username, err)
+		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
+		return
+	}
+
+	// Send ID command to backend with forwarding parameters if enabled.
+	// This MUST be done before authenticating to the backend, as the ID command
+	// is only valid in the "Not Authenticated" state.
+	useIDCommand := s.server.remoteUseIDCommand
+	// Override with routing-specific setting if available
+	if s.routingInfo != nil {
+		useIDCommand = s.routingInfo.RemoteUseIDCommand
+	}
+	if useIDCommand {
+		if err := s.sendForwardingParametersToBackend(); err != nil {
+			log.Printf("[IMAP Proxy] Failed to send forwarding parameters to backend: %v", err)
+			// Continue anyway - forwarding parameters are not critical
+		}
+	}
+
+	// Authenticate to backend with master credentials
+	backendResponse, err := s.authenticateToBackend()
+	if err != nil {
+		log.Printf("[IMAP Proxy] Backend authentication failed for %s: %v", s.username, err)
+		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", clientTag))
+		// Close the backend connection since authentication failed
+		if s.backendConn != nil {
+			s.backendConn.Close()
+			s.backendConn = nil
+			s.backendReader = nil
+			s.backendWriter = nil
+		}
+		return
+	}
+
+	// Register connection
+	if err := s.registerConnection(); err != nil {
+		log.Printf("[IMAP Proxy] Failed to register connection for %s: %v", s.username, err)
+	}
+
+	// Forward the backend's success response, replacing the client's tag.
+	var responsePayload string
+	if idx := strings.Index(backendResponse, " "); idx != -1 {
+		// The payload is everything after the first space (e.g., "OK Authentication successful")
+		responsePayload = backendResponse[idx+1:]
+	} else {
+		// Fallback if the response format is unexpected
+		responsePayload = "OK Authentication successful"
+	}
+	s.sendResponse(fmt.Sprintf("%s %s", clientTag, responsePayload))
 }
 
 // startProxy starts bidirectional proxying between client and backend.

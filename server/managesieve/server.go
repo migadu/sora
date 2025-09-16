@@ -275,23 +275,28 @@ type proxyProtocolListener struct {
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
 
-	// Try to read PROXY protocol header
-	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("%w: %v", errProxyProtocol, err)
-	}
+		// Try to read PROXY protocol header
+		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+		if err != nil {
+			conn.Close()
+			// Log the error but continue accepting new connections - don't crash the entire server
+			log.Printf("[ManageSieve] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+			// Continue the loop to accept the next connection instead of returning an error
+			continue
+		}
 
-	// Wrap the connection with proxy info for later extraction
-	return &proxyProtocolConn{
-		Conn:      wrappedConn,
-		proxyInfo: proxyInfo,
-	}, nil
+		// Wrap the connection with proxy info for later extraction
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
 }
 
 // proxyProtocolConn wraps a connection with PROXY protocol information

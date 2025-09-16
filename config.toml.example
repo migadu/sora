@@ -1084,6 +1084,31 @@ db_error_threshold = "1m"
 # backend Sora servers. This enables horizontal scaling and high availability.
 
 # =============================================================================  
+# PROXY SERVER FORWARDING CONFIGURATION
+# =============================================================================
+# All proxy servers support forwarding client connection information to backends
+# to preserve the real client IP addresses for logging, rate limiting, and security.
+#
+# Two types of forwarding are available:
+# 1. PROXY Protocol v2 (remote_use_proxy_protocol) - Transport-level forwarding
+# 2. Protocol-specific forwarding - Application-level forwarding
+#
+# PROTOCOL-SPECIFIC FORWARDING OPTIONS:
+# - IMAP Proxy: remote_use_id_command (uses IMAP ID command with x-* parameters)
+# - POP3 Proxy: remote_use_xclient (uses POP3 XCLIENT command)
+# - LMTP Proxy: remote_use_xclient (uses LMTP XCLIENT command)  
+# - ManageSieve Proxy: remote_use_xclient (uses ManageSieve XCLIENT command)
+#
+# BACKEND COMPATIBILITY:
+# - Modern backends (Dovecot, Postfix): Support both PROXY protocol and forwarding
+# - Legacy backends: May only support PROXY protocol, disable forwarding commands
+# - Set forwarding options to 'false' for backends that don't support them
+#
+# SECURITY:
+# - Forwarding only works from trusted proxy networks (RFC1918 + localhost)
+# - Configure 'trusted_proxies' to restrict which clients can send forwarding info
+#
+# =============================================================================  
 # IMAP PROXY CONFIGURATION
 # =============================================================================
 # Proxy IMAP connections across multiple backend servers with load balancing
@@ -1164,6 +1189,22 @@ remote_tls = false
 #   remote_tls_verify = false                  # Skip backend cert verification
 #   remote_tls_verify = true                   # Verify backend certificates
 remote_tls_verify = true
+
+# Use PROXY protocol for backend connections
+# When enabled, the proxy server sends PROXY protocol v2 headers to backend servers
+# to preserve the real client IP address for logging and rate limiting.
+# Examples:
+#   remote_use_proxy_protocol = true           # Send PROXY headers (default)
+#   remote_use_proxy_protocol = false          # Don't send PROXY headers
+remote_use_proxy_protocol = true
+
+# Use IMAP ID command for forwarding client connection info to backends
+# When enabled, the proxy sends ID command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_id_command = true               # Send ID forwarding (default)
+#   remote_use_id_command = false              # Don't send ID forwarding
+remote_use_id_command = true
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 # Control proxy connection handling and load balancing
@@ -1381,6 +1422,21 @@ remote_tls = false
 # Verify backend server certificates. It is strongly recommended to keep this true.
 remote_tls_verify = true
 
+# Use PROXY protocol for backend connections found via prelookup
+# When enabled, PROXY protocol v2 headers are sent to preserve real client IP addresses
+# Examples:
+#   remote_use_proxy_protocol = true           # Send PROXY headers (default)
+#   remote_use_proxy_protocol = false          # Don't send PROXY headers
+remote_use_proxy_protocol = true
+
+# Use IMAP ID command for forwarding client connection info to prelookup backends
+# When enabled, the proxy sends ID command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_id_command = true               # Send ID forwarding (default)
+#   remote_use_id_command = false              # Don't send ID forwarding
+remote_use_id_command = true
+
 # --- PRELOOKUP FALLBACK BEHAVIOR ---
 # Control what happens when prelookup fails or user is not found
 
@@ -1418,6 +1474,15 @@ tls_key_file = ""
 tls_verify = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to backends  
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default) 
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
@@ -1500,6 +1565,15 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to prelookup backends
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default)
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # =============================================================================
 # MANAGESIEVE PROXY CONFIGURATION
@@ -1520,6 +1594,15 @@ tls_key_file = ""
 tls_verify = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to backends
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default)
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
@@ -1596,6 +1679,15 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to prelookup backends
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default)
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # =============================================================================
 # LMTP PROXY CONFIGURATION
@@ -1614,6 +1706,15 @@ tls_key_file = ""
 tls_verify = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to backends
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default)
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
@@ -1650,6 +1751,15 @@ query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1
 fallback_to_default = true
 remote_tls = false
 remote_tls_verify = true
+remote_use_proxy_protocol = true
+
+# Use XCLIENT command for forwarding client connection info to prelookup backends
+# When enabled, the proxy sends XCLIENT command with client IP, port, session info
+# to preserve the real client information for logging and rate limiting.
+# Examples:
+#   remote_use_xclient = true                  # Send XCLIENT forwarding (default)
+#   remote_use_xclient = false                 # Don't send XCLIENT forwarding
+remote_use_xclient = true
 
 # =============================================================================
 # PROMETHEUS METRICS CONFIGURATION

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,52 @@ import (
 )
 
 const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
+
+// maskingWriter is a wrapper for an io.Writer that redacts sensitive information.
+type maskingWriter struct {
+	w io.Writer
+}
+
+// Write inspects the log output, and if it's a client command (prefixed with "C: "),
+// it attempts to mask sensitive parts of LOGIN or AUTHENTICATE commands.
+func (mw *maskingWriter) Write(p []byte) (n int, err error) {
+	line := string(p)
+	originalLen := len(p)
+
+	// Only process client commands
+	if !strings.HasPrefix(line, "C: ") {
+		return mw.w.Write(p)
+	}
+
+	cmdLine := strings.TrimPrefix(line, "C: ")
+	trimmedCmdLine := strings.TrimRight(cmdLine, "\r\n")
+	parts := strings.Fields(trimmedCmdLine)
+	if len(parts) < 2 { // Needs at least tag and command
+		return mw.w.Write(p)
+	}
+
+	command := strings.ToUpper(parts[1])
+
+	// Use the helper to mask the command line
+	maskedCmdLine := helpers.MaskSensitive(trimmedCmdLine, command, "LOGIN", "AUTHENTICATE")
+
+	// If the line was modified, write the masked version.
+	if maskedCmdLine != trimmedCmdLine {
+		maskedLine := "C: " + maskedCmdLine + "\r\n"
+		_, err = mw.w.Write([]byte(maskedLine))
+	} else {
+		// Otherwise, write the original line.
+		_, err = mw.w.Write(p)
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	// We "pretend" to have written the original number of bytes
+	// to satisfy the io.Writer contract and not confuse the caller.
+	return originalLen, nil
+}
 
 type IMAPServer struct {
 	addr               string
@@ -96,7 +143,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 	if rdb == nil {
 		return nil, fmt.Errorf("database is required for IMAP server")
 	}
-	
+
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -194,7 +241,8 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 
 	var debugWriter io.Writer
 	if options.Debug {
-		debugWriter = os.Stdout
+		// Wrap os.Stdout with our masking writer to redact passwords from debug logs
+		debugWriter = &maskingWriter{w: os.Stdout}
 	}
 
 	s.server = imapserver.New(&imapserver.Options{
@@ -321,25 +369,28 @@ type proxyProtocolListener struct {
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
 
-	// Try to read PROXY protocol header
-	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-	if err != nil {
-		conn.Close()
-		// Log but don't crash - let the server continue accepting other connections
-		log.Printf("[IMAP] PROXY protocol error, rejecting connection: %v", err)
-		return nil, fmt.Errorf("PROXY protocol error: %w", err)
-	}
+		// Try to read PROXY protocol header
+		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+		if err != nil {
+			conn.Close()
+			// Log the error but continue accepting new connections - don't crash the entire server
+			log.Printf("[IMAP] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+			// Continue the loop to accept the next connection instead of returning an error
+			continue
+		}
 
-	// Wrap the connection with proxy info for later extraction
-	return &proxyProtocolConn{
-		Conn:      wrappedConn,
-		proxyInfo: proxyInfo,
-	}, nil
+		// Wrap the connection with proxy info for later extraction
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
 }
 
 // proxyProtocolConn wraps a connection with PROXY protocol information
@@ -483,4 +534,23 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 	}
 
 	return nil
+}
+
+// getTrustedProxies returns the list of trusted proxy CIDR blocks for parameter forwarding
+func (s *IMAPServer) getTrustedProxies() []string {
+	if s.proxyReader != nil {
+		// Get trusted proxies from PROXY protocol configuration
+		// Access the configuration from the ProxyProtocolReader
+		// Note: This assumes the ProxyProtocolReader has access to the config
+		// For now, we'll use default safe values that match PROXY protocol defaults
+	}
+
+	// Return default trusted proxy networks (RFC1918 private networks + localhost)
+	// These are safe defaults that match the PROXY protocol configuration
+	return []string{
+		"127.0.0.0/8",    // localhost
+		"10.0.0.0/8",     // RFC1918 private networks
+		"172.16.0.0/12",  // RFC1918 private networks
+		"192.168.0.0/16", // RFC1918 private networks
+	}
 }

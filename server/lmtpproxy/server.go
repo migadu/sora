@@ -32,23 +32,28 @@ type Server struct {
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remoteUseXCLIENT   bool     // Whether backend supports XCLIENT command for forwarding
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
 type ServerOptions struct {
-	Addr               string
-	RemoteAddrs        []string
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	RemoteTLS          bool
-	RemoteTLSVerify    bool
-	ConnectTimeout     time.Duration
-	EnableAffinity     bool
-	AffinityValidity   time.Duration
-	AffinityStickiness float64
-	PreLookup          *proxy.PreLookupConfig
+	Addr                   string
+	RemoteAddrs            []string
+	TLS                    bool
+	TLSCertFile            string
+	TLSKeyFile             string
+	TLSVerify              bool
+	RemoteTLS              bool
+	RemoteTLSVerify        bool
+	RemoteUseProxyProtocol bool
+	ConnectTimeout         time.Duration
+	EnableAffinity         bool
+	AffinityValidity       time.Duration
+	AffinityStickiness     float64
+	PreLookup              *proxy.PreLookupConfig
+	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 }
 
 // New creates a new LMTP proxy server.
@@ -84,7 +89,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, connectTimeout, routingLookup)
+	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()
@@ -119,6 +124,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		affinityStickiness: stickiness,
 		ctx:                ctx,
 		cancel:             cancel,
+		trustedProxies:     opts.TrustedProxies,
+		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 	}, nil
 }
 
@@ -169,6 +176,12 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[LMTP Proxy] Session panic recovered: %v", r)
+					conn.Close()
+				}
+			}()
 
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy").Inc()

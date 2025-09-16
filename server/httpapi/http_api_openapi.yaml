@@ -37,10 +37,17 @@ components:
         password:
           type: string
           format: password
+          description: "Plain text password for the account. Cannot be used together with password_hash."
           example: "s3cr3t_p4ssw0rd"
+        password_hash:
+          type: string
+          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
-        - password
+      anyOf:
+        - required: ["password"]
+        - required: ["password_hash"]
 
     UpdateAccountRequest:
       type: object
@@ -48,9 +55,15 @@ components:
         password:
           type: string
           format: password
+          description: "New plain text password for the account. Cannot be used together with password_hash."
           example: "new_s3cr3t_p4ssw0rd"
-      required:
-        - password
+        password_hash:
+          type: string
+          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
+      anyOf:
+        - required: ["password"]
+        - required: ["password_hash"]
 
     AddCredentialRequest:
       type: object
@@ -63,11 +76,17 @@ components:
         password:
           type: string
           format: password
-          description: "The password for the new credential. It can be different from the primary account's password."
+          description: "Plain text password for the new credential. It can be different from the primary account's password. Cannot be used together with password_hash."
           example: "s3cr3t_p4ssw0rd_for_alias"
+        password_hash:
+          type: string
+          description: "Pre-computed password hash (bcrypt, SSHA512, etc.) for the new credential. Cannot be used together with password."
+          example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
-        - password
+      anyOf:
+        - required: ["password"]
+        - required: ["password_hash"]
 
     KickConnectionsRequest:
       type: object
@@ -447,13 +466,31 @@ paths:
       tags:
         - Account Management
       summary: Create a new account
-      description: Creates a new primary account and its first credential.
+      description: |
+        Creates a new primary account and its first credential.
+        
+        You can provide either a plain text password or a pre-computed password hash:
+        - Use `password` for plain text passwords (will be hashed using bcrypt)
+        - Use `password_hash` for pre-computed hashes (bcrypt, SSHA512, SHA512)
+        
+        **Note**: You cannot specify both `password` and `password_hash` in the same request.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateAccountRequest'
+            examples:
+              with_password:
+                summary: Create account with plain text password
+                value:
+                  email: "user@example.com"
+                  password: "s3cr3t_p4ssw0rd"
+              with_password_hash:
+                summary: Create account with pre-computed hash
+                value:
+                  email: "user@example.com" 
+                  password_hash: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       responses:
         '201':
           description: Account created successfully.
@@ -471,11 +508,28 @@ paths:
                   message:
                     type: string
         '400':
-          description: Invalid request body or parameters.
+          description: |
+            Invalid request body or parameters. Common causes:
+            - Missing required field `email`
+            - Neither `password` nor `password_hash` provided
+            - Both `password` and `password_hash` provided (only one allowed)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              examples:
+                missing_email:
+                  summary: Missing email field
+                  value:
+                    error: "Email is required"
+                missing_password:
+                  summary: Missing password or password_hash
+                  value:
+                    error: "Either password or password_hash is required"
+                both_passwords:
+                  summary: Both password fields provided
+                  value:
+                    error: "Cannot specify both password and password_hash"
         '409':
           description: Account with this email already exists.
           content:
@@ -525,7 +579,14 @@ paths:
       tags:
         - Account Management
       summary: Update an account's password
-      description: Updates the password for a specific credential (email).
+      description: |
+        Updates the password for a specific credential (email).
+        
+        You can provide either a plain text password or a pre-computed password hash:
+        - Use `password` for plain text passwords (will be hashed using bcrypt)
+        - Use `password_hash` for pre-computed hashes (bcrypt, SSHA512, SHA512)
+        
+        **Note**: You cannot specify both `password` and `password_hash` in the same request.
       parameters:
         - name: email
           in: path
@@ -539,6 +600,15 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/UpdateAccountRequest'
+            examples:
+              with_password:
+                summary: Update account with plain text password
+                value:
+                  password: "new_s3cr3t_p4ssw0rd"
+              with_password_hash:
+                summary: Update account with pre-computed hash
+                value:
+                  password_hash: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       responses:
         '200':
           description: Account updated successfully.
@@ -550,11 +620,23 @@ paths:
                   message:
                     type: string
         '400':
-          description: Invalid request body.
+          description: |
+            Invalid request body. Common causes:
+            - Neither `password` nor `password_hash` provided
+            - Both `password` and `password_hash` provided (only one allowed)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              examples:
+                missing_password:
+                  summary: Missing password or password_hash
+                  value:
+                    error: "Either password or password_hash is required"
+                both_passwords:
+                  summary: Both password fields provided
+                  value:
+                    error: "Cannot specify both password and password_hash"
         '404':
           description: Account not found.
           content:
@@ -692,7 +774,14 @@ paths:
       tags:
         - Account Management
       summary: Add a credential (alias) to an account
-      description: Adds a new credential (email alias) to an existing account. The account is identified by an existing email address (primary or alias) provided in the URL path.
+      description: |
+        Adds a new credential (email alias) to an existing account. The account is identified by an existing email address (primary or alias) provided in the URL path.
+        
+        You can provide either a plain text password or a pre-computed password hash:
+        - Use `password` for plain text passwords (will be hashed using bcrypt)
+        - Use `password_hash` for pre-computed hashes (bcrypt, SSHA512, SHA512)
+        
+        **Note**: You cannot specify both `password` and `password_hash` in the same request.
       parameters:
         - name: email
           in: path
@@ -707,6 +796,17 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/AddCredentialRequest'
+            examples:
+              with_password:
+                summary: Add credential with plain text password
+                value:
+                  email: "alias@example.com"
+                  password: "s3cr3t_p4ssw0rd_for_alias"
+              with_password_hash:
+                summary: Add credential with pre-computed hash
+                value:
+                  email: "alias@example.com"
+                  password_hash: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       responses:
         '201':
           description: Credential added successfully.
@@ -721,11 +821,28 @@ paths:
                   message:
                     type: string
         '400':
-          description: Invalid request body.
+          description: |
+            Invalid request body. Common causes:
+            - Missing required field `email`
+            - Neither `password` nor `password_hash` provided  
+            - Both `password` and `password_hash` provided (only one allowed)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              examples:
+                missing_email:
+                  summary: Missing email field
+                  value:
+                    error: "Email is required"
+                missing_password:
+                  summary: Missing password or password_hash
+                  value:
+                    error: "Either password or password_hash is required"
+                both_passwords:
+                  summary: Both password fields provided
+                  value:
+                    error: "Cannot specify both password and password_hash"
         '500':
           description: Internal server error.
           content:

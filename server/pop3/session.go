@@ -90,7 +90,7 @@ func (s *POP3Session) handleConnection() {
 		parts := strings.Split(line, " ")
 		cmd := strings.ToUpper(parts[0])
 
-		s.Log("CLIENT COMMAND: %s", line)
+		s.Log("CLIENT COMMAND: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
 
 		switch cmd {
 		case "CAPA":
@@ -1540,6 +1540,28 @@ func (s *POP3Session) handleConnection() {
 			s.Close()
 			success = true
 			return
+
+		case "XCLIENT":
+			// XCLIENT command for Dovecot-style parameter forwarding
+			start := time.Now()
+			success := false
+			defer func() {
+				status := "failure"
+				if success {
+					status = "success"
+				}
+				metrics.CommandsTotal.WithLabelValues("pop3", "XCLIENT", status).Inc()
+				metrics.CommandDuration.WithLabelValues("pop3", "XCLIENT").Observe(time.Since(start).Seconds())
+			}()
+
+			// Extract the arguments (everything after XCLIENT)
+			args := ""
+			if len(parts) > 1 {
+				args = strings.Join(parts[1:], " ")
+			}
+
+			s.handleXCLIENT(args, writer)
+			success = true
 
 		default:
 			writer.WriteString(fmt.Sprintf("-ERR Unknown command: %s\r\n", cmd))

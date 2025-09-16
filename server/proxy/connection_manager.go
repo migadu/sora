@@ -13,10 +13,11 @@ import (
 
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
-	remoteAddrs     []string
-	remoteTLS       bool
-	remoteTLSVerify bool
-	connectTimeout  time.Duration
+	remoteAddrs            []string
+	remoteTLS              bool
+	remoteTLSVerify        bool
+	remoteUseProxyProtocol bool
+	connectTimeout         time.Duration
 
 	// Round-robin index
 	nextIndex atomic.Uint32
@@ -31,12 +32,12 @@ type ConnectionManager struct {
 }
 
 // NewConnectionManager creates a new connection manager
-func NewConnectionManager(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, connectTimeout time.Duration) (*ConnectionManager, error) {
-	return NewConnectionManagerWithRouting(remoteAddrs, remoteTLS, remoteTLSVerify, connectTimeout, nil)
+func NewConnectionManager(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRouting(remoteAddrs, remoteTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, nil)
 }
 
 // NewConnectionManagerWithRouting creates a new connection manager with optional user routing
-func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
+func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
@@ -51,13 +52,14 @@ func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remot
 	}
 
 	return &ConnectionManager{
-		remoteAddrs:     remoteAddrs,
-		remoteTLS:       remoteTLS,
-		remoteTLSVerify: remoteTLSVerify,
-		connectTimeout:  connectTimeout,
-		healthyStatus:   healthyStatus,
-		lastCheck:       lastCheck,
-		routingLookup:   routingLookup,
+		remoteAddrs:            remoteAddrs,
+		remoteTLS:              remoteTLS,
+		remoteTLSVerify:        remoteTLSVerify,
+		remoteUseProxyProtocol: remoteUseProxyProtocol,
+		connectTimeout:         connectTimeout,
+		healthyStatus:          healthyStatus,
+		lastCheck:              lastCheck,
+		routingLookup:          routingLookup,
 	}, nil
 }
 
@@ -236,18 +238,28 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
 		addr, conn.LocalAddr(), conn.RemoteAddr())
 
-	// If we have client IP information, send PROXY protocol header
-	if clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
+	// Determine whether to use PROXY protocol. Check both global setting and routing-specific override.
+	useProxyProtocol := cm.remoteUseProxyProtocol
+	
+	// If routingInfo is provided and this connection is for that specific server,
+	// check for routing-specific PROXY protocol override
+	if routingInfo != nil && routingInfo.ServerAddress == addr {
+		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
+	}
+
+	// If we have client IP information and PROXY protocol is enabled, send PROXY protocol header
+	if useProxyProtocol && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
 		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d",
 			clientIP, clientPort, serverIP, serverPort)
 		err = cm.writeProxyV2Header(conn, clientIP, clientPort, serverIP, serverPort)
 		if err != nil {
 			conn.Close()
+			log.Printf("[ConnectionManager] Failed to send PROXY protocol header to %s: %v", addr, err)
 			return nil, fmt.Errorf("failed to send PROXY protocol header: %w", err)
 		}
 	} else {
-		log.Printf("[ConnectionManager] No PROXY header sent - clientIP=%s:%d serverIP=%s:%d",
-			clientIP, clientPort, serverIP, serverPort)
+		log.Printf("[ConnectionManager] No PROXY header sent - useProxyProtocol=%t clientIP=%s:%d serverIP=%s:%d",
+			useProxyProtocol, clientIP, clientPort, serverIP, serverPort)
 	}
 
 	// Determine TLS settings. Default to the connection manager's global settings.
@@ -268,11 +280,26 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		}
 		log.Printf("[ConnectionManager] Starting TLS handshake to %s", addr)
 		tlsConn := tls.Client(conn, tlsConfig)
+		
+		// Set a deadline for the TLS handshake
+		if err := conn.SetDeadline(time.Now().Add(cm.connectTimeout)); err != nil {
+			conn.Close()
+			log.Printf("[ConnectionManager] Failed to set TLS handshake deadline for %s: %v", addr, err)
+			return nil, fmt.Errorf("failed to set TLS deadline: %w", err)
+		}
+		
 		err = tlsConn.Handshake()
 		if err != nil {
 			conn.Close()
+			log.Printf("[ConnectionManager] TLS handshake failed for %s: %v", addr, err)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
+		
+		// Clear the deadline after successful handshake
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			log.Printf("[ConnectionManager] Warning: failed to clear TLS deadline for %s: %v", addr, err)
+		}
+		
 		return tlsConn, nil
 	}
 
@@ -414,6 +441,11 @@ func (cm *ConnectionManager) IsRemoteTLS() bool {
 // IsRemoteTLSVerifyEnabled returns whether TLS verification is enabled
 func (cm *ConnectionManager) IsRemoteTLSVerifyEnabled() bool {
 	return cm.remoteTLSVerify
+}
+
+// GetConnectTimeout returns the configured connection timeout
+func (cm *ConnectionManager) GetConnectTimeout() time.Duration {
+	return cm.connectTimeout
 }
 
 // HasRouting returns true if a user routing lookup is configured.

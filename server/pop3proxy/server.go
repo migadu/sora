@@ -31,25 +31,30 @@ type POP3ProxyServer struct {
 	affinityValidity   time.Duration
 	affinityStickiness float64
 	authLimiter        server.AuthLimiter
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remoteUseXCLIENT   bool     // Whether backend supports XCLIENT command for forwarding
 }
 
 type POP3ProxyServerOptions struct {
-	Debug              bool
-	TLS                bool
-	TLSCertFile        string
-	TLSKeyFile         string
-	TLSVerify          bool
-	RemoteAddrs        []string
-	RemoteTLS          bool
-	RemoteTLSVerify    bool
-	MasterSASLUsername string
-	MasterSASLPassword string
-	ConnectTimeout     time.Duration
-	EnableAffinity     bool
-	AffinityValidity   time.Duration
-	AffinityStickiness float64
-	AuthRateLimit      server.AuthRateLimiterConfig
-	PreLookup          *proxy.PreLookupConfig
+	Debug                  bool
+	TLS                    bool
+	TLSCertFile            string
+	TLSKeyFile             string
+	TLSVerify              bool
+	RemoteAddrs            []string
+	RemoteTLS              bool
+	RemoteTLSVerify        bool
+	RemoteUseProxyProtocol bool
+	MasterSASLUsername     string
+	MasterSASLPassword     string
+	ConnectTimeout         time.Duration
+	EnableAffinity         bool
+	AffinityValidity       time.Duration
+	AffinityStickiness     float64
+	AuthRateLimit          server.AuthRateLimiterConfig
+	PreLookup              *proxy.PreLookupConfig
+	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -78,6 +83,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		options.RemoteAddrs,
 		options.RemoteTLS,
 		options.RemoteTLSVerify,
+		options.RemoteUseProxyProtocol,
 		options.ConnectTimeout,
 		routingLookup,
 	)
@@ -117,6 +123,8 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		affinityValidity:   options.AffinityValidity,
 		affinityStickiness: stickiness,
 		authLimiter:        authLimiter,
+		trustedProxies:     options.TrustedProxies,
+		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided
@@ -200,7 +208,16 @@ func (s *POP3ProxyServer) Start() error {
 		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Inc()
 
 		s.wg.Add(1)
-		go session.handleConnection()
+		go func() {
+			defer s.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[POP3 Proxy] Session panic recovered: %v", r)
+					conn.Close()
+				}
+			}()
+			session.handleConnection()
+		}()
 	}
 }
 
