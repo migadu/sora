@@ -225,6 +225,12 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 		}
+
+		// Warn if the certificate chain is incomplete.
+		if len(cert.Certificate) < 2 {
+			log.Printf("[IMAP] WARNING: The loaded TLS certificate file '%s' contains only one certificate. For full client compatibility, it should contain the full certificate chain (leaf + intermediates).", options.TLSCertFile)
+		}
+
 		s.tlsConfig = &tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			MinVersion:               tls.VersionTLS12, // Allow older TLS versions for better compatibility

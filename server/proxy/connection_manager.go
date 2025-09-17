@@ -82,7 +82,7 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	if preferredAddr != "" {
 		// Check if this is a prelookup-routed connection
 		isPrelookupRoute := routingInfo != nil && routingInfo.IsPrelookupAccount && routingInfo.ServerAddress == preferredAddr
-		
+
 		// Check if the preferred address is in our managed list of servers.
 		isInList := false
 		for _, addr := range cm.remoteAddrs {
@@ -110,7 +110,7 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 				}
 				return nil, "", fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
 			}
-			
+
 			// For affinity-based connections, fall back to round-robin
 			log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
 
@@ -262,13 +262,21 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
 		addr, conn.LocalAddr(), conn.RemoteAddr())
 
-	// Determine whether to use PROXY protocol. Check both global setting and routing-specific override.
+	// Determine effective settings for this connection.
+	// Default to the connection manager's global settings.
 	useProxyProtocol := cm.remoteUseProxyProtocol
-	
+	remoteTLS := cm.remoteTLS
+	remoteTLSVerify := cm.remoteTLSVerify
+
 	// If routingInfo is provided and this connection is for that specific server,
-	// check for routing-specific PROXY protocol override
+	// override the TLS settings with the ones from the prelookup config.
 	if routingInfo != nil && routingInfo.ServerAddress == addr {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
+		remoteTLS = routingInfo.RemoteTLS
+		remoteTLSVerify = routingInfo.RemoteTLSVerify
+		log.Printf("[ConnectionManager] Using prelookup settings for %s: remoteTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSVerify, useProxyProtocol)
+	} else {
+		log.Printf("[ConnectionManager] Using global settings for %s: remoteTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSVerify, useProxyProtocol)
 	}
 
 	// If we have client IP information and PROXY protocol is enabled, send PROXY protocol header
@@ -281,23 +289,9 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			log.Printf("[ConnectionManager] Failed to send PROXY protocol header to %s: %v", addr, err)
 			return nil, fmt.Errorf("failed to send PROXY protocol header: %w", err)
 		}
-	} else {
-		log.Printf("[ConnectionManager] No PROXY header sent - useProxyProtocol=%t clientIP=%s:%d serverIP=%s:%d",
-			useProxyProtocol, clientIP, clientPort, serverIP, serverPort)
-	}
-
-	// Determine TLS settings. Default to the connection manager's global settings.
-	remoteTLS := cm.remoteTLS
-	remoteTLSVerify := cm.remoteTLSVerify
-
-	// If routingInfo is provided and this connection is for that specific server,
-	// override the TLS settings with the ones from the prelookup config.
-	if routingInfo != nil && routingInfo.ServerAddress == addr {
-		remoteTLS = routingInfo.RemoteTLS
-		remoteTLSVerify = routingInfo.RemoteTLSVerify
-		log.Printf("[ConnectionManager] Using prelookup TLS settings for %s: remoteTLS=%t, remoteTLSVerify=%t", addr, remoteTLS, remoteTLSVerify)
-	} else {
-		log.Printf("[ConnectionManager] Using global TLS settings for %s: remoteTLS=%t, remoteTLSVerify=%t", addr, remoteTLS, remoteTLSVerify)
+	} else if useProxyProtocol {
+		log.Printf("[ConnectionManager] PROXY protocol enabled but not sent (missing client/server info): client=%s:%d server=%s:%d",
+			clientIP, clientPort, serverIP, serverPort)
 	}
 
 	// Now establish TLS if required
@@ -313,14 +307,14 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		}
 		log.Printf("[ConnectionManager] Starting TLS handshake to %s (InsecureSkipVerify=%t)", addr, !remoteTLSVerify)
 		tlsConn := tls.Client(conn, tlsConfig)
-		
+
 		// Set a deadline for the TLS handshake
 		if err := conn.SetDeadline(time.Now().Add(cm.connectTimeout)); err != nil {
 			conn.Close()
 			log.Printf("[ConnectionManager] Failed to set TLS handshake deadline for %s: %v", addr, err)
 			return nil, fmt.Errorf("failed to set TLS deadline: %w", err)
 		}
-		
+
 		err = tlsConn.Handshake()
 		if err != nil {
 			conn.Close()
@@ -328,12 +322,12 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			log.Printf("[ConnectionManager] TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
-		
+
 		// Clear the deadline after successful handshake
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			log.Printf("[ConnectionManager] Warning: failed to clear TLS deadline for %s: %v", addr, err)
 		}
-		
+
 		return tlsConn, nil
 	}
 
