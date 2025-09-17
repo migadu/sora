@@ -150,9 +150,10 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		}
 
 		// Set InsecureSkipVerify if requested (for self-signed certificates)
+		// This setting on the proxy listener is intended to control client certificate
+		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
-			server.tlsConfig.InsecureSkipVerify = true
-			log.Printf("WARNING: TLS certificate verification disabled for POP3 proxy server")
+			log.Printf("WARNING: Client TLS certificate verification is not enforced for POP3 proxy server (tls_verify=false)")
 		}
 	}
 

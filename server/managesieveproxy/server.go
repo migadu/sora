@@ -161,7 +161,18 @@ func (s *Server) Start() error {
 		}
 
 		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
+			Certificates:             []tls.Certificate{cert},
+			MinVersion:               tls.VersionTLS12,
+			ClientAuth:               tls.NoClientCert,
+			ServerName:               s.hostname,
+			PreferServerCipherSuites: true,
+		}
+
+		// For consistency with other servers, log a warning if tls_verify is false.
+		// This setting on the proxy listener is intended to control client certificate
+		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
+		if !s.tlsVerify {
+			log.Printf("WARNING: Client TLS certificate verification is not enforced for ManageSieve proxy server (tls_verify=false)")
 		}
 
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)

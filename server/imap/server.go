@@ -233,9 +233,11 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
 		}
 
+		// This setting on the server listener is intended to control client certificate
+		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
-			s.tlsConfig.InsecureSkipVerify = true
-			log.Printf("WARNING TLS certificate verification disabled for IMAP server")
+			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
+			log.Printf("WARNING: Client TLS certificate verification is not enforced for IMAP server (tls_verify=false)")
 		}
 	}
 

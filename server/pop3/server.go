@@ -63,7 +63,7 @@ type POP3ServerOptions struct {
 func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
-	
+
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
@@ -113,9 +113,11 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 		}
 
 		// Set InsecureSkipVerify if requested (for self-signed certificates)
+		// This setting on the server listener is intended to control client certificate
+		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
-			server.tlsConfig.InsecureSkipVerify = true
-			log.Printf("WARNING: TLS certificate verification disabled for POP3 server")
+			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
+			log.Printf("WARNING: Client TLS certificate verification is not enforced for POP3 server (tls_verify=false)")
 		}
 	}
 
@@ -311,12 +313,12 @@ func (s *POP3Server) getTrustedProxies() []string {
 		// Note: This assumes the ProxyProtocolReader has access to the config
 		// For now, we'll use default safe values that match PROXY protocol defaults
 	}
-	
+
 	// Return default trusted proxy networks (RFC1918 private networks + localhost)
 	// These are safe defaults that match the PROXY protocol configuration
 	return []string{
 		"127.0.0.0/8",    // localhost
-		"10.0.0.0/8",     // RFC1918 private networks  
+		"10.0.0.0/8",     // RFC1918 private networks
 		"172.16.0.0/12",  // RFC1918 private networks
 		"192.168.0.0/16", // RFC1918 private networks
 	}
