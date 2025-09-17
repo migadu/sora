@@ -139,6 +139,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	if config.RemoteTLSVerify != nil {
 		remoteTLSVerify = *config.RemoteTLSVerify
 	}
+	log.Printf("[PreLookup] TLS configuration: RemoteTLS=%t, RemoteTLSVerify=%t (config.RemoteTLSVerify=%v)", config.RemoteTLS, remoteTLSVerify, config.RemoteTLSVerify)
 
 	// Get remote port for prelookup results
 	remotePort, err := config.GetRemotePort()

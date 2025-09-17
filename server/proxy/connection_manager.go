@@ -220,6 +220,12 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	if cm.remoteTLS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: !cm.remoteTLSVerify,
+			// Explicitly set empty certificates to prevent automatic client certificate presentation
+			Certificates: []tls.Certificate{},
+			// Disable client certificate authentication
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				return nil, nil
+			},
 		}
 		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 	} else {
@@ -289,14 +295,23 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	if routingInfo != nil && routingInfo.ServerAddress == addr {
 		remoteTLS = routingInfo.RemoteTLS
 		remoteTLSVerify = routingInfo.RemoteTLSVerify
+		log.Printf("[ConnectionManager] Using prelookup TLS settings for %s: remoteTLS=%t, remoteTLSVerify=%t", addr, remoteTLS, remoteTLSVerify)
+	} else {
+		log.Printf("[ConnectionManager] Using global TLS settings for %s: remoteTLS=%t, remoteTLSVerify=%t", addr, remoteTLS, remoteTLSVerify)
 	}
 
 	// Now establish TLS if required
 	if remoteTLS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: !remoteTLSVerify,
+			// Explicitly set empty certificates to prevent automatic client certificate presentation
+			Certificates: []tls.Certificate{},
+			// Disable client certificate authentication
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				return nil, nil
+			},
 		}
-		log.Printf("[ConnectionManager] Starting TLS handshake to %s", addr)
+		log.Printf("[ConnectionManager] Starting TLS handshake to %s (InsecureSkipVerify=%t)", addr, !remoteTLSVerify)
 		tlsConn := tls.Client(conn, tlsConfig)
 		
 		// Set a deadline for the TLS handshake
@@ -310,6 +325,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		if err != nil {
 			conn.Close()
 			log.Printf("[ConnectionManager] TLS handshake failed for %s: %v", addr, err)
+			log.Printf("[ConnectionManager] TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
 		
