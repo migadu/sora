@@ -20,6 +20,10 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
+// maxAuthErrors is the number of invalid commands tolerated during the
+// authentication phase before the connection is dropped.
+const maxAuthErrors = 2
+
 // Session represents an IMAP proxy session.
 type Session struct {
 	server             *Server
@@ -37,6 +41,7 @@ type Session struct {
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
+	errorCount         int
 }
 
 // newSession creates a new IMAP proxy session.
@@ -49,6 +54,7 @@ func newSession(server *Server, conn net.Conn) *Session {
 		clientWriter: bufio.NewWriter(conn),
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
+		errorCount:   0,
 	}
 }
 
@@ -69,9 +75,23 @@ func (s *Session) handleConnection() {
 	// Handle authentication phase
 	authenticated := false
 	for !authenticated {
+		// Set a read deadline for the client command to prevent idle connections
+		// from sitting in the authentication phase forever.
+		if s.server.sessionTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+				log.Printf("[IMAP Proxy] Failed to set read deadline for %s: %v", clientAddr, err)
+				return
+			}
+		}
+
 		// Read command from client
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[IMAP Proxy] Client %s timed out waiting for command", clientAddr)
+				s.sendResponse("* BYE Idle timeout")
+				return
+			}
 			if err != io.EOF {
 				log.Printf("[IMAP Proxy] Error reading from client %s: %v", clientAddr, err)
 			}
@@ -85,10 +105,14 @@ func (s *Session) handleConnection() {
 		if err != nil {
 			// This would be a malformed line, e.g., unclosed quote.
 			// Send a tagged BAD response if we have a tag.
+			var resp string
 			if tag != "" {
-				s.sendResponse(fmt.Sprintf("%s BAD %s", tag, err.Error()))
+				resp = fmt.Sprintf("%s BAD %s", tag, err.Error())
 			} else {
-				s.sendResponse(fmt.Sprintf("* BAD %s", err.Error()))
+				resp = fmt.Sprintf("* BAD %s", err.Error())
+			}
+			if s.handleAuthError(resp) {
+				return
 			}
 			continue
 		}
@@ -97,7 +121,9 @@ func (s *Session) handleConnection() {
 			continue
 		}
 		if command == "" { // Tag only
-			s.sendResponse(fmt.Sprintf("%s BAD Command is missing", tag))
+			if s.handleAuthError(fmt.Sprintf("%s BAD Command is missing", tag)) {
+				return
+			}
 			continue
 		}
 
@@ -106,7 +132,9 @@ func (s *Session) handleConnection() {
 		switch command {
 		case "LOGIN":
 			if len(args) < 2 {
-				s.sendResponse(fmt.Sprintf("%s NO LOGIN requires username and password", tag))
+				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+					return
+				}
 				continue
 			}
 
@@ -125,7 +153,9 @@ func (s *Session) handleConnection() {
 
 		case "AUTHENTICATE":
 			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
-				s.sendResponse(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag))
+				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
+					return
+				}
 				continue
 			}
 
@@ -151,6 +181,7 @@ func (s *Session) handleConnection() {
 			}
 
 			if saslLine == "*" {
+				// Client-side cancellation is not an error we should count.
 				s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
 				continue
 			}
@@ -158,13 +189,17 @@ func (s *Session) handleConnection() {
 			// Decode SASL PLAIN
 			decoded, err := base64.StdEncoding.DecodeString(saslLine)
 			if err != nil {
-				s.sendResponse(fmt.Sprintf("%s NO Invalid base64 encoding", tag))
+				if s.handleAuthError(fmt.Sprintf("%s NO Invalid base64 encoding", tag)) {
+					return
+				}
 				continue
 			}
 
 			parts := strings.Split(string(decoded), "\x00")
 			if len(parts) != 3 {
-				s.sendResponse(fmt.Sprintf("%s NO Invalid SASL PLAIN response", tag))
+				if s.handleAuthError(fmt.Sprintf("%s NO Invalid SASL PLAIN response", tag)) {
+					return
+				}
 				continue
 			}
 
@@ -174,6 +209,8 @@ func (s *Session) handleConnection() {
 
 			if err := s.authenticateUser(authnID, password); err != nil {
 				log.Printf("[IMAP Proxy] Authentication failed for %s: %v", authnID, err)
+				// This is an actual authentication failure, not a protocol error.
+				// The rate limiter handles this, so we don't count it as a command error.
 				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				continue
 			}
@@ -201,10 +238,20 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK NOOP completed", tag))
 
 		default:
-			s.sendResponse(fmt.Sprintf("%s NO Command not supported before authentication", tag))
+			if s.handleAuthError(fmt.Sprintf("%s NO Command not supported before authentication", tag)) {
+				return
+			}
+			continue
 		}
 	}
 
+	// Clear the read deadline once authenticated, as the connection will now be
+	// in proxy mode where idle is handled by the backend (e.g., IDLE command).
+	if s.server.sessionTimeout > 0 {
+		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+			log.Printf("[IMAP Proxy] Warning: failed to clear read deadline for %s: %v", clientAddr, err)
+		}
+	}
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
 		log.Printf("[IMAP Proxy] Starting proxy for user %s", s.username)
@@ -212,6 +259,20 @@ func (s *Session) handleConnection() {
 	} else {
 		log.Printf("[IMAP Proxy] Cannot start proxy for user %s: no backend connection", s.username)
 	}
+}
+
+// handleAuthError increments the error count, sends an error response, and
+// returns true if the connection should be dropped.
+func (s *Session) handleAuthError(response string) bool {
+	s.errorCount++
+	s.sendResponse(response)
+	if s.errorCount >= maxAuthErrors {
+		log.Printf("[IMAP Proxy] Too many authentication errors from %s, dropping connection.", s.clientConn.RemoteAddr())
+		// Send a final BYE message before closing.
+		s.sendResponse("* BYE Too many invalid commands")
+		return true
+	}
+	return false
 }
 
 // sendGreeting sends the IMAP greeting.

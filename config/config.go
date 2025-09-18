@@ -463,6 +463,7 @@ type IMAPProxyServerConfig struct {
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
+	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -487,6 +488,7 @@ type POP3ProxyServerConfig struct {
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
+	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -511,6 +513,7 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
+	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
@@ -533,6 +536,8 @@ type LMTPProxyServerConfig struct {
 	RemoteTLSVerify        bool             `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool             `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string           `toml:"connect_timeout"`
+	SessionTimeout         string           `toml:"session_timeout"`  // Maximum session duration
+	MaxMessageSize         string           `toml:"max_message_size"` // Maximum message size announced in EHLO
 	EnableAffinity         bool             `toml:"enable_affinity"`
 	AffinityStickiness     float64          `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string           `toml:"affinity_validity"`
@@ -776,6 +781,7 @@ func NewDefaultConfig() Config {
 				Addr:                   ":124",
 				MaxConnections:         1000,
 				MaxConnectionsPerIP:    0, // Disable per-IP limits for proxy scenarios
+				MaxMessageSize:         "50mb",
 				TLS:                    false,
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
@@ -926,6 +932,14 @@ func (c *LMTPProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(c.ConnectTimeout)
 }
 
+// GetMaxMessageSize parses the max message size for LMTP proxy.
+func (c *LMTPProxyServerConfig) GetMaxMessageSize() (int64, error) {
+	if c.MaxMessageSize == "" {
+		return 52428800, nil // Default: 50MiB
+	}
+	return helpers.ParseSize(c.MaxMessageSize)
+}
+
 // GetAffinityValidity parses the affinity validity duration for LMTP proxy
 func (c *LMTPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
 	if c.AffinityValidity == "" {
@@ -940,4 +954,36 @@ func (c *IMAPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
 		return 24 * time.Hour, nil
 	}
 	return helpers.ParseDuration(c.AffinityValidity)
+}
+
+// GetSessionTimeout parses the session timeout duration for IMAP proxy
+func (c *IMAPProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
+	if c.SessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes for IMAP (interactive sessions)
+	}
+	return helpers.ParseDuration(c.SessionTimeout)
+}
+
+// GetSessionTimeout parses the session timeout duration for POP3 proxy
+func (c *POP3ProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
+	if c.SessionTimeout == "" {
+		return 10 * time.Minute, nil // Default: 10 minutes for POP3 (short sessions)
+	}
+	return helpers.ParseDuration(c.SessionTimeout)
+}
+
+// GetSessionTimeout parses the session timeout duration for ManageSieve proxy
+func (c *ManageSieveProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
+	if c.SessionTimeout == "" {
+		return 15 * time.Minute, nil // Default: 15 minutes for ManageSieve (script management)
+	}
+	return helpers.ParseDuration(c.SessionTimeout)
+}
+
+// GetSessionTimeout parses the session timeout duration for LMTP proxy
+func (c *LMTPProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
+	if c.SessionTimeout == "" {
+		return 5 * time.Minute, nil // Default: 5 minutes for LMTP (delivery sessions)
+	}
+	return helpers.ParseDuration(c.SessionTimeout)
 }

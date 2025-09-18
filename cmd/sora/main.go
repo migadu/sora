@@ -751,7 +751,6 @@ func main() {
 		go startMetricsServer(ctx, cfg.Servers.Metrics, errChan)
 	}
 
-
 	// Start proxy servers
 	if cfg.Servers.IMAPProxy.Start {
 		go startIMAPProxyServer(ctx, hostname, resilientDB, errChan, cfg)
@@ -793,7 +792,6 @@ func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *stor
 		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
 		return
 	}
-
 	s, err := imap.New(ctx, hostname, addr, s3storage, resilientDB, uploadWorker, cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:               config.Servers.Debug,
@@ -905,6 +903,7 @@ func startManageSieveServer(ctx context.Context, hostname string, addr string, r
 		log.Printf("WARNING: invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
 		maxSize = managesieve.DefaultMaxScriptSize
 	}
+
 	s, err := managesieve.New(ctx, hostname, addr, resilientDB, managesieve.ManageSieveServerOptions{
 		InsecureAuth:        config.Servers.ManageSieve.InsecureAuth,
 		TLSVerify:           config.Servers.ManageSieve.TLSVerify,
@@ -998,6 +997,13 @@ func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		affinityValidity = 24 * time.Hour
 	}
 
+	// Parse session timeout
+	sessionTimeout, err := config.Servers.IMAPProxy.GetSessionTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid IMAP proxy session_timeout '%s': %v. Using default.", config.Servers.IMAPProxy.SessionTimeout, err)
+		sessionTimeout = 30 * time.Minute
+	}
+
 	server, err := imapproxy.New(ctx, resilientDB, hostname, imapproxy.ServerOptions{
 		Addr:                   config.Servers.IMAPProxy.Addr,
 		RemoteAddrs:            config.Servers.IMAPProxy.RemoteAddrs,
@@ -1010,12 +1016,13 @@ func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.IMAPProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.IMAPProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.IMAPProxy.RemoteUseProxyProtocol,
-		ConnectTimeout:     connectTimeout,
-		EnableAffinity:     config.Servers.IMAPProxy.EnableAffinity,
-		AffinityStickiness: config.Servers.IMAPProxy.AffinityStickiness,
-		AffinityValidity:   affinityValidity,
-		AuthRateLimit:      config.Servers.IMAPProxy.AuthRateLimit,
-		PreLookup:          config.Servers.IMAPProxy.PreLookup,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		EnableAffinity:         config.Servers.IMAPProxy.EnableAffinity,
+		AffinityStickiness:     config.Servers.IMAPProxy.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		AuthRateLimit:          config.Servers.IMAPProxy.AuthRateLimit,
+		PreLookup:              config.Servers.IMAPProxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
@@ -1053,6 +1060,13 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *res
 		affinityValidity = 24 * time.Hour
 	}
 
+	// Parse session timeout
+	sessionTimeout, err := config.Servers.POP3Proxy.GetSessionTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid POP3 proxy session_timeout '%s': %v. Using default.", config.Servers.POP3Proxy.SessionTimeout, err)
+		sessionTimeout = 10 * time.Minute
+	}
+
 	server, err := pop3proxy.New(ctx, hostname, config.Servers.POP3Proxy.Addr, resilientDB, pop3proxy.POP3ProxyServerOptions{
 		RemoteAddrs:            config.Servers.POP3Proxy.RemoteAddrs,
 		MasterSASLUsername:     config.Servers.POP3Proxy.MasterSASLUsername,
@@ -1064,13 +1078,14 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.POP3Proxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.POP3Proxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.POP3Proxy.RemoteUseProxyProtocol,
-		ConnectTimeout:     connectTimeout,
-		Debug:              config.Servers.Debug,
-		EnableAffinity:     config.Servers.POP3Proxy.EnableAffinity,
-		AffinityStickiness: config.Servers.POP3Proxy.AffinityStickiness,
-		AffinityValidity:   affinityValidity,
-		AuthRateLimit:      config.Servers.POP3Proxy.AuthRateLimit,
-		PreLookup:          config.Servers.POP3Proxy.PreLookup,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		Debug:                  config.Servers.Debug,
+		EnableAffinity:         config.Servers.POP3Proxy.EnableAffinity,
+		AffinityStickiness:     config.Servers.POP3Proxy.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		AuthRateLimit:          config.Servers.POP3Proxy.AuthRateLimit,
+		PreLookup:              config.Servers.POP3Proxy.PreLookup,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -1106,6 +1121,13 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, resilient
 		affinityValidity = 24 * time.Hour
 	}
 
+	// Parse session timeout
+	sessionTimeout, err := config.Servers.ManageSieveProxy.GetSessionTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid ManageSieve proxy session_timeout '%s': %v. Using default.", config.Servers.ManageSieveProxy.SessionTimeout, err)
+		sessionTimeout = 15 * time.Minute
+	}
+
 	server, err := managesieveproxy.New(ctx, resilientDB, hostname, managesieveproxy.ServerOptions{
 		Addr:                   config.Servers.ManageSieveProxy.Addr,
 		RemoteAddrs:            config.Servers.ManageSieveProxy.RemoteAddrs,
@@ -1118,12 +1140,13 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, resilient
 		RemoteTLS:              config.Servers.ManageSieveProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.ManageSieveProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.ManageSieveProxy.RemoteUseProxyProtocol,
-		ConnectTimeout:     connectTimeout,
-		AuthRateLimit:      config.Servers.ManageSieveProxy.AuthRateLimit,
-		PreLookup:          config.Servers.ManageSieveProxy.PreLookup,
-		EnableAffinity:     config.Servers.ManageSieveProxy.EnableAffinity,
-		AffinityStickiness: config.Servers.ManageSieveProxy.AffinityStickiness,
-		AffinityValidity:   affinityValidity,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		AuthRateLimit:          config.Servers.ManageSieveProxy.AuthRateLimit,
+		PreLookup:              config.Servers.ManageSieveProxy.PreLookup,
+		EnableAffinity:         config.Servers.ManageSieveProxy.EnableAffinity,
+		AffinityStickiness:     config.Servers.ManageSieveProxy.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
@@ -1159,6 +1182,20 @@ func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		affinityValidity = 24 * time.Hour
 	}
 
+	// Parse session timeout
+	sessionTimeout, err := config.Servers.LMTPProxy.GetSessionTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid LMTP proxy session_timeout '%s': %v. Using default.", config.Servers.LMTPProxy.SessionTimeout, err)
+		sessionTimeout = 5 * time.Minute
+	}
+
+	// Parse max message size
+	maxMessageSize, err := config.Servers.LMTPProxy.GetMaxMessageSize()
+	if err != nil {
+		log.Printf("WARNING: invalid LMTP proxy max_message_size '%s': %v. Using default.", config.Servers.LMTPProxy.MaxMessageSize, err)
+		maxMessageSize = 52428800 // 50MiB
+	}
+
 	server, err := lmtpproxy.New(ctx, resilientDB, hostname, lmtpproxy.ServerOptions{
 		Addr:                   config.Servers.LMTPProxy.Addr,
 		RemoteAddrs:            config.Servers.LMTPProxy.RemoteAddrs,
@@ -1169,11 +1206,13 @@ func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.LMTPProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.LMTPProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.LMTPProxy.RemoteUseProxyProtocol,
-		ConnectTimeout:     connectTimeout,
-		EnableAffinity:     config.Servers.LMTPProxy.EnableAffinity,
-		AffinityStickiness: config.Servers.LMTPProxy.AffinityStickiness,
-		AffinityValidity:   affinityValidity,
-		PreLookup:          config.Servers.LMTPProxy.PreLookup,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		EnableAffinity:         config.Servers.LMTPProxy.EnableAffinity,
+		AffinityStickiness:     config.Servers.LMTPProxy.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		PreLookup:              config.Servers.LMTPProxy.PreLookup,
+		MaxMessageSize:         maxMessageSize,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)

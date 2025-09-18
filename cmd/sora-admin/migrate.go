@@ -23,7 +23,7 @@ import (
 
 // Migrations are now embedded in the `db` package and accessed via `db.MigrationsFS`.
 
-func handleMigrateCommand() {
+func handleMigrateCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printMigrateUsage()
 		os.Exit(1)
@@ -32,13 +32,13 @@ func handleMigrateCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "up":
-		handleMigrateUp()
+		handleMigrateUp(ctx)
 	case "down":
-		handleMigrateDown()
+		handleMigrateDown(ctx)
 	case "version":
-		handleMigrateVersion()
+		handleMigrateVersion(ctx)
 	case "force":
-		handleMigrateForce()
+		handleMigrateForce(ctx)
 	case "help", "--help", "-h":
 		printMigrateUsage()
 	default:
@@ -74,7 +74,7 @@ Use 'sora-admin migrate <subcommand> --help' for detailed help.
 `)
 }
 
-func handleMigrateUp() {
+func handleMigrateUp(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate up", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	fs.Usage = func() {
@@ -83,16 +83,17 @@ func handleMigrateUp() {
 	}
 	fs.Parse(os.Args[3:])
 
-	m, db, err := getMigrateInstance(*configPath)
+	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
-	if err := acquireExclusiveLock(db); err != nil {
+	if err := acquireExclusiveLock(ctx, db); err != nil {
 		log.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
-	defer releaseExclusiveLock(db)
+	// Use a background context for deferred cleanup to ensure it runs even if the primary context is cancelled.
+	defer releaseExclusiveLock(context.Background(), db)
 
 	log.Println("Applying UP migrations...")
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
@@ -102,7 +103,7 @@ func handleMigrateUp() {
 	showVersion(m)
 }
 
-func handleMigrateDown() {
+func handleMigrateDown(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate down", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	limit := fs.Int("limit", 1, "Number of migrations to revert")
@@ -113,16 +114,16 @@ func handleMigrateDown() {
 	}
 	fs.Parse(os.Args[3:])
 
-	m, db, err := getMigrateInstance(*configPath)
+	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
-	if err := acquireExclusiveLock(db); err != nil {
+	if err := acquireExclusiveLock(ctx, db); err != nil {
 		log.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
-	defer releaseExclusiveLock(db)
+	defer releaseExclusiveLock(context.Background(), db)
 
 	if *all {
 		version, dirty, err := m.Version()
@@ -152,7 +153,7 @@ func handleMigrateDown() {
 	showVersion(m)
 }
 
-func handleMigrateVersion() {
+func handleMigrateVersion(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate version", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	fs.Usage = func() {
@@ -161,7 +162,7 @@ func handleMigrateVersion() {
 	}
 	fs.Parse(os.Args[3:])
 
-	m, db, err := getMigrateInstance(*configPath)
+	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize migration tool: %v", err)
 	}
@@ -170,7 +171,7 @@ func handleMigrateVersion() {
 	showVersion(m)
 }
 
-func handleMigrateForce() {
+func handleMigrateForce(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate force", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
 	fs.Usage = func() {
@@ -189,16 +190,16 @@ func handleMigrateForce() {
 		log.Fatalf("Invalid version number: %v", err)
 	}
 
-	m, db, err := getMigrateInstance(*configPath)
+	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
-	if err := acquireExclusiveLock(db); err != nil {
+	if err := acquireExclusiveLock(ctx, db); err != nil {
 		log.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
-	defer releaseExclusiveLock(db)
+	defer releaseExclusiveLock(context.Background(), db)
 
 	log.Printf("Forcing database version to %d...", version)
 	if err := m.Force(version); err != nil {
@@ -208,7 +209,7 @@ func handleMigrateForce() {
 	showVersion(m)
 }
 
-func getMigrateInstance(configPath string) (*migrate.Migrate, *sql.DB, error) {
+func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrate, *sql.DB, error) {
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
@@ -234,7 +235,7 @@ func getMigrateInstance(configPath string) (*migrate.Migrate, *sql.DB, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open sql.DB for migrations: %w", err)
 	}
-	if err := sqlDB.Ping(); err != nil {
+	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
 		return nil, nil, fmt.Errorf("failed to ping database: %w", err)
 	}
@@ -269,13 +270,13 @@ func getMigrateInstance(configPath string) (*migrate.Migrate, *sql.DB, error) {
 	return m, sqlDB, nil
 }
 
-func acquireExclusiveLock(db *sql.DB) error {
+func acquireExclusiveLock(ctx context.Context, db *sql.DB) error {
 	var lockAcquired bool
 	// Use a context with a short timeout to avoid waiting forever.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	err := db.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
+	err := db.QueryRowContext(queryCtx, "SELECT pg_try_advisory_lock($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
 	if err != nil {
 		return fmt.Errorf("failed to query for advisory lock: %w", err)
 	}
@@ -288,13 +289,13 @@ func acquireExclusiveLock(db *sql.DB) error {
 	return nil
 }
 
-func releaseExclusiveLock(db *sql.DB) {
+func releaseExclusiveLock(ctx context.Context, db *sql.DB) {
 	var unlocked bool
 	// Use a background context as the main context might be done.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	err := db.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
+	err := db.QueryRowContext(queryCtx, "SELECT pg_advisory_unlock($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
 	if err != nil {
 		log.Printf("WARN: failed to release advisory lock after migration: %v", err)
 	} else if unlocked {

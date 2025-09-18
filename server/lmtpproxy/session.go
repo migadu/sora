@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/textproto"
 	"strings"
 	"sync"
 	"time"
@@ -69,10 +70,23 @@ func (s *Session) handleConnection() {
 
 	// Handle commands until we get RCPT TO
 	for {
+		// Set a read deadline for the client command to prevent idle connections.
+		if s.server.sessionTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+				log.Printf("[LMTP Proxy] Failed to set read deadline for %s: %v", clientAddr, err)
+				return
+			}
+		}
+
 		// Read command from client
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
-			if err != io.EOF {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[LMTP Proxy] Client %s timed out waiting for command", clientAddr)
+				s.sendResponse("421 4.4.2 Idle timeout, closing connection")
+				return
+			}
+			if !isClosingError(err) {
 				log.Printf("[LMTP Proxy] Error reading from client %s: %v", clientAddr, err)
 			}
 			return
@@ -103,7 +117,9 @@ func (s *Session) handleConnection() {
 				// Send extended response
 				s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
 				s.sendResponse("250-PIPELINING")
-				s.sendResponse("250-SIZE 52428800") // 50MB
+				if s.server.maxMessageSize > 0 {
+					s.sendResponse(fmt.Sprintf("250-SIZE %d", s.server.maxMessageSize))
+				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
 				s.sendResponse("250 DSN")
@@ -141,6 +157,13 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
+			// Clear the read deadline before connecting to the backend and starting the proxy.
+			// The proxy loop will manage its own deadlines.
+			if s.server.sessionTimeout > 0 {
+				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+					log.Printf("[LMTP Proxy] Warning: failed to clear read deadline for %s: %v", clientAddr, err)
+				}
+			}
 			// Now connect to backend
 			if err := s.connectToBackend(); err != nil {
 				log.Printf("[LMTP Proxy] Failed to connect to backend for %s: %v", s.username, err)
@@ -457,14 +480,8 @@ func (s *Session) startProxy(initialCommand string) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// If this copy returns, it means the client has closed the connection or there was an error.
-		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
-		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
-		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(bytesIn))
-		if err != nil && !isClosingError(err) {
-			log.Printf("[LMTP Proxy] Error copying from client to backend: %v", err)
-		}
+		s.proxyClientToBackend()
 	}()
 
 	// Backend to client
@@ -488,6 +505,83 @@ func (s *Session) startProxy(initialCommand string) {
 	}()
 
 	wg.Wait()
+}
+
+// proxyClientToBackend handles copying data from the client to the backend,
+// applying an idle timeout between commands.
+func (s *Session) proxyClientToBackend() {
+	var totalBytesIn int64
+	defer func() {
+		// Record total bytes when the copy loop exits
+		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(totalBytesIn))
+	}()
+
+	for {
+		// Set a read deadline to prevent idle connections between commands.
+		if s.server.sessionTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+				log.Printf("[LMTP Proxy] Failed to set read deadline for %s: %v", s.username, err)
+				return
+			}
+		}
+
+		line, err := s.clientReader.ReadString('\n')
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[LMTP Proxy] Idle timeout for user %s, closing connection.", s.username)
+				return
+			}
+			if !isClosingError(err) {
+				log.Printf("[LMTP Proxy] Error reading from client for %s: %v", s.username, err)
+			}
+			return
+		}
+
+		// Forward the command to backend
+		n, err := s.backendWriter.WriteString(line)
+		totalBytesIn += int64(n)
+		if err != nil {
+			if !isClosingError(err) {
+				log.Printf("[LMTP Proxy] Error writing to backend for %s: %v", s.username, err)
+			}
+			return
+		}
+		if err := s.backendWriter.Flush(); err != nil {
+			if !isClosingError(err) {
+				log.Printf("[LMTP Proxy] Error flushing to backend for %s: %v", s.username, err)
+			}
+			return
+		}
+
+		// If this was a DATA command, switch to raw data proxying for the message body.
+		cmd, _, _, _ := server.ParseLine(strings.TrimSpace(line), false)
+		if cmd == "DATA" {
+			// The backend's "354" response will be handled by the other goroutine.
+			// We must now proxy the message body until ".\r\n".
+			// The idle timeout is suspended during active data transfer.
+			if s.server.sessionTimeout > 0 {
+				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+					log.Printf("[LMTP Proxy] Warning: failed to clear read deadline for DATA transfer: %v", err)
+				}
+			}
+
+			// Use a DotReader to correctly handle the message body, including dot-stuffing.
+			tp := textproto.NewReader(s.clientReader)
+			dr := tp.DotReader()
+
+			// Copy the message body directly.
+			bytesCopied, err := io.Copy(s.backendWriter, dr)
+			totalBytesIn += bytesCopied
+			if err != nil {
+				log.Printf("[LMTP Proxy] Error proxying DATA content for %s: %v", s.username, err)
+				return
+			}
+			if err := s.backendWriter.Flush(); err != nil {
+				log.Printf("[LMTP Proxy] Error flushing after DATA content for %s: %v", s.username, err)
+				return
+			}
+		}
+	}
 }
 
 // close closes all connections.
@@ -586,7 +680,11 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 }
 
 func isClosingError(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+	if err == io.EOF || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// Check for the specific string net.OpError produces on a closed connection
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 // findParameter searches for a parameter with a given prefix in a list of arguments.

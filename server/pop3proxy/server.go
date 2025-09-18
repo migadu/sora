@@ -33,6 +33,7 @@ type POP3ProxyServer struct {
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *proxy.PreLookupConfig
+	sessionTimeout     time.Duration
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 }
 
@@ -49,6 +50,7 @@ type POP3ProxyServerOptions struct {
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	ConnectTimeout         time.Duration
+	SessionTimeout         time.Duration
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
@@ -131,6 +133,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		authLimiter:        authLimiter,
 		trustedProxies:     options.TrustedProxies,
 		prelookupConfig:    options.PreLookup,
+		sessionTimeout:     options.SessionTimeout,
 		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
 	}
 

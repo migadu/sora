@@ -18,6 +18,10 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
+// maxAuthErrors is the number of invalid commands tolerated during the
+// authentication phase before the connection is dropped.
+const maxAuthErrors = 2
+
 type POP3ProxySession struct {
 	server             *POP3ProxyServer
 	clientConn         net.Conn
@@ -32,6 +36,7 @@ type POP3ProxySession struct {
 	serverAddr         string
 	authenticated      bool
 	mutex              sync.Mutex
+	errorCount         int
 }
 
 func (s *POP3ProxySession) handleConnection() {
@@ -47,11 +52,22 @@ func (s *POP3ProxySession) handleConnection() {
 	reader := bufio.NewReader(s.clientConn)
 
 	for {
-		// Set read deadline
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// Set a read deadline for the client command to prevent idle connections.
+		if s.server.sessionTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+				log.Printf("[POP3 Proxy] Failed to set read deadline for %s: %v", s.RemoteIP, err)
+				return
+			}
+		}
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[POP3 Proxy] client %s timed out waiting for command", s.RemoteIP)
+				writer.WriteString("-ERR Idle timeout, closing connection\r\n")
+				writer.Flush()
+				return
+			}
 			if err == io.EOF {
 				log.Printf("[POP3 Proxy] client %s dropped connection", s.RemoteIP)
 			} else {
@@ -81,8 +97,9 @@ func (s *POP3ProxySession) handleConnection() {
 
 		case "USER":
 			if len(parts) < 2 {
-				writer.WriteString("-ERR Missing username\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Missing username\r\n") {
+					return
+				}
 				continue
 			}
 			s.username = parts[1]
@@ -91,13 +108,15 @@ func (s *POP3ProxySession) handleConnection() {
 
 		case "PASS":
 			if s.username == "" {
-				writer.WriteString("-ERR Must provide USER first\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Must provide USER first\r\n") {
+					return
+				}
 				continue
 			}
 			if len(parts) < 2 {
-				writer.WriteString("-ERR Missing password\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Missing password\r\n") {
+					return
+				}
 				continue
 			}
 			password := parts[1]
@@ -117,6 +136,13 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
+			// Clear the read deadline before moving to the proxying phase, which sets its own.
+			if s.server.sessionTimeout > 0 {
+				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+					log.Printf("[POP3 Proxy] Warning: failed to clear read deadline for %s: %v", s.RemoteIP, err)
+				}
+			}
+
 			// Register connection
 			if err := s.registerConnection(); err != nil {
 				log.Printf("[POP3 Proxy] Failed to register connection for user %s from %s: %v", s.username, s.RemoteIP, err)
@@ -128,15 +154,17 @@ func (s *POP3ProxySession) handleConnection() {
 
 		case "AUTH":
 			if len(parts) < 2 {
-				writer.WriteString("-ERR Missing authentication mechanism\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Missing authentication mechanism\r\n") {
+					return
+				}
 				continue
 			}
 
 			mechanism := strings.ToUpper(parts[1])
 			if mechanism != "PLAIN" {
-				writer.WriteString("-ERR Unsupported authentication mechanism\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Unsupported authentication mechanism\r\n") {
+					return
+				}
 				continue
 			}
 
@@ -169,16 +197,18 @@ func (s *POP3ProxySession) handleConnection() {
 			// Decode base64
 			decoded, err := base64.StdEncoding.DecodeString(authData)
 			if err != nil {
-				writer.WriteString("-ERR Invalid authentication data\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Invalid authentication data\r\n") {
+					return
+				}
 				continue
 			}
 
 			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
 			authParts := strings.Split(string(decoded), "\x00")
 			if len(authParts) != 3 {
-				writer.WriteString("-ERR Invalid authentication format\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Invalid authentication format\r\n") {
+					return
+				}
 				continue
 			}
 
@@ -188,8 +218,9 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// For proxy, we expect authzID to be empty or same as authnID
 			if authzID != "" && authzID != authnID {
-				writer.WriteString("-ERR Proxy authentication not supported\r\n")
-				writer.Flush()
+				if s.handleAuthError(writer, "-ERR Proxy authentication not supported\r\n") {
+					return
+				}
 				continue
 			}
 
@@ -208,6 +239,13 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
+			// Clear the read deadline before moving to the proxying phase, which sets its own.
+			if s.server.sessionTimeout > 0 {
+				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+					log.Printf("[POP3 Proxy] Warning: failed to clear read deadline for %s: %v", authnID, err)
+				}
+			}
+
 			// Register connection
 			if err := s.registerConnection(); err != nil {
 				log.Printf("[POP3 Proxy] Failed to register connection for user %s from %s: %v", authnID, s.RemoteIP, err)
@@ -223,10 +261,28 @@ func (s *POP3ProxySession) handleConnection() {
 			return
 
 		default:
-			writer.WriteString("-ERR Command not available before authentication\r\n")
-			writer.Flush()
+			if s.handleAuthError(writer, "-ERR Command not available before authentication\r\n") {
+				return
+			}
+			continue
 		}
 	}
+}
+
+// handleAuthError increments the error count, sends an error response, and
+// returns true if the connection should be dropped.
+func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string) bool {
+	s.errorCount++
+	writer.WriteString(response)
+	writer.Flush()
+	if s.errorCount >= maxAuthErrors {
+		log.Printf("[POP3 Proxy] Too many authentication errors from %s, dropping connection.", s.RemoteIP)
+		// Send a final error message before closing.
+		writer.WriteString("-ERR Too many invalid commands, closing connection\r\n")
+		writer.Flush()
+		return true
+	}
+	return false
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
@@ -601,11 +657,20 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 	}()
 
 	for {
-		// Set read deadline
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// Set a read deadline to prevent idle authenticated connections.
+		if s.server.sessionTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+				log.Printf("[POP3 Proxy] Failed to set read deadline for %s: %v", s.username, err)
+				return
+			}
+		}
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[POP3 Proxy] Idle timeout for authenticated user %s, closing connection.", s.username)
+				return
+			}
 			if err != io.EOF && !isClosingError(err) {
 				log.Printf("[POP3 Proxy] error reading from client for %s: %v", s.username, err)
 			}

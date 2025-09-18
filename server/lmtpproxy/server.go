@@ -35,6 +35,8 @@ type Server struct {
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *proxy.PreLookupConfig
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
+	sessionTimeout     time.Duration
+	maxMessageSize     int64
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -49,12 +51,14 @@ type ServerOptions struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
+	SessionTimeout         time.Duration
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
+	MaxMessageSize         int64
 }
 
 // New creates a new LMTP proxy server.
@@ -133,6 +137,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		trustedProxies:     opts.TrustedProxies,
 		prelookupConfig:    opts.PreLookup,
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
+		sessionTimeout:     opts.SessionTimeout,
+		maxMessageSize:     opts.MaxMessageSize,
 	}, nil
 }
 

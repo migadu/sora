@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -101,6 +103,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create a context that is cancelled on an interrupt signal (Ctrl+C).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Allow 'sora-admin -v' and 'sora-admin --version' as shortcuts
 	if os.Args[1] == "-v" || os.Args[1] == "--version" {
 		printVersion()
@@ -125,7 +131,7 @@ func main() {
 	case "config":
 		handleConfigDump()
 	case "migrate":
-		handleMigrateCommand()
+		handleMigrateCommand(ctx)
 	case "version":
 		printVersion()
 	case "import":

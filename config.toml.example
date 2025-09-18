@@ -1216,6 +1216,13 @@ remote_use_id_command = true
 #   connect_timeout = "60s"                    # Generous timeout
 connect_timeout = "30s"
 
+# Maximum session duration before automatic disconnect
+# Examples:
+#   session_timeout = "30m"                    # 30 minutes (default for IMAP)
+#   session_timeout = "1h"                     # 1 hour for heavy usage
+#   session_timeout = "10m"                    # 10 minutes for security
+session_timeout = "30m"
+
 # Enable user-server affinity (sticky connections)
 # Remembers which backend server each user connects to for session consistency
 # Examples:
@@ -1495,6 +1502,14 @@ remote_use_xclient = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
+
+# Maximum session duration before automatic disconnect
+# Examples:
+#   session_timeout = "10m"                    # 10 minutes (default for POP3)
+#   session_timeout = "5m"                     # 5 minutes for security
+#   session_timeout = "15m"                    # 15 minutes for convenience
+session_timeout = "10m"
+
 enable_affinity = true # User-server affinity for session consistency
 # The probability (0.0 to 1.0) that a connection will stick to its preferred server.
 # A value of 1.0 means connections are always sticky. A value of 0.9 (the default)
@@ -1618,6 +1633,13 @@ remote_use_xclient = true
 # Connection and behavior settings
 connect_timeout = "30s"
 
+# Maximum session duration before automatic disconnect
+# Examples:
+#   session_timeout = "15m"                    # 15 minutes (default for ManageSieve)
+#   session_timeout = "10m"                    # 10 minutes for security
+#   session_timeout = "30m"                    # 30 minutes for complex scripts
+session_timeout = "15m"
+
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as other protocols
 
@@ -1731,6 +1753,21 @@ remote_use_xclient = true
 
 # Connection and behavior settings
 connect_timeout = "30s"
+
+# Maximum session duration before automatic disconnect
+# Examples:
+#   session_timeout = "5m"                     # 5 minutes (default for LMTP)
+#   session_timeout = "2m"                     # 2 minutes for fast delivery
+#   session_timeout = "10m"                    # 10 minutes for complex routing
+session_timeout = "5m"
+
+# Maximum message size announced by the proxy.
+# This should match the backend server's limit.
+# Examples:
+#   max_message_size = "50mb"
+#   max_message_size = "100mb"
+max_message_size = "50mb"
+
 enable_affinity = true    # User-server affinity for consistent delivery
 affinity_validity = "24h" # How long to remember user-server affinity
 # The probability (0.0 to 1.0) that a connection will stick to its preferred server.

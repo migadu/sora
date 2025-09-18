@@ -32,6 +32,7 @@ type Server struct {
 	enableAffinity     bool
 	affinityValidity   time.Duration
 	affinityStickiness float64
+	sessionTimeout     time.Duration
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -55,6 +56,7 @@ type ServerOptions struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
+	SessionTimeout         time.Duration
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
@@ -140,6 +142,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		enableAffinity:     opts.EnableAffinity,
 		affinityValidity:   opts.AffinityValidity,
 		affinityStickiness: stickiness,
+		sessionTimeout:     opts.SessionTimeout,
 		ctx:                ctx,
 		cancel:             cancel,
 		authLimiter:        authLimiter,

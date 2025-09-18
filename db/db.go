@@ -201,6 +201,11 @@ func (db *Database) migrate(ctx context.Context) error {
 	}
 	defer sqlDB.Close()
 
+	if err := sqlDB.PingContext(ctx); err != nil {
+		// The deferred sqlDB.Close() will run on function exit.
+		return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
+	}
+
 	dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{})
 	if err != nil {
 		return fmt.Errorf("failed to create migration db driver: %w", err)
