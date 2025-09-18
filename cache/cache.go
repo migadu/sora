@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -203,10 +204,36 @@ func (c *Cache) MoveIn(path string, contentHash string) error {
 		log.Printf("[CACHE] failed to create target directory %s: %v\n", filepath.Dir(target), err)
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
+
+	// Try rename first (fast path)
 	if err := os.Rename(path, target); err != nil {
-		log.Printf("[CACHE] failed to move file %s to %s: %v\n", path, target, err)
-		return fmt.Errorf("failed to move file into cache: %w", err)
+		// If rename fails, check for specific conditions.
+		if os.IsExist(err) {
+			// This can happen on some OSes (like Windows) if the target exists.
+			// It can also happen if another process cached the file concurrently.
+			// The file is already in the cache, so we just need to remove the source.
+			log.Printf("[CACHE] file %s already exists in cache, removing source %s", target, path)
+			if err := os.Remove(path); err != nil {
+				log.Printf("[CACHE] failed to remove source file %s after finding existing cache entry: %v", path, err)
+			}
+		} else if isCrossDeviceError(err) {
+			// Cross-device link error (common on Unix), fall back to copy+delete.
+			log.Printf("[CACHE] cross-device link detected, falling back to copy+delete for %s to %s\n", path, target)
+			if err := copyFile(path, target); err != nil {
+				log.Printf("[CACHE] failed to copy file %s to %s: %v\n", path, target, err)
+				return fmt.Errorf("failed to copy file into cache: %w", err)
+			}
+			if err := os.Remove(path); err != nil {
+				log.Printf("[CACHE] failed to remove source file %s after copy: %v\n", path, err)
+				// File was copied successfully, so continue with tracking.
+			}
+		} else {
+			// Another type of error occurred.
+			log.Printf("[CACHE] failed to move file %s to %s: %v\n", path, target, err)
+			return fmt.Errorf("failed to move file into cache: %w", err)
+		}
 	}
+
 	if err := c.trackFile(target); err != nil {
 		log.Printf("[CACHE] failed to track file %s: %v. The file was moved but not tracked.", target, err)
 		// The file is already moved. If tracking fails, the cache is inconsistent.
@@ -549,6 +576,34 @@ func (c *Cache) GetPathForContentHash(contentHash string) string {
 func isDirNotEmptyError(err error) bool {
 	// syscall.ENOTEMPTY is common on POSIX systems.
 	return errors.Is(err, syscall.ENOTEMPTY)
+}
+
+// isCrossDeviceError checks if an error is due to a cross-device link.
+func isCrossDeviceError(err error) bool {
+	return errors.Is(err, syscall.EXDEV)
+}
+
+// copyFile copies a file from src to dst, preserving permissions.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
 
 // CacheStats holds cache statistics
