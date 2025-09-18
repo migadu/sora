@@ -713,7 +713,9 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// Create database pools for all write hosts
 	if config.Write != nil && len(config.Write.Hosts) > 0 {
 		for i, host := range config.Write.Hosts {
-			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write", runMigrations)
+			// Only run migrations and acquire lock for the very first write pool.
+			isFirstPool := (i == 0)
+			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write", runMigrations && isFirstPool, isFirstPool)
 			if err != nil {
 				log.Printf("[RESILIENT-FAILOVER] Failed to create write pool for host %s: %v", host, err)
 				continue
@@ -737,7 +739,8 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	// Create database pools for all read hosts
 	if config.Read != nil && len(config.Read.Hosts) > 0 {
 		for i, host := range config.Read.Hosts {
-			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", false)
+			// Never run migrations or acquire lock for read pools.
+			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", false, false)
 			if err != nil {
 				log.Printf("[RESILIENT-FAILOVER] Failed to create read pool for host %s: %v", host, err)
 				continue
@@ -775,7 +778,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 }
 
 // createDatabasePool creates a single database connection pool
-func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool) (*db.Database, error) {
+func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool, acquireLock bool) (*db.Database, error) {
 	// Create a temporary config for this single host
 	tempConfig := &config.DatabaseConfig{
 		LogQueries: logQueries,
@@ -793,7 +796,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 		},
 	}
 
-	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations)
+	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations, acquireLock)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s database pool for %s: %w", poolType, host, err)
 	}

@@ -25,7 +25,7 @@ import (
 )
 
 //go:embed migrations/*.sql
-var migrationsFS embed.FS
+var MigrationsFS embed.FS
 
 // HostHealth tracks the health status of a database host
 type HostHealth struct {
@@ -65,6 +65,7 @@ type Database struct {
 	ReadPool      *pgxpool.Pool    // Read operations pool
 	WriteFailover *FailoverManager // Failover manager for write operations
 	ReadFailover  *FailoverManager // Failover manager for read operations
+	lockConn      *pgxpool.Conn    // Connection holding the advisory lock
 }
 
 // DatabasePoolConfig holds configuration for the database connection pool.
@@ -132,6 +133,26 @@ func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, 
 }
 
 func (db *Database) Close() {
+	// Release the advisory lock first, while the connection is still valid.
+	if db.lockConn != nil {
+		// We use a background context with a timeout because the main application
+		// context might have been cancelled during shutdown.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var unlocked bool
+		err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
+		if err != nil {
+			log.Printf("[DB] WARN: Failed to explicitly release advisory lock: %v", err)
+		} else if unlocked {
+			log.Println("[DB] Released shared database advisory lock.")
+		} else {
+			log.Println("[DB] WARN: Advisory lock was not held at time of release.")
+		}
+		db.lockConn.Release()
+	}
+
+	// Now, close the connection pools.
 	if db.WritePool != nil {
 		db.WritePool.Close()
 	}
@@ -160,7 +181,9 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 }
 
 func (db *Database) migrate(ctx context.Context) error {
-	migrations, err := fs.Sub(migrationsFS, "migrations")
+	// The go:embed directive includes the 'migrations' directory, so we need to
+	// create a sub-filesystem rooted at that directory.
+	migrations, err := fs.Sub(MigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("failed to get migrations subdirectory: %w", err)
 	}
@@ -402,7 +425,7 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 }
 
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
-func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
+func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool, acquireLock bool) (*Database, error) {
 	if dbConfig.Write == nil {
 		return nil, fmt.Errorf("write database configuration is required")
 	}
@@ -445,6 +468,32 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 	}
 
+	if acquireLock {
+		// Acquire and hold an advisory lock to signal that the server is running.
+		lockConn, err := db.WritePool.Acquire(ctx)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to acquire connection for advisory lock: %w", err)
+		}
+
+		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
+		// It will fail only if an exclusive lock is held (e.g., by the migration tool).
+		var lockAcquired bool
+		err = lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock_shared($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
+		if err != nil {
+			lockConn.Release()
+			db.Close()
+			return nil, fmt.Errorf("failed to attempt advisory lock: %w", err)
+		}
+		if !lockAcquired {
+			lockConn.Release()
+			db.Close()
+			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d). A migration may be in progress", consts.SoraAdvisoryLockID)
+		}
+
+		log.Printf("[DB] Acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
+		db.lockConn = lockConn // Store the *pgxpool.Conn
+	}
 	return db, nil
 }
 

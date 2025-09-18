@@ -1,6 +1,6 @@
 -- PostgreSQL schema for managing email accounts, credentials, mailboxes, messages, and SIEVE scripts
 -- Ensure the database has the necessary extensions installed, such as pg_trgm for full-text search.
-CREATE EXTENSION pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE accounts (
 	id BIGSERIAL PRIMARY KEY,

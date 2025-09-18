@@ -124,6 +124,8 @@ func main() {
 		handleHealthStatus()
 	case "config":
 		handleConfigDump()
+	case "migrate":
+		handleMigrateCommand()
 	case "version":
 		printVersion()
 	case "import":
@@ -297,6 +299,7 @@ Commands:
   connections   Connection management
   health        System health status
   config        Configuration management
+  migrate       Database schema migration management
   uploader      Upload queue management
   import        Import maildir data
   export        Export maildir data
