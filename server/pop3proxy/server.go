@@ -68,22 +68,10 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	// Initialize prelookup client if configured
-	var routingLookup proxy.UserRoutingLookup
-	if options.PreLookup != nil && options.PreLookup.Enabled {
-		prelookupClient, err := proxy.NewPreLookupClient(serverCtx, options.PreLookup)
-		if err != nil {
-			log.Printf("[POP3 Proxy] Failed to initialize prelookup client: %v", err)
-			if !options.PreLookup.FallbackDefault {
-				serverCancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
-			}
-			log.Printf("[POP3 Proxy] Continuing without prelookup due to fallback_to_default=true")
-		} else {
-			routingLookup = prelookupClient
-			log.Printf("[POP3 Proxy] Prelookup database client initialized successfully")
-		}
+	routingLookup, err := proxy.InitializePrelookup(serverCtx, options.PreLookup, "POP3")
+	if err != nil {
+		return nil, err // InitializePrelookup handles fallback logic and returns error only when fatal
 	}
-
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRouting(
 		options.RemoteAddrs,

@@ -85,22 +85,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize prelookup client if configured
-	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
-		if err != nil {
-			log.Printf("[IMAP Proxy] Failed to initialize prelookup client: %v", err)
-			if !opts.PreLookup.FallbackDefault {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
-			}
-			log.Printf("[IMAP Proxy] Continuing without prelookup due to fallback_to_default=true")
-		} else {
-			routingLookup = prelookupClient
-			log.Printf("[IMAP Proxy] Prelookup database client initialized successfully")
-		}
+	routingLookup, err := proxy.InitializePrelookup(ctx, opts.PreLookup, "IMAP")
+	if err != nil {
+		return nil, err // InitializePrelookup handles fallback logic and returns error only when fatal
 	}
-
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
@@ -171,6 +159,10 @@ func (s *Server) Start() error {
 			ClientAuth:               clientAuth,
 			ServerName:               s.hostname,
 			PreferServerCipherSuites: true,
+		}
+		// Warn if the certificate chain is incomplete.
+		if len(cert.Certificate) < 2 {
+			log.Printf("[IMAP Proxy] WARNING: The loaded TLS certificate file '%s' contains only one certificate. For full client compatibility, it should contain the full certificate chain (leaf + intermediates).", s.tlsCertFile)
 		}
 
 		if s.tlsVerify {

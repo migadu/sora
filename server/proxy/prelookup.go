@@ -82,14 +82,19 @@ func (c *PreLookupClient) normalizeServerAddress(addr string) string {
 	if addr == "" || c.remotePort == 0 {
 		return addr
 	}
-	
-	// If the address already contains a port, return as-is
-	if strings.Contains(addr, ":") {
+
+	// Check if a port is already present.
+	// net.SplitHostPort is the robust way to do this, as it correctly
+	// handles IPv6 addresses like "[::1]".
+	_, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		// Address already has a port, return as-is.
 		return addr
 	}
-	
-	// Add the default port
-	normalized := fmt.Sprintf("%s:%d", addr, c.remotePort)
+
+	// If there's an error, it's likely "missing port in address".
+	// We can now safely add our default port.
+	normalized := net.JoinHostPort(addr, strconv.Itoa(c.remotePort))
 	log.Printf("[PreLookup] Normalized server address '%s' to '%s' using default port %d", addr, normalized, c.remotePort)
 	return normalized
 }
@@ -469,89 +474,7 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 				}, nil
 
 			} else if numCols >= 2 {
-				// Multiple columns: auth+route mode
-				values := make([]interface{}, numCols)
-				valuePtrs := make([]interface{}, numCols)
-				for i := range values {
-					valuePtrs[i] = &values[i]
-				}
-
-				err := rows.Scan(valuePtrs...)
-				if err != nil {
-					return nil, err
-				}
-
-				log.Printf("[PreLookup] Auto-detected auth+route mode for user '%s' (%d columns)", email, numCols)
-
-				// Extract values - assume common patterns:
-				// 2 cols: password_hash, server_address
-				// 3+ cols: account_id, password_hash, server_address (last is server)
-				var accountID int64
-				var passwordHash, serverAddress string
-				var ok bool
-
-				if numCols == 2 {
-					if values[0] != nil {
-						passwordHash, ok = values[0].(string)
-						if !ok {
-							return nil, fmt.Errorf("prelookup query: expected column 1 (password_hash) to be a string, but got %T", values[0])
-						}
-					}
-					if values[1] != nil {
-						serverAddress, ok = values[1].(string)
-						if !ok {
-							return nil, fmt.Errorf("prelookup query: expected column 2 (server_address) to be a string, but got %T", values[1])
-						}
-					}
-				} else { // 3+ columns
-					if values[0] != nil {
-						accountID, ok = values[0].(int64)
-						if !ok {
-							return nil, fmt.Errorf("prelookup query: expected column 1 (account_id) to be an int64, but got %T", values[0])
-						}
-					}
-					if values[1] != nil {
-						passwordHash, ok = values[1].(string)
-						if !ok {
-							return nil, fmt.Errorf("prelookup query: expected column 2 (password_hash) to be a string, but got %T", values[1])
-						}
-					}
-					if values[numCols-1] != nil {
-						serverAddress, ok = values[numCols-1].(string)
-						if !ok {
-							return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
-						}
-					}
-				}
-
-				// Verify password
-				if !c.verifyPassword(password, passwordHash) {
-					log.Printf("[PreLookup] Authentication failed for user: %s", email)
-					return map[string]interface{}{
-						"mode":   "auth_and_route",
-						"info":   nil,
-						"result": AuthFailed,
-					}, nil
-				}
-
-				log.Printf("[PreLookup] Authentication successful for user '%s'", email)
-				normalizedAddr := c.normalizeServerAddress(serverAddress)
-				info := &UserRoutingInfo{
-					ServerAddress:          normalizedAddr,
-					AccountID:              accountID,
-					IsPrelookupAccount:     true,
-					RemoteTLS:              c.remoteTLS,
-					RemoteTLSVerify:        c.remoteTLSVerify,
-					RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
-					RemoteUseIDCommand:     c.remoteUseIDCommand,
-					RemoteUseXCLIENT:       c.remoteUseXCLIENT,
-				}
-
-				return map[string]interface{}{
-					"mode":   "auth_and_route",
-					"info":   info,
-					"result": AuthSuccess,
-				}, nil
+				return c._handleAuthAndRoute(rows, email, password)
 			}
 
 			return nil, fmt.Errorf("unexpected number of columns: %d", numCols)
@@ -615,6 +538,130 @@ func (c *PreLookupClient) verifyPassword(password, hash string) bool {
 		return false
 	}
 	return true
+}
+
+// _handleAuthAndRoute processes a row for auth+route mode.
+func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password string) (interface{}, error) {
+	fieldDescs := rows.FieldDescriptions()
+	numCols := len(fieldDescs)
+
+	values := make([]interface{}, numCols)
+	valuePtrs := make([]interface{}, numCols)
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	err := rows.Scan(valuePtrs...)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[PreLookup] Auto-detected auth+route mode for user '%s' (%d columns)", email, numCols)
+
+	// Extract values - assume common patterns:
+	// 2 cols: password_hash, server_address
+	// 3+ cols: account_id, password_hash, server_address (last is server)
+	var accountID int64
+	var passwordHash, serverAddress string
+	var ok bool
+
+	if numCols == 2 {
+		if values[0] == nil {
+			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is NULL in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		passwordHash, ok = values[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("prelookup query: expected column 1 (password_hash) to be a string, but got %T", values[0])
+		}
+		if strings.TrimSpace(passwordHash) == "" {
+			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+
+		if values[1] == nil {
+			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is NULL in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		serverAddress, ok = values[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("prelookup query: expected column 2 (server_address) to be a string, but got %T", values[1])
+		}
+		if strings.TrimSpace(serverAddress) == "" {
+			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is empty in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		// For 2-column mode, use a placeholder account ID since it's not provided
+		accountID = -1 // Use -1 to distinguish from default 0
+	} else { // 3+ columns
+		if values[0] == nil {
+			log.Printf("[PreLookup] Authentication failed for user '%s': account_id is NULL in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		accountID, ok = values[0].(int64)
+		if !ok {
+			return nil, fmt.Errorf("prelookup query: expected column 1 (account_id) to be an int64, but got %T", values[0])
+		}
+		if accountID <= 0 {
+			log.Printf("[PreLookup] Authentication failed for user '%s': account_id is invalid (%d) in prelookup result", email, accountID)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+
+		if values[1] == nil {
+			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is NULL in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		passwordHash, ok = values[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("prelookup query: expected column 2 (password_hash) to be a string, but got %T", values[1])
+		}
+		if strings.TrimSpace(passwordHash) == "" {
+			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+
+		if values[numCols-1] == nil {
+			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is NULL in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+		serverAddress, ok = values[numCols-1].(string)
+		if !ok {
+			return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
+		}
+		if strings.TrimSpace(serverAddress) == "" {
+			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is empty in prelookup result", email)
+			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+		}
+	}
+
+	// Verify password
+	if !c.verifyPassword(password, passwordHash) {
+		log.Printf("[PreLookup] Authentication failed for user: %s", email)
+		return map[string]interface{}{
+			"mode":   "auth_and_route",
+			"info":   nil,
+			"result": AuthFailed,
+		}, nil
+	}
+
+	log.Printf("[PreLookup] Authentication successful for user '%s'", email)
+	normalizedAddr := c.normalizeServerAddress(serverAddress)
+	info := &UserRoutingInfo{
+		ServerAddress:          normalizedAddr,
+		AccountID:              accountID,
+		IsPrelookupAccount:     true,
+		RemoteTLS:              c.remoteTLS,
+		RemoteTLSVerify:        c.remoteTLSVerify,
+		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
+		RemoteUseIDCommand:     c.remoteUseIDCommand,
+		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
+	}
+
+	return map[string]interface{}{
+		"mode":   "auth_and_route",
+		"info":   info,
+		"result": AuthSuccess,
+	}, nil
 }
 
 // startCacheJanitor runs a background goroutine to clean up expired cache entries.

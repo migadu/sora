@@ -7,13 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -258,93 +256,50 @@ func (s *Session) handleRecipient(to string) error {
 
 	// 2. Fallback to main DB to get account ID for affinity
 	s.isPrelookupAccount = false
-	row := s.server.rdb.QueryRowWithRetry(s.ctx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
+	dbCtx, dbCancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer dbCancel()
+
+	row := s.server.rdb.QueryRowWithRetry(dbCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
 	if err := row.Scan(&s.accountID); err != nil {
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
 	return nil
 }
 
-// getPreferredBackend fetches the preferred backend server for the user based on affinity.
-func (s *Session) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity || s.isPrelookupAccount {
-		return "", nil
-	}
-
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
-	defer cancel()
-
-	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
-	if err != nil {
-		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if errors.Is(err, consts.ErrNoServerAffinity) {
-			return "", nil
-		}
-		return "", err
-	}
-
-	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
-		return lastAddr, nil
-	}
-
-	return "", nil
-}
-
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
-	var preferredAddr string
-	var err error
-	routingMethod := "roundrobin" // Default to round-robin
-	isPrelookupRoute := false
-	routingInfo := s.routingInfo
-
-	// 1. Use prelookup result if available
-	if routingInfo != nil && routingInfo.ServerAddress != "" {
-		isPrelookupRoute = true
-		routingMethod = "prelookup"
-		address := routingInfo.ServerAddress
-		// If the address from prelookup doesn't contain a port,
-		// use the new RemotePort field if it's available.
-		_, _, splitErr := net.SplitHostPort(address)
-		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
-		if portErr != nil {
-			log.Printf("[LMTP Proxy] Invalid remote_port in prelookup config: %v", portErr)
-		}
-		if splitErr != nil && remotePort > 0 {
-			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
-		}
-		preferredAddr = address
-	} else {
-		// 2. If no prelookup route, try affinity
-		preferredAddr, err = s.getPreferredBackend()
-		if err != nil {
-			log.Printf("[LMTP Proxy] Could not get preferred backend for %s: %v", s.username, err)
-		}
-		if preferredAddr != "" {
-			routingMethod = "affinity"
-			log.Printf("[LMTP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-		}
+	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
+		Ctx:                s.ctx,
+		Username:           s.username,
+		AccountID:          s.accountID,
+		IsPrelookupAccount: s.isPrelookupAccount,
+		RoutingInfo:        s.routingInfo,
+		ConnManager:        s.server.connManager,
+		RDB:                s.server.rdb,
+		EnableAffinity:     s.server.enableAffinity,
+		AffinityValidity:   s.server.affinityValidity,
+		AffinityStickiness: s.server.affinityStickiness,
+		ProxyName:          "LMTP Proxy",
+	})
+	if err != nil {
+		log.Printf("[LMTP Proxy] Error determining route for %s: %v", s.username, err)
 	}
 
-	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
-	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
-		if rand.Float64() > s.server.affinityStickiness {
-			log.Printf("[LMTP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
-			preferredAddr = "" // This will cause the connection manager to use round-robin
-			routingMethod = "roundrobin"
-		}
-	}
+	// Update session routing info if it was fetched by DetermineRoute
+	s.routingInfo = routeResult.RoutingInfo
+	preferredAddr := routeResult.PreferredAddr
+	isPrelookupRoute := routeResult.IsPrelookupRoute
 
 	// 4. Connect using the determined address (or round-robin if empty)
 	// Track which routing method was used for this connection.
-	metrics.ProxyRoutingMethod.WithLabelValues("lmtp", routingMethod).Inc()
+	metrics.ProxyRoutingMethod.WithLabelValues("lmtp", routeResult.RoutingMethod).Inc()
 
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
 		// Track backend connection failure

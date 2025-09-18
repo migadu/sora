@@ -3,12 +3,17 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
@@ -78,52 +83,14 @@ func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, er
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
-	// If we have a preferred address (from affinity or prelookup), try it first.
 	if preferredAddr != "" {
-		// Check if this is a prelookup-routed connection
-		isPrelookupRoute := routingInfo != nil && routingInfo.IsPrelookupAccount && routingInfo.ServerAddress == preferredAddr
-
-		// Check if the preferred address is in our managed list of servers.
-		isInList := false
-		for _, addr := range cm.remoteAddrs {
-			if addr == preferredAddr {
-				isInList = true
-				break
-			}
+		conn, addr, err, fallback := cm.tryPreferredAddress(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+		if !fallback {
+			// If no fallback is needed, we either succeeded or had a hard failure.
+			return conn, addr, err
 		}
-
-		// Only try the preferred address if it's not in the list,
-		// or if it is in the list and is currently marked as healthy.
-		if !isInList || cm.isHealthy(preferredAddr) {
-			conn, err := cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
-			if err == nil {
-				// Success, return the connection.
-				return conn, preferredAddr, nil
-			}
-
-			// If the connection failed...
-			if isPrelookupRoute {
-				// For prelookup routes, do NOT fall back to round-robin
-				log.Printf("[ConnectionManager] Failed to connect to prelookup-designated server %s: %v. NOT falling back to round-robin as prelookup result is definitive.", preferredAddr, err)
-				if isInList {
-					cm.markUnhealthy(preferredAddr)
-				}
-				return nil, "", fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
-			}
-
-			// For affinity-based connections, fall back to round-robin
-			log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
-
-			// If it was a server from our list, mark it as unhealthy.
-			if isInList {
-				cm.markUnhealthy(preferredAddr)
-			}
-		} else if isPrelookupRoute {
-			// If the prelookup server is in our list but marked as unhealthy, we should still fail
-			// rather than falling back to round-robin, because prelookup results are definitive
-			log.Printf("[ConnectionManager] Prelookup-designated server %s is marked as unhealthy. NOT falling back to round-robin as prelookup result is definitive.", preferredAddr)
-			return nil, "", fmt.Errorf("prelookup-designated server %s is marked as unhealthy", preferredAddr)
-		}
+		// If fallback is true, the connection failed but we should proceed to round-robin.
+		// The error from tryPreferredAddress is logged but not returned to the client yet.
 	}
 
 	// Try all servers in round-robin order
@@ -152,6 +119,57 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	}
 
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
+}
+
+// tryPreferredAddress attempts to connect to a preferred address (from affinity or prelookup).
+// It returns the connection, address, and an error if it fails.
+// The 'shouldFallback' boolean indicates if the caller should attempt round-robin.
+func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (conn net.Conn, addr string, err error, shouldFallback bool) {
+	isPrelookupRoute := routingInfo != nil && routingInfo.IsPrelookupAccount && routingInfo.ServerAddress == preferredAddr
+
+	isInList := false
+	for _, a := range cm.remoteAddrs {
+		if a == preferredAddr {
+			isInList = true
+			break
+		}
+	}
+
+	// If the server is in our list and marked unhealthy, decide whether to fail hard or fall back.
+	if isInList && !cm.isHealthy(preferredAddr) {
+		if isPrelookupRoute {
+			// Prelookup routes are definitive; if the server is unhealthy, we fail hard.
+			log.Printf("[ConnectionManager] Prelookup-designated server %s is marked as unhealthy. NOT falling back to round-robin.", preferredAddr)
+			err = fmt.Errorf("prelookup-designated server %s is marked as unhealthy", preferredAddr)
+			return nil, "", err, false // No fallback
+		}
+		// For affinity, if the server is unhealthy, we just fall back to round-robin.
+		log.Printf("[ConnectionManager] Preferred (affinity) server %s is marked as unhealthy. Falling back to round-robin.", preferredAddr)
+		return nil, "", nil, true // Fallback
+	}
+
+	// Attempt to dial the preferred address.
+	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+	if err == nil {
+		// Success!
+		return conn, preferredAddr, nil, false // No fallback
+	}
+
+	// Connection failed. Mark it as unhealthy if it's in our managed list.
+	if isInList {
+		cm.markUnhealthy(preferredAddr)
+	}
+
+	if isPrelookupRoute {
+		// For prelookup routes, do NOT fall back to round-robin.
+		log.Printf("[ConnectionManager] Failed to connect to prelookup-designated server %s: %v. NOT falling back to round-robin.", preferredAddr, err)
+		err = fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
+		return nil, "", err, false // No fallback
+	}
+
+	// For affinity-based connections, log the failure and indicate that we should fall back.
+	log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
+	return nil, "", err, true // Fallback
 }
 
 // ResolveAddresses resolves hostnames to IP addresses, expanding the address list
@@ -487,4 +505,82 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 		return nil, nil
 	}
 	return cm.routingLookup.LookupUserRoute(ctx, email)
+}
+
+// RouteParams holds all parameters needed to determine a backend route.
+type RouteParams struct {
+	Ctx                context.Context
+	Username           string
+	AccountID          int64
+	IsPrelookupAccount bool
+	RoutingInfo        *UserRoutingInfo
+	ConnManager        *ConnectionManager
+	RDB                *resilient.ResilientDatabase // For affinity lookup
+	EnableAffinity     bool
+	AffinityValidity   time.Duration
+	AffinityStickiness float64
+	ProxyName          string // "IMAP Proxy", "POP3 Proxy", etc. for logging
+}
+
+// RouteResult holds the outcome of a routing decision.
+type RouteResult struct {
+	PreferredAddr    string
+	RoutingMethod    string
+	IsPrelookupRoute bool
+	RoutingInfo      *UserRoutingInfo // Can be updated by the lookup
+}
+
+// DetermineRoute centralizes the logic for choosing a backend server.
+// The precedence is: Prelookup > Affinity > Round-robin.
+func DetermineRoute(params RouteParams) (RouteResult, error) {
+	result := RouteResult{
+		RoutingMethod: "roundrobin", // Default
+		RoutingInfo:   params.RoutingInfo,
+	}
+
+	// 1. Try routing lookup first, only if not already available from auth
+	if result.RoutingInfo == nil && params.ConnManager.HasRouting() {
+		routingCtx, routingCancel := context.WithTimeout(params.Ctx, 5*time.Second)
+		var lookupErr error
+		result.RoutingInfo, lookupErr = params.ConnManager.LookupUserRoute(routingCtx, params.Username)
+		routingCancel()
+		if lookupErr != nil {
+			log.Printf("[%s] Routing lookup failed for %s: %v, falling back to affinity", params.ProxyName, params.Username, lookupErr)
+		}
+	}
+
+	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
+		result.PreferredAddr = result.RoutingInfo.ServerAddress
+		result.RoutingMethod = "prelookup"
+		result.IsPrelookupRoute = true
+		log.Printf("[%s] Using routing lookup for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+	}
+
+	// 2. If no routing info from prelookup, try affinity
+	if result.PreferredAddr == "" && params.EnableAffinity && !params.IsPrelookupAccount && params.AccountID > 0 {
+		affinityCtx, affinityCancel := context.WithTimeout(params.Ctx, 2*time.Second)
+		lastAddr, lastTime, affinityErr := params.RDB.GetLastServerAddressWithRetry(affinityCtx, params.AccountID)
+		affinityCancel()
+
+		if affinityErr != nil {
+			if !errors.Is(affinityErr, consts.ErrNoServerAffinity) {
+				log.Printf("[%s] Could not get preferred backend for %s: %v", params.ProxyName, params.Username, affinityErr)
+			}
+		} else if lastAddr != "" && time.Since(lastTime) < params.AffinityValidity {
+			result.PreferredAddr = lastAddr
+			result.RoutingMethod = "affinity"
+			log.Printf("[%s] Using server affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+		}
+	}
+
+	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
+	if result.PreferredAddr != "" && !result.IsPrelookupRoute && params.AffinityStickiness < 1.0 {
+		if rand.Float64() > params.AffinityStickiness {
+			log.Printf("[%s] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", params.ProxyName, params.Username, params.AffinityStickiness)
+			result.PreferredAddr = "" // This will cause the connection manager to use round-robin
+			result.RoutingMethod = "roundrobin"
+		}
+	}
+
+	return result, nil
 }

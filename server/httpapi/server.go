@@ -281,10 +281,10 @@ func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 // Request/Response types
 
 type CreateAccountRequest struct {
-	Email        string                      `json:"email"`
-	Password     string                      `json:"password"`
-	PasswordHash string                      `json:"password_hash"`
-	Credentials  []CreateCredentialSpec      `json:"credentials,omitempty"`
+	Email        string                 `json:"email"`
+	Password     string                 `json:"password"`
+	PasswordHash string                 `json:"password_hash"`
+	Credentials  []CreateCredentialSpec `json:"credentials,omitempty"`
 }
 
 type CreateCredentialSpec struct {
@@ -394,7 +394,6 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			"message":     "Account created successfully with multiple credentials",
 		})
 	} else {
-		// Single credential creation (backward compatibility)
 		if req.Email == "" {
 			s.writeError(w, http.StatusBadRequest, "Email is required")
 			return

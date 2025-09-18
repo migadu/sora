@@ -734,7 +734,7 @@ func NewDefaultConfig() Config {
 				TLS:                    false,
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
-				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
+				RemoteUseProxyProtocol: true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",
@@ -749,7 +749,7 @@ func NewDefaultConfig() Config {
 				TLS:                    false,
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
-				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
+				RemoteUseProxyProtocol: true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",
@@ -765,7 +765,7 @@ func NewDefaultConfig() Config {
 				TLS:                    false,
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
-				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
+				RemoteUseProxyProtocol: true,
 				AuthRateLimit:          DefaultAuthRateLimiterConfig(),
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
@@ -779,7 +779,7 @@ func NewDefaultConfig() Config {
 				TLS:                    false,
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
-				RemoteUseProxyProtocol: true, // Default to true for backward compatibility
+				RemoteUseProxyProtocol: true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",

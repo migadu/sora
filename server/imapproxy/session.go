@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -312,95 +311,34 @@ func (s *Session) authenticateUser(username, password string) error {
 	return nil
 }
 
-// getPreferredBackend fetches the preferred backend server for the user based on affinity.
-func (s *Session) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity || s.isPrelookupAccount {
-		return "", nil
-	}
-
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
-	defer cancel()
-
-	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
-	if err != nil {
-		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if errors.Is(err, consts.ErrNoServerAffinity) {
-			return "", nil
-		}
-		return "", err
-	}
-
-	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
-		return lastAddr, nil
-	}
-
-	return "", nil
-}
-
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
-	var preferredAddr string
-	var err error
-	// Use s.routingInfo directly. If it's nil from authentication,
-	// we'll try to populate it here.
-	routingMethod := "roundrobin" // Default to round-robin
-	isPrelookupRoute := false
-
-	// 1. Try routing lookup first, only if not already available from auth
-	if s.routingInfo == nil && s.server.connManager.HasRouting() {
-		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		var lookupErr error
-		// Update the session's routingInfo so it's available for later steps.
-		s.routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
-		routingCancel()
-		if lookupErr != nil {
-			log.Printf("[IMAP Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
-		}
+	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
+		Ctx:                s.ctx,
+		Username:           s.username,
+		AccountID:          s.accountID,
+		IsPrelookupAccount: s.isPrelookupAccount,
+		RoutingInfo:        s.routingInfo,
+		ConnManager:        s.server.connManager,
+		RDB:                s.server.rdb,
+		EnableAffinity:     s.server.enableAffinity,
+		AffinityValidity:   s.server.affinityValidity,
+		AffinityStickiness: s.server.affinityStickiness,
+		ProxyName:          "IMAP Proxy",
+	})
+	if err != nil {
+		log.Printf("[IMAP Proxy] Error determining route for %s: %v", s.username, err)
 	}
 
-	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
-		address := s.routingInfo.ServerAddress
-		// If the address from prelookup doesn't contain a port,
-		// use the new RemotePort field if it's available.
-		_, _, splitErr := net.SplitHostPort(address)
-		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
-		if portErr != nil {
-			log.Printf("[IMAP Proxy] Invalid remote_port in prelookup config: %v", portErr)
-		}
-		if splitErr != nil && remotePort > 0 {
-			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
-		}
-		preferredAddr = address
-		routingMethod = "prelookup"
-		isPrelookupRoute = true
-		log.Printf("[IMAP Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
-	}
-
-	// 2. If no routing info from prelookup, try affinity
-	if preferredAddr == "" {
-		preferredAddr, err = s.getPreferredBackend()
-		if err != nil {
-			log.Printf("[IMAP Proxy] Could not get preferred backend for %s: %v", s.username, err)
-		}
-		if preferredAddr != "" {
-			routingMethod = "affinity"
-			log.Printf("[IMAP Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-		}
-	}
-
-	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
-	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
-		if rand.Float64() > s.server.affinityStickiness {
-			log.Printf("[IMAP Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
-			preferredAddr = "" // This will cause the connection manager to use round-robin
-			routingMethod = "roundrobin"
-		}
-	}
+	// Update session routing info if it was fetched by DetermineRoute
+	s.routingInfo = routeResult.RoutingInfo
+	preferredAddr := routeResult.PreferredAddr
+	isPrelookupRoute := routeResult.IsPrelookupRoute
 
 	// 4. Connect using the determined address (or round-robin if empty)
 	// Create a new context for this connection attempt, respecting the overall session context.
 	// Track which routing method was used for this connection.
-	metrics.ProxyRoutingMethod.WithLabelValues("imap", routingMethod).Inc()
+	metrics.ProxyRoutingMethod.WithLabelValues("imap", routeResult.RoutingMethod).Inc()
 
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer connectCancel()

@@ -803,7 +803,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 
 // getCurrentDatabase returns the current active database pool
 func (rd *ResilientDatabase) getCurrentDatabase() *db.Database {
-	return rd.getCurrentDatabaseForOperation(true) // Default to write operation for backward compatibility
+	return rd.getCurrentDatabaseForOperation(true)
 }
 
 // getCurrentDatabaseForOperation returns the current active database pool for the specified operation type

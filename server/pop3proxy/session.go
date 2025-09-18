@@ -8,13 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -322,93 +320,32 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	return nil
 }
 
-// getPreferredBackend fetches the preferred backend server for the user based on affinity.
-func (s *POP3ProxySession) getPreferredBackend() (string, error) {
-	if !s.server.enableAffinity || s.isPrelookupAccount {
-		return "", nil
-	}
-
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
-	defer cancel()
-
-	lastAddr, lastTime, err := s.server.rdb.GetLastServerAddressWithRetry(ctx, s.accountID)
-	if err != nil {
-		// Don't log ErrDBNotFound as an error, it's an expected case.
-		if errors.Is(err, consts.ErrNoServerAffinity) {
-			return "", nil
-		}
-		return "", err
-	}
-
-	if lastAddr != "" && time.Since(lastTime) < s.server.affinityValidity {
-		return lastAddr, nil
-	}
-
-	return "", nil
-}
-
 func (s *POP3ProxySession) connectToBackend() error {
-	var preferredAddr string
-	var err error
-	// Use s.routingInfo directly. If it's nil from authentication,
-	// we'll try to populate it here.
-	routingMethod := "roundrobin" // Default to round-robin
-	isPrelookupRoute := false
-
-	// 1. Try routing lookup first, only if not already available from auth
-	if s.routingInfo == nil && s.server.connManager.HasRouting() {
-		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
-		var lookupErr error
-		// Update the session's routingInfo so it's available for later steps.
-		s.routingInfo, lookupErr = s.server.connManager.LookupUserRoute(routingCtx, s.username)
-		routingCancel()
-		if lookupErr != nil {
-			log.Printf("[POP3 Proxy] Routing lookup failed for %s: %v, falling back to affinity", s.username, lookupErr)
-		}
+	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
+		Ctx:                s.ctx,
+		Username:           s.username,
+		AccountID:          s.accountID,
+		IsPrelookupAccount: s.isPrelookupAccount,
+		RoutingInfo:        s.routingInfo,
+		ConnManager:        s.server.connManager,
+		RDB:                s.server.rdb,
+		EnableAffinity:     s.server.enableAffinity,
+		AffinityValidity:   s.server.affinityValidity,
+		AffinityStickiness: s.server.affinityStickiness,
+		ProxyName:          "POP3 Proxy",
+	})
+	if err != nil {
+		log.Printf("[POP3 Proxy] Error determining route for %s: %v", s.username, err)
 	}
 
-	if s.routingInfo != nil && s.routingInfo.ServerAddress != "" {
-		address := s.routingInfo.ServerAddress
-		// If the address from prelookup doesn't contain a port,
-		// use the new RemotePort field if it's available.
-		_, _, splitErr := net.SplitHostPort(address)
-		remotePort, portErr := s.server.prelookupConfig.GetRemotePort()
-		if portErr != nil {
-			log.Printf("[POP3 Proxy] Invalid remote_port in prelookup config: %v", portErr)
-		}
-		if splitErr != nil && remotePort > 0 {
-			address = net.JoinHostPort(address, fmt.Sprintf("%d", remotePort))
-		}
-		preferredAddr = address
-		routingMethod = "prelookup"
-		isPrelookupRoute = true
-		log.Printf("[POP3 Proxy] Using routing lookup for %s: %s", s.username, preferredAddr)
-	}
-
-	// 2. If no routing info, try affinity
-	if preferredAddr == "" {
-		preferredAddr, err = s.getPreferredBackend()
-		if err != nil {
-			log.Printf("[POP3 Proxy] Could not get preferred backend for %s: %v", s.username, err)
-		}
-		if preferredAddr != "" {
-			routingMethod = "affinity"
-			log.Printf("[POP3 Proxy] Using server affinity for %s: %s", s.username, preferredAddr)
-		}
-	}
-
-	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
-	if preferredAddr != "" && !isPrelookupRoute && s.server.affinityStickiness < 1.0 {
-		if rand.Float64() > s.server.affinityStickiness {
-			log.Printf("[POP3 Proxy] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", s.username, s.server.affinityStickiness)
-			preferredAddr = "" // This will cause the connection manager to use round-robin
-			routingMethod = "roundrobin"
-		}
-	}
+	// Update session routing info if it was fetched by DetermineRoute
+	s.routingInfo = routeResult.RoutingInfo
+	preferredAddr := routeResult.PreferredAddr
+	isPrelookupRoute := routeResult.IsPrelookupRoute
 
 	// 4. Connect using the determined address (or round-robin if empty)
 	// Track which routing method was used for this connection.
-	metrics.ProxyRoutingMethod.WithLabelValues("pop3", routingMethod).Inc()
+	metrics.ProxyRoutingMethod.WithLabelValues("pop3", routeResult.RoutingMethod).Inc()
 
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())

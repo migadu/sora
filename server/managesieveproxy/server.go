@@ -85,22 +85,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize prelookup client if configured
-	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup != nil && opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
-		if err != nil {
-			log.Printf("[ManageSieve Proxy] Failed to initialize prelookup client: %v", err)
-			if !opts.PreLookup.FallbackDefault {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
-			}
-			log.Printf("[ManageSieve Proxy] Continuing without prelookup due to fallback_to_default=true")
-		} else {
-			routingLookup = prelookupClient
-			log.Printf("[ManageSieve Proxy] Prelookup database client initialized successfully")
-		}
+	routingLookup, err := proxy.InitializePrelookup(ctx, opts.PreLookup, "ManageSieve")
+	if err != nil {
+		return nil, err // InitializePrelookup handles fallback logic and returns error only when fatal
 	}
-
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
