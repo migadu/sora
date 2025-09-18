@@ -241,13 +241,13 @@ Update existing account passwords:
 
 ```bash
 # Basic password update
-./sora-admin update-account --email user@example.com --password newpassword
+./sora-admin accounts update --email user@example.com --password newpassword
 
 # Update password with specific hash type
-./sora-admin update-account --email user@example.com --password newpassword --hash ssha512
+./sora-admin accounts update --email user@example.com --password newpassword --hash ssha512
 
 # Use custom database connection (overriding config file)  
-./sora-admin update-account --email user@example.com --password newpassword \
+./sora-admin accounts update --email user@example.com --password newpassword \
   --dbhost localhost --dbport 5432 --dbuser postgres --dbname sora_db
 ```
 
@@ -260,21 +260,21 @@ Update existing account passwords:
 ### Monitoring Commands
 
 ```bash
-# View connection statistics
-./sora-admin connection-stats    # Connection metrics by protocol/server
-./sora-admin connection-stats --user user@example.com  # User-specific
+# View connection statistics (now under 'stats connection')
+./sora-admin stats connection    # Connection metrics by protocol/server
+./sora-admin stats connection --user user@example.com  # User-specific
 
-# View cache performance metrics
-./sora-admin cache-metrics       # Show latest hit/miss ratios per instance
+# View cache performance metrics (now under 'cache metrics')
+./sora-admin cache metrics       # Show latest hit/miss ratios per instance
 
-# Check system health
-./sora-admin health-status       # Overall health check
-./sora-admin health-status --detailed  # Component details
+# Check system health (now under 'health')
+./sora-admin health       # Overall health check
+./sora-admin health --detailed  # Component details
 
-# Kick connections
-./sora-admin kick-connections --user user@example.com
-./sora-admin kick-connections --protocol imap
-./sora-admin kick-connections --server backend1.example.com
+# Kick connections (now under 'connections kick')
+./sora-admin connections kick --user user@example.com
+./sora-admin connections kick --protocol imap
+./sora-admin connections kick --server backend1.example.com
 ```
 
 ### Import/Export Operations

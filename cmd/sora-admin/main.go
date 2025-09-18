@@ -1950,7 +1950,7 @@ func isFlagSet(fs *flag.FlagSet, name string) bool {
 }
 
 func handleImportMaildir() {
-	// Parse import-maildir specific flags
+	// Parse import specific flags
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
@@ -1963,7 +1963,7 @@ func handleImportMaildir() {
 	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
 	forceReimport := fs.Bool("force-reimport", false, "Force reimport of messages even if they already exist")
 	cleanupDB := fs.Bool("cleanup-db", false, "Remove the SQLite import database after successful import")
-	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, dovecot-keywords)")
+	dovecot := fs.Bool("dovecot", false, "Process Dovecot-specific files (subscriptions, keywords, uidlist)")
 	sievePath := fs.String("sieve", "", "Path to Sieve script file to import for the user")
 	preserveUIDs := fs.Bool("preserve-uids", false, "Preserve original UIDs from dovecot-uidlist files")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to import (e.g. INBOX,Sent)")
@@ -1974,7 +1974,7 @@ func handleImportMaildir() {
 		fmt.Printf(`Import maildir from a given path
 
 Usage:
-  sora-admin import-maildir [options]
+  sora-admin import [options]
 
 Options:
   --email string          Email address for the account to import mail to (required)
@@ -2003,30 +2003,30 @@ custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist file
 
 Examples:
   # Import all mail (correct path points to maildir root)
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+  sora-admin import --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
 
   # Dry run to preview (note: correct maildir path)
-  sora-admin import-maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
+  sora-admin import --email user@example.com --maildir-path /home/user/Maildir --dry-run
 
   # Import only INBOX and Sent folders
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
+  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
 
   # Import messages from 2023
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
 
   # Import with cleanup (removes SQLite database after completion)
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
+  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
 
   # Import from Dovecot with subscriptions and custom keywords
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
 
   # Import with Sieve script
-  sora-admin import-maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
+  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
 `)
 	}
 
-	// Parse the remaining arguments (skip the command and subcommand name)
-	if err := fs.Parse(os.Args[3:]); err != nil {
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -2140,7 +2140,7 @@ Examples:
 }
 
 func handleExportMaildir() {
-	// Parse export-maildir specific flags
+	// Parse export specific flags
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
@@ -2150,7 +2150,7 @@ func handleExportMaildir() {
 	dryRun := fs.Bool("dry-run", false, "Preview what would be exported without making changes")
 	showProgress := fs.Bool("progress", true, "Show export progress")
 	delay := fs.Duration("delay", 0, "Delay between operations to control rate (e.g. 500ms)")
-	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions)")
+	dovecot := fs.Bool("dovecot", false, "Export Dovecot-specific files (subscriptions and dovecot-uidlist)")
 	exportUIDList := fs.Bool("export-dovecot-uidlist", false, "Export dovecot-uidlist files with UID mappings")
 	overwriteFlags := fs.Bool("overwrite-flags", false, "Update flags on existing messages")
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to export (e.g. INBOX,Sent)")
@@ -2161,7 +2161,7 @@ func handleExportMaildir() {
 		fmt.Printf(`Export messages to maildir format
 
 Usage:
-  sora-admin export-maildir [options]
+  sora-admin export [options]
 
 Options:
   --email string          Email address for the account to export mail from (required)
@@ -2184,24 +2184,24 @@ with the same content hash will be skipped unless --overwrite-flags is specified
 
 Examples:
   # Export all mail to a new maildir
-  sora-admin export-maildir --email user@example.com --maildir-path /var/backup/user/Maildir
+  sora-admin export --email user@example.com --maildir-path /var/backup/user/Maildir
 
   # Export only INBOX and Sent folders
-  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+  sora-admin export --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
 
   # Export with Dovecot metadata (includes dovecot-uidlist files)
-  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export --email user@example.com --maildir-path /backup/maildir --dovecot
   
   # Export with only dovecot-uidlist files (no subscriptions)
-  sora-admin export-maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
+  sora-admin export --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
 
   # Update flags on existing messages
-  sora-admin export-maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
+  sora-admin export --email user@example.com --maildir-path /existing/maildir --overwrite-flags
 `)
 	}
 
-	// Parse the remaining arguments (skip the command and subcommand name)
-	if err := fs.Parse(os.Args[3:]); err != nil {
+	// Parse the remaining arguments (skip the command name)
+	if err := fs.Parse(os.Args[2:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
