@@ -164,17 +164,25 @@ func (c *Cache) Exists(contentHash string) (bool, error) {
 	path := c.GetPathForContentHash(contentHash)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		atomic.AddInt64(&c.cacheMisses, 1)
-		return false, nil
-	}
-	if err == nil {
-		atomic.AddInt64(&c.cacheHits, 1)
-	}
-	return err == nil, err
-}
 
+	var count int
+	// Querying the index is more reliable than checking the filesystem (avoids TOCTOU races)
+	// and is generally faster.
+	err := c.db.QueryRow(`SELECT COUNT(*) FROM cache_index WHERE path = ?`, path).Scan(&count)
+	if err != nil {
+		// This is an internal DB error, not a cache miss.
+		log.Printf("[CACHE] failed to query index for existence of %s: %v", path, err)
+		return false, fmt.Errorf("failed to query cache index: %w", err)
+	}
+
+	exists := count > 0
+	if exists {
+		atomic.AddInt64(&c.cacheHits, 1)
+	} else {
+		atomic.AddInt64(&c.cacheMisses, 1)
+	}
+	return exists, nil
+}
 func (c *Cache) Delete(contentHash string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -253,61 +261,6 @@ func (c *Cache) trackFile(path string) error {
 	return err
 }
 
-func (c *Cache) PurgeIfNeeded(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	dataDir := filepath.Join(c.basePath, DataDir)
-	var nullTotalSize sql.NullInt64
-	row := c.db.QueryRow(`SELECT SUM(size) FROM cache_index`)
-	if err := row.Scan(&nullTotalSize); err != nil {
-		// An error here (other than sql.ErrNoRows, which Scan handles for Null types) is problematic.
-		return fmt.Errorf("failed to get total cache size: %w", err)
-	}
-	var totalSize int64
-	if nullTotalSize.Valid {
-		totalSize = nullTotalSize.Int64
-	}
-
-	if totalSize <= c.capacity {
-		log.Printf("[CACHE] size: %d, within capacity: %d\n", totalSize, c.capacity)
-		return nil
-	}
-
-	log.Printf("[CACHE] size: %d, exceeds capacity: %d\n", totalSize, c.capacity)
-
-	rows, err := c.db.Query(`SELECT path, size FROM cache_index ORDER BY mod_time ASC`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	var freed int64
-	for rows.Next() {
-		var path string
-		var size int64
-		if err := rows.Scan(&path, &size); err != nil { // Log if scan fails
-			log.Printf("[CACHE] error scanning row during purge: %v\n", err)
-			continue
-		}
-		if err := os.Remove(path); err == nil {
-			if _, dbErr := c.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path); dbErr != nil {
-				log.Printf("[CACHE] failed to delete index entry for %s: %v", path, dbErr)
-			}
-			freed += size
-			removeEmptyParents(path, dataDir)
-			if (totalSize - freed) <= c.capacity {
-				log.Printf("[CACHE] freed %d bytes, total size now: %d bytes\n", freed, totalSize-freed)
-				break
-			}
-		}
-	}
-	if err := c.cleanupStaleDirectories(); err != nil {
-		log.Printf("[CACHE] error during cleanupStaleDirectories: %v", err)
-	}
-	return nil
-}
-
 func removeEmptyParents(path string, stopAt string) {
 	for {
 		dir := filepath.Dir(path)
@@ -323,36 +276,72 @@ func removeEmptyParents(path string, stopAt string) {
 	}
 }
 
-func (c *Cache) SyncFromDisk() error {
-	var filePaths []string
+type fileStat struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
 
+func (c *Cache) SyncFromDisk() error {
+	log.Println("[CACHE] starting disk sync")
+	var files []fileStat
+
+	// Phase 1: Walk disk and collect file info (no lock)
 	dataDir := filepath.Join(c.basePath, DataDir)
 	err := filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.Type().IsRegular() {
-			filePaths = append(filePaths, path)
+			info, statErr := d.Info()
+			if statErr != nil {
+				log.Printf("[CACHE] failed to get stat for %s during sync: %v", path, statErr)
+				return nil // Continue walking
+			}
+			files = append(files, fileStat{path: path, size: info.Size(), modTime: info.ModTime()})
 		}
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to walk cache directory: %w", err)
 	}
-
-	for _, path := range filePaths {
+	if len(files) > 0 {
+		log.Printf("[CACHE] found %d files on disk, updating index...", len(files))
+		// Phase 2: Update index in a single transaction (short lock)
 		c.mu.Lock()
-		if err := c.trackFile(path); err != nil {
-			log.Printf("[CACHE] error tracking file %s: %v", path, err)
+		tx, err := c.db.Begin()
+		if err != nil {
+			c.mu.Unlock()
+			return fmt.Errorf("failed to begin transaction for disk sync: %w", err)
+		}
+
+		stmt, err := tx.Prepare(`INSERT OR REPLACE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`)
+		if err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return fmt.Errorf("failed to prepare statement for disk sync: %w", err)
+		}
+		defer stmt.Close()
+
+		for _, f := range files {
+			if _, err := stmt.Exec(f.path, f.size, f.modTime); err != nil {
+				log.Printf("[CACHE] error tracking file %s during sync: %v", f.path, err)
+				// Continue, try to sync as much as possible
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			c.mu.Unlock()
+			return fmt.Errorf("failed to commit disk sync transaction: %w", err)
 		}
 		c.mu.Unlock()
+		log.Printf("[CACHE] index update complete")
 	}
-
+	// Phase 3: Clean up stale entries and directories (uses its own locking)
 	ctx := context.Background()
 	if err := c.RemoveStaleDBEntries(ctx); err != nil {
-		return fmt.Errorf("failed to remove stale DB entries: %w", err)
+		return fmt.Errorf("failed to remove stale DB entries after sync: %w", err)
 	}
-
 	return c.cleanupStaleDirectories()
 }
 
@@ -418,13 +407,156 @@ func (c *Cache) cleanupStaleDirectories() error {
 	})
 }
 
+// PurgeIfNeeded checks if the cache size exceeds its capacity and, if so,
+// removes the least recently used items until it's within limits.
+// This version is optimized to reduce lock contention and use batch database operations.
+func (c *Cache) PurgeIfNeeded(ctx context.Context) error {
+	// Phase 1: Check size and get candidates for deletion (read-only, minimal lock).
+	pathsToPurge, err := c.getPurgeCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get purge candidates: %w", err)
+	}
+	if len(pathsToPurge) == 0 {
+		return nil // Nothing to do.
+	}
+
+	// Phase 2: Delete files from the filesystem (slow, no lock needed).
+	successfullyRemovedPaths := c.deleteFiles(pathsToPurge)
+
+	if len(successfullyRemovedPaths) == 0 {
+		log.Println("[CACHE] attempted to purge files, but none were successfully removed from filesystem")
+		return nil
+	}
+
+	// Phase 3: Remove entries from the database index in a single batch (write, short lock).
+	if err := c.removeIndexEntries(ctx, successfullyRemovedPaths); err != nil {
+		return fmt.Errorf("failed to remove purged files from index: %w", err)
+	}
+
+	// Optional: Cleanup empty parent directories.
+	dataDir := filepath.Join(c.basePath, DataDir)
+	for _, path := range successfullyRemovedPaths {
+		removeEmptyParents(path, dataDir)
+	}
+
+	// Final cleanup of any other empty dirs that might have been left.
+	if err := c.cleanupStaleDirectories(); err != nil {
+		log.Printf("[CACHE] error during post-purge directory cleanup: %v", err)
+	}
+
+	return nil
+}
+
+// getPurgeCandidates identifies which files to purge to get back under capacity.
+// It holds a lock only for the duration of the database query.
+func (c *Cache) getPurgeCandidates(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var totalSize int64
+	row := c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM cache_index`)
+	if err := row.Scan(&totalSize); err != nil {
+		return nil, fmt.Errorf("failed to get total cache size: %w", err)
+	}
+
+	if totalSize <= c.capacity {
+		return nil, nil // Cache is within capacity, nothing to do.
+	}
+
+	log.Printf("[CACHE] size: %d, exceeds capacity: %d. Identifying files to purge.", totalSize, c.capacity)
+	amountToFree := totalSize - c.capacity
+
+	// Query for the oldest files sufficient to free up the required space.
+	rows, err := c.db.QueryContext(ctx, `SELECT path, size FROM cache_index ORDER BY mod_time ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query for purge candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var pathsToPurge []string
+	var freedSoFar int64
+	for rows.Next() {
+		var path string
+		var size int64
+		if err := rows.Scan(&path, &size); err != nil {
+			log.Printf("[CACHE] error scanning purge candidate: %v", err)
+			continue
+		}
+		pathsToPurge = append(pathsToPurge, path)
+		freedSoFar += size
+		if freedSoFar >= amountToFree {
+			break // We have enough candidates.
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating purge candidates: %w", err)
+	}
+
+	log.Printf("[CACHE] identified %d files to purge to free up at least %d bytes", len(pathsToPurge), amountToFree)
+	return pathsToPurge, nil
+}
+
+// deleteFiles removes files from the filesystem and returns a slice of paths that were successfully removed.
+func (c *Cache) deleteFiles(paths []string) []string {
+	var successfullyRemoved []string
+	for _, path := range paths {
+		// os.Remove is idempotent on non-existent files if we check the error.
+		if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+			successfullyRemoved = append(successfullyRemoved, path)
+		} else {
+			log.Printf("[CACHE] failed to remove file during purge: %s, error: %v", path, err)
+		}
+	}
+	return successfullyRemoved
+}
+
+// removeIndexEntries removes a batch of paths from the cache index.
+func (c *Cache) removeIndexEntries(ctx context.Context, paths []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for index removal: %w", err)
+	}
+	defer tx.Rollback()
+
+	// For SQLite, we build a query with placeholders for batch delete.
+	// This is safe as paths are generated internally.
+	if len(paths) == 0 {
+		return nil
+	}
+	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(paths)-1) + `)`
+	args := make([]interface{}, len(paths))
+	for i, p := range paths {
+		args[i] = p
+	}
+
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to batch delete from index: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit index deletions: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("[CACHE] removed %d entries from index", rowsAffected)
+	return nil
+}
+
 func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
+	// This function runs without a lock initially to read from the DB.
+	// The lock is acquired per-batch inside purgeHashBatch during the write phase.
+	// This is safe because we are using WAL mode for SQLite, which allows concurrent reads and writes.
 	threshold := time.Now().Add(-c.orphanCleanupAge)
 	rows, err := c.db.Query(`SELECT path FROM cache_index WHERE mod_time < ?`, threshold)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+
 	var batch []string // Stores contentHashes
 	var paths []string
 	purged := 0
@@ -435,6 +567,7 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 			log.Printf("[CACHE] error scanning path: %v", err)
 			continue
 		}
+
 		contentHash := filepath.Base(path)
 		// Basic validation for a hash-like string, adjust if needed
 		if len(contentHash) < 32 || len(contentHash) > 128 { // Example length check for typical hashes
@@ -445,10 +578,10 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 		batch = append(batch, contentHash)
 		paths = append(paths, path)
 
-		if len(batch) == PurgeBatchSize {
+		if len(batch) >= PurgeBatchSize {
 			purged += c.purgeHashBatch(ctx, batch, paths)
-			batch = nil
-			paths = nil
+			batch = make([]string, 0, PurgeBatchSize)
+			paths = make([]string, 0, PurgeBatchSize)
 		}
 	}
 
@@ -459,12 +592,13 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 	if purged > 0 {
 		log.Printf("[CACHE] removed %d orphaned entries\n", purged)
 	}
+
 	return nil
 }
 
 func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, paths []string) int {
-	dataDir := filepath.Join(c.basePath, DataDir)
-	existingDBHashes, err := c.sourceDB.FindExistingContentHashesWithRetry(ctx, contentHashes) // This DB method needs to be created
+	// Phase 1: Check against the main database (slow network call, no lock needed).
+	existingDBHashes, err := c.sourceDB.FindExistingContentHashesWithRetry(ctx, contentHashes)
 	if err != nil {
 		log.Printf("[CACHE] error finding existing content hashes from sourceDB: %v", err)
 		return 0
@@ -474,90 +608,134 @@ func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, path
 	for _, hash := range existingDBHashes {
 		existsMap[hash] = true
 	}
+
+	// Phase 2: Identify which files are true orphans and can be deleted.
+	var pathsToDelete []string
+	for i, currentHash := range contentHashes {
+		if !existsMap[currentHash] {
+			pathsToDelete = append(pathsToDelete, paths[i])
+		}
+	}
+
+	if len(pathsToDelete) == 0 {
+		return 0
+	}
+
+	// Phase 3: Perform local filesystem and DB modifications under a lock.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	dataDir := filepath.Join(c.basePath, DataDir)
+	var successfullyRemovedPaths []string
+
+	// Delete files from filesystem first.
+	for _, path := range pathsToDelete {
+		if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+			successfullyRemovedPaths = append(successfullyRemovedPaths, path)
+			if err == nil {
+				removeEmptyParents(path, dataDir)
+			}
+		} else {
+			log.Printf("[CACHE] error removing cached file %s: %v\n", path, err)
+		}
+	}
+
+	if len(successfullyRemovedPaths) == 0 {
+		return 0
+	}
+
+	// Batch delete from the SQLite index inside a transaction.
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("[CACHE] error beginning transaction: %v\n", err)
-		return 0 // Cannot proceed without a transaction for DB deletes
+		return 0
 	}
 	defer tx.Rollback() // Rollback if not committed
 
-	purged := 0
-	for i, currentHash := range contentHashes {
-		if !existsMap[currentHash] {
-			// Attempt to remove the file first
-			err := os.Remove(paths[i])
-			fileRemovedOrNotExists := err == nil || os.IsNotExist(err)
+	// SQLite doesn't support array parameters, so we build a query with placeholders.
+	// This is safe as paths are generated internally, not from user input.
+	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(successfullyRemovedPaths)-1) + `)`
+	args := make([]interface{}, len(successfullyRemovedPaths))
+	for i, p := range successfullyRemovedPaths {
+		args[i] = p
+	}
 
-			if err != nil && !os.IsNotExist(err) {
-				log.Printf("[CACHE] error removing cached file %s: %v\n", paths[i], err)
-				// If file removal failed for a reason other than "not exist",
-				// skip deleting the DB entry to avoid orphaning the DB record.
-				continue
-			}
-
-			// If file was successfully removed or didn't exist, try to remove the DB entry.
-			if fileRemovedOrNotExists {
-				_, dbErr := tx.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, paths[i])
-				if dbErr != nil {
-					log.Printf("[CACHE] error deleting cache index entry for path %s: %v\n", paths[i], dbErr)
-					// Log the error and continue. The transaction will attempt to commit other successful deletes.
-					// This might leave an orphaned file if os.Remove succeeded but DB delete failed,
-					// but RemoveStaleDBEntries might catch it later if the file is truly gone.
-					continue
-				}
-				removeEmptyParents(paths[i], dataDir) // Only remove parents if both file and DB entry are handled.
-				purged++
-			}
-		}
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		log.Printf("[CACHE] error batch deleting from index: %v\n", err)
+		return 0
 	}
 
 	if err := tx.Commit(); err != nil {
 		log.Printf("[CACHE] error committing transaction: %v\n", err)
-		return 0 // Return 0 as the batch operation wasn't fully successful
+		return 0
 	}
-	return purged
+
+	rowsAffected, _ := result.RowsAffected()
+	return int(rowsAffected)
 }
 
 func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Phase 1: Get all indexed paths without holding the main lock.
+	// This is safe due to SQLite's WAL mode allowing concurrent reads.
 	rows, err := c.db.QueryContext(ctx, `SELECT path FROM cache_index`)
 	if err != nil {
 		return fmt.Errorf("failed to query cache_index: %w", err)
 	}
 	defer rows.Close()
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback() // safe to call even if tx is already committed
 
-	var removed int
+	var allPaths []string
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			log.Printf("[CACHE] error scanning path: %v\n", err)
+			log.Printf("[CACHE] error scanning path during stale check: %v\n", err)
 			continue
 		}
+		allPaths = append(allPaths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating indexed paths: %w", err)
+	}
+
+	// Phase 2: Check which files are missing from the filesystem (slow I/O, no lock).
+	var stalePaths []string
+	for _, path := range allPaths {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			_, err = tx.ExecContext(ctx, `DELETE FROM cache_index WHERE path = ?`, path)
-			if err != nil {
-				log.Printf("[CACHE] failed to delete index entry for path %s: %v\n", path, err)
-				// Continue to try and remove other stale entries
-			}
-			removed++
+			stalePaths = append(stalePaths, path)
 		}
 	}
 
+	if len(stalePaths) == 0 {
+		return nil // Nothing to do.
+	}
+
+	// Phase 3: Remove stale entries from the index in a single batch (write, short lock).
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for stale entry removal: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Use the same batch delete pattern as other purge functions.
+	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(stalePaths)-1) + `)`
+	args := make([]interface{}, len(stalePaths))
+	for i, p := range stalePaths {
+		args[i] = p
+	}
+
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to batch delete stale entries from index: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit deletions: %w", err)
+		return fmt.Errorf("failed to commit stale entry deletions: %w", err)
 	}
 
-	if removed > 0 {
-		log.Printf("[CACHE] removed %d stale entries\n", removed)
-	}
-
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("[CACHE] removed %d stale entries from index\n", rowsAffected)
 	return nil
 }
 
@@ -584,26 +762,49 @@ func isCrossDeviceError(err error) bool {
 }
 
 // copyFile copies a file from src to dst, preserving permissions.
+// It performs an atomic write by first copying to a temporary file in the
+// same directory and then renaming it to the final destination. This prevents
+// readers from accessing a partially written file.
 func copyFile(src, dst string) error {
+	// Open the source file for reading.
 	srcFile, err := os.Open(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open source file %s: %w", src, err)
 	}
 	defer srcFile.Close()
 
-	srcInfo, err := srcFile.Stat()
+	// Get source file info to preserve permissions.
+	_, err = srcFile.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to stat source file %s: %w", src, err)
 	}
 
-	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	// Create a temporary file in the same directory as the destination.
+	// This is crucial for an atomic os.Rename later.
+	dstDir := filepath.Dir(dst)
+	tempFile, err := os.CreateTemp(dstDir, "copy-*.tmp")
 	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
+		return fmt.Errorf("failed to create temporary file in %s: %w", dstDir, err)
 
-	_, err = io.Copy(dstFile, srcFile)
-	return err
+	}
+	// Ensure the temporary file is cleaned up if any error occurs before the final rename.
+	defer os.Remove(tempFile.Name())
+
+	// Copy the contents from source to the temporary file.
+	if _, err = io.Copy(tempFile, srcFile); err != nil {
+		tempFile.Close() // Attempt to close before removing.
+		return fmt.Errorf("failed to copy data from %s to %s: %w", src, tempFile.Name(), err)
+	}
+
+	// Close the temporary file to ensure all data is flushed to disk.
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file %s: %w", tempFile.Name(), err)
+	}
+
+	// Atomically move the temporary file to its final destination.
+	// This overwrites the destination if it exists, which is the desired behavior
+	// in case of a race condition where another process cached the file.
+	return os.Rename(tempFile.Name(), dst)
 }
 
 // CacheStats holds cache statistics
@@ -678,42 +879,26 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Get all cached file paths
-	rows, err := c.db.QueryContext(ctx, `SELECT path FROM cache_index`)
-	if err != nil {
-		return fmt.Errorf("failed to query cache index: %w", err)
-	}
-	defer rows.Close()
+	log.Println("[CACHE] purging all cached objects and clearing index")
 
-	var paths []string
-	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
-			log.Printf("[CACHE] error scanning path during purge: %v", err)
-			continue
-		}
-		paths = append(paths, path)
-	}
-
-	// Remove all files
+	// Atomically and efficiently remove the entire data directory.
 	dataDir := filepath.Join(c.basePath, DataDir)
-	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			log.Printf("[CACHE] failed to remove file %s: %v", path, err)
-		}
-		removeEmptyParents(path, dataDir)
+	if err := os.RemoveAll(dataDir); err != nil {
+		// If removal fails, we should not proceed to clear the index.
+		return fmt.Errorf("failed to remove cache data directory %s: %w", dataDir, err)
 	}
 
-	// Clear the cache index
+	// Recreate the data directory for future use.
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to recreate cache data directory %s: %w", dataDir, err)
+	}
+
+	// Clear the cache index in a single operation.
 	if _, err := c.db.ExecContext(ctx, `DELETE FROM cache_index`); err != nil {
 		return fmt.Errorf("failed to clear cache index: %w", err)
 	}
 
-	// Clean up any remaining empty directories
-	if err := c.cleanupStaleDirectories(); err != nil {
-		log.Printf("[CACHE] error during cleanupStaleDirectories: %v", err)
-	}
-
+	log.Println("[CACHE] purge complete")
 	return nil
 }
 
