@@ -132,6 +132,10 @@ func main() {
 	fManageSieveTLSCert := flag.String("managesievetlscert", cfg.Servers.ManageSieve.TLSCertFile, "TLS cert for ManageSieve (overrides config)")
 	fManageSieveTLSKey := flag.String("managesievetlskey", cfg.Servers.ManageSieve.TLSKeyFile, "TLS key for ManageSieve (overrides config)")
 	fManageSieveTLSVerify := flag.Bool("managesievetlsverify", cfg.Servers.ManageSieve.TLSVerify, "Verify TLS certificates for ManageSieve (overrides config)")
+	fHttpapiTLS := flag.Bool("httpapitls", cfg.Servers.HTTPAPI.TLS, "Enable TLS for HTTP API (overrides config)")
+	fHttpapiTLSCert := flag.String("httpapitlscert", cfg.Servers.HTTPAPI.TLSCertFile, "TLS cert for HTTP API (overrides config)")
+	fHttpapiTLSKey := flag.String("httpapitlskey", cfg.Servers.HTTPAPI.TLSKeyFile, "TLS key for HTTP API (overrides config)")
+	fHttpapiTLSVerify := flag.Bool("httpapitlsverify", cfg.Servers.HTTPAPI.TLSVerify, "Verify client TLS certificates for HTTP API (mTLS) (overrides config)")
 
 	// Proxy server flags
 	fStartImapProxy := flag.Bool("imapproxy", cfg.Servers.IMAPProxy.Start, "Start the IMAP proxy server (overrides config)")
@@ -428,6 +432,20 @@ func main() {
 	}
 	if isFlagSet("managesievetlsverify") {
 		cfg.Servers.ManageSieve.TLSVerify = *fManageSieveTLSVerify
+	}
+
+	// HTTP API TLS settings
+	if isFlagSet("httpapitls") {
+		cfg.Servers.HTTPAPI.TLS = *fHttpapiTLS
+	}
+	if isFlagSet("httpapitlscert") {
+		cfg.Servers.HTTPAPI.TLSCertFile = *fHttpapiTLSCert
+	}
+	if isFlagSet("httpapitlskey") {
+		cfg.Servers.HTTPAPI.TLSKeyFile = *fHttpapiTLSKey
+	}
+	if isFlagSet("httpapitlsverify") {
+		cfg.Servers.HTTPAPI.TLSVerify = *fHttpapiTLSVerify
 	}
 
 	// Proxy server settings
@@ -1016,6 +1034,7 @@ func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.IMAPProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.IMAPProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.IMAPProxy.RemoteUseProxyProtocol,
+		RemoteUseIDCommand:     config.Servers.IMAPProxy.RemoteUseIDCommand,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		EnableAffinity:         config.Servers.IMAPProxy.EnableAffinity,
@@ -1078,6 +1097,7 @@ func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.POP3Proxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.POP3Proxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.POP3Proxy.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       config.Servers.POP3Proxy.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		Debug:                  config.Servers.Debug,
@@ -1140,6 +1160,7 @@ func startManageSieveProxyServer(ctx context.Context, hostname string, resilient
 		RemoteTLS:              config.Servers.ManageSieveProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.ManageSieveProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.ManageSieveProxy.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       config.Servers.ManageSieveProxy.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		AuthRateLimit:          config.Servers.ManageSieveProxy.AuthRateLimit,
@@ -1206,6 +1227,7 @@ func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *res
 		RemoteTLS:              config.Servers.LMTPProxy.RemoteTLS,
 		RemoteTLSVerify:        config.Servers.LMTPProxy.RemoteTLSVerify,
 		RemoteUseProxyProtocol: config.Servers.LMTPProxy.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       config.Servers.LMTPProxy.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		EnableAffinity:         config.Servers.LMTPProxy.EnableAffinity,
@@ -1275,6 +1297,7 @@ func startHTTPAPIServer(ctx context.Context, rdb *resilient.ResilientDatabase, c
 		TLS:          config.Servers.HTTPAPI.TLS,
 		TLSCertFile:  config.Servers.HTTPAPI.TLSCertFile,
 		TLSKeyFile:   config.Servers.HTTPAPI.TLSKeyFile,
+		TLSVerify:    config.Servers.HTTPAPI.TLSVerify,
 	}
 
 	httpapi.Start(ctx, rdb, options, errChan)

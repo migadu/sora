@@ -125,13 +125,12 @@ port = "5432"
 #### Proxy Mode Configuration
 ```toml
 [servers.imap_proxy]
-enabled = true
-listen = ":1143"          # Proxy listen port
-backends = [              # Backend servers to proxy to
+start = true
+addr = ":1143"            # Proxy listen port
+remote_addrs = [          # Backend servers to proxy to
     "backend1.example.com:143",
     "backend2.example.com:143",
 ]
-strategy = "round-robin"  # or "least-connections", "ip-hash"
 ```
 
 #### Production Resilience

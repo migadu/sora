@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ type Server struct {
 	tls          bool
 	tlsCertFile  string
 	tlsKeyFile   string
+	tlsVerify    bool
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -42,6 +44,7 @@ type ServerOptions struct {
 	TLS          bool
 	TLSCertFile  string
 	TLSKeyFile   string
+	TLSVerify    bool
 }
 
 // New creates a new HTTP API server
@@ -66,6 +69,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tls:          options.TLS,
 		tlsCertFile:  options.TLSCertFile,
 		tlsKeyFile:   options.TLSKeyFile,
+		tlsVerify:    options.TLSVerify,
 	}
 
 	return s, nil
@@ -111,6 +115,15 @@ func (s *Server) start(ctx context.Context) error {
 
 	// Start server with or without TLS
 	if s.tls {
+		// Add TLS config for mTLS
+		tlsConfig := &tls.Config{}
+		if s.tlsVerify {
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			tlsConfig.ClientAuth = tls.NoClientCert
+		}
+		s.server.TLSConfig = tlsConfig
+
 		return s.server.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
 	}
 	return s.server.ListenAndServe()

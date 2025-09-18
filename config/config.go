@@ -462,6 +462,7 @@ type IMAPProxyServerConfig struct {
 	RemoteTLS              bool                  `toml:"remote_tls"`
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseIDCommand     bool                  `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
 	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	EnableAffinity         bool                  `toml:"enable_affinity"`
@@ -487,6 +488,7 @@ type POP3ProxyServerConfig struct {
 	RemoteTLS              bool                  `toml:"remote_tls"`
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
 	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	EnableAffinity         bool                  `toml:"enable_affinity"`
@@ -512,6 +514,7 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLS              bool                  `toml:"remote_tls"`
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
 	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
@@ -535,6 +538,7 @@ type LMTPProxyServerConfig struct {
 	RemoteTLS              bool             `toml:"remote_tls"`
 	RemoteTLSVerify        bool             `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool             `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT       bool             `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string           `toml:"connect_timeout"`
 	SessionTimeout         string           `toml:"session_timeout"`  // Maximum session duration
 	MaxMessageSize         string           `toml:"max_message_size"` // Maximum message size announced in EHLO
@@ -551,13 +555,6 @@ type ConnectionTrackingConfig struct {
 	TerminationPollInterval string `toml:"termination_poll_interval"`
 	BatchUpdates            bool   `toml:"batch_updates"`
 	PersistToDB             bool   `toml:"persist_to_db"`
-}
-
-// RealIPConfig holds real IP extraction configuration
-type RealIPConfig struct {
-	Enabled        bool     `toml:"enabled"`         // Enable real IP extraction
-	TrustedProxies []string `toml:"trusted_proxies"` // CIDR blocks of trusted proxies
-	HeaderNames    []string `toml:"header_names"`    // Headers to check for real IP
 }
 
 // MetricsConfig holds metrics server configuration
@@ -581,6 +578,7 @@ type HTTPAPIConfig struct {
 	TLS          bool     `toml:"tls"`
 	TLSCertFile  string   `toml:"tls_cert_file"`
 	TLSKeyFile   string   `toml:"tls_key_file"`
+	TLSVerify    bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
 }
 
 // ServersConfig holds all server configurations.
@@ -595,7 +593,6 @@ type ServersConfig struct {
 	ManageSieveProxy   ManageSieveProxyServerConfig `toml:"managesieve_proxy"`
 	LMTPProxy          LMTPProxyServerConfig        `toml:"lmtp_proxy"`
 	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
-	RealIP             RealIPConfig                 `toml:"real_ip"`
 	Metrics            MetricsConfig                `toml:"metrics"`
 	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
 }
@@ -740,6 +737,7 @@ func NewDefaultConfig() Config {
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
 				RemoteUseProxyProtocol: true,
+				RemoteUseIDCommand:     true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",
@@ -755,6 +753,7 @@ func NewDefaultConfig() Config {
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
 				RemoteUseProxyProtocol: true,
+				RemoteUseXCLIENT:       true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",
@@ -771,6 +770,7 @@ func NewDefaultConfig() Config {
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
 				RemoteUseProxyProtocol: true,
+				RemoteUseXCLIENT:       true,
 				AuthRateLimit:          DefaultAuthRateLimiterConfig(),
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
@@ -786,6 +786,7 @@ func NewDefaultConfig() Config {
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
 				RemoteUseProxyProtocol: true,
+				RemoteUseXCLIENT:       true,
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,
 				AffinityValidity:       "24h",
@@ -796,26 +797,6 @@ func NewDefaultConfig() Config {
 				TerminationPollInterval: "30s",
 				BatchUpdates:            true,
 				PersistToDB:             true,
-			},
-			RealIP: RealIPConfig{
-				Enabled: false,
-				TrustedProxies: []string{
-					"127.0.0.0/8",    // localhost
-					"10.0.0.0/8",     // RFC1918 private
-					"172.16.0.0/12",  // RFC1918 private
-					"192.168.0.0/16", // RFC1918 private
-					"fc00::/7",       // IPv6 unique local
-					"::1/128",        // IPv6 localhost
-				},
-				HeaderNames: []string{
-					"X-Forwarded-For",
-					"X-Real-IP",
-					"CF-Connecting-IP",
-					"True-Client-IP",
-					"X-Forwarded",
-					"Forwarded-For",
-					"Forwarded",
-				},
 			},
 			Metrics: MetricsConfig{
 				Enabled:              true,
@@ -835,6 +816,7 @@ func NewDefaultConfig() Config {
 				TLS:          false,
 				TLSCertFile:  "",
 				TLSKeyFile:   "",
+				TLSVerify:    false,
 			},
 		},
 		Uploader: UploaderConfig{
