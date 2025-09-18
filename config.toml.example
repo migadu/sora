@@ -80,7 +80,7 @@ endpoint = "s3.amazonaws.com"           # S3-compatible storage endpoint URL (e.
 disable_tls = false                     # Disable TLS for S3 endpoint. Useful for local MinIO setups.
 access_key = "YOUR_S3_ACCESS_KEY_HERE"  # S3 access key ID for authentication.
 secret_key = "YOUR_S3_SECRET_KEY_HERE"  # S3 secret access key for authentication.
-bucket = "your-sora-mail-bucket"      # S3 bucket name for storing message bodies. Must be globally unique.
+bucket = "your-sora-mail-bucket"        # S3 bucket name for storing message bodies. Must be globally unique.
 trace = false                           # Enable detailed S3 request/response tracing. Impacts performance.
 
 # --- CLIENT-SIDE ENCRYPTION SETTINGS ---
@@ -232,11 +232,11 @@ external_relay = ""           # External SMTP relay for mail forwarding (optiona
 
 # --- TLS/SSL CONFIGURATION ---
 # Transport encryption for LMTP connections
-tls = false                      # Enable TLS for LMTP server (immediate TLS).
-tls_use_starttls = false         # Use STARTTLS for opportunistic encryption.
-tls_cert_file = "/path/to/your/lmtp.crt" # TLS certificate file path.
+tls = false                               # Enable TLS for LMTP server (immediate TLS).
+tls_use_starttls = false                  # Use STARTTLS for opportunistic encryption.
+tls_cert_file = "/path/to/your/lmtp.crt"  # TLS certificate file path.
 tls_key_file = "/path/to/your/lmtp.key"   # TLS private key file path.
-tls_verify = true                       # Verify client certificates (mutual TLS).
+tls_verify = true                         # Verify client certificates (mutual TLS).
 
 # --- CONNECTION LIMITING ---
 # Control concurrent LMTP connections for resource management
@@ -262,12 +262,12 @@ addr = ":110"                  # Listen address and port. Use :995 for POP3S.
 
 # --- TLS/SSL CONFIGURATION ---
 # Transport encryption for POP3 connections
-tls = false                      # Enable TLS for POP3 connections (POP3S).
-tls_cert_file = "/path/to/your/pop3.crt" # TLS certificate file path.
+tls = false                               # Enable TLS for POP3 connections (POP3S).
+tls_cert_file = "/path/to/your/pop3.crt"  # TLS certificate file path.
 tls_key_file = "/path/to/your/pop3.key"   # TLS private key file path.
-tls_verify = false               # Verify client certificates (mutual TLS).
-master_sasl_username = ""        # Master username for proxy authentication.
-master_sasl_password = ""        # Master password for proxy authentication.
+tls_verify = false                        # Verify client certificates (mutual TLS).
+master_sasl_username = ""                 # Master username for proxy authentication.
+master_sasl_password = ""                 # Master password for proxy authentication.
 
 # --- CONNECTION LIMITING ---
 # Control concurrent POP3 connections
@@ -421,34 +421,10 @@ max_delay = "30s"
 delay_multiplier = 2.0
 
 # --- ENHANCED CACHE AND DATABASE SETTINGS ---
-
-# How often to clean up expired in-memory cache entries (fast blocks, delays)
-# Examples:
-#   cache_cleanup_interval = "30s"             # Aggressive cleanup
-#   cache_cleanup_interval = "1m"              # Standard cleanup
-#   cache_cleanup_interval = "5m"              # Conservative cleanup
-cache_cleanup_interval = "1m"
-
-# How often to sync batched authentication attempts to the database
-# Examples:
-#   db_sync_interval = "10s"                   # Frequent sync
-#   db_sync_interval = "30s"                   # Standard sync
-#   db_sync_interval = "1m"                    # Infrequent sync
-db_sync_interval = "30s"
-
-# Maximum number of pending auth attempts before forcing a database sync
-# Examples:
-#   max_pending_batch = 50                     # Small batch
-#   max_pending_batch = 100                    # Standard batch
-#   max_pending_batch = 200                    # Large batch
-max_pending_batch = 100
-
-# Time to wait before retrying database operations after an error (circuit breaker)
-# Examples:
-#   db_error_threshold = "30s"                 # Quick recovery
-#   db_error_threshold = "1m"                  # Standard recovery
-#   db_error_threshold = "5m"                  # Conservative recovery
-db_error_threshold = "1m"
+cache_cleanup_interval = "1m"   # How often to clean up expired in-memory cache entries (fast blocks, delays).
+db_sync_interval = "30s"        # How often to sync batched auth attempts to the database.
+max_pending_batch = 100         # Max pending auth attempts before forcing a DB sync.
+db_error_threshold = "1m"       # Time to wait before retrying DB operations after an error.
 
 # --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers based on database queries.
@@ -478,18 +454,25 @@ cache_ttl = "10m"               # Cache duration for routing decisions.
 cache_size = 10000              # Maximum entries in the routing cache.
 
 # --- PRELOOKUP CONFIGURATION ---
-# Auto-detection of mode based on query results:
-# - 1 column returned (server_address): Routing-only (auth on backend).
-# - 2+ columns returned (password_hash, server_address, ...): Auth+Routing (auth on proxy).
-auth_method = "bcrypt"          # Auth method for password verification ("bcrypt", "plain"). Used in Auth+Route mode.
-query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true" # Main query for user lookup. REQUIRED if prelookup is enabled.
+auth_method = "bcrypt"          # Auth method for password verification ("bcrypt", "plain", "ssha512", etc.). Used in Auth+Route mode.
+
+# Main query for user lookup. The number and order of columns determine the operational mode.
+# Column patterns:
+#   1. Routing-only (1 column):
+#      - SELECT server_address FROM ...
+#   2. Auth+Routing (2 columns):
+#      - SELECT password_hash, server_address FROM ...
+#   3. Auth+Routing with Account ID (3+ columns):
+#      - SELECT account_id, password_hash, server_address, ... FROM ...
+#
+query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true" # REQUIRED if prelookup is enabled.
 
 # --- PRELOOKUP BACKEND TLS CONFIGURATION ---
 # TLS settings for connections to backend servers returned by the prelookup query.
 # These settings override the proxy's main remote_tls settings when a server
 # is determined via prelookup.
 remote_tls = false                # Enable TLS for connections to prelookup backends.
-remote_tls_verify = true         # Verify backend server certificates. Strongly recommended.
+remote_tls_verify = true          # Verify backend server certificates. Strongly recommended.
 # remote_port = 143
 # Default port for backends if not specified in query result.
 remote_use_proxy_protocol = true  # Send PROXY protocol v2 headers to backends.
@@ -506,12 +489,12 @@ fallback_to_default = true    # true: Fallback to default proxy routing if prelo
 
 [servers.pop3_proxy]
 start = true                                                              # Enable/disable POP3-proxy server.
-addr = ":1110"                                                          # Proxy listen address.
+addr = ":1110"                                                            # Proxy listen address.
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]   # Backend server addresses.
 max_connections = 1000                                                    # Maximum concurrent connections to the proxy.
 max_connections_per_ip = 20                                               # Maximum connections per client IP to the proxy.
-master_sasl_username = "proxyuser"                                      # Master username for authenticating to backends.
-master_sasl_password = "proxypass"                                      # Master password for authenticating to backends.
+master_sasl_username = "proxyuser"                                        # Master username for authenticating to backends.
+master_sasl_password = "proxypass"                                        # Master password for authenticating to backends.
 
 # --- TLS AND BEHAVIOR CONFIGURATION ---
 tls = false                       # Enable TLS for client-to-proxy connections.
@@ -666,10 +649,10 @@ remote_use_xclient = true        # Send ManageSieve XCLIENT command with client 
 
 [servers.lmtp_proxy]
 start = true                                                          # Enable/disable LMTP proxy.
-addr = ":124"                                                    # Proxy listen address.
+addr = ":124"                                                         # Proxy listen address.
 remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"] # Backend server addresses.
-max_connections = 1000                                             # Maximum concurrent connections to the proxy.
-max_connections_per_ip = 0                                         # Maximum connections per client IP (0 = unlimited, for trusted MTAs).
+max_connections = 1000                                                # Maximum concurrent connections to the proxy.
+max_connections_per_ip = 0                                            # Maximum connections per client IP (0 = unlimited, for trusted MTAs).
 
 # --- TLS AND BEHAVIOR CONFIGURATION ---
 tls = false                       # Enable TLS for client-to-proxy connections.

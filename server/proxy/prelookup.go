@@ -77,25 +77,63 @@ type PreLookupClient struct {
 	breaker                *circuitbreaker.CircuitBreaker
 }
 
+// normalizeHostPort ensures an address has a port, fixing malformed IPv6 addresses if necessary.
+// If the address has no port, the defaultPort is added.
+func normalizeHostPort(addr string, defaultPort int) string {
+	if addr == "" {
+		return ""
+	}
+
+	// net.SplitHostPort is the robust way to do this, as it correctly
+	// handles IPv6 addresses like "[::1]:143".
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil {
+		// Address is already in a valid host:port format.
+		// Re-join to ensure canonical format (e.g., for IPv6).
+		return net.JoinHostPort(host, port)
+	}
+
+	// If parsing fails, it could be because:
+	// 1. It's a host without a port (e.g., "localhost", "2001:db8::1").
+	// 2. It's a malformed IPv6 with a port but no brackets (e.g., "2001:db8::1:143").
+
+	// Let's test for case #2. This is a heuristic.
+	// An IPv6 address will have more than one colon.
+	if strings.Count(addr, ":") > 1 {
+		lastColon := strings.LastIndex(addr, ":")
+		// Assume the part after the last colon is the port.
+		if lastColon != -1 && lastColon < len(addr)-1 {
+			hostPart := addr[:lastColon]
+			portPart := addr[lastColon+1:]
+
+			// Check if the parts look like a valid IP and port.
+			if net.ParseIP(hostPart) != nil {
+				if _, pErr := strconv.Atoi(portPart); pErr == nil {
+					// This looks like a valid but malformed IPv6:port. Fix it.
+					fixedAddr := net.JoinHostPort(hostPart, portPart)
+					log.Printf("[PreLookup] Corrected malformed IPv6 address '%s' to '%s'", addr, fixedAddr)
+					return fixedAddr
+				}
+			}
+		}
+	}
+
+	// If we're here, it's most likely case #1: a host without a port.
+	// Add the default port if one is configured.
+	if defaultPort > 0 {
+		return net.JoinHostPort(addr, strconv.Itoa(defaultPort))
+	}
+
+	// No default port to add, and we couldn't fix it, so return as is.
+	return addr
+}
+
 // normalizeServerAddress adds the default port to a server address if no port is specified
 func (c *PreLookupClient) normalizeServerAddress(addr string) string {
-	if addr == "" || c.remotePort == 0 {
-		return addr
+	normalized := normalizeHostPort(addr, c.remotePort)
+	if normalized != addr {
+		log.Printf("[PreLookup] Normalized server address '%s' to '%s'", addr, normalized)
 	}
-
-	// Check if a port is already present.
-	// net.SplitHostPort is the robust way to do this, as it correctly
-	// handles IPv6 addresses like "[::1]".
-	_, _, err := net.SplitHostPort(addr)
-	if err == nil {
-		// Address already has a port, return as-is.
-		return addr
-	}
-
-	// If there's an error, it's likely "missing port in address".
-	// We can now safely add our default port.
-	normalized := net.JoinHostPort(addr, strconv.Itoa(c.remotePort))
-	log.Printf("[PreLookup] Normalized server address '%s' to '%s' using default port %d", addr, normalized, c.remotePort)
 	return normalized
 }
 
@@ -162,33 +200,29 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	if len(config.Hosts) > 0 {
 		host := config.Hosts[0] // Use first host for now, can be enhanced for multiple hosts
 
-		// Handle host:port combination
-		// Priority: 1) host:port in hosts array, 2) separate port field, 3) default 5432
-		if !strings.Contains(host, ":") {
-			port := 5432 // Default PostgreSQL port
-			if config.Port != nil {
-				var p int64
-				var err error
-				switch v := config.Port.(type) {
-				case string:
-					p, err = strconv.ParseInt(v, 10, 32)
-					if err != nil {
-						return nil, fmt.Errorf("invalid string for port: %q", v)
-					}
-				case int:
-					p = int64(v)
-				case int64: // TOML parsers often use int64 for numbers
-					p = v
-				default:
-					return nil, fmt.Errorf("invalid type for port: %T", v)
+		// Determine the default port to use if the host doesn't specify one.
+		defaultPort := 5432 // Default PostgreSQL port
+		if config.Port != nil {
+			var p int64
+			switch v := config.Port.(type) {
+			case string:
+				p, err = strconv.ParseInt(v, 10, 32)
+				if err != nil {
+					return nil, fmt.Errorf("invalid string for port: %q", v)
 				}
-				port = int(p)
+			case int:
+				p = int64(v)
+			case int64: // TOML parsers often use int64 for numbers
+				p = v
+			default:
+				return nil, fmt.Errorf("invalid type for port: %T", v)
 			}
-			if port <= 0 || port > 65535 {
-				return nil, fmt.Errorf("port number %d is out of the valid range (1-65535)", port)
-			}
-			host = fmt.Sprintf("%s:%d", host, port)
+			defaultPort = int(p)
 		}
+		if defaultPort <= 0 || defaultPort > 65535 {
+			return nil, fmt.Errorf("port number %d is out of the valid range (1-65535)", defaultPort)
+		}
+		host = normalizeHostPort(host, defaultPort)
 
 		connString = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
 			config.User, config.Password, host, config.Name, tlsMode)
