@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
-	_ "embed"
+	"database/sql"
+	"embed"
 	"fmt"
+	"io/fs"
 	"log"
 	"strconv"
 	"strings"
@@ -11,15 +13,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib" // For database/sql compatibility
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-//go:embed schema.sql
-var schema string
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // HostHealth tracks the health status of a database host
 type HostHealth struct {
@@ -154,8 +160,56 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 }
 
 func (db *Database) migrate(ctx context.Context) error {
-	_, err := db.WritePool.Exec(ctx, schema)
-	return err
+	migrations, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to get migrations subdirectory: %w", err)
+	}
+
+	sourceDriver, err := iofs.New(migrations, ".")
+	if err != nil {
+		return fmt.Errorf("failed to create migration source driver: %w", err)
+	}
+
+	// The pgx/v5 migrate driver's WithInstance function expects a *sql.DB instance.
+	// We'll create a temporary one from our existing pool's configuration.
+	sqlDB, err := sql.Open("pgx", db.WritePool.Config().ConnString())
+	if err != nil {
+		return fmt.Errorf("failed to open a temporary sql.DB for migrations: %w", err)
+	}
+	defer sqlDB.Close()
+
+	dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to create migration db driver: %w", err)
+	}
+
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
+	if err != nil {
+		return fmt.Errorf("failed to create migrate instance: %w", err)
+	}
+
+	m.Log = &migrationLogger{}
+
+	log.Println("[DB] running migrations...")
+	err = m.Up()
+	if err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	if err == migrate.ErrNoChange {
+		log.Println("[DB] migrations are up to date")
+	} else {
+		log.Println("[DB] migrations applied successfully")
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil && err != migrate.ErrNilVersion {
+		return fmt.Errorf("failed to get migration version: %w", err)
+	}
+	if dirty {
+		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
+	}
+	return nil
 }
 
 // GetPoolHealth returns the health status of database connection pools
@@ -665,6 +719,19 @@ func (mtx *measuredTx) Commit(ctx context.Context) error {
 	}
 	metrics.DBTransactionDuration.Observe(time.Since(mtx.start).Seconds())
 	return err
+}
+
+// migrationLogger implements migrate.Logger interface
+type migrationLogger struct{}
+
+func (l *migrationLogger) Printf(format string, v ...interface{}) {
+	// Prepend a prefix to all migration logs for clarity
+	log.Printf("[DB-MIGRATE] "+format, v...)
+}
+
+func (l *migrationLogger) Verbose() bool {
+	// Set to true to see verbose migration output
+	return true
 }
 
 func (mtx *measuredTx) Rollback(ctx context.Context) error {
