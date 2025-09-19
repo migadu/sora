@@ -2,7 +2,9 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strconv"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/migadu/sora/config"
 )
+
+// ErrNoProxyHeader is returned by ReadProxyHeader in optional mode when no PROXY header is found.
+var ErrNoProxyHeader = errors.New("no PROXY protocol header found")
 
 // ProxyProtocolConfig is an alias for config.ProxyProtocolConfig for compatibility
 type ProxyProtocolConfig = config.ProxyProtocolConfig
@@ -40,8 +45,13 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		timeout: 5 * time.Second, // default timeout
 	}
 
-	log.Printf("[%s-PROXY] Initializing PROXY protocol reader: enabled=%t, trusted_proxies=%v, timeout=%v",
-		protocol, config.Enabled, config.TrustedProxies, reader.timeout)
+	// Normalize mode
+	if reader.config.Mode != "optional" {
+		reader.config.Mode = "required" // Default to "required"
+	}
+
+	log.Printf("[%s-PROXY] Initializing PROXY protocol reader: enabled=%t, mode=%s, trusted_proxies=%v, timeout=%v",
+		protocol, config.Enabled, reader.config.Mode, config.TrustedProxies, reader.timeout)
 
 	// Parse timeout
 	if config.Timeout != "" {
@@ -64,6 +74,11 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 	return reader, nil
 }
 
+// IsOptionalMode returns true if the PROXY protocol is configured in "optional" mode.
+func (r *ProxyProtocolReader) IsOptionalMode() bool {
+	return r.config.Mode == "optional"
+}
+
 // ReadProxyHeader reads and parses PROXY protocol header from connection
 // Returns the real client info and a potentially wrapped connection
 func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo, net.Conn, error) {
@@ -71,12 +86,12 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 		return nil, conn, nil
 	}
 
-	// Check if connection is from trusted proxy
 	if !r.isTrustedConnection(conn) {
-		log.Printf("[PROXY] WARNING: Connection from %s is NOT in trusted_proxies list - PROXY protocol will be IGNORED! Check your trusted_proxies configuration.", conn.RemoteAddr())
-		return nil, conn, nil // Not from trusted proxy, no PROXY protocol expected
+		// If PROXY protocol is enabled, we MUST only accept connections from trusted proxies.
+		// This is a critical security boundary.
+		log.Printf("[PROXY] REJECTING connection from untrusted source %s. Add to trusted_proxies if this is a valid proxy.", conn.RemoteAddr())
+		return nil, conn, fmt.Errorf("connection from untrusted source %s", conn.RemoteAddr())
 	}
-
 	log.Printf("[PROXY] Processing connection from trusted proxy %s", conn.RemoteAddr())
 
 	// Set read deadline for PROXY header
@@ -90,7 +105,15 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	// Peek at first few bytes to detect PROXY protocol
 	peek, err := reader.Peek(16) // Peek more bytes to detect PROXY v2 signature
 	if err != nil {
-		return nil, conn, fmt.Errorf("failed to peek connection: %w", err)
+		// If peeking fails (e.g., connection closed immediately), it's not a "no header" case.
+		// It's a connection error.
+		conn.SetReadDeadline(time.Time{})
+		// In optional mode, a quick EOF before the header can be treated as "no header".
+		if r.IsOptionalMode() && errors.Is(err, io.EOF) {
+			return nil, conn, ErrNoProxyHeader
+		}
+		// Otherwise, it's a genuine connection error.
+		return nil, conn, fmt.Errorf("failed to peek connection for PROXY header: %w", err)
 	}
 
 	// Check for PROXY v1 signature
@@ -155,16 +178,22 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	}
 
 	// No PROXY protocol detected, clear deadline and return original connection
-	log.Printf("[PROXY] No PROXY protocol detected from %s (peeked: %x)", conn.RemoteAddr(), peek)
 	conn.SetReadDeadline(time.Time{})
 
-	// Need to return the buffered connection since we peeked
+	// The connection now has buffered data, so we must return a wrapped connection
+	// that uses the buffer first.
 	wrappedConn := &proxyProtocolConn{
 		Conn:   conn,
 		reader: reader,
 	}
 
-	return nil, wrappedConn, nil
+	// Check the mode to decide what to return
+	if r.IsOptionalMode() {
+		// In optional mode, not finding a header is not a fatal error.
+		return nil, wrappedConn, ErrNoProxyHeader
+	}
+
+	return nil, wrappedConn, fmt.Errorf("PROXY protocol header missing")
 }
 
 // parseProxyV1 parses PROXY protocol version 1 header

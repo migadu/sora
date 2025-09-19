@@ -279,19 +279,27 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 
 		// Try to read PROXY protocol header
 		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-		if err != nil {
-			conn.Close()
-			// Log the error but continue accepting new connections - don't crash the entire server
-			log.Printf("[POP3] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
-			// Continue the loop to accept the next connection instead of returning an error
-			continue
+		if err == nil {
+			// PROXY header found and parsed successfully.
+			return &proxyProtocolConn{
+				Conn:      wrappedConn,
+				proxyInfo: proxyInfo,
+			}, nil
 		}
 
-		// Wrap the connection with proxy info for later extraction
-		return &proxyProtocolConn{
-			Conn:      wrappedConn,
-			proxyInfo: proxyInfo,
-		}, nil
+		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
+		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
+		// and to not consume bytes from the connection if no header is found.
+		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
+			log.Printf("[POP3] No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
+			// The wrappedConn should be the original connection, possibly with a buffered reader.
+			return wrappedConn, nil
+		}
+
+		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
+		conn.Close()
+		log.Printf("[POP3] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+		continue
 	}
 }
 

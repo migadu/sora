@@ -185,6 +185,11 @@ tls_verify = true                         # Verify client certificates (mutual T
 # Enable PROXY protocol v1/v2 support 
 # WARNING: Only enable if you trust the source! Allows IP spoofing if misconfigured.
 enabled = false       # Enable PROXY protocol v1/v2 support.
+# mode can be "required" (default) or "optional".
+# "required": All connections MUST have a PROXY header.
+# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
+# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
+# mode = "required"
 trusted_proxies = [   # Trusted proxy networks. SECURITY: Only list networks you control!
     "127.0.0.0/8",    # localhost
     "10.0.0.0/8",     # RFC1918 private networks  
@@ -247,6 +252,11 @@ max_connections_per_ip = 5    # Maximum connections per client IP.
 [servers.lmtp.proxy_protocol]
 # Enable PROXY protocol support for real client IP detection
 enabled = false                 # Enable if behind a load balancer/proxy.
+# mode can be "required" (default) or "optional".
+# "required": All connections MUST have a PROXY header.
+# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
+# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
+# mode = "required"
 trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 timeout = "5s"                  # Timeout for reading PROXY protocol header.
 
@@ -278,6 +288,11 @@ max_connections_per_ip = 5    # Maximum connections per client IP.
 [servers.pop3.proxy_protocol]
 # Enable PROXY protocol support for real client IP detection
 enabled = false
+# mode can be "required" (default) or "optional".
+# "required": All connections MUST have a PROXY header.
+# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
+# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
+# mode = "required"
 trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 timeout = "5s"
 
@@ -335,6 +350,11 @@ max_connections_per_ip = 3    # Maximum connections per client IP.
 [servers.managesieve.proxy_protocol]
 # Enable PROXY protocol support for real client IP detection
 enabled = false
+# mode can be "required" (default) or "optional".
+# "required": All connections MUST have a PROXY header.
+# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
+# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
+# mode = "required"
 trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 timeout = "5s"
 

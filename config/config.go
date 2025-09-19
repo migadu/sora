@@ -247,6 +247,7 @@ func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {
 // ProxyProtocolConfig holds PROXY protocol configuration
 type ProxyProtocolConfig struct {
 	Enabled        bool     `toml:"enabled"`         // Enable PROXY protocol support
+	Mode           string   `toml:"mode,omitempty"`  // "required" (default) or "optional"
 	TrustedProxies []string `toml:"trusted_proxies"` // CIDR blocks of trusted proxies
 	Timeout        string   `toml:"timeout"`         // Timeout for reading PROXY header
 }
