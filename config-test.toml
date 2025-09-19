@@ -1,0 +1,124 @@
+# SORA MAIL SERVER - TEST CONFIGURATION FILE
+# =============================================================================
+# 
+# This configuration file is specifically for running database integration tests.
+# It uses a local PostgreSQL database with test-specific settings.
+#
+# SETUP INSTRUCTIONS:
+# 1. Create a test database: createdb sora_test
+# 2. Enable pg_trgm extension: psql sora_test -c "CREATE EXTENSION pg_trgm;"
+# 3. Run tests with: go test -tags=integration ./db
+#
+# DATABASE REQUIREMENTS:
+# - PostgreSQL server running locally
+# - Database named 'sora_test' (separate from production)
+# - pg_trgm extension enabled
+# - User with CREATE/DROP privileges for test isolation
+
+log_output = "stderr"
+
+# TEST DATABASE CONFIGURATION
+# =============================================================================
+# Uses local PostgreSQL with dedicated test database
+
+[database]
+log_queries = true              # Enable for test debugging
+query_timeout = "10s"           # Shorter timeout for faster test feedback
+search_timeout = "30s"          # Reduced timeout for tests
+write_timeout = "10s"           # Faster timeout for test writes
+
+# WRITE DATABASE CONFIGURATION (TEST)
+[database.write]
+hosts = ["localhost"]
+port = 5432
+user = "postgres"
+password = "password"
+name = "sora_mail_db"
+tls = false
+
+# Smaller connection pools for testing
+max_conns = 10
+min_conns = 2
+max_conn_lifetime = "10m"
+max_conn_idle_time = "5m"
+query_timeout = "10s"
+
+# READ DATABASE CONFIGURATION (TEST)
+# For tests, we can use the same database for read/write
+[database.read]
+hosts = ["localhost"]
+port = 5432
+user = "postgres"
+password = "password"
+name = "sora_mail_db"
+tls = false
+
+max_conns = 5
+min_conns = 1
+max_conn_lifetime = "10m"
+max_conn_idle_time = "5m"
+query_timeout = "10s"
+
+# OBJECT STORAGE CONFIGURATION (MINIMAL FOR TESTS)
+# =============================================================================
+# Minimal S3 configuration since most tests won't need actual S3
+
+[s3]
+endpoint = "http://localhost:9000"  # Local minio if needed
+access_key = "test_access_key"
+secret_key = "test_secret_key"
+bucket_name = "sora-test"
+region = "us-east-1"
+use_ssl = false
+
+# SERVER CONFIGURATION (MINIMAL FOR TESTS)
+# =============================================================================
+# Basic server config for tests that might need it
+
+[server.imap]
+enabled = false                 # Disable servers for unit tests
+bind = "127.0.0.1:1143"
+tls = false
+
+[server.lmtp]
+enabled = false
+bind = "127.0.0.1:1024"
+
+[server.pop3]
+enabled = false
+bind = "127.0.0.1:1110"
+
+[server.managesieve]
+enabled = false
+bind = "127.0.0.1:14190"
+
+# ADMIN CONFIGURATION (MINIMAL)
+[admin]
+enabled = false
+bind = "127.0.0.1:18080"
+username = "admin"
+password = "test_password"
+
+# CACHE CONFIGURATION (MINIMAL FOR TESTS)
+[cache]
+enabled = false
+max_size = "10mb"               # Small cache for tests
+default_ttl = "1m"
+cleanup_interval = "30s"
+storage_path = "/tmp/sora-test-cache"
+
+# RETENTION CONFIGURATION (ACCELERATED FOR TESTS)
+[retention]
+grace_period = "1m"             # Very short grace period for testing
+cleanup_interval = "30s"       # Frequent cleanup for tests
+max_cleanup_batch_size = 100
+
+# RATE LIMITING (DISABLED FOR TESTS)
+[rate_limiting]
+enabled = false
+
+# LOGGING (VERBOSE FOR TESTS)
+[logging]
+level = "debug"                 # Verbose logging for test debugging
+include_caller = true
+include_timestamp = true

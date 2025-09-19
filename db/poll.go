@@ -36,19 +36,21 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	rows, err := tx.Query(ctx, `
 		SELECT * FROM (
 			WITH
-			  global_stats AS (
-			    SELECT
-			      (SELECT COUNT(m_count.uid) FROM messages m_count WHERE m_count.mailbox_id = $1 AND m_count.expunged_at IS NULL) AS total_messages,
-			      (
-			        SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 0)
-			        FROM messages m_mod
-			        WHERE m_mod.mailbox_id = $1
-			      ) AS highest_mailbox_modseq
+			  global_stats AS ( -- Use the mailbox_stats cache for high-performance stat retrieval.
+				SELECT
+					COALESCE(ms.message_count, 0) AS total_messages,
+					COALESCE(ms.highest_modseq, 0) AS highest_mailbox_modseq
+				FROM mailboxes mb
+				LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+				WHERE mb.id = $1
 			  ),
 			  current_mailbox_state AS (
 			    SELECT
 			        m.uid,
-			        ROW_NUMBER() OVER (ORDER BY m.uid) AS seq_num,
+			        -- Sequence number within the set of messages that existed before the current changes (for expunges)
+			        ROW_NUMBER() OVER (ORDER BY m.uid) AS pre_change_seq_num,
+			        -- Sequence number within the set of messages that exist now (for fetches)
+			        ROW_NUMBER() OVER (PARTITION BY (m.expunged_modseq IS NULL) ORDER BY m.uid) AS post_change_seq_num,
 			        m.flags,
 			        m.custom_flags,
 			        m.created_modseq,
@@ -60,14 +62,17 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  changed_messages AS (
 			    SELECT
 			        cms.uid,
-			        cms.seq_num,
+			        CASE
+			            WHEN cms.expunged_modseq IS NOT NULL THEN cms.pre_change_seq_num
+			            ELSE cms.post_change_seq_num
+			        END AS seq_num,
 			        cms.flags,
 			        cms.custom_flags,
 			        cms.expunged_modseq,
 			        GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) AS effective_modseq,
 			        true AS is_message_update
 			    FROM current_mailbox_state cms
-			    WHERE GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) > $2 -- $2 is sinceModSeq
+			    WHERE (cms.created_modseq > $2 OR cms.updated_modseq_val > $2 OR COALESCE(cms.expunged_modseq, 0) > $2) -- $2 is sinceModSeq
 			  )
 			SELECT
 			    cm.uid,

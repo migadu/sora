@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,13 +16,40 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 )
 
+// EmailAddress defines the methods needed from an email address object.
+type EmailAddress interface {
+	Domain() string
+	LocalPart() string
+}
+
+// UploaderDB defines the database operations needed by the uploader worker.
+// This interface makes the worker testable by allowing mocks.
+type UploaderDB interface {
+	AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error)
+	MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error
+	GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error)
+	IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error
+}
+
+// UploaderS3 defines the S3 storage operations needed by the uploader worker.
+type UploaderS3 interface {
+	PutWithRetry(ctx context.Context, key string, reader io.Reader, size int64) error
+}
+
+// UploaderCache defines the cache operations needed by the uploader worker.
+type UploaderCache interface {
+	MoveIn(srcPath, contentHash string) error
+}
+
 type UploadWorker struct {
-	rdb           *resilient.ResilientDatabase
-	s3            *resilient.ResilientS3Storage  // Use resilient S3 with circuit breakers
-	cache         *cache.Cache
+	rdb           UploaderDB
+	s3            UploaderS3
+	cache         UploaderCache
 	path          string
 	batchSize     int
 	concurrency   int
@@ -33,19 +61,19 @@ type UploadWorker struct {
 }
 
 func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
-	// Wrap S3 storage with resilient patterns including circuit breakers
-	resilientS3 := resilient.NewResilientS3Storage(s3)
-	
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create local path %s: %w", path, err)
 		}
 	}
+	// Wrap S3 storage with resilient patterns including circuit breakers
+	resilientS3 := resilient.NewResilientS3Storage(s3)
+
 	notifyCh := make(chan struct{}, 1)
 
 	return &UploadWorker{
 		rdb:           rdb,
-		s3:            resilientS3,  // Use resilient S3 wrapper
+		s3:            resilientS3,
 		cache:         cache,
 		errCh:         errCh,
 		path:          path,
@@ -142,10 +170,12 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Early validation of upload data
 	if !isValidContentHash(upload.ContentHash) {
 		log.Printf("[UPLOADER] ERROR: invalid content hash in upload record: %s", upload.ContentHash)
-		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for invalid hash %s: %v", upload.ContentHash, err)
+		}
 		return
 	}
-	
+
 	log.Printf("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
 
 	// Check for context cancellation early
@@ -160,7 +190,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
 	if err != nil {
 		log.Printf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
-		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after email lookup failure: %v", upload.ContentHash, err)
+		}
 		return
 	}
 
@@ -173,7 +205,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	if err != nil {
 		log.Printf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
 		// Mark attempt and let it be retried
-		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID) // Log error if this fails too?
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after upload check failure: %v", upload.ContentHash, err)
+		}
 		return
 	}
 
@@ -195,7 +229,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after file read failure: %v", upload.ContentHash, err)
+		}
 		log.Printf("[UPLOADER] could not read file %s: %v", filePath, err)
 		return // Cannot proceed without the file
 	}
@@ -205,7 +241,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	start := time.Now()
 	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
-		w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after S3 failure: %v", upload.ContentHash, err)
+		}
 		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
 
 		// Track upload failure

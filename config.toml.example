@@ -393,7 +393,7 @@ tls_verify = true             # Verify client certificates for proxy connections
 remote_tls = false                # Enable TLS for proxy-to-backend connections.
 remote_tls_verify = true          # Verify backend server certificates. Recommended.
 remote_use_proxy_protocol = true  # Send PROXY protocol v2 headers to backends.
-remote_use_id_command = true      # Send IMAP ID command with client info to backends.
+remote_use_id_command = false      # Send IMAP ID command with client info to backends.
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 # Control proxy connection handling and load balancing
@@ -421,10 +421,34 @@ max_delay = "30s"
 delay_multiplier = 2.0
 
 # --- ENHANCED CACHE AND DATABASE SETTINGS ---
-cache_cleanup_interval = "1m"   # How often to clean up expired in-memory cache entries (fast blocks, delays).
-db_sync_interval = "30s"        # How often to sync batched auth attempts to the database.
-max_pending_batch = 100         # Max pending auth attempts before forcing a DB sync.
-db_error_threshold = "1m"       # Time to wait before retrying DB operations after an error.
+
+# How often to clean up expired in-memory cache entries (fast blocks, delays)
+# Examples:
+#   cache_cleanup_interval = "30s"             # Aggressive cleanup
+#   cache_cleanup_interval = "1m"              # Standard cleanup
+#   cache_cleanup_interval = "5m"              # Conservative cleanup
+cache_cleanup_interval = "1m"
+
+# How often to sync batched authentication attempts to the database
+# Examples:
+#   db_sync_interval = "10s"                   # Frequent sync
+#   db_sync_interval = "30s"                   # Standard sync
+#   db_sync_interval = "1m"                    # Infrequent sync
+db_sync_interval = "30s"
+
+# Maximum number of pending auth attempts before forcing a database sync
+# Examples:
+#   max_pending_batch = 50                     # Small batch
+#   max_pending_batch = 100                    # Standard batch
+#   max_pending_batch = 200                    # Large batch
+max_pending_batch = 100
+
+# Time to wait before retrying database operations after an error (circuit breaker)
+# Examples:
+#   db_error_threshold = "30s"                 # Quick recovery
+#   db_error_threshold = "1m"                  # Standard recovery
+#   db_error_threshold = "5m"                  # Conservative recovery
+db_error_threshold = "1m"
 
 # --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers based on database queries.
@@ -476,7 +500,7 @@ remote_tls_verify = true          # Verify backend server certificates. Strongly
 # remote_port = 143
 # Default port for backends if not specified in query result.
 remote_use_proxy_protocol = true  # Send PROXY protocol v2 headers to backends.
-remote_use_id_command = true      # Send IMAP ID command with client info to backends.
+remote_use_id_command = false     # Send IMAP ID command with client info to backends.
 
 # --- PRELOOKUP FALLBACK BEHAVIOR ---
 # Control what happens when prelookup fails or user is not found
@@ -504,7 +528,7 @@ tls_verify = true                 # Verify client certificates (mutual TLS).
 remote_tls = false                # Enable TLS for proxy-to-backend connections.
 remote_tls_verify = true          # Verify backend server certificates.
 remote_use_proxy_protocol = true
-remote_use_xclient = true         # Send POP3 XCLIENT command with client info to backends.
+remote_use_xclient = false        # Send POP3 XCLIENT command with client info to backends.
 connect_timeout = "30s"           # Connection timeout for backend servers.
 session_timeout = "10m"           # Maximum session duration.
 enable_affinity = true            # Enable user-server affinity (sticky sessions).
@@ -560,7 +584,7 @@ remote_tls = false
 remote_tls_verify = true
 # remote_port = 110
 remote_use_proxy_protocol = true
-remote_use_xclient = true        # Send POP3 XCLIENT command with client info to prelookup backends.
+remote_use_xclient = false       # Send POP3 XCLIENT command with client info to prelookup backends.
 
 
 # MANAGESIEVE PROXY CONFIGURATION
@@ -584,7 +608,7 @@ tls_verify = true                 # Verify client certificates (mutual TLS).
 remote_tls = false                # Enable TLS for proxy-to-backend connections.
 remote_tls_verify = true          # Verify backend server certificates.
 remote_use_proxy_protocol = true
-remote_use_xclient = true         # Send ManageSieve XCLIENT command with client info to backends.
+remote_use_xclient = false        # Send ManageSieve XCLIENT command with client info to backends.
 connect_timeout = "30s"           # Connection timeout for backend servers.
 session_timeout = "15m"           # Maximum session duration.
 enable_affinity = true            # Enable user-server affinity (sticky sessions).
@@ -640,7 +664,7 @@ remote_tls = false
 remote_tls_verify = true
 # remote_port = 4190
 remote_use_proxy_protocol = true
-remote_use_xclient = true        # Send ManageSieve XCLIENT command with client info to backends.
+remote_use_xclient = false       # Send ManageSieve XCLIENT command with client info to backends.
 
 
 # LMTP PROXY CONFIGURATION
@@ -662,7 +686,7 @@ tls_verify = true                 # Verify client certificates (mutual TLS).
 remote_tls = false                # Enable TLS for proxy-to-backend connections.
 remote_tls_verify = true          # Verify backend server certificates.
 remote_use_proxy_protocol = true
-remote_use_xclient = true         # Send LMTP XCLIENT command with client info to backends.
+remote_use_xclient = false        # Send LMTP XCLIENT command with client info to backends.
 connect_timeout = "30s"           # Connection timeout for backend servers.
 session_timeout = "5m"            # Maximum session duration.
 max_message_size = "50mb"         # Maximum message size announced by the proxy. Should match backends.
@@ -696,7 +720,7 @@ remote_tls = false
 remote_tls_verify = true
 # remote_port = 24
 remote_use_proxy_protocol = true
-remote_use_xclient = true        # Send LMTP XCLIENT command with client info to prelookup backends.
+remote_use_xclient = false       # Send LMTP XCLIENT command with client info to prelookup backends.
 
 
 # PROMETHEUS METRICS CONFIGURATION

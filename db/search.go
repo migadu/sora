@@ -25,6 +25,11 @@ const (
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
 func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
+	return db.buildSearchCriteriaWithPrefix(criteria, paramPrefix, paramCounter, "m")
+}
+
+// buildSearchCriteriaWithPrefix builds the SQL WHERE clause with configurable table prefix
+func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria, paramPrefix string, paramCounter *int, tablePrefix string) (string, pgx.NamedArgs, error) {
 	var conditions []string
 	args := pgx.NamedArgs{}
 
@@ -33,9 +38,13 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 		return fmt.Sprintf("%s%d", paramPrefix, *paramCounter)
 	}
 
-	// For SeqNum
+	// For SeqNum - use seqnum column directly in CTE context
+	seqColumn := "seqnum"
+	if tablePrefix == "m" {
+		seqColumn = "ms.seqnum" // When joining with message_sequences
+	}
 	for _, seqSet := range criteria.SeqNum {
-		seqCond, seqArgs, err := buildNumSetCondition(seqSet, "seqnum", paramPrefix, paramCounter)
+		seqCond, seqArgs, err := buildNumSetCondition(seqSet, seqColumn, paramPrefix, paramCounter)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to build SeqNum condition: %w", err)
 		}
@@ -44,8 +53,12 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 	}
 
 	// For UID
+	uidColumn := fmt.Sprintf("%s.uid", tablePrefix)
+	if tablePrefix == "" {
+		uidColumn = "uid"
+	}
 	for _, uidSet := range criteria.UID {
-		uidCond, uidArgs, err := buildNumSetCondition(uidSet, "uid", paramPrefix, paramCounter)
+		uidCond, uidArgs, err := buildNumSetCondition(uidSet, uidColumn, paramPrefix, paramCounter)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to build UID condition: %w", err)
 		}
@@ -54,37 +67,44 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 	}
 
 	// Date filters
+	datePrefix := tablePrefix
+	if tablePrefix == "" {
+		datePrefix = ""
+	} else {
+		datePrefix = tablePrefix + "."
+	}
+	
 	if !criteria.Since.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Since
-		conditions = append(conditions, fmt.Sprintf("internal_date >= @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%sinternal_date >= @%s", datePrefix, param))
 	}
 	if !criteria.Before.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Before
-		conditions = append(conditions, fmt.Sprintf("internal_date <= @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%sinternal_date <= @%s", datePrefix, param))
 	}
 	if !criteria.SentSince.IsZero() {
 		param := nextParam()
 		args[param] = criteria.SentSince
-		conditions = append(conditions, fmt.Sprintf("sent_date >= @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%ssent_date >= @%s", datePrefix, param))
 	}
 	if !criteria.SentBefore.IsZero() {
 		param := nextParam()
 		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("sent_date <= @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%ssent_date <= @%s", datePrefix, param))
 	}
 
 	// Message size
 	if criteria.Larger > 0 {
 		param := nextParam()
 		args[param] = criteria.Larger
-		conditions = append(conditions, fmt.Sprintf("size > @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%ssize > @%s", datePrefix, param))
 	}
 	if criteria.Smaller > 0 {
 		param := nextParam()
 		args[param] = criteria.Smaller
-		conditions = append(conditions, fmt.Sprintf("size < @%s", param))
+		conditions = append(conditions, fmt.Sprintf("%ssize < @%s", datePrefix, param))
 	}
 
 	// Body full-text search
@@ -100,22 +120,22 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 		param := nextParam()
 		args[param] = textCriteria
 		// Search in both headers and body text using full-text search
+		// Note: headers_tsv column may not exist in current schema, so search only body for now
 		conditions = append(conditions, fmt.Sprintf(
-			"((text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)) OR "+
-				"(headers_tsv IS NOT NULL AND headers_tsv @@ plainto_tsquery('simple', @%s)))",
-			param, param))
+			"(text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s))",
+			param))
 	}
 
 	// Flags
 	for _, flag := range criteria.Flag {
 		param := nextParam()
 		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(flags & @%s) != 0", param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) != 0", datePrefix, param))
 	}
 	for _, flag := range criteria.NotFlag {
 		param := nextParam()
 		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(flags & @%s) = 0", param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) = 0", datePrefix, param))
 	}
 
 	// Header conditions
@@ -126,7 +146,7 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 		case "subject":
 			param := nextParam()
 			args[param] = "%" + lowerValue + "%"
-			conditions = append(conditions, fmt.Sprintf("LOWER(subject) LIKE @%s", param))
+			conditions = append(conditions, fmt.Sprintf("LOWER(%ssubject) LIKE @%s", datePrefix, param))
 		case "message-id":
 			param := nextParam()
 			// if the message ID is wrapped in <messageId>, we need to remove the brackets
@@ -134,16 +154,16 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 				lowerValue = lowerValue[1 : len(lowerValue)-1]
 			}
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(message_id) = @%s", param))
+			conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
 		case "in-reply-to":
 			param := nextParam()
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(in_reply_to) = @%s", param))
+			conditions = append(conditions, fmt.Sprintf("LOWER(%sin_reply_to) = @%s", datePrefix, param))
 		case "from", "to", "cc", "bcc", "reply-to":
 			recipientJSONParam := nextParam()
 			recipientValue := fmt.Sprintf(`[{"type": "%s", "email": "%s"}]`, lowerKey, lowerValue)
 			args[recipientJSONParam] = recipientValue
-			conditions = append(conditions, fmt.Sprintf(`recipients_json @> @%s::jsonb`, recipientJSONParam))
+			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
 		default:
 			return "", nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -154,7 +174,7 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 
 	// Recursive NOT
 	for _, notCriteria := range criteria.Not {
-		subCond, subArgs, err := db.buildSearchCriteria(&notCriteria, paramPrefix, paramCounter)
+		subCond, subArgs, err := db.buildSearchCriteriaWithPrefix(&notCriteria, paramPrefix, paramCounter, tablePrefix)
 		if err != nil {
 			return "", nil, err
 		}
@@ -164,11 +184,11 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 
 	// Recursive OR
 	for _, orPair := range criteria.Or {
-		leftCond, leftArgs, err := db.buildSearchCriteria(&orPair[0], paramPrefix, paramCounter)
+		leftCond, leftArgs, err := db.buildSearchCriteriaWithPrefix(&orPair[0], paramPrefix, paramCounter, tablePrefix)
 		if err != nil {
 			return "", nil, err
 		}
-		rightCond, rightArgs, err := db.buildSearchCriteria(&orPair[1], paramPrefix, paramCounter)
+		rightCond, rightArgs, err := db.buildSearchCriteriaWithPrefix(&orPair[1], paramPrefix, paramCounter, tablePrefix)
 		if err != nil {
 			return "", nil, err
 		}
@@ -189,8 +209,21 @@ func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPref
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
 func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) string {
+	return db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
+}
+
+// buildSortOrderClauseWithPrefix builds an SQL ORDER BY clause from IMAP sort criteria with configurable table prefix
+func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCriterion, tablePrefix string) string {
+	// Determine column prefix (empty for CTE queries, "m." for regular queries)
+	var colPrefix string
+	if tablePrefix == "" {
+		colPrefix = ""
+	} else {
+		colPrefix = tablePrefix + "."
+	}
+
 	if len(sortCriteria) == 0 {
-		return "ORDER BY uid"
+		return fmt.Sprintf("ORDER BY %suid", colPrefix)
 	}
 
 	var orderClauses []string
@@ -206,36 +239,35 @@ func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) stri
 		var orderField string
 		switch criterion.Key {
 		case imap.SortKeyArrival:
-			orderField = "internal_date"
+			orderField = fmt.Sprintf("%sinternal_date", colPrefix)
 		case imap.SortKeyDate:
-			orderField = "sent_date"
+			orderField = fmt.Sprintf("%ssent_date", colPrefix)
 		case imap.SortKeySubject:
-			// RFC 5256: normalized subject, converted to uppercase.
-			orderField = "UPPER(subject)"
+			// Use the pre-normalized sort column for performance.
+			orderField = fmt.Sprintf("%ssubject_sort", colPrefix)
 		case imap.SortKeySize:
-			orderField = "size"
+			orderField = fmt.Sprintf("%ssize", colPrefix)
 		case imap.SortKeyDisplay:
-			// RFC 5957 (updates RFC 5256): Sort by the display name of the first 'from' address,
-			// fallback to email, then empty string. Case-insensitive.
-			orderField = "COALESCE((SELECT COALESCE(LOWER(r.value->>'name'), LOWER(r.value->>'email')) FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'from' LIMIT 1), '')"
+			// Use pre-normalized columns. Fallback from name to email.
+			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
-			// RFC 5256: Sort by the mailbox of the first 'from' address. Case-insensitive.
-			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'from' LIMIT 1), '')"
+			// Use the pre-normalized sort column.
+			orderField = fmt.Sprintf("%sfrom_email_sort", colPrefix)
 		case imap.SortKeyTo:
-			// RFC 5256: Sort by the mailbox of the first 'to' address. Case-insensitive.
-			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'to' LIMIT 1), '')"
+			// Use the pre-normalized sort column.
+			orderField = fmt.Sprintf("%sto_email_sort", colPrefix)
 		case imap.SortKeyCc:
-			// RFC 5256: Sort by the mailbox of the first 'cc' address. Case-insensitive.
-			orderField = "COALESCE((SELECT LOWER(r.value->>'email') FROM jsonb_array_elements(recipients_json) r WHERE r.value->>'type' = 'cc' LIMIT 1), '')"
+			// Use the pre-normalized sort column.
+			orderField = fmt.Sprintf("%scc_email_sort", colPrefix)
 		default:
 			// If the sort key is not supported, default to uid
-			orderField = "uid"
+			orderField = fmt.Sprintf("%suid", colPrefix)
 		}
 
 		orderClauses = append(orderClauses, fmt.Sprintf("%s %s", orderField, direction))
 	}
 	// Always include uid as the final sort criterion to ensure consistent ordering
-	orderClauses = append(orderClauses, "uid ASC")
+	orderClauses = append(orderClauses, fmt.Sprintf("%suid ASC", colPrefix))
 
 	return "ORDER BY " + strings.Join(orderClauses, ", ")
 }
@@ -328,20 +360,13 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 // handling both default and custom sorting with optimized query selection.
 func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string) ([]Message, error) {
 	paramCounter := 0
-	whereCondition, whereArgs, err := db.buildSearchCriteria(criteria, "p", &paramCounter)
-	if err != nil {
-		return nil, err
-	}
-
-	whereArgs["mailboxID"] = mailboxID
-
-	if orderByClause == "" {
-		orderByClause = "ORDER BY uid" // Default sort order
-	}
 
 	var finalQueryString string
 	var metricsLabel string
 	var resultLimit int
+	var whereCondition string
+	var whereArgs pgx.NamedArgs
+	var err error
 
 	// Determine appropriate result limit based on query complexity
 	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
@@ -359,42 +384,58 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	// Use optimized query path when possible
 	if !isComplexQuery {
+		// Fast path: Simple query with table aliases
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "m")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+		
+		// For simple queries, ensure ORDER BY uses "m." prefix
+		if orderByClause == "" {
+			orderByClause = "ORDER BY m.uid"
+		}
+		
 		// Fast path: Simple query without joining message_contents.
 		// We still need to generate seqnum for non-UID searches.
-		const simpleQuery = `
-			WITH message_seqs AS (
-				SELECT
-					m.id, m.uid,
-					ROW_NUMBER() OVER (ORDER BY m.uid) AS seqnum,
-					m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-					m.internal_date, m.size, m.body_structure, m.in_reply_to, m.recipients_json,
-					m.created_modseq, m.updated_modseq, m.expunged_modseq,
-					m.flags_changed_at, m.subject, m.sent_date, m.message_id
-				FROM messages m
-				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
-			)
+		const simpleQuery = `			
 			SELECT 
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-				flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-			FROM message_seqs
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+				m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
 		`
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", simpleQuery, whereCondition, orderByClause, resultLimit)
+		// The WHERE clause needs to be applied to the joined result.
+		// The join condition on message_sequences implicitly filters for non-expunged messages.
+		finalQueryString = fmt.Sprintf("%s WHERE m.mailbox_id = @mailboxID AND %s %s LIMIT %d", simpleQuery, whereCondition, orderByClause, resultLimit)
 		metricsLabel = "search_messages_simple"
 	} else {
+		// Complex path: Use CTE with empty table prefix (CTE columns are accessed directly)
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+		
+		// For CTE queries, ensure ORDER BY uses no prefix
+		if orderByClause == "" {
+			orderByClause = "ORDER BY uid"
+		}
+		
 		// Complex path: Use CTE when sequence numbers or FTS are needed
 		const complexQuery = `
 		WITH message_seqs AS (
 			SELECT
 				m.id, m.uid,
-				ROW_NUMBER() OVER (ORDER BY m.uid) AS seqnum,
+				ms.seqnum,
 				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, m.body_structure,
-				m.created_modseq, m.updated_modseq, m.expunged_modseq,
+				m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq,
 				m.flags_changed_at, m.subject, m.sent_date, m.message_id,
-				m.in_reply_to, m.recipients_json,
-				mc.text_body_tsv
+				m.in_reply_to, m.recipients_json, mc.text_body_tsv,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
+			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
 			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)
@@ -442,8 +483,16 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 
 // GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
 func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]Message, error) {
-	// Construct the ORDER BY clause based on the sort criteria
-	orderBy := db.buildSortOrderClause(sortCriteria)
+	// Determine query complexity to choose appropriate table prefix
+	var orderBy string
+	isComplexQuery := db.needsComplexQuery(criteria, "")
+	if isComplexQuery {
+		// Complex queries use CTE, so no table prefix needed
+		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "")
+	} else {
+		// Simple queries use table aliases, so use "m" prefix
+		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
+	}
 
 	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy)
 	if err != nil {

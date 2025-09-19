@@ -143,22 +143,14 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	for _, uidRange := range uidSet {
 		// Base query is the same for all cases
-		baseQuery := `
-			WITH numbered_messages AS (
-				SELECT
-					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-					internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
-					flags_changed_at, subject, sent_date, message_id,
-					row_number() OVER (ORDER BY uid) AS seqnum
-			FROM messages m
-				WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-			)
+		baseQuery := `			
 			SELECT 
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-				flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-			FROM numbered_messages
-			WHERE uid >= $2
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+				m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+			WHERE m.mailbox_id = $1 AND m.uid >= $2
 		`
 
 		var rows pgx.Rows
@@ -169,12 +161,12 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		if uidRange.Stop == imap.UID(0) {
 			// Wildcard range (e.g., 1:*)
 			rangeDesc = fmt.Sprintf("%d:*", uidRange.Start)
-			query := baseQuery + " ORDER BY seqnum"
+			query := baseQuery + " ORDER BY ms.seqnum"
 			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start))
 		} else {
 			// Regular range (e.g., 1:5)
 			rangeDesc = fmt.Sprintf("%d:%d", uidRange.Start, uidRange.Stop)
-			query := baseQuery + " AND uid <= $3 ORDER BY seqnum"
+			query := baseQuery + " AND m.uid <= $3 ORDER BY ms.seqnum"
 			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start), uint32(uidRange.Stop))
 		}
 
@@ -203,23 +195,16 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 	for _, seqRange := range seqSet {
 		stopSeq := seqRange.Stop
 
-		query := `
-			WITH numbered_messages AS (
-				SELECT
-					id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-					internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
-					flags_changed_at, subject, sent_date, message_id,
-					row_number() OVER (ORDER BY uid) AS seqnum
-			FROM messages m
-				WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-			)
+		query := `			
 			SELECT 
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-				flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-			FROM numbered_messages
-			WHERE seqnum >= $2 AND seqnum <= $3
-			ORDER BY seqnum
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+				m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+			WHERE m.mailbox_id = $1
+			  AND ms.seqnum >= $2 AND ms.seqnum <= $3
+			ORDER BY ms.seqnum
 		`
 
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, seqRange.Start, stopSeq)
@@ -240,21 +225,14 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int64) ([]Message, error) {
 	query := `
-		WITH numbered_messages AS (
-			SELECT
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
-				flags_changed_at, subject, sent_date, message_id,
-				row_number() OVER (ORDER BY uid) AS seqnum
-			FROM messages m
-			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-		)
 		SELECT 
-			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-		FROM numbered_messages
-		ORDER BY seqnum
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+		WHERE m.mailbox_id = $1
+		ORDER BY ms.seqnum
 	`
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
@@ -320,22 +298,14 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 	bitwiseFlag := FlagToBitwise(flag)
 	// Query to select messages with the specified flag, including custom_flags
 	// and other necessary fields to populate the Message struct.
-	// It also calculates seqnum.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		WITH numbered_messages AS (
-			SELECT
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
-				flags_changed_at, subject, sent_date, message_id,
-				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages m
-			WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
-		)
 		SELECT 
-			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-		FROM numbered_messages
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+		WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0
 	`, mailboxID, bitwiseFlag)
 	if err != nil {
 		return nil, err

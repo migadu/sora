@@ -20,6 +20,22 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("cannot move messages within the same mailbox")
 	}
 
+	// Acquire locks on both mailboxes in a consistent order to prevent deadlocks.
+	// The triggers for message_sequences and mailbox_stats will attempt to acquire
+	// locks, and a concurrent MOVE operation between the same two mailboxes could
+	// otherwise lead to a deadlock (A->B locks B then A; B->A locks A then B).
+	var lock1, lock2 int64
+	if srcMailboxID < destMailboxID {
+		lock1 = srcMailboxID
+		lock2 = destMailboxID
+	} else {
+		lock1 = destMailboxID
+		lock2 = srcMailboxID
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1), pg_advisory_xact_lock($2)", lock1, lock2); err != nil {
+		return nil, fmt.Errorf("failed to acquire locks for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	}
+
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `
 		SELECT id, uid FROM messages 
@@ -85,13 +101,15 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		INSERT INTO messages (
 			account_id, content_hash, uploaded, message_id, in_reply_to, 
 			subject, sent_date, internal_date, flags, custom_flags, size, 
-			body_structure, recipients_json, s3_domain, s3_localpart, 
+			body_structure, recipients_json, s3_domain, s3_localpart,
+			subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort,
 			mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
 		)
 		SELECT 
 			m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
 			m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
 			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+			m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_email_sort, m.cc_email_sort,
 			$1 AS mailbox_id,
 			$2 AS mailbox_path,
 			NOW() AS flags_changed_at,

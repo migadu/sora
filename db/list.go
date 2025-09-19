@@ -26,21 +26,13 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 
 	// Now query only the non-expunged messages
 	query := `
-		WITH numbered_messages AS (
-			SELECT
-				id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-				internal_date, size, body_structure, in_reply_to, recipients_json, created_modseq, updated_modseq, expunged_modseq,
-				flags_changed_at, subject, sent_date, message_id,
-				ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM messages m
-			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-		)
 		SELECT 
-			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-			internal_date, size, body_structure, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-		FROM numbered_messages
-		ORDER BY uid` // Ordering by uid is fine, seqnum is derived based on id order
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+		WHERE m.mailbox_id = $1 ORDER BY ms.seqnum`
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {

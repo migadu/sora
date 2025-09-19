@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,10 +43,9 @@ func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, su
 func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed bool) ([]*DBMailbox, error) {
 	query := `
 		SELECT
-			m.id, m.name, m.uid_validity, m.path, m.subscribed,
-			COUNT(child.id) > 0 AS has_children, m.created_at, m.updated_at
+			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at,
+			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LENGTH(child.path) = LENGTH(m.path) + 16 AND child.path LIKE m.path || '%') AS has_children
 		FROM mailboxes m
-		LEFT JOIN mailboxes child ON child.account_id = m.account_id AND child.path LIKE m.path || '%' AND child.path != m.path
 		WHERE m.account_id = $1
 	`
 
@@ -52,7 +53,8 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 		query += " AND m.subscribed = TRUE"
 	}
 
-	query += " GROUP BY m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at"
+	// Add a consistent ordering
+	query += " ORDER BY m.name"
 
 	// Prepare the query to fetch all mailboxes for the given user
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, userID)
@@ -64,19 +66,14 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 	// Collect the mailboxes
 	var mailboxes []*DBMailbox
 	for rows.Next() {
-		var mailboxID int64
-		var mailboxName string
-		var hasChildren bool
+		var mailbox DBMailbox
 		var uidValidityInt64 int64
-		var path string
-		var subscribed bool
-		var createdAt, updatedAt time.Time
 
-		if err := rows.Scan(&mailboxID, &mailboxName, &uidValidityInt64, &path, &subscribed, &hasChildren, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
-		mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), path, subscribed, hasChildren, createdAt, updatedAt)
+		mailbox.UIDValidity = uint32(uidValidityInt64)
 		mailboxes = append(mailboxes, &mailbox)
 	}
 
@@ -90,48 +87,47 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 
 // GetMailbox fetches the mailbox
 func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int64) (*DBMailbox, error) {
-	var mailboxName string
-	var hasChildren bool
+	var mailbox DBMailbox
 	var uidValidityInt64 int64
-	var subscribed bool
-	var path string
-	var createdAt, updatedAt time.Time
 
+	// First, fetch the core mailbox details.
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT 
-			m.id, m.name, m.uid_validity, m.path, m.subscribed,
-			COUNT(child.id) > 0 AS has_children, m.created_at, m.updated_at
-		FROM mailboxes m
-		LEFT JOIN mailboxes child ON child.account_id = m.account_id AND child.path LIKE m.path || '%' AND child.path != m.path
-		WHERE m.id = $1 AND m.account_id = $2
-		GROUP BY m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at
-	`, mailboxID, userID).Scan(&mailboxID, &mailboxName, &uidValidityInt64, &path, &subscribed, &hasChildren, &createdAt, &updatedAt)
+		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at
+		FROM mailboxes
+		WHERE id = $1 AND account_id = $2
+	`, mailboxID, userID).Scan(
+		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt,
+	)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, consts.ErrMailboxNotFound
 		}
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch mailbox %d: %w", mailboxID, err)
 	}
 
-	mailbox := NewDBMailbox(mailboxID, mailboxName, uint32(uidValidityInt64), path, subscribed, hasChildren, createdAt, updatedAt)
+	mailbox.UIDValidity = uint32(uidValidityInt64)
+
+	// Separately, check if the mailbox has children using an efficient EXISTS query.
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
+	`, userID, mailbox.Path).Scan(&mailbox.HasChildren)
+	if err != nil {
+		log.Printf("[DB] failed to check for children of mailbox ID %d: %v", mailboxID, err)
+		return nil, consts.ErrInternalError
+	}
+
 	return &mailbox, nil
 }
 
 // GetMailboxByName fetches the mailbox for a specific user by name
 func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name string) (*DBMailbox, error) {
 	var mailbox DBMailbox
-
 	var uidValidityInt64 int64
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT 
-			m.id, m.name, m.uid_validity, m.path, m.subscribed,
-			COUNT(child.id) > 0 AS has_children, m.created_at, m.updated_at
-		FROM mailboxes m
-		LEFT JOIN mailboxes child ON child.account_id = m.account_id AND child.path LIKE m.path || '%' AND child.path != m.path
-		WHERE m.account_id = $1 AND LOWER(m.name) = $2
-		GROUP BY m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at
-	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.HasChildren, &mailbox.CreatedAt, &mailbox.UpdatedAt)
+		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at
+		FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2
+	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -142,6 +138,16 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 	}
 
 	mailbox.UIDValidity = uint32(uidValidityInt64)
+
+	// Separately, check if the mailbox has children using an efficient EXISTS query.
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
+	`, userID, mailbox.Path).Scan(&mailbox.HasChildren)
+	if err != nil {
+		log.Printf("[DB] failed to check for children of mailbox '%s': %v", name, err)
+		return nil, consts.ErrInternalError
+	}
+
 	return &mailbox, nil
 }
 
@@ -153,7 +159,8 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 	}
 
 	// Avoid low uid_validity which may cause issues with some IMAP clients
-	uidValidity := uint32(time.Now().Unix())
+	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
+	uidValidity := uint32(time.Now().UnixNano())
 
 	// Determine the parent path if parentID is provided
 	var parentPath string
@@ -218,7 +225,8 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 	}
 
 	// Start a transaction
-	uidValidity := uint32(time.Now().Unix())
+	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
+	uidValidity := uint32(time.Now().UnixNano())
 
 	// Determine the parent path if parentID is provided
 	var parentPath string
@@ -228,8 +236,11 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
 		`, *parentID, userID).Scan(&parentPath)
 
-		if err != nil && err != pgx.ErrNoRows {
-			return fmt.Errorf("failed to fetch parent mailbox: %w", err)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("failed to create default mailbox: parent mailbox with ID %d not found: %w", *parentID, consts.ErrMailboxNotFound)
+			}
+			return fmt.Errorf("failed to fetch parent mailbox for default creation: %w", err)
 		}
 	}
 
@@ -288,8 +299,6 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 
 // DeleteMailbox deletes a mailbox for a specific user by id
 func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64) error {
-	// The resilient wrapper will fetch the mailbox path before calling this.
-	// For now, we need to fetch it inside the transaction.
 	var mboxPath string
 	err := tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxPath)
 	if err != nil {
@@ -297,6 +306,29 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox path for deletion: %w", err)
+	}
+
+	// Find all mailboxes that will be deleted (the target and its children)
+	// to acquire locks in a consistent order and prevent deadlocks.
+	var mailboxesToDelete []int64
+	rows, err := tx.Query(ctx, `SELECT id FROM mailboxes WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')`, userID, mailboxID, mboxPath)
+	if err != nil {
+		return fmt.Errorf("failed to query mailboxes for deletion lock: %w", err)
+	}
+	mailboxesToDelete, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		// pgx.CollectRows closes the rows, so we don't need to defer rows.Close()
+		return fmt.Errorf("failed to collect mailboxes for deletion lock: %w", err)
+	}
+
+	// Sort the IDs to ensure a consistent lock acquisition order across all transactions.
+	sort.Slice(mailboxesToDelete, func(i, j int) bool { return mailboxesToDelete[i] < mailboxesToDelete[j] })
+
+	// Acquire locks in a deterministic order.
+	if len(mailboxesToDelete) > 0 {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(id) FROM unnest($1::bigint[]) AS id", mailboxesToDelete); err != nil {
+			return fmt.Errorf("failed to acquire locks for mailbox deletion: %w", err)
+		}
 	}
 
 	// Before deleting the mailboxes, update all messages within them (the one
@@ -308,8 +340,8 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		SET mailbox_path = mb.name
 		FROM mailboxes mb
 		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '%')
+		  AND mb.account_id = $1 
+		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
 	`, userID, mailboxID, mboxPath)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
@@ -318,8 +350,8 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Delete the mailbox and all its children in one query using path-based approach
 	result, err := tx.Exec(ctx, `
-		DELETE FROM mailboxes 
-		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '%')
+		DELETE FROM mailboxes
+		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')
 	`, userID, mailboxID, mboxPath)
 
 	if err != nil {
@@ -329,23 +361,26 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
-		log.Printf("[DB] ERROR: mailbox %d not found for deletion", mailboxID)
-		return consts.ErrInternalError
+		// This should not happen if the initial SELECT succeeded, but it's a good safeguard.
+		log.Printf("[DB] ERROR: mailbox %d not found for deletion during the final delete step", mailboxID)
+		return consts.ErrMailboxNotFound
 	}
 
 	return nil
 }
 
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, userId int64) error {
-	for _, mailboxName := range consts.DefaultMailboxes {
+	// Use a base timestamp and an increment to guarantee unique UIDVALIDITY values
+	// for all default mailboxes created in this single transaction.
+	baseUidValidity := time.Now().Unix()
+	for i, mailboxName := range consts.DefaultMailboxes {
 		var mailboxID int64
-		uidValidity := uint32(time.Now().UnixNano())
+		uidValidity := uint32(baseUidValidity + int64(i))
 
 		// Use ON CONFLICT to handle existing mailboxes gracefully.
 		// The DO UPDATE clause with a no-op is a common way to get RETURNING to work with conflicts.
 		err := tx.QueryRow(ctx, `
-			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
-			VALUES ($1, $2, $3, TRUE, '')
+			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
 			ON CONFLICT (account_id, name) DO UPDATE 
 			SET name = EXCLUDED.name -- This is a no-op to ensure RETURNING works
 			RETURNING id
@@ -382,61 +417,49 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 	}
 	defer tx.Rollback(ctx)
 
-	const query = `
+	// This query is highly optimized to use the mailbox_stats cache table.
+	// It avoids expensive COUNT/SUM operations on the large messages table.
+	const summaryQuery = `
 		SELECT
-			mb.highest_uid + 1 AS uid_next,
-			COALESCE(COUNT(m.uid) FILTER (WHERE m.expunged_at IS NULL), 0) AS num_messages,
-			COALESCE(SUM(m.size) FILTER (WHERE m.expunged_at IS NULL), 0) AS total_size,
-			(
-				SELECT COALESCE(MAX(GREATEST(m_mod.created_modseq, COALESCE(m_mod.updated_modseq, 0), COALESCE(m_mod.expunged_modseq, 0))), 1)
-				FROM messages m_mod
-				WHERE m_mod.mailbox_id = $1
-			) AS highest_modseq,
-			COALESCE(COUNT(m.uid) FILTER (WHERE (m.flags & $2) = 0 AND m.expunged_at IS NULL), 0) AS unseen_count -- $2 is FlagSeen
+			mb.highest_uid + 1,
+			COALESCE(ms.message_count, 0),
+			COALESCE(ms.total_size, 0),
+			COALESCE(ms.highest_modseq, 1),
+			COALESCE(ms.unseen_count, 0)
 		FROM mailboxes mb
-		LEFT JOIN messages m ON m.mailbox_id = mb.id
+		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
 		WHERE mb.id = $1
-		GROUP BY mb.id, mb.highest_uid;
 	`
-	row := tx.QueryRow(ctx, query, mailboxID, FlagSeen)
+	row := tx.QueryRow(ctx, summaryQuery, mailboxID)
 
 	var s MailboxSummary
 	err = row.Scan(&s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.UnseenCount)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Mailbox doesn't exist. Return a specific error so the caller can handle it.
+			return nil, consts.ErrMailboxNotFound
+		}
+		return nil, fmt.Errorf("failed to get mailbox summary stats: %w", err)
+	}
 
 	// If we have unseen messages, find the first unseen sequence number in the same transaction
 	if s.UnseenCount > 0 {
-		firstUnseenQuery := `
-			WITH numbered_messages AS (
-				SELECT 
-					uid,
-					flags,
-					row_number() OVER (ORDER BY uid) AS seqnum
-				FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
-			)
-			SELECT seqnum
-			FROM numbered_messages
-			WHERE (flags & $2) = 0  -- Where \Seen flag is not set
-			ORDER BY seqnum
-			LIMIT 1
-		`
-		err = tx.QueryRow(ctx, firstUnseenQuery, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				// Shouldn't happen since we have a positive unseen count, but handle it anyway
-				s.FirstUnseenSeqNum = 0
-			} else {
-				log.Printf("[DB] ERROR: failed to get first unseen sequence number: %v", err)
-				// Continue with FirstUnseenSeqNum = 0, it's not critical enough to fail the whole operation
-				s.FirstUnseenSeqNum = 0
-			}
+		// With the message_sequences cache, we can directly look up the sequence number
+		// of the first unseen message in a single, efficient query.
+		err = tx.QueryRow(ctx, `
+			SELECT ms.seqnum FROM messages m
+			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+			WHERE m.mailbox_id = $1 AND (m.flags & $2) = 0
+			ORDER BY ms.seqnum LIMIT 1
+		`, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
+
+		if err != nil && err != pgx.ErrNoRows {
+			log.Printf("[DB] ERROR: failed to get first unseen sequence number for mailbox %d: %v", mailboxID, err)
+			s.FirstUnseenSeqNum = 0 // Default to 0 on failure
 		}
 	} else {
 		// No unseen messages
 		s.FirstUnseenSeqNum = 0
-	}
-	if err != nil {
-		return nil, fmt.Errorf("GetMailboxSummary: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -449,8 +472,15 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailboxID int64) (int, int64, error) {
 	var count int
 	var size int64
-	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL", mailboxID).Scan(&count, &size)
+	// This query is optimized to use the mailbox_stats cache table.
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		"SELECT message_count, total_size FROM mailbox_stats WHERE mailbox_id = $1",
+		mailboxID).Scan(&count, &size)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			// If no stats row exists (e.g., for a new or empty mailbox), return 0.
+			return 0, 0, nil
+		}
 		return 0, 0, err
 	}
 	return count, size, nil
@@ -458,21 +488,27 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 
 // SetSubscribed updates the subscription status of a mailbox, but ignores unsubscribing for root folders.
 func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64, subscribed bool) error {
-	// Update the subscription status only if the mailbox is not a root folder
+	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
 	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxName)
-	if err == nil {
-		for _, rootFolder := range consts.DefaultMailboxes {
-			if strings.EqualFold(mboxName, rootFolder) {
-				log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mboxName)
-				return nil
-			}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return consts.ErrMailboxNotFound
+		}
+		return fmt.Errorf("failed to fetch mailbox %d for subscription update: %w", mailboxID, err)
+	}
+
+	// Prevent subscription changes for default mailboxes.
+	for _, rootFolder := range consts.DefaultMailboxes {
+		if strings.EqualFold(mboxName, rootFolder) {
+			log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mboxName)
+			return nil
 		}
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2
-	`, subscribed, mailboxID)
+		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2 AND account_id = $3
+	`, subscribed, mailboxID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update subscription status for mailbox %d: %v", mailboxID, err)
 	}
@@ -507,20 +543,24 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Fetch the mailbox to be moved to get its current state (oldName, oldPath).
 	// Lock this row to prevent other operations on it.
 	var oldName, oldPath string
-	var hasChildren bool
 	err = tx.QueryRow(ctx, `
-		SELECT m.name, m.path, COUNT(child.id) > 0
-		FROM mailboxes m
-		LEFT JOIN mailboxes child ON child.account_id = m.account_id AND child.path LIKE m.path || '%' AND child.path != m.path
-		WHERE m.id = $1 AND m.account_id = $2
-		GROUP BY m.id, m.name, m.path
-		FOR UPDATE OF m
-	`, mailboxID, userID).Scan(&oldName, &oldPath, &hasChildren)
+		SELECT name, path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE
+	`, mailboxID, userID).Scan(&oldName, &oldPath)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
-		log.Printf("[DB] ERROR: failed to fetch mailbox to rename (ID: %d): %v", mailboxID, err)
+		log.Printf("[DB] ERROR: failed to fetch and lock mailbox to rename (ID: %d): %v", mailboxID, err)
+		return consts.ErrInternalError
+	}
+
+	// Separately, check if the mailbox has children. This avoids using GROUP BY with FOR UPDATE.
+	var hasChildren bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '/%')
+	`, userID, oldPath).Scan(&hasChildren)
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
@@ -577,8 +617,8 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				path = $3 || SUBSTRING(path FROM LENGTH($4) + 1),
 				updated_at = now()
 			WHERE 
-				account_id = $5 AND 
-				path LIKE $4 || '%' AND 
+				account_id = $5 AND
+				path LIKE $4 || '/%' AND
 				id != $6
 		`, newPrefix, oldPrefix, newPath, oldPath, userID, mailboxID)
 

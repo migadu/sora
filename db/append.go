@@ -80,13 +80,15 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		INSERT INTO messages (
 			account_id, content_hash, uploaded, message_id, in_reply_to, 
 			subject, sent_date, internal_date, flags, custom_flags, size, 
-			body_structure, recipients_json, s3_domain, s3_localpart, 
+			body_structure, recipients_json, s3_domain, s3_localpart,
+			subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort,
 			mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
 		)
 		SELECT 
 			m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
 			m.subject, m.sent_date, m.internal_date, m.flags | $5, m.custom_flags, m.size,
 			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+			m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_email_sort, m.cc_email_sort,
 			$1 AS mailbox_id,
 			$2 AS mailbox_path, -- Use the fetched destination mailbox name
 			NOW() AS flags_changed_at,
@@ -158,6 +160,35 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
+	// Prepare denormalized sort fields for faster sorting.
+	var subjectSort, fromNameSort, fromEmailSort, toEmailSort, ccEmailSort string
+	subjectSort = strings.ToUpper(helpers.SanitizeUTF8(options.Subject))
+
+	var fromFound, toFound, ccFound bool
+	for _, r := range options.Recipients {
+		switch r.AddressType {
+		case "from":
+			if !fromFound {
+				fromNameSort = strings.ToLower(r.Name)
+				fromEmailSort = strings.ToLower(r.EmailAddress)
+				fromFound = true
+			}
+		case "to":
+			if !toFound {
+				toEmailSort = strings.ToLower(r.EmailAddress)
+				toFound = true
+			}
+		case "cc":
+			if !ccFound {
+				ccEmailSort = strings.ToLower(r.EmailAddress)
+				ccFound = true
+			}
+		}
+		if fromFound && toFound && ccFound {
+			break
+		}
+	}
+
 	inReplyToStr := strings.Join(options.InReplyTo, " ")
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(options.Flags)
@@ -182,9 +213,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq)
+			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort)
 		VALUES
-			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'))
+			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_email_sort, @cc_email_sort)
 		RETURNING id
 	`, pgx.NamedArgs{
 		"account_id":      options.UserID,
@@ -204,10 +235,18 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"in_reply_to":     saneInReplyToStr,
 		"body_structure":  bodyStructureData,
 		"recipients_json": recipientsJSON,
+		"subject_sort":    subjectSort,
+		"from_name_sort":  fromNameSort,
+		"from_email_sort": fromEmailSort,
+		"to_email_sort":   toEmailSort,
+		"cc_email_sort":   ccEmailSort,
 	}).Scan(&messageRowId)
 
 	if err != nil {
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		// Check for a unique constraint violation specifically on the message_id.
+		// Other unique violations (e.g., from triggers) are not recoverable here
+		// as they will abort the transaction.
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" && pgErr.ConstraintName == "messages_message_id_mailbox_id_key" {
 			// Unique constraint violation. Check if it's due to message_id and if we can return the existing message.
 			// The saneMessageID was used in the INSERT attempt.
 
@@ -342,6 +381,35 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
+	// Prepare denormalized sort fields for faster sorting.
+	var subjectSort, fromNameSort, fromEmailSort, toEmailSort, ccEmailSort string
+	subjectSort = strings.ToUpper(helpers.SanitizeUTF8(options.Subject))
+
+	var fromFound, toFound, ccFound bool
+	for _, r := range options.Recipients {
+		switch r.AddressType {
+		case "from":
+			if !fromFound {
+				fromNameSort = strings.ToLower(r.Name)
+				fromEmailSort = strings.ToLower(r.EmailAddress)
+				fromFound = true
+			}
+		case "to":
+			if !toFound {
+				toEmailSort = strings.ToLower(r.EmailAddress)
+				toFound = true
+			}
+		case "cc":
+			if !ccFound {
+				ccEmailSort = strings.ToLower(r.EmailAddress)
+				ccFound = true
+			}
+		}
+		if fromFound && toFound && ccFound {
+			break
+		}
+	}
+
 	inReplyToStr := strings.Join(options.InReplyTo, " ")
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(options.Flags)
@@ -366,9 +434,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq)
+			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort)
 		VALUES
-			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'))
+			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_email_sort, @cc_email_sort)
 		RETURNING id
 	`, pgx.NamedArgs{
 		"account_id":      options.UserID,
@@ -388,10 +456,18 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"in_reply_to":     saneInReplyToStr,
 		"body_structure":  bodyStructureData,
 		"recipients_json": recipientsJSON,
+		"subject_sort":    subjectSort,
+		"from_name_sort":  fromNameSort,
+		"from_email_sort": fromEmailSort,
+		"to_email_sort":   toEmailSort,
+		"cc_email_sort":   ccEmailSort,
 	}).Scan(&messageRowId)
 
 	if err != nil {
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		// Check for a unique constraint violation specifically on the message_id.
+		// Other unique violations (e.g., from triggers) are not recoverable here
+		// as they will abort the transaction.
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" && pgErr.ConstraintName == "messages_message_id_mailbox_id_key" {
 			// Unique constraint violation. Check if it's due to message_id and if we can return the existing message.
 			// The saneMessageID was used in the INSERT attempt.
 

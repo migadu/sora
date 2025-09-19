@@ -16,9 +16,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/migadu/sora/pkg/resilient"
 	_ "modernc.org/sqlite"
 )
+
+// SourceDatabase defines the interface for interacting with the main database.
+// This allows for mocking in tests.
+type SourceDatabase interface {
+	FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error)
+	GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error)
+}
 
 const DataDir = "data"
 const IndexDB = "cache_index.db"
@@ -32,7 +38,7 @@ type Cache struct {
 	orphanCleanupAge time.Duration
 	db               *sql.DB
 	mu               sync.Mutex
-	sourceDB         *resilient.ResilientDatabase
+	sourceDB         SourceDatabase
 	// Metrics - using atomic for thread-safe counters
 	cacheHits   int64
 	cacheMisses int64
@@ -48,12 +54,12 @@ func (c *Cache) Close() error {
 	return nil
 }
 
-func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval time.Duration, orphanCleanupAge time.Duration, sourceDb *resilient.ResilientDatabase) (*Cache, error) {
-	basePath = filepath.Clean(strings.TrimSpace(basePath))
+func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval time.Duration, orphanCleanupAge time.Duration, sourceDb SourceDatabase) (*Cache, error) {
+	basePath = strings.TrimSpace(basePath)
 	if basePath == "" {
 		return nil, fmt.Errorf("cache base path cannot be empty")
 	}
-
+	basePath = filepath.Clean(basePath)
 	dataDir := filepath.Join(basePath, DataDir)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache data path %s: %w", dataDir, err)
@@ -201,6 +207,10 @@ func (c *Cache) Delete(contentHash string) error {
 		log.Printf("[CACHE] failed to remove index entry for path %s: %v\n", path, err)
 		return fmt.Errorf("failed to remove index entry for path %s: %w", path, err)
 	}
+
+	// Clean up empty parent directories.
+	dataDir := filepath.Join(c.basePath, DataDir)
+	removeEmptyParents(path, dataDir)
 	return nil
 }
 
@@ -208,6 +218,20 @@ func (c *Cache) MoveIn(path string, contentHash string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	target := c.GetPathForContentHash(contentHash)
+
+	// Check if the file already exists. If so, our work is done.
+	// We just need to remove the source file.
+	if _, err := os.Stat(target); err == nil {
+		log.Printf("[CACHE] file %s already exists in cache, removing source %s", target, path)
+		if err := os.Remove(path); err != nil {
+			// Log the error but don't fail the operation, as the file is in the cache.
+			log.Printf("[CACHE] failed to remove source file %s after finding existing cache entry: %v", path, err)
+		}
+		// Ensure the file is tracked, in case it was present on disk but not in the index.
+		return c.trackFile(target)
+	}
+
+	// File does not exist, so proceed with moving it.
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		log.Printf("[CACHE] failed to create target directory %s: %v\n", filepath.Dir(target), err)
 		return fmt.Errorf("failed to create target directory: %w", err)
@@ -215,16 +239,9 @@ func (c *Cache) MoveIn(path string, contentHash string) error {
 
 	// Try rename first (fast path)
 	if err := os.Rename(path, target); err != nil {
-		// If rename fails, check for specific conditions.
-		if os.IsExist(err) {
-			// This can happen on some OSes (like Windows) if the target exists.
-			// It can also happen if another process cached the file concurrently.
-			// The file is already in the cache, so we just need to remove the source.
-			log.Printf("[CACHE] file %s already exists in cache, removing source %s", target, path)
-			if err := os.Remove(path); err != nil {
-				log.Printf("[CACHE] failed to remove source file %s after finding existing cache entry: %v", path, err)
-			}
-		} else if isCrossDeviceError(err) {
+		// If rename fails, it's not because the file exists (we checked that).
+		// It's likely a cross-device error.
+		if isCrossDeviceError(err) {
 			// Cross-device link error (common on Unix), fall back to copy+delete.
 			log.Printf("[CACHE] cross-device link detected, falling back to copy+delete for %s to %s\n", path, target)
 			if err := copyFile(path, target); err != nil {
@@ -568,10 +585,17 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 			continue
 		}
 
-		contentHash := filepath.Base(path)
-		// Basic validation for a hash-like string, adjust if needed
-		if len(contentHash) < 32 || len(contentHash) > 128 { // Example length check for typical hashes
-			log.Printf("[CACHE] suspicious content hash from path %s: %s", path, contentHash)
+		// Reconstruct the content hash from the file path.
+		// The path is like /.../data_dir/ab/cd/ef...
+		// We need to get the path relative to data_dir and remove separators.
+		dataDir := filepath.Join(c.basePath, DataDir)
+		relPath, err := filepath.Rel(dataDir, path)
+		if err != nil {
+			log.Printf("[CACHE] could not determine relative path for %s: %v", path, err)
+			continue
+		}
+		contentHash := strings.ReplaceAll(relPath, string(filepath.Separator), "")
+		if len(contentHash) == 0 {
 			continue
 		}
 

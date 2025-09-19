@@ -583,7 +583,7 @@ func (db *Database) GetCredentialDetails(ctx context.Context, email string) (*Cr
 			   a.id, a.created_at, a.deleted_at,
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS total_credentials,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   (SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL) AS message_count
+			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
 		WHERE LOWER(c.address) = LOWER($1)
@@ -642,8 +642,8 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	var details AccountDetails
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.created_at, a.deleted_at,
-			   (SELECT count(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   (SELECT count(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL) AS message_count
+			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
@@ -700,14 +700,23 @@ type AccountSummary struct {
 // ListAccounts returns a summary of all accounts in the system
 func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) {
 	query := `
+		WITH account_stats AS (
+			SELECT mb.account_id,
+				   COUNT(mb.id) as mailbox_count,
+				   COALESCE(SUM(ms.message_count), 0) as message_count
+			FROM mailboxes mb
+			LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+			GROUP BY mb.account_id
+		)
 		SELECT a.id,
 			   a.created_at,
 			   COALESCE(pc.address, '') AS primary_email,
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
-			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   (SELECT COUNT(*) FROM messages WHERE expunged_at IS NULL AND account_id = a.id) AS message_count
+			   COALESCE(s.mailbox_count, 0),
+			   COALESCE(s.message_count, 0)
 		FROM accounts a
-				 LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = TRUE
+		LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = TRUE
+		LEFT JOIN account_stats s ON a.id = s.account_id
 		WHERE a.deleted_at IS NULL
 		ORDER BY a.created_at DESC`
 

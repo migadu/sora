@@ -1,12 +1,17 @@
 package db
 
 import (
+	"context"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -319,4 +324,298 @@ func TestManuallyCreatedHashes(t *testing.T) {
 	if err != nil {
 		t.Errorf("Manually created SSHA512 hex hash verification failed: %v", err)
 	}
+}
+
+// Note: TestNeedsRehash is already implemented in auth_rehash_test.go
+
+// TestPasswordGenerationAndVerification tests all hash types end-to-end
+func TestPasswordGenerationAndVerification(t *testing.T) {
+	password := "testPassword123!"
+	
+	tests := []struct {
+		name     string
+		hashType string
+		genFunc  func(string) (string, error)
+	}{
+		{
+			name:     "bcrypt",
+			hashType: "bcrypt",
+			genFunc:  func(p string) (string, error) { return GenerateBcryptHash(p) },
+		},
+		{
+			name:     "ssha512",
+			hashType: "ssha512", 
+			genFunc:  func(p string) (string, error) { return GenerateSSHA512Hash(p) },
+		},
+		{
+			name:     "ssha512 hex",
+			hashType: "ssha512_hex",
+			genFunc:  func(p string) (string, error) { return GenerateSSHA512HashHex(p) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Generate hash
+			hash, err := tt.genFunc(password)
+			require.NoError(t, err)
+			require.NotEmpty(t, hash)
+
+			// Verify correct password
+			err = VerifyPassword(hash, password)
+			assert.NoError(t, err)
+
+			// Verify incorrect password
+			err = VerifyPassword(hash, "wrongPassword")
+			assert.Error(t, err)
+
+			// Test with empty password
+			err = VerifyPassword(hash, "")
+			assert.Error(t, err)
+		})
+	}
+}
+
+// TestPasswordEdgeCases tests edge cases and error conditions
+func TestPasswordEdgeCases(t *testing.T) {
+	t.Run("empty password", func(t *testing.T) {
+		hash, err := GenerateBcryptHash("")
+		require.NoError(t, err)
+		
+		err = VerifyPassword(hash, "")
+		assert.NoError(t, err)
+	})
+
+	t.Run("very long password", func(t *testing.T) {
+		longPassword := strings.Repeat("a", 1000)
+		_, err := GenerateBcryptHash(longPassword)
+		// bcrypt has a 72-byte limit, so this should fail
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "password length exceeds 72 bytes")
+	})
+
+	t.Run("unicode password", func(t *testing.T) {
+		unicodePassword := "测试密码🔒"
+		hash, err := GenerateBcryptHash(unicodePassword)
+		require.NoError(t, err)
+		
+		err = VerifyPassword(hash, unicodePassword)
+		assert.NoError(t, err)
+	})
+
+	t.Run("malformed hashes", func(t *testing.T) {
+		malformedHashes := []string{
+			"{INVALID}hash",
+			"{SHA512}invalidbase64!@#",
+			"{SSHA512}tooshort",
+			"$2a$invalidcost$hash",
+			"",
+		}
+
+		for _, hash := range malformedHashes {
+			err := VerifyPassword(hash, "password")
+			assert.Error(t, err, "Hash: %s", hash)
+		}
+	})
+}
+
+// Database test helpers moved to test_helpers_test.go
+
+// TestUpdatePassword tests password updating functionality  
+func TestUpdatePassword(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	
+	testDB := setupTestDatabase(t)
+	defer testDB.Close()
+	
+	ctx := context.Background()
+	
+	// First create a test account
+	tx, err := testDB.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	// Create test account with unique email
+	testEmail := fmt.Sprintf("testuser_%d@example.com", time.Now().UnixNano())
+	req := CreateAccountRequest{
+		Email:     testEmail,
+		Password:  "originalpassword",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	}
+	err = testDB.CreateAccount(ctx, tx, req)
+	require.NoError(t, err)
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	// Test password update
+	tx2, err := testDB.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	// Generate new password hash
+	newHash, err := GenerateBcryptHash("newpassword123")
+	require.NoError(t, err)
+
+	// Update password
+	err = testDB.UpdatePassword(ctx, tx2, testEmail, newHash)
+	assert.NoError(t, err)
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify the password was updated by trying to authenticate
+	_, storedHash, err := testDB.GetCredentialForAuth(ctx, testEmail)
+	require.NoError(t, err)
+	
+	// Old password should fail
+	err = VerifyPassword(storedHash, "originalpassword")
+	assert.Error(t, err)
+	
+	// New password should work
+	err = VerifyPassword(storedHash, "newpassword123")
+	assert.NoError(t, err)
+}
+
+// TestGetCredentialForAuth tests credential retrieval for authentication
+func TestGetCredentialForAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	testDB := setupTestDatabase(t)
+	defer testDB.Close()
+	
+	ctx := context.Background()
+
+	// Create a test account first
+	tx, err := testDB.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	testEmail := fmt.Sprintf("testauth_%d@example.com", time.Now().UnixNano())
+	req := CreateAccountRequest{
+		Email:     testEmail,
+		Password:  "testpassword123",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	}
+	err = testDB.CreateAccount(ctx, tx, req)
+	require.NoError(t, err)
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	// Test 1: Valid user
+	accountID, hashedPassword, err := testDB.GetCredentialForAuth(ctx, testEmail)
+	assert.NoError(t, err)
+	assert.Greater(t, accountID, int64(0))
+	assert.NotEmpty(t, hashedPassword)
+
+	// Verify the returned hash works
+	err = VerifyPassword(hashedPassword, "testpassword123")
+	assert.NoError(t, err)
+
+	// Test 2: Non-existent user
+	_, _, err = testDB.GetCredentialForAuth(ctx, "nonexistent@example.com")
+	assert.Error(t, err)
+
+	// Test 3: Empty address
+	_, _, err = testDB.GetCredentialForAuth(ctx, "")
+	assert.Error(t, err)
+
+	// Test 4: Case insensitive lookup
+	upperCaseEmail := strings.ToUpper(testEmail)
+	accountID2, hashedPassword2, err := testDB.GetCredentialForAuth(ctx, upperCaseEmail)
+	assert.NoError(t, err)
+	assert.Equal(t, accountID, accountID2)
+	assert.Equal(t, hashedPassword, hashedPassword2)
+}
+
+// TestGetAccountIDByAddress tests account ID lookup by address
+func TestGetAccountIDByAddress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db := setupTestDatabase(t)
+	defer db.Close()
+	
+	ctx := context.Background()
+	
+	// Create a test account
+	testEmail := fmt.Sprintf("test_get_account_%d@example.com", time.Now().UnixNano())
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	
+	req := CreateAccountRequest{
+		Email:     testEmail,
+		Password:  "password123",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	}
+	err = db.CreateAccount(ctx, tx, req)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	
+	// Test cases:
+	// 1. Valid user
+	accountID, err := db.GetAccountIDByAddress(ctx, testEmail)
+	assert.NoError(t, err)
+	assert.Greater(t, accountID, int64(0))
+	
+	// 2. Non-existent user (should return ErrUserNotFound)
+	_, err = db.GetAccountIDByAddress(ctx, "nonexistent@example.com")
+	assert.Error(t, err)
+	// 3. Empty address (should return error)
+	// 4. Case insensitive lookup
+	// 5. Normalized address handling
+}
+
+// TestGetPrimaryEmailForAccount tests primary email retrieval
+func TestGetPrimaryEmailForAccount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db := setupTestDatabase(t)
+	defer db.Close()
+	
+	ctx := context.Background()
+	
+	// Create a test account
+	testEmail := fmt.Sprintf("test_primary_email_%d@example.com", time.Now().UnixNano())
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	
+	req := CreateAccountRequest{
+		Email:     testEmail,
+		Password:  "password123",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	}
+	err = db.CreateAccount(ctx, tx, req)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	
+	// Get account ID
+	accountID, err := db.GetAccountIDByAddress(ctx, testEmail)
+	require.NoError(t, err)
+	
+	// Test cases:
+	// 1. Account with primary email
+	primaryEmail, err := db.GetPrimaryEmailForAccount(ctx, accountID)
+	assert.NoError(t, err)
+	assert.Equal(t, testEmail, primaryEmail.FullAddress())
+	
+	// 2. Non-existent account (should return error)
+	_, err = db.GetPrimaryEmailForAccount(ctx, 99999999)
+	assert.Error(t, err)
+	// 3. Account without primary email (should return error)
+	// 4. Valid address format in response
 }

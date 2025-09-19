@@ -17,6 +17,17 @@ func init() {
 
 // Serialize the BodyStructure to Gob
 func SerializeBodyStructureGob(bs *imap.BodyStructure) ([]byte, error) {
+	// Handle nil pointer by creating a default body structure
+	if bs == nil {
+		defaultBodyStructure := &imap.BodyStructureSinglePart{
+			Type:    "text",
+			Subtype: "plain",
+			Size:    0,
+		}
+		var defaultBS imap.BodyStructure = defaultBodyStructure
+		bs = &defaultBS
+	}
+	
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(bs); err != nil {

@@ -95,6 +95,13 @@ CREATE TABLE messages (
 	size INTEGER NOT NULL,				-- Size of the message in bytes
 	body_structure BYTEA NOT NULL,      -- Serialized BodyStructure of the message
 
+	-- Denormalized fields for sorting performance
+	subject_sort TEXT,
+	from_name_sort TEXT,
+	from_email_sort TEXT,
+	to_email_sort TEXT,
+	cc_email_sort TEXT,
+
 	--
 	-- Keep messages if mailbox is deleted by nullifying the mailbox_id
 	--
@@ -113,7 +120,8 @@ CREATE TABLE messages (
 	expunged_modseq BIGINT,
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
 	updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-	CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50) -- Limit to 50 custom flags
+	CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50), -- Limit to 50 custom flags
+	CONSTRAINT messages_message_id_mailbox_id_key UNIQUE (message_id, mailbox_id)
 );
 
 -- Index for faster lookups by account_id, supporting various cleanup and query operations
@@ -177,10 +185,6 @@ CREATE INDEX idx_messages_custom_flags ON messages USING GIN (custom_flags);
 -- This index uses the jsonb_path_ops for efficient querying
 CREATE INDEX idx_messages_recipients_json ON messages USING GIN (recipients_json jsonb_path_ops);
 
--- For fast flag-only searches (common IMAP operations like SEARCH UNSEEN)
--- This index on the expression `(flags & 1)` allows for fast filtering on the \Seen flag (for both SEEN and UNSEEN searches).
-CREATE INDEX idx_messages_mailbox_seen_flag_uid ON messages (mailbox_id, (flags & 1), uid) WHERE expunged_at IS NULL;
-
 -- For date range searches (SEARCH SINCE, SEARCH BEFORE)
 CREATE INDEX idx_messages_mailbox_dates_uid ON messages (mailbox_id, internal_date, sent_date, uid) WHERE expunged_at IS NULL;
 
@@ -189,6 +193,14 @@ CREATE INDEX idx_messages_mailbox_size_uid ON messages (mailbox_id, size, uid) W
 
 -- Compound index for mailbox + multiple common search fields
 CREATE INDEX idx_messages_mailbox_common_search ON messages (mailbox_id, (flags & 1), internal_date, size, uid) WHERE expunged_at IS NULL;
+
+-- Indexes for denormalized sort columns
+CREATE INDEX idx_messages_subject_sort ON messages (mailbox_id, subject_sort) WHERE expunged_at IS NULL;
+CREATE INDEX idx_messages_from_email_sort ON messages (mailbox_id, from_email_sort) WHERE expunged_at IS NULL;
+CREATE INDEX idx_messages_to_email_sort ON messages (mailbox_id, to_email_sort) WHERE expunged_at IS NULL;
+CREATE INDEX idx_messages_cc_email_sort ON messages (mailbox_id, cc_email_sort) WHERE expunged_at IS NULL;
+-- Index for display name sort (name fallback to email)
+CREATE INDEX idx_messages_from_display_sort ON messages (mailbox_id, COALESCE(from_name_sort, from_email_sort)) WHERE expunged_at IS NULL;
 
 -- Table to store message bodies, separated for performance
 CREATE TABLE message_contents (

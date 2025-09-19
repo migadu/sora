@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -312,6 +313,27 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 		return nil
 	}
 
+	// Get all mailbox IDs for the accounts being deleted to lock them in a consistent order.
+	var mailboxIDs []int64
+	rows, err := tx.Query(ctx, "SELECT id FROM mailboxes WHERE account_id = ANY($1)", accountIDs)
+	if err != nil {
+		return fmt.Errorf("failed to query mailbox IDs for locking: %w", err)
+	}
+	mailboxIDs, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return fmt.Errorf("failed to collect mailbox IDs for locking: %w", err)
+	}
+
+	// Sort the IDs to ensure a consistent lock acquisition order.
+	sort.Slice(mailboxIDs, func(i, j int) bool { return mailboxIDs[i] < mailboxIDs[j] })
+
+	// Acquire locks in a deterministic order.
+	if len(mailboxIDs) > 0 {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(id) FROM unnest($1::bigint[]) AS id", mailboxIDs); err != nil {
+			return fmt.Errorf("failed to acquire locks for account deletion: %w", err)
+		}
+	}
+
 	// Use = ANY($1) for efficient batch operations
 	batchOps := []struct {
 		tableName string
@@ -333,7 +355,7 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 
 	// Mark all messages for the deleted accounts as expunged.
 	// This signals the next phase of the cleanup worker to remove the S3 objects.
-	_, err := tx.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE messages 
 		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
 		WHERE account_id = ANY($1) AND expunged_at IS NULL

@@ -29,10 +29,40 @@ import (
 	"github.com/minio/minio-go/v7"
 )
 
+// DatabaseManager defines the interface for database operations required by the cleaner.
+// This allows for mocking in tests.
+type DatabaseManager interface {
+	AcquireCleanupLockWithRetry(ctx context.Context) (bool, error)
+	ReleaseCleanupLockWithRetry(ctx context.Context) error
+	ExpungeOldMessagesWithRetry(ctx context.Context, maxAge time.Duration) (int64, error)
+	CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupOldAuthAttemptsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
+	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+	PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error)
+	DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
+	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
+	FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error)
+}
+
+// S3Manager defines the interface for S3 operations required by the cleaner.
+type S3Manager interface {
+	DeleteWithRetry(ctx context.Context, key string) error
+}
+
+// CacheManager defines the interface for cache operations required by the cleaner.
+type CacheManager interface {
+	Delete(contentHash string) error
+}
+
 type CleanupWorker struct {
-	rdb                   *resilient.ResilientDatabase
-	s3                    *resilient.ResilientS3Storage  // Use resilient S3 with circuit breakers
-	cache                 *cache.Cache
+	rdb                   DatabaseManager
+	s3                    S3Manager
+	cache                 CacheManager
 	interval              time.Duration
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
@@ -45,11 +75,11 @@ type CleanupWorker struct {
 func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention time.Duration) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
-	
+
 	return &CleanupWorker{
-		rdb:                   rdb,
-		s3:                    resilientS3,  // Use resilient S3 wrapper
-		cache:                 cache,
+		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
+		s3:                    resilientS3, // *resilient.ResilientS3Storage implements S3Manager
+		cache:                 cache,       // *cache.Cache implements CacheManager
 		interval:              interval,
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAgeRestriction,
@@ -190,11 +220,11 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		for _, candidate := range candidates {
 			// Validate candidate data before processing
 			if candidate.ContentHash == "" || candidate.S3Domain == "" || candidate.S3Localpart == "" {
-				log.Printf("[CLEANUP] WARNING: invalid candidate data - hash:%s domain:%s localpart:%s", 
+				log.Printf("[CLEANUP] WARNING: invalid candidate data - hash:%s domain:%s localpart:%s",
 					candidate.ContentHash, candidate.S3Domain, candidate.S3Localpart)
 				continue
 			}
-			
+
 			// Check for context cancellation in the loop
 			select {
 			case <-ctx.Done():
@@ -202,7 +232,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 				return fmt.Errorf("context cancelled during S3 cleanup")
 			default:
 			}
-			
+
 			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
 			s3Err := w.s3.DeleteWithRetry(ctx, s3Key)
 
