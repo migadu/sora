@@ -219,6 +219,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 			imap.CapCondStore:   struct{}{},
 			imap.CapChildren:    struct{}{},
 			imap.CapID:          struct{}{},
+			imap.CapNamespace:   struct{}{},
 		},
 		masterUsername:     options.MasterUsername,
 		masterPassword:     options.MasterPassword,

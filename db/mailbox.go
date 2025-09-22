@@ -557,12 +557,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Separately, check if the mailbox has children. This avoids using GROUP BY with FOR UPDATE.
 	var hasChildren bool
 	err = tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '/%')
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2)
 	`, userID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		log.Printf("[DB] ERROR: failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
+	
 
 	// Determine the path of the new parent.
 	var newParentPath string
@@ -610,21 +611,28 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		oldPrefix := oldName + delimiter
 		newPrefix := newName + delimiter
 
+
+		// The path of children only changes if the mailbox is moved to a new parent. For a simple
+		// rename, only the 'name' of the children needs to be updated. We use concatenation with
+		// SUBSTRING to only replace the prefix, which is safer than a global REPLACE.
 		_, err = tx.Exec(ctx, `
 			UPDATE mailboxes
 			SET 
 				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
-				path = $3 || SUBSTRING(path FROM LENGTH($4) + 1),
+				path = CASE 
+					WHEN $3 != $4 THEN $3 || SUBSTRING(path FROM LENGTH($4) + 1)
+					ELSE path
+				END,
 				updated_at = now()
 			WHERE 
 				account_id = $5 AND
-				path LIKE $4 || '/%' AND
-				id != $6
-		`, newPrefix, oldPrefix, newPath, oldPath, userID, mailboxID)
+				path LIKE $4 || '%' AND path != $4
+		`, newPrefix, oldPrefix, newPath, oldPath, userID)
 
 		if err != nil {
 			return fmt.Errorf("failed to update child mailboxes: %w", err)
 		}
+		
 	}
 
 	return nil

@@ -61,14 +61,20 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	if len(newParts) > 1 {
 		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
 		newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, newParentPath)
-		if err != nil {
-			if err == consts.ErrMailboxNotFound {
-				s.Log("[RENAME] new parent mailbox '%s' for '%s' does not exist", newParentPath, newName)
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Text: fmt.Sprintf("Cannot rename mailbox to '%s' because parent mailbox '%s' does not exist", newName, newParentPath),
-				}
+		if err == consts.ErrMailboxNotFound {
+			// Parent does not exist, so we need to create it.
+			// This is a common expectation for IMAP clients.
+			s.Log("[RENAME] new parent mailbox '%s' for '%s' does not exist, auto-creating", newParentPath, newName)
+			createErr := s.server.rdb.CreateMailboxWithRetry(s.ctx, userID, newParentPath, nil)
+			if createErr != nil {
+				return s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
 			}
+			// Fetch the newly created parent to get its ID.
+			newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, newParentPath)
+			if err != nil {
+				return s.internalError("failed to fetch auto-created new parent mailbox '%s': %v", newParentPath, err)
+			}
+		} else if err != nil {
 			return s.internalError("failed to fetch new parent mailbox '%s': %v", newParentPath, err)
 		}
 		newParentMailboxID = &newParentMailbox.ID

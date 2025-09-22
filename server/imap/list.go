@@ -34,72 +34,43 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
-	var l []imap.ListData
-
-	// For LSUB, we need to include parent folders of subscribed mailboxes
+	var parentFolders map[string]bool
 	if options.SelectSubscribed {
-		// First, collect all subscribed mailboxes
-		subscribedMailboxes := make(map[string]bool)
-		for _, mbox := range mboxes {
-			if mbox.Subscribed {
-				subscribedMailboxes[mbox.Name] = true
+		parentFolders = calculateParentFolders(mboxes)
+	}
+
+	var l []imap.ListData
+	for _, mbox := range mboxes {
+		// Check if mailbox matches any of the patterns
+		match := false
+		for _, pattern := range patterns {
+			if imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern) {
+				match = true
+				break
 			}
 		}
-
-		// Then, find all parent folders that should be included
-		parentFolders := make(map[string]bool)
-		for subscribedName := range subscribedMailboxes {
-			parts := strings.Split(subscribedName, string(consts.MailboxDelimiter))
-			// Add all parent paths
-			for i := 1; i < len(parts); i++ {
-				parentPath := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-				if parentPath != "" {
-					parentFolders[parentPath] = true
-					// Also try with trailing delimiter
-					parentFolders[parentPath+string(consts.MailboxDelimiter)] = true
-				}
-			}
+		if !match {
+			continue
 		}
 
-		// Process mailboxes for LSUB
-		for _, mbox := range mboxes {
-			match := false
-			for _, pattern := range patterns {
-				match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
-				if match {
-					break
-				}
-			}
-			if !match {
+		// For LSUB, only include subscribed mailboxes or their parents
+		if options.SelectSubscribed {
+			if !mbox.Subscribed && !parentFolders[mbox.Name] {
 				continue
 			}
-
-			// Include if subscribed or if it's a parent of a subscribed mailbox
-			if mbox.Subscribed || parentFolders[mbox.Name] {
-				data := listMailbox(mbox, options, s.server.caps, parentFolders[mbox.Name])
-				if data != nil {
-					l = append(l, *data)
-				}
-			}
 		}
-	} else {
-		// Regular LIST behavior
-		for _, mbox := range mboxes {
-			match := false
-			for _, pattern := range patterns {
-				match = imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern)
-				if match {
-					break
-				}
-			}
-			if !match {
-				continue
-			}
 
-			data := listMailbox(mbox, options, s.server.caps, false)
-			if data != nil {
-				l = append(l, *data)
-			}
+		// Determine if the mailbox is a parent folder for LSUB response attributes.
+		// A folder is a "parent" if it's being listed as part of an LSUB response
+		// because it's an ancestor of a subscribed folder.
+		isParentForLsub := false
+		if parentFolders != nil {
+			isParentForLsub = parentFolders[mbox.Name]
+		}
+
+		data := listMailbox(mbox, options, s.server.caps, isParentForLsub)
+		if data != nil {
+			l = append(l, *data)
 		}
 	}
 
@@ -152,6 +123,31 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	return nil
 }
 
+// calculateParentFolders finds all parent folders of subscribed mailboxes.
+// This is used for LSUB command to include non-subscribed parent mailboxes
+// in the response, marking them as \Noselect.
+func calculateParentFolders(mboxes []*db.DBMailbox) map[string]bool {
+	subscribedMailboxes := make(map[string]bool)
+	for _, mbox := range mboxes {
+		if mbox.Subscribed {
+			subscribedMailboxes[mbox.Name] = true
+		}
+	}
+
+	parentFolders := make(map[string]bool)
+	for subscribedName := range subscribedMailboxes {
+		parts := strings.Split(subscribedName, string(consts.MailboxDelimiter))
+		// Add all parent paths (e.g., for "A/B/C", add "A" and "A/B")
+		for i := 1; i < len(parts); i++ {
+			parentPath := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+			if parentPath != "" {
+				parentFolders[parentPath] = true
+			}
+		}
+	}
+	return parentFolders
+}
+
 func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, isParentFolder bool) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
 
@@ -186,6 +182,14 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 	case "JUNK":
 		isStandardSpecialMailbox = true
 		specialUseAttributeIfApplicable = imap.MailboxAttrJunk
+	}
+
+	// For LSUB, if a mailbox has a special-use flag, only include it if the
+	// client is explicitly asking for special-use mailboxes. This prevents
+	// auto-subscribed special mailboxes from appearing in a generic LSUB "*".
+	// We make an exception for INBOX, which is always expected.
+	if options.SelectSubscribed && isStandardSpecialMailbox && !options.ReturnSpecialUse && !options.SelectSpecialUse {
+		return nil
 	}
 
 	if options.SelectSpecialUse && !isStandardSpecialMailbox {

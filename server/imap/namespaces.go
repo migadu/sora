@@ -1,11 +1,19 @@
 package imap
 
 import (
-	"fmt"
-
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/consts"
 )
 
 func (s *IMAPSession) Namespace() (*imap.NamespaceData, error) {
-	return nil, fmt.Errorf("Namespace not implemented")
+	return &imap.NamespaceData{
+		Personal: []imap.NamespaceDescriptor{
+			{
+				Prefix: "",
+				Delim:  consts.MailboxDelimiter,
+			},
+		},
+		Other:  nil,
+		Shared: nil,
+	}, nil
 }

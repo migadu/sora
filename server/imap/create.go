@@ -49,39 +49,24 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 			// Create each level of the hierarchy if it doesn't exist
 			for i := 1; i < len(parts); i++ {
 				parentPathWithoutDelim := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-				parentPathWithDelim := parentPathWithoutDelim + string(consts.MailboxDelimiter)
 
 				var parentMailbox *db.DBMailbox
 
-				// Check if without-delimiter version exists
+				// Check if parent mailbox exists. If not, create it.
 				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, parentPathWithoutDelim)
-				withoutDelimExists := (err == nil)
-
-				// Check if with-delimiter version exists
-				_, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, parentPathWithDelim)
-				withDelimExists := (err == nil)
-
-				// Create missing versions
-				if !withoutDelimExists {
+				if err == consts.ErrMailboxNotFound {
 					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithoutDelim)
 					err = s.server.rdb.CreateMailboxWithRetry(s.ctx, userID, parentPathWithoutDelim, currentParentID)
 					if err != nil {
 						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
 
-					// Get the newly created parent
 					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, parentPathWithoutDelim)
 					if err != nil {
 						return s.internalError("failed to fetch auto-created parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
-				}
-
-				if !withDelimExists {
-					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithDelim)
-					err = s.server.rdb.CreateMailboxWithRetry(s.ctx, userID, parentPathWithDelim, currentParentID)
-					if err != nil {
-						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithDelim, err)
-					}
+				} else if err != nil {
+					return s.internalError("failed to check for parent mailbox '%s': %v", parentPathWithoutDelim, err)
 				}
 
 				if parentMailbox != nil {
