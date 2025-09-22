@@ -39,7 +39,6 @@ type Server struct {
 	authLimiter        server.AuthLimiter
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *proxy.PreLookupConfig
-	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 	sessionTimeout     time.Duration
 }
 
@@ -65,7 +64,6 @@ type ServerOptions struct {
 	AuthRateLimit          server.AuthRateLimiterConfig
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 }
 
 // New creates a new ManageSieve proxy server.
@@ -139,7 +137,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		authLimiter:        authLimiter,
 		trustedProxies:     opts.TrustedProxies,
 		prelookupConfig:    opts.PreLookup,
-		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 		sessionTimeout:     opts.SessionTimeout,
 	}, nil
 }

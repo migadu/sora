@@ -193,15 +193,7 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 	}
 
 	if isStandardSpecialMailbox {
-		addTheAttribute := false
-		if serverCaps.Has(imap.CapSpecialUse) {
-			addTheAttribute = true
-		} else {
-			if options.ReturnSpecialUse || options.SelectSpecialUse {
-				addTheAttribute = true
-			}
-		}
-		if addTheAttribute {
+		if serverCaps.Has(imap.CapSpecialUse) || options.ReturnSpecialUse || options.SelectSpecialUse {
 			attributes = append(attributes, specialUseAttributeIfApplicable)
 		}
 	}

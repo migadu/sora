@@ -875,7 +875,6 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLS:              serverConfig.RemoteTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
-		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		AuthRateLimit:          authRateLimit,

@@ -432,24 +432,6 @@ func (s *Session) authenticateToBackend() error {
 	backendWriter := bufio.NewWriter(s.backendConn)
 	backendReader := bufio.NewReader(s.backendConn)
 
-	// Send forwarding parameters via XCLIENT if enabled
-	useXCLIENT := s.server.remoteUseXCLIENT
-	// Override with routing-specific setting if available
-	if s.routingInfo != nil {
-		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
-	}
-
-	// The proxy's role is to forward the original client's information if enabled.
-	// It is the backend server's responsibility to verify if the connection
-	// (from this proxy) is from a trusted IP before processing forwarded parameters.
-	// The `isFromTrustedProxy()` check is for proxy-chaining, which is handled separately.
-	if useXCLIENT {
-		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
-			log.Printf("[ManageSieve Proxy] Failed to send forwarding parameters for %s: %v", s.username, err)
-			// Continue without forwarding parameters rather than failing
-		}
-	}
-
 	// Send AUTHENTICATE PLAIN command with impersonation
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))

@@ -325,7 +325,7 @@ type PreLookupConfig struct {
 	RemotePort             interface{} `toml:"remote_port"`               // Default port for routed backends if not in address
 	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections from prelookup
 	RemoteUseIDCommand     bool        `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding from prelookup (IMAP only)
-	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding from prelookup (POP3/LMTP/ManageSieve)
+	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding from prelookup (POP3/LMTP)
 }
 
 // GetCacheTTL returns the configured cache TTL duration
@@ -515,7 +515,6 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLS              bool                  `toml:"remote_tls"`
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
 	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
@@ -844,7 +843,6 @@ func NewDefaultConfig() Config {
 				RemoteTLS:              false,
 				RemoteTLSVerify:        true,
 				RemoteUseProxyProtocol: true,
-				RemoteUseXCLIENT:       false,
 				AuthRateLimit:          DefaultAuthRateLimiterConfig(),
 				EnableAffinity:         true,
 				AffinityStickiness:     0.9,

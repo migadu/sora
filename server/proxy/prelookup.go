@@ -33,7 +33,7 @@ type UserRoutingInfo struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	RemoteUseIDCommand     bool // Use IMAP ID command for forwarding (IMAP only)
-	RemoteUseXCLIENT       bool // Use XCLIENT command for forwarding (POP3/LMTP/ManageSieve)
+	RemoteUseXCLIENT       bool // Use XCLIENT command for forwarding (POP3/LMTP)
 }
 
 // AuthResult represents the result of authentication
