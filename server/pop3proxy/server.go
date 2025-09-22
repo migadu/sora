@@ -16,6 +16,7 @@ import (
 )
 
 type POP3ProxyServer struct {
+	name               string // Server name for logging
 	addr               string
 	hostname           string
 	rdb                *resilient.ResilientDatabase
@@ -38,6 +39,7 @@ type POP3ProxyServer struct {
 }
 
 type POP3ProxyServerOptions struct {
+	Name                   string // Server name for logging
 	Debug                  bool
 	TLS                    bool
 	TLSCertFile            string
@@ -74,15 +76,15 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	if options.PreLookup != nil && options.PreLookup.Enabled {
 		prelookupClient, err := proxy.NewPreLookupClient(serverCtx, options.PreLookup)
 		if err != nil {
-			log.Printf("[POP3 Proxy] Failed to initialize prelookup client: %v", err)
+			log.Printf("[POP3 Proxy %s] Failed to initialize prelookup client: %v", options.Name, err)
 			if !options.PreLookup.FallbackDefault {
 				serverCancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[POP3 Proxy] Continuing without prelookup due to fallback_to_default=true")
+			log.Printf("[POP3 Proxy %s] Continuing without prelookup due to fallback_to_default=true", options.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[POP3 Proxy] Prelookup database client initialized successfully")
+			log.Printf("[POP3 Proxy %s] Prelookup database client initialized successfully", options.Name)
 		}
 	}
 
@@ -105,20 +107,21 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("WARNING: Failed to resolve some addresses for POP3 proxy: %v", err)
+		log.Printf("WARNING: Failed to resolve some addresses for POP3 proxy [%s]: %v", options.Name, err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := options.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid POP3 proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		log.Printf("WARNING: invalid POP3 proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", options.Name, stickiness)
 		stickiness = 1.0
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("POP3-PROXY", options.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.AuthRateLimit, rdb, options.TrustedProxies)
 
 	server := &POP3ProxyServer{
+		name:               options.Name,
 		hostname:           hostname,
 		addr:               addr,
 		rdb:                rdb,
@@ -158,9 +161,9 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		}
 
 		if options.TLSVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for POP3 proxy server (tls_verify=true)")
+			log.Printf("Client TLS certificate verification is REQUIRED for POP3 proxy [%s] (tls_verify=true)", options.Name)
 		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for POP3 proxy server (tls_verify=false)")
+			log.Printf("Client TLS certificate verification is DISABLED for POP3 proxy [%s] (tls_verify=false)", options.Name)
 		}
 	}
 
@@ -177,14 +180,14 @@ func (s *POP3ProxyServer) Start() error {
 			s.cancel()
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
-		log.Printf("* POP3 proxy listening with TLS on %s", s.addr)
+		log.Printf("* POP3 proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("* POP3 proxy listening on %s", s.addr)
+		log.Printf("* POP3 proxy [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 
@@ -216,7 +219,7 @@ func (s *POP3ProxyServer) Start() error {
 		}
 
 		session.RemoteIP = conn.RemoteAddr().String()
-		log.Printf("* POP3 proxy new connection from %s", session.RemoteIP)
+		log.Printf("* POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
 
 		// Track proxy connection
 		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()
@@ -227,7 +230,7 @@ func (s *POP3ProxyServer) Start() error {
 			defer s.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[POP3 Proxy] Session panic recovered: %v", r)
+					log.Printf("[POP3 Proxy %s] Session panic recovered: %v", s.name, r)
 					conn.Close()
 				}
 			}()
@@ -242,7 +245,7 @@ func (s *POP3ProxyServer) SetConnectionTracker(tracker *proxy.ConnectionTracker)
 }
 
 func (s *POP3ProxyServer) Stop() error {
-	log.Printf("* POP3 proxy server closing")
+	log.Printf("* POP3 proxy [%s] server closing", s.name)
 	if s.cancel != nil {
 		s.cancel()
 	}

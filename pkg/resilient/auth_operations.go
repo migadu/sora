@@ -2,7 +2,6 @@ package resilient
 
 import (
 	"context"
-	"errors"
 	"log"
 	"strings"
 	"time"
@@ -17,72 +16,39 @@ import (
 // --- AuthRateLimiter Wrappers ---
 
 func (rd *ResilientDatabase) RecordAuthAttemptWithRetry(ctx context.Context, ipAddress, username, protocol string, success bool) error {
-	// This is a high-frequency write operation. Retries should be short.
 	config := retry.BackoffConfig{
 		InitialInterval: 100 * time.Millisecond,
 		MaxInterval:     500 * time.Millisecond,
 		MaxRetries:      2,
 	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		// Apply auth-specific timeout for authentication logging
-		authCtx, cancel := rd.withTimeout(ctx, timeoutAuth)
-		defer cancel()
-
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabaseForOperation(true).RecordAuthAttempt(authCtx, tx, ipAddress, username, protocol, success)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return cbErr
-	}, config)
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).RecordAuthAttempt(ctx, tx, ipAddress, username, protocol, success)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutAuth, op)
+	return err
 }
 
 func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error) {
-	// This is a read operation used for security checks. Retries should be short.
 	config := retry.BackoffConfig{
 		InitialInterval: 100 * time.Millisecond,
 		MaxInterval:     500 * time.Millisecond,
 		MaxRetries:      2,
 	}
-	err = retry.WithRetryAdvanced(ctx, func() error {
-		// Apply auth-specific timeout for security operations
-		authCtx, cancel := rd.withTimeout(ctx, timeoutAuth)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			ip, user, dbErr := rd.getOperationalDatabaseForOperation(false).GetFailedAttemptsCountSeparateWindows(authCtx, ipAddress, username, ipWindowDuration, usernameWindowDuration)
-			if dbErr != nil {
-				return nil, dbErr
-			}
-			return []int{ip, user}, nil
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
+	op := func(ctx context.Context) (interface{}, error) {
+		ip, user, dbErr := rd.getOperationalDatabaseForOperation(false).GetFailedAttemptsCountSeparateWindows(ctx, ipAddress, username, ipWindowDuration, usernameWindowDuration)
+		if dbErr != nil {
+			return nil, dbErr
 		}
-		counts := result.([]int)
-		ipCount = counts[0]
-		usernameCount = counts[1]
-		return nil
-	}, config)
-	return ipCount, usernameCount, err
+		return []int{ip, user}, nil
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	counts := result.([]int)
+	return counts[0], counts[1], nil
 }
 
 // GetAuthAttemptsStats is not performance-critical and can be called directly for now.
@@ -94,37 +60,16 @@ func (rd *ResilientDatabase) GetAuthAttemptsStats(ctx context.Context, windowDur
 }
 
 func (rd *ResilientDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error) {
-	// This is a background cleanup task, low priority, no retries needed.
+	// This is a background cleanup task, low priority, limited retries.
 	config := retry.BackoffConfig{MaxRetries: 1}
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(true).CleanupOldAuthAttempts(writeCtx, tx, maxAge)
-		})
-		if cbErr != nil {
-			return retry.Stop(cbErr)
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		count = result.(int64)
-		return nil
-	}, config)
-	return count, err
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(true).CleanupOldAuthAttempts(ctx, tx, maxAge)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 // AuthenticateWithRetry handles the full authentication flow with resilience.
@@ -138,48 +83,27 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		MaxRetries:      2, // Auth retries should be limited
 	}
 
-	var hashedPassword string
-	err = retry.WithRetryAdvanced(ctx, func() error {
-		queryCtx, cancel := rd.withTimeout(ctx, timeoutAuth)
-		defer cancel()
+	type credResult struct {
+		ID   int64
+		Hash string
+	}
 
-		// Define a struct to hold the multiple return values from GetCredentialForAuth
-		type credResult struct {
-			ID   int64
-			Hash string
+	op := func(ctx context.Context) (interface{}, error) {
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
+		if dbErr != nil {
+			return nil, dbErr
 		}
+		return credResult{ID: id, Hash: hash}, nil
+	}
 
-		// Authentication is a critical read path. Use queryBreaker.
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(queryCtx, address)
-			if dbErr != nil {
-				return nil, dbErr
-			}
-			return credResult{ID: id, Hash: hash}, nil
-		})
-
-		if cbErr != nil {
-			// Don't retry on auth errors (user not found), only on connection errors.
-			if errors.Is(cbErr, consts.ErrUserNotFound) {
-				return retry.Stop(cbErr)
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			log.Printf("Retrying credential fetch for %s due to retryable error: %v", address, cbErr)
-			return cbErr
-		}
-
-		// Unpack results
-		cred := result.(credResult)
-		accountID = cred.ID
-		hashedPassword = cred.Hash
-		return nil
-	}, config)
-
+	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
 		return 0, err // Return error from fetching credentials
 	}
+
+	cred := result.(credResult)
+	accountID = cred.ID
+	hashedPassword := cred.Hash
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {

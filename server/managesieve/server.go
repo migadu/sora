@@ -47,23 +47,22 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth          bool
-	Debug                 bool
-	TLS                   bool
-	TLSCertFile           string
-	TLSKeyFile            string
-	TLSVerify             bool
-	TLSUseStartTLS        bool
-	MaxScriptSize         int64
-	MasterSASLUsername    string
-	MasterSASLPassword    string
-	MaxConnections        int
-	MaxConnectionsPerIP   int
-	ProxyProtocol         bool     // Enable PROXY protocol support
-	ProxyProtocolRequired bool     // Require PROXY protocol headers
-	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
-	TrustedNetworks       []string // Global trusted networks for parameter forwarding
-	AuthRateLimit         server.AuthRateLimiterConfig
+	InsecureAuth         bool
+	Debug                bool
+	TLS                  bool
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSVerify            bool
+	TLSUseStartTLS       bool
+	MaxScriptSize        int64
+	MasterSASLUsername   string
+	MasterSASLPassword   string
+	MaxConnections       int
+	MaxConnectionsPerIP  int
+	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
+	TrustedNetworks      []string // Global trusted networks for parameter forwarding
+	AuthRateLimit        server.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -80,9 +79,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 
-		if !options.ProxyProtocolRequired {
-			proxyConfig.Mode = "optional"
-		}
+		// Proxy protocol is always required when enabled
 
 		var err error
 		proxyReader, err = server.NewProxyProtocolReader("ManageSieve", proxyConfig)
@@ -92,8 +89,8 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		}
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("ManageSieve", options.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	serverInstance := &ManageSieveServer{
 		hostname:           hostname,

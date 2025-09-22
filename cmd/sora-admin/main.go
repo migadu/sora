@@ -2421,26 +2421,11 @@ Examples:
 }
 
 func showCacheStats(cfg AdminConfig) error {
-	// Parse cache configuration
-	capacityBytes, err := helpers.ParseSize(cfg.LocalCache.Capacity)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache capacity '%s': %w", cfg.LocalCache.Capacity, err)
-	}
-
-	maxObjectSizeBytes, err := helpers.ParseSize(cfg.LocalCache.MaxObjectSize)
-	if err != nil {
-		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
-	}
-
-	// Parse additional cache configuration
-	purgeInterval, err := helpers.ParseDuration(cfg.LocalCache.PurgeInterval)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache purge interval '%s': %w", cfg.LocalCache.PurgeInterval, err)
-	}
-	orphanCleanupAge, err := helpers.ParseDuration(cfg.LocalCache.OrphanCleanupAge)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache orphan cleanup age '%s': %w", cfg.LocalCache.OrphanCleanupAge, err)
-	}
+	// Parse cache configuration using defaulting methods
+	capacityBytes := cfg.LocalCache.GetCapacityWithDefault()
+	maxObjectSizeBytes := cfg.LocalCache.GetMaxObjectSizeWithDefault()
+	purgeInterval := cfg.LocalCache.GetPurgeIntervalWithDefault()
+	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
@@ -2492,26 +2477,11 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 		}
 	}
 
-	// Parse cache configuration
-	capacityBytes, err := helpers.ParseSize(cfg.LocalCache.Capacity)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache capacity '%s': %w", cfg.LocalCache.Capacity, err)
-	}
-
-	maxObjectSizeBytes, err := helpers.ParseSize(cfg.LocalCache.MaxObjectSize)
-	if err != nil {
-		return fmt.Errorf("failed to parse max object size '%s': %w", cfg.LocalCache.MaxObjectSize, err)
-	}
-
-	// Parse additional cache configuration
-	purgeInterval, err := helpers.ParseDuration(cfg.LocalCache.PurgeInterval)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache purge interval '%s': %w", cfg.LocalCache.PurgeInterval, err)
-	}
-	orphanCleanupAge, err := helpers.ParseDuration(cfg.LocalCache.OrphanCleanupAge)
-	if err != nil {
-		return fmt.Errorf("failed to parse cache orphan cleanup age '%s': %w", cfg.LocalCache.OrphanCleanupAge, err)
-	}
+	// Parse cache configuration using defaulting methods
+	capacityBytes := cfg.LocalCache.GetCapacityWithDefault()
+	maxObjectSizeBytes := cfg.LocalCache.GetMaxObjectSizeWithDefault()
+	purgeInterval := cfg.LocalCache.GetPurgeIntervalWithDefault()
+	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
 	ctx := context.Background()
@@ -2613,10 +2583,7 @@ func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error
 	defer rdb.Close()
 
 	// Validate retry interval parsing (for config validation)
-	_, err = helpers.ParseDuration(cfg.Uploader.RetryInterval)
-	if err != nil {
-		return fmt.Errorf("failed to parse retry interval '%s': %w", cfg.Uploader.RetryInterval, err)
-	}
+	cfg.Uploader.GetRetryIntervalWithDefault()
 
 	// Get uploader statistics
 	stats, err := rdb.GetUploaderStatsWithRetry(ctx, cfg.Uploader.MaxAttempts)

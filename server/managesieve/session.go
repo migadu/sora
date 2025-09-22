@@ -136,13 +136,22 @@ func (s *ManageSieveSession) handleConnection() {
 				continue
 			}
 
+			// Get connection and proxy info for rate limiting
+			netConn := *s.conn
+			var proxyInfo *server.ProxyProtocolInfo
+			if s.ProxyIP != "" {
+				proxyInfo = &server.ProxyProtocolInfo{
+					SrcIP: s.RemoteIP,
+				}
+			}
+
 			// Apply progressive authentication delay BEFORE any other checks
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 			server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN")
 
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
-				if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address.FullAddress()); err != nil {
+				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 					s.Log("[LOGIN] rate limited: %v", err)
 					s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
 					continue
@@ -162,8 +171,7 @@ func (s *ManageSieveSession) handleConnection() {
 						s.Log("[LOGIN] Failed to get account ID for master user '%s': %v", address.FullAddress(), err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
-							remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-							s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
 						}
 						metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
 						s.sendResponse("NO Authentication failed\r\n")
@@ -178,8 +186,7 @@ func (s *ManageSieveSession) handleConnection() {
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
-						remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-						s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
 					}
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
 					s.sendResponse("NO Authentication failed\r\n")
@@ -190,8 +197,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// Record successful attempt
 			if s.server.authLimiter != nil {
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
 			}
 
 			// Check if the context was cancelled during authentication logic
@@ -958,13 +964,22 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 		s.Log("authentication attempt for %s", address.FullAddress())
 
+		// Get connection and proxy info for rate limiting
+		netConn := *s.conn
+		var proxyInfo *server.ProxyProtocolInfo
+		if s.ProxyIP != "" {
+			proxyInfo = &server.ProxyProtocolInfo{
+				SrcIP: s.RemoteIP,
+			}
+		}
+
 		// Apply progressive authentication delay BEFORE any other checks
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL")
 
 		// Check authentication rate limiting after delay
 		if s.server.authLimiter != nil {
-			if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address.FullAddress()); err != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 				s.Log("[SASL PLAIN] rate limited: %v", err)
 				s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
 				return false
@@ -975,8 +990,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		if err != nil {
 			// Record failed attempt
 			if s.server.authLimiter != nil {
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
 			}
 			s.sendResponse("NO Authentication failed\r\n")
 			s.Log("authentication failed")
@@ -985,8 +999,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 		// Record successful attempt
 		if s.server.authLimiter != nil {
-			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
 		}
 
 		targetAddress = &address

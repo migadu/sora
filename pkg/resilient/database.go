@@ -291,57 +291,24 @@ type resilientRow struct {
 // Scan executes the query and scans the result. This is where the retry and
 // circuit breaker logic is actually applied for the query.
 func (r *resilientRow) Scan(dest ...interface{}) error {
-	var scanErr error
-
-	// The retry logic will re-execute this function upon failure.
-	retryErr := retry.WithRetryAdvanced(r.ctx, func() error {
-		queryCtx, cancel := r.rd.withTimeout(r.ctx, timeoutRead)
-		defer cancel()
-
-		// The circuit breaker protects each individual attempt.
-		_, cbErr := r.rd.queryBreaker.Execute(func() (interface{}, error) {
-			var pool *pgxpool.Pool
-			if useMaster, ok := r.ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
-				db := r.rd.getOperationalDatabaseForOperation(true)
-				pool = db.WritePool
-			} else {
-				db := r.rd.getOperationalDatabaseForOperation(false)
-				// For a db.Database object representing a single host, WritePool and ReadPool are the same.
-				// We use ReadPool for semantic clarity.
-				pool = db.ReadPool
-			}
-
-			scanErr = pool.QueryRow(queryCtx, r.sql, r.args...).Scan(dest...)
-
-			// pgx.ErrNoRows is an expected outcome, not a system failure.
-			// We treat it as a success for the circuit breaker so it doesn't trip.
-			if scanErr != nil && !errors.Is(scanErr, pgx.ErrNoRows) {
-				return nil, scanErr // A real error occurred.
-			}
-			return nil, nil // Success (or ErrNoRows).
-		})
-
-		// If the circuit breaker returns an error, check if it's retryable.
-		if cbErr != nil {
-			if r.rd.isRetryableError(cbErr) {
-				log.Printf("Retrying QueryRow due to retryable error: %v", cbErr)
-				return cbErr // Signal to retry.WithRetry to try again.
-			}
-			// It's a non-retryable error (e.g., circuit open), so stop retrying.
-			return retry.Stop(cbErr)
+	op := func(ctx context.Context) (interface{}, error) {
+		var pool *pgxpool.Pool
+		if useMaster, ok := r.ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
+			db := r.rd.getOperationalDatabaseForOperation(true)
+			pool = db.WritePool
+		} else {
+			db := r.rd.getOperationalDatabaseForOperation(false)
+			pool = db.ReadPool
 		}
-
-		// If the circuit breaker reported success, we don't need to retry.
-		return nil
-	}, r.config)
-
-	// If retry.WithRetry failed after all attempts, it returns the last error.
-	if retryErr != nil {
-		return retryErr
+		// The error from Scan (including pgx.ErrNoRows) is returned directly.
+		// The helper will correctly handle pgx.ErrNoRows as a non-retryable error.
+		return nil, pool.QueryRow(ctx, r.sql, r.args...).Scan(dest...)
 	}
 
-	// Otherwise, the operation succeeded. The result of Scan is in scanErr.
-	return scanErr
+	// Use the helper to execute the operation with retries and circuit breaker.
+	// Pass pgx.ErrNoRows as a non-retryable error.
+	_, err := r.rd.executeReadWithRetry(r.ctx, r.config, timeoutRead, op, pgx.ErrNoRows)
+	return err
 }
 
 func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, args ...interface{}) pgx.Row {
@@ -356,37 +323,24 @@ func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, 
 }
 
 func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args ...interface{}) (pgconn.CommandTag, error) {
+	// This operation is now transactional, which is an improvement.
 	config := retry.BackoffConfig{
 		InitialInterval: 1 * time.Second,
 		MaxInterval:     10 * time.Second,
 		Multiplier:      2.0,
 		Jitter:          true,
-		MaxRetries:      2,
+		MaxRetries:      2, // Writes are less safe to retry.
 	}
 
-	var tag pgconn.CommandTag
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return tx.Exec(ctx, sql, args...)
+	}
 
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			t, execErr := rd.getOperationalDatabaseForOperation(true).WritePool.Exec(writeCtx, sql, args...)
-			return t, execErr
-		})
-
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			log.Printf("Retrying exec due to retryable error: %v", cbErr)
-			return cbErr
-		}
-
-		tag = result.(pgconn.CommandTag)
-		return nil
-	}, config)
-
-	return tag, err
+	result, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	return result.(pgconn.CommandTag), nil
 }
 
 func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {
@@ -432,35 +386,11 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		Jitter:          true,
 		MaxRetries:      2,
 	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(writeCtx, tx, address, newHashedPassword)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return nil
-	}, config)
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(ctx, tx, address, newHashedPassword)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	return err
 }
 
 // GetLastServerAddressWithRetry retrieves the last server address a user connected to, with retry logic.
@@ -473,85 +403,34 @@ func (rd *ResilientDatabase) GetLastServerAddressWithRetry(ctx context.Context, 
 		MaxRetries:      3,
 	}
 
-	var lastAddr string
-	var lastTime time.Time
-
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		// This is a read operation.
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			addr, t, err := rd.getOperationalDatabaseForOperation(false).GetLastServerAddress(readCtx, accountID)
-			if err != nil {
-				return nil, err
-			}
-			return []interface{}{addr, t}, nil
-		})
-
-		if cbErr != nil {
-			if errors.Is(cbErr, consts.ErrNoServerAffinity) {
-				return retry.Stop(cbErr) // Not a retryable error.
-			}
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			log.Printf("Retrying GetLastServerAddress for account %d due to retryable error: %v", accountID, cbErr)
-			return cbErr
+	op := func(ctx context.Context) (interface{}, error) {
+		addr, t, err := rd.getOperationalDatabaseForOperation(false).GetLastServerAddress(ctx, accountID)
+		if err != nil {
+			return nil, err
 		}
+		return []interface{}{addr, t}, nil
+	}
 
-		resSlice := result.([]interface{})
-		lastAddr = resSlice[0].(string)
-		lastTime = resSlice[1].(time.Time)
-		return nil
-	}, config)
+	result, err := rd.executeReadWithRetry(ctx, config, timeoutRead, op, consts.ErrNoServerAffinity)
+	if err != nil {
+		return "", time.Time{}, err
+	}
 
-	return lastAddr, lastTime, err
+	resSlice := result.([]interface{})
+	return resSlice[0].(string), resSlice[1].(time.Time), nil
 }
 
 // UpdateLastServerAddressWithRetry updates the last server address a user connected to, with retry logic.
 func (rd *ResilientDatabase) UpdateLastServerAddressWithRetry(ctx context.Context, accountID int64, serverAddr string) error {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      3,
+	config := writeRetryConfig
+	config.MaxRetries = 3 // Can be slightly more aggressive for this simple update.
+
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).UpdateLastServerAddress(ctx, tx, accountID, serverAddr)
 	}
 
-	return retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		// This is a write operation.
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabaseForOperation(true).UpdateLastServerAddress(writeCtx, tx, accountID, serverAddr)
-		})
-
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			log.Printf("Retrying UpdateLastServerAddress for account %d due to retryable error: %v", accountID, cbErr)
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			log.Printf("Retrying UpdateLastServerAddress for account %d due to retryable commit error: %v", accountID, err)
-			return err
-		}
-
-		return nil
-	}, config)
+	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	return err
 }
 
 func (rd *ResilientDatabase) Close() {
@@ -595,70 +474,22 @@ var importExportRetryConfig = retry.BackoffConfig{
 }
 
 func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, userID, mailboxID int64, hash string) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(writeCtx, tx, userID, mailboxID, hash)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		count = result.(int64)
-		return nil
-	}, importExportRetryConfig)
-	return count, err
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(ctx, tx, userID, mailboxID, hash)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64) error {
-	return retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabaseForOperation(true).CompleteS3Upload(writeCtx, tx, hash, accountID)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return nil
-	}, importExportRetryConfig)
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).CompleteS3Upload(ctx, tx, hash, accountID)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
+	return err
 }
 
 // --- Health Status Wrappers ---
@@ -671,32 +502,11 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 		Jitter:          true,
 		MaxRetries:      2,
 	}
-	return retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		_, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(writeCtx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
-		})
-		if cbErr != nil && !rd.isRetryableError(cbErr) {
-			return retry.Stop(cbErr)
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		return cbErr
-	}, config)
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(ctx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	return err
 }
 
 // --- Runtime Failover Implementation ---

@@ -2,7 +2,6 @@ package resilient
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"strings"
@@ -104,25 +103,17 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 		MaxRetries:      4,
 	}
 
-	var reader io.ReadCloser
-	err := retry.WithRetry(ctx, func() error {
-		result, cbErr := rs.getBreaker.Execute(func() (interface{}, error) {
-			r, getErr := rs.storage.Get(key)
-			return r, getErr
-		})
-
-		if cbErr != nil {
-			if rs.isRetryableError(cbErr) {
-				return cbErr
-			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
-		}
-
-		reader = result.(io.ReadCloser)
-		return nil
-	}, config)
-
-	return reader, err
+	op := func() (interface{}, error) {
+		return rs.storage.Get(key)
+	}
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.(io.ReadCloser), nil
 }
 
 func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body io.Reader, size int64) error {
@@ -134,21 +125,11 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 		MaxRetries:      3,
 	}
 
-	return retry.WithRetry(ctx, func() error {
-		_, cbErr := rs.putBreaker.Execute(func() (interface{}, error) {
-			putErr := rs.storage.Put(key, body, size)
-			return nil, putErr
-		})
-
-		if cbErr != nil {
-			if rs.isRetryableError(cbErr) {
-				return cbErr
-			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
-		}
-
-		return nil
-	}, config)
+	op := func() (interface{}, error) {
+		return nil, rs.storage.Put(key, body, size)
+	}
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, op)
+	return err
 }
 
 func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) error {
@@ -160,21 +141,11 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 		MaxRetries:      3,
 	}
 
-	return retry.WithRetry(ctx, func() error {
-		_, cbErr := rs.deleteBreaker.Execute(func() (interface{}, error) {
-			deleteErr := rs.storage.Delete(key)
-			return nil, deleteErr
-		})
-
-		if cbErr != nil {
-			if rs.isRetryableError(cbErr) {
-				return cbErr
-			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
-		}
-
-		return nil
-	}, config)
+	op := func() (interface{}, error) {
+		return nil, rs.storage.Delete(key)
+	}
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, op)
+	return err
 }
 
 func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
@@ -186,24 +157,14 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 		MaxRetries:      3,
 	}
 
-	var info minio.UploadInfo
-	err := retry.WithRetry(ctx, func() error {
-		result, cbErr := rs.putBreaker.Execute(func() (interface{}, error) {
-			uploadInfo, putErr := rs.storage.Client.PutObject(ctx, rs.storage.BucketName, key, reader, objectSize, opts)
-			return uploadInfo, putErr
-		})
-
-		if cbErr != nil {
-			if rs.isRetryableError(cbErr) {
-				return cbErr
-			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
-		}
-
-		info = result.(minio.UploadInfo)
-		return nil
-	}, config)
-
+	op := func() (interface{}, error) {
+		return rs.storage.Client.PutObject(ctx, rs.storage.BucketName, key, reader, objectSize, opts)
+	}
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, op)
+	if err != nil {
+		return minio.UploadInfo{}, err
+	}
+	info := result.(minio.UploadInfo)
 	return info, err
 }
 
@@ -216,26 +177,17 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 		MaxRetries:      4,
 	}
 
-	var object *minio.Object
-	err := retry.WithRetry(ctx, func() error {
-		result, cbErr := rs.getBreaker.Execute(func() (interface{}, error) {
-			obj, getErr := rs.storage.Client.GetObject(ctx, rs.storage.BucketName, key, opts)
-			return obj, getErr
-		})
-
-		if cbErr != nil {
-			if rs.isRetryableError(cbErr) {
-				return cbErr
-			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
-		}
-
-		if result != nil {
-			object = result.(*minio.Object)
-		}
-		return nil
-	}, config)
-
+	op := func() (interface{}, error) {
+		return rs.storage.Client.GetObject(ctx, rs.storage.BucketName, key, opts)
+	}
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	object := result.(*minio.Object)
 	return object, err
 }
 
@@ -248,25 +200,33 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 		MaxRetries:      3,
 	}
 
-	var info minio.ObjectInfo
-	err := retry.WithRetry(ctx, func() error {
-		result, cbErr := rs.getBreaker.Execute(func() (interface{}, error) {
-			objInfo, statErr := rs.storage.Client.StatObject(ctx, rs.storage.BucketName, key, opts)
-			return objInfo, statErr
-		})
+	op := func() (interface{}, error) {
+		return rs.storage.Client.StatObject(ctx, rs.storage.BucketName, key, opts)
+	}
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
+	if err != nil {
+		return minio.ObjectInfo{}, err
+	}
+	info := result.(minio.ObjectInfo)
+	return info, err
+}
 
+// executeS3OperationWithRetry provides a generic wrapper for executing an S3 operation with retries and a circuit breaker.
+func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, op func() (interface{}, error)) (interface{}, error) {
+	var result interface{}
+	err := retry.WithRetry(ctx, func() error {
+		res, cbErr := breaker.Execute(op)
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
-				return cbErr
+				return cbErr // Signal to retry
 			}
-			return fmt.Errorf("circuit breaker error: %w", cbErr)
+			// Use retry.Stop for non-retryable errors to stop the loop immediately.
+			return retry.Stop(cbErr)
 		}
-
-		info = result.(minio.ObjectInfo)
+		result = res
 		return nil
 	}, config)
-
-	return info, err
+	return result, err
 }
 
 func (rs *ResilientS3Storage) GetGetBreakerState() circuitbreaker.State {

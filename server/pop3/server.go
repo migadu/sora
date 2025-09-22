@@ -50,20 +50,19 @@ type POP3Server struct {
 }
 
 type POP3ServerOptions struct {
-	Debug                 bool
-	TLS                   bool
-	TLSCertFile           string
-	TLSKeyFile            string
-	TLSVerify             bool
-	MasterSASLUsername    string
-	MasterSASLPassword    string
-	MaxConnections        int
-	MaxConnectionsPerIP   int
-	ProxyProtocol         bool     // Enable PROXY protocol support
-	ProxyProtocolRequired bool     // Require PROXY protocol headers
-	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
-	TrustedNetworks       []string // Global trusted networks for parameter forwarding
-	AuthRateLimit         serverPkg.AuthRateLimiterConfig
+	Debug                bool
+	TLS                  bool
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSVerify            bool
+	MasterSASLUsername   string
+	MasterSASLPassword   string
+	MaxConnections       int
+	MaxConnectionsPerIP  int
+	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
+	TrustedNetworks      []string // Global trusted networks for parameter forwarding
+	AuthRateLimit        serverPkg.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -84,9 +83,7 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 
-		if !options.ProxyProtocolRequired {
-			proxyConfig.Mode = "optional"
-		}
+		// Proxy protocol is always required when enabled
 
 		var err error
 		proxyReader, err = serverPkg.NewProxyProtocolReader("POP3", proxyConfig)
@@ -96,24 +93,24 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 		}
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := serverPkg.NewAuthRateLimiter("POP3", options.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	server := &POP3Server{
-		hostname:               hostname,
-		addr:                   popAddr,
-		rdb:                    rdb,
-		s3:                     resilientS3,
-		appCtx:                 serverCtx,
-		cancel:                 serverCancel,
-		uploader:               uploadWorker,
-		cache:                  cache,
-		masterSASLUsername:     []byte(options.MasterSASLUsername),
-		masterSASLPassword:     []byte(options.MasterSASLPassword),
-		limiter:                serverPkg.NewConnectionLimiter("POP3", options.MaxConnections, options.MaxConnectionsPerIP),
-		proxyReader:            proxyReader,
-		authLimiter:            authLimiter,
-		trustedNetworks: options.TrustedNetworks,
+		hostname:           hostname,
+		addr:               popAddr,
+		rdb:                rdb,
+		s3:                 resilientS3,
+		appCtx:             serverCtx,
+		cancel:             serverCancel,
+		uploader:           uploadWorker,
+		cache:              cache,
+		masterSASLUsername: []byte(options.MasterSASLUsername),
+		masterSASLPassword: []byte(options.MasterSASLPassword),
+		limiter:            serverPkg.NewConnectionLimiter("POP3", options.MaxConnections, options.MaxConnectionsPerIP),
+		proxyReader:        proxyReader,
+		authLimiter:        authLimiter,
+		trustedNetworks:    options.TrustedNetworks,
 	}
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided

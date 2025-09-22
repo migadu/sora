@@ -24,14 +24,29 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// callback `username`: authentication-identity (user whose credentials are provided)
 			// callback `password`: password for authentication-identity
 
-			// Check authentication rate limiting before attempting any authentication
+			// Get the underlying net.Conn for proxy-aware rate limiting
+			netConn := s.conn.NetConn()
+
+			// Create proxy info from session data
+			var proxyInfo *server.ProxyProtocolInfo
+			if s.ProxyIP != "" {
+				// This is a proxied connection, reconstruct proxy info
+				proxyInfo = &server.ProxyProtocolInfo{
+					SrcIP: s.RemoteIP,
+				}
+			}
+
+			// Apply progressive authentication delay BEFORE any other checks
+			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+			server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-SASL")
+
+			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 				targetUser := username
 				if identity != "" {
 					targetUser = identity // Use authorization identity if provided
 				}
-				if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, targetUser); err != nil {
+				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, targetUser); err != nil {
 					s.Log("[SASL PLAIN] rate limited: %v", err)
 					return &imap.Error{
 						Type: imap.StatusResponseTypeNo,

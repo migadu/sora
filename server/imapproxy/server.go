@@ -19,6 +19,7 @@ import (
 type Server struct {
 	listener           net.Listener
 	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
 	addr               string
 	hostname           string
 	connManager        *proxy.ConnectionManager
@@ -44,6 +45,7 @@ type Server struct {
 
 // ServerOptions holds options for creating a new IMAP proxy server.
 type ServerOptions struct {
+	Name                   string // Server name for logging
 	Addr                   string
 	RemoteAddrs            []string
 	MasterSASLUsername     string
@@ -91,15 +93,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
 		if err != nil {
-			log.Printf("[IMAP Proxy] Failed to initialize prelookup client: %v", err)
+			log.Printf("[IMAP Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
 			if !opts.PreLookup.FallbackDefault {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[IMAP Proxy] Continuing without prelookup due to fallback_to_default=true")
+			log.Printf("[IMAP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[IMAP Proxy] Prelookup database client initialized successfully")
+			log.Printf("[IMAP Proxy %s] Prelookup database client initialized successfully", opts.Name)
 		}
 	}
 
@@ -115,21 +117,22 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[IMAP Proxy] Failed to resolve addresses: %v", err)
+		log.Printf("[IMAP Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid IMAP proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		log.Printf("WARNING: invalid IMAP proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
 		stickiness = 1.0
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("IMAP-PROXY", opts.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
 
 	return &Server{
 		rdb:                rdb,
+		name:               opts.Name,
 		addr:               opts.Addr,
 		hostname:           hostname,
 		connManager:        connManager,
@@ -177,22 +180,22 @@ func (s *Server) Start() error {
 		}
 
 		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for IMAP proxy server (tls_verify=true)")
+			log.Printf("Client TLS certificate verification is REQUIRED for IMAP proxy [%s] (tls_verify=true)", s.name)
 		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for IMAP proxy server (tls_verify=false)")
+			log.Printf("Client TLS certificate verification is DISABLED for IMAP proxy [%s] (tls_verify=false)", s.name)
 		}
 
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* IMAP proxy listening with TLS on %s", s.addr)
+		log.Printf("* IMAP proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		s.listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("* IMAP proxy listening on %s", s.addr)
+		log.Printf("* IMAP proxy [%s] listening on %s", s.name, s.addr)
 	}
 
 	return s.acceptConnections()
@@ -216,7 +219,7 @@ func (s *Server) acceptConnections() error {
 			defer s.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[IMAP Proxy] Session panic recovered: %v", r)
+					log.Printf("[IMAP Proxy %s] Session panic recovered: %v", s.name, r)
 					conn.Close()
 				}
 			}()

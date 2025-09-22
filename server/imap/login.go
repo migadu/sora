@@ -13,15 +13,28 @@ import (
 const MasterUsernameSeparator = "~"
 
 func (s *IMAPSession) Login(address, password string) error {
-	// Create a fake net.Addr from the RemoteIP for rate limiting
-	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+	// Get the underlying net.Conn for proxy-aware rate limiting
+	netConn := s.conn.NetConn()
+
+	// Create proxy info from session data
+	var proxyInfo *server.ProxyProtocolInfo
+	if s.ProxyIP != "" {
+		// This is a proxied connection, reconstruct proxy info
+		proxyInfo = &server.ProxyProtocolInfo{
+			SrcIP: s.RemoteIP,
+			// Note: ProxyIP is not a field in ProxyProtocolInfo,
+			// but GetConnectionIPs will extract the proxy from the connection
+		}
+	}
 
 	// Apply progressive authentication delay BEFORE any other checks
+	// Create a fake net.Addr from the RemoteIP for delay calculation
+	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN")
 
-	// Check authentication rate limiting after delay
+	// Check authentication rate limiting after delay using proxy-aware method
 	if s.server.authLimiter != nil {
-		if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, address); err != nil {
+		if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
 			s.Log("[LOGIN] rate limited: %v", err)
 			// Track rate limiting as a specific error type
 			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
@@ -69,8 +82,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, address.FullAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
 			}
 
 			return nil
@@ -79,8 +91,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		// Record failed master password authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
-			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, authAddress, false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authAddress, false)
 		}
 	}
 
@@ -103,8 +114,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
-			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressSt.FullAddress(), false)
 		}
 
 		return &imap.Error{
@@ -138,8 +148,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	// Record successful authentication
 	if s.server.authLimiter != nil {
-		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, addressSt.FullAddress(), true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressSt.FullAddress(), true)
 	}
 
 	// Trigger cache warmup for the authenticated user

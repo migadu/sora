@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/server/httpapi"
 	"github.com/migadu/sora/server/imap"
@@ -44,114 +44,26 @@ var (
 	date    = "unknown"
 )
 
-func main() {
-	// Handle -v or --version flag before anything else
-	showVersion := flag.Bool("v", false, "Show version information and exit")
-	flag.BoolVar(showVersion, "version", false, "Show version information and exit")
+// serverDependencies encapsulates all shared services and dependencies needed by servers
+type serverDependencies struct {
+	storage       *storage.S3Storage
+	resilientDB   *resilient.ResilientDatabase
+	uploadWorker  *uploader.UploadWorker
+	cacheInstance *cache.Cache
+	cleanupWorker *cleaner.CleanupWorker
+	hostname      string
+	config        config.Config
+}
 
+func main() {
 	errorHandler := errors.NewErrorHandler()
 	cfg := config.NewDefaultConfig()
 
-	// --- Define Command-Line Flags ---
-	// Note: The version flag is defined above to be handled before other flags are parsed
-	// in their final form.
-	// These flags will override values from the config file if set.
-	// Their default values are set from the initial `cfg` for consistent -help messages.
-
-	// Logging flag - its default comes from cfg.LogOutput
-	fLogOutput := flag.String("logoutput", cfg.LogOutput, "Log output destination: 'syslog' or 'stderr' (overrides config)")
-
+	// Parse command-line flags
+	showVersion := flag.Bool("version", false, "Show version information and exit")
+	flag.BoolVar(showVersion, "v", false, "Show version information and exit")
 	configPath := flag.String("config", "config.toml", "Path to TOML configuration file")
-
-	// Database flags - using new read/write split configuration
-	fDbLogQueries := flag.Bool("dblogqueries", cfg.Database.LogQueries, "Log all database queries (overrides config)")
-
-	// S3 flags
-	fS3Endpoint := flag.String("s3endpoint", cfg.S3.Endpoint, "S3 endpoint (overrides config)")
-	fS3AccessKey := flag.String("s3accesskey", cfg.S3.AccessKey, "S3 access key (overrides config)")
-	fS3SecretKey := flag.String("s3secretkey", cfg.S3.SecretKey, "S3 secret key (overrides config)")
-	fS3Bucket := flag.String("s3bucket", cfg.S3.Bucket, "S3 bucket name (overrides config)")
-	fS3Trace := flag.Bool("s3trace", cfg.S3.Trace, "Trace S3 operations (overrides config)")
-
-	// Server enable/address flags
-	fDebug := flag.Bool("debug", cfg.Servers.Debug, "Print all commands and responses (overrides config)")
-	fStartImap := flag.Bool("imap", cfg.Servers.IMAP.Start, "Start the IMAP server (overrides config)")
-	fImapAddr := flag.String("imapaddr", cfg.Servers.IMAP.Addr, "IMAP server address (overrides config)")
-	fStartLmtp := flag.Bool("lmtp", cfg.Servers.LMTP.Start, "Start the LMTP server (overrides config)")
-	fLmtpAddr := flag.String("lmtpaddr", cfg.Servers.LMTP.Addr, "LMTP server address (overrides config)")
-	fStartPop3 := flag.Bool("pop3", cfg.Servers.POP3.Start, "Start the POP3 server (overrides config)")
-	fPop3Addr := flag.String("pop3addr", cfg.Servers.POP3.Addr, "POP3 server address (overrides config)")
-	fStartManageSieve := flag.Bool("managesieve", cfg.Servers.ManageSieve.Start, "Start the ManageSieve server (overrides config)")
-	fManagesieveAddr := flag.String("managesieveaddr", cfg.Servers.ManageSieve.Addr, "ManageSieve server address (overrides config)")
-	fManagesieveInsecureAuth := flag.Bool("managesieveinsecureauth", cfg.Servers.ManageSieve.InsecureAuth, "Allow authentication without TLS (overrides config)")
-	fManagesieveMaxScriptSize := flag.String("managesievescriptsize", cfg.Servers.ManageSieve.MaxScriptSize, "Maximum script size (overrides config)")
-
-	fMasterUsername := flag.String("masterusername", cfg.Servers.IMAP.MasterUsername, "Master username (overrides config)")
-	fMasterPassword := flag.String("masterpassword", cfg.Servers.IMAP.MasterPassword, "Master password (overrides config)")
-	fMasterSASLUsername := flag.String("mastersaslusername", cfg.Servers.IMAP.MasterSASLUsername, "Master SASL username (overrides config)")
-	fMasterSASLPassword := flag.String("mastersaslpassword", cfg.Servers.IMAP.MasterSASLPassword, "Master SASL password (overrides config)")
-
-	// Uploader flags
-	fUploaderPath := flag.String("uploaderpath", cfg.Uploader.Path, "Directory for pending uploads (overrides config)")
-	fUploaderBatchSize := flag.Int("uploaderbatchsize", cfg.Uploader.BatchSize, "Number of files to upload in a single batch (overrides config)")
-	fUploaderConcurrency := flag.Int("uploaderconcurrency", cfg.Uploader.Concurrency, "Number of concurrent upload workers (overrides config)")
-	fUploaderMaxAttempts := flag.Int("uploadermaxattempts", cfg.Uploader.MaxAttempts, "Maximum number of attempts to upload a file (overrides config)")
-	fUploaderRetryInterval := flag.String("uploaderretryinterval", cfg.Uploader.RetryInterval, "Retry interval for failed uploads")
-
-	// Cache flags
-	fCachePath := flag.String("cachedir", cfg.LocalCache.Path, "Local path for storing cached files (overrides config)")
-	fCacheCapacity := flag.String("cachesize", cfg.LocalCache.Capacity, "Disk cache size in Megabytes (overrides config)")
-	fCacheMaxObjectSize := flag.String("cachemaxobject", cfg.LocalCache.MaxObjectSize, "Maximum object size accepted in cache (overrides config)")
-	fCacheMetricsInterval := flag.String("cachemetricsinterval", cfg.LocalCache.MetricsInterval, "Interval for storing cache metrics (overrides config)")
-
-	// LMTP specific
-	fExternalRelay := flag.String("externalrelay", cfg.Servers.LMTP.ExternalRelay, "External relay for LMTP (overrides config)")
-
-	// TLS flags for IMAP
-	fImapTLS := flag.Bool("imaptls", cfg.Servers.IMAP.TLS, "Enable TLS for IMAP (overrides config)")
-	fImapTLSCert := flag.String("imaptlscert", cfg.Servers.IMAP.TLSCertFile, "TLS cert for IMAP (overrides config)")
-	fImapTLSKey := flag.String("imaptlskey", cfg.Servers.IMAP.TLSKeyFile, "TLS key for IMAP (overrides config)")
-	fImapTLSVerify := flag.Bool("imaptlsverify", cfg.Servers.IMAP.TLSVerify, "Verify TLS certificates for IMAP (overrides config)")
-
-	// TLS flags for POP3
-	fPop3TLS := flag.Bool("pop3tls", cfg.Servers.POP3.TLS, "Enable TLS for POP3 (overrides config)")
-	fPop3TLSCert := flag.String("pop3tlscert", cfg.Servers.POP3.TLSCertFile, "TLS cert for POP3 (overrides config)")
-	fPop3TLSKey := flag.String("pop3tlskey", cfg.Servers.POP3.TLSKeyFile, "TLS key for POP3 (overrides config)")
-	fPop3TLSVerify := flag.Bool("pop3tlsverify", cfg.Servers.POP3.TLSVerify, "Verify TLS certificates for POP3 (overrides config)")
-
-	// TLS flags for LMTP
-	fLmtpTLS := flag.Bool("lmtptls", cfg.Servers.LMTP.TLS, "Enable TLS for LMTP (overrides config)")
-	fLmtpTLSUseStartTLS := flag.Bool("lmtpstarttls", cfg.Servers.LMTP.TLSUseStartTLS, "Enable StartTLS for LMTP (overrides config)")
-	fLmtpTLSCert := flag.String("lmtptlscert", cfg.Servers.LMTP.TLSCertFile, "TLS cert for LMTP (overrides config)")
-	fLmtpTLSKey := flag.String("lmtptlskey", cfg.Servers.LMTP.TLSKeyFile, "TLS key for LMTP (overrides config)")
-	fLmtpTLSVerify := flag.Bool("lmtptlsverify", cfg.Servers.LMTP.TLSVerify, "Verify TLS certificates for LMTP (overrides config)")
-
-	// TLS flags for ManageSieve
-	fManageSieveTLS := flag.Bool("managesievetls", cfg.Servers.ManageSieve.TLS, "Enable TLS for ManageSieve (overrides config)")
-	fManageSieveTLSUseStartTLS := flag.Bool("managesievestarttls", cfg.Servers.ManageSieve.TLSUseStartTLS, "Enable StartTLS for ManageSieve (overrides config)")
-	fManageSieveTLSCert := flag.String("managesievetlscert", cfg.Servers.ManageSieve.TLSCertFile, "TLS cert for ManageSieve (overrides config)")
-	fManageSieveTLSKey := flag.String("managesievetlskey", cfg.Servers.ManageSieve.TLSKeyFile, "TLS key for ManageSieve (overrides config)")
-	fManageSieveTLSVerify := flag.Bool("managesievetlsverify", cfg.Servers.ManageSieve.TLSVerify, "Verify TLS certificates for ManageSieve (overrides config)")
-	fHttpapiTLS := flag.Bool("httpapitls", cfg.Servers.HTTPAPI.TLS, "Enable TLS for HTTP API (overrides config)")
-	fHttpapiTLSCert := flag.String("httpapitlscert", cfg.Servers.HTTPAPI.TLSCertFile, "TLS cert for HTTP API (overrides config)")
-	fHttpapiTLSKey := flag.String("httpapitlskey", cfg.Servers.HTTPAPI.TLSKeyFile, "TLS key for HTTP API (overrides config)")
-	fHttpapiTLSVerify := flag.Bool("httpapitlsverify", cfg.Servers.HTTPAPI.TLSVerify, "Verify client TLS certificates for HTTP API (mTLS) (overrides config)")
-
-	// Proxy server flags
-	fStartImapProxy := flag.Bool("imapproxy", cfg.Servers.IMAPProxy.Start, "Start the IMAP proxy server (overrides config)")
-	fImapProxyAddr := flag.String("imapproxyaddr", cfg.Servers.IMAPProxy.Addr, "IMAP proxy server address (overrides config)")
-	fStartPop3Proxy := flag.Bool("pop3proxy", cfg.Servers.POP3Proxy.Start, "Start the POP3 proxy server (overrides config)")
-	fPop3ProxyAddr := flag.String("pop3proxyaddr", cfg.Servers.POP3Proxy.Addr, "POP3 proxy server address (overrides config)")
-	fStartManageSieveProxy := flag.Bool("managesieveproxy", cfg.Servers.ManageSieveProxy.Start, "Start the ManageSieve proxy server (overrides config)")
-	fManageSieveProxyAddr := flag.String("managesieveproxyaddr", cfg.Servers.ManageSieveProxy.Addr, "ManageSieve proxy server address (overrides config)")
-	fStartLmtpProxy := flag.Bool("lmtpproxy", cfg.Servers.LMTPProxy.Start, "Start the LMTP proxy server (overrides config)")
-	fLmtpProxyAddr := flag.String("lmtpproxyaddr", cfg.Servers.LMTPProxy.Addr, "LMTP proxy server address (overrides config)")
-
-	// Metrics flags
-	fMetricsEnabled := flag.Bool("metrics", cfg.Servers.Metrics.Enabled, "Enable metrics server (overrides config)")
-	fMetricsAddr := flag.String("metricsaddr", cfg.Servers.Metrics.Addr, "Metrics server address (overrides config)")
-	fMetricsPath := flag.String("metricspath", cfg.Servers.Metrics.Path, "Metrics endpoint path (overrides config)")
-
+	fLogOutput := flag.String("logoutput", cfg.LogOutput, "Log output destination: 'syslog', 'stderr', 'stdout', or file path")
 	flag.Parse()
 
 	if *showVersion {
@@ -159,36 +71,69 @@ func main() {
 		os.Exit(0)
 	}
 
-	// --- Load Configuration from TOML File ---
-	// Values from the TOML file will override the application defaults.
-	// This is done *before* applying command-line flag overrides for logging,
-	// so the TOML value for LogOutput can be used if the flag isn't set.
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
-		if os.IsNotExist(err) {
-			if isFlagSet("config") { // User explicitly set -config
-				errorHandler.ConfigError(*configPath, err)
-				os.Exit(errorHandler.WaitForExit())
-			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using application defaults and command-line flags.", *configPath)
-			}
-		} else {
-			errorHandler.ConfigError(*configPath, err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-	} else {
-		log.Printf("loaded configuration from %s", *configPath)
-	}
+	// Load and validate configuration
+	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
-	// --- Determine Final Log Output ---
-	// Precedence: 1. Command-line flag, 2. TOML config, 3. Default
-	finalLogOutput := cfg.LogOutput // Start with config file value (or default if no config file)
+	// Apply command-line flag overrides
+	finalLogOutput := cfg.LogOutput
 	if isFlagSet("logoutput") {
-		finalLogOutput = *fLogOutput // Command-line flag overrides
+		finalLogOutput = *fLogOutput
 	}
 
-	// --- Initialize Logging ---
-	// This must be done *after* flags are parsed and config is loaded.
-	var logFile *os.File // Declare here to manage its scope for deferred closing
+	// Initialize logging
+	logFile := initializeLogging(finalLogOutput)
+	if logFile != nil {
+		defer func(f *os.File) {
+			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
+			if err := f.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
+			}
+		}(logFile)
+	}
+
+	// Set up context and signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-signalChan
+		log.Printf("Received signal: %s, shutting down...", sig)
+		cancel()
+	}()
+
+	// Initialize all core services
+	deps, err := initializeServices(ctx, cfg, errorHandler)
+	if err != nil {
+		errorHandler.FatalError("initialize services", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	// Clean up resources on exit
+	if deps.resilientDB != nil {
+		defer deps.resilientDB.Close()
+	}
+	if deps.cacheInstance != nil {
+		defer deps.cacheInstance.Close()
+	}
+
+	// Start all configured servers
+	errChan := startServers(ctx, deps)
+
+	// Wait for shutdown signal or error
+	select {
+	case <-ctx.Done():
+		errorHandler.Shutdown(ctx)
+	case err := <-errChan:
+		errorHandler.FatalError("server operation", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+}
+
+// initializeLogging sets up the logging system based on the configuration
+func initializeLogging(finalLogOutput string) *os.File {
+	var logFile *os.File
 	var initialLogMessage string
 
 	switch finalLogOutput {
@@ -218,7 +163,6 @@ func main() {
 		var openErr error
 		logFile, openErr = os.OpenFile(finalLogOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if openErr != nil {
-			// At this point, log output might still be stderr or the default.
 			log.Printf("WARNING: failed to open log file '%s' (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, finalLogOutput, openErr)
 			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (failed to open log file '%s', selected by '%s').", finalLogOutput, finalLogOutput)
 			logFile = nil // Ensure logFile is nil if open failed
@@ -230,16 +174,6 @@ func main() {
 	}
 	log.Println(initialLogMessage)
 
-	// If logFile was successfully opened, defer its closure.
-	if logFile != nil {
-		defer func(f *os.File) {
-			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
-			if err := f.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
-			}
-		}(logFile)
-	}
-
 	log.Println("")
 	log.Println(" ▗▄▄▖ ▗▄▖ ▗▄▄▖  ▗▄▖  ")
 	log.Println("▐▌   ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌ ")
@@ -247,250 +181,86 @@ func main() {
 	log.Println("▗▄▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌ ")
 	log.Println("")
 
-	// --- Apply Command-Line Flag Overrides (for flags other than logoutput) ---
-	// If a flag was explicitly set on the command line, its value overrides both
-	// application defaults and values from the TOML file.
+	return logFile
+}
 
-	// --- Apply Command-Line Flag Overrides ---
-	// If a flag was explicitly set on the command line, its value overrides both
-	// application defaults and values from the TOML file.
-
-	if isFlagSet("dblogqueries") {
-		cfg.Database.LogQueries = *fDbLogQueries
-	}
-
-	// Cache
-	if isFlagSet("cachesize") {
-		cfg.LocalCache.Capacity = *fCacheCapacity
-	}
-	if isFlagSet("cachedir") {
-		cfg.LocalCache.Path = *fCachePath
-	}
-	if isFlagSet("cachemaxobject") {
-		cfg.LocalCache.MaxObjectSize = *fCacheMaxObjectSize
-	}
-	if isFlagSet("cachemetricsinterval") {
-		cfg.LocalCache.MetricsInterval = *fCacheMetricsInterval
+// loadAndValidateConfig loads configuration from file and validates all server configurations
+func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
+	// Load configuration from TOML file
+	if err := config.LoadConfigFromFile(configPath, cfg); err != nil {
+		if os.IsNotExist(err) {
+			if isFlagSet("config") { // User explicitly set -config
+				errorHandler.ConfigError(configPath, err)
+				os.Exit(errorHandler.WaitForExit())
+			} else {
+				log.Printf("WARNING: default configuration file '%s' not found. Using application defaults.", configPath)
+			}
+		} else {
+			errorHandler.ConfigError(configPath, err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+	} else {
+		log.Printf("loaded configuration from %s", configPath)
 	}
 
-	// S3 Config
-	if isFlagSet("s3endpoint") {
-		cfg.S3.Endpoint = *fS3Endpoint
-	}
-	if isFlagSet("s3accesskey") {
-		cfg.S3.AccessKey = *fS3AccessKey
-	}
-	if isFlagSet("s3secretkey") {
-		cfg.S3.SecretKey = *fS3SecretKey
-	}
-	if isFlagSet("s3bucket") {
-		cfg.S3.Bucket = *fS3Bucket
-	}
-	if isFlagSet("s3trace") {
-		cfg.S3.Trace = *fS3Trace
+	// Get all configured servers
+	allServers := cfg.GetAllServers()
+
+	// Validate all server configurations
+	for _, server := range allServers {
+		if err := server.Validate(); err != nil {
+			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)
+			os.Exit(errorHandler.WaitForExit())
+		}
 	}
 
-	// Metrics
-	if isFlagSet("metrics") {
-		cfg.Servers.Metrics.Enabled = *fMetricsEnabled
-	}
-	if isFlagSet("metricsaddr") {
-		cfg.Servers.Metrics.Addr = *fMetricsAddr
-	}
-	if isFlagSet("metricspath") {
-		cfg.Servers.Metrics.Path = *fMetricsPath
+	// Check for server name conflicts
+	serverNames := make(map[string]bool)
+	serverAddresses := make(map[string]string) // addr -> server name
+	for _, server := range allServers {
+		if serverNames[server.Name] {
+			errorHandler.ValidationError("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", server.Name))
+			os.Exit(errorHandler.WaitForExit())
+		}
+		serverNames[server.Name] = true
+
+		// Check for address conflicts
+		if existingServerName, exists := serverAddresses[server.Addr]; exists {
+			errorHandler.ValidationError("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", server.Addr, existingServerName, server.Name))
+			os.Exit(errorHandler.WaitForExit())
+		}
+		serverAddresses[server.Addr] = server.Name
 	}
 
-	// Servers
-	if isFlagSet("debug") {
-		cfg.Servers.Debug = *fDebug
-	}
-
-	if isFlagSet("imap") {
-		cfg.Servers.IMAP.Start = *fStartImap
-	}
-	if isFlagSet("imapaddr") {
-		cfg.Servers.IMAP.Addr = *fImapAddr
-	}
-	if isFlagSet("lmtp") {
-		cfg.Servers.LMTP.Start = *fStartLmtp
-	}
-	if isFlagSet("lmtpaddr") {
-		cfg.Servers.LMTP.Addr = *fLmtpAddr
-	}
-	if isFlagSet("pop3") {
-		cfg.Servers.POP3.Start = *fStartPop3
-	}
-	if isFlagSet("pop3addr") {
-		cfg.Servers.POP3.Addr = *fPop3Addr
-	}
-	if isFlagSet("managesieve") {
-		cfg.Servers.ManageSieve.Start = *fStartManageSieve
-	}
-	if isFlagSet("managesievescriptsize") {
-		cfg.Servers.ManageSieve.MaxScriptSize = *fManagesieveMaxScriptSize
-	}
-	if isFlagSet("managesieveaddr") {
-		cfg.Servers.ManageSieve.Addr = *fManagesieveAddr
-	}
-	if isFlagSet("managesieveinnsecureauth") {
-		cfg.Servers.ManageSieve.InsecureAuth = *fManagesieveInsecureAuth
-	}
-
-	if isFlagSet("masterusername") {
-		cfg.Servers.IMAP.MasterUsername = *fMasterUsername
-	}
-	if isFlagSet("masterpassword") {
-		cfg.Servers.IMAP.MasterPassword = *fMasterPassword
-	}
-	if isFlagSet("mastersaslusername") {
-		cfg.Servers.IMAP.MasterSASLUsername = *fMasterSASLUsername
-	}
-	if isFlagSet("mastersaslpassword") {
-		cfg.Servers.IMAP.MasterSASLPassword = *fMasterSASLPassword
-	}
-
-	// Upload worker
-	if isFlagSet("uploaderpath") {
-		cfg.Uploader.Path = *fUploaderPath
-	}
-	if isFlagSet("uploaderbatchsize") {
-		cfg.Uploader.BatchSize = *fUploaderBatchSize
-	}
-	if isFlagSet("uploaderconcurrency") {
-		cfg.Uploader.Concurrency = *fUploaderConcurrency
-	}
-	if isFlagSet("uploadermaxattempts") {
-		cfg.Uploader.MaxAttempts = *fUploaderMaxAttempts
-	}
-	if isFlagSet("uploaderretryinterval") {
-		cfg.Uploader.RetryInterval = *fUploaderRetryInterval
-	}
-
-	// LMTP
-	if isFlagSet("externalrelay") {
-		cfg.Servers.LMTP.ExternalRelay = *fExternalRelay
-	}
-
-	// IMAP TLS settings
-	if isFlagSet("imaptls") {
-		cfg.Servers.IMAP.TLS = *fImapTLS
-	}
-	if isFlagSet("imaptlscert") {
-		cfg.Servers.IMAP.TLSCertFile = *fImapTLSCert
-	}
-	if isFlagSet("imaptlskey") {
-		cfg.Servers.IMAP.TLSKeyFile = *fImapTLSKey
-	}
-	if isFlagSet("imaptlsverify") {
-		cfg.Servers.IMAP.TLSVerify = *fImapTLSVerify
-	}
-
-	// POP3 TLS settings
-	if isFlagSet("pop3tls") {
-		cfg.Servers.POP3.TLS = *fPop3TLS
-	}
-	if isFlagSet("pop3tlscert") {
-		cfg.Servers.POP3.TLSCertFile = *fPop3TLSCert
-	}
-	if isFlagSet("pop3tlskey") {
-		cfg.Servers.POP3.TLSKeyFile = *fPop3TLSKey
-	}
-	if isFlagSet("pop3tlsverify") {
-		cfg.Servers.POP3.TLSVerify = *fPop3TLSVerify
-	}
-
-	// LMTP TLS settings
-	if isFlagSet("lmtptls") {
-		cfg.Servers.LMTP.TLS = *fLmtpTLS
-	}
-	if isFlagSet("lmtpstarttls") {
-		cfg.Servers.LMTP.TLSUseStartTLS = *fLmtpTLSUseStartTLS
-	}
-	if isFlagSet("lmtptlscert") {
-		cfg.Servers.LMTP.TLSCertFile = *fLmtpTLSCert
-	}
-	if isFlagSet("lmtptlskey") {
-		cfg.Servers.LMTP.TLSKeyFile = *fLmtpTLSKey
-	}
-	if isFlagSet("lmtptlsverify") {
-		cfg.Servers.LMTP.TLSVerify = *fLmtpTLSVerify
-	}
-
-	// ManageSieve TLS settings
-	if isFlagSet("managesievetls") {
-		cfg.Servers.ManageSieve.TLS = *fManageSieveTLS
-	}
-	if isFlagSet("managesievestarttls") {
-		cfg.Servers.ManageSieve.TLSUseStartTLS = *fManageSieveTLSUseStartTLS
-	}
-	if isFlagSet("managesievetlscert") {
-		cfg.Servers.ManageSieve.TLSCertFile = *fManageSieveTLSCert
-	}
-	if isFlagSet("managesievetlskey") {
-		cfg.Servers.ManageSieve.TLSKeyFile = *fManageSieveTLSKey
-	}
-	if isFlagSet("managesievetlsverify") {
-		cfg.Servers.ManageSieve.TLSVerify = *fManageSieveTLSVerify
-	}
-
-	// HTTP API TLS settings
-	if isFlagSet("httpapitls") {
-		cfg.Servers.HTTPAPI.TLS = *fHttpapiTLS
-	}
-	if isFlagSet("httpapitlscert") {
-		cfg.Servers.HTTPAPI.TLSCertFile = *fHttpapiTLSCert
-	}
-	if isFlagSet("httpapitlskey") {
-		cfg.Servers.HTTPAPI.TLSKeyFile = *fHttpapiTLSKey
-	}
-	if isFlagSet("httpapitlsverify") {
-		cfg.Servers.HTTPAPI.TLSVerify = *fHttpapiTLSVerify
-	}
-
-	// Proxy server settings
-	if isFlagSet("imapproxy") {
-		cfg.Servers.IMAPProxy.Start = *fStartImapProxy
-	}
-	if isFlagSet("imapproxyaddr") {
-		cfg.Servers.IMAPProxy.Addr = *fImapProxyAddr
-	}
-	if isFlagSet("pop3proxy") {
-		cfg.Servers.POP3Proxy.Start = *fStartPop3Proxy
-	}
-	if isFlagSet("pop3proxyaddr") {
-		cfg.Servers.POP3Proxy.Addr = *fPop3ProxyAddr
-	}
-	if isFlagSet("managesieveproxy") {
-		cfg.Servers.ManageSieveProxy.Start = *fStartManageSieveProxy
-	}
-	if isFlagSet("managesieveproxyaddr") {
-		cfg.Servers.ManageSieveProxy.Addr = *fManageSieveProxyAddr
-	}
-	if isFlagSet("lmtpproxy") {
-		cfg.Servers.LMTPProxy.Start = *fStartLmtpProxy
-	}
-	if isFlagSet("lmtpproxyaddr") {
-		cfg.Servers.LMTPProxy.Addr = *fLmtpProxyAddr
-	}
-
-	// --- Application Logic using cfg ---
-
-	// Determine if any mail storage services are enabled, which require S3, cache, uploader, and cleaner.
-	storageServicesNeeded := cfg.Servers.IMAP.Start || cfg.Servers.LMTP.Start || cfg.Servers.POP3.Start
-
-	// Check if any server at all is configured to start.
-	anyServerStarted := storageServicesNeeded || cfg.Servers.ManageSieve.Start ||
-		cfg.Servers.IMAPProxy.Start || cfg.Servers.POP3Proxy.Start ||
-		cfg.Servers.ManageSieveProxy.Start || cfg.Servers.LMTPProxy.Start ||
-		cfg.Servers.HTTPAPI.Start
-
-	if !anyServerStarted {
-		errorHandler.ValidationError("servers", fmt.Errorf("no servers enabled. Please enable at least one server in your configuration"))
+	// Check if any server is configured
+	if len(allServers) == 0 {
+		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in the [[servers]] section"))
 		os.Exit(errorHandler.WaitForExit())
 	}
 
-	var s3storage *storage.S3Storage
+	log.Printf("Found %d configured servers", len(allServers))
+}
+
+// initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
+func initializeServices(ctx context.Context, cfg config.Config, errorHandler *errors.ErrorHandler) (*serverDependencies, error) {
+	hostname, _ := os.Hostname()
+
+	// Determine if any mail storage services are enabled
+	allServers := cfg.GetAllServers()
+	storageServicesNeeded := false
+	for _, server := range allServers {
+		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
+			storageServicesNeeded = true
+			break
+		}
+	}
+
+	deps := &serverDependencies{
+		hostname: hostname,
+		config:   cfg,
+	}
+
+	// Initialize S3 storage if needed
 	if storageServicesNeeded {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
@@ -506,7 +276,7 @@ func main() {
 		}
 		log.Printf("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
 		var err error
-		s3storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())
@@ -514,92 +284,53 @@ func main() {
 
 		// Enable encryption if configured
 		if cfg.S3.Encrypt {
-			if err := s3storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			if err := deps.storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
 				errorHandler.FatalError("enable S3 encryption", err)
 				os.Exit(errorHandler.WaitForExit())
 			}
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle SIGINT and SIGTERM for graceful shutdown
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-signalChan
-		log.Printf("Received signal: %s, shutting down...", sig)
-		cancel()
-	}()
-
 	// Initialize the resilient database with runtime failover
 	log.Printf("Connecting to database with resilient failover configuration")
-
-	resilientDB, err := resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
+	var err error
+	deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 	if err != nil {
 		log.Printf("Failed to initialize resilient database: %v", err)
 		os.Exit(1)
 	}
-	defer resilientDB.Close()
 
 	// Start the new aggregated metrics and health monitoring for all managed pools
-	resilientDB.StartPoolMetrics(ctx)
-	resilientDB.StartPoolHealthMonitoring(ctx)
-
+	deps.resilientDB.StartPoolMetrics(ctx)
+	deps.resilientDB.StartPoolHealthMonitoring(ctx)
 	log.Printf("Database resilience features initialized: failover, circuit breakers, pool monitoring")
-
-	hostname, _ := os.Hostname()
-
-	errChan := make(chan error, 1)
 
 	// Initialize health monitoring
 	log.Printf("Initializing health monitoring...")
-	healthIntegration := health.NewHealthIntegration(resilientDB)
-
-	// Declare workers and cache, they will be initialized only if needed.
-	var cacheInstance *cache.Cache
-	var cleanupWorker *cleaner.CleanupWorker
-	var uploadWorker *uploader.UploadWorker
+	healthIntegration := health.NewHealthIntegration(deps.resilientDB)
 
 	if storageServicesNeeded {
 		log.Println("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
 
 		// Register S3 health check
-		healthIntegration.RegisterS3Check(s3storage)
+		healthIntegration.RegisterS3Check(deps.storage)
 
-		// Initialize the local cache
-		cacheSizeBytes, err := cfg.LocalCache.GetCapacity()
-		if err != nil {
-			errorHandler.ValidationError("cache size", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		maxObjectSizeBytes, err := cfg.LocalCache.GetMaxObjectSize()
-		if err != nil {
-			errorHandler.ValidationError("cache max object size", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		purgeInterval, err := cfg.LocalCache.GetPurgeInterval()
-		if err != nil {
-			errorHandler.ValidationError("cache purge interval", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		orphanCleanupAge, err := cfg.LocalCache.GetOrphanCleanupAge()
-		if err != nil {
-			errorHandler.ValidationError("cache orphan cleanup age", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		cacheInstance, err = cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, resilientDB)
+		// Initialize the local cache using configuration defaulting methods
+		cacheSizeBytes := cfg.LocalCache.GetCapacityWithDefault()
+		maxObjectSizeBytes := cfg.LocalCache.GetMaxObjectSizeWithDefault()
+		purgeInterval := cfg.LocalCache.GetPurgeIntervalWithDefault()
+		orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
+
+		deps.cacheInstance, err = cache.New(cfg.LocalCache.Path, cacheSizeBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, deps.resilientDB)
 		if err != nil {
 			errorHandler.FatalError("initialize cache", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		defer cacheInstance.Close()
-		if err := cacheInstance.SyncFromDisk(); err != nil {
+		if err := deps.cacheInstance.SyncFromDisk(); err != nil {
 			errorHandler.FatalError("sync cache from disk", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		cacheInstance.StartPurgeLoop(ctx)
+		deps.cacheInstance.StartPurgeLoop(ctx)
 
 		// Register cache health check
 		healthIntegration.RegisterCustomCheck(&health.HealthCheck{
@@ -608,8 +339,7 @@ func main() {
 			Timeout:  5 * time.Second,
 			Critical: false,
 			Check: func(ctx context.Context) error {
-				// Check if cache directory is accessible
-				stats, err := cacheInstance.GetStats()
+				stats, err := deps.cacheInstance.GetStats()
 				if err != nil {
 					return fmt.Errorf("cache error: %w", err)
 				}
@@ -620,49 +350,34 @@ func main() {
 			},
 		})
 
-		// Register database failover health check to monitor standby hosts
+		// Register database failover health check
 		healthIntegration.RegisterCustomCheck(&health.HealthCheck{
 			Name:     "database_failover",
-			Interval: 45 * time.Second, // Stagger with other checks
+			Interval: 45 * time.Second,
 			Timeout:  5 * time.Second,
-			Critical: true, // A down primary DB is critical
+			Critical: true,
 			Check: func(ctx context.Context) error {
 				var errorMessages []string
-
-				// Check database connectivity through resilient layer
-				row := resilientDB.QueryRowWithRetry(ctx, "SELECT 1")
+				row := deps.resilientDB.QueryRowWithRetry(ctx, "SELECT 1")
 				var result int
 				if err := row.Scan(&result); err != nil {
 					errorMessages = append(errorMessages, fmt.Sprintf("database connectivity check failed: %v", err))
 				}
-
-				// The health check function should return an error if the component is unhealthy.
-				// The health integration service will then update the status in the database.
 				if len(errorMessages) > 0 {
-					// Returning an error marks the component as unhealthy/degraded.
-					// The error message itself will be stored in the `last_error` column.
 					return fmt.Errorf("%s", strings.Join(errorMessages, "; "))
 				}
-
 				return nil
 			},
 		})
+
 		// Start cache metrics collection
-		metricsInterval, err := cfg.LocalCache.GetMetricsInterval()
-		if err != nil {
-			errorHandler.ValidationError("cache metrics_interval", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		metricsRetention, err := cfg.LocalCache.GetMetricsRetention()
-		if err != nil {
-			errorHandler.ValidationError("cache metrics_retention", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
+		metricsInterval := cfg.LocalCache.GetMetricsIntervalWithDefault()
+		metricsRetention := cfg.LocalCache.GetMetricsRetentionWithDefault()
 
 		log.Printf("[CACHE] starting metrics collection with interval: %v", metricsInterval)
 		go func() {
-			metricsTicker := time.NewTicker(metricsInterval) // Store metrics at configured interval
-			cleanupTicker := time.NewTicker(24 * time.Hour)  // Cleanup old metrics daily
+			metricsTicker := time.NewTicker(metricsInterval)
+			cleanupTicker := time.NewTicker(24 * time.Hour)
 			defer metricsTicker.Stop()
 			defer cleanupTicker.Stop()
 
@@ -671,15 +386,14 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-metricsTicker.C:
-					metrics := cacheInstance.GetMetrics(hostname)
+					metrics := deps.cacheInstance.GetMetrics(hostname)
 					uptimeSeconds := int64(time.Since(metrics.StartTime).Seconds())
 
-					if err := resilientDB.StoreCacheMetricsWithRetry(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
+					if err := deps.resilientDB.StoreCacheMetricsWithRetry(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
 						log.Printf("[CACHE] WARNING: failed to store metrics: %v", err)
 					}
 				case <-cleanupTicker.C:
-					// Cleanup old cache metrics
-					if deleted, err := resilientDB.CleanupOldCacheMetricsWithRetry(ctx, metricsRetention); err != nil {
+					if deleted, err := deps.resilientDB.CleanupOldCacheMetricsWithRetry(ctx, metricsRetention); err != nil {
 						log.Printf("[CACHE] WARNING: failed to cleanup old metrics: %v", err)
 					} else if deleted > 0 {
 						log.Printf("[CACHE] cleaned up %d old cache metrics records", deleted)
@@ -688,285 +402,111 @@ func main() {
 			}
 		}()
 
-		// Initialize and start the cleanup worker
-		gracePeriod, err := cfg.Cleanup.GetGracePeriod()
-		if err != nil {
-			errorHandler.ValidationError("cleanup grace_period duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		wakeInterval, err := cfg.Cleanup.GetWakeInterval()
-		if err != nil {
-			errorHandler.ValidationError("cleanup wake_interval duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		maxAgeRestriction, err := cfg.Cleanup.GetMaxAgeRestriction()
-		if err != nil {
-			errorHandler.ValidationError("cleanup max_age_restriction duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		ftsRetention, err := cfg.Cleanup.GetFTSRetention()
-		if err != nil {
-			errorHandler.ValidationError("cleanup fts_retention duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		authAttemptsRetention, err := cfg.Cleanup.GetAuthAttemptsRetention()
-		if err != nil {
-			errorHandler.ValidationError("cleanup auth_attempts_retention duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		healthStatusRetention, err := cfg.Cleanup.GetHealthStatusRetention()
-		if err != nil {
-			errorHandler.ValidationError("cleanup health_status_retention duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		cleanupWorker = cleaner.New(resilientDB, s3storage, cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
-		cleanupWorker.Start(ctx)
+		// Initialize and start the cleanup worker using configuration defaulting methods
+		gracePeriod := cfg.Cleanup.GetGracePeriodWithDefault()
+		wakeInterval := cfg.Cleanup.GetWakeIntervalWithDefault()
+		maxAgeRestriction := cfg.Cleanup.GetMaxAgeRestrictionWithDefault()
+		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
+		authAttemptsRetention := cfg.Cleanup.GetAuthAttemptsRetentionWithDefault()
+		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
+
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
+		deps.cleanupWorker.Start(ctx)
 
 		// Initialize and start the upload worker
-		retryInterval, err := cfg.Uploader.GetRetryInterval()
-		if err != nil {
-			errorHandler.ValidationError("uploader retry_interval duration", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, resilientDB, s3storage, cacheInstance, errChan)
+		retryInterval := cfg.Uploader.GetRetryIntervalWithDefault()
+		errChan := make(chan error, 1)
+		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, errChan)
 		if err != nil {
 			errorHandler.FatalError("create upload worker", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		uploadWorker.Start(ctx)
+		deps.uploadWorker.Start(ctx)
 	} else {
 		log.Println("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
 	}
 
-	// Start health monitoring (this begins writing to the database)
+	// Start health monitoring
 	healthIntegration.Start(ctx)
-	defer healthIntegration.Stop()
 	log.Printf("Health monitoring started - collecting metrics every 30-60 seconds")
 
-	if cfg.Servers.LMTP.Start {
-		go startLMTPServer(ctx, hostname, cfg.Servers.LMTP.Addr, s3storage, resilientDB, uploadWorker, errChan, cfg)
-	}
-	if cfg.Servers.IMAP.Start {
-		go startIMAPServer(ctx, hostname, cfg.Servers.IMAP.Addr, s3storage, resilientDB, uploadWorker, cacheInstance, errChan, cfg)
-	}
-	if cfg.Servers.POP3.Start {
-		go startPOP3Server(ctx, hostname, cfg.Servers.POP3.Addr, s3storage, resilientDB, uploadWorker, cacheInstance, errChan, cfg)
-	}
-	if cfg.Servers.ManageSieve.Start {
-		go startManageSieveServer(ctx, hostname, cfg.Servers.ManageSieve.Addr, resilientDB, errChan, cfg)
-	}
-
-	// Start metrics server
-	if cfg.Servers.Metrics.Enabled {
-		// Configure metrics collection settings
-		metrics.Configure(
-			cfg.Servers.Metrics.EnableUserMetrics,
-			cfg.Servers.Metrics.EnableDomainMetrics,
-			cfg.Servers.Metrics.UserMetricsThreshold,
-			cfg.Servers.Metrics.MaxTrackedUsers,
-			cfg.Servers.Metrics.HashUsernames,
-		)
-		go startMetricsServer(ctx, cfg.Servers.Metrics, errChan)
-	}
-
-	// Start proxy servers
-	if cfg.Servers.IMAPProxy.Start {
-		go startIMAPProxyServer(ctx, hostname, resilientDB, errChan, cfg)
-	}
-	if cfg.Servers.POP3Proxy.Start {
-		go startPOP3ProxyServer(ctx, hostname, resilientDB, errChan, cfg)
-	}
-	if cfg.Servers.ManageSieveProxy.Start {
-		go startManageSieveProxyServer(ctx, hostname, resilientDB, errChan, cfg)
-	}
-	if cfg.Servers.LMTPProxy.Start {
-		go startLMTPProxyServer(ctx, hostname, resilientDB, errChan, cfg)
-	}
-
-	// Start HTTP API server
-	if cfg.Servers.HTTPAPI.Start {
-		go startHTTPAPIServer(ctx, resilientDB, cacheInstance, errChan, cfg)
-	}
-
-	select {
-	case <-ctx.Done():
-		errorHandler.Shutdown(ctx)
-	case err := <-errChan:
-		errorHandler.FatalError("server operation", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
+	return deps, nil
 }
 
-func startIMAPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
+// startServers starts all configured servers and returns an error channel for monitoring
+func startServers(ctx context.Context, deps *serverDependencies) chan error {
+	errChan := make(chan error, 1)
+	allServers := deps.config.GetAllServers()
 
-	appendLimit, err := config.Servers.IMAP.GetAppendLimit()
-	if err != nil {
-		log.Printf("WARNING: invalid APPENDLIMIT value '%s': %v. Using default of %d.", config.Servers.IMAP.AppendLimit, err, imap.DefaultAppendLimit)
-		appendLimit = imap.DefaultAppendLimit
-	}
-
-	ftsRetention, err := config.Cleanup.GetFTSRetention()
-	if err != nil {
-		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
-		return
-	}
-	s, err := imap.New(ctx, hostname, addr, s3storage, resilientDB, uploadWorker, cacheInstance,
-		imap.IMAPServerOptions{
-			Debug:                 config.Servers.Debug,
-			TLS:                   config.Servers.IMAP.TLS,
-			TLSCertFile:           config.Servers.IMAP.TLSCertFile,
-			TLSKeyFile:            config.Servers.IMAP.TLSKeyFile,
-			TLSVerify:             config.Servers.IMAP.TLSVerify,
-			MasterUsername:        []byte(config.Servers.IMAP.MasterUsername),
-			MasterPassword:        []byte(config.Servers.IMAP.MasterPassword),
-			MasterSASLUsername:    []byte(config.Servers.IMAP.MasterSASLUsername),
-			MasterSASLPassword:    []byte(config.Servers.IMAP.MasterSASLPassword),
-			AppendLimit:           appendLimit,
-			MaxConnections:        config.Servers.IMAP.MaxConnections,
-			MaxConnectionsPerIP:   config.Servers.IMAP.MaxConnectionsPerIP,
-			ProxyProtocol:         config.Servers.ProxyProtocol,
-			ProxyProtocolRequired: config.Servers.ProxyProtocolRequired,
-			ProxyProtocolTimeout:  config.Servers.ProxyProtocolTimeout,
-			TrustedNetworks:       config.Servers.TrustedNetworks,
-			AuthRateLimit:         config.Servers.IMAP.AuthRateLimit,
-			EnableWarmup:          config.LocalCache.EnableWarmup,
-			WarmupMessageCount:    config.LocalCache.WarmupMessageCount,
-			WarmupMailboxes:       config.LocalCache.WarmupMailboxes,
-			WarmupAsync:           config.LocalCache.WarmupAsync,
-			WarmupTimeout:         config.LocalCache.WarmupTimeout,
-			FTSRetention:          ftsRetention,
-		})
-	if err != nil {
-		errChan <- err
-		return
-	}
-
-	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down IMAP server...")
-		s.Close()
-	}()
-
-	if err := s.Serve(addr); err != nil && ctx.Err() == nil {
-		errChan <- err
-	}
-}
-
-func startLMTPServer(ctx context.Context, hostname, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, errChan chan error, config config.Config) {
-	ftsRetention, err := config.Cleanup.GetFTSRetention()
-	if err != nil {
-		errChan <- fmt.Errorf("failed to parse FTS retention: %w", err)
-		return
-	}
-
-	lmtpServer, err := lmtp.New(ctx, hostname, addr, s3storage, resilientDB, uploadWorker, lmtp.LMTPServerOptions{
-		ExternalRelay:         config.Servers.LMTP.ExternalRelay,
-		TLSVerify:             config.Servers.LMTP.TLSVerify,
-		TLS:                   config.Servers.LMTP.TLS,
-		TLSCertFile:           config.Servers.LMTP.TLSCertFile,
-		TLSKeyFile:            config.Servers.LMTP.TLSKeyFile,
-		TLSUseStartTLS:        config.Servers.LMTP.TLSUseStartTLS,
-		Debug:                 config.Servers.Debug,
-		MaxConnections:        config.Servers.LMTP.MaxConnections,
-		MaxConnectionsPerIP:   config.Servers.LMTP.MaxConnectionsPerIP,
-		ProxyProtocol:         config.Servers.ProxyProtocol,
-		ProxyProtocolRequired: config.Servers.ProxyProtocolRequired,
-		ProxyProtocolTimeout:  config.Servers.ProxyProtocolTimeout,
-		TrustedNetworks:       config.Servers.TrustedNetworks,
-		FTSRetention:          ftsRetention,
-	})
-
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
-		return
-	}
-
-	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down LMTP server...")
-		if err := lmtpServer.Close(); err != nil {
-			log.Printf("Error closing LMTP server: %v", err)
+	// Start all configured servers dynamically
+	for _, server := range allServers {
+		// Format server type name for display
+		displayType := ""
+		switch server.Type {
+		case "imap":
+			displayType = "IMAP"
+		case "lmtp":
+			displayType = "LMTP"
+		case "pop3":
+			displayType = "POP3"
+		case "managesieve":
+			displayType = "ManageSieve"
+		case "metrics":
+			displayType = "Metrics"
+		case "imap_proxy":
+			displayType = "IMAP proxy"
+		case "pop3_proxy":
+			displayType = "POP3 proxy"
+		case "managesieve_proxy":
+			displayType = "ManageSieve proxy"
+		case "lmtp_proxy":
+			displayType = "LMTP proxy"
+		case "http_api":
+			displayType = "HTTP API"
+		default:
+			displayType = strings.ToUpper(server.Type)
 		}
-	}()
 
-	lmtpServer.Start(errChan)
-}
-
-func startPOP3Server(ctx context.Context, hostname string, addr string, s3storage *storage.S3Storage, resilientDB *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
-	s, err := pop3.New(ctx, hostname, addr, s3storage, resilientDB, uploadWorker, cacheInstance, pop3.POP3ServerOptions{
-		Debug:                 config.Servers.Debug,
-		TLS:                   config.Servers.POP3.TLS,
-		TLSCertFile:           config.Servers.POP3.TLSCertFile,
-		TLSKeyFile:            config.Servers.POP3.TLSKeyFile,
-		TLSVerify:             config.Servers.POP3.TLSVerify,
-		MasterSASLUsername:    config.Servers.POP3.MasterSASLUsername,
-		MasterSASLPassword:    config.Servers.POP3.MasterSASLPassword,
-		MaxConnections:        config.Servers.POP3.MaxConnections,
-		MaxConnectionsPerIP:   config.Servers.POP3.MaxConnectionsPerIP,
-		ProxyProtocol:         config.Servers.ProxyProtocol,
-		ProxyProtocolRequired: config.Servers.ProxyProtocolRequired,
-		ProxyProtocolTimeout:  config.Servers.ProxyProtocolTimeout,
-		TrustedNetworks:       config.Servers.TrustedNetworks,
-		AuthRateLimit:         config.Servers.POP3.AuthRateLimit,
-	})
-
-	if err != nil {
-		errChan <- err
-		return
+		log.Printf(" * %s [%s] listening on %s", displayType, server.Name, server.Addr)
+		switch server.Type {
+		case "imap":
+			go startDynamicIMAPServer(ctx, deps, server, errChan)
+		case "lmtp":
+			go startDynamicLMTPServer(ctx, deps, server, errChan)
+		case "pop3":
+			go startDynamicPOP3Server(ctx, deps, server, errChan)
+		case "managesieve":
+			go startDynamicManageSieveServer(ctx, deps, server, errChan)
+		case "metrics":
+			// Configure metrics collection settings
+			metrics.Configure(
+				server.EnableUserMetrics,
+				server.EnableDomainMetrics,
+				server.UserMetricsThreshold,
+				server.MaxTrackedUsers,
+				server.HashUsernames,
+			)
+			go startDynamicMetricsServer(ctx, server, errChan)
+		case "imap_proxy":
+			go startDynamicIMAPProxyServer(ctx, deps, server, errChan)
+		case "pop3_proxy":
+			go startDynamicPOP3ProxyServer(ctx, deps, server, errChan)
+		case "managesieve_proxy":
+			go startDynamicManageSieveProxyServer(ctx, deps, server, errChan)
+		case "lmtp_proxy":
+			go startDynamicLMTPProxyServer(ctx, deps, server, errChan)
+		case "http_api":
+			go startDynamicHTTPAPIServer(ctx, deps, server, errChan)
+		default:
+			log.Printf("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
+		}
 	}
 
-	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down POP3 server...")
-		s.Close()
-	}()
-
-	s.Start(errChan)
-}
-
-func startManageSieveServer(ctx context.Context, hostname string, addr string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
-	maxSize, err := config.Servers.ManageSieve.GetMaxScriptSize()
-	if err != nil {
-		log.Printf("WARNING: invalid MANAGESIEVE MAX_SCRIPT_SIZE value '%s': %v. Using default of %d.", config.Servers.ManageSieve.MaxScriptSize, err, managesieve.DefaultMaxScriptSize)
-		maxSize = managesieve.DefaultMaxScriptSize
-	}
-
-	s, err := managesieve.New(ctx, hostname, addr, resilientDB, managesieve.ManageSieveServerOptions{
-		InsecureAuth:          config.Servers.ManageSieve.InsecureAuth,
-		TLSVerify:             config.Servers.ManageSieve.TLSVerify,
-		TLS:                   config.Servers.ManageSieve.TLS,
-		TLSCertFile:           config.Servers.ManageSieve.TLSCertFile,
-		TLSKeyFile:            config.Servers.ManageSieve.TLSKeyFile,
-		TLSUseStartTLS:        config.Servers.ManageSieve.TLSUseStartTLS,
-		Debug:                 config.Servers.Debug,
-		MaxScriptSize:         maxSize,
-		MasterSASLUsername:    config.Servers.ManageSieve.MasterSASLUsername,
-		MasterSASLPassword:    config.Servers.ManageSieve.MasterSASLPassword,
-		MaxConnections:        config.Servers.ManageSieve.MaxConnections,
-		MaxConnectionsPerIP:   config.Servers.ManageSieve.MaxConnectionsPerIP,
-		ProxyProtocol:         config.Servers.ProxyProtocol,
-		ProxyProtocolRequired: config.Servers.ProxyProtocolRequired,
-		ProxyProtocolTimeout:  config.Servers.ProxyProtocolTimeout,
-		TrustedNetworks:       config.Servers.TrustedNetworks,
-		AuthRateLimit:         config.Servers.ManageSieve.AuthRateLimit,
-	})
-
-	if err != nil {
-		errChan <- err
-		return
-	}
-
-	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down ManageSieve server...")
-		s.Close()
-	}()
-
-	s.Start(errChan)
+	return errChan
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol.
-func startConnectionTrackerForProxy(protocol string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *config.ConnectionTrackingConfig, server interface {
+func startConnectionTrackerForProxy(protocol string, serverName string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *config.ConnectionTrackingConfig, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
 	if !trackingConfig.Enabled {
@@ -975,17 +515,17 @@ func startConnectionTrackerForProxy(protocol string, rdb *resilient.ResilientDat
 
 	updateInterval, err := trackingConfig.GetUpdateInterval()
 	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking update_interval '%s': %v. Using default.", trackingConfig.UpdateInterval, err)
+		log.Printf("WARNING: invalid connection_tracking update_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.UpdateInterval, protocol, serverName, err)
 		updateInterval = 10 * time.Second
 	}
 
 	terminationPollInterval, err := trackingConfig.GetTerminationPollInterval()
 	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s': %v. Using default.", trackingConfig.TerminationPollInterval, err)
+		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.TerminationPollInterval, protocol, serverName, err)
 		terminationPollInterval = 30 * time.Second
 	}
 
-	log.Printf("[%s Proxy] Starting connection tracker.", protocol)
+	log.Printf("[%s Proxy %s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		rdb,
@@ -1012,270 +552,182 @@ func isFlagSet(name string) bool {
 	return isSet
 }
 
-func startIMAPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
-	// Parse connection timeout
-	connectTimeout, err := config.Servers.IMAPProxy.GetConnectTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid IMAP proxy connect_timeout '%s': %v. Using default.", config.Servers.IMAPProxy.ConnectTimeout, err)
-		connectTimeout = 30 * time.Second
+// Dynamic server functions
+func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	appendLimit := serverConfig.GetAppendLimitWithDefault()
+	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
-	// Parse affinity validity
-	affinityValidity, err := config.Servers.IMAPProxy.GetAffinityValidity()
-	if err != nil {
-		log.Printf("WARNING: invalid IMAP proxy affinity_validity '%s': %v. Using default.", config.Servers.IMAPProxy.AffinityValidity, err)
-		affinityValidity = 24 * time.Hour
-	}
+	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	// Parse session timeout
-	sessionTimeout, err := config.Servers.IMAPProxy.GetSessionTimeout()
+	s, err := imap.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
+		imap.IMAPServerOptions{
+			Debug:                serverConfig.Debug,
+			TLS:                  serverConfig.TLS,
+			TLSCertFile:          serverConfig.TLSCertFile,
+			TLSKeyFile:           serverConfig.TLSKeyFile,
+			TLSVerify:            serverConfig.TLSVerify,
+			MasterUsername:       []byte(serverConfig.MasterUsername),
+			MasterPassword:       []byte(serverConfig.MasterPassword),
+			MasterSASLUsername:   []byte(serverConfig.MasterSASLUsername),
+			MasterSASLPassword:   []byte(serverConfig.MasterSASLPassword),
+			AppendLimit:          appendLimit,
+			MaxConnections:       serverConfig.MaxConnections,
+			MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
+			ProxyProtocol:        serverConfig.ProxyProtocol,
+			ProxyProtocolTimeout: proxyProtocolTimeout,
+			TrustedNetworks:      deps.config.Servers.TrustedNetworks,
+			AuthRateLimit:        authRateLimit,
+			EnableWarmup:         deps.config.LocalCache.EnableWarmup,
+			WarmupMessageCount:   deps.config.LocalCache.WarmupMessageCount,
+			WarmupMailboxes:      deps.config.LocalCache.WarmupMailboxes,
+			WarmupAsync:          deps.config.LocalCache.WarmupAsync,
+			WarmupTimeout:        deps.config.LocalCache.WarmupTimeout,
+			FTSRetention:         ftsRetention,
+		})
 	if err != nil {
-		log.Printf("WARNING: invalid IMAP proxy session_timeout '%s': %v. Using default.", config.Servers.IMAPProxy.SessionTimeout, err)
-		sessionTimeout = 30 * time.Minute
-	}
-
-	server, err := imapproxy.New(ctx, resilientDB, hostname, imapproxy.ServerOptions{
-		Addr:                   config.Servers.IMAPProxy.Addr,
-		RemoteAddrs:            config.Servers.IMAPProxy.RemoteAddrs,
-		MasterSASLUsername:     config.Servers.IMAPProxy.MasterSASLUsername,
-		MasterSASLPassword:     config.Servers.IMAPProxy.MasterSASLPassword,
-		TLS:                    config.Servers.IMAPProxy.TLS,
-		TLSCertFile:            config.Servers.IMAPProxy.TLSCertFile,
-		TLSKeyFile:             config.Servers.IMAPProxy.TLSKeyFile,
-		TLSVerify:              config.Servers.IMAPProxy.TLSVerify,
-		RemoteTLS:              config.Servers.IMAPProxy.RemoteTLS,
-		RemoteTLSVerify:        config.Servers.IMAPProxy.RemoteTLSVerify,
-		RemoteUseProxyProtocol: config.Servers.IMAPProxy.RemoteUseProxyProtocol,
-		RemoteUseIDCommand:     config.Servers.IMAPProxy.RemoteUseIDCommand,
-		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
-		EnableAffinity:         config.Servers.IMAPProxy.EnableAffinity,
-		AffinityStickiness:     config.Servers.IMAPProxy.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
-		AuthRateLimit:          config.Servers.IMAPProxy.AuthRateLimit,
-		PreLookup:              config.Servers.IMAPProxy.PreLookup,
-	})
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
+		errChan <- err
 		return
-	}
-
-	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("IMAP", resilientDB, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
-		defer tracker.Stop()
 	}
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down IMAP proxy server...")
-		server.Stop()
+		s.Close()
 	}()
 
-	if err := server.Start(); err != nil && ctx.Err() == nil {
-		errChan <- fmt.Errorf("IMAP proxy server error: %w", err)
+	if err := s.Serve(serverConfig.Addr); err != nil {
+		errChan <- err
 	}
 }
 
-func startPOP3ProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
-	// Parse connection timeout
-	connectTimeout, err := config.Servers.POP3Proxy.GetConnectTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid POP3 proxy connect_timeout '%s': %v. Using default.", config.Servers.POP3Proxy.ConnectTimeout, err)
-		connectTimeout = 30 * time.Second
-	}
+func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	// Parse affinity validity
-	affinityValidity, err := config.Servers.POP3Proxy.GetAffinityValidity()
-	if err != nil {
-		log.Printf("WARNING: invalid POP3 proxy affinity_validity '%s': %v. Using default.", config.Servers.POP3Proxy.AffinityValidity, err)
-		affinityValidity = 24 * time.Hour
-	}
-
-	// Parse session timeout
-	sessionTimeout, err := config.Servers.POP3Proxy.GetSessionTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid POP3 proxy session_timeout '%s': %v. Using default.", config.Servers.POP3Proxy.SessionTimeout, err)
-		sessionTimeout = 10 * time.Minute
-	}
-
-	server, err := pop3proxy.New(ctx, hostname, config.Servers.POP3Proxy.Addr, resilientDB, pop3proxy.POP3ProxyServerOptions{
-		RemoteAddrs:            config.Servers.POP3Proxy.RemoteAddrs,
-		MasterSASLUsername:     config.Servers.POP3Proxy.MasterSASLUsername,
-		MasterSASLPassword:     config.Servers.POP3Proxy.MasterSASLPassword,
-		TLS:                    config.Servers.POP3Proxy.TLS,
-		TLSCertFile:            config.Servers.POP3Proxy.TLSCertFile,
-		TLSKeyFile:             config.Servers.POP3Proxy.TLSKeyFile,
-		TLSVerify:              config.Servers.POP3Proxy.TLSVerify,
-		RemoteTLS:              config.Servers.POP3Proxy.RemoteTLS,
-		RemoteTLSVerify:        config.Servers.POP3Proxy.RemoteTLSVerify,
-		RemoteUseProxyProtocol: config.Servers.POP3Proxy.RemoteUseProxyProtocol,
-		RemoteUseXCLIENT:       config.Servers.POP3Proxy.RemoteUseXCLIENT,
-		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
-		Debug:                  config.Servers.Debug,
-		EnableAffinity:         config.Servers.POP3Proxy.EnableAffinity,
-		AffinityStickiness:     config.Servers.POP3Proxy.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
-		AuthRateLimit:          config.Servers.POP3Proxy.AuthRateLimit,
-		PreLookup:              config.Servers.POP3Proxy.PreLookup,
+	lmtpServer, err := lmtp.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+		ExternalRelay:        serverConfig.ExternalRelay,
+		TLSVerify:            serverConfig.TLSVerify,
+		TLS:                  serverConfig.TLS,
+		TLSCertFile:          serverConfig.TLSCertFile,
+		TLSKeyFile:           serverConfig.TLSKeyFile,
+		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
+		Debug:                serverConfig.Debug,
+		MaxConnections:       serverConfig.MaxConnections,
+		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: proxyProtocolTimeout,
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
+		FTSRetention:         ftsRetention,
 	})
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
-		return
-	}
 
-	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("POP3", resilientDB, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
-		defer tracker.Stop()
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
+		return
 	}
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down POP3 proxy server...")
-		server.Stop()
+		log.Println("Shutting down LMTP server...")
+		if err := lmtpServer.Close(); err != nil {
+			log.Printf("Error closing LMTP server: %v", err)
+		}
 	}()
 
-	server.Start()
+	lmtpServer.Start(errChan)
 }
 
-func startManageSieveProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
-	// Parse connection timeout
-	connectTimeout, err := config.Servers.ManageSieveProxy.GetConnectTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid ManageSieve proxy connect_timeout '%s': %v. Using default.", config.Servers.ManageSieveProxy.ConnectTimeout, err)
-		connectTimeout = 30 * time.Second
+func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
-	// Parse affinity validity
-	affinityValidity, err := config.Servers.ManageSieveProxy.GetAffinityValidity()
-	if err != nil {
-		log.Printf("WARNING: invalid ManageSieve proxy affinity_validity '%s': %v. Using default.", config.Servers.ManageSieveProxy.AffinityValidity, err)
-		affinityValidity = 24 * time.Hour
-	}
+	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	// Parse session timeout
-	sessionTimeout, err := config.Servers.ManageSieveProxy.GetSessionTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid ManageSieve proxy session_timeout '%s': %v. Using default.", config.Servers.ManageSieveProxy.SessionTimeout, err)
-		sessionTimeout = 15 * time.Minute
-	}
-
-	server, err := managesieveproxy.New(ctx, resilientDB, hostname, managesieveproxy.ServerOptions{
-		Addr:                   config.Servers.ManageSieveProxy.Addr,
-		RemoteAddrs:            config.Servers.ManageSieveProxy.RemoteAddrs,
-		MasterSASLUsername:     config.Servers.ManageSieveProxy.MasterSASLUsername,
-		MasterSASLPassword:     config.Servers.ManageSieveProxy.MasterSASLPassword,
-		TLS:                    config.Servers.ManageSieveProxy.TLS,
-		TLSCertFile:            config.Servers.ManageSieveProxy.TLSCertFile,
-		TLSKeyFile:             config.Servers.ManageSieveProxy.TLSKeyFile,
-		TLSVerify:              config.Servers.ManageSieveProxy.TLSVerify,
-		RemoteTLS:              config.Servers.ManageSieveProxy.RemoteTLS,
-		RemoteTLSVerify:        config.Servers.ManageSieveProxy.RemoteTLSVerify,
-		RemoteUseProxyProtocol: config.Servers.ManageSieveProxy.RemoteUseProxyProtocol,
-		RemoteUseXCLIENT:       config.Servers.ManageSieveProxy.RemoteUseXCLIENT,
-		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
-		AuthRateLimit:          config.Servers.ManageSieveProxy.AuthRateLimit,
-		PreLookup:              config.Servers.ManageSieveProxy.PreLookup,
-		EnableAffinity:         config.Servers.ManageSieveProxy.EnableAffinity,
-		AffinityStickiness:     config.Servers.ManageSieveProxy.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
+	s, err := pop3.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
+		Debug:                serverConfig.Debug,
+		TLS:                  serverConfig.TLS,
+		TLSCertFile:          serverConfig.TLSCertFile,
+		TLSKeyFile:           serverConfig.TLSKeyFile,
+		TLSVerify:            serverConfig.TLSVerify,
+		MasterSASLUsername:   serverConfig.MasterSASLUsername,
+		MasterSASLPassword:   serverConfig.MasterSASLPassword,
+		MaxConnections:       serverConfig.MaxConnections,
+		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: proxyProtocolTimeout,
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
+		AuthRateLimit:        authRateLimit,
 	})
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
-		return
-	}
 
-	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", resilientDB, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
-		defer tracker.Stop()
+	if err != nil {
+		errChan <- err
+		return
 	}
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down ManageSieve proxy server...")
-		server.Stop()
+		log.Println("Shutting down POP3 server...")
+		s.Close()
 	}()
 
-	server.Start()
+	s.Start(errChan)
 }
 
-func startLMTPProxyServer(ctx context.Context, hostname string, resilientDB *resilient.ResilientDatabase, errChan chan error, config config.Config) {
-	// Parse connection timeout
-	connectTimeout, err := config.Servers.LMTPProxy.GetConnectTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid LMTP proxy connect_timeout '%s': %v. Using default.", config.Servers.LMTPProxy.ConnectTimeout, err)
-		connectTimeout = 30 * time.Second
+func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	maxSize := serverConfig.GetMaxScriptSizeWithDefault()
+
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
-	// Parse affinity validity
-	affinityValidity, err := config.Servers.LMTPProxy.GetAffinityValidity()
-	if err != nil {
-		log.Printf("WARNING: invalid LMTP proxy affinity_validity '%s': %v. Using default.", config.Servers.LMTPProxy.AffinityValidity, err)
-		affinityValidity = 24 * time.Hour
-	}
+	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	// Parse session timeout
-	sessionTimeout, err := config.Servers.LMTPProxy.GetSessionTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid LMTP proxy session_timeout '%s': %v. Using default.", config.Servers.LMTPProxy.SessionTimeout, err)
-		sessionTimeout = 5 * time.Minute
-	}
-
-	// Parse max message size
-	maxMessageSize, err := config.Servers.LMTPProxy.GetMaxMessageSize()
-	if err != nil {
-		log.Printf("WARNING: invalid LMTP proxy max_message_size '%s': %v. Using default.", config.Servers.LMTPProxy.MaxMessageSize, err)
-		maxMessageSize = 52428800 // 50MiB
-	}
-
-	server, err := lmtpproxy.New(ctx, resilientDB, hostname, lmtpproxy.ServerOptions{
-		Addr:                   config.Servers.LMTPProxy.Addr,
-		RemoteAddrs:            config.Servers.LMTPProxy.RemoteAddrs,
-		TLS:                    config.Servers.LMTPProxy.TLS,
-		TLSCertFile:            config.Servers.LMTPProxy.TLSCertFile,
-		TLSKeyFile:             config.Servers.LMTPProxy.TLSKeyFile,
-		TLSVerify:              config.Servers.LMTPProxy.TLSVerify,
-		RemoteTLS:              config.Servers.LMTPProxy.RemoteTLS,
-		RemoteTLSVerify:        config.Servers.LMTPProxy.RemoteTLSVerify,
-		RemoteUseProxyProtocol: config.Servers.LMTPProxy.RemoteUseProxyProtocol,
-		RemoteUseXCLIENT:       config.Servers.LMTPProxy.RemoteUseXCLIENT,
-		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
-		EnableAffinity:         config.Servers.LMTPProxy.EnableAffinity,
-		AffinityStickiness:     config.Servers.LMTPProxy.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
-		PreLookup:              config.Servers.LMTPProxy.PreLookup,
-		MaxMessageSize:         maxMessageSize,
+	s, err := managesieve.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
+		InsecureAuth:         serverConfig.InsecureAuth,
+		TLSVerify:            serverConfig.TLSVerify,
+		TLS:                  serverConfig.TLS,
+		TLSCertFile:          serverConfig.TLSCertFile,
+		TLSKeyFile:           serverConfig.TLSKeyFile,
+		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
+		Debug:                serverConfig.Debug,
+		MaxScriptSize:        maxSize,
+		MasterSASLUsername:   serverConfig.MasterSASLUsername,
+		MasterSASLPassword:   serverConfig.MasterSASLPassword,
+		MaxConnections:       serverConfig.MaxConnections,
+		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: proxyProtocolTimeout,
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
+		AuthRateLimit:        authRateLimit,
 	})
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)
-		return
-	}
 
-	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("LMTP", resilientDB, hostname, &config.Servers.ConnectionTracking, server); tracker != nil {
-		defer tracker.Stop()
+	if err != nil {
+		errChan <- err
+		return
 	}
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down LMTP proxy server...")
-		server.Stop()
+		log.Println("Shutting down ManageSieve server...")
+		s.Close()
 	}()
 
-	server.Start()
+	s.Start(errChan)
 }
 
-// startMetricsServer starts the Prometheus metrics HTTP server
-func startMetricsServer(ctx context.Context, config config.MetricsConfig, errChan chan error) {
-	log.Printf("Starting metrics server on %s%s", config.Addr, config.Path)
+func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerConfig, errChan chan error) {
 
 	mux := http.NewServeMux()
-	mux.Handle(config.Path, promhttp.Handler())
+	mux.Handle(serverConfig.Path, promhttp.Handler())
 
 	server := &http.Server{
-		Addr:    config.Addr,
+		Addr:    serverConfig.Addr,
 		Handler: mux,
 	}
 
@@ -1294,23 +746,226 @@ func startMetricsServer(ctx context.Context, config config.MetricsConfig, errCha
 	}
 }
 
-// startHTTPAPIServer starts the HTTP API server
-func startHTTPAPIServer(ctx context.Context, rdb *resilient.ResilientDatabase, cacheInstance *cache.Cache, errChan chan error, config config.Config) {
-	if config.Servers.HTTPAPI.APIKey == "" {
-		errChan <- fmt.Errorf("HTTP API server enabled but no API key configured")
+func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
+	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
+	}
+
+	server, err := imapproxy.New(ctx, deps.resilientDB, deps.hostname, imapproxy.ServerOptions{
+		Name:                   serverConfig.Name,
+		Addr:                   serverConfig.Addr,
+		RemoteAddrs:            serverConfig.RemoteAddrs,
+		MasterSASLUsername:     serverConfig.MasterSASLUsername,
+		MasterSASLPassword:     serverConfig.MasterSASLPassword,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSVerify:              serverConfig.TLSVerify,
+		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
+		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
+		RemoteUseIDCommand:     serverConfig.RemoteUseIDCommand,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		EnableAffinity:         serverConfig.EnableAffinity,
+		AffinityStickiness:     serverConfig.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		AuthRateLimit:          authRateLimit,
+		PreLookup:              serverConfig.PreLookup,
+		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+	})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
+		return
+	}
+
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+		defer tracker.Stop()
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down IMAP proxy server...")
+		server.Stop()
+	}()
+
+	if err := server.Start(); err != nil && ctx.Err() == nil {
+		errChan <- fmt.Errorf("IMAP proxy server error: %w", err)
+	}
+}
+
+func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
+	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
+	}
+
+	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
+		Name:                   serverConfig.Name,
+		RemoteAddrs:            serverConfig.RemoteAddrs,
+		MasterSASLUsername:     serverConfig.MasterSASLUsername,
+		MasterSASLPassword:     serverConfig.MasterSASLPassword,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSVerify:              serverConfig.TLSVerify,
+		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
+		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		Debug:                  serverConfig.Debug,
+		EnableAffinity:         serverConfig.EnableAffinity,
+		AffinityStickiness:     serverConfig.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		AuthRateLimit:          authRateLimit,
+		PreLookup:              serverConfig.PreLookup,
+		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+	})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
+		return
+	}
+
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+		defer tracker.Stop()
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down POP3 proxy server...")
+		server.Stop()
+	}()
+
+	server.Start()
+}
+
+func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
+	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+
+	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
+	}
+
+	server, err := managesieveproxy.New(ctx, deps.resilientDB, deps.hostname, managesieveproxy.ServerOptions{
+		Name:                   serverConfig.Name,
+		Addr:                   serverConfig.Addr,
+		RemoteAddrs:            serverConfig.RemoteAddrs,
+		MasterSASLUsername:     serverConfig.MasterSASLUsername,
+		MasterSASLPassword:     serverConfig.MasterSASLPassword,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSVerify:              serverConfig.TLSVerify,
+		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
+		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		AuthRateLimit:          authRateLimit,
+		PreLookup:              serverConfig.PreLookup,
+		EnableAffinity:         serverConfig.EnableAffinity,
+		AffinityStickiness:     serverConfig.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+	})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
+		return
+	}
+
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+		defer tracker.Stop()
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down ManageSieve proxy server...")
+		server.Stop()
+	}()
+
+	server.Start()
+}
+
+func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
+	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
+
+	server, err := lmtpproxy.New(ctx, deps.resilientDB, deps.hostname, lmtpproxy.ServerOptions{
+		Name:                   serverConfig.Name,
+		Addr:                   serverConfig.Addr,
+		RemoteAddrs:            serverConfig.RemoteAddrs,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSVerify:              serverConfig.TLSVerify,
+		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
+		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
+		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
+		ConnectTimeout:         connectTimeout,
+		SessionTimeout:         sessionTimeout,
+		EnableAffinity:         serverConfig.EnableAffinity,
+		AffinityStickiness:     serverConfig.AffinityStickiness,
+		AffinityValidity:       affinityValidity,
+		PreLookup:              serverConfig.PreLookup,
+		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+		MaxMessageSize:         maxMessageSize,
+	})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)
+		return
+	}
+
+	// Start connection tracker if enabled.
+	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+		defer tracker.Stop()
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down LMTP proxy server...")
+		server.Stop()
+	}()
+
+	server.Start()
+}
+
+func startDynamicHTTPAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	if serverConfig.APIKey == "" {
+		log.Printf("WARNING: HTTP API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
 		return
 	}
 
 	options := httpapi.ServerOptions{
-		Addr:         config.Servers.HTTPAPI.Addr,
-		APIKey:       config.Servers.HTTPAPI.APIKey,
-		AllowedHosts: config.Servers.HTTPAPI.AllowedHosts,
-		Cache:        cacheInstance,
-		TLS:          config.Servers.HTTPAPI.TLS,
-		TLSCertFile:  config.Servers.HTTPAPI.TLSCertFile,
-		TLSKeyFile:   config.Servers.HTTPAPI.TLSKeyFile,
-		TLSVerify:    config.Servers.HTTPAPI.TLSVerify,
+		Addr:         serverConfig.Addr,
+		APIKey:       serverConfig.APIKey,
+		AllowedHosts: serverConfig.AllowedHosts,
+		Cache:        deps.cacheInstance,
+		TLS:          serverConfig.TLS,
+		TLSCertFile:  serverConfig.TLSCertFile,
+		TLSKeyFile:   serverConfig.TLSKeyFile,
+		TLSVerify:    serverConfig.TLSVerify,
 	}
 
-	httpapi.Start(ctx, rdb, options, errChan)
+	httpapi.Start(ctx, deps.resilientDB, options, errChan)
 }

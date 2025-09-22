@@ -52,6 +52,9 @@ type AuthDatabase interface {
 type AuthLimiter interface {
 	CanAttemptAuth(ctx context.Context, remoteAddr net.Addr, username string) error
 	RecordAuthAttempt(ctx context.Context, remoteAddr net.Addr, username string, success bool)
+	// New methods with proxy awareness
+	CanAttemptAuthWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string) error
+	RecordAuthAttemptWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string, success bool)
 	GetStats(ctx context.Context, windowDuration time.Duration) map[string]interface{}
 	Stop()
 }
@@ -61,6 +64,9 @@ type AuthRateLimiter struct {
 	config   AuthRateLimiterConfig
 	db       AuthDatabase
 	protocol string
+
+	// Trusted networks for exemption
+	trustedNetworks []string
 
 	// Fast IP blocking cache
 	blockedIPs map[string]*BlockedIPInfo
@@ -103,6 +109,11 @@ type IPFailureInfo struct {
 
 // NewAuthRateLimiter creates a new authentication rate limiter.
 func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig, rdb AuthDatabase) *AuthRateLimiter {
+	return NewAuthRateLimiterWithTrustedNetworks(protocol, config, rdb, nil)
+}
+
+// NewAuthRateLimiterWithTrustedNetworks creates a new authentication rate limiter with trusted networks exemption.
+func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimiterConfig, rdb AuthDatabase, trustedNetworks []string) *AuthRateLimiter {
 	if !config.Enabled {
 		return nil
 	}
@@ -111,6 +122,7 @@ func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig, rdb AuthD
 		config:           config,
 		db:               rdb,
 		protocol:         protocol,
+		trustedNetworks:  trustedNetworks,
 		blockedIPs:       make(map[string]*BlockedIPInfo),
 		ipFailureCounts:  make(map[string]*IPFailureInfo),
 		pendingRecords:   make([]AuthAttempt, 0, config.MaxPendingBatch),
@@ -178,6 +190,79 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 	}
 
 	return nil
+}
+
+// CanAttemptAuthWithProxy checks if authentication can be attempted with proper proxy IP detection
+func (a *AuthRateLimiter) CanAttemptAuthWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string) error {
+	if a == nil {
+		return nil
+	}
+
+	// Extract real client IP and proxy IP
+	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
+
+	// Check if the real client IP is from a trusted network
+	if a.isFromTrustedNetwork(clientIP) {
+		if proxyIP != "" {
+			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting for trusted client %s via proxy %s", a.protocol, clientIP, proxyIP)
+		} else {
+			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting for trusted client %s", a.protocol, clientIP)
+		}
+		return nil
+	}
+
+	// Use the real client IP for rate limiting
+	clientAddr := &StringAddr{Addr: clientIP}
+	return a.CanAttemptAuth(ctx, clientAddr, username)
+}
+
+// RecordAuthAttemptWithProxy records an authentication attempt with proper proxy IP detection
+func (a *AuthRateLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string, success bool) {
+	if a == nil {
+		return
+	}
+
+	// Extract real client IP and proxy IP
+	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
+
+	// Check if the real client IP is from a trusted network
+	if a.isFromTrustedNetwork(clientIP) {
+		if proxyIP != "" {
+			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting recording for trusted client %s via proxy %s", a.protocol, clientIP, proxyIP)
+		} else {
+			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting recording for trusted client %s", a.protocol, clientIP)
+		}
+		return
+	}
+
+	// Use the real client IP for rate limiting
+	clientAddr := &StringAddr{Addr: clientIP}
+	a.RecordAuthAttempt(ctx, clientAddr, username, success)
+}
+
+// isFromTrustedNetwork checks if an IP address is in the trusted networks
+func (a *AuthRateLimiter) isFromTrustedNetwork(ipStr string) bool {
+	if len(a.trustedNetworks) == 0 {
+		return false
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	// Check against trusted networks
+	for _, cidr := range a.trustedNetworks {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // RecordAuthAttempt records an authentication attempt with fast blocking and delays

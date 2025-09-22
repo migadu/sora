@@ -113,23 +113,22 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
-	Debug                 bool
-	TLS                   bool
-	TLSCertFile           string
-	TLSKeyFile            string
-	TLSVerify             bool
-	MasterUsername        []byte
-	MasterPassword        []byte
-	MasterSASLUsername    []byte
-	MasterSASLPassword    []byte
-	AppendLimit           int64
-	MaxConnections        int
-	MaxConnectionsPerIP   int
-	ProxyProtocol         bool     // Enable PROXY protocol support
-	ProxyProtocolRequired bool     // Require PROXY protocol headers
-	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
-	TrustedNetworks       []string // Global trusted networks for parameter forwarding
-	AuthRateLimit         serverPkg.AuthRateLimiterConfig
+	Debug                bool
+	TLS                  bool
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSVerify            bool
+	MasterUsername       []byte
+	MasterPassword       []byte
+	MasterSASLUsername   []byte
+	MasterSASLPassword   []byte
+	AppendLimit          int64
+	MaxConnections       int
+	MaxConnectionsPerIP  int
+	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
+	TrustedNetworks      []string // Global trusted networks for parameter forwarding
+	AuthRateLimit        serverPkg.AuthRateLimiterConfig
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -162,9 +161,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 
-		if !options.ProxyProtocolRequired {
-			proxyConfig.Mode = "optional"
-		}
+		// Proxy protocol is always required when enabled
 
 		var err error
 		proxyReader, err = serverPkg.NewProxyProtocolReader("IMAP", proxyConfig)
@@ -173,8 +170,8 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 		}
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := serverPkg.NewAuthRateLimiter("IMAP", options.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	// Parse warmup timeout with default fallback
 	warmupTimeout := 5 * time.Minute // Default timeout

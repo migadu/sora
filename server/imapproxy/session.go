@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -126,8 +125,6 @@ func (s *Session) handleConnection() {
 			}
 			continue
 		}
-
-		log.Printf("[IMAP Proxy] Client %s: %s", clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
 		switch command {
 		case "LOGIN":
@@ -299,12 +296,14 @@ func (s *Session) authenticateUser(username, password string) error {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
+	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := s.clientConn.RemoteAddr()
+	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-PROXY")
 
-	// Check if the authentication attempt is allowed by the rate limiter.
-	if err := s.server.authLimiter.CanAttemptAuth(s.ctx, remoteAddr, username); err != nil {
-		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
-		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, nil, username); err != nil {
+		// Don't record as auth failure - this is rate limiting, not authentication failure
+		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
 	}
 
@@ -329,7 +328,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
-				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
 				metrics.TrackDomainConnection("imap_proxy", address.Domain())
 				metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
@@ -338,7 +337,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
 				log.Printf("[IMAP Proxy] Prelookup authentication failed for %s (bad password)", username)
-				s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
@@ -353,14 +352,14 @@ func (s *Session) authenticateUser(username, password string) error {
 	log.Printf("[IMAP Proxy] Authenticating user %s via main database", username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
-		s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, false)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
 	s.accountID = accountID
 	s.isPrelookupAccount = false // Authenticated against the main DB
-	s.server.authLimiter.RecordAuthAttempt(s.ctx, remoteAddr, username, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()

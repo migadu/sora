@@ -217,13 +217,22 @@ func (s *POP3Session) handleConnection() {
 
 			s.Log("authentication attempt for %s", userAddress.FullAddress())
 
+			// Get connection and proxy info for rate limiting
+			netConn := *s.conn
+			var proxyInfo *server.ProxyProtocolInfo
+			if s.ProxyIP != "" {
+				proxyInfo = &server.ProxyProtocolInfo{
+					SrcIP: s.RemoteIP,
+				}
+			}
+
 			// Apply progressive authentication delay BEFORE any other checks
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 			server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PASS")
 
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
-				if err := s.server.authLimiter.CanAttemptAuth(ctx, remoteAddr, userAddress.FullAddress()); err != nil {
+				if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress()); err != nil {
 					s.Log("[PASS] rate limited: %v", err)
 					// Track rate limiting
 					metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
@@ -247,8 +256,7 @@ func (s *POP3Session) handleConnection() {
 						s.Log("[PASS] Failed to get account ID for master user '%s': %v", userAddress.FullAddress(), err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
-							remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-							s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, userAddress.FullAddress(), false)
+							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
 						}
 						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 							s.Log("authentication failed")
@@ -265,8 +273,7 @@ func (s *POP3Session) handleConnection() {
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
-						remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-						s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, userAddress.FullAddress(), false)
+						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
 					}
 					// Track failed authentication
 					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
@@ -282,8 +289,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Record successful attempt
 			if s.server.authLimiter != nil {
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, userAddress.FullAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), true)
 			}
 
 			// This is a potential write operation.
@@ -1301,13 +1307,22 @@ func (s *POP3Session) handleConnection() {
 
 				s.Log("authentication attempt for %s", address.FullAddress())
 
+				// Get connection and proxy info for rate limiting
+				netConn := *s.conn
+				var proxyInfo *server.ProxyProtocolInfo
+				if s.ProxyIP != "" {
+					proxyInfo = &server.ProxyProtocolInfo{
+						SrcIP: s.RemoteIP,
+					}
+				}
+
 				// Apply progressive authentication delay BEFORE any other checks
 				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 				server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-SASL")
 
 				// Check authentication rate limiting after delay
 				if s.server.authLimiter != nil {
-					if err := s.server.authLimiter.CanAttemptAuth(ctx, remoteAddr, address.FullAddress()); err != nil {
+					if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 						s.Log("[SASL PLAIN] rate limited: %v", err)
 						if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
 							return
@@ -1320,8 +1335,7 @@ func (s *POP3Session) handleConnection() {
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
-						remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-						s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, address.FullAddress(), false)
+						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)
 					}
 					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 						s.Log("authentication failed")
@@ -1332,8 +1346,7 @@ func (s *POP3Session) handleConnection() {
 
 				// Record successful attempt
 				if s.server.authLimiter != nil {
-					remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-					s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, address.FullAddress(), true)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), true)
 				}
 			}
 

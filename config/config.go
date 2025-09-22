@@ -2,9 +2,13 @@ package config
 
 import (
 	"fmt"
+	"log"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -578,24 +582,90 @@ type HTTPAPIConfig struct {
 	TLSVerify    bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
 }
 
+// ServerConfig represents a single server instance
+type ServerConfig struct {
+	Type string `toml:"type"`
+	Name string `toml:"name"`
+	Addr string `toml:"addr"`
+
+	// Common server options
+	TLS         bool   `toml:"tls,omitempty"`
+	TLSCertFile string `toml:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `toml:"tls_key_file,omitempty"`
+	TLSVerify   bool   `toml:"tls_verify,omitempty"`
+	Debug       bool   `toml:"debug,omitempty"` // Enable debug logging for this server
+
+	// PROXY protocol support (for non-proxy servers)
+	ProxyProtocol        bool   `toml:"proxy_protocol,omitempty"`
+	ProxyProtocolTimeout string `toml:"proxy_protocol_timeout,omitempty"`
+
+	// Connection limits
+	MaxConnections      int `toml:"max_connections,omitempty"`
+	MaxConnectionsPerIP int `toml:"max_connections_per_ip,omitempty"`
+
+	// IMAP specific
+	AppendLimit        string `toml:"append_limit,omitempty"`
+	MasterUsername     string `toml:"master_username,omitempty"`
+	MasterPassword     string `toml:"master_password,omitempty"`
+	MasterSASLUsername string `toml:"master_sasl_username,omitempty"`
+	MasterSASLPassword string `toml:"master_sasl_password,omitempty"`
+
+	// LMTP specific
+	ExternalRelay  string `toml:"external_relay,omitempty"`
+	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
+
+	// ManageSieve specific
+	MaxScriptSize string `toml:"max_script_size,omitempty"`
+	InsecureAuth  bool   `toml:"insecure_auth,omitempty"`
+
+	// Proxy specific
+	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
+	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
+	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
+	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
+	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
+	SessionTimeout         string   `toml:"session_timeout,omitempty"`
+	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
+	AffinityStickiness     float64  `toml:"affinity_stickiness,omitempty"`
+	AffinityValidity       string   `toml:"affinity_validity,omitempty"`
+	MaxMessageSize         string   `toml:"max_message_size,omitempty"`
+
+	// HTTP API specific
+	APIKey       string   `toml:"api_key,omitempty"`
+	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
+
+	// Metrics specific
+	Path                 string `toml:"path,omitempty"`
+	EnableUserMetrics    bool   `toml:"enable_user_metrics,omitempty"`
+	EnableDomainMetrics  bool   `toml:"enable_domain_metrics,omitempty"`
+	UserMetricsThreshold int    `toml:"user_metrics_threshold,omitempty"`
+	MaxTrackedUsers      int    `toml:"max_tracked_users,omitempty"`
+	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
+
+	// Auth rate limiting (embedded)
+	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+
+	// Pre-lookup (embedded)
+	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
-	Debug                 bool                         `toml:"debug"`
-	ProxyProtocol         bool                         `toml:"proxy_protocol"`          // Enable PROXY protocol support globally
-	ProxyProtocolRequired bool                         `toml:"proxy_protocol_required"` // Require PROXY protocol headers
-	ProxyProtocolTimeout  string                       `toml:"proxy_protocol_timeout"`  // Timeout for reading PROXY headers
-	TrustedNetworks       []string                     `toml:"trusted_networks"`        // Global trusted networks for proxy parameter forwarding
-	IMAP                  IMAPServerConfig             `toml:"imap"`
-	LMTP                  LMTPServerConfig             `toml:"lmtp"`
-	POP3                  POP3ServerConfig             `toml:"pop3"`
-	ManageSieve           ManageSieveServerConfig      `toml:"managesieve"`
-	IMAPProxy             IMAPProxyServerConfig        `toml:"imap_proxy"`
-	POP3Proxy             POP3ProxyServerConfig        `toml:"pop3_proxy"`
-	ManageSieveProxy      ManageSieveProxyServerConfig `toml:"managesieve_proxy"`
-	LMTPProxy             LMTPProxyServerConfig        `toml:"lmtp_proxy"`
-	ConnectionTracking    ConnectionTrackingConfig     `toml:"connection_tracking"`
-	Metrics               MetricsConfig                `toml:"metrics"`
-	HTTPAPI               HTTPAPIConfig                `toml:"http_api"`
+	TrustedNetworks []string `toml:"trusted_networks"` // Global trusted networks for proxy parameter forwarding
+
+	IMAP               IMAPServerConfig             `toml:"imap,omitempty"`
+	LMTP               LMTPServerConfig             `toml:"lmtp,omitempty"`
+	POP3               POP3ServerConfig             `toml:"pop3,omitempty"`
+	ManageSieve        ManageSieveServerConfig      `toml:"managesieve,omitempty"`
+	IMAPProxy          IMAPProxyServerConfig        `toml:"imap_proxy,omitempty"`
+	POP3Proxy          POP3ProxyServerConfig        `toml:"pop3_proxy,omitempty"`
+	ManageSieveProxy   ManageSieveProxyServerConfig `toml:"managesieve_proxy,omitempty"`
+	LMTPProxy          LMTPProxyServerConfig        `toml:"lmtp_proxy,omitempty"`
+	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
+	Metrics            MetricsConfig                `toml:"metrics"`
+	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
 }
 
 // Config holds all configuration for the application.
@@ -607,6 +677,9 @@ type Config struct {
 	Cleanup    CleanupConfig    `toml:"cleanup"`
 	Servers    ServersConfig    `toml:"servers"`
 	Uploader   UploaderConfig   `toml:"uploader"`
+
+	// Dynamic server instances (top-level array)
+	DynamicServers []ServerConfig `toml:"server"`
 }
 
 // NewDefaultConfig creates a Config struct with default values.
@@ -674,11 +747,7 @@ func NewDefaultConfig() Config {
 			WarmupAsync:        true,
 		},
 		Servers: ServersConfig{
-			Debug:                 false,
-			ProxyProtocol:         false,
-			ProxyProtocolRequired: true,
-			ProxyProtocolTimeout:  "5s",
-			TrustedNetworks:       []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+			TrustedNetworks: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 			IMAP: IMAPServerConfig{
 				Start:               true,
 				Addr:                ":143",
@@ -973,4 +1042,382 @@ func (c *LMTPProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
 		return 5 * time.Minute, nil // Default: 5 minutes for LMTP (delivery sessions)
 	}
 	return helpers.ParseDuration(c.SessionTimeout)
+}
+
+// Helper methods for ServerConfig
+func (s *ServerConfig) GetAppendLimit() (int64, error) {
+	if s.AppendLimit == "" {
+		return 25 * 1024 * 1024, nil // 25MB default
+	}
+	return helpers.ParseSize(s.AppendLimit)
+}
+
+func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
+	if s.MaxScriptSize == "" {
+		return 16 * 1024, nil // 16KB default
+	}
+	return helpers.ParseSize(s.MaxScriptSize)
+}
+
+func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
+	if s.ConnectTimeout == "" {
+		return 30 * time.Second, nil
+	}
+	return helpers.ParseDuration(s.ConnectTimeout)
+}
+
+func (s *ServerConfig) GetSessionTimeout() (time.Duration, error) {
+	if s.SessionTimeout == "" {
+		// Default timeouts based on server type
+		switch s.Type {
+		case "imap", "imap_proxy":
+			return 30 * time.Minute, nil
+		case "pop3", "pop3_proxy":
+			return 10 * time.Minute, nil
+		case "managesieve", "managesieve_proxy":
+			return 15 * time.Minute, nil
+		case "lmtp", "lmtp_proxy":
+			return 5 * time.Minute, nil
+		default:
+			return 30 * time.Minute, nil
+		}
+	}
+	return helpers.ParseDuration(s.SessionTimeout)
+}
+
+func (s *ServerConfig) GetAffinityValidity() (time.Duration, error) {
+	if s.AffinityValidity == "" {
+		return 24 * time.Hour, nil
+	}
+	return helpers.ParseDuration(s.AffinityValidity)
+}
+
+func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
+	if s.MaxMessageSize == "" {
+		return 52428800, nil // 50MB default
+	}
+	return helpers.ParseSize(s.MaxMessageSize)
+}
+
+func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
+	if s.ProxyProtocolTimeout == "" {
+		return 5 * time.Second, nil // 5 second default
+	}
+	return helpers.ParseDuration(s.ProxyProtocolTimeout)
+}
+
+// Configuration defaulting methods with logging
+func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
+	limit, err := s.GetAppendLimit()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
+		return 25 * 1024 * 1024 // 25MB default
+	}
+	return limit
+}
+
+func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
+	size, err := s.GetMaxScriptSize()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
+		return 16 * 1024 // 16KB default
+	}
+	return size
+}
+
+func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetConnectTimeout()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
+		return 30 * time.Second
+	}
+	return timeout
+}
+
+func (s *ServerConfig) GetSessionTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetSessionTimeout()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse session timeout for server '%s': %v, using default", s.Name, err)
+		// Return type-specific defaults
+		switch s.Type {
+		case "imap", "imap_proxy":
+			return 30 * time.Minute
+		case "pop3", "pop3_proxy":
+			return 10 * time.Minute
+		case "managesieve", "managesieve_proxy":
+			return 15 * time.Minute
+		case "lmtp", "lmtp_proxy":
+			return 5 * time.Minute
+		default:
+			return 30 * time.Minute
+		}
+	}
+	return timeout
+}
+
+func (s *ServerConfig) GetAffinityValidityWithDefault() time.Duration {
+	validity, err := s.GetAffinityValidity()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse affinity validity for server '%s': %v, using default (24h)", s.Name, err)
+		return 24 * time.Hour
+	}
+	return validity
+}
+
+func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
+	size, err := s.GetMaxMessageSize()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
+		return 52428800 // 50MB default
+	}
+	return size
+}
+
+func (s *ServerConfig) GetProxyProtocolTimeoutWithDefault() string {
+	if s.ProxyProtocolTimeout == "" {
+		return "5s"
+	}
+	return s.ProxyProtocolTimeout
+}
+
+// Configuration defaulting methods for other config types
+func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
+	period, err := c.GetGracePeriod()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup grace_period: %v, using default (14 days)", err)
+		return 14 * 24 * time.Hour
+	}
+	return period
+}
+
+func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
+	interval, err := c.GetWakeInterval()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
+		return time.Hour
+	}
+	return interval
+}
+
+func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
+	restriction, err := c.GetMaxAgeRestriction()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
+		return 0
+	}
+	return restriction
+}
+
+func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
+	retention, err := c.GetFTSRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (2 years)", err)
+		return 730 * 24 * time.Hour
+	}
+	return retention
+}
+
+func (c *CleanupConfig) GetAuthAttemptsRetentionWithDefault() time.Duration {
+	retention, err := c.GetAuthAttemptsRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup auth_attempts_retention: %v, using default (7 days)", err)
+		return 7 * 24 * time.Hour
+	}
+	return retention
+}
+
+func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
+	retention, err := c.GetHealthStatusRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
+		return 30 * 24 * time.Hour
+	}
+	return retention
+}
+
+func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
+	capacity, err := c.GetCapacity()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache size: %v, using default (1GB)", err)
+		return 1024 * 1024 * 1024 // 1GB
+	}
+	return capacity
+}
+
+func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
+	size, err := c.GetMaxObjectSize()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache max object size: %v, using default (5MB)", err)
+		return 5 * 1024 * 1024 // 5MB
+	}
+	return size
+}
+
+func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
+	interval, err := c.GetPurgeInterval()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache purge interval: %v, using default (12 hours)", err)
+		return 12 * time.Hour
+	}
+	return interval
+}
+
+func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
+	age, err := c.GetOrphanCleanupAge()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
+		return 30 * 24 * time.Hour
+	}
+	return age
+}
+
+func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
+	interval, err := c.GetMetricsInterval()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
+		return 5 * time.Minute
+	}
+	return interval
+}
+
+func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
+	retention, err := c.GetMetricsRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cache metrics_retention: %v, using default (30 days)", err)
+		return 30 * 24 * time.Hour
+	}
+	return retention
+}
+
+func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
+	interval, err := c.GetRetryInterval()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
+		return 30 * time.Second
+	}
+	return interval
+}
+
+func (c *ConnectionTrackingConfig) GetUpdateIntervalWithDefault() time.Duration {
+	interval, err := c.GetUpdateInterval()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking update_interval '%s': %v. Using default.", c.UpdateInterval, err)
+		return 10 * time.Second
+	}
+	return interval
+}
+
+func (c *ConnectionTrackingConfig) GetTerminationPollIntervalWithDefault() time.Duration {
+	interval, err := c.GetTerminationPollInterval()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s': %v. Using default.", c.TerminationPollInterval, err)
+		return 30 * time.Second
+	}
+	return interval
+}
+
+// IsEnabled checks if a server should be started based on its configuration
+func (s *ServerConfig) IsEnabled() bool {
+	return s.Type != "" && s.Name != "" && s.Addr != ""
+}
+
+// ValidateServerConfig validates a server configuration
+func (s *ServerConfig) Validate() error {
+	if s.Type == "" {
+		return fmt.Errorf("server type is required")
+	}
+	if s.Name == "" {
+		return fmt.Errorf("server name is required")
+	}
+	if s.Addr == "" {
+		return fmt.Errorf("server address is required")
+	}
+
+	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_api"}
+	isValidType := false
+	for _, validType := range validTypes {
+		if s.Type == validType {
+			isValidType = true
+			break
+		}
+	}
+	if !isValidType {
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+	}
+
+	return nil
+}
+
+// GetAllServers returns all configured servers from the dynamic configuration
+func (c *Config) GetAllServers() []ServerConfig {
+	var allServers []ServerConfig
+
+	// Add dynamic servers
+	for _, server := range c.DynamicServers {
+		if server.IsEnabled() {
+			allServers = append(allServers, server)
+		}
+	}
+
+	return allServers
+}
+
+// LoadConfigFromFile loads configuration from a TOML file and trims whitespace from all string fields
+func LoadConfigFromFile(configPath string, cfg *Config) error {
+	_, err := toml.DecodeFile(configPath, cfg)
+	if err != nil {
+		return err
+	}
+
+	// Trim whitespace from all string fields in the configuration
+	trimStringFields(reflect.ValueOf(cfg).Elem())
+	return nil
+}
+
+// trimStringFields recursively trims whitespace from all string fields in a struct
+func trimStringFields(v reflect.Value) {
+	if !v.IsValid() || !v.CanSet() {
+		return
+	}
+
+	switch v.Kind() {
+	case reflect.String:
+		// Trim whitespace from string fields
+		v.SetString(strings.TrimSpace(v.String()))
+
+	case reflect.Slice:
+		// Handle slices of strings and slices of structs
+		for i := 0; i < v.Len(); i++ {
+			elem := v.Index(i)
+			if elem.Kind() == reflect.String {
+				elem.SetString(strings.TrimSpace(elem.String()))
+			} else {
+				trimStringFields(elem)
+			}
+		}
+
+	case reflect.Struct:
+		// Recursively process struct fields
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			if field.CanSet() {
+				trimStringFields(field)
+			}
+		}
+
+	case reflect.Ptr:
+		// Handle pointers to structs
+		if !v.IsNil() {
+			trimStringFields(v.Elem())
+		}
+
+	case reflect.Interface:
+		// Handle interface{} values (like the Port field which can be string or int)
+		if !v.IsNil() {
+			elem := v.Elem()
+			if elem.Kind() == reflect.String {
+				v.Set(reflect.ValueOf(strings.TrimSpace(elem.String())))
+			}
+		}
+	}
 }

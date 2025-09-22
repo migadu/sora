@@ -6,408 +6,221 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/pkg/retry"
 )
 
 // --- HTTP API Wrappers ---
 
-// apiRetryConfig provides a default retry strategy for HTTP API handlers.
-var apiRetryConfig = retry.BackoffConfig{
-	InitialInterval: 200 * time.Millisecond,
-	MaxInterval:     2 * time.Second,
-	Multiplier:      1.8,
-	Jitter:          true,
-	MaxRetries:      3,
-}
-
 func (rd *ResilientDatabase) AccountExistsWithRetry(ctx context.Context, email string) (bool, error) {
-	var exists bool
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).AccountExists(readCtx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		exists = result.(bool)
-		return nil
-	}, apiRetryConfig)
-	return exists, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).AccountExists(ctx, email)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
 }
 
 func (rd *ResilientDatabase) GetActiveConnectionsWithRetry(ctx context.Context) ([]db.ConnectionInfo, error) {
-	var connections []db.ConnectionInfo
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetActiveConnections(readCtx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			connections = result.([]db.ConnectionInfo)
-		}
-		return nil
-	}, apiRetryConfig)
-	return connections, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetActiveConnections(ctx)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.ConnectionInfo{}, nil
+	}
+	return result.([]db.ConnectionInfo), nil
 }
 
 func (rd *ResilientDatabase) MarkConnectionsForTerminationWithRetry(ctx context.Context, criteria db.TerminationCriteria) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(true).MarkConnectionsForTermination(writeCtx, tx, criteria)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		count = result.(int64)
-		return nil
-	}, apiRetryConfig)
-	return count, err
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(true).MarkConnectionsForTermination(ctx, tx, criteria)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, apiRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) GetConnectionStatsWithRetry(ctx context.Context) (*db.ConnectionStats, error) {
-	var stats *db.ConnectionStats
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetConnectionStats(readCtx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(*db.ConnectionStats)
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetConnectionStats(ctx)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.(*db.ConnectionStats), nil
 }
 
 func (rd *ResilientDatabase) GetUserConnectionsWithRetry(ctx context.Context, email string) ([]db.ConnectionInfo, error) {
-	var connections []db.ConnectionInfo
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetUserConnections(readCtx, email)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			connections = result.([]db.ConnectionInfo)
-		}
-		return nil
-	}, apiRetryConfig)
-	return connections, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetUserConnections(ctx, email)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.ConnectionInfo{}, nil
+	}
+	return result.([]db.ConnectionInfo), nil
 }
 
 func (rd *ResilientDatabase) GetLatestCacheMetricsWithRetry(ctx context.Context) ([]*db.CacheMetricsRecord, error) {
-	var metrics []*db.CacheMetricsRecord
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetLatestCacheMetrics(readCtx)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			metrics = result.([]*db.CacheMetricsRecord)
-		}
-		return nil
-	}, apiRetryConfig)
-	return metrics, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetLatestCacheMetrics(ctx)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []*db.CacheMetricsRecord{}, nil
+	}
+	return result.([]*db.CacheMetricsRecord), nil
 }
 
 func (rd *ResilientDatabase) GetCacheMetricsWithRetry(ctx context.Context, instanceID string, since time.Time, limit int) ([]*db.CacheMetricsRecord, error) {
-	var metrics []*db.CacheMetricsRecord
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetCacheMetrics(readCtx, instanceID, since, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			metrics = result.([]*db.CacheMetricsRecord)
-		}
-		return nil
-	}, apiRetryConfig)
-	return metrics, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetCacheMetrics(ctx, instanceID, since, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []*db.CacheMetricsRecord{}, nil
+	}
+	return result.([]*db.CacheMetricsRecord), nil
 }
 
 func (rd *ResilientDatabase) GetSystemHealthOverviewWithRetry(ctx context.Context, hostname string) (*db.SystemHealthOverview, error) {
-	var overview *db.SystemHealthOverview
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetSystemHealthOverview(readCtx, hostname)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			overview = result.(*db.SystemHealthOverview)
-		}
-		return nil
-	}, apiRetryConfig)
-	return overview, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetSystemHealthOverview(ctx, hostname)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.(*db.SystemHealthOverview), nil
 }
 
 func (rd *ResilientDatabase) GetAllHealthStatusesWithRetry(ctx context.Context, hostname string) ([]*db.HealthStatus, error) {
-	var statuses []*db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetAllHealthStatuses(readCtx, hostname)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			statuses = result.([]*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return statuses, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetAllHealthStatuses(ctx, hostname)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []*db.HealthStatus{}, nil
+	}
+	return result.([]*db.HealthStatus), nil
 }
 
 func (rd *ResilientDatabase) GetHealthHistoryWithRetry(ctx context.Context, hostname, component string, since time.Time, limit int) ([]*db.HealthStatus, error) {
-	var history []*db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetHealthHistory(readCtx, hostname, component, since, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			history = result.([]*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return history, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetHealthHistory(ctx, hostname, component, since, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []*db.HealthStatus{}, nil
+	}
+	return result.([]*db.HealthStatus), nil
 }
 
 func (rd *ResilientDatabase) GetHealthStatusWithRetry(ctx context.Context, hostname, component string) (*db.HealthStatus, error) {
-	var status *db.HealthStatus
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetHealthStatus(readCtx, hostname, component)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			status = result.(*db.HealthStatus)
-		}
-		return nil
-	}, apiRetryConfig)
-	return status, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetHealthStatus(ctx, hostname, component)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.(*db.HealthStatus), nil
 }
 
 func (rd *ResilientDatabase) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
-	var stats *db.UploaderStats
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetUploaderStats(readCtx, maxAttempts)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(*db.UploaderStats)
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetUploaderStats(ctx, maxAttempts)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.(*db.UploaderStats), nil
 }
 
 func (rd *ResilientDatabase) GetFailedUploadsWithRetry(ctx context.Context, maxAttempts, limit int) ([]db.PendingUpload, error) {
-	var uploads []db.PendingUpload
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetFailedUploads(readCtx, maxAttempts, limit)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			uploads = result.([]db.PendingUpload)
-		}
-		return nil
-	}, apiRetryConfig)
-	return uploads, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetFailedUploads(ctx, maxAttempts, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.PendingUpload{}, nil
+	}
+	return result.([]db.PendingUpload), nil
 }
 
 func (rd *ResilientDatabase) GetAuthAttemptsStatsWithRetry(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
-	var stats map[string]interface{}
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetAuthAttemptsStats(readCtx, windowDuration)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			stats = result.(map[string]interface{})
-		}
-		return nil
-	}, apiRetryConfig)
-	return stats, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetAuthAttemptsStats(ctx, windowDuration)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return map[string]interface{}{}, nil
+	}
+	return result.(map[string]interface{}), nil
 }
 
 func (rd *ResilientDatabase) CleanupStaleConnectionsWithRetry(ctx context.Context, staleDuration time.Duration) (int64, error) {
-	var count int64
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
-		if err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
-		}
-		defer tx.Rollback(ctx)
-
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(true).CleanupStaleConnections(writeCtx, tx, staleDuration)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		count = result.(int64)
-		return nil
-	}, adminRetryConfig)
-	return count, err
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(true).CleanupStaleConnections(ctx, tx, staleDuration)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) GetBlockedIPsWithRetry(ctx context.Context, ipWindow, usernameWindow time.Duration, maxAttemptsIP, maxAttemptsUsername int) ([]map[string]interface{}, error) {
-	var blocked []map[string]interface{}
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
-
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
-			return rd.getOperationalDatabaseForOperation(false).GetBlockedIPs(readCtx, ipWindow, usernameWindow, maxAttemptsIP, maxAttemptsUsername)
-		})
-		if cbErr != nil {
-			if !rd.isRetryableError(cbErr) {
-				return retry.Stop(cbErr)
-			}
-			return cbErr
-		}
-		if result != nil {
-			blocked = result.([]map[string]interface{})
-		} else {
-			blocked = nil
-		}
-		return nil
-	}, adminRetryConfig)
-	return blocked, err
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetBlockedIPs(ctx, ipWindow, usernameWindow, maxAttemptsIP, maxAttemptsUsername)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []map[string]interface{}{}, nil
+	}
+	return result.([]map[string]interface{}), nil
 }

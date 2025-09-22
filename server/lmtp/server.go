@@ -41,6 +41,9 @@ type LMTPServerBackend struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Trusted networks for connection filtering
+	trustedNetworks []*net.IPNet
+
 	// Sieve script caching
 	sieveCache           *SieveScriptCache
 	defaultSieveExecutor sieveengine.Executor
@@ -50,20 +53,19 @@ type LMTPServerBackend struct {
 }
 
 type LMTPServerOptions struct {
-	ExternalRelay         string
-	Debug                 bool
-	TLS                   bool
-	TLSCertFile           string
-	TLSKeyFile            string
-	TLSVerify             bool
-	TLSUseStartTLS        bool
-	MaxConnections        int
-	MaxConnectionsPerIP   int
-	ProxyProtocol         bool     // Enable PROXY protocol support
-	ProxyProtocolRequired bool     // Require PROXY protocol headers
-	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
-	TrustedNetworks       []string // Global trusted networks for parameter forwarding
-	FTSRetention          time.Duration
+	ExternalRelay        string
+	Debug                bool
+	TLS                  bool
+	TLSCertFile          string
+	TLSKeyFile           string
+	TLSVerify            bool
+	TLSUseStartTLS       bool
+	MaxConnections       int
+	MaxConnectionsPerIP  int
+	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
+	TrustedNetworks      []string // Global trusted networks for parameter forwarding
+	FTSRetention         time.Duration
 }
 
 func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -78,9 +80,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 
-		if !options.ProxyProtocolRequired {
-			proxyConfig.Mode = "optional"
-		}
+		// Proxy protocol is always required when enabled
 
 		var err error
 		proxyReader, err = server.NewProxyProtocolReader("LMTP", proxyConfig)
@@ -165,6 +165,9 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 	}
 	s.XCLIENTTrustedNets = trustedNets
 
+	// Store trusted networks in backend for connection filtering
+	backend.trustedNetworks = trustedNets
+
 	// Configure StartTLS if enabled and TLS config is available
 	if options.TLSUseStartTLS && backend.tlsConfig != nil {
 		s.TLSConfig = backend.tlsConfig
@@ -191,7 +194,44 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 	return backend, nil
 }
 
+// isFromTrustedNetwork checks if an IP address is from a trusted network
+func (b *LMTPServerBackend) isFromTrustedNetwork(ip net.IP) bool {
+	for _, network := range b.trustedNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	// Check if connection is from a trusted network
+	remoteAddr := c.Conn().RemoteAddr()
+	var ip net.IP
+	switch addr := remoteAddr.(type) {
+	case *net.TCPAddr:
+		ip = addr.IP
+	case *net.UDPAddr:
+		ip = addr.IP
+	default:
+		// Try to parse as string
+		host, _, err := net.SplitHostPort(remoteAddr.String())
+		if err != nil {
+			log.Printf("[LMTP] Connection rejected from %s: invalid address format", remoteAddr)
+			return nil, fmt.Errorf("invalid remote address format")
+		}
+		ip = net.ParseIP(host)
+		if ip == nil {
+			log.Printf("[LMTP] Connection rejected from %s: could not parse IP", remoteAddr)
+			return nil, fmt.Errorf("could not parse remote IP address")
+		}
+	}
+
+	if !b.isFromTrustedNetwork(ip) {
+		log.Printf("[LMTP] Connection rejected from %s: not from trusted network", ip)
+		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
+	}
+
 	// Check connection limits
 	releaseConn, err := b.limiter.Accept(c.Conn().RemoteAddr())
 	if err != nil {

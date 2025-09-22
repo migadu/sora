@@ -19,6 +19,7 @@ import (
 type Server struct {
 	listener           net.Listener
 	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
 	addr               string
 	hostname           string
 	masterSASLUsername []byte
@@ -44,6 +45,7 @@ type Server struct {
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
 type ServerOptions struct {
+	Name                   string // Server name for logging
 	Addr                   string
 	RemoteAddrs            []string
 	MasterSASLUsername     string
@@ -104,21 +106,22 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[ManageSieve Proxy] Failed to resolve addresses: %v", err)
+		log.Printf("[ManageSieve Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid ManageSieve proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		log.Printf("WARNING: invalid ManageSieve proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
 		stickiness = 1.0
 	}
 
-	// Initialize authentication rate limiter
-	authLimiter := server.NewAuthRateLimiter("SIEVE-PROXY", opts.AuthRateLimit, rdb)
+	// Initialize authentication rate limiter with trusted networks
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
 
 	return &Server{
 		rdb:                rdb,
+		name:               opts.Name,
 		addr:               opts.Addr,
 		hostname:           hostname,
 		masterSASLUsername: []byte(opts.MasterSASLUsername),
@@ -166,22 +169,22 @@ func (s *Server) Start() error {
 		}
 
 		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for ManageSieve proxy server (tls_verify=true)")
+			log.Printf("Client TLS certificate verification is REQUIRED for ManageSieve proxy [%s] (tls_verify=true)", s.name)
 		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for ManageSieve proxy server (tls_verify=false)")
+			log.Printf("Client TLS certificate verification is DISABLED for ManageSieve proxy [%s] (tls_verify=false)", s.name)
 		}
 
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* ManageSieve proxy listening with TLS on %s", s.addr)
+		log.Printf("* ManageSieve proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		s.listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("* ManageSieve proxy listening on %s", s.addr)
+		log.Printf("* ManageSieve proxy [%s] listening on %s", s.name, s.addr)
 	}
 
 	return s.acceptConnections()
@@ -205,7 +208,7 @@ func (s *Server) acceptConnections() error {
 			defer s.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[ManageSieve Proxy] Session panic recovered: %v", r)
+					log.Printf("[ManageSieve Proxy %s] Session panic recovered: %v", s.name, r)
 					conn.Close()
 				}
 			}()

@@ -11,6 +11,7 @@ import (
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -18,6 +19,7 @@ import (
 type Server struct {
 	listener           net.Listener
 	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
 	addr               string
 	hostname           string
 	connManager        *proxy.ConnectionManager
@@ -37,10 +39,14 @@ type Server struct {
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 	sessionTimeout     time.Duration
 	maxMessageSize     int64
+
+	// Trusted networks for connection filtering
+	trustedNetworks []*net.IPNet
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
 type ServerOptions struct {
+	Name                   string // Server name for logging
 	Addr                   string
 	RemoteAddrs            []string
 	TLS                    bool
@@ -86,15 +92,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
 		if err != nil {
-			log.Printf("[LMTP Proxy] Failed to initialize prelookup client: %v", err)
+			log.Printf("[LMTP Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
 			if !opts.PreLookup.FallbackDefault {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[LMTP Proxy] Continuing without prelookup due to fallback_to_default=true")
+			log.Printf("[LMTP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[LMTP Proxy] Prelookup database client initialized successfully")
+			log.Printf("[LMTP Proxy %s] Prelookup database client initialized successfully", opts.Name)
 		}
 	}
 
@@ -110,18 +116,29 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[LMTP Proxy] Failed to resolve addresses: %v", err)
+		log.Printf("[LMTP Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid LMTP proxy affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", stickiness)
+		log.Printf("WARNING: invalid LMTP proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
 		stickiness = 1.0
+	}
+
+	// Parse trusted networks for connection filtering
+	trustedNets, err := server.ParseTrustedNetworks(opts.TrustedProxies)
+	if err != nil {
+		if routingLookup != nil {
+			routingLookup.Close()
+		}
+		cancel()
+		return nil, fmt.Errorf("failed to parse trusted networks for LMTP proxy: %w", err)
 	}
 
 	return &Server{
 		rdb:                rdb,
+		name:               opts.Name,
 		addr:               opts.Addr,
 		hostname:           hostname,
 		connManager:        connManager,
@@ -139,6 +156,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 		sessionTimeout:     opts.SessionTimeout,
 		maxMessageSize:     opts.MaxMessageSize,
+		trustedNetworks:    trustedNets,
 	}, nil
 }
 
@@ -167,25 +185,35 @@ func (s *Server) Start() error {
 		}
 
 		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for LMTP proxy server (tls_verify=true)")
+			log.Printf("Client TLS certificate verification is REQUIRED for LMTP proxy [%s] (tls_verify=true)", s.name)
 		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for LMTP proxy server (tls_verify=false)")
+			log.Printf("Client TLS certificate verification is DISABLED for LMTP proxy [%s] (tls_verify=false)", s.name)
 		}
 
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* LMTP proxy listening with TLS on %s", s.addr)
+		log.Printf("* LMTP proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		s.listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("* LMTP proxy listening on %s", s.addr)
+		log.Printf("* LMTP proxy [%s] listening on %s", s.name, s.addr)
 	}
 
 	return s.acceptConnections()
+}
+
+// isFromTrustedNetwork checks if an IP address is from a trusted network
+func (s *Server) isFromTrustedNetwork(ip net.IP) bool {
+	for _, network := range s.trustedNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // acceptConnections accepts incoming connections.
@@ -201,12 +229,42 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
+		// Check if connection is from a trusted network
+		remoteAddr := conn.RemoteAddr()
+		var ip net.IP
+		switch addr := remoteAddr.(type) {
+		case *net.TCPAddr:
+			ip = addr.IP
+		case *net.UDPAddr:
+			ip = addr.IP
+		default:
+			// Try to parse as string
+			host, _, err := net.SplitHostPort(remoteAddr.String())
+			if err != nil {
+				log.Printf("[LMTP Proxy %s] Connection rejected from %s: invalid address format", s.name, remoteAddr)
+				conn.Close()
+				continue
+			}
+			ip = net.ParseIP(host)
+			if ip == nil {
+				log.Printf("[LMTP Proxy %s] Connection rejected from %s: could not parse IP", s.name, remoteAddr)
+				conn.Close()
+				continue
+			}
+		}
+
+		if !s.isFromTrustedNetwork(ip) {
+			log.Printf("[LMTP Proxy %s] Connection rejected from %s: not from trusted network", s.name, ip)
+			conn.Close()
+			continue
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[LMTP Proxy] Session panic recovered: %v", r)
+					log.Printf("[LMTP Proxy %s] Session panic recovered: %v", s.name, r)
 					conn.Close()
 				}
 			}()

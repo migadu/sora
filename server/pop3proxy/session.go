@@ -289,12 +289,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
+	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := s.clientConn.RemoteAddr()
+	server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY")
 
-	// Check if the authentication attempt is allowed by the rate limiter.
-	if err := s.server.authLimiter.CanAttemptAuth(ctx, remoteAddr, username); err != nil {
-		s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
-		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, s.clientConn, nil, username); err != nil {
+		// Don't record as auth failure - this is rate limiting, not authentication failure
+		metrics.ProtocolErrors.WithLabelValues("pop3_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
 	}
 
@@ -321,7 +323,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				s.routingInfo = routingInfo
 				s.username = address.FullAddress()
 				s.authenticated = true
-				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
 				metrics.TrackDomainConnection("pop3_proxy", address.Domain())
 				metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
@@ -335,7 +337,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
 				log.Printf("[POP3 Proxy] Prelookup authentication failed for user %s from %s (bad password)", username, s.RemoteIP)
-				s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
@@ -350,12 +352,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	log.Printf("[POP3 Proxy] Authenticating user %s via main database", username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
-		s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, false)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
-	s.server.authLimiter.RecordAuthAttempt(ctx, remoteAddr, username, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
