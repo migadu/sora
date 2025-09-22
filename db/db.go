@@ -454,7 +454,6 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 	} else {
 		// If no read config specified, use write pool for reads
-		log.Printf("[DB] No read configuration specified, using write pool for read operations")
 		readPool = writePool
 		readFailover = writeFailover // Share the same failover manager
 	}

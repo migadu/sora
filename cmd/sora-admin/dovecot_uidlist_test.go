@@ -166,7 +166,7 @@ func TestGetUIDForFile(t *testing.T) {
 func TestWriteDovecotUIDList(t *testing.T) {
 	// Create temporary directory
 	tempDir := t.TempDir()
-	
+
 	// Create test UID list
 	uidList := &DovecotUIDList{
 		Version:     3,
@@ -179,19 +179,19 @@ func TestWriteDovecotUIDList(t *testing.T) {
 			"1234567892.M3P3.hostname": 50,
 		},
 	}
-	
+
 	// Write UID list
 	err := WriteDovecotUIDList(tempDir, uidList)
 	if err != nil {
 		t.Fatalf("WriteDovecotUIDList failed: %v", err)
 	}
-	
+
 	// Read back and verify
 	readUIDList, err := ParseDovecotUIDList(tempDir)
 	if err != nil {
 		t.Fatalf("ParseDovecotUIDList failed: %v", err)
 	}
-	
+
 	// Verify the content
 	if readUIDList.Version != uidList.Version {
 		t.Errorf("Version = %v, want %v", readUIDList.Version, uidList.Version)
@@ -205,7 +205,7 @@ func TestWriteDovecotUIDList(t *testing.T) {
 	if readUIDList.GlobalUID != uidList.GlobalUID {
 		t.Errorf("GlobalUID = %v, want %v", readUIDList.GlobalUID, uidList.GlobalUID)
 	}
-	
+
 	for filename, expectedUID := range uidList.UIDMappings {
 		if actualUID, ok := readUIDList.UIDMappings[filename]; !ok {
 			t.Errorf("Missing UID mapping for %s", filename)
@@ -221,9 +221,9 @@ func TestCreateDovecotUIDListFromMessages(t *testing.T) {
 		{UID: 5, Filename: "1234567891.M2P2.hostname"},
 		{UID: 10, Filename: "1234567892.M3P3.hostname"},
 	}
-	
+
 	uidList := CreateDovecotUIDListFromMessages(1234567890, messages)
-	
+
 	if uidList.Version != 3 {
 		t.Errorf("Version = %v, want 3", uidList.Version)
 	}
@@ -233,13 +233,13 @@ func TestCreateDovecotUIDListFromMessages(t *testing.T) {
 	if uidList.NextUID != 11 {
 		t.Errorf("NextUID = %v, want 11", uidList.NextUID)
 	}
-	
+
 	expectedMappings := map[string]uint32{
 		"1234567890.M1P1.hostname": 1,
 		"1234567891.M2P2.hostname": 5,
 		"1234567892.M3P3.hostname": 10,
 	}
-	
+
 	for filename, expectedUID := range expectedMappings {
 		if actualUID, ok := uidList.UIDMappings[filename]; !ok {
 			t.Errorf("Missing UID mapping for %s", filename)

@@ -59,6 +59,6 @@ func (s *POP3Session) isFromTrustedProxy() bool {
 	// Get trusted proxies configuration from server PROXY protocol config
 	// This reuses the same trusted network logic as PROXY protocol
 	trustedProxies := s.server.getTrustedProxies()
-	
+
 	return server.IsTrustedForwarding(*s.conn, trustedProxies)
 }

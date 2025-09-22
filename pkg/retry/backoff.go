@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"time"
@@ -34,15 +35,15 @@ func ExponentialBackoff(config BackoffConfig) func(int) time.Duration {
 		}
 
 		interval := float64(config.InitialInterval) * math.Pow(config.Multiplier, float64(attempt-1))
-		
+
 		if interval > float64(config.MaxInterval) {
 			interval = float64(config.MaxInterval)
 		}
 
 		duration := time.Duration(interval)
-		
+
 		if config.Jitter {
-			jitter := time.Duration(rand.Int63n(int64(duration/2)))
+			jitter := time.Duration(rand.Int63n(int64(duration / 2)))
 			duration = duration/2 + jitter
 		}
 
@@ -54,9 +55,11 @@ type RetryableFunc func() error
 
 func WithRetry(ctx context.Context, fn RetryableFunc, config BackoffConfig) error {
 	backoff := ExponentialBackoff(config)
-	
+
 	var lastErr error
+	var attempts int
 	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		attempts = attempt + 1
 		if attempt > 0 {
 			delay := backoff(attempt)
 			select {
@@ -75,8 +78,8 @@ func WithRetry(ctx context.Context, fn RetryableFunc, config BackoffConfig) erro
 			return nil
 		}
 	}
-	
-	return fmt.Errorf("operation failed after %d attempts: %w", config.MaxRetries+1, lastErr)
+
+	return fmt.Errorf("operation failed after %d attempts: %w", attempts, lastErr)
 }
 
 // StopError wraps an error to indicate that retries should stop immediately
@@ -106,9 +109,11 @@ func IsStopError(err error) bool {
 // WithRetryAdvanced is like WithRetry but respects StopError to halt retries immediately
 func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConfig) error {
 	backoff := ExponentialBackoff(config)
-	
+
 	var lastErr error
+	var attempts int
 	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		attempts = attempt + 1
 		if attempt > 0 {
 			delay := backoff(attempt)
 			select {
@@ -124,8 +129,10 @@ func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConf
 			if IsStopError(err) {
 				var stopErr StopError
 				errors.As(err, &stopErr)
+				log.Printf("[RETRY-DEBUG] StopError detected on attempt %d, stopping retries: %v", attempts, stopErr.Err)
 				return stopErr.Err
 			}
+			log.Printf("[RETRY-DEBUG] Error on attempt %d (will retry if < %d): %v", attempts, config.MaxRetries+1, err)
 			if attempt < config.MaxRetries {
 				continue
 			}
@@ -133,6 +140,6 @@ func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConf
 			return nil
 		}
 	}
-	
-	return fmt.Errorf("operation failed after %d attempts: %w", config.MaxRetries+1, lastErr)
+
+	return fmt.Errorf("operation failed after %d attempts: %w", attempts, lastErr)
 }

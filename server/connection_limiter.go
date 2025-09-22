@@ -12,13 +12,13 @@ import (
 
 // ConnectionLimiter manages connection limits for protocol servers
 type ConnectionLimiter struct {
-	maxConnections    int
-	maxPerIP          int
-	currentTotal      atomic.Int64
-	perIPConnections  map[string]*atomic.Int64
-	mu                sync.RWMutex
-	cleanupInterval   time.Duration
-	protocol          string
+	maxConnections   int
+	maxPerIP         int
+	currentTotal     atomic.Int64
+	perIPConnections map[string]*atomic.Int64
+	mu               sync.RWMutex
+	cleanupInterval  time.Duration
+	protocol         string
 }
 
 // NewConnectionLimiter creates a new connection limiter
@@ -85,10 +85,10 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 	// Increment total counter
 	total := cl.currentTotal.Add(1)
-	
+
 	var perIP int64 = 0
 	var ipCounter *atomic.Int64
-	
+
 	// Only track per-IP if limits are enabled (maxPerIP > 0)
 	if cl.maxPerIP > 0 {
 		// Increment per-IP counter
@@ -100,23 +100,23 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 			cl.perIPConnections[ip] = ipCounter
 		}
 		cl.mu.Unlock()
-		
+
 		perIP = ipCounter.Add(1)
-		
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: %d/%d", 
+
+		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: %d/%d",
 			cl.protocol, ip, total, cl.maxConnections, perIP, cl.maxPerIP)
 	} else {
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: unlimited", 
+		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: unlimited",
 			cl.protocol, ip, total, cl.maxConnections)
 	}
 
 	// Return cleanup function
 	return func() {
 		cl.currentTotal.Add(-1)
-		
+
 		if cl.maxPerIP > 0 && ipCounter != nil {
 			remaining := ipCounter.Add(-1)
-			
+
 			// Clean up IP entry if no connections remain
 			if remaining <= 0 {
 				cl.mu.Lock()
@@ -125,11 +125,11 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 				}
 				cl.mu.Unlock()
 			}
-			
-			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: %d", 
+
+			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: %d",
 				cl.protocol, ip, cl.currentTotal.Load(), remaining)
 		} else {
-			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: unlimited", 
+			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: unlimited",
 				cl.protocol, ip, cl.currentTotal.Load())
 		}
 	}, nil
@@ -139,7 +139,7 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
-	
+
 	stats := ConnectionStats{
 		Protocol:         cl.protocol,
 		TotalConnections: cl.currentTotal.Load(),
@@ -147,11 +147,11 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 		MaxPerIP:         int64(cl.maxPerIP),
 		IPConnections:    make(map[string]int64),
 	}
-	
+
 	for ip, counter := range cl.perIPConnections {
 		stats.IPConnections[ip] = counter.Load()
 	}
-	
+
 	return stats
 }
 
@@ -160,11 +160,11 @@ func (cl *ConnectionLimiter) StartCleanup(ctx context.Context) {
 	if cl.cleanupInterval <= 0 {
 		return
 	}
-	
+
 	go func() {
 		ticker := time.NewTicker(cl.cleanupInterval)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -180,7 +180,7 @@ func (cl *ConnectionLimiter) StartCleanup(ctx context.Context) {
 func (cl *ConnectionLimiter) cleanup() {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	
+
 	cleaned := 0
 	for ip, counter := range cl.perIPConnections {
 		if counter.Load() <= 0 {
@@ -188,7 +188,7 @@ func (cl *ConnectionLimiter) cleanup() {
 			cleaned++
 		}
 	}
-	
+
 	if cleaned > 0 {
 		log.Printf("[%s-LIMITER] Cleaned up %d stale IP entries", cl.protocol, cleaned)
 	}

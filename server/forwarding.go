@@ -363,6 +363,19 @@ func (fp *ForwardingParams) ValidateForwarding() error {
 	return nil
 }
 
+// ParseTrustedNetworks parses a slice of CIDR strings into a slice of *net.IPNet
+func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
+	var networks []*net.IPNet
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted network CIDR %s: %w", cidr, err)
+		}
+		networks = append(networks, network)
+	}
+	return networks, nil
+}
+
 // IsTrustedForwarding checks if the connection is from a trusted proxy
 // This function should be used to validate forwarding parameters
 func IsTrustedForwarding(conn net.Conn, trustedProxies []string) bool {

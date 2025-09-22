@@ -10,9 +10,9 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/migadu/sora/helpers"
 )
 
 // PerformanceTestConfig controls the scale of performance tests
@@ -117,7 +117,7 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 		// Use nextUID for unique UID generation
 		currentUID := pts.nextUID
 		pts.nextUID++ // Increment for next message
-		
+
 		// Generate varied content based on message type
 		subject, body, headers := pts.generateMessageContent(i, messageType)
 		contentHash := fmt.Sprintf("hash_%s_%d", messageType, currentUID)
@@ -150,22 +150,22 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 			 recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
 			        nextval('messages_modseq'), $18, $19, $20, $21, $22)`,
-			pts.accountID,                       // account_id
-			pts.mailboxID,                       // mailbox_id
-			"INBOX",                             // mailbox_path
-			currentUID,                          // uid (using nextUID)
-			messageID,                           // message_id
-			contentHash,                         // content_hash
-			"test-domain",                       // s3_domain
-			fmt.Sprintf("test-%d", currentUID),  // s3_localpart
-			flags,                               // flags (bitwise)
-			"[]",                                // custom_flags (empty JSON array)
-			internalDate,                        // internal_date
-			size,                                // size
-			subject,                             // subject
-			sentDate,                            // sent_date
-			"",                                  // in_reply_to (empty for now)
-			bodyStructureBytes, // body_structure (proper gob encoding)
+			pts.accountID,                      // account_id
+			pts.mailboxID,                      // mailbox_id
+			"INBOX",                            // mailbox_path
+			currentUID,                         // uid (using nextUID)
+			messageID,                          // message_id
+			contentHash,                        // content_hash
+			"test-domain",                      // s3_domain
+			fmt.Sprintf("test-%d", currentUID), // s3_localpart
+			flags,                              // flags (bitwise)
+			"[]",                               // custom_flags (empty JSON array)
+			internalDate,                       // internal_date
+			size,                               // size
+			subject,                            // subject
+			sentDate,                           // sent_date
+			"",                                 // in_reply_to (empty for now)
+			bodyStructureBytes,                 // body_structure (proper gob encoding)
 			fmt.Sprintf(`[{"type":"from","email":"sender%d@example.com"},{"type":"to","email":"user%d@example.com"}]`, i%100, (i+1)%100), // recipients_json
 			normalizeForSort(subject), // subject_sort
 			"",                        // from_name_sort

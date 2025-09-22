@@ -237,12 +237,12 @@ func TestMessagePartStruct(t *testing.T) {
 // Database test helpers for message tests
 func setupMessageTestDatabase(t *testing.T) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
-	
+
 	ctx := context.Background()
-	
+
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
-	
+
 	// Create test account
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
@@ -292,13 +292,13 @@ func TestGetMessagesByNumSet(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Empty mailbox with UID set - should return empty slice
 	var uidSet imap.UIDSet
 	uidSet.AddRange(1, 10)
-	
+
 	messages, err := db.GetMessagesByNumSet(ctx, mailboxID, uidSet)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
@@ -306,7 +306,7 @@ func TestGetMessagesByNumSet(t *testing.T) {
 	// Test 2: Empty mailbox with sequence set - should return empty slice
 	var seqSet imap.SeqSet
 	seqSet.AddRange(1, 10)
-	
+
 	messages, err = db.GetMessagesByNumSet(ctx, mailboxID, seqSet)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
@@ -314,7 +314,7 @@ func TestGetMessagesByNumSet(t *testing.T) {
 	// Test 3: Non-existent mailbox - should return error
 	_, err = db.GetMessagesByNumSet(ctx, 99999, uidSet)
 	assert.NoError(t, err) // This might not error, just return empty
-	
+
 	t.Logf("Successfully tested GetMessagesByNumSet with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
@@ -326,7 +326,7 @@ func TestGetMessagesByFlag(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: No messages with \\Seen flag in empty mailbox
@@ -343,7 +343,7 @@ func TestGetMessagesByFlag(t *testing.T) {
 	messages, err = db.GetMessagesByFlag(ctx, 99999, imap.FlagSeen)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
-	
+
 	t.Logf("Successfully tested GetMessagesByFlag with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
@@ -355,7 +355,7 @@ func TestCopyMessages(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Create a second mailbox for testing copies
@@ -397,7 +397,7 @@ func TestCopyMessages(t *testing.T) {
 
 	err = tx3.Commit(ctx)
 	require.NoError(t, err)
-	
+
 	t.Logf("Successfully tested CopyMessages with accountID: %d, srcMailboxID: %d, destMailboxID: %d", accountID, mailboxID, sentMailbox.ID)
 }
 
@@ -409,7 +409,7 @@ func TestListMessages(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: List messages in empty mailbox
@@ -421,7 +421,7 @@ func TestListMessages(t *testing.T) {
 	messages, err = db.ListMessages(ctx, 99999)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Should return empty, not error
-	
+
 	t.Logf("Successfully tested ListMessages with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
@@ -433,7 +433,7 @@ func TestGetMessageTextBody(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Get body for non-existent message
@@ -445,7 +445,7 @@ func TestGetMessageTextBody(t *testing.T) {
 	body, err = db.GetMessageTextBody(ctx, imap.UID(1), 99999)
 	assert.Error(t, err) // Should return error for non-existent mailbox
 	assert.Empty(t, body)
-	
+
 	t.Logf("Successfully tested GetMessageTextBody with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
@@ -457,7 +457,7 @@ func TestGetMessageEnvelope(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Get envelope for non-existent message
@@ -469,7 +469,7 @@ func TestGetMessageEnvelope(t *testing.T) {
 	envelope, err = db.GetMessageEnvelope(ctx, imap.UID(1), 99999)
 	assert.Error(t, err) // Should return error for non-existent mailbox
 	assert.Nil(t, envelope)
-	
+
 	t.Logf("Successfully tested GetMessageEnvelope with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
@@ -481,7 +481,7 @@ func TestInsertMessage(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Insert a basic message
@@ -490,7 +490,7 @@ func TestInsertMessage(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	now := time.Now()
-	
+
 	// Create a valid BodyStructure for the test message
 	bodyStructure := &imap.BodyStructureSinglePart{
 		Type:        "text",
@@ -502,7 +502,7 @@ func TestInsertMessage(t *testing.T) {
 		Size:        1024,
 	}
 	var bs imap.BodyStructure = bodyStructure
-	
+
 	options := &InsertMessageOptions{
 		UserID:        accountID,
 		MailboxID:     mailboxID,
@@ -557,7 +557,7 @@ func TestInsertMessageFromImporter(t *testing.T) {
 
 	db, accountID, mailboxID := setupMessageTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test: Insert message from importer (no S3 upload)
@@ -566,7 +566,7 @@ func TestInsertMessageFromImporter(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	now := time.Now()
-	
+
 	// Create a valid BodyStructure for the test message
 	bodyStructure := &imap.BodyStructureSinglePart{
 		Type:        "text",
@@ -578,13 +578,13 @@ func TestInsertMessageFromImporter(t *testing.T) {
 		Size:        2048,
 	}
 	var bs imap.BodyStructure = bodyStructure
-	
+
 	options := &InsertMessageOptions{
 		UserID:        accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",
-		S3Localpart:   "import/message1", 
+		S3Localpart:   "import/message1",
 		ContentHash:   "import123hash",
 		MessageID:     "<import1@example.com>",
 		Flags:         []imap.Flag{imap.FlagFlagged},
@@ -592,7 +592,7 @@ func TestInsertMessageFromImporter(t *testing.T) {
 		Size:          2048,
 		Subject:       "Imported Message",
 		PlaintextBody: "This is an imported message",
-		SentDate:      now.Add(-2*time.Hour),
+		SentDate:      now.Add(-2 * time.Hour),
 		InReplyTo:     []string{"<previous@example.com>"},
 		BodyStructure: &bs,
 	}

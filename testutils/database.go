@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/require"
-	"github.com/BurntSushi/toml"
 )
 
 // TestConfig represents minimal test configuration
@@ -114,7 +114,7 @@ func (td *TestDatabase) Cleanup(t *testing.T) {
 // CreateTestAccount creates a test account for testing purposes
 func (td *TestDatabase) CreateTestAccount(t *testing.T, email, password string) int64 {
 	ctx := context.Background()
-	
+
 	tx, err := td.Database.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
@@ -142,7 +142,7 @@ func (td *TestDatabase) CreateTestAccount(t *testing.T, email, password string) 
 // CreateTestMailbox creates a test mailbox for testing purposes
 func (td *TestDatabase) CreateTestMailbox(t *testing.T, accountID int64, name string) {
 	ctx := context.Background()
-	
+
 	tx, err := td.Database.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
@@ -157,11 +157,11 @@ func (td *TestDatabase) CreateTestMailbox(t *testing.T, accountID int64, name st
 // TruncateAllTables cleans all data from test database tables
 func (td *TestDatabase) TruncateAllTables(t *testing.T) {
 	ctx := context.Background()
-	
+
 	// List of tables to truncate in dependency order
 	tables := []string{
 		"messages",
-		"s3_upload_queue", 
+		"s3_upload_queue",
 		"mailboxes",
 		"credentials",
 		"accounts",

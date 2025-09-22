@@ -147,6 +147,17 @@ health_status_retention = "30d" # How long to retain health status history in th
 [servers]
 debug = false                  # Global debug flag for all protocol servers. Enables verbose logging.
 
+# --- GLOBAL PROXY PROTOCOL CONFIGURATION ---
+# Simplified PROXY protocol settings applied to all servers that enable it
+proxy_protocol = false          # Enable PROXY protocol support globally
+proxy_protocol_required = true  # Require PROXY protocol headers (false = optional mode)
+proxy_protocol_timeout = "5s"   # Timeout for reading PROXY protocol headers
+
+# --- TRUSTED NETWORKS ---
+# Networks trusted for proxy parameter forwarding (XCLIENT, ID commands, etc.)
+# These networks can forward client information through proxy protocols
+trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
 
 # IMAP SERVER CONFIGURATION
 # =============================================================================
@@ -177,26 +188,6 @@ tls_cert_file = "/path/to/your/imap.crt"  # TLS certificate file path (required 
 tls_key_file = "/path/to/your/imap.key"   # TLS private key file path (required if tls=true).
 tls_verify = true                         # Verify client certificates (mutual TLS). Usually false.
 
-# --- PROXY PROTOCOL CONFIGURATION ---
-# Enable real client IP detection when behind load balancers/proxies
-# CRITICAL: Only enable when actually behind a proxy that sends PROXY headers!
-
-[servers.imap.proxy_protocol]
-# Enable PROXY protocol v1/v2 support 
-# WARNING: Only enable if you trust the source! Allows IP spoofing if misconfigured.
-enabled = false       # Enable PROXY protocol v1/v2 support.
-# mode can be "required" (default) or "optional".
-# "required": All connections MUST have a PROXY header.
-# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
-# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
-# mode = "required"
-trusted_proxies = [   # Trusted proxy networks. SECURITY: Only list networks you control!
-    "127.0.0.0/8",    # localhost
-    "10.0.0.0/8",     # RFC1918 private networks  
-    "172.16.0.0/12",  # RFC1918 private networks
-    "192.168.0.0/16"  # RFC1918 private networks
-]
-timeout = "5s"        # Timeout for reading PROXY protocol header.
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Protect against brute force attacks with progressive delays and blocking
@@ -248,17 +239,6 @@ tls_verify = true                         # Verify client certificates (mutual T
 max_connections = 500         # Maximum concurrent LMTP connections.
 max_connections_per_ip = 5    # Maximum connections per client IP.
 
-# --- PROXY PROTOCOL CONFIGURATION ---
-[servers.lmtp.proxy_protocol]
-# Enable PROXY protocol support for real client IP detection
-enabled = false                 # Enable if behind a load balancer/proxy.
-# mode can be "required" (default) or "optional".
-# "required": All connections MUST have a PROXY header.
-# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
-# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
-# mode = "required"
-trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-timeout = "5s"                  # Timeout for reading PROXY protocol header.
 
 
 # POP3 SERVER CONFIGURATION  
@@ -284,17 +264,6 @@ master_sasl_password = ""                 # Master password for proxy authentica
 max_connections = 500         # Maximum concurrent POP3 connections.
 max_connections_per_ip = 5    # Maximum connections per client IP.
 
-# --- PROXY PROTOCOL CONFIGURATION ---
-[servers.pop3.proxy_protocol]
-# Enable PROXY protocol support for real client IP detection
-enabled = false
-# mode can be "required" (default) or "optional".
-# "required": All connections MUST have a PROXY header.
-# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
-# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
-# mode = "required"
-trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as IMAP (see IMAP section for detailed explanations)
@@ -346,17 +315,6 @@ master_sasl_password = ""       # Master password for proxy authentication.
 max_connections = 200         # Maximum concurrent ManageSieve connections.
 max_connections_per_ip = 3    # Maximum connections per client IP.
 
-# --- PROXY PROTOCOL CONFIGURATION ---
-[servers.managesieve.proxy_protocol]
-# Enable PROXY protocol support for real client IP detection
-enabled = false
-# mode can be "required" (default) or "optional".
-# "required": All connections MUST have a PROXY header.
-# "optional": Connections are inspected for a PROXY header. If not present, it's treated as a direct connection.
-# WARNING: Use "optional" with extreme caution as it weakens security guarantees.
-# mode = "required"
-trusted_proxies = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same anti-brute-force protection as IMAP/POP3 (see IMAP section for details)

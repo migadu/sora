@@ -322,14 +322,14 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 			rows, err := c.pool.Query(ctx, c.query, email)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-					return nil, err
+					return nil, retry.Stop(err)
 				}
 				return nil, err
 			}
 			defer rows.Close()
 
 			if !rows.Next() {
-				return nil, pgx.ErrNoRows
+				return nil, retry.Stop(pgx.ErrNoRows)
 			}
 
 			// Get field descriptions to determine the number of columns
@@ -373,10 +373,10 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 		})
 
 		if cbErr != nil {
-			// Handle ErrNoRows: it's not a retryable error, it's a final result.
+			// Handle ErrNoRows: already wrapped with retry.Stop() inside circuit breaker
 			if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
-				serverAddress = ""       // Explicitly clear it
-				return retry.Stop(cbErr) // Stop retrying, but we'll handle this "error" below.
+				serverAddress = "" // Explicitly clear it
+				return cbErr       // Already wrapped with retry.Stop() inside circuit breaker
 			}
 			if isRetryableError(cbErr) {
 				log.Printf("[PreLookup] Retrying routing query for '%s' due to: %v", email, cbErr)
@@ -468,14 +468,14 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 			rows, err := c.pool.Query(ctx, c.query, email)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
-					return nil, err
+					return nil, retry.Stop(err)
 				}
 				return nil, err
 			}
 			defer rows.Close()
 
 			if !rows.Next() {
-				return nil, pgx.ErrNoRows
+				return nil, retry.Stop(pgx.ErrNoRows)
 			}
 
 			// Auto-detect mode based on number of columns
@@ -515,15 +515,12 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 		})
 
 		if cbErr != nil {
-			if errors.Is(cbErr, pgx.ErrNoRows) || errors.Is(cbErr, sql.ErrNoRows) {
-				routingInfo = nil
-				authResult = AuthUserNotFound
-				return retry.Stop(cbErr)
-			}
 			if isRetryableError(cbErr) {
 				log.Printf("[PreLookup] Retrying auth query for '%s' due to: %v", email, cbErr)
 				return cbErr
 			}
+			// For non-retryable errors (including ErrNoRows wrapped in retry.Stop),
+			// stop the retry loop.
 			return retry.Stop(cbErr)
 		}
 
@@ -540,6 +537,11 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 	}, config)
 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("[PreLookup] Query failed for user '%s': %v", email, err)
+		return nil, AuthUserNotFound, fmt.Errorf("database query failed: %w", err)
+	} else if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
+		// User not found is an expected outcome, not an error to return.
+		authResult = AuthUserNotFound
 		log.Printf("[PreLookup] Query failed for user '%s': %v", email, err)
 		return nil, AuthUserNotFound, fmt.Errorf("database query failed: %w", err)
 	}

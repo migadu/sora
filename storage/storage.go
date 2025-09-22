@@ -15,9 +15,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/migadu/sora/pkg/metrics"
 )
 
 type S3Storage struct {
@@ -96,7 +96,7 @@ func (s *S3Storage) Exists(key string) (bool, string, error) {
 
 func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	start := time.Now()
-	
+
 	exists, _, err := s.Exists(key)
 	if err != nil {
 		log.Printf("[STORAGE] error checking existence of object %s: %v", key, err)
@@ -252,7 +252,7 @@ func classifyS3Error(err error) string {
 	if err == nil {
 		return "none"
 	}
-	
+
 	errStr := err.Error()
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):

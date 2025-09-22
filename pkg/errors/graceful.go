@@ -43,7 +43,7 @@ func NewErrorHandler() *ErrorHandler {
 func (eh *ErrorHandler) FatalError(operation string, err error) {
 	gracefulErr := NewGracefulError(operation, err)
 	eh.logger.Printf("FATAL: %v", gracefulErr)
-	
+
 	select {
 	case eh.exitChannel <- 1:
 	default:
@@ -56,7 +56,7 @@ func (eh *ErrorHandler) ConfigError(configPath string, err error) {
 	} else {
 		eh.logger.Printf("ERROR: failed to parse configuration file '%s': %v", configPath, err)
 	}
-	
+
 	select {
 	case eh.exitChannel <- 1:
 	default:
@@ -65,7 +65,7 @@ func (eh *ErrorHandler) ConfigError(configPath string, err error) {
 
 func (eh *ErrorHandler) ValidationError(field string, err error) {
 	eh.logger.Printf("ERROR: invalid configuration - %s: %v", field, err)
-	
+
 	select {
 	case eh.exitChannel <- 1:
 	default:

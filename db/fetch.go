@@ -21,7 +21,7 @@ import (
 // can be used for IMAP BODY[TEXT] requests.
 func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
 	var textBody sql.NullString // Use sql.NullString to handle case where LEFT JOIN finds no match
-	
+
 	start := time.Now()
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT mc.text_body 

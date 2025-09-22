@@ -11,14 +11,14 @@ import (
 
 func TestNewSearchCriteriaValidator(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	assert.Equal(t, 1000, validator.MaxSearchTermLength)
 	assert.Equal(t, 50, validator.MaxSearchTerms)
 	assert.Equal(t, 365*24*time.Hour, validator.MaxDateRange)
 	assert.Equal(t, 10, validator.MaxTextSearchTerms)
 	assert.Equal(t, 20, validator.MaxSequenceRanges)
 	assert.Equal(t, 20, validator.MaxFlagFilters)
-	
+
 	expectedHeaders := []string{"subject", "message-id", "in-reply-to", "from", "to", "cc", "bcc", "reply-to"}
 	for _, header := range expectedHeaders {
 		assert.True(t, validator.SupportedHeaders[header], "Header %s should be supported", header)
@@ -27,9 +27,9 @@ func TestNewSearchCriteriaValidator(t *testing.T) {
 
 func TestValidateSearchCriteria_NilCriteria(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	result := validator.ValidateSearchCriteria(nil)
-	
+
 	assert.False(t, result.Valid)
 	assert.Len(t, result.Errors, 1)
 	assert.Equal(t, "criteria", result.Errors[0].Field)
@@ -39,9 +39,9 @@ func TestValidateSearchCriteria_NilCriteria(t *testing.T) {
 func TestValidateSearchCriteria_EmptyCriteria(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
 	criteria := &imap.SearchCriteria{}
-	
+
 	result := validator.ValidateSearchCriteria(criteria)
-	
+
 	assert.True(t, result.Valid)
 	assert.Empty(t, result.Errors)
 	assert.Equal(t, ComplexitySimple, result.Complexity)
@@ -49,7 +49,7 @@ func TestValidateSearchCriteria_EmptyCriteria(t *testing.T) {
 
 func TestValidateSequenceRanges(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		seqNum      []imap.SeqSet
@@ -100,16 +100,16 @@ func TestValidateSequenceRanges(t *testing.T) {
 			errorField:  "UID",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			criteria := &imap.SearchCriteria{
 				SeqNum: tt.seqNum,
 				UID:    tt.uid,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.True(t, result.HasErrorsForField(tt.errorField))
@@ -123,7 +123,7 @@ func TestValidateSequenceRanges(t *testing.T) {
 func TestValidateDateRanges(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
 	now := time.Now()
-	
+
 	tests := []struct {
 		name        string
 		since       time.Time
@@ -165,7 +165,7 @@ func TestValidateDateRanges(t *testing.T) {
 			expectError: true,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			criteria := &imap.SearchCriteria{
@@ -174,9 +174,9 @@ func TestValidateDateRanges(t *testing.T) {
 				SentSince:  tt.sentSince,
 				SentBefore: tt.sentBefore,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.True(t, result.HasErrorsForField("dates"))
@@ -189,7 +189,7 @@ func TestValidateDateRanges(t *testing.T) {
 
 func TestValidateTextTerms(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		body        []string
@@ -252,7 +252,7 @@ func TestValidateTextTerms(t *testing.T) {
 			errorField:  "Text",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Fill empty slices with valid values for length tests
@@ -270,14 +270,14 @@ func TestValidateTextTerms(t *testing.T) {
 					}
 				}
 			}
-			
+
 			criteria := &imap.SearchCriteria{
 				Body: tt.body,
 				Text: tt.text,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.True(t, result.HasErrorsForField(tt.errorField))
@@ -290,7 +290,7 @@ func TestValidateTextTerms(t *testing.T) {
 
 func TestValidateHeaders(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		headers     []imap.SearchCriteriaHeaderField
@@ -340,15 +340,15 @@ func TestValidateHeaders(t *testing.T) {
 			expectError: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			criteria := &imap.SearchCriteria{
 				Header: tt.headers,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.NotEmpty(t, result.Errors)
@@ -361,7 +361,7 @@ func TestValidateHeaders(t *testing.T) {
 
 func TestValidateFlags(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		flags       []imap.Flag
@@ -381,7 +381,7 @@ func TestValidateFlags(t *testing.T) {
 			expectError: true,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Fill empty flag slices
@@ -395,14 +395,14 @@ func TestValidateFlags(t *testing.T) {
 					tt.notFlags[i] = imap.Flag("test-not-flag")
 				}
 			}
-			
+
 			criteria := &imap.SearchCriteria{
 				Flag:    tt.flags,
 				NotFlag: tt.notFlags,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.True(t, result.HasErrorsForField("flags"))
@@ -415,7 +415,7 @@ func TestValidateFlags(t *testing.T) {
 
 func TestValidateSizeFilters(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		larger      int64
@@ -453,16 +453,16 @@ func TestValidateSizeFilters(t *testing.T) {
 			expectError: false,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			criteria := &imap.SearchCriteria{
 				Larger:  tt.larger,
 				Smaller: tt.smaller,
 			}
-			
+
 			result := validator.ValidateSearchCriteria(criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.True(t, result.HasErrorsForField("size"))
@@ -475,7 +475,7 @@ func TestValidateSizeFilters(t *testing.T) {
 
 func TestComplexityCalculation(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name               string
 		criteria           *imap.SearchCriteria
@@ -494,7 +494,7 @@ func TestComplexityCalculation(t *testing.T) {
 					{Key: "from", Value: "user@example.com"},
 					{Key: "to", Value: "recipient@example.com"},
 				},
-				Flag:   []imap.Flag{imap.FlagSeen, imap.FlagAnswered},
+				Flag: []imap.Flag{imap.FlagSeen, imap.FlagAnswered},
 			},
 			expectedComplexity: ComplexityModerate,
 		},
@@ -522,14 +522,14 @@ func TestComplexityCalculation(t *testing.T) {
 			expectedComplexity: ComplexityVeryHigh,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := validator.ValidateSearchCriteria(tt.criteria)
-			
+
 			assert.True(t, result.Valid)
 			assert.Equal(t, tt.expectedComplexity, result.Complexity)
-			
+
 			// High complexity should generate warnings
 			if result.Complexity >= ComplexityHigh {
 				assert.NotEmpty(t, result.Warnings)
@@ -541,7 +541,7 @@ func TestComplexityCalculation(t *testing.T) {
 
 func TestValidateNestedCriteria(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name        string
 		criteria    *imap.SearchCriteria
@@ -590,11 +590,11 @@ func TestValidateNestedCriteria(t *testing.T) {
 			expectError: true,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := validator.ValidateSearchCriteria(tt.criteria)
-			
+
 			if tt.expectError {
 				assert.False(t, result.Valid)
 				assert.NotEmpty(t, result.Errors)
@@ -607,14 +607,14 @@ func TestValidateNestedCriteria(t *testing.T) {
 
 func TestValidationResult_GetFirstError(t *testing.T) {
 	result := &ValidationResult{}
-	
+
 	// Test with no errors
 	assert.Nil(t, result.GetFirstError())
-	
+
 	// Test with errors
 	result.addError("test", "test error", nil)
 	result.addError("test2", "second error", nil)
-	
+
 	firstErr := result.GetFirstError()
 	require.NotNil(t, firstErr)
 	assert.Equal(t, "search validation error in test: test error (value: <nil>)", firstErr.Error())
@@ -622,14 +622,14 @@ func TestValidationResult_GetFirstError(t *testing.T) {
 
 func TestValidationResult_HasErrorsForField(t *testing.T) {
 	result := &ValidationResult{}
-	
+
 	// Test with no errors
 	assert.False(t, result.HasErrorsForField("test"))
-	
+
 	// Test with errors
 	result.addError("test", "test error", nil)
 	result.addError("other", "other error", nil)
-	
+
 	assert.True(t, result.HasErrorsForField("test"))
 	assert.True(t, result.HasErrorsForField("other"))
 	assert.False(t, result.HasErrorsForField("nonexistent"))
@@ -646,7 +646,7 @@ func TestSearchComplexityString(t *testing.T) {
 		{ComplexityVeryHigh, "very_high"},
 		{SearchComplexity(999), "unknown"},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.expected, func(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.complexity.String())
@@ -660,22 +660,22 @@ func TestValidationError_Error(t *testing.T) {
 		Message: "test message",
 		Value:   42,
 	}
-	
+
 	expected := "search validation error in test: test message (value: 42)"
 	assert.Equal(t, expected, err.Error())
 }
 
 func TestMaxTermCountValidation(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	// Create criteria that exceed the max term count
 	criteria := &imap.SearchCriteria{
-		Body: make([]string, 30), // 30 terms
-		Text: make([]string, 25), // 25 terms
+		Body:   make([]string, 30),                        // 30 terms
+		Text:   make([]string, 25),                        // 25 terms
 		Header: make([]imap.SearchCriteriaHeaderField, 5), // 5 terms
 		// Total: 60 terms, exceeds MaxSearchTerms (50)
 	}
-	
+
 	// Fill with valid values
 	for i := range criteria.Body {
 		criteria.Body[i] = "body"
@@ -686,9 +686,9 @@ func TestMaxTermCountValidation(t *testing.T) {
 	for i := range criteria.Header {
 		criteria.Header[i] = imap.SearchCriteriaHeaderField{Key: "subject", Value: "test"}
 	}
-	
+
 	result := validator.ValidateSearchCriteria(criteria)
-	
+
 	assert.False(t, result.Valid)
 	assert.True(t, result.HasErrorsForField("total"))
 }

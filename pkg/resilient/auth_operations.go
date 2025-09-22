@@ -59,7 +59,7 @@ func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx 
 		MaxInterval:     500 * time.Millisecond,
 		MaxRetries:      2,
 	}
-	err = retry.WithRetry(ctx, func() error {
+	err = retry.WithRetryAdvanced(ctx, func() error {
 		// Apply auth-specific timeout for security operations
 		authCtx, cancel := rd.withTimeout(ctx, timeoutAuth)
 		defer cancel()
@@ -139,7 +139,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	}
 
 	var hashedPassword string
-	err = retry.WithRetry(ctx, func() error {
+	err = retry.WithRetryAdvanced(ctx, func() error {
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutAuth)
 		defer cancel()
 

@@ -112,7 +112,7 @@ func NewCachingStrategy() *CachingStrategy {
 func (cs *CachingStrategy) Activate(level DegradationLevel) error {
 	log.Printf("Activating extended caching strategy at level %s", level)
 	cs.setActive(true, level)
-	
+
 	switch level {
 	case LevelMinor:
 		log.Printf("Increasing cache retention time")
@@ -121,7 +121,7 @@ func (cs *CachingStrategy) Activate(level DegradationLevel) error {
 	case LevelCritical:
 		log.Printf("Enabling cache-only mode for reads")
 	}
-	
+
 	return nil
 }
 
@@ -150,7 +150,7 @@ func NewRateLimitingStrategy(normalLimit int) *RateLimitingStrategy {
 func (rl *RateLimitingStrategy) Activate(level DegradationLevel) error {
 	log.Printf("Activating rate limiting strategy at level %s", level)
 	rl.setActive(true, level)
-	
+
 	switch level {
 	case LevelMinor:
 		rl.currentLimit = int(float64(rl.normalLimit) * 0.8)
@@ -161,7 +161,7 @@ func (rl *RateLimitingStrategy) Activate(level DegradationLevel) error {
 	case LevelEmergency:
 		rl.currentLimit = int(float64(rl.normalLimit) * 0.2)
 	}
-	
+
 	log.Printf("Reduced rate limit from %d to %d", rl.normalLimit, rl.currentLimit)
 	return nil
 }
@@ -194,7 +194,7 @@ func NewConnectionPoolStrategy(normalMaxConns int) *ConnectionPoolStrategy {
 func (cp *ConnectionPoolStrategy) Activate(level DegradationLevel) error {
 	log.Printf("Activating connection pool management strategy at level %s", level)
 	cp.setActive(true, level)
-	
+
 	switch level {
 	case LevelMinor:
 		log.Printf("Reducing connection pool size by 20%%")
@@ -205,7 +205,7 @@ func (cp *ConnectionPoolStrategy) Activate(level DegradationLevel) error {
 	case LevelEmergency:
 		log.Printf("Minimizing connection pool size")
 	}
-	
+
 	return nil
 }
 
@@ -216,12 +216,12 @@ func (cp *ConnectionPoolStrategy) Deactivate() error {
 }
 
 type DegradationManager struct {
-	strategies      map[string]Strategy
-	healthMonitor   *health.HealthMonitor
-	currentLevel    DegradationLevel
-	mu              sync.RWMutex
-	ctx             context.Context
-	cancel          context.CancelFunc
+	strategies         map[string]Strategy
+	healthMonitor      *health.HealthMonitor
+	currentLevel       DegradationLevel
+	mu                 sync.RWMutex
+	ctx                context.Context
+	cancel             context.CancelFunc
 	evaluationInterval time.Duration
 }
 
@@ -242,10 +242,10 @@ func (dm *DegradationManager) RegisterStrategy(strategy Strategy) {
 
 func (dm *DegradationManager) Start(ctx context.Context) {
 	dm.ctx, dm.cancel = context.WithCancel(ctx)
-	
+
 	// Register health status change callback
 	dm.healthMonitor.AddStatusCallback(dm.onHealthStatusChange)
-	
+
 	// Start periodic evaluation
 	go dm.evaluateLoop()
 }
@@ -254,7 +254,7 @@ func (dm *DegradationManager) Stop() {
 	if dm.cancel != nil {
 		dm.cancel()
 	}
-	
+
 	// Deactivate all strategies
 	dm.mu.RLock()
 	strategies := make([]Strategy, 0, len(dm.strategies))
@@ -262,7 +262,7 @@ func (dm *DegradationManager) Stop() {
 		strategies = append(strategies, strategy)
 	}
 	dm.mu.RUnlock()
-	
+
 	for _, strategy := range strategies {
 		if strategy.IsActive() {
 			strategy.Deactivate()
@@ -286,7 +286,7 @@ func (dm *DegradationManager) evaluateLoop() {
 
 func (dm *DegradationManager) onHealthStatusChange(componentName string, status health.ComponentStatus) {
 	log.Printf("Health status change for %s: %s", componentName, status)
-	
+
 	// Trigger immediate evaluation on health changes
 	go func() {
 		select {
@@ -301,14 +301,14 @@ func (dm *DegradationManager) onHealthStatusChange(componentName string, status 
 func (dm *DegradationManager) evaluateDegradationLevel() {
 	overallStatus := dm.healthMonitor.GetOverallStatus()
 	allStatuses := dm.healthMonitor.GetAllStatuses()
-	
+
 	newLevel := dm.calculateDegradationLevel(overallStatus, allStatuses)
-	
+
 	dm.mu.Lock()
 	oldLevel := dm.currentLevel
 	dm.currentLevel = newLevel
 	dm.mu.Unlock()
-	
+
 	if oldLevel != newLevel {
 		log.Printf("Degradation level changed: %s -> %s", oldLevel, newLevel)
 		dm.applyStrategies(newLevel, oldLevel)
@@ -319,12 +319,12 @@ func (dm *DegradationManager) calculateDegradationLevel(overallStatus health.Com
 	switch overallStatus {
 	case health.StatusHealthy:
 		return LevelNormal
-		
+
 	case health.StatusDegraded:
 		// Count degraded/unhealthy components
 		degradedCount := 0
 		unhealthyCount := 0
-		
+
 		for _, status := range statuses {
 			switch status {
 			case health.StatusDegraded:
@@ -333,7 +333,7 @@ func (dm *DegradationManager) calculateDegradationLevel(overallStatus health.Com
 				unhealthyCount++
 			}
 		}
-		
+
 		if unhealthyCount > 0 {
 			return LevelMajor
 		}
@@ -341,7 +341,7 @@ func (dm *DegradationManager) calculateDegradationLevel(overallStatus health.Com
 			return LevelMajor
 		}
 		return LevelMinor
-		
+
 	case health.StatusUnhealthy:
 		// Check if critical components are down
 		if dm.healthMonitor.IsUnhealthy("database") {
@@ -351,10 +351,10 @@ func (dm *DegradationManager) calculateDegradationLevel(overallStatus health.Com
 			return LevelCritical
 		}
 		return LevelMajor
-		
+
 	case health.StatusUnreachable:
 		return LevelEmergency
-		
+
 	default:
 		return LevelNormal
 	}
@@ -367,11 +367,11 @@ func (dm *DegradationManager) applyStrategies(newLevel, oldLevel DegradationLeve
 		strategies[k] = v
 	}
 	dm.mu.RUnlock()
-	
+
 	for name, strategy := range strategies {
 		shouldActivate := dm.shouldActivateStrategy(name, newLevel)
 		isActive := strategy.IsActive()
-		
+
 		if shouldActivate && !isActive {
 			if err := strategy.Activate(newLevel); err != nil {
 				log.Printf("Failed to activate strategy %s: %v", name, err)
@@ -417,13 +417,13 @@ func (dm *DegradationManager) GetCurrentLevel() DegradationLevel {
 func (dm *DegradationManager) GetActiveStrategies() map[string]DegradationLevel {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
-	
+
 	active := make(map[string]DegradationLevel)
 	for name, strategy := range dm.strategies {
 		if strategy.IsActive() {
 			active[name] = strategy.Level()
 		}
 	}
-	
+
 	return active
 }

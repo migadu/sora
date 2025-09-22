@@ -73,7 +73,7 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 	} else {
 		datePrefix = tablePrefix + "."
 	}
-	
+
 	if !criteria.Since.IsZero() {
 		param := nextParam()
 		args[param] = criteria.Since
@@ -390,12 +390,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
-		
+
 		// For simple queries, ensure ORDER BY uses "m." prefix
 		if orderByClause == "" {
 			orderByClause = "ORDER BY m.uid"
 		}
-		
+
 		// Fast path: Simple query without joining message_contents.
 		// We still need to generate seqnum for non-UID searches.
 		const simpleQuery = `			
@@ -417,12 +417,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
-		
+
 		// For CTE queries, ensure ORDER BY uses no prefix
 		if orderByClause == "" {
 			orderByClause = "ORDER BY uid"
 		}
-		
+
 		// Complex path: Use CTE when sequence numbers or FTS are needed
 		const complexQuery = `
 		WITH message_seqs AS (

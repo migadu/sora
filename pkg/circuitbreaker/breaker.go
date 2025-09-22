@@ -35,13 +35,13 @@ var (
 )
 
 type Settings struct {
-	Name               string
-	MaxRequests        uint32
-	Interval           time.Duration
-	Timeout            time.Duration
-	ReadyToTrip        func(counts Counts) bool
-	OnStateChange      func(name string, from State, to State)
-	IsSuccessful       func(err error) bool
+	Name          string
+	MaxRequests   uint32
+	Interval      time.Duration
+	Timeout       time.Duration
+	ReadyToTrip   func(counts Counts) bool
+	OnStateChange func(name string, from State, to State)
+	IsSuccessful  func(err error) bool
 }
 
 type Counts struct {
@@ -94,12 +94,12 @@ type CircuitBreaker struct {
 
 func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	cb := &CircuitBreaker{
-		name:        st.Name,
-		maxRequests: st.MaxRequests,
-		interval:    st.Interval,
-		timeout:     st.Timeout,
-		readyToTrip: st.ReadyToTrip,
-		isSuccessful: st.IsSuccessful,
+		name:          st.Name,
+		maxRequests:   st.MaxRequests,
+		interval:      st.Interval,
+		timeout:       st.Timeout,
+		readyToTrip:   st.ReadyToTrip,
+		isSuccessful:  st.IsSuccessful,
 		onStateChange: st.OnStateChange,
 	}
 

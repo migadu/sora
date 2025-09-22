@@ -47,20 +47,23 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth        bool
-	Debug               bool
-	TLS                 bool
-	TLSCertFile         string
-	TLSKeyFile          string
-	TLSVerify           bool
-	TLSUseStartTLS      bool
-	MaxScriptSize       int64
-	MasterSASLUsername  string
-	MasterSASLPassword  string
-	MaxConnections      int
-	MaxConnectionsPerIP int
-	ProxyProtocol       server.ProxyProtocolConfig
-	AuthRateLimit       server.AuthRateLimiterConfig
+	InsecureAuth          bool
+	Debug                 bool
+	TLS                   bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSVerify             bool
+	TLSUseStartTLS        bool
+	MaxScriptSize         int64
+	MasterSASLUsername    string
+	MasterSASLPassword    string
+	MaxConnections        int
+	MaxConnectionsPerIP   int
+	ProxyProtocol         bool     // Enable PROXY protocol support
+	ProxyProtocolRequired bool     // Require PROXY protocol headers
+	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
+	TrustedNetworks       []string // Global trusted networks for parameter forwarding
+	AuthRateLimit         server.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -68,9 +71,21 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
-	if options.ProxyProtocol.Enabled {
+	if options.ProxyProtocol {
+		// Create ProxyProtocolConfig from simplified settings
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Mode:           "required",
+			TrustedProxies: options.TrustedNetworks,
+			Timeout:        options.ProxyProtocolTimeout,
+		}
+
+		if !options.ProxyProtocolRequired {
+			proxyConfig.Mode = "optional"
+		}
+
 		var err error
-		proxyReader, err = server.NewProxyProtocolReader("ManageSieve", options.ProxyProtocol)
+		proxyReader, err = server.NewProxyProtocolReader("ManageSieve", proxyConfig)
 		if err != nil {
 			serverCancel()
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)

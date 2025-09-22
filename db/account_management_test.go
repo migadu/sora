@@ -14,10 +14,10 @@ import (
 // Database test helpers for account management tests
 func setupAccountManagementTestDatabase(t *testing.T) (*Database, string) {
 	db := setupTestDatabase(t)
-	
+
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
-	
+
 	return db, testEmail
 }
 
@@ -29,7 +29,7 @@ func TestDeleteAccount(t *testing.T) {
 
 	db, testEmail := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create an account first
@@ -86,7 +86,7 @@ func TestRestoreAccount(t *testing.T) {
 
 	db, testEmail := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create and delete an account
@@ -154,7 +154,7 @@ func TestUpdateAccount(t *testing.T) {
 
 	db, testEmail := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create an account first
@@ -216,7 +216,7 @@ func TestAccountExists(t *testing.T) {
 
 	db, testEmail := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Check non-existent account
@@ -257,7 +257,7 @@ func TestGetAccountDetails(t *testing.T) {
 
 	db, testEmail := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create an account first
@@ -301,7 +301,7 @@ func TestListAccounts(t *testing.T) {
 
 	db, _ := setupAccountManagementTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: List accounts before creating any
@@ -320,7 +320,7 @@ func TestListAccounts(t *testing.T) {
 		// Create completely unique emails for separate accounts
 		email := fmt.Sprintf("account_%d_%d@example.com", time.Now().UnixNano()/1000000, i)
 		createdEmails = append(createdEmails, strings.ToLower(email))
-		
+
 		req := CreateAccountRequest{
 			Email:     email,
 			Password:  "password123",
@@ -350,7 +350,7 @@ func TestListAccounts(t *testing.T) {
 			}
 		}
 	}
-	
+
 	assert.Equal(t, 3, foundAccounts)
 
 	t.Logf("Successfully tested ListAccounts with %d total accounts", len(accounts))

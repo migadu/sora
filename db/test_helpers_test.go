@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/require"
 	"github.com/BurntSushi/toml"
+	"github.com/stretchr/testify/require"
 )
 
 // TestConfig represents minimal test configuration

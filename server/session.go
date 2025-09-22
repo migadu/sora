@@ -13,13 +13,13 @@ type ConnectionStatsProvider interface {
 
 type Session struct {
 	Id       string
-	RemoteIP string  // Real client IP (from PROXY protocol or direct connection)
-	ProxyIP  string  // Proxy IP (only set when connection comes through PROXY protocol)
+	RemoteIP string // Real client IP (from PROXY protocol or direct connection)
+	ProxyIP  string // Proxy IP (only set when connection comes through PROXY protocol)
 	*User
 	HostName string
 	Protocol string
 	Stats    ConnectionStatsProvider
-	
+
 	// Parameter forwarding support (Dovecot-style)
 	ForwardingParams *ForwardingParams // Forwarded connection parameters
 }

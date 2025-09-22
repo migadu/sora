@@ -13,17 +13,17 @@ import (
 
 // DovecotUIDList represents the parsed dovecot-uidlist file
 type DovecotUIDList struct {
-	Version      int
-	UIDValidity  uint32
-	NextUID      uint32
-	GlobalUID    string
-	UIDMappings  map[string]uint32 // filename -> UID
+	Version     int
+	UIDValidity uint32
+	NextUID     uint32
+	GlobalUID   string
+	UIDMappings map[string]uint32 // filename -> UID
 }
 
 // ParseDovecotUIDList parses a dovecot-uidlist file from the given maildir path
 func ParseDovecotUIDList(maildirPath string) (*DovecotUIDList, error) {
 	uidlistPath := filepath.Join(maildirPath, "dovecot-uidlist")
-	
+
 	file, err := os.Open(uidlistPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -160,17 +160,17 @@ func parseUIDMapping(line string, uidlist *DovecotUIDList) error {
 	// The filename may be like: 1276528487.M364837P9451.kurkku,S=1355,W=1394:2,
 	// We want to extract just: 1276528487.M364837P9451.kurkku
 	baseFilename := filename
-	
+
 	// First, remove anything after the first comma (size info like ,S=1355,W=1394)
 	if idx := strings.Index(baseFilename, ","); idx > 0 {
 		baseFilename = baseFilename[:idx]
 	}
-	
+
 	// Then remove anything after colon (flags like :2,S)
 	if idx := strings.Index(baseFilename, ":"); idx > 0 {
 		baseFilename = baseFilename[:idx]
 	}
-	
+
 	baseFilename = filepath.Base(baseFilename)
 
 	uidlist.UIDMappings[baseFilename] = uint32(uid)
@@ -206,7 +206,7 @@ func WriteDovecotUIDList(maildirPath string, uidList *DovecotUIDList) error {
 	}
 
 	uidlistPath := filepath.Join(maildirPath, "dovecot-uidlist")
-	
+
 	file, err := os.Create(uidlistPath)
 	if err != nil {
 		return fmt.Errorf("failed to create dovecot-uidlist: %w", err)

@@ -331,7 +331,7 @@ func TestManuallyCreatedHashes(t *testing.T) {
 // TestPasswordGenerationAndVerification tests all hash types end-to-end
 func TestPasswordGenerationAndVerification(t *testing.T) {
 	password := "testPassword123!"
-	
+
 	tests := []struct {
 		name     string
 		hashType string
@@ -344,7 +344,7 @@ func TestPasswordGenerationAndVerification(t *testing.T) {
 		},
 		{
 			name:     "ssha512",
-			hashType: "ssha512", 
+			hashType: "ssha512",
 			genFunc:  func(p string) (string, error) { return GenerateSSHA512Hash(p) },
 		},
 		{
@@ -381,7 +381,7 @@ func TestPasswordEdgeCases(t *testing.T) {
 	t.Run("empty password", func(t *testing.T) {
 		hash, err := GenerateBcryptHash("")
 		require.NoError(t, err)
-		
+
 		err = VerifyPassword(hash, "")
 		assert.NoError(t, err)
 	})
@@ -398,7 +398,7 @@ func TestPasswordEdgeCases(t *testing.T) {
 		unicodePassword := "测试密码🔒"
 		hash, err := GenerateBcryptHash(unicodePassword)
 		require.NoError(t, err)
-		
+
 		err = VerifyPassword(hash, unicodePassword)
 		assert.NoError(t, err)
 	})
@@ -421,17 +421,17 @@ func TestPasswordEdgeCases(t *testing.T) {
 
 // Database test helpers moved to test_helpers_test.go
 
-// TestUpdatePassword tests password updating functionality  
+// TestUpdatePassword tests password updating functionality
 func TestUpdatePassword(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
-	
+
 	testDB := setupTestDatabase(t)
 	defer testDB.Close()
-	
+
 	ctx := context.Background()
-	
+
 	// First create a test account
 	tx, err := testDB.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
@@ -470,11 +470,11 @@ func TestUpdatePassword(t *testing.T) {
 	// Verify the password was updated by trying to authenticate
 	_, storedHash, err := testDB.GetCredentialForAuth(ctx, testEmail)
 	require.NoError(t, err)
-	
+
 	// Old password should fail
 	err = VerifyPassword(storedHash, "originalpassword")
 	assert.Error(t, err)
-	
+
 	// New password should work
 	err = VerifyPassword(storedHash, "newpassword123")
 	assert.NoError(t, err)
@@ -488,7 +488,7 @@ func TestGetCredentialForAuth(t *testing.T) {
 
 	testDB := setupTestDatabase(t)
 	defer testDB.Close()
-	
+
 	ctx := context.Background()
 
 	// Create a test account first
@@ -543,15 +543,15 @@ func TestGetAccountIDByAddress(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
-	
+
 	// Create a test account
 	testEmail := fmt.Sprintf("test_get_account_%d@example.com", time.Now().UnixNano())
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	
+
 	req := CreateAccountRequest{
 		Email:     testEmail,
 		Password:  "password123",
@@ -561,13 +561,13 @@ func TestGetAccountIDByAddress(t *testing.T) {
 	err = db.CreateAccount(ctx, tx, req)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
-	
+
 	// Test cases:
 	// 1. Valid user
 	accountID, err := db.GetAccountIDByAddress(ctx, testEmail)
 	assert.NoError(t, err)
 	assert.Greater(t, accountID, int64(0))
-	
+
 	// 2. Non-existent user (should return ErrUserNotFound)
 	_, err = db.GetAccountIDByAddress(ctx, "nonexistent@example.com")
 	assert.Error(t, err)
@@ -584,15 +584,15 @@ func TestGetPrimaryEmailForAccount(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
-	
+
 	// Create a test account
 	testEmail := fmt.Sprintf("test_primary_email_%d@example.com", time.Now().UnixNano())
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	
+
 	req := CreateAccountRequest{
 		Email:     testEmail,
 		Password:  "password123",
@@ -602,17 +602,17 @@ func TestGetPrimaryEmailForAccount(t *testing.T) {
 	err = db.CreateAccount(ctx, tx, req)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
-	
+
 	// Get account ID
 	accountID, err := db.GetAccountIDByAddress(ctx, testEmail)
 	require.NoError(t, err)
-	
+
 	// Test cases:
 	// 1. Account with primary email
 	primaryEmail, err := db.GetPrimaryEmailForAccount(ctx, accountID)
 	assert.NoError(t, err)
 	assert.Equal(t, testEmail, primaryEmail.FullAddress())
-	
+
 	// 2. Non-existent account (should return error)
 	_, err = db.GetPrimaryEmailForAccount(ctx, 99999999)
 	assert.Error(t, err)

@@ -7,7 +7,7 @@ require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.5.0.20250605085616-231f7ff5a407
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
-	github.com/emersion/go-smtp v0.21.3
+	github.com/emersion/go-smtp v0.24.0
 	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/gorilla/mux v1.8.1
@@ -25,6 +25,8 @@ require (
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25
 
 replace github.com/emersion/go-imap/v2 => github.com/dejanstrbac/go-imap/v2 v2.0.0-20250916132813-07d69cfbad94
+
+replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

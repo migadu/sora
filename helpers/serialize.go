@@ -27,7 +27,7 @@ func SerializeBodyStructureGob(bs *imap.BodyStructure) ([]byte, error) {
 		var defaultBS imap.BodyStructure = defaultBodyStructure
 		bs = &defaultBS
 	}
-	
+
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(bs); err != nil {

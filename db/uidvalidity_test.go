@@ -13,12 +13,12 @@ import (
 // Database test helpers for UIDVALIDITY tests
 func setupUIDValidityTestDatabase(t *testing.T) (*Database, int64) {
 	db := setupTestDatabase(t)
-	
+
 	ctx := context.Background()
-	
+
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
-	
+
 	// Create test account
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
@@ -51,12 +51,12 @@ func TestUIDValidityGeneration(t *testing.T) {
 
 	db, accountID := setupUIDValidityTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create mailboxes with small time delays to ensure unique UIDVALIDITY
 	var mailboxes []*DBMailbox
-	
+
 	for i := 0; i < 3; i++ {
 		tx, err := db.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
@@ -109,7 +109,7 @@ func TestUIDValidityPersistence(t *testing.T) {
 
 	db, accountID := setupUIDValidityTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create a mailbox
@@ -163,7 +163,7 @@ func TestDefaultMailboxesUIDValidity(t *testing.T) {
 
 	db, accountID := setupUIDValidityTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create default mailboxes
@@ -185,7 +185,7 @@ func TestDefaultMailboxesUIDValidity(t *testing.T) {
 	// Test 3: Verify all default mailboxes have valid UIDVALIDITY
 	defaultMailboxNames := []string{"INBOX", "Drafts", "Sent", "Trash"}
 	foundDefaultMailboxes := 0
-	
+
 	for _, mailbox := range mailboxes {
 		for _, defaultName := range defaultMailboxNames {
 			if mailbox.Name == defaultName {
@@ -210,7 +210,7 @@ func TestUIDValidityRangeValidation(t *testing.T) {
 
 	db, accountID := setupUIDValidityTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create a mailbox

@@ -20,12 +20,12 @@ func TestSearchConstants(t *testing.T) {
 // Database test helpers for search tests
 func setupSearchTestDatabase(t *testing.T) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
-	
+
 	ctx := context.Background()
-	
+
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
-	
+
 	// Create test account
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
@@ -82,7 +82,7 @@ func TestBuildNumSetCondition(t *testing.T) {
 		{
 			name:        "sequence set",
 			numSet:      imap.SeqSet{imap.SeqRange{Start: 1, Stop: 10}},
-			columnName:  "seqnum", 
+			columnName:  "seqnum",
 			expectError: false,
 		},
 		{
@@ -97,7 +97,7 @@ func TestBuildNumSetCondition(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// This would test the buildNumSetCondition function
 			t.Skip("buildNumSetCondition is internal function")
-			
+
 			// Example test structure:
 			// paramCounter := 0
 			// condition, args, err := buildNumSetCondition(tt.numSet, tt.columnName, "p", &paramCounter)
@@ -122,7 +122,7 @@ func TestBuildSearchCriteria(t *testing.T) {
 	defer db.Close()
 
 	// Test cases for different search criteria:
-	
+
 	tests := []struct {
 		name     string
 		criteria *imap.SearchCriteria
@@ -261,7 +261,7 @@ func TestBuildSortOrderClause(t *testing.T) {
 			expected: "m.internal_date ASC",
 		},
 		{
-			name:     "sort by date descending", 
+			name:     "sort by date descending",
 			criteria: []imap.SortCriterion{{Key: imap.SortKeyArrival, Reverse: true}},
 			expected: "m.internal_date DESC",
 		},
@@ -355,7 +355,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 
 	db, accountID, mailboxID := setupSearchTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Search empty mailbox (should return empty results)
@@ -410,7 +410,7 @@ func TestGetMessagesSorted(t *testing.T) {
 
 	db, accountID, mailboxID := setupSearchTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Sort empty result set
@@ -467,7 +467,7 @@ func TestFullTextSearch(t *testing.T) {
 
 	db, accountID, mailboxID := setupSearchTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Search for single word in body (empty mailbox)
@@ -519,7 +519,7 @@ func TestFullTextSearch(t *testing.T) {
 // TestSearchCriteriaValidation tests search criteria validation using SearchCriteriaValidator
 func TestSearchCriteriaValidation(t *testing.T) {
 	validator := NewSearchCriteriaValidator()
-	
+
 	tests := []struct {
 		name     string
 		criteria *imap.SearchCriteria
@@ -551,7 +551,7 @@ func TestSearchCriteriaValidation(t *testing.T) {
 			valid: false,
 		},
 		{
-			name: "invalid size range", 
+			name: "invalid size range",
 			criteria: &imap.SearchCriteria{
 				Larger:  1000,
 				Smaller: 500, // Smaller is less than Larger
@@ -591,9 +591,9 @@ func TestSearchCriteriaValidation(t *testing.T) {
 					tt.criteria.Text[i] = "term"
 				}
 			}
-			
+
 			result := validator.ValidateSearchCriteria(tt.criteria)
-			
+
 			if tt.valid {
 				assert.True(t, result.Valid, "Expected criteria to be valid")
 				if !result.Valid && len(result.Errors) > 0 {
@@ -616,13 +616,13 @@ func TestSearchPerformanceBasic(t *testing.T) {
 
 	db, accountID, mailboxID := setupSearchTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Basic performance validation - ensure search operations complete in reasonable time
 	t.Run("BasicSearchPerformance", func(t *testing.T) {
 		maxDuration := 5 * time.Second // Reasonable timeout for empty mailbox
-		
+
 		testCases := []struct {
 			name     string
 			criteria *imap.SearchCriteria
@@ -646,16 +646,16 @@ func TestSearchPerformanceBasic(t *testing.T) {
 				start := time.Now()
 				messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, tc.criteria)
 				elapsed := time.Since(start)
-				
+
 				assert.NoError(t, err)
 				if messages != nil {
 					assert.Empty(t, messages) // Empty mailbox in basic tests
 				} else {
 					t.Logf("Search returned nil (no results) as expected for empty mailbox")
 				}
-				
+
 				if elapsed > maxDuration {
-					t.Errorf("%s took %v, which exceeds maximum expected duration of %v", 
+					t.Errorf("%s took %v, which exceeds maximum expected duration of %v",
 						tc.name, elapsed, maxDuration)
 				} else {
 					t.Logf("%s completed in %v", tc.name, elapsed)
@@ -669,8 +669,8 @@ func TestSearchPerformanceBasic(t *testing.T) {
 		assert.Equal(t, 5000, MaxSearchResults, "MaxSearchResults should be 5000")
 		assert.Equal(t, 1000, MaxComplexSortResults, "MaxComplexSortResults should be 1000")
 		assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than regular search limit")
-		
-		t.Logf("Search limits: MaxSearchResults=%d, MaxComplexSortResults=%d", 
+
+		t.Logf("Search limits: MaxSearchResults=%d, MaxComplexSortResults=%d",
 			MaxSearchResults, MaxComplexSortResults)
 	})
 
@@ -686,7 +686,7 @@ func TestSearchEdgeCases(t *testing.T) {
 
 	db, accountID, mailboxID := setupSearchTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Search with empty search terms

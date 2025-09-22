@@ -215,7 +215,7 @@ func (rd *ResilientDatabase) CreateAccountWithCredentialsWithRetry(ctx context.C
 
 		return nil
 	}, adminRetryConfig)
-	
+
 	return accountID, err
 }
 

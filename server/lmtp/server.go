@@ -50,26 +50,40 @@ type LMTPServerBackend struct {
 }
 
 type LMTPServerOptions struct {
-	ExternalRelay       string
-	Debug               bool
-	TLS                 bool
-	TLSCertFile         string
-	TLSKeyFile          string
-	TLSVerify           bool
-	TLSUseStartTLS      bool
-	MaxConnections      int
-	MaxConnectionsPerIP int
-	ProxyProtocol       server.ProxyProtocolConfig
-	FTSRetention        time.Duration
+	ExternalRelay         string
+	Debug                 bool
+	TLS                   bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSVerify             bool
+	TLSUseStartTLS        bool
+	MaxConnections        int
+	MaxConnectionsPerIP   int
+	ProxyProtocol         bool     // Enable PROXY protocol support
+	ProxyProtocolRequired bool     // Require PROXY protocol headers
+	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
+	TrustedNetworks       []string // Global trusted networks for parameter forwarding
+	FTSRetention          time.Duration
 }
 
 func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
-	if options.ProxyProtocol.Enabled {
-		var err error
+	if options.ProxyProtocol {
+		// Create ProxyProtocolConfig from simplified settings
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Mode:           "required",
+			TrustedProxies: options.TrustedNetworks,
+			Timeout:        options.ProxyProtocolTimeout,
+		}
 
-		proxyReader, err = server.NewProxyProtocolReader("LMTP", options.ProxyProtocol)
+		if !options.ProxyProtocolRequired {
+			proxyConfig.Mode = "optional"
+		}
+
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("LMTP", proxyConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
 		}
@@ -125,6 +139,31 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 	s.Domain = hostname
 	s.AllowInsecureAuth = true
 	s.LMTP = true
+
+	// Configure XCLIENT support (always enabled)
+	s.EnableXCLIENT = true
+
+	// Set trusted networks for XCLIENT using global trusted networks
+	var trustedProxies []string
+	if len(options.TrustedNetworks) > 0 {
+		// Use global trusted networks
+		trustedProxies = options.TrustedNetworks
+	} else {
+		// Use safe default trusted networks (RFC1918 private networks + localhost)
+		trustedProxies = []string{
+			"127.0.0.0/8",    // localhost
+			"::1/128",        // IPv6 localhost
+			"10.0.0.0/8",     // RFC1918 private networks
+			"172.16.0.0/12",  // RFC1918 private networks
+			"192.168.0.0/16", // RFC1918 private networks
+		}
+	}
+
+	trustedNets, err := server.ParseTrustedNetworks(trustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse trusted networks for XCLIENT: %w", err)
+	}
+	s.XCLIENTTrustedNets = trustedNets
 
 	// Configure StartTLS if enabled and TLS config is available
 	if options.TLSUseStartTLS && backend.tlsConfig != nil {

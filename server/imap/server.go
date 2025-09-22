@@ -113,20 +113,23 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
-	Debug               bool
-	TLS                 bool
-	TLSCertFile         string
-	TLSKeyFile          string
-	TLSVerify           bool
-	MasterUsername      []byte
-	MasterPassword      []byte
-	MasterSASLUsername  []byte
-	MasterSASLPassword  []byte
-	AppendLimit         int64
-	MaxConnections      int
-	MaxConnectionsPerIP int
-	ProxyProtocol       serverPkg.ProxyProtocolConfig
-	AuthRateLimit       serverPkg.AuthRateLimiterConfig
+	Debug                 bool
+	TLS                   bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSVerify             bool
+	MasterUsername        []byte
+	MasterPassword        []byte
+	MasterSASLUsername    []byte
+	MasterSASLPassword    []byte
+	AppendLimit           int64
+	MaxConnections        int
+	MaxConnectionsPerIP   int
+	ProxyProtocol         bool     // Enable PROXY protocol support
+	ProxyProtocolRequired bool     // Require PROXY protocol headers
+	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
+	TrustedNetworks       []string // Global trusted networks for parameter forwarding
+	AuthRateLimit         serverPkg.AuthRateLimiterConfig
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -150,9 +153,21 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
-	if options.ProxyProtocol.Enabled {
+	if options.ProxyProtocol {
+		// Create ProxyProtocolConfig from simplified settings
+		proxyConfig := serverPkg.ProxyProtocolConfig{
+			Enabled:        true,
+			Mode:           "required",
+			TrustedProxies: options.TrustedNetworks,
+			Timeout:        options.ProxyProtocolTimeout,
+		}
+
+		if !options.ProxyProtocolRequired {
+			proxyConfig.Mode = "optional"
+		}
+
 		var err error
-		proxyReader, err = serverPkg.NewProxyProtocolReader("IMAP", options.ProxyProtocol)
+		proxyReader, err = serverPkg.NewProxyProtocolReader("IMAP", proxyConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
 		}

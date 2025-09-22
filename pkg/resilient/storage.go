@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v7"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 	"github.com/migadu/sora/storage"
+	"github.com/minio/minio-go/v7"
 )
 
 type ResilientS3Storage struct {
@@ -67,7 +67,7 @@ func (rs *ResilientS3Storage) isRetryableError(err error) bool {
 	}
 
 	errStr := strings.ToLower(err.Error())
-	
+
 	retryableErrors := []string{
 		"connection refused",
 		"connection reset",
@@ -110,14 +110,14 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 			r, getErr := rs.storage.Get(key)
 			return r, getErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		reader = result.(io.ReadCloser)
 		return nil
 	}, config)
@@ -139,14 +139,14 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 			putErr := rs.storage.Put(key, body, size)
 			return nil, putErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		return nil
 	}, config)
 }
@@ -165,14 +165,14 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 			deleteErr := rs.storage.Delete(key)
 			return nil, deleteErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		return nil
 	}, config)
 }
@@ -192,14 +192,14 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 			uploadInfo, putErr := rs.storage.Client.PutObject(ctx, rs.storage.BucketName, key, reader, objectSize, opts)
 			return uploadInfo, putErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		info = result.(minio.UploadInfo)
 		return nil
 	}, config)
@@ -222,14 +222,14 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 			obj, getErr := rs.storage.Client.GetObject(ctx, rs.storage.BucketName, key, opts)
 			return obj, getErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		if result != nil {
 			object = result.(*minio.Object)
 		}
@@ -254,14 +254,14 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 			objInfo, statErr := rs.storage.Client.StatObject(ctx, rs.storage.BucketName, key, opts)
 			return objInfo, statErr
 		})
-		
+
 		if cbErr != nil {
 			if rs.isRetryableError(cbErr) {
 				return cbErr
 			}
 			return fmt.Errorf("circuit breaker error: %w", cbErr)
 		}
-		
+
 		info = result.(minio.ObjectInfo)
 		return nil
 	}, config)

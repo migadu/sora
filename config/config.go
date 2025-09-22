@@ -393,23 +393,21 @@ type IMAPServerConfig struct {
 	TLSCertFile         string                `toml:"tls_cert_file"`
 	TLSKeyFile          string                `toml:"tls_key_file"`
 	TLSVerify           bool                  `toml:"tls_verify"`
-	ProxyProtocol       ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
 // LMTPServerConfig holds LMTP server configuration.
 type LMTPServerConfig struct {
-	Start               bool                `toml:"start"`
-	Addr                string              `toml:"addr"`
-	MaxConnections      int                 `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                 `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	ExternalRelay       string              `toml:"external_relay"`
-	TLS                 bool                `toml:"tls"`
-	TLSUseStartTLS      bool                `toml:"tls_use_starttls"`
-	TLSCertFile         string              `toml:"tls_cert_file"`
-	TLSKeyFile          string              `toml:"tls_key_file"`
-	TLSVerify           bool                `toml:"tls_verify"`
-	ProxyProtocol       ProxyProtocolConfig `toml:"proxy_protocol"` // PROXY protocol configuration
+	Start               bool   `toml:"start"`
+	Addr                string `toml:"addr"`
+	MaxConnections      int    `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int    `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	ExternalRelay       string `toml:"external_relay"`
+	TLS                 bool   `toml:"tls"`
+	TLSUseStartTLS      bool   `toml:"tls_use_starttls"`
+	TLSCertFile         string `toml:"tls_cert_file"`
+	TLSKeyFile          string `toml:"tls_key_file"`
+	TLSVerify           bool   `toml:"tls_verify"`
 }
 
 // POP3ServerConfig holds POP3 server configuration.
@@ -424,7 +422,6 @@ type POP3ServerConfig struct {
 	TLSCertFile         string                `toml:"tls_cert_file"`
 	TLSKeyFile          string                `toml:"tls_key_file"`
 	TLSVerify           bool                  `toml:"tls_verify"`
-	ProxyProtocol       ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
@@ -443,7 +440,6 @@ type ManageSieveServerConfig struct {
 	TLSCertFile         string                `toml:"tls_cert_file"`
 	TLSKeyFile          string                `toml:"tls_key_file"`
 	TLSVerify           bool                  `toml:"tls_verify"`
-	ProxyProtocol       ProxyProtocolConfig   `toml:"proxy_protocol"`  // PROXY protocol configuration
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 }
 
@@ -584,18 +580,22 @@ type HTTPAPIConfig struct {
 
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
-	Debug              bool                         `toml:"debug"`
-	IMAP               IMAPServerConfig             `toml:"imap"`
-	LMTP               LMTPServerConfig             `toml:"lmtp"`
-	POP3               POP3ServerConfig             `toml:"pop3"`
-	ManageSieve        ManageSieveServerConfig      `toml:"managesieve"`
-	IMAPProxy          IMAPProxyServerConfig        `toml:"imap_proxy"`
-	POP3Proxy          POP3ProxyServerConfig        `toml:"pop3_proxy"`
-	ManageSieveProxy   ManageSieveProxyServerConfig `toml:"managesieve_proxy"`
-	LMTPProxy          LMTPProxyServerConfig        `toml:"lmtp_proxy"`
-	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
-	Metrics            MetricsConfig                `toml:"metrics"`
-	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
+	Debug                 bool                         `toml:"debug"`
+	ProxyProtocol         bool                         `toml:"proxy_protocol"`          // Enable PROXY protocol support globally
+	ProxyProtocolRequired bool                         `toml:"proxy_protocol_required"` // Require PROXY protocol headers
+	ProxyProtocolTimeout  string                       `toml:"proxy_protocol_timeout"`  // Timeout for reading PROXY headers
+	TrustedNetworks       []string                     `toml:"trusted_networks"`        // Global trusted networks for proxy parameter forwarding
+	IMAP                  IMAPServerConfig             `toml:"imap"`
+	LMTP                  LMTPServerConfig             `toml:"lmtp"`
+	POP3                  POP3ServerConfig             `toml:"pop3"`
+	ManageSieve           ManageSieveServerConfig      `toml:"managesieve"`
+	IMAPProxy             IMAPProxyServerConfig        `toml:"imap_proxy"`
+	POP3Proxy             POP3ProxyServerConfig        `toml:"pop3_proxy"`
+	ManageSieveProxy      ManageSieveProxyServerConfig `toml:"managesieve_proxy"`
+	LMTPProxy             LMTPProxyServerConfig        `toml:"lmtp_proxy"`
+	ConnectionTracking    ConnectionTrackingConfig     `toml:"connection_tracking"`
+	Metrics               MetricsConfig                `toml:"metrics"`
+	HTTPAPI               HTTPAPIConfig                `toml:"http_api"`
 }
 
 // Config holds all configuration for the application.
@@ -674,7 +674,11 @@ func NewDefaultConfig() Config {
 			WarmupAsync:        true,
 		},
 		Servers: ServersConfig{
-			Debug: false,
+			Debug:                 false,
+			ProxyProtocol:         false,
+			ProxyProtocolRequired: true,
+			ProxyProtocolTimeout:  "5s",
+			TrustedNetworks:       []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 			IMAP: IMAPServerConfig{
 				Start:               true,
 				Addr:                ":143",

@@ -44,20 +44,26 @@ type POP3Server struct {
 
 	// Authentication rate limiting
 	authLimiter serverPkg.AuthLimiter
+
+	// XCLIENT is always enabled but limited to trusted networks
+	trustedNetworks []string
 }
 
 type POP3ServerOptions struct {
-	Debug               bool
-	TLS                 bool
-	TLSCertFile         string
-	TLSKeyFile          string
-	TLSVerify           bool
-	MasterSASLUsername  string
-	MasterSASLPassword  string
-	MaxConnections      int
-	MaxConnectionsPerIP int
-	ProxyProtocol       serverPkg.ProxyProtocolConfig
-	AuthRateLimit       serverPkg.AuthRateLimiterConfig
+	Debug                 bool
+	TLS                   bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSVerify             bool
+	MasterSASLUsername    string
+	MasterSASLPassword    string
+	MaxConnections        int
+	MaxConnectionsPerIP   int
+	ProxyProtocol         bool     // Enable PROXY protocol support
+	ProxyProtocolRequired bool     // Require PROXY protocol headers
+	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
+	TrustedNetworks       []string // Global trusted networks for parameter forwarding
+	AuthRateLimit         serverPkg.AuthRateLimiterConfig
 }
 
 func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -69,9 +75,21 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *serverPkg.ProxyProtocolReader
-	if options.ProxyProtocol.Enabled {
+	if options.ProxyProtocol {
+		// Create ProxyProtocolConfig from simplified settings
+		proxyConfig := serverPkg.ProxyProtocolConfig{
+			Enabled:        true,
+			Mode:           "required",
+			TrustedProxies: options.TrustedNetworks,
+			Timeout:        options.ProxyProtocolTimeout,
+		}
+
+		if !options.ProxyProtocolRequired {
+			proxyConfig.Mode = "optional"
+		}
+
 		var err error
-		proxyReader, err = serverPkg.NewProxyProtocolReader("POP3", options.ProxyProtocol)
+		proxyReader, err = serverPkg.NewProxyProtocolReader("POP3", proxyConfig)
 		if err != nil {
 			serverCancel()
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
@@ -82,19 +100,20 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 	authLimiter := serverPkg.NewAuthRateLimiter("POP3", options.AuthRateLimit, rdb)
 
 	server := &POP3Server{
-		hostname:           hostname,
-		addr:               popAddr,
-		rdb:                rdb,
-		s3:                 resilientS3,
-		appCtx:             serverCtx,
-		cancel:             serverCancel,
-		uploader:           uploadWorker,
-		cache:              cache,
-		masterSASLUsername: []byte(options.MasterSASLUsername),
-		masterSASLPassword: []byte(options.MasterSASLPassword),
-		limiter:            serverPkg.NewConnectionLimiter("POP3", options.MaxConnections, options.MaxConnectionsPerIP),
-		proxyReader:        proxyReader,
-		authLimiter:        authLimiter,
+		hostname:               hostname,
+		addr:                   popAddr,
+		rdb:                    rdb,
+		s3:                     resilientS3,
+		appCtx:                 serverCtx,
+		cancel:                 serverCancel,
+		uploader:               uploadWorker,
+		cache:                  cache,
+		masterSASLUsername:     []byte(options.MasterSASLUsername),
+		masterSASLPassword:     []byte(options.MasterSASLPassword),
+		limiter:                serverPkg.NewConnectionLimiter("POP3", options.MaxConnections, options.MaxConnectionsPerIP),
+		proxyReader:            proxyReader,
+		authLimiter:            authLimiter,
+		trustedNetworks: options.TrustedNetworks,
 	}
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
@@ -313,17 +332,14 @@ func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
 }
 
-// getTrustedProxies returns the list of trusted proxy CIDR blocks for parameter forwarding
+// getTrustedProxies returns the list of trusted proxy CIDR blocks for XCLIENT parameter forwarding
 func (s *POP3Server) getTrustedProxies() []string {
-	if s.proxyReader != nil {
-		// Get trusted proxies from PROXY protocol configuration
-		// Access the configuration from the ProxyProtocolReader
-		// Note: This assumes the ProxyProtocolReader has access to the config
-		// For now, we'll use default safe values that match PROXY protocol defaults
+	// XCLIENT is always enabled, use configured trusted networks
+	if len(s.trustedNetworks) > 0 {
+		return s.trustedNetworks
 	}
 
-	// Return default trusted proxy networks (RFC1918 private networks + localhost)
-	// These are safe defaults that match the PROXY protocol configuration
+	// If no networks specified, use RFC1918 defaults
 	return []string{
 		"127.0.0.0/8",    // localhost
 		"10.0.0.0/8",     // RFC1918 private networks

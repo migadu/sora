@@ -13,12 +13,12 @@ import (
 // Database test helpers for mailbox rename and UIDVALIDITY tests
 func setupMailboxRenameTestDatabase(t *testing.T) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
-	
+
 	ctx := context.Background()
-	
+
 	// Use test name and timestamp to create unique email
 	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
-	
+
 	// Create test account
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
@@ -66,7 +66,7 @@ func TestRenameMailbox(t *testing.T) {
 
 	db, accountID, mailboxID := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Basic mailbox rename
@@ -117,15 +117,15 @@ func TestRenameMailboxInvalidName(t *testing.T) {
 
 	db, accountID, mailboxID := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test invalid names
 	invalidNames := []string{
-		"",                    // empty name
-		"Name\twith\ttab",     // tab character
+		"",                     // empty name
+		"Name\twith\ttab",      // tab character
 		"Name\rwith\rcarriage", // carriage return
-		"Name\nwith\nnewline", // newline
+		"Name\nwith\nnewline",  // newline
 		"Name\x00with\x00null", // null character
 	}
 
@@ -153,7 +153,7 @@ func TestRenameMailboxHierarchy(t *testing.T) {
 
 	db, accountID, parentMailboxID := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create child mailbox
@@ -214,7 +214,7 @@ func TestMailboxUIDValidity(t *testing.T) {
 
 	db, accountID, _ := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Create multiple mailboxes and verify they have unique UIDVALIDITY
@@ -239,8 +239,8 @@ func TestMailboxUIDValidity(t *testing.T) {
 	// Find our test mailboxes
 	for _, mailbox := range allMailboxes {
 		if mailbox.Name == "UIDTestMailbox_0" ||
-		   mailbox.Name == "UIDTestMailbox_1" ||
-		   mailbox.Name == "UIDTestMailbox_2" {
+			mailbox.Name == "UIDTestMailbox_1" ||
+			mailbox.Name == "UIDTestMailbox_2" {
 			mailboxes = append(mailboxes, mailbox)
 		}
 	}
@@ -259,20 +259,20 @@ func TestMailboxUIDValidity(t *testing.T) {
 	for _, mailbox := range mailboxes {
 		uidValidities[mailbox.UIDValidity]++
 	}
-	
+
 	// At least verify that we don't have all different values or all the same value in suspicious ways
 	assert.LessOrEqual(t, len(uidValidities), 3, "Should not have more unique UIDVALIDITY values than mailboxes")
 	assert.GreaterOrEqual(t, len(uidValidities), 1, "Should have at least one UIDVALIDITY value")
-	
+
 	// Log the distribution for debugging
 	t.Logf("UIDVALIDITY distribution: %v", uidValidities)
 
 	// Test 4: Verify UIDVALIDITY is reasonable (nanosecond timestamp-based, truncated to uint32)
-	// Since UIDVALIDITY is now based on nanoseconds truncated to uint32, 
+	// Since UIDVALIDITY is now based on nanoseconds truncated to uint32,
 	// we need to check it's a reasonable nanosecond-derived value
 	nowNano := time.Now().UnixNano()
 	expectedUIDValidity := uint32(nowNano)
-	
+
 	for _, mailbox := range mailboxes {
 		// UIDVALIDITY should be within a reasonable range of the current nanosecond timestamp
 		// (truncated to uint32). Allow for some time difference due to test execution time.
@@ -281,8 +281,8 @@ func TestMailboxUIDValidity(t *testing.T) {
 			timeDiff = -timeDiff
 		}
 		// Allow up to 1 second worth of nanoseconds difference (1e9 nanoseconds)
-		assert.Less(t, timeDiff, int64(1000000000), 
-			"UIDVALIDITY %d should be within 1 second of expected nanosecond-based value %d", 
+		assert.Less(t, timeDiff, int64(1000000000),
+			"UIDVALIDITY %d should be within 1 second of expected nanosecond-based value %d",
 			mailbox.UIDValidity, expectedUIDValidity)
 	}
 
@@ -297,7 +297,7 @@ func TestMailboxUIDValidityPersistence(t *testing.T) {
 
 	db, accountID, mailboxID := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test 1: Get initial UIDVALIDITY
@@ -349,7 +349,7 @@ func TestRenameNonExistentMailbox(t *testing.T) {
 
 	db, accountID, _ := setupMailboxRenameTestDatabase(t)
 	defer db.Close()
-	
+
 	ctx := context.Background()
 
 	// Test: Try to rename non-existent mailbox
