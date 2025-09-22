@@ -756,10 +756,17 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
+	remotePort, err := serverConfig.GetRemotePort()
+	if err != nil {
+		errChan <- fmt.Errorf("invalid remote_port for IMAP proxy %s: %w", serverConfig.Name, err)
+		return
+	}
+
 	server, err := imapproxy.New(ctx, deps.resilientDB, deps.hostname, imapproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
+		RemotePort:             remotePort,
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		TLS:                    serverConfig.TLS,
@@ -810,9 +817,16 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
+	remotePort, err := serverConfig.GetRemotePort()
+	if err != nil {
+		errChan <- fmt.Errorf("invalid remote_port for POP3 proxy %s: %w", serverConfig.Name, err)
+		return
+	}
+
 	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
 		Name:                   serverConfig.Name,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
+		RemotePort:             remotePort,
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		TLS:                    serverConfig.TLS,
@@ -862,10 +876,17 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
 
+	remotePort, err := serverConfig.GetRemotePort()
+	if err != nil {
+		errChan <- fmt.Errorf("invalid remote_port for ManageSieve proxy %s: %w", serverConfig.Name, err)
+		return
+	}
+
 	server, err := managesieveproxy.New(ctx, deps.resilientDB, deps.hostname, managesieveproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
+		RemotePort:             remotePort,
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		TLS:                    serverConfig.TLS,
@@ -909,10 +930,17 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
+	remotePort, err := serverConfig.GetRemotePort()
+	if err != nil {
+		errChan <- fmt.Errorf("invalid remote_port for LMTP proxy %s: %w", serverConfig.Name, err)
+		return
+	}
+
 	server, err := lmtpproxy.New(ctx, deps.resilientDB, deps.hostname, lmtpproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
+		RemotePort:             remotePort,
 		TLS:                    serverConfig.TLS,
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,

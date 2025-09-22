@@ -1,4 +1,4 @@
-.PHONY: all clean build sora sora-admin install test
+.PHONY: all clean build sora sora-admin install test test-integration test-integration-imap test-integration-lmtp test-integration-pop3
 
 # Binary names - can be overridden by environment variables
 SORA_BINARY ?= sora
@@ -47,6 +47,22 @@ clean:
 test:
 	go test ./...
 
+# Run integration tests (requires PostgreSQL)
+test-integration:
+	./run_integration_tests.sh
+
+# Run IMAP integration tests only
+test-integration-imap:
+	./run_integration_tests.sh --protocol imap
+
+# Run LMTP integration tests only  
+test-integration-lmtp:
+	./run_integration_tests.sh --protocol lmtp
+
+# Run POP3 integration tests only
+test-integration-pop3:
+	./run_integration_tests.sh --protocol pop3
+
 # Cross-compile with musl libc for Linux
 build-linux-musl:
 	CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux go build -ldflags="${LDFLAGS_VARS} -extldflags -static" -o $(SORA_LINUX_BINARY) ./cmd/sora
@@ -66,7 +82,11 @@ help:
 	@echo "  sora-admin   - Build only the sora-admin tool for account management"
 	@echo "  install      - Install both executables to GOPATH/bin"
 	@echo "  clean        - Remove build artifacts"
-	@echo "  test         - Run tests"
+	@echo "  test         - Run unit tests"
+	@echo "  test-integration - Run all integration tests (requires PostgreSQL)"
+	@echo "  test-integration-imap - Run IMAP integration tests only"
+	@echo "  test-integration-lmtp - Run LMTP integration tests only"
+	@echo "  test-integration-pop3 - Run POP3 integration tests only"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"
 	@echo "  build-freebsd - Cross-compile binaries for FreeBSD"
 	@echo "  help         - Show this help message"

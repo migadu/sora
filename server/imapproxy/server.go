@@ -48,6 +48,7 @@ type ServerOptions struct {
 	Name                   string // Server name for logging
 	Addr                   string
 	RemoteAddrs            []string
+	RemotePort             int // Default port for backends if not in address
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	TLS                    bool
@@ -106,7 +107,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
+	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

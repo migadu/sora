@@ -13,10 +13,10 @@ import (
 func TestSearchPerformanceFramework(t *testing.T) {
 	// Test the performance test configuration
 	config := FastPerformanceConfig
-	assert.Equal(t, 5, config.SmallDataset)
-	assert.Equal(t, 10, config.MediumDataset)
-	assert.Equal(t, 20, config.LargeDataset)
-	assert.Equal(t, 30, config.VeryLargeDataset)
+	assert.Equal(t, 20, config.SmallDataset)
+	assert.Equal(t, 50, config.MediumDataset)
+	assert.Equal(t, 100, config.LargeDataset)
+	assert.Equal(t, 150, config.VeryLargeDataset)
 
 	t.Logf("✅ Performance config validation passed: %+v", config)
 }

@@ -382,6 +382,126 @@ func (c *PreLookupConfig) GetRemotePort() (int, error) {
 	return port, nil
 }
 
+// GetRemotePort parses the remote port for IMAP proxy and returns it as an int.
+func (c *IMAPProxyServerConfig) GetRemotePort() (int, error) {
+	if c.RemotePort == nil {
+		return 0, nil // No port configured
+	}
+	var p int64
+	var err error
+	switch v := c.RemotePort.(type) {
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		p, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string for remote_port: %q", v)
+		}
+	case int:
+		p = int64(v)
+	case int64: // TOML parsers often use int64 for numbers
+		p = v
+	default:
+		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
+	}
+	port := int(p)
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	}
+	return port, nil
+}
+
+// GetRemotePort parses the remote port for POP3 proxy and returns it as an int.
+func (c *POP3ProxyServerConfig) GetRemotePort() (int, error) {
+	if c.RemotePort == nil {
+		return 0, nil // No port configured
+	}
+	var p int64
+	var err error
+	switch v := c.RemotePort.(type) {
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		p, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string for remote_port: %q", v)
+		}
+	case int:
+		p = int64(v)
+	case int64: // TOML parsers often use int64 for numbers
+		p = v
+	default:
+		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
+	}
+	port := int(p)
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	}
+	return port, nil
+}
+
+// GetRemotePort parses the remote port for ManageSieve proxy and returns it as an int.
+func (c *ManageSieveProxyServerConfig) GetRemotePort() (int, error) {
+	if c.RemotePort == nil {
+		return 0, nil // No port configured
+	}
+	var p int64
+	var err error
+	switch v := c.RemotePort.(type) {
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		p, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string for remote_port: %q", v)
+		}
+	case int:
+		p = int64(v)
+	case int64: // TOML parsers often use int64 for numbers
+		p = v
+	default:
+		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
+	}
+	port := int(p)
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	}
+	return port, nil
+}
+
+// GetRemotePort parses the remote port for LMTP proxy and returns it as an int.
+func (c *LMTPProxyServerConfig) GetRemotePort() (int, error) {
+	if c.RemotePort == nil {
+		return 0, nil // No port configured
+	}
+	var p int64
+	var err error
+	switch v := c.RemotePort.(type) {
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		p, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string for remote_port: %q", v)
+		}
+	case int:
+		p = int64(v)
+	case int64: // TOML parsers often use int64 for numbers
+		p = v
+	default:
+		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
+	}
+	port := int(p)
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	}
+	return port, nil
+}
+
 // IMAPServerConfig holds IMAP server configuration.
 type IMAPServerConfig struct {
 	Start               bool                  `toml:"start"`
@@ -452,6 +572,7 @@ type IMAPProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
+	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
@@ -478,6 +599,7 @@ type POP3ProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
+	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
@@ -504,6 +626,7 @@ type ManageSieveProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
+	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
@@ -529,6 +652,7 @@ type LMTPProxyServerConfig struct {
 	Start                  bool             `toml:"start"`
 	Addr                   string           `toml:"addr"`
 	RemoteAddrs            []string         `toml:"remote_addrs"`
+	RemotePort             interface{}      `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int              `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int              `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	TLS                    bool             `toml:"tls"`
@@ -618,18 +742,19 @@ type ServerConfig struct {
 	InsecureAuth  bool   `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific
-	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
-	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
-	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
-	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
-	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
-	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
-	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
-	SessionTimeout         string   `toml:"session_timeout,omitempty"`
-	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
-	AffinityStickiness     float64  `toml:"affinity_stickiness,omitempty"`
-	AffinityValidity       string   `toml:"affinity_validity,omitempty"`
-	MaxMessageSize         string   `toml:"max_message_size,omitempty"`
+	RemoteAddrs            []string    `toml:"remote_addrs,omitempty"`
+	RemotePort             interface{} `toml:"remote_port,omitempty"` // Default port for backends if not in address
+	RemoteTLS              bool        `toml:"remote_tls,omitempty"`
+	RemoteTLSVerify        bool        `toml:"remote_tls_verify,omitempty"`
+	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand     bool        `toml:"remote_use_id_command,omitempty"`
+	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient,omitempty"`
+	ConnectTimeout         string      `toml:"connect_timeout,omitempty"`
+	SessionTimeout         string      `toml:"session_timeout,omitempty"`
+	EnableAffinity         bool        `toml:"enable_affinity,omitempty"`
+	AffinityStickiness     float64     `toml:"affinity_stickiness,omitempty"`
+	AffinityValidity       string      `toml:"affinity_validity,omitempty"`
+	MaxMessageSize         string      `toml:"max_message_size,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`
@@ -1102,6 +1227,35 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 		return 5 * time.Second, nil // 5 second default
 	}
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
+}
+
+func (s *ServerConfig) GetRemotePort() (int, error) {
+	if s.RemotePort == nil {
+		return 0, nil // No port configured
+	}
+	var p int64
+	var err error
+	switch v := s.RemotePort.(type) {
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		p, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string for remote_port: %q", v)
+		}
+	case int:
+		p = int64(v)
+	case int64: // TOML parsers often use int64 for numbers
+		p = v
+	default:
+		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
+	}
+	port := int(p)
+	if port < 0 || port > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	}
+	return port, nil
 }
 
 // Configuration defaulting methods with logging

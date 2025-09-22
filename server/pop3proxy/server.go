@@ -46,6 +46,7 @@ type POP3ProxyServerOptions struct {
 	TLSKeyFile             string
 	TLSVerify              bool
 	RemoteAddrs            []string
+	RemotePort             int // Default port for backends if not in address
 	RemoteTLS              bool
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
@@ -91,6 +92,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRouting(
 		options.RemoteAddrs,
+		options.RemotePort,
 		options.RemoteTLS,
 		options.RemoteTLSVerify,
 		options.RemoteUseProxyProtocol,

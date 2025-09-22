@@ -19,6 +19,7 @@ import (
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
 	remoteAddrs            []string
+	remotePort             int // Default port for backends if not in address
 	remoteTLS              bool
 	remoteTLSVerify        bool
 	remoteUseProxyProtocol bool
@@ -37,27 +38,34 @@ type ConnectionManager struct {
 }
 
 // NewConnectionManager creates a new connection manager
-func NewConnectionManager(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration) (*ConnectionManager, error) {
-	return NewConnectionManagerWithRouting(remoteAddrs, remoteTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, nil)
+func NewConnectionManager(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRouting(remoteAddrs, remotePort, remoteTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, nil)
 }
 
 // NewConnectionManagerWithRouting creates a new connection manager with optional user routing
-func NewConnectionManagerWithRouting(remoteAddrs []string, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
+func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
+	}
+
+	// Normalize remote addresses to include default port if missing
+	normalizedAddrs := make([]string, len(remoteAddrs))
+	for i, addr := range remoteAddrs {
+		normalizedAddrs[i] = normalizeHostPort(addr, remotePort)
 	}
 
 	healthyStatus := make(map[string]bool)
 	lastCheck := make(map[string]time.Time)
 
 	// Initially mark all servers as healthy
-	for _, addr := range remoteAddrs {
+	for _, addr := range normalizedAddrs {
 		healthyStatus[addr] = true
 		lastCheck[addr] = time.Now()
 	}
 
 	return &ConnectionManager{
-		remoteAddrs:            remoteAddrs,
+		remoteAddrs:            normalizedAddrs,
+		remotePort:             remotePort,
 		remoteTLS:              remoteTLS,
 		remoteTLSVerify:        remoteTLSVerify,
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
@@ -231,7 +239,13 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 		Timeout: cm.connectTimeout,
 	}
 
-	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
+	// Resolve the address to ensure proper IPv6 formatting
+	resolvedAddr := cm.resolveAddress(addr)
+	if resolvedAddr != addr {
+		log.Printf("[ConnectionManager] Resolved %s to %s", addr, resolvedAddr)
+	}
+
+	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", resolvedAddr)
 
 	var conn net.Conn
 	var err error
@@ -245,21 +259,44 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 				return nil, nil
 			},
 		}
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", addr)
+		conn, err = dialer.DialContext(ctx, "tcp", resolvedAddr)
 	}
 
 	if err != nil {
-		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
+		log.Printf("[ConnectionManager] Failed to connect to %s: %v", resolvedAddr, err)
 		return nil, err
 	}
 
 	// Log the actual local and remote addresses of the established connection
 	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
-		addr, conn.LocalAddr(), conn.RemoteAddr())
+		resolvedAddr, conn.LocalAddr(), conn.RemoteAddr())
 
 	return conn, nil
+}
+
+// resolveAddress resolves a single address to ensure proper IPv6 formatting
+func (cm *ConnectionManager) resolveAddress(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// If no port specified, just return as-is (shouldn't happen in our case)
+		return addr
+	}
+
+	// Try to resolve the host to IP
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// If resolution fails, return the original address
+		return addr
+	}
+
+	// Use the first resolved IP and rejoin with the port
+	if len(ips) > 0 {
+		return net.JoinHostPort(ips[0].String(), port)
+	}
+
+	return addr
 }
 
 func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, error) {
@@ -268,17 +305,23 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		Timeout: cm.connectTimeout,
 	}
 
-	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", addr)
+	// Resolve the address to ensure proper IPv6 formatting
+	resolvedAddr := cm.resolveAddress(addr)
+	if resolvedAddr != addr {
+		log.Printf("[ConnectionManager] Resolved %s to %s", addr, resolvedAddr)
+	}
+
+	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", resolvedAddr)
 
 	// Always establish plain TCP connection first
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", resolvedAddr)
 	if err != nil {
-		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
+		log.Printf("[ConnectionManager] Failed to connect to %s: %v", resolvedAddr, err)
 		return nil, err
 	}
 
 	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
-		addr, conn.LocalAddr(), conn.RemoteAddr())
+		resolvedAddr, conn.LocalAddr(), conn.RemoteAddr())
 
 	// Determine effective settings for this connection.
 	// Default to the connection manager's global settings.

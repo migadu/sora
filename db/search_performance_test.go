@@ -33,10 +33,10 @@ var DefaultPerformanceConfig = PerformanceTestConfig{
 
 // FastPerformanceConfig for quick testing during development
 var FastPerformanceConfig = PerformanceTestConfig{
-	SmallDataset:     5,
-	MediumDataset:    10,
-	LargeDataset:     20,
-	VeryLargeDataset: 30,
+	SmallDataset:     20,
+	MediumDataset:    50,
+	LargeDataset:     100,
+	VeryLargeDataset: 150,
 }
 
 // PerformanceTestSuite provides helpers for performance testing
@@ -383,15 +383,22 @@ func TestSearchPerformance(t *testing.T) {
 
 	t.Run("CreateTestData", func(t *testing.T) {
 		// Create test datasets with different characteristics
+		// Always create some business messages (contains "quarterly")
 		err := pts.CreateTestMessages(ctx, pts.config.SmallDataset, "business")
 		require.NoError(t, err)
 
-		err = pts.CreateTestMessages(ctx, pts.config.MediumDataset-pts.config.SmallDataset, "newsletter")
+		// Always create some support messages (contains "performance", "database", "optimization")
+		// Even in short mode, we need these for the search tests to work
+		supportCount := pts.config.MediumDataset - pts.config.SmallDataset
+		if testing.Short() {
+			supportCount = 10 // Minimum for search tests to work
+		}
+		err = pts.CreateTestMessages(ctx, supportCount, "support")
 		require.NoError(t, err)
 
-		// Skip large dataset creation in short mode to save time
+		// Create newsletter messages only if not in short mode
 		if !testing.Short() {
-			err = pts.CreateTestMessages(ctx, pts.config.LargeDataset-pts.config.MediumDataset, "support")
+			err = pts.CreateTestMessages(ctx, pts.config.LargeDataset-pts.config.MediumDataset, "newsletter")
 			require.NoError(t, err)
 		}
 	})
