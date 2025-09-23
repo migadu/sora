@@ -16,8 +16,6 @@ github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ3
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dejanstrbac/go-imap/v2 v2.0.0-20250916132813-07d69cfbad94 h1:Qm0DCaMqqlGyuu43DDmBzE8s/kR2XAEnt83meASHFvA=
-github.com/dejanstrbac/go-imap/v2 v2.0.0-20250916132813-07d69cfbad94/go.mod h1:BZTFHsS1hmgBkFlHqbxGLXk2hnRqTItUgwjSSCsYNAk=
 github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20 h1:6IgUZs9K6HT2WStg7HF01m6innJXSr9vZ+rFDFaG0Ao=
 github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20/go.mod h1:ZtRRkbTyp2XTHCA+BmyTFTrj8xY4I+b4McvHxCU2gsQ=
 github.com/dhui/dktest v0.4.6 h1:+DPKyScKSEp3VLtbMDHcUq6V5Lm5zfZZVb0Sk7Ahom4=
@@ -94,6 +92,8 @@ github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
 github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
+github.com/migadu/go-imap/v2 v2.0.0-20250923055924-85df4fd4ac8c h1:ihSxCfYEy5HHZ6KWnxVXaSG+TdSOaqN4eDIkFGQYVoM=
+github.com/migadu/go-imap/v2 v2.0.0-20250923055924-85df4fd4ac8c/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
 github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25 h1:Oxwm8edsPKTTbEawtsF1TZrk7JcCR3Wwh+9ZVJPvnqw=
 github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25/go.mod h1:2r/4pcAuXiYsV2xkGw/Uybwz7ZoS4eOuz3vuqM4eTyg=
 github.com/minio/crc64nvme v1.0.1 h1:DHQPrYPdqK7jQG/Ls5CTBZWeex/2FMS3G5XGkycuFrY=

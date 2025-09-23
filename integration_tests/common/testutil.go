@@ -105,14 +105,41 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 	account := CreateTestAccount(t, rdb)
 	address := GetRandomAddress(t)
 
+	// Create a temporary directory for the uploader
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	// Create error channel for uploader
+	errCh := make(chan error, 1)
+
+	// Create UploadWorker for testing
+	uploadWorker, err := uploader.New(
+		context.Background(),
+		tempDir,                    // path
+		10,                        // batchSize
+		1,                         // concurrency
+		3,                         // maxAttempts
+		time.Second,               // retryInterval
+		"test-instance",           // instanceID
+		rdb,                       // database
+		&storage.S3Storage{},      // S3 storage
+		nil,                       // cache (can be nil)
+		errCh,                     // error channel
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+
 	server, err := imap.New(
 		context.Background(),
 		"localhost",
 		address,
 		&storage.S3Storage{},
 		rdb,
-		nil, // uploader.UploadWorker
-		nil, // cache.Cache
+		uploadWorker, // properly initialized UploadWorker
+		nil,          // cache.Cache
 		imap.IMAPServerOptions{},
 	)
 	if err != nil {
@@ -139,6 +166,8 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for server to shut down
 		}
+		// Clean up temporary directory
+		os.RemoveAll(tempDir)
 	}
 
 	return &TestServer{

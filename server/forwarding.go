@@ -364,12 +364,34 @@ func (fp *ForwardingParams) ValidateForwarding() error {
 }
 
 // ParseTrustedNetworks parses a slice of CIDR strings into a slice of *net.IPNet
+// Automatically adds /32 for IPv4 and /128 for IPv6 addresses without subnet notation
 func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 	var networks []*net.IPNet
 	for _, cidr := range cidrs {
+		// Try parsing as CIDR first
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid trusted network CIDR %s: %w", cidr, err)
+			// If CIDR parsing fails, try parsing as plain IP and add appropriate subnet
+			ip := net.ParseIP(cidr)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid trusted network '%s': not a valid IP address or CIDR", cidr)
+			}
+			
+			// Determine if IPv4 or IPv6 and add appropriate subnet
+			var cidrWithSubnet string
+			if ip.To4() != nil {
+				// IPv4 address
+				cidrWithSubnet = cidr + "/32"
+			} else {
+				// IPv6 address
+				cidrWithSubnet = cidr + "/128"
+			}
+			
+			// Parse the corrected CIDR
+			_, network, err = net.ParseCIDR(cidrWithSubnet)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse corrected CIDR '%s': %w", cidrWithSubnet, err)
+			}
 		}
 		networks = append(networks, network)
 	}

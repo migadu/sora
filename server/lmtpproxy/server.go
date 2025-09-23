@@ -130,11 +130,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Parse trusted networks for connection filtering
 	trustedNets, err := server.ParseTrustedNetworks(opts.TrustedProxies)
 	if err != nil {
-		if routingLookup != nil {
-			routingLookup.Close()
-		}
-		cancel()
-		return nil, fmt.Errorf("failed to parse trusted networks for LMTP proxy: %w", err)
+		// Log the error and use empty trusted networks to prevent server crash
+		log.Printf("WARNING: failed to parse trusted networks for LMTP proxy (%v), using empty trusted networks (proxy connections will be restricted)", err)
+		trustedNets = []*net.IPNet{}
 	}
 
 	return &Server{

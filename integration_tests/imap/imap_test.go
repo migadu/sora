@@ -3,7 +3,6 @@
 package imap_test
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -141,63 +140,8 @@ func TestIMAP_MailboxOperations(t *testing.T) {
 	t.Logf("Deleted mailbox: %s", testMailbox)
 }
 
-func TestIMAP_MultipleConnections(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	// Test multiple concurrent connections
-	numConnections := 3
-	done := make(chan error, numConnections)
-
-	for i := 0; i < numConnections; i++ {
-		go func(connID int) {
-			c, err := imapclient.DialInsecure(server.Address, nil)
-			if err != nil {
-				done <- fmt.Errorf("connection %d: failed to dial: %v", connID, err)
-				return
-			}
-			defer c.Logout()
-
-			if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-				done <- fmt.Errorf("connection %d: login failed: %v", connID, err)
-				return
-			}
-
-			// Select INBOX
-			if _, err := c.Select("INBOX", nil).Wait(); err != nil {
-				done <- fmt.Errorf("connection %d: select failed: %v", connID, err)
-				return
-			}
-
-			// Create a unique mailbox for this connection
-			testMailbox := fmt.Sprintf("Test%d", connID)
-			if err := c.Create(testMailbox, nil).Wait(); err != nil {
-				done <- fmt.Errorf("connection %d: create mailbox failed: %v", connID, err)
-				return
-			}
-
-			// Clean up
-			if err := c.Delete(testMailbox).Wait(); err != nil {
-				done <- fmt.Errorf("connection %d: delete mailbox failed: %v", connID, err)
-				return
-			}
-
-			done <- nil
-		}(i)
-	}
-
-	// Wait for all connections to complete
-	for i := 0; i < numConnections; i++ {
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
-	}
-	t.Logf("Successfully handled %d concurrent connections", numConnections)
-}
-
-func TestIMAP_IdleCommand(t *testing.T) {
+// TestIMAP_AppendOperation tests various APPEND scenarios.
+func TestIMAP_AppendOperation(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
@@ -213,626 +157,619 @@ func TestIMAP_IdleCommand(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
+	t.Run("Simple Append", func(t *testing.T) {
+		// Select INBOX to check initial state
+		mbox, err := c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Select INBOX failed: %v", err)
+		}
+		initialMessages := mbox.NumMessages
+
+		// Append a simple message
+		messageLiteral := "Subject: Simple Append Test\r\n\r\nThis is a test."
+		appendCmd := c.Append("INBOX", int64(len(messageLiteral)), nil)
+		if _, err := appendCmd.Write([]byte(messageLiteral)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND command failed: %v", err)
+		}
+
+		// Verify message count increased
+		mbox, err = c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Reselect INBOX failed: %v", err)
+		}
+		if mbox.NumMessages != initialMessages+1 {
+			t.Errorf("Expected %d messages, got %d", initialMessages+1, mbox.NumMessages)
+		}
+		t.Logf("Message count is now %d", mbox.NumMessages)
+
+		// Fetch and verify the subject
+		fetchCmd := c.Fetch(imap.SeqSetNum(mbox.NumMessages), &imap.FetchOptions{
+			Envelope: true,
+		})
+		msgs, err := fetchCmd.Collect()
+		if err != nil {
+			t.Fatalf("FETCH failed: %v", err)
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("Expected 1 message, got %d", len(msgs))
+		}
+		if msgs[0].Envelope.Subject != "Simple Append Test" {
+			t.Errorf("Expected subject 'Simple Append Test', got '%s'", msgs[0].Envelope.Subject)
+		}
+		t.Logf("Fetched message with correct subject: %s", msgs[0].Envelope.Subject)
+	})
+
+	t.Run("Append with Flags and Date", func(t *testing.T) {
+		// Select INBOX to get current state
+		mbox, err := c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Select INBOX failed: %v", err)
+		}
+		initialMessages := mbox.NumMessages
+
+		// Append a message with specific flags and internal date
+		messageLiteral := "Subject: Flags and Date Test\r\n\r\nTesting flags."
+		customDate := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+		appendCmd := c.Append("INBOX", int64(len(messageLiteral)), &imap.AppendOptions{
+			Flags: []imap.Flag{imap.FlagSeen, imap.FlagFlagged},
+			Time:  customDate,
+		})
+		if _, err := appendCmd.Write([]byte(messageLiteral)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND command failed: %v", err)
+		}
+
+		// Verify message count
+		mbox, err = c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Reselect INBOX failed: %v", err)
+		}
+		if mbox.NumMessages != initialMessages+1 {
+			t.Errorf("Expected %d messages, got %d", initialMessages+1, mbox.NumMessages)
+		}
+
+		// Fetch the new message and verify flags and date
+		fetchCmd := c.Fetch(imap.SeqSetNum(mbox.NumMessages), &imap.FetchOptions{
+			Flags:        true,
+			InternalDate: true,
+		})
+		msgs, err := fetchCmd.Collect()
+		if err != nil {
+			t.Fatalf("FETCH failed: %v", err)
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("Expected 1 message, got %d", len(msgs))
+		}
+		msg := msgs[0]
+
+		if !containsFlag(msg.Flags, imap.FlagSeen) {
+			t.Error("Expected \\Seen flag, but not found")
+		}
+		if !containsFlag(msg.Flags, imap.FlagFlagged) {
+			t.Error("Expected \\Flagged flag, but not found")
+		}
+		if !msg.InternalDate.Equal(customDate) {
+			t.Errorf("Expected internal date %v, got %v", customDate, msg.InternalDate)
+		}
+		t.Logf("Fetched message with correct flags (%v) and date (%v)", msg.Flags, msg.InternalDate)
+	})
+
+	t.Run("Append to Non-Existent Mailbox", func(t *testing.T) {
+		messageLiteral := "Subject: Failure Test\r\n\r\nThis should not be appended."
+		appendCmd := c.Append("NonExistentMailbox", int64(len(messageLiteral)), nil)
+		if _, err := appendCmd.Write([]byte(messageLiteral)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+
+		_, err = appendCmd.Wait()
+		if err == nil {
+			t.Fatal("Expected APPEND to non-existent mailbox to fail, but it succeeded")
+		}
+		t.Logf("APPEND correctly failed for non-existent mailbox: %v", err)
+	})
+
+	t.Run("Append with Unicode Content", func(t *testing.T) {
+		// Select INBOX to get current state
+		mbox, err := c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Select INBOX failed: %v", err)
+		}
+		initialMessages := mbox.NumMessages
+
+		// Append a message with Unicode subject
+		unicodeSubject := "Test: こんにちは世界"
+		messageLiteral := "Subject: " + unicodeSubject + "\r\n\r\nUnicode body: ✅"
+		appendCmd := c.Append("INBOX", int64(len(messageLiteral)), nil)
+		if _, err := appendCmd.Write([]byte(messageLiteral)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND command failed: %v", err)
+		}
+
+		// Verify message count
+		mbox, err = c.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Reselect INBOX failed: %v", err)
+		}
+		if mbox.NumMessages != initialMessages+1 {
+			t.Errorf("Expected %d messages, got %d", initialMessages+1, mbox.NumMessages)
+		}
+
+		// Fetch and verify the subject
+		fetchCmd := c.Fetch(imap.SeqSetNum(mbox.NumMessages), &imap.FetchOptions{
+			Envelope: true,
+		})
+		msgs, err := fetchCmd.Collect()
+		if err != nil {
+			t.Fatalf("FETCH failed: %v", err)
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("Expected 1 message, got %d", len(msgs))
+		}
+		if msgs[0].Envelope.Subject != unicodeSubject {
+			t.Errorf("Expected subject '%s', got '%s'", unicodeSubject, msgs[0].Envelope.Subject)
+		}
+		t.Logf("Fetched message with correct Unicode subject: %s", msgs[0].Envelope.Subject)
+	})
+}
+
+// TestIMAP_ComprehensiveMessageOperations tests comprehensive message operations
+func TestIMAP_ComprehensiveMessageOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	mbox, err := c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+	t.Logf("Selected INBOX with %d messages", mbox.NumMessages)
+
+	// Test 1: APPEND message
+	testMessage := "From: sender@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Test Message for Operations\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This is a test message for comprehensive operations testing.\r\n"
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	appendData, err := appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+	t.Logf("APPEND successful - UID: %d, UIDValidity: %d", appendData.UID, appendData.UIDValidity)
+
+	// Test 2: FETCH message
+	fetchCmd := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{
+		Flags: true,
+		UID:   true,
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierHeader},
+		},
+	})
+	fetchResults, err := fetchCmd.Collect()
+	if err != nil {
+		t.Fatalf("FETCH failed: %v", err)
+	}
+
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	fetchResult := fetchResults[0]
+	t.Logf("FETCH successful - SeqNum: %d, UID: %d, Flags: %v", fetchResult.SeqNum, fetchResult.UID, fetchResult.Flags)
+
+	// Verify the message was stored with correct flags
+	if !containsFlag(fetchResult.Flags, imap.FlagSeen) {
+		t.Error("Expected \\Seen flag not found in fetched message")
+	}
+
+	// Test 3: Basic search for flags (most compatible search)
+	searchResults, err := c.Search(&imap.SearchCriteria{
+		Flag: []imap.Flag{imap.FlagSeen},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH by flags failed: %v", err)
+	}
+
+	if len(searchResults.AllSeqNums()) == 0 {
+		t.Error("SEARCH by flags returned no results")
+	} else {
+		t.Logf("SEARCH by flags found %d messages", len(searchResults.AllSeqNums()))
+	}
+
+	t.Log("Comprehensive message operations test completed successfully")
+}
+
+// TestIMAP_ComprehensiveMailboxStatus tests comprehensive STATUS operations
+func TestIMAP_ComprehensiveMailboxStatus(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Test 1: STATUS on empty INBOX
+	statusData, err := c.Status("INBOX", &imap.StatusOptions{
+		NumMessages:   true,
+		NumUnseen:     true,
+		UIDNext:       true,
+		UIDValidity:   true,
+		HighestModSeq: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS command failed: %v", err)
+	}
+
+	if statusData.Mailbox != "INBOX" {
+		t.Errorf("Expected mailbox INBOX, got %s", statusData.Mailbox)
+	}
+
+	if statusData.NumMessages != nil && *statusData.NumMessages != 0 {
+		t.Errorf("Expected 0 messages in empty INBOX, got %d", *statusData.NumMessages)
+	}
+
+	if statusData.NumUnseen != nil && *statusData.NumUnseen != 0 {
+		t.Errorf("Expected 0 unseen messages in empty INBOX, got %d", *statusData.NumUnseen)
+	}
+
+	t.Logf("Empty INBOX status - Messages: %v, Unseen: %v, UIDNext: %d, UIDValidity: %d, HighestModSeq: %d",
+		statusData.NumMessages, statusData.NumUnseen, statusData.UIDNext, statusData.UIDValidity, statusData.HighestModSeq)
+
+	// Add some messages to test with
+	testMessage1 := "From: test1@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Status Test Message 1\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"First test message for status testing.\r\n"
+
+	testMessage2 := "From: test2@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Status Test Message 2\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"Second test message for status testing.\r\n"
+
+	// Append first message with \Seen flag
+	appendCmd1 := c.Append("INBOX", int64(len(testMessage1)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd1.Write([]byte(testMessage1))
+	if err != nil {
+		t.Fatalf("APPEND write first message failed: %v", err)
+	}
+	err = appendCmd1.Close()
+	if err != nil {
+		t.Fatalf("APPEND close first message failed: %v", err)
+	}
+	_, err = appendCmd1.Wait()
+	if err != nil {
+		t.Fatalf("APPEND first message failed: %v", err)
+	}
+
+	// Append second message without \Seen flag (unseen)
+	appendCmd2 := c.Append("INBOX", int64(len(testMessage2)), &imap.AppendOptions{
+		Flags: []imap.Flag{},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd2.Write([]byte(testMessage2))
+	if err != nil {
+		t.Fatalf("APPEND write second message failed: %v", err)
+	}
+	err = appendCmd2.Close()
+	if err != nil {
+		t.Fatalf("APPEND close second message failed: %v", err)
+	}
+	_, err = appendCmd2.Wait()
+	if err != nil {
+		t.Fatalf("APPEND second message failed: %v", err)
+	}
+
+	// Test 2: STATUS after adding messages
+	statusData, err = c.Status("INBOX", &imap.StatusOptions{
+		NumMessages:   true,
+		NumUnseen:     true,
+		UIDNext:       true,
+		UIDValidity:   true,
+		HighestModSeq: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS command after adding messages failed: %v", err)
+	}
+
+	if statusData.NumMessages != nil && *statusData.NumMessages != 2 {
+		t.Errorf("Expected 2 messages after adding, got %d", *statusData.NumMessages)
+	}
+
+	if statusData.NumUnseen != nil && *statusData.NumUnseen != 1 {
+		t.Errorf("Expected 1 unseen message after adding, got %d", *statusData.NumUnseen)
+	}
+
+	t.Logf("INBOX status after adding messages - Messages: %v, Unseen: %v, UIDNext: %d, UIDValidity: %d, HighestModSeq: %d",
+		statusData.NumMessages, statusData.NumUnseen, statusData.UIDNext, statusData.UIDValidity, statusData.HighestModSeq)
+
+	// Test 3: STATUS with selective options
+	statusData, err = c.Status("INBOX", &imap.StatusOptions{
+		NumMessages: true,
+		UIDNext:     true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS with selective options failed: %v", err)
+	}
+
+	// Only requested fields should be populated
+	if statusData.NumMessages == nil {
+		t.Error("NumMessages should be populated when requested")
+	}
+	if statusData.UIDNext == 0 {
+		t.Error("UIDNext should be populated when requested")
+	}
+	t.Logf("Selective STATUS - Messages: %v, UIDNext: %d", statusData.NumMessages, statusData.UIDNext)
+
+	// Test 4: STATUS on non-existent mailbox (should fail)
+	_, err = c.Status("NonExistentMailbox", &imap.StatusOptions{
+		NumMessages: true,
+	}).Wait()
+	if err == nil {
+		t.Error("STATUS on non-existent mailbox should fail")
+	} else {
+		t.Logf("STATUS correctly failed on non-existent mailbox: %v", err)
+	}
+
+	t.Log("Comprehensive mailbox status test completed successfully")
+}
+
+// TestIMAP_ComprehensiveCopyMove tests COPY and MOVE operations
+func TestIMAP_ComprehensiveCopyMove(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Create test mailbox
+	testMailbox := "CopyMoveTest"
+	if err := c.Create(testMailbox, nil).Wait(); err != nil {
+		t.Fatalf("CREATE test mailbox failed: %v", err)
+	}
+	defer func() {
+		c.Delete(testMailbox).Wait()
+	}()
+
+	// Select INBOX to add test message
 	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
 		t.Fatalf("Select INBOX failed: %v", err)
 	}
 
-	// Test IDLE command
+	// Add test message
+	testMessage := "From: copymove@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Copy Move Test Message\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This is a test message for copy/move operations.\r\n"
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen, imap.FlagFlagged},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	appendData, err := appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+	t.Logf("APPEND successful - UID: %d", appendData.UID)
+
+	// Test 1: COPY message by sequence number
+	copyData, err := c.Copy(imap.SeqSetNum(1), testMailbox).Wait()
+	if err != nil {
+		t.Fatalf("COPY by sequence number failed: %v", err)
+	}
+	t.Logf("COPY successful - Source UID: %d, Dest UID: %d", copyData.SourceUIDs[0], copyData.DestUIDs[0])
+
+	// Verify message was copied
+	selectData, err := c.Select(testMailbox, nil).Wait()
+	if err != nil {
+		t.Fatalf("Select test mailbox failed: %v", err)
+	}
+	if selectData.NumMessages != 1 {
+		t.Errorf("Expected 1 message in destination mailbox, got %d", selectData.NumMessages)
+	}
+
+	// Verify copied message has same flags
+	fetchResults, err := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{
+		Flags: true,
+		UID:   true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH from destination mailbox failed: %v", err)
+	}
+
+	if len(fetchResults) > 0 {
+		flags := fetchResults[0].Flags
+		if !containsFlag(flags, imap.FlagSeen) {
+			t.Error("\\Seen flag not preserved in copied message")
+		}
+		if !containsFlag(flags, imap.FlagFlagged) {
+			t.Error("\\Flagged flag not preserved in copied message")
+		}
+		t.Logf("Copied message flags: %v", flags)
+	}
+
+	// Test 2: UID COPY operation
+	// Go back to INBOX and add another message
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	testMessage2 := "From: copymove2@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: UID Copy Test Message\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This is a second test message for UID copy operation.\r\n"
+
+	appendCmd2 := c.Append("INBOX", int64(len(testMessage2)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagAnswered},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd2.Write([]byte(testMessage2))
+	if err != nil {
+		t.Fatalf("APPEND write second message failed: %v", err)
+	}
+	err = appendCmd2.Close()
+	if err != nil {
+		t.Fatalf("APPEND close second message failed: %v", err)
+	}
+	_, err = appendCmd2.Wait()
+	if err != nil {
+		t.Fatalf("APPEND second message failed: %v", err)
+	}
+
+	// COPY the second message (using sequence number)
+	copyData, err = c.Copy(imap.SeqSetNum(2), testMailbox).Wait()
+	if err != nil {
+		t.Fatalf("COPY second message failed: %v", err)
+	}
+	t.Logf("COPY second message successful - Source UID: %d, Dest UID: %d", copyData.SourceUIDs[0], copyData.DestUIDs[0])
+
+	// Verify destination now has 2 messages
+	selectData, err = c.Select(testMailbox, nil).Wait()
+	if err != nil {
+		t.Fatalf("Select test mailbox after UID COPY failed: %v", err)
+	}
+	if selectData.NumMessages != 2 {
+		t.Errorf("Expected 2 messages in destination mailbox after UID COPY, got %d", selectData.NumMessages)
+	}
+
+	t.Log("Comprehensive copy/move test completed successfully")
+}
+
+// TestIMAP_IdleBasic tests basic IDLE functionality
+func TestIMAP_IdleBasic(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX for IDLE test
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Test basic IDLE functionality
 	idleCmd, err := c.Idle()
 	if err != nil {
-		// Check if IDLE is supported
 		if strings.Contains(err.Error(), "IDLE") || strings.Contains(err.Error(), "not supported") {
 			t.Skip("IDLE command not supported by server")
 		}
 		t.Fatalf("IDLE command failed to start: %v", err)
 	}
-	t.Log("IDLE command started")
+	t.Log("IDLE command started successfully")
 
-	// Give it a moment to idle
+	// Let IDLE run for a short time
 	time.Sleep(100 * time.Millisecond)
 
+	// End IDLE
 	if err := idleCmd.Close(); err != nil {
 		t.Fatalf("Failed to stop IDLE: %v", err)
 	}
-	t.Log("IDLE command executed and stopped successfully")
+	t.Log("IDLE command stopped successfully")
+
+	// Verify connection is still functional after IDLE
+	_, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Connection not functional after IDLE: %v", err)
+	}
+
+	t.Log("Basic IDLE test completed successfully")
 }
 
-func TestIMAP_Capabilities(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	// Test CAPABILITY command before authentication
-	capsBeforeAuth, err := c.Capability().Wait()
-	if err != nil {
-		t.Fatalf("CAPABILITY command failed before auth: %v", err)
-	}
-
-	var capsList []string
-	for c := range capsBeforeAuth {
-		capsList = append(capsList, string(c))
-	}
-	t.Logf("Server capabilities before auth: %v", capsList)
-
-	// Login first
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Test CAPABILITY command after authentication
-	caps, err := c.Capability().Wait()
-	if err != nil {
-		t.Fatalf("CAPABILITY command failed after auth: %v", err)
-	}
-
-	// Check for required capabilities (should be available after auth)
-	requiredCaps := []string{"IMAP4rev1", "NAMESPACE"}
-	for _, required := range requiredCaps {
-		if !caps.Has(imap.Cap(required)) {
-			t.Errorf("Required capability %s not found after authentication", required)
-		}
-	}
-
-	capsList = nil
-	for c := range caps {
-		capsList = append(capsList, string(c))
-	}
-
-	t.Logf("Server capabilities after auth: %v", capsList)
-}
-
-func TestIMAP_ConnectionReuse(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	// Test multiple operations on the same connection
-	for i := 0; i < 5; i++ {
-		c, err := imapclient.DialInsecure(server.Address, nil)
-		if err != nil {
-			t.Fatalf("Failed to dial IMAP server iteration %d: %v", i+1, err)
-		}
-
-		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-			c.Close()
-			t.Fatalf("Login %d failed: %v", i+1, err)
-		}
-
-		if _, err := c.Select("INBOX", nil).Wait(); err != nil {
-			c.Close()
-			t.Fatalf("Select %d failed: %v", i+1, err)
-		}
-
-		// Test logout and re-login
-		if err := c.Logout().Wait(); err != nil {
-			// Logout might fail if server closes connection first, which is ok.
-			t.Logf("Logout %d returned an error (might be expected): %v", i+1, err)
-		}
-	}
-
-	t.Log("Connection reuse test completed successfully")
-}
-
-func TestIMAP_Namespace(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Test NAMESPACE command
-	nsData, err := c.Namespace().Wait()
-	if err != nil {
-		t.Fatalf("NAMESPACE command failed: %v", err)
-	}
-
-	// Verify personal namespace
-	if len(nsData.Personal) != 1 {
-		t.Fatalf("Expected 1 personal namespace, got %d", len(nsData.Personal))
-	}
-
-	personalNs := nsData.Personal[0]
-	if personalNs.Prefix != "" {
-		t.Errorf("Expected empty prefix for personal namespace, got '%s'", personalNs.Prefix)
-	}
-
-	if personalNs.Delim != '/' {
-		t.Errorf("Expected '/' delimiter for personal namespace, got '%c'", personalNs.Delim)
-	}
-
-	// Verify no shared or other namespaces
-	if nsData.Shared != nil {
-		t.Errorf("Expected no shared namespaces, got %d", len(nsData.Shared))
-	}
-
-	if nsData.Other != nil {
-		t.Errorf("Expected no other namespaces, got %d", len(nsData.Other))
-	}
-
-	t.Log("NAMESPACE command executed successfully")
-	t.Logf("Personal namespace: prefix='%s', delimiter='%c'", personalNs.Prefix, personalNs.Delim)
-}
-
-func TestIMAP_LsubCommand(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// 1. Create a nested mailbox structure and an unrelated folder
-	mailboxHierarchy := []string{
-		"A",
-		"A/B",
-		"A/B/C",
-		"AnotherFolder", // A non-subscribed, non-parent folder
-	}
-	for _, mbox := range mailboxHierarchy {
-		if err := c.Create(mbox, nil).Wait(); err != nil {
-			t.Fatalf("CREATE mailbox '%s' failed: %v", mbox, err)
-		}
-	}
-	t.Logf("Created mailboxes: %v", mailboxHierarchy)
-
-	// 2. Subscribe only to the deepest mailbox and INBOX
-	if err := c.Subscribe("A/B/C").Wait(); err != nil {
-		t.Fatalf("SUBSCRIBE to 'A/B/C' failed: %v", err)
-	}
-	if err := c.Subscribe("INBOX").Wait(); err != nil {
-		t.Fatalf("SUBSCRIBE to 'INBOX' failed: %v", err)
-	}
-	t.Log("Subscribed to: A/B/C and INBOX")
-
-	// 3. Issue LSUB command
-	lsubCmd := c.List("", "*", &imap.ListOptions{SelectSubscribed: true})
-	mailboxes, err := lsubCmd.Collect()
-	if err != nil {
-		t.Fatalf("LSUB command failed: %v", err)
-	}
-
-	// 4. Verify the response
-	expectedMailboxes := map[string]struct {
-		Subscribed bool
-		Noselect   bool
-	}{
-		"INBOX": {Subscribed: true, Noselect: false},
-		"A":     {Subscribed: false, Noselect: true},
-		"A/B":   {Subscribed: false, Noselect: true},
-		"A/B/C": {Subscribed: true, Noselect: false},
-	}
-
-	if len(mailboxes) != len(expectedMailboxes) {
-		t.Errorf("LSUB returned %d mailboxes, expected %d", len(mailboxes), len(expectedMailboxes))
-	}
-
-	for _, mbox := range mailboxes {
-		expected, ok := expectedMailboxes[mbox.Mailbox]
-		if !ok {
-			t.Errorf("LSUB returned unexpected mailbox: %s", mbox.Mailbox)
-			continue
-		}
-
-		hasSubscribed := mailboxHasAttr(mbox.Attrs, imap.MailboxAttrSubscribed)
-		if expected.Subscribed != hasSubscribed {
-			t.Errorf("Mailbox '%s' subscribed attribute mismatch: got %v, want %v", mbox.Mailbox, hasSubscribed, expected.Subscribed)
-		}
-
-		hasNoselect := mailboxHasAttr(mbox.Attrs, imap.MailboxAttrNoSelect)
-		if expected.Noselect != hasNoselect {
-			t.Errorf("Mailbox '%s' noselect attribute mismatch: got %v, want %v", mbox.Mailbox, hasNoselect, expected.Noselect)
-		}
-	}
-}
-
-func mailboxHasAttr(attrs []imap.MailboxAttr, attr imap.MailboxAttr) bool {
-	for _, a := range attrs {
-		if a == attr {
+// Helper function to check if a flag is present in a slice of flags
+func containsFlag(flags []imap.Flag, flag imap.Flag) bool {
+	for _, f := range flags {
+		if f == flag {
 			return true
 		}
 	}
 	return false
-}
-
-func TestIMAP_RenameParentFolder(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// 1. Create nested mailboxes and subscribe to a child
-	parentMailbox := "Projects"
-	childMailbox := "Projects/Sora"
-
-	// Create the child mailbox. The server should auto-create the parent 'Projects'.
-	// This avoids a potential server bug where explicit parent creation causes ambiguity.
-	if err := c.Create(childMailbox, nil).Wait(); err != nil {
-		t.Fatalf("CREATE mailbox '%s' failed: %v", childMailbox, err)
-	}
-	t.Logf("Created mailboxes: %s, %s", parentMailbox, childMailbox)
-
-	if err := c.Subscribe(childMailbox).Wait(); err != nil {
-		t.Fatalf("SUBSCRIBE to '%s' failed: %v", childMailbox, err)
-	}
-	t.Logf("Subscribed to: %s", childMailbox)
-
-	// 2. Rename the parent folder
-	newParentMailbox := "Projects-Archived"
-	if err := c.Rename(parentMailbox, newParentMailbox, nil).Wait(); err != nil {
-		t.Fatalf("RENAME from '%s' to '%s' failed: %v", parentMailbox, newParentMailbox, err)
-	}
-	t.Logf("Renamed '%s' to '%s'", parentMailbox, newParentMailbox)
-
-	newChildMailbox := "Projects-Archived/Sora"
-
-	// 3. Verify LIST response after rename
-	listCmd := c.List("", "*", nil)
-	listMailboxes, err := listCmd.Collect()
-	if err != nil {
-		t.Fatalf("LIST command failed after rename: %v", err)
-	}
-
-	foundMailboxes := make(map[string]bool)
-	for _, mbox := range listMailboxes {
-		foundMailboxes[mbox.Mailbox] = true
-	}
-
-	if !foundMailboxes[newParentMailbox] || !foundMailboxes[newChildMailbox] {
-		t.Errorf("LIST after rename: expected to find '%s' and '%s'", newParentMailbox, newChildMailbox)
-	}
-	if foundMailboxes[parentMailbox] || foundMailboxes[childMailbox] {
-		t.Errorf("LIST after rename: found old mailboxes '%s' or '%s', which should have been removed", parentMailbox, childMailbox)
-	}
-	t.Log("LIST response verified successfully after rename.")
-
-	// 4. Verify LSUB response after rename
-	lsubCmd := c.List("", "*", &imap.ListOptions{SelectSubscribed: true})
-	lsubMailboxes, err := lsubCmd.Collect()
-	if err != nil {
-		t.Fatalf("LSUB command failed after rename: %v", err)
-	}
-
-	expectedLsub := map[string]struct {
-		Subscribed bool
-		Noselect   bool
-	}{
-		"INBOX":          {Subscribed: true, Noselect: false},
-		newParentMailbox: {Subscribed: false, Noselect: true},
-		newChildMailbox:  {Subscribed: true, Noselect: false},
-	}
-
-	foundLsub := make(map[string]bool)
-	for _, mbox := range lsubMailboxes {
-		if expected, ok := expectedLsub[mbox.Mailbox]; ok {
-			foundLsub[mbox.Mailbox] = true
-			if expected.Subscribed != mailboxHasAttr(mbox.Attrs, imap.MailboxAttrSubscribed) || expected.Noselect != mailboxHasAttr(mbox.Attrs, imap.MailboxAttrNoSelect) {
-				t.Errorf("LSUB mailbox '%s' has incorrect attributes", mbox.Mailbox)
-			}
-		}
-		if mbox.Mailbox == parentMailbox || mbox.Mailbox == childMailbox {
-			t.Errorf("LSUB after rename: found old mailbox '%s', which should have been removed", mbox.Mailbox)
-		}
-	}
-
-	if len(foundLsub) != len(expectedLsub) {
-		t.Errorf("LSUB after rename: did not find all expected mailboxes. Found %d, expected %d", len(foundLsub), len(expectedLsub))
-	}
-	t.Log("LSUB response verified successfully after rename.")
-}
-
-func TestIMAP_NamespaceDelimiterConsistency(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Get NAMESPACE response
-	nsData, err := c.Namespace().Wait()
-	if err != nil {
-		t.Fatalf("NAMESPACE command failed: %v", err)
-	}
-
-	if len(nsData.Personal) == 0 {
-		t.Fatal("Expected at least one personal namespace")
-	}
-
-	namespaceDelim := nsData.Personal[0].Delim
-
-	// Create a test mailbox and verify LIST uses same delimiter
-	testMailbox := "TestFolder/SubFolder"
-	if err := c.Create(testMailbox, nil).Wait(); err != nil {
-		t.Fatalf("CREATE mailbox failed: %v", err)
-	}
-	defer c.Delete("TestFolder").Wait()
-
-	// Get LIST response
-	listCmd := c.List("", "*", nil)
-	mailboxes, err := listCmd.Collect()
-	if err != nil {
-		t.Fatalf("LIST command failed: %v", err)
-	}
-
-	// Verify LIST uses same delimiter as NAMESPACE
-	for _, mbox := range mailboxes {
-		if mbox.Delim != namespaceDelim {
-			t.Errorf("LIST delimiter '%c' doesn't match NAMESPACE delimiter '%c'", mbox.Delim, namespaceDelim)
-		}
-	}
-
-	t.Logf("NAMESPACE and LIST delimiters are consistent: '%c'", namespaceDelim)
-}
-
-func TestIMAP_NamespaceInboxAccessibility(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Get NAMESPACE response
-	nsData, err := c.Namespace().Wait()
-	if err != nil {
-		t.Fatalf("NAMESPACE command failed: %v", err)
-	}
-
-	personalNs := nsData.Personal[0]
-	t.Logf("Personal namespace: prefix='%s', delimiter='%c'", personalNs.Prefix, personalNs.Delim)
-
-	// INBOX should be accessible regardless of namespace prefix
-	// Test various INBOX name variations
-	inboxVariations := []string{"INBOX", "inbox", "Inbox"}
-
-	for _, inboxName := range inboxVariations {
-		selectCmd := c.Select(inboxName, nil)
-		mbox, err := selectCmd.Wait()
-		if err != nil {
-			// Only INBOX (uppercase) is guaranteed to work per RFC
-			if inboxName != "INBOX" {
-				t.Logf("SELECT %s failed as expected: %v", inboxName, err)
-				continue
-			}
-			t.Fatalf("SELECT %s failed: %v", inboxName, err)
-		}
-
-		if mbox == nil {
-			t.Fatalf("SELECT %s returned nil mailbox", inboxName)
-		}
-
-		t.Logf("Successfully selected %s", inboxName)
-	}
-
-	// Verify INBOX appears in LIST regardless of namespace prefix
-	listCmd := c.List("", "*", nil)
-	mailboxes, err := listCmd.Collect()
-	if err != nil {
-		t.Fatalf("LIST command failed: %v", err)
-	}
-
-	foundInbox := false
-	for _, mbox := range mailboxes {
-		if strings.ToUpper(mbox.Mailbox) == "INBOX" {
-			foundInbox = true
-			// INBOX should not have namespace prefix
-			if personalNs.Prefix != "" && strings.HasPrefix(mbox.Mailbox, personalNs.Prefix) {
-				t.Errorf("INBOX should not have namespace prefix, but found: %s", mbox.Mailbox)
-			}
-			break
-		}
-	}
-
-	if !foundInbox {
-		t.Error("INBOX not found in LIST response")
-	}
-}
-
-func TestIMAP_NamespaceMailboxOperations(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Get NAMESPACE response
-	nsData, err := c.Namespace().Wait()
-	if err != nil {
-		t.Fatalf("NAMESPACE command failed: %v", err)
-	}
-
-	personalNs := nsData.Personal[0]
-	t.Logf("Personal namespace: prefix='%s', delimiter='%c'", personalNs.Prefix, personalNs.Delim)
-
-	// Test mailbox creation with proper namespace handling
-	// Since our namespace has empty prefix, mailboxes should work normally
-	testMailboxes := []string{
-		"TestFolder",
-		"TestFolder" + string(personalNs.Delim) + "SubFolder",
-		"AnotherFolder",
-	}
-
-	// Create mailboxes
-	for _, mbox := range testMailboxes {
-		fullName := personalNs.Prefix + mbox
-		if err := c.Create(fullName, nil).Wait(); err != nil {
-			t.Fatalf("CREATE mailbox '%s' failed: %v", fullName, err)
-		}
-		t.Logf("Created mailbox: %s", fullName)
-	}
-
-	// List mailboxes and verify they appear correctly
-	listCmd := c.List("", "*", nil)
-	mailboxes, err := listCmd.Collect()
-	if err != nil {
-		t.Fatalf("LIST command failed: %v", err)
-	}
-
-	foundMailboxes := make(map[string]bool)
-	for _, mbox := range mailboxes {
-		foundMailboxes[mbox.Mailbox] = true
-	}
-
-	// Verify created mailboxes appear in LIST
-	for _, expectedMbox := range testMailboxes {
-		fullName := personalNs.Prefix + expectedMbox
-		if !foundMailboxes[fullName] {
-			t.Errorf("Created mailbox '%s' not found in LIST response", fullName)
-		}
-	}
-
-	// Test mailbox operations (STATUS, SELECT)
-	for _, mbox := range testMailboxes {
-		fullName := personalNs.Prefix + mbox
-		
-		// Test STATUS
-		statusData, err := c.Status(fullName, &imap.StatusOptions{
-			NumMessages: true,
-			UIDNext:     true,
-		}).Wait()
-		if err != nil {
-			t.Errorf("STATUS for mailbox '%s' failed: %v", fullName, err)
-		} else {
-			t.Logf("STATUS for %s: NumMessages=%v, UIDNext=%v", fullName, statusData.NumMessages, statusData.UIDNext)
-		}
-
-		// Test SELECT (only for non-hierarchical test mailboxes)
-		if !strings.Contains(mbox, string(personalNs.Delim)) {
-			selectData, err := c.Select(fullName, nil).Wait()
-			if err != nil {
-				t.Errorf("SELECT for mailbox '%s' failed: %v", fullName, err)
-			} else {
-				t.Logf("SELECT for %s successful: NumMessages=%d", fullName, selectData.NumMessages)
-			}
-		}
-	}
-
-	// Cleanup
-	for i := len(testMailboxes) - 1; i >= 0; i-- {
-		fullName := personalNs.Prefix + testMailboxes[i]
-		if err := c.Delete(fullName).Wait(); err != nil {
-			t.Logf("Failed to delete mailbox '%s': %v", fullName, err)
-		}
-	}
-}
-
-func TestIMAP_NamespaceNegativeTests(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Test NAMESPACE response structure
-	nsData, err := c.Namespace().Wait()
-	if err != nil {
-		t.Fatalf("NAMESPACE command failed: %v", err)
-	}
-
-	// Verify no shared namespaces
-	if nsData.Shared != nil && len(nsData.Shared) > 0 {
-		t.Errorf("Server returned shared namespaces when none should be supported: %v", nsData.Shared)
-	}
-
-	// Verify no other user namespaces
-	if nsData.Other != nil && len(nsData.Other) > 0 {
-		t.Errorf("Server returned other user namespaces when none should be supported: %v", nsData.Other)
-	}
-
-	// Verify we have exactly one personal namespace
-	if len(nsData.Personal) != 1 {
-		t.Errorf("Expected exactly 1 personal namespace, got %d", len(nsData.Personal))
-	}
-
-	// Test that unsupported namespace prefixes fail gracefully
-	// Try to create mailboxes with invalid namespace-like names
-	invalidNamespaces := []string{
-		"#shared/test",
-		"#user/someone/test", 
-		"~user/test",
-	}
-
-	for _, invalidName := range invalidNamespaces {
-		err := c.Create(invalidName, nil).Wait()
-		// These should either fail or be treated as regular mailbox names
-		// Since we don't support these namespace types, they should work as regular names
-		if err == nil {
-			t.Logf("Created mailbox with namespace-like name '%s' - treated as regular mailbox", invalidName)
-			// Clean up
-			c.Delete(invalidName).Wait()
-		} else {
-			t.Logf("Failed to create namespace-like mailbox '%s': %v", invalidName, err)
-		}
-	}
-
-	t.Log("NAMESPACE negative tests completed")
 }

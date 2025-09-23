@@ -58,18 +58,20 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		var err error
 		reader.timeout, err = time.ParseDuration(config.Timeout)
 		if err != nil {
-			return nil, fmt.Errorf("invalid proxy protocol timeout: %w", err)
+			// Log the error and use default timeout to prevent server crash
+			log.Printf("WARNING: invalid proxy protocol timeout '%s' for %s (%v), using default timeout of 5s", config.Timeout, protocol, err)
+			reader.timeout = 5 * time.Second
 		}
 	}
 
 	// Parse trusted proxy CIDR blocks
-	for _, cidr := range config.TrustedProxies {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid trusted proxy CIDR %s: %w", cidr, err)
-		}
-		reader.trustedNets = append(reader.trustedNets, network)
+	trustedNets, err := ParseTrustedNetworks(config.TrustedProxies)
+	if err != nil {
+		// Log the error and use empty trusted networks to prevent server crash
+		log.Printf("WARNING: failed to parse trusted proxy networks for %s (%v), using empty trusted networks (PROXY protocol will be disabled)", protocol, err)
+		trustedNets = []*net.IPNet{}
 	}
+	reader.trustedNets = trustedNets
 
 	return reader, nil
 }

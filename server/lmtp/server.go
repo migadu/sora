@@ -161,7 +161,9 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 
 	trustedNets, err := server.ParseTrustedNetworks(trustedProxies)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse trusted networks for XCLIENT: %w", err)
+		// Log the error and use empty trusted networks to prevent server crash
+		log.Printf("WARNING: failed to parse trusted networks for XCLIENT (%v), using empty trusted networks (XCLIENT will be disabled)", err)
+		trustedNets = []*net.IPNet{}
 	}
 	s.XCLIENTTrustedNets = trustedNets
 

@@ -80,10 +80,12 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// First, update message count if it has increased (new messages)
 	// This must be done before processing expunges to ensure sequence numbers are valid
 	currentCount := s.currentNumMessages.Load()
+	messageCountChanged := false
 	if poll.NumMessages > currentCount {
 		s.Log("[POLL] Updating message count from %d to %d", currentCount, poll.NumMessages)
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
+		messageCountChanged = true
 	}
 
 	// Group updates by sequence number to detect duplicate expunges
@@ -140,10 +142,22 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
+	
+	// Check if we have any updates to process before calling sessionTracker.Poll
+	// We have updates if there are database updates OR if the message count changed
+	hasUpdates := len(poll.Updates) > 0 || messageCountChanged
+	
 	release() // Release lock before writing to the network
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {
+		return nil
+	}
+
+	// Only call sessionTracker.Poll if we have meaningful updates to send
+	// This prevents sending empty updates that cause panics in the go-imap library
+	if !hasUpdates {
+		s.Log("[POLL] No updates to send, skipping sessionTracker.Poll")
 		return nil
 	}
 
