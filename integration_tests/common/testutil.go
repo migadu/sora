@@ -134,6 +134,7 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 
 	server, err := imap.New(
 		context.Background(),
+		"test",
 		"localhost",
 		address,
 		&storage.S3Storage{},
@@ -209,6 +210,7 @@ func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 
 	server, err := lmtp.New(
 		context.Background(),
+		"test",
 		"localhost",
 		address,
 		s3Storage,
@@ -259,6 +261,7 @@ func SetupPOP3Server(t *testing.T) (*TestServer, TestAccount) {
 
 	server, err := pop3.New(
 		context.Background(),
+		"test",
 		"localhost",
 		address,
 		&storage.S3Storage{},
