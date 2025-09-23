@@ -483,15 +483,18 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 
 // GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
 func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]Message, error) {
-	// Determine query complexity to choose appropriate table prefix
+	// Build ORDER BY clause first to determine if it requires complex query
+	// We'll use a temporary prefix to check complexity, then rebuild with correct prefix
+	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
+	isComplexQuery := db.needsComplexQuery(criteria, tempOrderBy)
+	
 	var orderBy string
-	isComplexQuery := db.needsComplexQuery(criteria, "")
 	if isComplexQuery {
 		// Complex queries use CTE, so no table prefix needed
 		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "")
 	} else {
 		// Simple queries use table aliases, so use "m" prefix
-		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
+		orderBy = tempOrderBy
 	}
 
 	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy)
