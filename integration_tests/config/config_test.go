@@ -34,9 +34,9 @@ func TestConfigLoading(t *testing.T) {
 
 	// Verify that proxy configurations support remote_port
 	for _, server := range cfg.DynamicServers {
-		if server.Type == "pop3_proxy" || server.Type == "lmtp_proxy" || 
-		   server.Type == "imap_proxy" || server.Type == "managesieve_proxy" {
-			
+		if server.Type == "pop3_proxy" || server.Type == "lmtp_proxy" ||
+			server.Type == "imap_proxy" || server.Type == "managesieve_proxy" {
+
 			remotePort, err := server.GetRemotePort()
 			if err != nil {
 				t.Errorf("Server %s (%s) has invalid remote_port: %v", server.Name, server.Type, err)
@@ -102,7 +102,7 @@ func TestIPv6ProxyConnection(t *testing.T) {
 				}
 
 				// Test that the server can be created without IPv6 errors
-				t.Logf("Successfully created POP3 proxy with remote_addrs: %v, remote_port: %d", 
+				t.Logf("Successfully created POP3 proxy with remote_addrs: %v, remote_port: %d",
 					tc.remoteAddrs, tc.remotePort)
 
 				// Clean up
@@ -128,7 +128,7 @@ func TestIPv6ProxyConnection(t *testing.T) {
 				}
 
 				// Test that the server can be created without IPv6 errors
-				t.Logf("Successfully created LMTP proxy with remote_addrs: %v, remote_port: %d", 
+				t.Logf("Successfully created LMTP proxy with remote_addrs: %v, remote_port: %d",
 					tc.remoteAddrs, tc.remotePort)
 
 				// Clean up
@@ -141,11 +141,11 @@ func TestIPv6ProxyConnection(t *testing.T) {
 func TestRemotePortNormalization(t *testing.T) {
 	// Test the address normalization logic directly
 	testCases := []struct {
-		name         string
-		addr         string
-		defaultPort  int
-		expectValid  bool
-		description  string
+		name        string
+		addr        string
+		defaultPort int
+		expectValid bool
+		description string
 	}{
 		{
 			name:        "localhost with default port",
@@ -200,7 +200,7 @@ func TestRemotePortNormalization(t *testing.T) {
 			// Test that the address would be properly formatted for dialing
 			// (This simulates what happens in the connection manager)
 			host, port, err := net.SplitHostPort(fmt.Sprintf("%s:%d", tc.addr, tc.defaultPort))
-			
+
 			// If this address would cause issues, SplitHostPort should fail
 			if tc.expectValid && err != nil {
 				// Try to resolve like the connection manager would
@@ -209,7 +209,7 @@ func TestRemotePortNormalization(t *testing.T) {
 					resolvedAddr := net.JoinHostPort(ips[0].String(), fmt.Sprintf("%d", tc.defaultPort))
 					host, port, err = net.SplitHostPort(resolvedAddr)
 					if err == nil {
-						t.Logf("Address resolved successfully: %s -> %s (host=%s, port=%s)", 
+						t.Logf("Address resolved successfully: %s -> %s (host=%s, port=%s)",
 							tc.addr, resolvedAddr, host, port)
 					} else {
 						t.Errorf("Even after resolution, address failed: %v", err)
@@ -245,7 +245,7 @@ remote_port = "993"
 	// Write to temporary file
 	tmpDir := t.TempDir()
 	configFile := filepath.Join(tmpDir, "test_config.toml")
-	
+
 	err := os.WriteFile(configFile, []byte(tomlContent), 0644)
 	if err != nil {
 		t.Fatalf("Failed to write test config: %v", err)

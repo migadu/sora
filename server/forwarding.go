@@ -376,7 +376,7 @@ func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 			if ip == nil {
 				return nil, fmt.Errorf("invalid trusted network '%s': not a valid IP address or CIDR", cidr)
 			}
-			
+
 			// Determine if IPv4 or IPv6 and add appropriate subnet
 			var cidrWithSubnet string
 			if ip.To4() != nil {
@@ -386,7 +386,7 @@ func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 				// IPv6 address
 				cidrWithSubnet = cidr + "/128"
 			}
-			
+
 			// Parse the corrected CIDR
 			_, network, err = net.ParseCIDR(cidrWithSubnet)
 			if err != nil {

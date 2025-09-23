@@ -21,6 +21,7 @@ const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
 type ManageSieveServer struct {
 	addr               string
+	name               string
 	hostname           string
 	rdb                *resilient.ResilientDatabase
 	appCtx             context.Context
@@ -65,7 +66,7 @@ type ManageSieveServerOptions struct {
 	AuthRateLimit        server.AuthRateLimiterConfig
 }
 
-func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
+func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
 	// Initialize PROXY protocol reader if enabled
@@ -94,6 +95,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	serverInstance := &ManageSieveServer{
 		hostname:           hostname,
+		name:               name,
 		addr:               addr,
 		rdb:                rdb,
 		appCtx:             serverCtx,
@@ -148,14 +150,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* ManageSieve listening with implicit TLS on %s", s.addr)
+		log.Printf("* ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* ManageSieve listening on %s", s.addr)
+		log.Printf("* ManageSieve [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 

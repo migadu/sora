@@ -24,6 +24,7 @@ import (
 
 type LMTPServerBackend struct {
 	addr          string
+	name          string
 	hostname      string
 	rdb           *resilient.ResilientDatabase
 	s3            *storage.S3Storage
@@ -68,7 +69,7 @@ type LMTPServerOptions struct {
 	FTSRetention         time.Duration
 }
 
-func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
+func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
 	if options.ProxyProtocol {
@@ -91,6 +92,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 
 	backend := &LMTPServerBackend{
 		addr:          addr,
+		name:          name,
 		appCtx:        appCtx,
 		hostname:      hostname,
 		rdb:           rdb,
@@ -113,7 +115,7 @@ func New(appCtx context.Context, hostname, addr string, s3 *storage.S3Storage, r
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}
 	backend.defaultSieveExecutor = defaultExecutor
-	log.Printf("LMTP default Sieve script parsed and cached")
+	log.Printf("LMTP [%s] default Sieve script parsed and cached", backend.name)
 
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
@@ -302,14 +304,14 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* LMTP listening with implicit TLS on %s", b.server.Addr)
+		log.Printf("* LMTP [%s] listening with implicit TLS on %s", b.name, b.server.Addr)
 	} else {
 		listener, err = net.Listen("tcp", b.server.Addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* LMTP listening on %s", b.server.Addr)
+		log.Printf("* LMTP [%s] listening on %s", b.name, b.server.Addr)
 	}
 	defer listener.Close()
 

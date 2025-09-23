@@ -168,12 +168,12 @@ func initializeLogging(finalLogOutput string) *os.File {
 			logFile = nil // Ensure logFile is nil if open failed
 		} else {
 			log.SetOutput(logFile)
-			
+
 			// Redirect both stdout and stderr to the log file
 			// This ensures all output (including panics, direct writes, and error handler output) goes to the file
 			os.Stdout = logFile
 			os.Stderr = logFile
-			
+
 			// Keep standard log flags (date, time) for file logging
 			initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to file '%s' (selected by '%s').", finalLogOutput, finalLogOutput)
 		}
@@ -570,7 +570,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	s, err := imap.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
+	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:                serverConfig.Debug,
 			TLS:                  serverConfig.TLS,
@@ -614,7 +614,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	lmtpServer, err := lmtp.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		ExternalRelay:        serverConfig.ExternalRelay,
 		TLSVerify:            serverConfig.TLSVerify,
 		TLS:                  serverConfig.TLS,
@@ -654,7 +654,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	s, err := pop3.New(ctx, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
+	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
 		Debug:                serverConfig.Debug,
 		TLS:                  serverConfig.TLS,
 		TLSCertFile:          serverConfig.TLSCertFile,
@@ -694,7 +694,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	s, err := managesieve.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
+	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
 		InsecureAuth:         serverConfig.InsecureAuth,
 		TLSVerify:            serverConfig.TLSVerify,
 		TLS:                  serverConfig.TLS,

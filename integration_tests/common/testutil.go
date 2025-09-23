@@ -117,16 +117,16 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 	// Create UploadWorker for testing
 	uploadWorker, err := uploader.New(
 		context.Background(),
-		tempDir,                    // path
-		10,                        // batchSize
-		1,                         // concurrency
-		3,                         // maxAttempts
-		time.Second,               // retryInterval
-		"test-instance",           // instanceID
-		rdb,                       // database
-		&storage.S3Storage{},      // S3 storage
-		nil,                       // cache (can be nil)
-		errCh,                     // error channel
+		tempDir,              // path
+		10,                   // batchSize
+		1,                    // concurrency
+		3,                    // maxAttempts
+		time.Second,          // retryInterval
+		"test-instance",      // instanceID
+		rdb,                  // database
+		&storage.S3Storage{}, // S3 storage
+		nil,                  // cache (can be nil)
+		errCh,                // error channel
 	)
 	if err != nil {
 		t.Fatalf("Failed to create upload worker: %v", err)

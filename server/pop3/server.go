@@ -21,11 +21,12 @@ import (
 
 type POP3Server struct {
 	addr               string
+	name               string
 	hostname           string
 	rdb                *resilient.ResilientDatabase
 	s3                 *resilient.ResilientS3Storage
 	appCtx             context.Context
-	cancel             context.CancelFunc // Cancel function for the app context
+	cancel             context.CancelFunc
 	uploader           *uploader.UploadWorker
 	cache              *cache.Cache
 	tlsConfig          *tls.Config
@@ -65,7 +66,7 @@ type POP3ServerOptions struct {
 	AuthRateLimit        serverPkg.AuthRateLimiterConfig
 }
 
-func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
+func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -98,6 +99,7 @@ func New(appCtx context.Context, hostname, popAddr string, s3 *storage.S3Storage
 
 	server := &POP3Server{
 		hostname:           hostname,
+		name:               name,
 		addr:               popAddr,
 		rdb:                rdb,
 		s3:                 resilientS3,
@@ -154,7 +156,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* POP3 listening with TLS on %s", s.addr)
+		log.Printf("* POP3 [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
@@ -162,7 +164,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* POP3 listening on %s", s.addr)
+		log.Printf("* POP3 [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 

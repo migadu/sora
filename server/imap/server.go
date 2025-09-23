@@ -75,6 +75,7 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 
 type IMAPServer struct {
 	addr               string
+	name               string
 	rdb                *resilient.ResilientDatabase
 	hostname           string
 	s3                 *resilient.ResilientS3Storage
@@ -138,7 +139,7 @@ type IMAPServerOptions struct {
 	FTSRetention       time.Duration
 }
 
-func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
+func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
 	// Validate required dependencies
 	if s3 == nil {
 		return nil, fmt.Errorf("S3 storage is required for IMAP server")
@@ -185,6 +186,7 @@ func New(appCtx context.Context, hostname, imapAddr string, s3 *storage.S3Storag
 
 	s := &IMAPServer{
 		hostname:           hostname,
+		name:               name,
 		appCtx:             appCtx,
 		addr:               imapAddr,
 		rdb:                rdb,
@@ -342,13 +344,13 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
-		log.Printf("* IMAP listening with TLS on %s", imapAddr)
+		log.Printf("* IMAP [%s] listening with TLS on %s", s.name, imapAddr)
 	} else {
 		listener, err = net.Listen("tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("* IMAP listening on %s", imapAddr)
+		log.Printf("* IMAP [%s] listening on %s", s.name, imapAddr)
 	}
 	defer listener.Close()
 	defer func() {

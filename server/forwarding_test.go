@@ -162,7 +162,7 @@ func TestParseTrustedNetworks_IPv6AutoSubnet(t *testing.T) {
 func TestParseTrustedNetworks_RealWorldExample(t *testing.T) {
 	// This is the exact case from the error message
 	input := []string{"54.38.178.38"}
-	
+
 	networks, err := ParseTrustedNetworks(input)
 	if err != nil {
 		t.Fatalf("Should not error on plain IPv4 address: %v", err)

@@ -142,11 +142,11 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
-	
+
 	// Check if we have any updates to process before calling sessionTracker.Poll
 	// We have updates if there are database updates OR if the message count changed
 	hasUpdates := len(poll.Updates) > 0 || messageCountChanged
-	
+
 	release() // Release lock before writing to the network
 
 	// Check if sessionTracker is still valid after releasing lock

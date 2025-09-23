@@ -563,7 +563,6 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		log.Printf("[DB] ERROR: failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
-	
 
 	// Determine the path of the new parent.
 	var newParentPath string
@@ -611,7 +610,6 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		oldPrefix := oldName + delimiter
 		newPrefix := newName + delimiter
 
-
 		// The path of children only changes if the mailbox is moved to a new parent. For a simple
 		// rename, only the 'name' of the children needs to be updated. We use concatenation with
 		// SUBSTRING to only replace the prefix, which is safer than a global REPLACE.
@@ -632,7 +630,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		if err != nil {
 			return fmt.Errorf("failed to update child mailboxes: %w", err)
 		}
-		
+
 	}
 
 	return nil
