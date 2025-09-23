@@ -127,17 +127,17 @@ func main() {
 	case "connections":
 		handleConnectionsCommand()
 	case "health":
-		handleHealthStatus()
+		handleHealthCommand()
 	case "config":
-		handleConfigDump()
+		handleConfigCommand()
 	case "migrate":
 		handleMigrateCommand(ctx)
 	case "version":
 		printVersion()
 	case "import":
-		handleImportMaildir()
+		handleImportCommand()
 	case "export":
-		handleExportMaildir()
+		handleExportCommand()
 	case "uploader":
 		handleUploaderCommand()
 	case "help", "--help", "-h":
@@ -1958,6 +1958,43 @@ func isFlagSet(fs *flag.FlagSet, name string) bool {
 	return isSet
 }
 
+func handleImportCommand() {
+	if len(os.Args) < 3 {
+		printImportUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "maildir":
+		handleImportMaildir()
+	case "--help", "-h":
+		printImportUsage()
+	default:
+		fmt.Printf("Unknown import subcommand: %s\n\n", subcommand)
+		printImportUsage()
+		os.Exit(1)
+	}
+}
+
+func printImportUsage() {
+	fmt.Printf(`Import Management
+
+Usage:
+  sora-admin import <subcommand> [options]
+
+Subcommands:
+  maildir  Import maildir data
+
+Examples:
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+
+Use 'sora-admin import <subcommand> --help' for detailed help.
+`)
+}
+
 func handleImportMaildir() {
 	// Parse import specific flags
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
@@ -1983,7 +2020,7 @@ func handleImportMaildir() {
 		fmt.Printf(`Import maildir from a given path
 
 Usage:
-  sora-admin import [options]
+  sora-admin import maildir [options]
 
 Options:
   --email string          Email address for the account to import mail to (required)
@@ -2012,30 +2049,30 @@ custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist file
 
 Examples:
   # Import all mail (correct path points to maildir root)
-  sora-admin import --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
 
   # Dry run to preview (note: correct maildir path)
-  sora-admin import --email user@example.com --maildir-path /home/user/Maildir --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
 
   # Import only INBOX and Sent folders
-  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
 
   # Import messages from 2023
-  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
 
   # Import with cleanup (removes SQLite database after completion)
-  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
 
   # Import from Dovecot with subscriptions and custom keywords
-  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
 
   # Import with Sieve script
-  sora-admin import --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command name and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -2148,6 +2185,43 @@ Examples:
 	}
 }
 
+func handleExportCommand() {
+	if len(os.Args) < 3 {
+		printExportUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "maildir":
+		handleExportMaildir()
+	case "--help", "-h":
+		printExportUsage()
+	default:
+		fmt.Printf("Unknown export subcommand: %s\n\n", subcommand)
+		printExportUsage()
+		os.Exit(1)
+	}
+}
+
+func printExportUsage() {
+	fmt.Printf(`Export Management
+
+Usage:
+  sora-admin export <subcommand> [options]
+
+Subcommands:
+  maildir  Export messages to maildir format
+
+Examples:
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+
+Use 'sora-admin export <subcommand> --help' for detailed help.
+`)
+}
+
 func handleExportMaildir() {
 	// Parse export specific flags
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
@@ -2170,7 +2244,7 @@ func handleExportMaildir() {
 		fmt.Printf(`Export messages to maildir format
 
 Usage:
-  sora-admin export [options]
+  sora-admin export maildir [options]
 
 Options:
   --email string          Email address for the account to export mail from (required)
@@ -2193,24 +2267,24 @@ with the same content hash will be skipped unless --overwrite-flags is specified
 
 Examples:
   # Export all mail to a new maildir
-  sora-admin export --email user@example.com --maildir-path /var/backup/user/Maildir
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
 
   # Export only INBOX and Sent folders
-  sora-admin export --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
 
   # Export with Dovecot metadata (includes dovecot-uidlist files)
-  sora-admin export --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
   
   # Export with only dovecot-uidlist files (no subscriptions)
-  sora-admin export --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
 
   # Update flags on existing messages
-  sora-admin export --email user@example.com --maildir-path /existing/maildir --overwrite-flags
+  sora-admin export maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
 `)
 	}
 
-	// Parse the remaining arguments (skip the command name)
-	if err := fs.Parse(os.Args[2:]); err != nil {
+	// Parse the remaining arguments (skip the command name and subcommand name)
+	if err := fs.Parse(os.Args[3:]); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
 
@@ -2996,6 +3070,43 @@ Examples:
 	}
 }
 
+func handleHealthCommand() {
+	if len(os.Args) < 3 {
+		printHealthUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "status":
+		handleHealthStatus()
+	case "--help", "-h":
+		printHealthUsage()
+	default:
+		fmt.Printf("Unknown health subcommand: %s\n\n", subcommand)
+		printHealthUsage()
+		os.Exit(1)
+	}
+}
+
+func printHealthUsage() {
+	fmt.Printf(`System Health Management
+
+Usage:
+  sora-admin health <subcommand> [options]
+
+Subcommands:
+  status   Show system health status and component monitoring
+
+Examples:
+  sora-admin health status
+  sora-admin health status --hostname server1.example.com
+  sora-admin health status --component database --detailed
+
+Use 'sora-admin health <subcommand> --help' for detailed help.
+`)
+}
+
 func handleHealthStatus() {
 	fs := flag.NewFlagSet("health", flag.ExitOnError)
 
@@ -3014,7 +3125,7 @@ func handleHealthStatus() {
 		fmt.Printf(`Show system health status and component monitoring
 
 Usage:
-  sora-admin health-status [options]
+  sora-admin health status [options]
 
 Options:
   --hostname string     Show health status for specific hostname
@@ -3033,16 +3144,16 @@ This command shows:
   - Component failure rates and error details
 
 Examples:
-  sora-admin health-status
-  sora-admin health-status --hostname server1.example.com
-  sora-admin health-status --component database --detailed
-  sora-admin health-status --history --since 24h
-  sora-admin health-status --json
+  sora-admin health status
+  sora-admin health status --hostname server1.example.com
+  sora-admin health status --component database --detailed
+  sora-admin health status --history --since 24h
+  sora-admin health status --json
 `)
 	}
 
-	// Parse command arguments (skip program name and command name)
-	args := os.Args[2:]
+	// Parse command arguments (skip program name, command name, and subcommand name)
+	args := os.Args[3:]
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
@@ -3635,6 +3746,43 @@ func showHistoricalCacheMetrics(ctx context.Context, rdb *resilient.ResilientDat
 	return nil
 }
 
+func handleConfigCommand() {
+	if len(os.Args) < 3 {
+		printConfigUsage()
+		os.Exit(1)
+	}
+
+	subcommand := os.Args[2]
+	switch subcommand {
+	case "dump":
+		handleConfigDump()
+	case "--help", "-h":
+		printConfigUsage()
+	default:
+		fmt.Printf("Unknown config subcommand: %s\n\n", subcommand)
+		printConfigUsage()
+		os.Exit(1)
+	}
+}
+
+func printConfigUsage() {
+	fmt.Printf(`Configuration Management
+
+Usage:
+  sora-admin config <subcommand> [options]
+
+Subcommands:
+  dump     Dump the parsed configuration for debugging
+
+Examples:
+  sora-admin config dump --config sora.config.toml
+  sora-admin config dump --format json --mask-secrets=false
+  sora-admin config dump --format pretty
+
+Use 'sora-admin config <subcommand> --help' for detailed help.
+`)
+}
+
 func handleConfigDump() {
 	// Parse config-dump specific flags
 	var configFile, format string
@@ -3648,7 +3796,7 @@ func handleConfigDump() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
 Usage:
-  sora-admin config-dump [options]
+  sora-admin config dump [options]
 
 Options:
   --config PATH        Path to configuration file (default: config.toml)
@@ -3656,13 +3804,13 @@ Options:
   --mask-secrets       Mask sensitive values like passwords (default: true)
 
 Examples:
-  sora-admin config-dump --config sora.config.toml
-  sora-admin config-dump --format json --mask-secrets=false
-  sora-admin config-dump --format pretty
+  sora-admin config dump --config sora.config.toml
+  sora-admin config dump --format json --mask-secrets=false
+  sora-admin config dump --format pretty
 `)
 	}
 
-	flagSet.Parse(os.Args[2:])
+	flagSet.Parse(os.Args[3:])
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
