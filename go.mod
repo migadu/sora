@@ -24,7 +24,7 @@ require (
 // Use forked versions until upstreams are updated
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25
 
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20250923055924-85df4fd4ac8c
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20250923191551-b4c173e22ac3
 
 replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20
 

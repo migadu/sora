@@ -6,14 +6,13 @@ import (
 )
 
 // Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
-// and ESORT extension (RFC 5267). It returns a list of message numbers sorted
-// according to the provided criteria.
-func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]uint32, error) {
-	criteria = s.decodeSearchCriteria(criteria)
+// and ESORT extension (RFC 5267). It returns sorted message data according to the provided criteria.
+func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+	searchCriteria = s.decodeSearchCriteria(searchCriteria)
 
-	if s.currentNumMessages.Load() == 0 && len(criteria.SeqNum) > 0 {
+	if s.currentNumMessages.Load() == 0 && len(searchCriteria.SeqNum) > 0 {
 		s.Log("[SORT] skipping SORT because mailbox is empty")
-		return []uint32{}, nil
+		return &imap.SortData{All: []uint32{}}, nil
 	}
 
 	// Acquire a read lock to safely get a snapshot of the session tracker.
@@ -31,7 +30,7 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 	}
 
 	// Pass both search criteria and sort criteria to the database layer
-	messages, err := s.server.rdb.GetMessagesSorted(s.ctx, selectedMailboxID, criteria, sortCriteria)
+	messages, err := s.server.rdb.GetMessagesSorted(s.ctx, selectedMailboxID, searchCriteria, sortCriteria)
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}
@@ -46,5 +45,23 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, criteria *imap.SearchCrit
 		}
 	}
 
-	return nums, nil
+	// Create SortData with the results
+	sortData := &imap.SortData{
+		All: nums,
+	}
+
+	// Handle ESORT options if provided
+	if options != nil {
+		if options.ReturnCount {
+			sortData.Count = uint32(len(nums))
+		}
+		if options.ReturnMin && len(nums) > 0 {
+			sortData.Min = nums[0]
+		}
+		if options.ReturnMax && len(nums) > 0 {
+			sortData.Max = nums[len(nums)-1]
+		}
+	}
+
+	return sortData, nil
 }

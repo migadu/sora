@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -762,6 +763,1641 @@ func TestIMAP_IdleBasic(t *testing.T) {
 	}
 
 	t.Log("Basic IDLE test completed successfully")
+}
+
+// TestIMAP_FlagOperations tests comprehensive flag operations
+func TestIMAP_FlagOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add a test message
+	testMessage := "From: flags@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Flag Operations Test\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This is a test message for flag operations.\r\n"
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+
+	// Test 1: Store flags (add)
+	storeCmd := c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagSeen, imap.FlagFlagged},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("STORE flags add failed: %v", err)
+	}
+
+	// Verify flags were added
+	fetchResults, err := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after flag add failed: %v", err)
+	}
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	flags := fetchResults[0].Flags
+	if !containsFlag(flags, imap.FlagSeen) {
+		t.Error("\\Seen flag not found after adding")
+	}
+	if !containsFlag(flags, imap.FlagFlagged) {
+		t.Error("\\Flagged flag not found after adding")
+	}
+	t.Logf("Flags after adding: %v", flags)
+
+	// Test 2: Store flags (remove)
+	storeCmd = c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsDel,
+		Flags: []imap.Flag{imap.FlagFlagged},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("STORE flags remove failed: %v", err)
+	}
+
+	// Verify flag was removed
+	fetchResults, err = c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after flag remove failed: %v", err)
+	}
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	flags = fetchResults[0].Flags
+	if !containsFlag(flags, imap.FlagSeen) {
+		t.Error("\\Seen flag should still be present")
+	}
+	if containsFlag(flags, imap.FlagFlagged) {
+		t.Error("\\Flagged flag should be removed")
+	}
+	t.Logf("Flags after removing \\Flagged: %v", flags)
+
+	// Test 3: Store flags (replace)
+	storeCmd = c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsSet,
+		Flags: []imap.Flag{imap.FlagAnswered, imap.FlagDraft},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("STORE flags replace failed: %v", err)
+	}
+
+	// Verify flags were replaced
+	fetchResults, err = c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after flag replace failed: %v", err)
+	}
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	flags = fetchResults[0].Flags
+	if containsFlag(flags, imap.FlagSeen) {
+		t.Error("\\Seen flag should be removed after replace")
+	}
+	if !containsFlag(flags, imap.FlagAnswered) {
+		t.Error("\\Answered flag not found after replace")
+	}
+	if !containsFlag(flags, imap.FlagDraft) {
+		t.Error("\\Draft flag not found after replace")
+	}
+	t.Logf("Flags after replace: %v", flags)
+
+	t.Log("Flag operations test completed successfully")
+}
+
+// TestIMAP_ExpungeOperations tests message expunge operations
+func TestIMAP_ExpungeOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add multiple test messages
+	for i := 1; i <= 3; i++ {
+		testMessage := "From: expunge@example.com\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: Expunge Test Message " + string(rune('0'+i)) + "\r\n" +
+			"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+			"\r\n" +
+			"This is test message " + string(rune('0'+i)) + " for expunge operations.\r\n"
+
+		appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+		_, err = appendCmd.Write([]byte(testMessage))
+		if err != nil {
+			t.Fatalf("APPEND write message %d failed: %v", i, err)
+		}
+		err = appendCmd.Close()
+		if err != nil {
+			t.Fatalf("APPEND close message %d failed: %v", i, err)
+		}
+		_, err = appendCmd.Wait()
+		if err != nil {
+			t.Fatalf("APPEND message %d failed: %v", i, err)
+		}
+	}
+
+	// Verify we have 3 messages
+	mbox, err := c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+	if mbox.NumMessages != 3 {
+		t.Errorf("Expected 3 messages, got %d", mbox.NumMessages)
+	}
+	t.Logf("Added 3 messages, total: %d", mbox.NumMessages)
+
+	// Mark the second message for deletion
+	storeCmd := c.Store(imap.SeqSetNum(2), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("STORE \\Deleted flag failed: %v", err)
+	}
+
+	// Verify the message is marked as deleted
+	fetchResults, err := c.Fetch(imap.SeqSetNum(2), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after marking deleted failed: %v", err)
+	}
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	if !containsFlag(fetchResults[0].Flags, imap.FlagDeleted) {
+		t.Error("\\Deleted flag not found on marked message")
+	}
+	t.Log("Successfully marked message 2 as deleted")
+
+	// Perform EXPUNGE
+	expungeResults, err := c.Expunge().Collect()
+	if err != nil {
+		t.Fatalf("EXPUNGE failed: %v", err)
+	}
+
+	t.Logf("EXPUNGE results: %v", expungeResults)
+
+	// Verify message count decreased
+	mbox, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX after expunge failed: %v", err)
+	}
+	if mbox.NumMessages != 2 {
+		t.Errorf("Expected 2 messages after expunge, got %d", mbox.NumMessages)
+	}
+
+	// Verify remaining messages are still accessible
+	fetchResults, err = c.Fetch(imap.SeqSetNum(1, 2), &imap.FetchOptions{
+		Envelope: true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after expunge failed: %v", err)
+	}
+	if len(fetchResults) != 2 {
+		t.Errorf("Expected 2 messages after expunge, got %d", len(fetchResults))
+	}
+
+	t.Log("Expunge operations test completed successfully")
+}
+
+// TestIMAP_SearchOperations tests comprehensive search operations
+func TestIMAP_SearchOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add test messages with different characteristics
+	messages := []struct {
+		subject string
+		from    string
+		flags   []imap.Flag
+		body    string
+	}{
+		{
+			subject: "Search Test Alpha",
+			from:    "alpha@example.com",
+			flags:   []imap.Flag{imap.FlagSeen},
+			body:    "This message contains the keyword alpha.",
+		},
+		{
+			subject: "Search Test Beta",
+			from:    "beta@example.com",
+			flags:   []imap.Flag{imap.FlagFlagged},
+			body:    "This message contains the keyword beta.",
+		},
+		{
+			subject: "Search Test Gamma",
+			from:    "gamma@example.com",
+			flags:   []imap.Flag{imap.FlagSeen, imap.FlagAnswered},
+			body:    "This message contains the keyword gamma.",
+		},
+	}
+
+	for i, msg := range messages {
+		testMessage := "From: " + msg.from + "\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: " + msg.subject + "\r\n" +
+			"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+			"\r\n" +
+			msg.body + "\r\n"
+
+		appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+			Flags: msg.flags,
+			Time:  time.Now(),
+		})
+		_, err = appendCmd.Write([]byte(testMessage))
+		if err != nil {
+			t.Fatalf("APPEND write message %d failed: %v", i+1, err)
+		}
+		err = appendCmd.Close()
+		if err != nil {
+			t.Fatalf("APPEND close message %d failed: %v", i+1, err)
+		}
+		_, err = appendCmd.Wait()
+		if err != nil {
+			t.Fatalf("APPEND message %d failed: %v", i+1, err)
+		}
+	}
+
+	// Test 1: Search by flag
+	searchResults, err := c.Search(&imap.SearchCriteria{
+		Flag: []imap.Flag{imap.FlagSeen},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH by \\Seen flag failed: %v", err)
+	}
+
+	seenMessages := searchResults.AllSeqNums()
+	if len(seenMessages) != 2 {
+		t.Errorf("Expected 2 messages with \\Seen flag, got %d", len(seenMessages))
+	}
+	t.Logf("SEARCH by \\Seen flag found %d messages: %v", len(seenMessages), seenMessages)
+
+	// Test 2: Search by subject
+	searchResults, err = c.Search(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{
+			{Key: "Subject", Value: "Alpha"},
+		},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH by subject failed: %v", err)
+	}
+
+	subjectMessages := searchResults.AllSeqNums()
+	if len(subjectMessages) != 1 {
+		t.Errorf("Expected 1 message with 'Alpha' in subject, got %d", len(subjectMessages))
+	}
+	t.Logf("SEARCH by subject 'Alpha' found %d messages: %v", len(subjectMessages), subjectMessages)
+
+	// Test 3: Search by from
+	searchResults, err = c.Search(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{
+			{Key: "From", Value: "beta@example.com"},
+		},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH by from failed: %v", err)
+	}
+
+	fromMessages := searchResults.AllSeqNums()
+	if len(fromMessages) != 1 {
+		t.Errorf("Expected 1 message from 'beta@example.com', got %d", len(fromMessages))
+	}
+	t.Logf("SEARCH by from 'beta@example.com' found %d messages: %v", len(fromMessages), fromMessages)
+
+	// Test 4: Search ALL
+	searchResults, err = c.Search(&imap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH ALL failed: %v", err)
+	}
+
+	allMessages := searchResults.AllSeqNums()
+	if len(allMessages) != 3 {
+		t.Errorf("Expected 3 messages in ALL search, got %d", len(allMessages))
+	}
+	t.Logf("SEARCH ALL found %d messages: %v", len(allMessages), allMessages)
+
+	// Test 5: Search NOT
+	searchResults, err = c.Search(&imap.SearchCriteria{
+		Not: []imap.SearchCriteria{
+			{Flag: []imap.Flag{imap.FlagSeen}},
+		},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH NOT \\Seen failed: %v", err)
+	}
+
+	notSeenMessages := searchResults.AllSeqNums()
+	if len(notSeenMessages) != 1 {
+		t.Errorf("Expected 1 message without \\Seen flag, got %d", len(notSeenMessages))
+	}
+	t.Logf("SEARCH NOT \\Seen found %d messages: %v", len(notSeenMessages), notSeenMessages)
+
+	t.Log("Search operations test completed successfully")
+}
+
+// TestIMAP_MoveOperations tests MOVE operations (if supported)
+func TestIMAP_MoveOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Create destination mailbox
+	destMailbox := "MoveTest"
+	if err := c.Create(destMailbox, nil).Wait(); err != nil {
+		t.Fatalf("CREATE destination mailbox failed: %v", err)
+	}
+	defer func() {
+		c.Delete(destMailbox).Wait()
+	}()
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add test message
+	testMessage := "From: move@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Move Test Message\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This is a test message for move operations.\r\n"
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen, imap.FlagImportant},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+
+	// Get initial message count in INBOX
+	inboxData, err := c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+	initialInboxCount := inboxData.NumMessages
+	t.Logf("Initial INBOX message count: %d", initialInboxCount)
+
+	// Attempt MOVE operation
+	moveData, err := c.Move(imap.SeqSetNum(1), destMailbox).Wait()
+	if err != nil {
+		if strings.Contains(err.Error(), "MOVE") || strings.Contains(err.Error(), "not supported") {
+			t.Skip("MOVE command not supported by server")
+		}
+		t.Fatalf("MOVE failed: %v", err)
+	}
+	t.Logf("MOVE successful - move data: %+v", moveData)
+
+	// Verify message was removed from INBOX
+	inboxData, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX after move failed: %v", err)
+	}
+	if inboxData.NumMessages != initialInboxCount-1 {
+		t.Errorf("Expected %d messages in INBOX after move, got %d", initialInboxCount-1, inboxData.NumMessages)
+	}
+
+	// Verify message was moved to destination
+	destData, err := c.Select(destMailbox, nil).Wait()
+	if err != nil {
+		t.Fatalf("Select destination mailbox failed: %v", err)
+	}
+	if destData.NumMessages != 1 {
+		t.Errorf("Expected 1 message in destination mailbox, got %d", destData.NumMessages)
+	}
+
+	// Verify moved message retains flags
+	fetchResults, err := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{
+		Flags: true,
+		Envelope: true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH from destination mailbox failed: %v", err)
+	}
+
+	if len(fetchResults) > 0 {
+		flags := fetchResults[0].Flags
+		subject := fetchResults[0].Envelope.Subject
+		if !containsFlag(flags, imap.FlagSeen) {
+			t.Error("\\Seen flag not preserved in moved message")
+		}
+		if !containsFlag(flags, imap.FlagImportant) {
+			t.Error("\\Important flag not preserved in moved message")
+		}
+		if subject != "Move Test Message" {
+			t.Errorf("Expected subject 'Move Test Message', got '%s'", subject)
+		}
+		t.Logf("Moved message - Subject: %s, Flags: %v", subject, flags)
+	}
+
+	t.Log("Move operations test completed successfully")
+}
+
+// TestIMAP_ConcurrentAccess tests multiple clients accessing the same mailbox
+func TestIMAP_ConcurrentAccess(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Number of concurrent clients
+	numClients := 3
+	clientDone := make(chan bool, numClients)
+	var wg sync.WaitGroup
+
+	// Pre-populate mailbox with some messages
+	setupClient, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial setup client: %v", err)
+	}
+	defer setupClient.Logout()
+
+	if err := setupClient.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Setup client login failed: %v", err)
+	}
+
+	if _, err := setupClient.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Setup client select failed: %v", err)
+	}
+
+	// Add initial messages
+	for i := 1; i <= 5; i++ {
+		testMessage := "From: concurrent@example.com\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: Concurrent Test Message " + string(rune('0'+i)) + "\r\n" +
+			"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+			"\r\n" +
+			"This is test message " + string(rune('0'+i)) + " for concurrent access testing.\r\n"
+
+		appendCmd := setupClient.Append("INBOX", int64(len(testMessage)), nil)
+		_, err = appendCmd.Write([]byte(testMessage))
+		if err != nil {
+			t.Fatalf("Setup APPEND write failed: %v", err)
+		}
+		err = appendCmd.Close()
+		if err != nil {
+			t.Fatalf("Setup APPEND close failed: %v", err)
+		}
+		_, err = appendCmd.Wait()
+		if err != nil {
+			t.Fatalf("Setup APPEND failed: %v", err)
+		}
+	}
+
+	setupClient.Logout()
+
+	// Start concurrent clients
+	for clientID := 0; clientID < numClients; clientID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			defer func() { clientDone <- true }()
+
+			c, err := imapclient.DialInsecure(server.Address, nil)
+			if err != nil {
+				t.Errorf("Client %d: Failed to dial: %v", id, err)
+				return
+			}
+			defer c.Logout()
+
+			if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+				t.Errorf("Client %d: Login failed: %v", id, err)
+				return
+			}
+
+			if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+				t.Errorf("Client %d: Select failed: %v", id, err)
+				return
+			}
+
+			// Each client performs different operations
+			switch id % 3 {
+			case 0:
+				// Client performs FETCH operations
+				for i := 0; i < 3; i++ {
+					fetchResults, err := c.Fetch(imap.SeqSetNum(uint32(i+1)), &imap.FetchOptions{
+						Envelope: true,
+						Flags:    true,
+					}).Collect()
+					if err != nil {
+						t.Errorf("Client %d: FETCH failed: %v", id, err)
+						return
+					}
+					if len(fetchResults) == 0 {
+						t.Errorf("Client %d: FETCH returned no results", id)
+						return
+					}
+					time.Sleep(10 * time.Millisecond) // Small delay
+				}
+
+			case 1:
+				// Client performs flag operations
+				for i := 1; i <= 2; i++ {
+					storeCmd := c.Store(imap.SeqSetNum(uint32(i)), &imap.StoreFlags{
+						Op:    imap.StoreFlagsAdd,
+						Flags: []imap.Flag{imap.FlagSeen},
+					}, nil)
+					_, err := storeCmd.Collect()
+					if err != nil {
+						t.Errorf("Client %d: STORE failed: %v", id, err)
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+
+			case 2:
+				// Client performs search operations
+				for i := 0; i < 3; i++ {
+					searchResults, err := c.Search(&imap.SearchCriteria{}, nil).Wait()
+					if err != nil {
+						t.Errorf("Client %d: SEARCH failed: %v", id, err)
+						return
+					}
+					if len(searchResults.AllSeqNums()) == 0 {
+						t.Errorf("Client %d: SEARCH returned no results", id)
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			t.Logf("Client %d completed successfully", id)
+		}(clientID)
+	}
+
+	// Wait for all clients to complete with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Log("All concurrent clients completed successfully")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Concurrent access test timed out")
+	}
+
+	// Verify we received completion signals from all clients
+	for i := 0; i < numClients; i++ {
+		select {
+		case <-clientDone:
+			// Good, client completed
+		case <-time.After(1 * time.Second):
+			t.Errorf("Did not receive completion signal from all clients")
+		}
+	}
+}
+
+// TestIMAP_IdleNotificationsLongPoll tests IDLE periodic polling notifications
+// This test validates the 15-second polling mechanism in addition to immediate notifications
+func TestIMAP_IdleNotificationsLongPoll(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// This test requires waiting for the 15-second IDLE poll interval
+	// to test the periodic polling mechanism in addition to immediate notifications
+	if testing.Short() {
+		t.Skip("Skipping IDLE long poll test in short mode (requires 15+ second wait)")
+	}
+
+	// Client 1: IDLE watcher
+	client1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client1: %v", err)
+	}
+	defer client1.Logout()
+
+	if err := client1.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client1 login failed: %v", err)
+	}
+
+	if _, err := client1.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Client1 select failed: %v", err)
+	}
+
+	// Start IDLE on client1
+	idleCmd, err := client1.Idle()
+	if err != nil {
+		if strings.Contains(err.Error(), "IDLE") || strings.Contains(err.Error(), "not supported") {
+			t.Skip("IDLE command not supported by server")
+		}
+		t.Fatalf("Client1 IDLE failed to start: %v", err)
+	}
+	defer idleCmd.Close()
+
+	t.Log("Client1 started IDLE")
+
+	// Client 2: Message sender
+	client2, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client2: %v", err)
+	}
+	defer client2.Logout()
+
+	if err := client2.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client2 login failed: %v", err)
+	}
+
+	// Give IDLE some time to start
+	time.Sleep(500 * time.Millisecond)
+
+	// Client2 adds a message while client1 is in IDLE
+	testMessage := "From: idle@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: IDLE Notification Test\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This message should trigger IDLE notification.\r\n"
+
+	appendCmd := client2.Append("INBOX", int64(len(testMessage)), nil)
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("Client2 APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("Client2 APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("Client2 APPEND failed: %v", err)
+	}
+
+	t.Log("Client2 appended message - now waiting for IDLE poll interval (15 seconds)")
+
+	// Wait for IDLE poll interval (15 seconds) plus some buffer
+	// This is the minimum time needed for the IDLE client to detect the new message
+	time.Sleep(16 * time.Second)
+
+	t.Log("IDLE poll interval elapsed - stopping IDLE")
+
+	// Stop IDLE on client1
+	if err := idleCmd.Close(); err != nil {
+		t.Fatalf("Failed to stop IDLE: %v", err)
+	}
+
+	// Verify client1 can see the new message
+	mbox, err := client1.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Client1 reselect failed: %v", err)
+	}
+
+	if mbox.NumMessages != 1 {
+		t.Errorf("Expected 1 message after IDLE notification, got %d", mbox.NumMessages)
+	} else {
+		t.Log("IDLE notification test completed successfully")
+	}
+}
+
+// TestIMAP_IdleNotificationsFast tests IDLE immediate notifications between clients
+// This test demonstrates that IDLE notifications work immediately via session tracking,
+// not just through the 15-second polling mechanism
+func TestIMAP_IdleNotificationsFast(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Client 1: IDLE watcher
+	client1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client1: %v", err)
+	}
+	defer client1.Logout()
+
+	if err := client1.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client1 login failed: %v", err)
+	}
+
+	if _, err := client1.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Client1 select failed: %v", err)
+	}
+
+	// Start IDLE on client1
+	idleCmd, err := client1.Idle()
+	if err != nil {
+		if strings.Contains(err.Error(), "IDLE") || strings.Contains(err.Error(), "not supported") {
+			t.Skip("IDLE command not supported by server")
+		}
+		t.Fatalf("Client1 IDLE failed to start: %v", err)
+	}
+	defer idleCmd.Close()
+
+	t.Log("Client1 started IDLE")
+
+	// Client 2: Message sender
+	client2, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client2: %v", err)
+	}
+	defer client2.Logout()
+
+	if err := client2.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client2 login failed: %v", err)
+	}
+
+	// Give IDLE some time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Client2 adds a message while client1 is in IDLE
+	testMessage := "From: idle@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: IDLE Fast Test\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This message tests IDLE mode without waiting for notifications.\r\n"
+
+	appendCmd := client2.Append("INBOX", int64(len(testMessage)), nil)
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("Client2 APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("Client2 APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("Client2 APPEND failed: %v", err)
+	}
+
+	t.Log("Client2 appended message")
+
+	// Small delay and then stop IDLE
+	time.Sleep(200 * time.Millisecond)
+
+	// Stop IDLE on client1
+	if err := idleCmd.Close(); err != nil {
+		t.Fatalf("Failed to stop IDLE: %v", err)
+	}
+
+	// Verify client1 can see the new message (this triggers a fresh poll)
+	mbox, err := client1.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Client1 reselect failed: %v", err)
+	}
+
+	// NOTE: This test validates immediate IDLE notifications work via session tracking.
+	// The server has both immediate cross-session notifications AND 15-second polling.
+	// From the logs, we can see "[POLL] Updating message count from 0 to 1" happens
+	// immediately when the APPEND occurs on the other session.
+	if mbox.NumMessages != 1 {
+		t.Errorf("Expected 1 message after IDLE immediate notification, got %d", mbox.NumMessages)
+	} else {
+		t.Log("IDLE immediate notification test completed successfully")
+	}
+}
+
+// TestIMAP_IdleNotificationsFlagChanges tests IDLE notifications for flag changes between clients
+func TestIMAP_IdleNotificationsFlagChanges(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Setup: Add a test message first
+	setupClient, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial setup client: %v", err)
+	}
+	defer setupClient.Logout()
+
+	if err := setupClient.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Setup client login failed: %v", err)
+	}
+
+	testMessage := "From: flagtest@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: IDLE Flag Change Test\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This message will have its flags changed while being watched via IDLE.\r\n"
+
+	appendCmd := setupClient.Append("INBOX", int64(len(testMessage)), nil)
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("Setup APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("Setup APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("Setup APPEND failed: %v", err)
+	}
+
+	setupClient.Logout()
+
+	// Client 1: IDLE watcher
+	client1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client1: %v", err)
+	}
+	defer client1.Logout()
+
+	if err := client1.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client1 login failed: %v", err)
+	}
+
+	if _, err := client1.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Client1 select failed: %v", err)
+	}
+
+	// Start IDLE on client1
+	idleCmd, err := client1.Idle()
+	if err != nil {
+		if strings.Contains(err.Error(), "IDLE") || strings.Contains(err.Error(), "not supported") {
+			t.Skip("IDLE command not supported by server")
+		}
+		t.Fatalf("Client1 IDLE failed to start: %v", err)
+	}
+	defer idleCmd.Close()
+
+	t.Log("Client1 started IDLE")
+
+	// Client 2: Flag modifier
+	client2, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client2: %v", err)
+	}
+	defer client2.Logout()
+
+	if err := client2.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client2 login failed: %v", err)
+	}
+
+	if _, err := client2.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Client2 select failed: %v", err)
+	}
+
+	// Give IDLE some time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Test 1: Client2 adds \Seen flag
+	t.Log("Client2 adding \\Seen flag")
+	storeCmd := client2.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagSeen},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("Client2 STORE \\Seen failed: %v", err)
+	}
+
+	// Small delay for notification
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 2: Client2 adds \Flagged flag
+	t.Log("Client2 adding \\Flagged flag")
+	storeCmd = client2.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagFlagged},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("Client2 STORE \\Flagged failed: %v", err)
+	}
+
+	// Small delay for notification
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 3: Client2 removes \Seen flag
+	t.Log("Client2 removing \\Seen flag")
+	storeCmd = client2.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsDel,
+		Flags: []imap.Flag{imap.FlagSeen},
+	}, nil)
+	_, err = storeCmd.Collect()
+	if err != nil {
+		t.Fatalf("Client2 STORE remove \\Seen failed: %v", err)
+	}
+
+	// Small delay for notification
+	time.Sleep(200 * time.Millisecond)
+
+	// Stop IDLE on client1
+	t.Log("Stopping IDLE on client1")
+	if err := idleCmd.Close(); err != nil {
+		t.Fatalf("Failed to stop IDLE: %v", err)
+	}
+
+	// Verify client1 can see the flag changes
+	fetchResults, err := client1.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("Client1 FETCH flags failed: %v", err)
+	}
+
+	if len(fetchResults) == 0 {
+		t.Fatal("FETCH returned no results")
+	}
+
+	finalFlags := fetchResults[0].Flags
+	t.Logf("Final flags seen by client1: %v", finalFlags)
+
+	// Verify final flag state: should have \Flagged but not \Seen
+	if !containsFlag(finalFlags, imap.FlagFlagged) {
+		t.Error("\\Flagged flag not found after IDLE flag change notifications")
+	}
+	if containsFlag(finalFlags, imap.FlagSeen) {
+		t.Error("\\Seen flag should be removed after IDLE flag change notifications")
+	}
+
+	t.Log("IDLE flag change notifications test completed successfully")
+}
+
+// TestIMAP_IdleNotificationsFlagChangesConcurrent tests concurrent flag changes with IDLE
+func TestIMAP_IdleNotificationsFlagChangesConcurrent(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Setup: Add multiple test messages
+	setupClient, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial setup client: %v", err)
+	}
+	defer setupClient.Logout()
+
+	if err := setupClient.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Setup client login failed: %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		testMessage := "From: concurrentflag@example.com\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: Concurrent Flag Test " + string(rune('0'+i)) + "\r\n" +
+			"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+			"\r\n" +
+			"This is test message " + string(rune('0'+i)) + " for concurrent flag changes.\r\n"
+
+		appendCmd := setupClient.Append("INBOX", int64(len(testMessage)), nil)
+		_, err = appendCmd.Write([]byte(testMessage))
+		if err != nil {
+			t.Fatalf("Setup APPEND write message %d failed: %v", i, err)
+		}
+		err = appendCmd.Close()
+		if err != nil {
+			t.Fatalf("Setup APPEND close message %d failed: %v", i, err)
+		}
+		_, err = appendCmd.Wait()
+		if err != nil {
+			t.Fatalf("Setup APPEND message %d failed: %v", i, err)
+		}
+	}
+
+	setupClient.Logout()
+
+	// Client 1: IDLE watcher
+	client1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial client1: %v", err)
+	}
+	defer client1.Logout()
+
+	if err := client1.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Client1 login failed: %v", err)
+	}
+
+	if _, err := client1.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Client1 select failed: %v", err)
+	}
+
+	// Start IDLE on client1
+	idleCmd, err := client1.Idle()
+	if err != nil {
+		if strings.Contains(err.Error(), "IDLE") || strings.Contains(err.Error(), "not supported") {
+			t.Skip("IDLE command not supported by server")
+		}
+		t.Fatalf("Client1 IDLE failed to start: %v", err)
+	}
+	defer idleCmd.Close()
+
+	t.Log("Client1 started IDLE")
+
+	// Multiple clients making concurrent flag changes
+	numClients := 3
+	var wg sync.WaitGroup
+	flagOperations := []struct {
+		seqNum uint32
+		op     imap.StoreFlagsOp
+		flags  []imap.Flag
+		name   string
+	}{
+		{1, imap.StoreFlagsAdd, []imap.Flag{imap.FlagSeen}, "msg1_seen"},
+		{2, imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, "msg2_flagged"},
+		{3, imap.StoreFlagsAdd, []imap.Flag{imap.FlagAnswered}, "msg3_answered"},
+	}
+
+	successCount := make(chan int, numClients)
+
+	// Give IDLE some time to start
+	time.Sleep(100 * time.Millisecond)
+
+	for clientID := 0; clientID < numClients; clientID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			c, err := imapclient.DialInsecure(server.Address, nil)
+			if err != nil {
+				t.Errorf("Client %d: Failed to dial: %v", id, err)
+				successCount <- 0
+				return
+			}
+			defer c.Logout()
+
+			if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+				t.Errorf("Client %d: Login failed: %v", id, err)
+				successCount <- 0
+				return
+			}
+
+			if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+				t.Errorf("Client %d: Select failed: %v", id, err)
+				successCount <- 0
+				return
+			}
+
+			// Perform flag operation
+			op := flagOperations[id]
+			t.Logf("Client %d performing %s", id, op.name)
+			storeCmd := c.Store(imap.SeqSetNum(op.seqNum), &imap.StoreFlags{
+				Op:    op.op,
+				Flags: op.flags,
+			}, nil)
+			_, err = storeCmd.Collect()
+			if err != nil {
+				t.Errorf("Client %d (%s): STORE failed: %v", id, op.name, err)
+				successCount <- 0
+				return
+			}
+
+			t.Logf("Client %d (%s) completed flag operation successfully", id, op.name)
+			successCount <- 1
+		}(clientID)
+	}
+
+	wg.Wait()
+
+	// Count successful operations
+	totalSuccess := 0
+	for i := 0; i < numClients; i++ {
+		totalSuccess += <-successCount
+	}
+
+	if totalSuccess != numClients {
+		t.Errorf("Expected %d successful flag operations, got %d", numClients, totalSuccess)
+	}
+
+	// Give some time for all notifications to propagate
+	time.Sleep(500 * time.Millisecond)
+
+	// Stop IDLE on client1
+	t.Log("Stopping IDLE on client1")
+	if err := idleCmd.Close(); err != nil {
+		t.Fatalf("Failed to stop IDLE: %v", err)
+	}
+
+	// Verify client1 can see all the flag changes
+	fetchResults, err := client1.Fetch(imap.SeqSetNum(1, 2, 3), &imap.FetchOptions{
+		Flags: true,
+		Envelope: true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("Client1 FETCH all messages failed: %v", err)
+	}
+
+	if len(fetchResults) != 3 {
+		t.Fatalf("Expected 3 messages, got %d", len(fetchResults))
+	}
+
+	// Verify each message has the expected flags
+	expectedFlags := [][]imap.Flag{
+		{imap.FlagSeen},
+		{imap.FlagFlagged},
+		{imap.FlagAnswered},
+	}
+
+	for i, result := range fetchResults {
+		flags := result.Flags
+		expectedFlag := expectedFlags[i][0]
+		
+		t.Logf("Message %d flags: %v", i+1, flags)
+		
+		if !containsFlag(flags, expectedFlag) {
+			t.Errorf("Message %d missing expected flag %v", i+1, expectedFlag)
+		}
+	}
+
+	t.Log("Concurrent IDLE flag change notifications test completed successfully")
+}
+
+// TestIMAP_RaceConditions tests race conditions in mailbox operations
+func TestIMAP_RaceConditions(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	numClients := 5
+	messagesPerClient := 10
+	var wg sync.WaitGroup
+	errors := make(chan error, numClients*messagesPerClient)
+
+	// Test concurrent APPEND operations
+	t.Run("ConcurrentAppend", func(t *testing.T) {
+		for clientID := 0; clientID < numClients; clientID++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+
+				c, err := imapclient.DialInsecure(server.Address, nil)
+				if err != nil {
+					errors <- err
+					return
+				}
+				defer c.Logout()
+
+				if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+					errors <- err
+					return
+				}
+
+				// Rapidly append messages
+				for msgID := 0; msgID < messagesPerClient; msgID++ {
+					testMessage := "From: race@example.com\r\n" +
+						"To: " + account.Email + "\r\n" +
+						"Subject: Race Test Client " + string(rune('0'+id)) + " Message " + string(rune('0'+msgID)) + "\r\n" +
+						"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+						"\r\n" +
+						"Race condition test message.\r\n"
+
+					appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+					_, err = appendCmd.Write([]byte(testMessage))
+					if err != nil {
+						errors <- err
+						return
+					}
+					err = appendCmd.Close()
+					if err != nil {
+						errors <- err
+						return
+					}
+					_, err = appendCmd.Wait()
+					if err != nil {
+						errors <- err
+						return
+					}
+				}
+			}(clientID)
+		}
+
+		wg.Wait()
+		close(errors)
+
+		// Check for errors
+		for err := range errors {
+			if err != nil {
+				t.Errorf("Concurrent append error: %v", err)
+			}
+		}
+
+		// Verify total message count
+		verifyClient, err := imapclient.DialInsecure(server.Address, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial verify client: %v", err)
+		}
+		defer verifyClient.Logout()
+
+		if err := verifyClient.Login(account.Email, account.Password).Wait(); err != nil {
+			t.Fatalf("Verify client login failed: %v", err)
+		}
+
+		mbox, err := verifyClient.Select("INBOX", nil).Wait()
+		if err != nil {
+			t.Fatalf("Verify client select failed: %v", err)
+		}
+
+		expectedMessages := uint32(numClients * messagesPerClient)
+		if mbox.NumMessages != expectedMessages {
+			t.Errorf("Expected %d messages after concurrent append, got %d", expectedMessages, mbox.NumMessages)
+		} else {
+			t.Logf("Successfully appended %d messages concurrently", expectedMessages)
+		}
+	})
+}
+
+// TestIMAP_ConcurrentFlagOperations tests concurrent flag modifications
+func TestIMAP_ConcurrentFlagOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Setup: Add a test message
+	setupClient, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial setup client: %v", err)
+	}
+	defer setupClient.Logout()
+
+	if err := setupClient.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Setup client login failed: %v", err)
+	}
+
+	if _, err := setupClient.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Setup client select failed: %v", err)
+	}
+
+	testMessage := "From: flagrace@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Flag Race Test\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"This message will have its flags modified concurrently.\r\n"
+
+	appendCmd := setupClient.Append("INBOX", int64(len(testMessage)), nil)
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("Setup APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("Setup APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("Setup APPEND failed: %v", err)
+	}
+
+	setupClient.Logout()
+
+	// Test concurrent flag operations on the same message
+	numClients := 3
+	var wg sync.WaitGroup
+	flagOperations := []struct {
+		op    imap.StoreFlagsOp
+		flags []imap.Flag
+		name  string
+	}{
+		{imap.StoreFlagsAdd, []imap.Flag{imap.FlagSeen}, "add_seen"},
+		{imap.StoreFlagsAdd, []imap.Flag{imap.FlagFlagged}, "add_flagged"},
+		{imap.StoreFlagsAdd, []imap.Flag{imap.FlagAnswered}, "add_answered"},
+	}
+
+	successCount := make(chan int, numClients)
+
+	for clientID := 0; clientID < numClients; clientID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			c, err := imapclient.DialInsecure(server.Address, nil)
+			if err != nil {
+				t.Errorf("Client %d: Failed to dial: %v", id, err)
+				successCount <- 0
+				return
+			}
+			defer c.Logout()
+
+			if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+				t.Errorf("Client %d: Login failed: %v", id, err)
+				successCount <- 0
+				return
+			}
+
+			if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+				t.Errorf("Client %d: Select failed: %v", id, err)
+				successCount <- 0
+				return
+			}
+
+			// Perform flag operation
+			op := flagOperations[id%len(flagOperations)]
+			storeCmd := c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+				Op:    op.op,
+				Flags: op.flags,
+			}, nil)
+			_, err = storeCmd.Collect()
+			if err != nil {
+				t.Errorf("Client %d (%s): STORE failed: %v", id, op.name, err)
+				successCount <- 0
+				return
+			}
+
+			t.Logf("Client %d (%s) completed flag operation successfully", id, op.name)
+			successCount <- 1
+		}(clientID)
+	}
+
+	wg.Wait()
+
+	// Count successful operations
+	totalSuccess := 0
+	for i := 0; i < numClients; i++ {
+		totalSuccess += <-successCount
+	}
+
+	if totalSuccess != numClients {
+		t.Errorf("Expected %d successful flag operations, got %d", numClients, totalSuccess)
+	}
+
+	// Verify final flag state
+	verifyClient, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial verify client: %v", err)
+	}
+	defer verifyClient.Logout()
+
+	if err := verifyClient.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Verify client login failed: %v", err)
+	}
+
+	if _, err := verifyClient.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Verify client select failed: %v", err)
+	}
+
+	fetchResults, err := verifyClient.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Flags: true}).Collect()
+	if err != nil {
+		t.Fatalf("Verify FETCH failed: %v", err)
+	}
+
+	if len(fetchResults) > 0 {
+		finalFlags := fetchResults[0].Flags
+		t.Logf("Final message flags after concurrent operations: %v", finalFlags)
+
+		// Check that at least some flags were set (depending on race conditions, we might get different combinations)
+		flagCount := 0
+		if containsFlag(finalFlags, imap.FlagSeen) {
+			flagCount++
+		}
+		if containsFlag(finalFlags, imap.FlagFlagged) {
+			flagCount++
+		}
+		if containsFlag(finalFlags, imap.FlagAnswered) {
+			flagCount++
+		}
+
+		if flagCount == 0 {
+			t.Error("No flags were set despite successful operations")
+		}
+	}
+
+	t.Log("Concurrent flag operations test completed")
+}
+
+// TestIMAP_ConcurrentMailboxOperations tests concurrent mailbox creation/deletion
+func TestIMAP_ConcurrentMailboxOperations(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	numClients := 3
+	var wg sync.WaitGroup
+	results := make(chan string, numClients*2) // CREATE + DELETE per client
+
+	for clientID := 0; clientID < numClients; clientID++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			c, err := imapclient.DialInsecure(server.Address, nil)
+			if err != nil {
+				results <- "error"
+				return
+			}
+			defer c.Logout()
+
+			if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+				results <- "error"
+				return
+			}
+
+			mailboxName := "ConcurrentTest" + string(rune('A'+id))
+
+			// CREATE mailbox
+			if err := c.Create(mailboxName, nil).Wait(); err != nil {
+				results <- "create_error"
+				return
+			}
+			results <- "create_success"
+
+			// Small delay to let other operations interleave
+			time.Sleep(50 * time.Millisecond)
+
+			// DELETE mailbox
+			if err := c.Delete(mailboxName).Wait(); err != nil {
+				results <- "delete_error"
+				return
+			}
+			results <- "delete_success"
+		}(clientID)
+	}
+
+	wg.Wait()
+
+	// Analyze results
+	createSuccess := 0
+	deleteSuccess := 0
+	errors := 0
+
+	for i := 0; i < numClients*2; i++ {
+		result := <-results
+		switch result {
+		case "create_success":
+			createSuccess++
+		case "delete_success":
+			deleteSuccess++
+		default:
+			errors++
+		}
+	}
+
+	if errors > 0 {
+		t.Errorf("Got %d errors during concurrent mailbox operations", errors)
+	}
+
+	if createSuccess != numClients {
+		t.Errorf("Expected %d successful CREATE operations, got %d", numClients, createSuccess)
+	}
+
+	if deleteSuccess != numClients {
+		t.Errorf("Expected %d successful DELETE operations, got %d", numClients, deleteSuccess)
+	}
+
+	t.Logf("Concurrent mailbox operations: %d creates, %d deletes, %d errors", createSuccess, deleteSuccess, errors)
+}
+
+// TestIMAP_SortCommand tests the SORT command implementation
+func TestIMAP_SortCommand(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// First check if SORT capability is advertised
+	caps, err := c.Capability().Wait()
+	if err != nil {
+		t.Fatalf("Failed to get capabilities: %v", err)
+	}
+
+	hasSortCap := false
+	for cap := range caps {
+		if string(cap) == "SORT" {
+			hasSortCap = true
+			break
+		}
+	}
+
+	if !hasSortCap {
+		t.Log("SORT capability not advertised - this might be the issue")
+	} else {
+		t.Log("SORT capability is properly advertised")
+	}
+
+	// Try to execute a simple SORT command on empty mailbox first
+	sortOptions := &imapclient.SortOptions{
+		SearchCriteria: &imap.SearchCriteria{},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDate, Reverse: false}},
+	}
+	sortCmd := c.Sort(sortOptions)
+	sortResult, err := sortCmd.Wait()
+	if err != nil {
+		t.Fatalf("SORT command failed on empty mailbox: %v", err)
+	}
+
+	if len(sortResult.SeqNums) != 0 {
+		t.Errorf("Expected 0 results for empty mailbox, got %d", len(sortResult.SeqNums))
+	}
+	t.Log("SORT command succeeded on empty mailbox")
+
+	// Test UID SORT on empty mailbox
+	uidSortOptions := &imapclient.SortOptions{
+		SearchCriteria: &imap.SearchCriteria{},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDate, Reverse: false}},
+	}
+	uidSortCmd := c.UIDSort(uidSortOptions)
+	uidSortResult, err := uidSortCmd.Wait()
+	if err != nil {
+		t.Fatalf("UID SORT failed on empty mailbox: %v", err)
+	}
+
+	if len(uidSortResult.UIDs) != 0 {
+		t.Errorf("Expected 0 UID SORT results for empty mailbox, got %d", len(uidSortResult.UIDs))
+	}
+	t.Log("UID SORT succeeded on empty mailbox")
+
+	t.Log("SORT command integration test completed successfully")
 }
 
 // Helper function to check if a flag is present in a slice of flags

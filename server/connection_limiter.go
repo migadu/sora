@@ -103,10 +103,10 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 		perIP = ipCounter.Add(1)
 
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: %d/%d",
+		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, %d/%d from this IP",
 			cl.protocol, ip, total, cl.maxConnections, perIP, cl.maxPerIP)
 	} else {
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Total: %d/%d, IP: unlimited",
+		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, unlimited from this IP",
 			cl.protocol, ip, total, cl.maxConnections)
 	}
 
@@ -126,10 +126,10 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 				cl.mu.Unlock()
 			}
 
-			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: %d",
+			log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, %d from this IP",
 				cl.protocol, ip, cl.currentTotal.Load(), remaining)
 		} else {
-			log.Printf("[%s-LIMITER] Connection released from %s - Total: %d, IP: unlimited",
+			log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, unlimited from this IP",
 				cl.protocol, ip, cl.currentTotal.Load())
 		}
 	}, nil
