@@ -703,6 +703,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
 		Debug:                serverConfig.Debug,
 		MaxScriptSize:        maxSize,
+		SupportedExtensions:  serverConfig.SupportedExtensions,
 		MasterSASLUsername:   serverConfig.MasterSASLUsername,
 		MasterSASLPassword:   serverConfig.MasterSASLPassword,
 		MaxConnections:       serverConfig.MaxConnections,

@@ -16,8 +16,8 @@ github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ3
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20 h1:6IgUZs9K6HT2WStg7HF01m6innJXSr9vZ+rFDFaG0Ao=
-github.com/dejanstrbac/go-smtp v0.0.0-20250921084656-e176e81bae20/go.mod h1:ZtRRkbTyp2XTHCA+BmyTFTrj8xY4I+b4McvHxCU2gsQ=
+github.com/dejanstrbac/go-smtp v0.0.0-20250924085942-8257c76f9245 h1:63pZcy3MOWv/IzQYvCXoBSYzY7O2Mnh+6zdGsZ7iB3c=
+github.com/dejanstrbac/go-smtp v0.0.0-20250924085942-8257c76f9245/go.mod h1:ZtRRkbTyp2XTHCA+BmyTFTrj8xY4I+b4McvHxCU2gsQ=
 github.com/dhui/dktest v0.4.6 h1:+DPKyScKSEp3VLtbMDHcUq6V5Lm5zfZZVb0Sk7Ahom4=
 github.com/dhui/dktest v0.4.6/go.mod h1:JHTSYDtKkvFNFHJKqCzVzqXecyv+tKt8EzceOmQOgbU=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
@@ -94,8 +94,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/migadu/go-imap/v2 v2.0.0-20250923191551-b4c173e22ac3 h1:CaSDscxtpg413FqjGh2lRz79sQqeh6Son72VhKPkkMA=
 github.com/migadu/go-imap/v2 v2.0.0-20250923191551-b4c173e22ac3/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
-github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25 h1:Oxwm8edsPKTTbEawtsF1TZrk7JcCR3Wwh+9ZVJPvnqw=
-github.com/migadu/go-sieve v0.0.0-20250609093216-f0c5e6465a25/go.mod h1:2r/4pcAuXiYsV2xkGw/Uybwz7ZoS4eOuz3vuqM4eTyg=
+github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43 h1:/07M1CWNcis7nhsnt7N2eWGIdPZue3YfCrKxXmVOFTw=
+github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43/go.mod h1:XykjlGKeykHsZKfFBDlmJiFbbQT+6Li9iUNNuZQNqxg=
 github.com/minio/crc64nvme v1.0.1 h1:DHQPrYPdqK7jQG/Ls5CTBZWeex/2FMS3G5XGkycuFrY=
 github.com/minio/crc64nvme v1.0.1/go.mod h1:eVfm2fAzLlxMdUGc0EEBGSMmPwmXD5XiNRpnu9J3bvg=
 github.com/minio/md5-simd v1.1.2 h1:Gdi1DZK69+ZVMoNHRXJyNcxrMA4dSxoYHZSQbirFg34=

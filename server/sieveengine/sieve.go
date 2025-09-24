@@ -69,9 +69,16 @@ type SieveExecutor struct {
 // or for contexts like syntax validation where policy interaction is minimal or doesn't require user context.
 // For scripts that may use vacation with persistence, use NewSieveExecutorWithOracle.
 func NewSieveExecutor(scriptContent string) (Executor, error) {
+	return NewSieveExecutorWithExtensions(scriptContent, nil)
+}
+
+// NewSieveExecutorWithExtensions creates a new SieveExecutor with the given script content and enabled extensions.
+// If enabledExtensions is nil, all extensions are allowed (backward compatible).
+func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []string) (Executor, error) {
 	// Load the script
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
+	options.EnabledExtensions = enabledExtensions
 	script, err := sieve.Load(scriptReader, options)
 	if err != nil {
 		return nil, err
@@ -85,10 +92,16 @@ func NewSieveExecutor(scriptContent string) (Executor, error) {
 	}, nil
 }
 
-// NewSieveExecutor creates a new SieveExecutor with the given script content, userID, and vacation oracle.
+// NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, userID, and vacation oracle.
 func NewSieveExecutorWithOracle(scriptContent string, userID int64, oracle VacationOracle) (Executor, error) {
+	return NewSieveExecutorWithOracleAndExtensions(scriptContent, userID, oracle, nil)
+}
+
+// NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, userID, vacation oracle, and enabled extensions.
+func NewSieveExecutorWithOracleAndExtensions(scriptContent string, userID int64, oracle VacationOracle, enabledExtensions []string) (Executor, error) {
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
+	options.EnabledExtensions = enabledExtensions
 	script, err := sieve.Load(scriptReader, options)
 	if err != nil {
 		return nil, err

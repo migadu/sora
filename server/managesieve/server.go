@@ -20,18 +20,19 @@ import (
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
 type ManageSieveServer struct {
-	addr               string
-	name               string
-	hostname           string
-	rdb                *resilient.ResilientDatabase
-	appCtx             context.Context
-	cancel             context.CancelFunc
-	tlsConfig          *tls.Config
-	useStartTLS        bool
-	insecureAuth       bool
-	maxScriptSize      int64
-	masterSASLUsername []byte
-	masterSASLPassword []byte
+	addr                string
+	name                string
+	hostname            string
+	rdb                 *resilient.ResilientDatabase
+	appCtx              context.Context
+	cancel              context.CancelFunc
+	tlsConfig           *tls.Config
+	useStartTLS         bool
+	insecureAuth        bool
+	maxScriptSize       int64
+	supportedExtensions []string // List of supported Sieve extensions
+	masterSASLUsername  []byte
+	masterSASLPassword  []byte
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -56,6 +57,7 @@ type ManageSieveServerOptions struct {
 	TLSVerify            bool
 	TLSUseStartTLS       bool
 	MaxScriptSize        int64
+	SupportedExtensions  []string // List of supported Sieve extensions
 	MasterSASLUsername   string
 	MasterSASLPassword   string
 	MaxConnections       int
@@ -94,21 +96,27 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	serverInstance := &ManageSieveServer{
-		hostname:           hostname,
-		name:               name,
-		addr:               addr,
-		rdb:                rdb,
-		appCtx:             serverCtx,
-		cancel:             serverCancel,
-		useStartTLS:        options.TLSUseStartTLS,
-		insecureAuth:       options.InsecureAuth,
-		maxScriptSize:      options.MaxScriptSize,
-		masterSASLUsername: []byte(options.MasterSASLUsername),
-		masterSASLPassword: []byte(options.MasterSASLPassword),
-		limiter:            server.NewConnectionLimiter("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP),
-		proxyReader:        proxyReader,
-		authLimiter:        authLimiter,
+		hostname:            hostname,
+		name:                name,
+		addr:                addr,
+		rdb:                 rdb,
+		appCtx:              serverCtx,
+		cancel:              serverCancel,
+		useStartTLS:         options.TLSUseStartTLS,
+		insecureAuth:        options.InsecureAuth,
+		maxScriptSize:       options.MaxScriptSize,
+		supportedExtensions: options.SupportedExtensions,
+		masterSASLUsername:  []byte(options.MasterSASLUsername),
+		masterSASLPassword:  []byte(options.MasterSASLPassword),
+		proxyReader:         proxyReader,
+		authLimiter:         authLimiter,
 	}
+
+	// No default extensions - only use what's explicitly configured
+
+	// Create connection limiter with trusted networks from proxy configuration
+	trustedProxies := server.GetTrustedProxiesForServer(serverInstance.proxyReader)
+	serverInstance.limiter = server.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
 
 	// Set up TLS config if TLS is enabled and certificates are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {

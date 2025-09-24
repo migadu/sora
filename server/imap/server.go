@@ -195,7 +195,6 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		cache:              cache,
 		appendLimit:        options.AppendLimit,
 		ftsRetention:       options.FTSRetention,
-		limiter:            serverPkg.NewConnectionLimiter("IMAP", options.MaxConnections, options.MaxConnectionsPerIP),
 		authLimiter:        authLimiter,
 		proxyReader:        proxyReader,
 		enableWarmup:       options.EnableWarmup,
@@ -228,6 +227,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterSASLUsername: options.MasterSASLUsername,
 		masterSASLPassword: options.MasterSASLPassword,
 	}
+
+	// Create connection limiter with trusted networks from proxy configuration
+	trustedProxies := serverPkg.GetTrustedProxiesForServer(s.proxyReader)
+	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
 
 	if s.appendLimit > 0 {
 		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
@@ -566,23 +569,4 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 	}
 
 	return nil
-}
-
-// getTrustedProxies returns the list of trusted proxy CIDR blocks for parameter forwarding
-func (s *IMAPServer) getTrustedProxies() []string {
-	if s.proxyReader != nil {
-		// Get trusted proxies from PROXY protocol configuration
-		// Access the configuration from the ProxyProtocolReader
-		// Note: This assumes the ProxyProtocolReader has access to the config
-		// For now, we'll use default safe values that match PROXY protocol defaults
-	}
-
-	// Return default trusted proxy networks (RFC1918 private networks + localhost)
-	// These are safe defaults that match the PROXY protocol configuration
-	return []string{
-		"127.0.0.0/8",    // localhost
-		"10.0.0.0/8",     // RFC1918 private networks
-		"172.16.0.0/12",  // RFC1918 private networks
-		"192.168.0.0/16", // RFC1918 private networks
-	}
 }

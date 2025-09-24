@@ -8,3 +8,4 @@ sora
 sora-admin
 !sora/
 !sora-admin/
+vendor/

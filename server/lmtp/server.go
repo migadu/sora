@@ -101,16 +101,20 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		externalRelay: options.ExternalRelay,
 		debug:         options.Debug,
 		ftsRetention:  options.FTSRetention,
-		limiter:       server.NewConnectionLimiter("LMTP", options.MaxConnections, options.MaxConnectionsPerIP),
 		proxyReader:   proxyReader,
 	}
+
+	// Create connection limiter with trusted networks from proxy configuration
+	limiterTrustedProxies := server.GetTrustedProxiesForServer(backend.proxyReader)
+	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", options.MaxConnections, options.MaxConnectionsPerIP, limiterTrustedProxies)
 
 	// Initialize Sieve script cache with a reasonable default size and TTL
 	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
 	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute)
 
 	// Parse and cache the default Sieve script at startup
-	defaultExecutor, err := sieveengine.NewSieveExecutor(defaultSieveScript)
+	// The default script uses fileinto extension, so we need to allow it
+	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, []string{"fileinto"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}
@@ -144,6 +148,10 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 	// Configure XCLIENT support (always enabled)
 	s.EnableXCLIENT = true
+
+	// Configure XRCPTFORWARD support (always enabled)
+	// Enable custom RCPT TO parameters like XRCPTFORWARD
+	s.EnableRCPTExtensions = true
 
 	// Set trusted networks for XCLIENT using global trusted networks
 	var trustedProxies []string
@@ -396,23 +404,4 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
 	return c.proxyInfo
-}
-
-// getTrustedProxies returns the list of trusted proxy CIDR blocks for parameter forwarding
-func (b *LMTPServerBackend) getTrustedProxies() []string {
-	if b.proxyReader != nil {
-		// Get trusted proxies from PROXY protocol configuration
-		// Access the configuration from the ProxyProtocolReader
-		// Note: This assumes the ProxyProtocolReader has access to the config
-		// For now, we'll use default safe values that match PROXY protocol defaults
-	}
-
-	// Return default trusted proxy networks (RFC1918 private networks + localhost)
-	// These are safe defaults that match the PROXY protocol configuration
-	return []string{
-		"127.0.0.0/8",    // localhost
-		"10.0.0.0/8",     // RFC1918 private networks
-		"172.16.0.0/12",  // RFC1918 private networks
-		"192.168.0.0/16", // RFC1918 private networks
-	}
 }

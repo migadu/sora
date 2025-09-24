@@ -12,7 +12,7 @@ import (
 // XCLIENT implements the smtp.XCLIENTBackend interface for full XCLIENT support
 // This method is called by the go-smtp library when an XCLIENT command is received
 func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) error {
-	s.Log("[XCLIENT] Processing XCLIENT command with %d attributes", len(attrs))
+	s.Log("[XCLIENT] *** XCLIENT METHOD CALLED *** Backend received XCLIENT command with %d attributes: %+v", len(attrs), attrs)
 
 	// Check if connection is from trusted proxy
 	if !s.isFromTrustedProxy() {
@@ -83,9 +83,17 @@ func (s *LMTPSession) isFromTrustedProxy() bool {
 	// Get the underlying network connection through the SMTP connection
 	netConn := s.conn.Conn()
 
-	// Get trusted proxies configuration from server PROXY protocol config
-	// This reuses the same trusted network logic as PROXY protocol
-	trustedProxies := s.backend.getTrustedProxies()
+	// First try to get trusted proxies from PROXY protocol config
+	var trustedProxies []string
+	if s.backend.proxyReader != nil {
+		trustedProxies = server.GetTrustedProxiesForServer(s.backend.proxyReader)
+	} else {
+		// If PROXY protocol is disabled, use the server's own trusted networks
+		// Convert trusted networks back to string format for compatibility
+		for _, network := range s.backend.trustedNetworks {
+			trustedProxies = append(trustedProxies, network.String())
+		}
+	}
 
 	return server.IsTrustedForwarding(netConn, trustedProxies)
 }
@@ -126,6 +134,19 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 	// Merge variables into existing forwarding parameters
 	for key, value := range forwardParams.Variables {
 		s.ForwardingParams.Variables[key] = value
+	}
+
+	// Update session proxy information like XCLIENT does
+	// Check if we have proxy information in the forwarding parameters
+	if proxyIP, exists := forwardParams.Variables["proxy"]; exists && proxyIP != "" {
+		// If s.ProxyIP is not set, the current s.RemoteIP is the proxy's IP
+		if s.ProxyIP == "" && s.RemoteIP != "" {
+			s.ProxyIP = s.RemoteIP
+		}
+		// Don't update s.RemoteIP for XRCPTFORWARD, unlike XCLIENT
+		// XRCPTFORWARD is per-recipient forwarding, not session-level IP forwarding
+
+		s.Log("[RCPT] XRCPTFORWARD set proxy information: proxy=%s", proxyIP)
 	}
 
 	s.Log("[RCPT] Processed XRCPTFORWARD parameters: %d variables", len(forwardParams.Variables))

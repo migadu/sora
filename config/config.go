@@ -556,6 +556,7 @@ type ManageSieveServerConfig struct {
 	MaxConnections      int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MaxScriptSize       string                `toml:"max_script_size"`
+	SupportedExtensions []string              `toml:"supported_extensions"` // List of supported Sieve extensions
 	InsecureAuth        bool                  `toml:"insecure_auth"`
 	MasterSASLUsername  string                `toml:"master_sasl_username"`
 	MasterSASLPassword  string                `toml:"master_sasl_password"`
@@ -738,8 +739,9 @@ type ServerConfig struct {
 	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
 
 	// ManageSieve specific
-	MaxScriptSize string `toml:"max_script_size,omitempty"`
-	InsecureAuth  bool   `toml:"insecure_auth,omitempty"`
+	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions
+	InsecureAuth        bool     `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific
 	RemoteAddrs            []string    `toml:"remote_addrs,omitempty"`
@@ -871,7 +873,7 @@ func NewDefaultConfig() Config {
 			WarmupAsync:        true,
 		},
 		Servers: ServersConfig{
-			TrustedNetworks: []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+			TrustedNetworks: []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"},
 			IMAP: IMAPServerConfig{
 				Start:               true,
 				Addr:                ":143",

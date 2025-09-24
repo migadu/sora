@@ -20,7 +20,12 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 
 	// Add proxy-specific information
 	forwardingParams.SessionID = s.generateSessionID()
-	forwardingParams.Protocol = "LMTP"
+	// Use ESMTP for PROTO parameter as per Postfix XCLIENT spec (valid values: SMTP, ESMTP)
+	forwardingParams.Protocol = "ESMTP"
+
+	// Don't set ProxyTTL for LMTP XCLIENT since it's not commonly supported
+	// and causes "501 Bad command" errors with standard LMTP servers
+	forwardingParams.ProxyTTL = 0
 	forwardingParams.Variables["proxy-server"] = s.server.hostname
 	if s.username != "" {
 		forwardingParams.Variables["proxy-user"] = s.username
@@ -37,6 +42,11 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 
 	// Send XCLIENT command to backend
 	xclientCommand := fmt.Sprintf("XCLIENT %s\r\n", xclientParams)
+
+	// Debug: Log the exact command being sent
+	log.Printf("[LMTP Proxy] Sending XCLIENT command to backend: %q", strings.TrimRight(xclientCommand, "\r\n"))
+	log.Printf("[LMTP Proxy] XCLIENT command bytes: %v", []byte(xclientCommand))
+	log.Printf("[LMTP Proxy] XCLIENT parameters breakdown: %+v", forwardingParams)
 
 	if _, err := writer.WriteString(xclientCommand); err != nil {
 		return fmt.Errorf("failed to write XCLIENT command: %v", err)
@@ -66,8 +76,40 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 
 	response = strings.TrimRight(response, "\r\n")
 
+	// Debug: Log the exact response received
+	log.Printf("[LMTP Proxy] Received XCLIENT response from backend: %q", response)
+
 	if strings.HasPrefix(response, "250") {
 		log.Printf("[LMTP Proxy] XCLIENT forwarding completed successfully for %s: %s", s.username, xclientParams)
+	} else if strings.HasPrefix(response, "220") {
+		// XCLIENT succeeded - server reset session and sent new greeting
+		log.Printf("[LMTP Proxy] XCLIENT accepted, server reset session with new greeting: %s", response)
+
+		// After XCLIENT, the session resets and we need to send LHLO again
+		lhloCommand := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
+		if _, err := writer.WriteString(lhloCommand); err != nil {
+			return fmt.Errorf("failed to write LHLO after XCLIENT: %v", err)
+		}
+		if err := writer.Flush(); err != nil {
+			return fmt.Errorf("failed to flush LHLO after XCLIENT: %v", err)
+		}
+
+		// Read LHLO response lines until we get the final one (without "-")
+		for {
+			lhloResponse, err := reader.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("failed to read LHLO response after XCLIENT: %v", err)
+			}
+			lhloResponse = strings.TrimRight(lhloResponse, "\r\n")
+			log.Printf("[LMTP Proxy] Backend LHLO after XCLIENT response: %s", lhloResponse)
+
+			// Check if this is the final response line (doesn't have "-" after status code)
+			if len(lhloResponse) >= 3 && lhloResponse[3] != '-' {
+				break
+			}
+		}
+
+		log.Printf("[LMTP Proxy] XCLIENT forwarding and session reset completed successfully for %s", s.username)
 	} else if strings.HasPrefix(response, "550") || strings.HasPrefix(response, "5") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {

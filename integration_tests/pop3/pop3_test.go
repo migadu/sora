@@ -4,14 +4,47 @@ package pop3_test
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 )
+
+// LogCapture helps capture log output for verification
+type LogCapture struct {
+	original *os.File
+	buffer   *bytes.Buffer
+}
+
+// NewLogCapture creates a new log capture that redirects standard log output to a buffer
+func NewLogCapture() *LogCapture {
+	lc := &LogCapture{
+		original: os.Stderr,
+		buffer:   &bytes.Buffer{},
+	}
+
+	// Redirect log output to our buffer
+	log.SetOutput(lc.buffer)
+	return lc
+}
+
+// Stop restores the original log output and returns captured logs
+func (lc *LogCapture) Stop() string {
+	log.SetOutput(lc.original)
+	return lc.buffer.String()
+}
+
+// ContainsProxyLog checks if the captured logs contain proxy= entries
+func (lc *LogCapture) ContainsProxyLog() bool {
+	logs := lc.buffer.String()
+	return strings.Contains(logs, "proxy=")
+}
 
 // POP3Client provides a simple POP3 client for testing
 type POP3Client struct {
@@ -97,6 +130,17 @@ func TestPOP3_BasicConnection(t *testing.T) {
 func TestPOP3_UserPass(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
+	// Start log capture to verify no proxy= entries (direct backend connection)
+	logCapture := NewLogCapture()
+	defer func() {
+		logs := logCapture.Stop()
+		if strings.Contains(logs, "proxy=") {
+			t.Errorf("Expected NO 'proxy=' entries in logs for direct backend connection, but found some. Logs:\n%s", logs)
+		} else {
+			t.Log("✓ Verified no 'proxy=' entries in logs for direct backend connection")
+		}
+	}()
+
 	server, account := common.SetupPOP3Server(t)
 	defer server.Close()
 
@@ -135,6 +179,17 @@ func TestPOP3_UserPass(t *testing.T) {
 
 func TestPOP3_InvalidLogin(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
+
+	// Start log capture to verify no proxy= entries (direct backend connection)
+	logCapture := NewLogCapture()
+	defer func() {
+		logs := logCapture.Stop()
+		if strings.Contains(logs, "proxy=") {
+			t.Errorf("Expected NO 'proxy=' entries in logs for direct backend connection, but found some. Logs:\n%s", logs)
+		} else {
+			t.Log("✓ Verified no 'proxy=' entries in logs for direct backend connection")
+		}
+	}()
 
 	server, account := common.SetupPOP3Server(t)
 	defer server.Close()

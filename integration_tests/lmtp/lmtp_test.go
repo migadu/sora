@@ -4,14 +4,53 @@ package lmtp_test
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"log"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 )
+
+// LogCapture captures log output for verification
+type LogCapture struct {
+	buffer *bytes.Buffer
+	writer io.Writer
+	oldLog *log.Logger
+	oldOut io.Writer
+}
+
+func NewLogCapture() *LogCapture {
+	buffer := &bytes.Buffer{}
+	writer := io.MultiWriter(os.Stderr, buffer)
+
+	// Save old settings
+	oldOut := log.Writer()
+	oldLog := log.New(oldOut, "", log.LstdFlags)
+
+	// Set new logger to capture output
+	log.SetOutput(writer)
+
+	return &LogCapture{
+		buffer: buffer,
+		writer: writer,
+		oldLog: oldLog,
+		oldOut: oldOut,
+	}
+}
+
+func (lc *LogCapture) GetOutput() string {
+	return lc.buffer.String()
+}
+
+func (lc *LogCapture) Close() {
+	log.SetOutput(lc.oldOut)
+}
 
 // LMTPClient provides a simple LMTP client for testing
 type LMTPClient struct {
@@ -146,6 +185,10 @@ func TestLMTP_LHLO(t *testing.T) {
 func TestLMTP_SimpleDelivery(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
+	// Start capture to verify no proxy logs
+	logCapture := NewLogCapture()
+	defer logCapture.Close()
+
 	server, account := common.SetupLMTPServer(t)
 	defer server.Close()
 
@@ -218,6 +261,15 @@ func TestLMTP_SimpleDelivery(t *testing.T) {
 	}
 	if !strings.HasPrefix(response, "250") {
 		t.Fatalf("Expected 250 response after message data, got: %s", response)
+	}
+
+	// Wait a bit for logs to be written
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that NO proxy information appears in logs (direct backend connection)
+	logOutput := logCapture.GetOutput()
+	if strings.Contains(logOutput, "proxy=") {
+		t.Errorf("Expected no 'proxy=' in logs for direct backend connection, but found it.\nLog output:\n%s", logOutput)
 	}
 
 	t.Log("Message delivered successfully")

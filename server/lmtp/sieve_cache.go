@@ -192,8 +192,8 @@ func (c *SieveScriptCache) GetOrCreate(scriptContent string, userID int64, oracl
 		return executor, nil
 	}
 
-	// Create new executor
-	executor, err := sieveengine.NewSieveExecutorWithOracle(scriptContent, userID, oracle)
+	// Create new executor with all supported extensions for user scripts
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, userID, oracle, []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}
@@ -231,8 +231,8 @@ func (c *SieveScriptCache) GetOrCreateWithMetadata(scriptContent string, scriptI
 
 	c.mu.Unlock()
 
-	// Create new executor
-	executor, err := sieveengine.NewSieveExecutorWithOracle(scriptContent, userID, oracle)
+	// Create new executor with all supported extensions for user scripts
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, userID, oracle, []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}

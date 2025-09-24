@@ -5,10 +5,15 @@ This directory contains comprehensive integration tests for the SORA mail server
 ## Overview
 
 The integration tests are organized by protocol:
+*Note: This directory (`integration_tests/`) contains protocol-specific tests. Comprehensive database integration tests are located in the `db/` directory.*
 
 - **`imap/`** - IMAP4rev1 protocol tests
 - **`lmtp/`** - LMTP (Local Mail Transfer Protocol) tests  
 - **`pop3/`** - POP3 protocol tests
+- **`imapproxy/`** - IMAP4rev1 proxy tests
+- **`pop3proxy/`** - POP3 proxy tests
+- **`lmtpproxy/`** - LMTP proxy tests
+- **`managesieveproxy/`** - ManageSieve proxy tests
 - **`common/`** - Shared test utilities and server setup helpers
 
 ## Prerequisites
@@ -37,6 +42,7 @@ The integration tests are organized by protocol:
 2. **Create test database**:
    ```bash
    createdb sora_mail_db
+   psql sora_mail_db -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
    ```
 
 3. **Apply schema** (if needed):
@@ -64,6 +70,15 @@ Run all integration tests:
 
 # POP3 only
 ./run_integration_tests.sh --protocol pop3
+
+# IMAP Proxy only
+./run_integration_tests.sh --protocol imapproxy
+
+# POP3 Proxy only
+./run_integration_tests.sh --protocol pop3proxy
+
+# ManageSieve Proxy only
+./run_integration_tests.sh --protocol managesieveproxy
 ```
 
 ### Manual Test Execution

@@ -229,7 +229,6 @@ func (s *POP3ProxyServer) Start() error {
 
 		s.wg.Add(1)
 		go func() {
-			defer s.wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[POP3 Proxy %s] Session panic recovered: %v", s.name, r)

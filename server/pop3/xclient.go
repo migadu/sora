@@ -47,6 +47,14 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 		s.Log("[XCLIENT] Updated client IP from forwarding parameters: %s", forwardingParams.OriginatingIP)
 	}
 
+	// The proxy might also send its own source IP. Let's check for that.
+	if proxySourceIP, ok := forwardingParams.Variables["proxy-source-ip"]; ok {
+		// If PROXY protocol wasn't used, this is our best source for the proxy's IP.
+		if s.ProxyIP == "" {
+			s.ProxyIP = proxySourceIP
+		}
+	}
+
 	s.Log("[XCLIENT] Processed forwarding parameters: client=%s:%d session=%s ttl=%d variables=%d",
 		forwardingParams.OriginatingIP, forwardingParams.OriginatingPort,
 		forwardingParams.SessionID, forwardingParams.ProxyTTL, len(forwardingParams.Variables))
@@ -58,7 +66,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 func (s *POP3Session) isFromTrustedProxy() bool {
 	// Get trusted proxies configuration from server PROXY protocol config
 	// This reuses the same trusted network logic as PROXY protocol
-	trustedProxies := s.server.getTrustedProxies()
+	trustedProxies := server.GetTrustedProxiesWithFallback(s.server.trustedNetworks)
 
 	return server.IsTrustedForwarding(*s.conn, trustedProxies)
 }

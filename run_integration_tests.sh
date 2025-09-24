@@ -113,11 +113,17 @@ run_test_suite() {
     
     # Set timeout for tests (10 minutes)
     timeout_duration="10m"
-    
+    # Use -count=1 to disable test caching to ensure tests actually run
     if [ -n "$TIMEOUT_CMD" ]; then
-        test_cmd="$TIMEOUT_CMD $timeout_duration go test -v -tags=integration -timeout=\"$timeout_duration\" ."
+        test_cmd="$TIMEOUT_CMD $timeout_duration go test -v -tags=integration -count=1 -timeout=\"$timeout_duration\" ."
     else
-        test_cmd="go test -v -tags=integration -timeout=\"$timeout_duration\" ."
+        test_cmd="go test -v -tags=integration -count=1 -timeout=\"$timeout_duration\" ."
+    fi
+    
+    if [ "$VERBOSE" = true ]; then
+        print_info "Note: Some tests (like IDLE) may take up to 20 seconds to complete"
+        print_info "Running command: $test_cmd"
+        print_info "Working directory: $(pwd)"
     fi
     
     if eval "$test_cmd"; then
@@ -169,7 +175,7 @@ main() {
                 echo ""
                 echo "Options:"
                 echo "  --skip-db-check    Skip database connectivity checks"
-                echo "  --protocol PROTO   Run tests for specific protocol (imap, lmtp, pop3)"
+                echo "  --protocol PROTO   Run tests for specific protocol (imap, lmtp, pop3, imapproxy, lmtpproxy, pop3proxy)"
                 echo "  --verbose, -v      Enable verbose output"
                 echo "  --help, -h         Show this help message"
                 echo ""
@@ -189,7 +195,7 @@ main() {
     
     # Set default protocols if none specified
     if [ ${#PROTOCOLS[@]} -eq 0 ]; then
-        PROTOCOLS=("imap" "lmtp" "pop3")
+        PROTOCOLS=("imap" "lmtp" "pop3" "imapproxy" "lmtpproxy" "pop3proxy")
     fi
     
     # Check prerequisites unless skipped

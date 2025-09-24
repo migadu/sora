@@ -44,7 +44,7 @@ func (s *IMAPSession) isFromTrustedProxy() bool {
 
 	// Get trusted proxies configuration from server PROXY protocol config
 	// This reuses the same trusted network logic as PROXY protocol
-	trustedProxies := s.server.getTrustedProxies()
+	trustedProxies := server.GetTrustedProxiesForServer(s.server.proxyReader)
 
 	return server.IsTrustedForwarding(conn, trustedProxies)
 }

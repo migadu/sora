@@ -81,6 +81,54 @@ func (r *ProxyProtocolReader) IsOptionalMode() bool {
 	return r.config.Mode == "optional"
 }
 
+// GetTrustedProxies returns the list of trusted proxy CIDR blocks
+func (r *ProxyProtocolReader) GetTrustedProxies() []string {
+	if r == nil {
+		return []string{}
+	}
+	return r.config.TrustedProxies
+}
+
+// GetTrustedProxiesForServer returns trusted proxy networks for a server with fallback defaults
+// This is a shared utility function for all server types to avoid code duplication
+func GetTrustedProxiesForServer(proxyReader *ProxyProtocolReader) []string {
+	if proxyReader != nil {
+		// Get trusted proxies from PROXY protocol configuration
+		trustedProxies := proxyReader.GetTrustedProxies()
+		if len(trustedProxies) > 0 {
+			return trustedProxies
+		}
+	}
+
+	return GetDefaultTrustedNetworks()
+}
+
+// GetTrustedProxiesWithFallback returns trusted proxy networks with explicit networks and fallback defaults
+// This is for servers that have their own trustedNetworks configuration (like POP3)
+func GetTrustedProxiesWithFallback(trustedNetworks []string) []string {
+	if len(trustedNetworks) > 0 {
+		return trustedNetworks
+	}
+
+	return GetDefaultTrustedNetworks()
+}
+
+// GetDefaultTrustedNetworks returns the default trusted proxy networks
+// This centralizes the default network definitions to avoid duplication
+func GetDefaultTrustedNetworks() []string {
+	// Return default trusted proxy networks (RFC1918 private networks + localhost + IPv6 defaults)
+	// These are safe defaults when no specific configuration is provided
+	return []string{
+		"127.0.0.0/8",    // IPv4 localhost
+		"::1/128",        // IPv6 localhost
+		"10.0.0.0/8",     // RFC1918 private networks
+		"172.16.0.0/12",  // RFC1918 private networks
+		"192.168.0.0/16", // RFC1918 private networks
+		"fc00::/7",       // IPv6 unique local addresses (RFC4193)
+		"fe80::/10",      // IPv6 link-local addresses
+	}
+}
+
 // ReadProxyHeader reads and parses PROXY protocol header from connection
 // Returns the real client info and a potentially wrapped connection
 func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo, net.Conn, error) {

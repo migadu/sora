@@ -487,7 +487,7 @@ func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, crit
 	// We'll use a temporary prefix to check complexity, then rebuild with correct prefix
 	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 	isComplexQuery := db.needsComplexQuery(criteria, tempOrderBy)
-	
+
 	var orderBy string
 	if isComplexQuery {
 		// Complex queries use CTE, so no table prefix needed

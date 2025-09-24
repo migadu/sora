@@ -109,11 +109,14 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		cache:              cache,
 		masterSASLUsername: []byte(options.MasterSASLUsername),
 		masterSASLPassword: []byte(options.MasterSASLPassword),
-		limiter:            serverPkg.NewConnectionLimiter("POP3", options.MaxConnections, options.MaxConnectionsPerIP),
 		proxyReader:        proxyReader,
 		authLimiter:        authLimiter,
 		trustedNetworks:    options.TrustedNetworks,
 	}
+
+	// Create connection limiter with trusted networks from proxy configuration
+	trustedProxies := serverPkg.GetTrustedProxiesWithFallback(server.trustedNetworks)
+	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
@@ -329,20 +332,4 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
-}
-
-// getTrustedProxies returns the list of trusted proxy CIDR blocks for XCLIENT parameter forwarding
-func (s *POP3Server) getTrustedProxies() []string {
-	// XCLIENT is always enabled, use configured trusted networks
-	if len(s.trustedNetworks) > 0 {
-		return s.trustedNetworks
-	}
-
-	// If no networks specified, use RFC1918 defaults
-	return []string{
-		"127.0.0.0/8",    // localhost
-		"10.0.0.0/8",     // RFC1918 private networks
-		"172.16.0.0/12",  // RFC1918 private networks
-		"192.168.0.0/16", // RFC1918 private networks
-	}
 }

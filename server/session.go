@@ -30,27 +30,29 @@ func (s *Session) Log(format string, args ...interface{}) {
 		user = fmt.Sprintf("%s/%d", s.FullAddress(), s.UserID())
 	}
 
-	// Build remote IP info - show both client and proxy IPs if proxied
-	remoteInfo := s.RemoteIP
+	// Build connection info - show proxy= when proxied, remote= when direct
+	var connInfo string
 	if s.ProxyIP != "" {
-		remoteInfo = fmt.Sprintf("%s proxy=%s", s.RemoteIP, s.ProxyIP)
+		connInfo = fmt.Sprintf("remote=%s proxy=%s", s.RemoteIP, s.ProxyIP)
+	} else {
+		connInfo = fmt.Sprintf("remote=%s", s.RemoteIP)
 	}
 
 	if s.Stats != nil {
 		if s.Protocol == "LMTP" {
 			// LMTP has no authenticated sessions
-			log.Printf("%s remote=%s user=%s session=%s conn_total=%d: %s",
+			log.Printf("%s %s user=%s session=%s conn_total=%d: %s",
 				s.Protocol,
-				remoteInfo,
+				connInfo,
 				user,
 				s.Id,
 				s.Stats.GetTotalConnections(),
 				fmt.Sprintf(format, args...),
 			)
 		} else {
-			log.Printf("%s remote=%s user=%s session=%s conn_total=%d conn_auth=%d: %s",
+			log.Printf("%s %s user=%s session=%s conn_total=%d conn_auth=%d: %s",
 				s.Protocol,
-				remoteInfo,
+				connInfo,
 				user,
 				s.Id,
 				s.Stats.GetTotalConnections(),
@@ -59,9 +61,9 @@ func (s *Session) Log(format string, args ...interface{}) {
 			)
 		}
 	} else {
-		log.Printf("%s remote=%s user=%s session=%s: %s",
+		log.Printf("%s %s user=%s session=%s: %s",
 			s.Protocol,
-			remoteInfo,
+			connInfo,
 			user,
 			s.Id,
 			fmt.Sprintf(format, args...),

@@ -54,7 +54,15 @@ func (s *ManageSieveSession) sendCapabilities() {
 	defer release()
 
 	s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
-	s.sendRawLine("\"SIEVE\" \"fileinto vacation\"")
+
+	// Build capabilities string from configured extensions
+	extensionsStr := ""
+	if len(s.server.supportedExtensions) > 0 {
+		extensionsStr = strings.Join(s.server.supportedExtensions, " ")
+	} else {
+		extensionsStr = "fileinto vacation" // fallback
+	}
+	s.sendRawLine(fmt.Sprintf("\"SIEVE\" \"%s\"", extensionsStr))
 
 	if s.server.tlsConfig != nil && s.server.useStartTLS && !s.isTLS {
 		s.sendRawLine("\"STARTTLS\"")
@@ -313,6 +321,30 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 			scriptName := parts[1]
 			scriptContent := parts[2]
+
+			// Check if script content is a literal string {length+}
+			if strings.HasPrefix(scriptContent, "{") && strings.HasSuffix(scriptContent, "+}") {
+				// Extract length from {length+}
+				lengthStr := strings.TrimSuffix(strings.TrimPrefix(scriptContent, "{"), "+}")
+				length := 0
+				if _, err := fmt.Sscanf(lengthStr, "%d", &length); err != nil || length < 0 {
+					s.sendResponse("NO Invalid literal string length\r\n")
+					continue
+				}
+
+				// Send continuation response (+ ready for literal data)
+				s.sendResponse("+\r\n")
+
+				// Read the literal content (length bytes)
+				literalContent := make([]byte, length)
+				n, err := io.ReadFull(s.reader, literalContent)
+				if err != nil || n != length {
+					s.sendResponse("NO Failed to read literal string content\r\n")
+					continue
+				}
+				scriptContent = string(literalContent)
+			}
+
 			success = s.handlePutScript(scriptName, scriptContent)
 
 		case "SETACTIVE":
@@ -577,6 +609,13 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		return false
 	}
 
+	// Validate script name - must not be empty and should be a valid identifier
+	name = strings.Trim(name, "\"") // Remove surrounding quotes if present
+	if name == "" {
+		s.sendResponse("NO Script name cannot be empty\r\n")
+		return false
+	}
+
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
@@ -596,6 +635,9 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 
 	scriptReader := strings.NewReader(content)
 	options := sieve.DefaultOptions()
+	// Configure extensions based on server configuration
+	// If no extensions are configured, none are supported
+	options.EnabledExtensions = s.server.supportedExtensions
 	_, err := sieve.Load(scriptReader, options)
 	if err != nil {
 		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))
@@ -705,6 +747,9 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	// Validate the script before activating it
 	scriptReader := strings.NewReader(script.Script)
 	options := sieve.DefaultOptions()
+	// Configure extensions based on server configuration
+	// If no extensions are configured, none are supported
+	options.EnabledExtensions = s.server.supportedExtensions
 	_, err = sieve.Load(scriptReader, options)
 	if err != nil {
 		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))

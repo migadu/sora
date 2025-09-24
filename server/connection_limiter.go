@@ -19,6 +19,7 @@ type ConnectionLimiter struct {
 	mu               sync.RWMutex
 	cleanupInterval  time.Duration
 	protocol         string
+	trustedNets      []*net.IPNet // Trusted networks that bypass per-IP limits
 }
 
 // NewConnectionLimiter creates a new connection limiter
@@ -29,7 +30,59 @@ func NewConnectionLimiter(protocol string, maxConnections, maxPerIP int) *Connec
 		perIPConnections: make(map[string]*atomic.Int64),
 		cleanupInterval:  5 * time.Minute, // Clean up stale IP entries
 		protocol:         protocol,
+		trustedNets:      []*net.IPNet{},
 	}
+}
+
+// NewConnectionLimiterWithTrustedNets creates a new connection limiter with trusted networks
+func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPerIP int, trustedProxies []string) *ConnectionLimiter {
+	trustedNets, err := ParseTrustedNetworks(trustedProxies)
+	if err != nil {
+		log.Printf("[%s-LIMITER] WARNING: failed to parse trusted networks (%v), proceeding without trusted network exemptions", protocol, err)
+		trustedNets = []*net.IPNet{}
+	}
+
+	return &ConnectionLimiter{
+		maxConnections:   maxConnections,
+		maxPerIP:         maxPerIP,
+		perIPConnections: make(map[string]*atomic.Int64),
+		cleanupInterval:  5 * time.Minute, // Clean up stale IP entries
+		protocol:         protocol,
+		trustedNets:      trustedNets,
+	}
+}
+
+// isTrustedConnection checks if connection is from trusted network
+func (cl *ConnectionLimiter) isTrustedConnection(remoteAddr net.Addr) bool {
+	if len(cl.trustedNets) == 0 {
+		return false
+	}
+
+	var ip net.IP
+	switch addr := remoteAddr.(type) {
+	case *net.TCPAddr:
+		ip = addr.IP
+	case *net.UDPAddr:
+		ip = addr.IP
+	default:
+		// Try to parse as string
+		host, _, err := net.SplitHostPort(remoteAddr.String())
+		if err != nil {
+			return false
+		}
+		ip = net.ParseIP(host)
+		if ip == nil {
+			return false
+		}
+	}
+
+	for _, network := range cl.trustedNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // CanAccept checks if a new connection can be accepted from the given remote address
@@ -47,7 +100,8 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 	}
 
 	// Check per-IP connection limit (skip if maxPerIP is 0, allowing unlimited per-IP for proxy scenarios)
-	if cl.maxPerIP > 0 {
+	// Also skip per-IP limits for trusted networks (proxies)
+	if cl.maxPerIP > 0 && !cl.isTrustedConnection(remoteAddr) {
 		// Extract IP from remote address
 		ip, _, err := net.SplitHostPort(remoteAddr.String())
 		if err != nil {
@@ -88,9 +142,10 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 	var perIP int64 = 0
 	var ipCounter *atomic.Int64
+	isTrusted := cl.isTrustedConnection(remoteAddr)
 
-	// Only track per-IP if limits are enabled (maxPerIP > 0)
-	if cl.maxPerIP > 0 {
+	// Only track per-IP if limits are enabled (maxPerIP > 0) and not from trusted network
+	if cl.maxPerIP > 0 && !isTrusted {
 		// Increment per-IP counter
 		cl.mu.Lock()
 		var exists bool
@@ -105,6 +160,9 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, %d/%d from this IP",
 			cl.protocol, ip, total, cl.maxConnections, perIP, cl.maxPerIP)
+	} else if isTrusted {
+		log.Printf("[%s-LIMITER] Connection accepted from %s (trusted network) - Active connections: %d/%d total, unlimited from trusted IP",
+			cl.protocol, ip, total, cl.maxConnections)
 	} else {
 		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, unlimited from this IP",
 			cl.protocol, ip, total, cl.maxConnections)
@@ -114,7 +172,7 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 	return func() {
 		cl.currentTotal.Add(-1)
 
-		if cl.maxPerIP > 0 && ipCounter != nil {
+		if cl.maxPerIP > 0 && !isTrusted && ipCounter != nil {
 			remaining := ipCounter.Add(-1)
 
 			// Clean up IP entry if no connections remain
