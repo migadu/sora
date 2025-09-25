@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,19 @@ import (
 )
 
 const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
+
+// ClientCapabilityFilter defines capability filtering rules for specific clients
+type ClientCapabilityFilter struct {
+	ClientName    string   `toml:"client_name"`    // Client name pattern (regex)
+	ClientVersion string   `toml:"client_version"` // Client version pattern (regex)
+	DisableCaps   []string `toml:"disable_caps"`   // List of capabilities to disable
+	Reason        string   `toml:"reason"`         // Human-readable reason for the filter
+}
+
+// CapabilityFiltersConfig holds all client capability filtering rules
+type CapabilityFiltersConfig struct {
+	Filters []ClientCapabilityFilter `toml:"client_filters"`
+}
 
 // connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
 type connectionLimitingListener struct {
@@ -173,6 +187,9 @@ type IMAPServer struct {
 	warmupMailboxes    []string
 	warmupAsync        bool
 	warmupTimeout      time.Duration
+
+	// Client capability filtering
+	capFilters []ClientCapabilityFilter
 }
 
 type IMAPServerOptions struct {
@@ -199,6 +216,8 @@ type IMAPServerOptions struct {
 	WarmupAsync        bool
 	WarmupTimeout      string
 	FTSRetention       time.Duration
+	// Client capability filtering
+	CapabilityFilters []ClientCapabilityFilter
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -264,6 +283,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		warmupMailboxes:    options.WarmupMailboxes,
 		warmupAsync:        options.WarmupAsync,
 		warmupTimeout:      warmupTimeout,
+		capFilters:         options.CapabilityFilters,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:     struct{}{},
 			imap.CapLiteralPlus:   struct{}{},
@@ -380,6 +400,13 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		ctx:       sessionCtx,
 		cancel:    sessionCancel,
 		startTime: time.Now(),
+	}
+
+	// Initialize session with full server capabilities
+	// These will be filtered when client ID is received via ID command
+	session.sessionCaps = make(imap.CapSet)
+	for cap := range s.caps {
+		session.sessionCaps[cap] = struct{}{}
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
@@ -648,4 +675,61 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 	}
 
 	return nil
+}
+
+// filterCapabilitiesForClient applies client-specific capability filtering
+func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData) {
+	if clientID == nil || len(s.capFilters) == 0 {
+		return // No client ID or no filters configured
+	}
+
+	clientName := clientID.Name
+	clientVersion := clientID.Version
+
+	// Apply each matching filter
+	for _, filter := range s.capFilters {
+		if s.clientMatches(clientName, clientVersion, filter) {
+			log.Printf("[IMAP] Applying capability filter for client %s %s: %s",
+				clientName, clientVersion, filter.Reason)
+
+			// Disable specified capabilities
+			for _, capStr := range filter.DisableCaps {
+				cap := imap.Cap(capStr)
+				if _, exists := sessionCaps[cap]; exists {
+					delete(sessionCaps, cap)
+					log.Printf("[IMAP] Disabled capability %s for client %s %s",
+						cap, clientName, clientVersion)
+				}
+			}
+		}
+	}
+}
+
+// clientMatches checks if a client matches the filter criteria
+func (s *IMAPServer) clientMatches(clientName, clientVersion string, filter ClientCapabilityFilter) bool {
+	// Match client name pattern
+	if filter.ClientName != "" {
+		matched, err := regexp.MatchString(filter.ClientName, clientName)
+		if err != nil {
+			log.Printf("[IMAP] Invalid client name regex pattern '%s': %v", filter.ClientName, err)
+			return false
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	// Match client version pattern
+	if filter.ClientVersion != "" {
+		matched, err := regexp.MatchString(filter.ClientVersion, clientVersion)
+		if err != nil {
+			log.Printf("[IMAP] Invalid client version regex pattern '%s': %v", filter.ClientVersion, err)
+			return false
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	return true
 }

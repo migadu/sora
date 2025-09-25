@@ -35,6 +35,10 @@ type IMAPSession struct {
 	mailboxTracker  *imapserver.MailboxTracker
 	sessionTracker  *imapserver.SessionTracker
 
+	// Client identification and capability filtering
+	clientID    *imap.IDData
+	sessionCaps imap.CapSet // Per-session capabilities after filtering
+
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
 	currentNumMessages   atomic.Uint32
@@ -47,6 +51,40 @@ type IMAPSession struct {
 
 func (s *IMAPSession) Context() context.Context {
 	return s.ctx
+}
+
+// GetCapabilities returns the effective capabilities for this session
+// If session-specific capabilities haven't been set, it returns the server's default capabilities
+func (s *IMAPSession) GetCapabilities() imap.CapSet {
+	if s.sessionCaps != nil {
+		return s.sessionCaps
+	}
+	return s.server.caps
+}
+
+// SetClientID stores the client ID information and applies capability filtering
+func (s *IMAPSession) SetClientID(clientID *imap.IDData) {
+	s.clientID = clientID
+	s.applyCapabilityFilters()
+}
+
+// applyCapabilityFilters applies client-specific capability filtering based on client ID
+func (s *IMAPSession) applyCapabilityFilters() {
+	// Start with the server's full capability set
+	s.sessionCaps = make(imap.CapSet)
+	for cap := range s.server.caps {
+		s.sessionCaps[cap] = struct{}{}
+	}
+
+	if s.clientID == nil {
+		return // No client ID, use all capabilities
+	}
+
+	// Apply capability filtering based on client identification
+	s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID)
+
+	s.Log("[CAPS] Applied capability filters for client %s %s: %d capabilities enabled",
+		s.clientID.Name, s.clientID.Version, len(s.sessionCaps))
 }
 
 func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error {

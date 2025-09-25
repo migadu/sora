@@ -160,7 +160,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Only include HighestModSeq if CONDSTORE capability is enabled
-	if s.server.caps.Has(imap.CapCondStore) {
+	if s.GetCapabilities().Has(imap.CapCondStore) {
 		selectData.HighestModSeq = s.currentHighestModSeq.Load()
 	}
 

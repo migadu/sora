@@ -207,6 +207,23 @@ tls_verify = true                         # Verify client certificates (mutual T
 proxy_protocol = false            # Enable PROXY protocol support (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
+# --- CLIENT CAPABILITY FILTERS ---
+# Disable specific IMAP capabilities for problematic clients based on their ID
+# This helps work around client bugs while maintaining full functionality for well-behaved clients
+# Note: CAPABILITY response still shows all capabilities, but command handlers respect filtering
+
+# [[server.client_filters]]
+# client_name = "com\\.apple\\.email\\.maild"  # iOS Apple Mail (regex pattern)
+# client_version = ".*"                        # Any version
+# disable_caps = ["CONDSTORE"]                 # Capabilities to disable
+# reason = "iOS Apple Mail has CONDSTORE implementation issues"
+
+# [[server.client_filters]]
+# client_name = "Microsoft Outlook"            # Outlook for Windows/Mac
+# client_version = "16\\..*"                   # Only version 16.x
+# disable_caps = ["IDLE", "CONDSTORE"]         # Multiple capabilities
+# reason = "Outlook 16.x has connection issues with IDLE and CONDSTORE"
+
 # --- AUTHENTICATION RATE LIMITING ---
 [server.auth_rate_limit]
 enabled = false                   # Enable authentication rate limiting.

@@ -68,7 +68,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 			isParentForLsub = parentFolders[mbox.Name]
 		}
 
-		data := listMailbox(mbox, options, s.server.caps, isParentForLsub)
+		data := listMailbox(mbox, options, s.GetCapabilities(), isParentForLsub)
 		if data != nil {
 			l = append(l, *data)
 		}
@@ -78,7 +78,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		return l[i].Mailbox < l[j].Mailbox
 	})
 
-	hasListStatusCap := s.server.caps.Has(imap.CapListStatus)
+	hasListStatusCap := s.GetCapabilities().Has(imap.CapListStatus)
 
 	// Now handle STATUS returns if needed - after we've processed all mailboxes
 	// This avoids the deadlock when Status() tries to acquire a write lock

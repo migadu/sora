@@ -79,7 +79,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
-		if s.server.caps.Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
+		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq
 
@@ -154,7 +154,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			m.WriteFlags(modified.flags)
 			m.WriteUID(modified.uid)
 			// CONDSTORE: Include MODSEQ in response if capability is enabled
-			if s.server.caps.Has(imap.CapCondStore) {
+			if s.GetCapabilities().Has(imap.CapCondStore) {
 				m.WriteModSeq(uint64(modified.modSeq))
 			}
 

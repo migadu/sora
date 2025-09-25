@@ -110,7 +110,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	// CONDSTORE functionality - only process if capability is enabled
-	if s.server.caps.Has(imap.CapCondStore) && options.ChangedSince > 0 {
+	if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
 		s.Log("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
 		var filteredMessages []db.Message
 
@@ -251,7 +251,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 
-	if s.server.caps.Has(imap.CapCondStore) && options.ModSeq {
+	if s.GetCapabilities().Has(imap.CapCondStore) && options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
 

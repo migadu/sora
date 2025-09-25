@@ -60,7 +60,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		num := uint32(summary.UnseenCount)
 		statusData.NumUnseen = &num
 	}
-	if s.server.caps.Has(imap.CapCondStore) && options.HighestModSeq {
+	if s.GetCapabilities().Has(imap.CapCondStore) && options.HighestModSeq {
 		statusData.HighestModSeq = summary.HighestModSeq
 	}
 

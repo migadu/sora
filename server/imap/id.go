@@ -14,6 +14,9 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 		s.Log("[ID] Client identified itself with: Name=%s Version=%s OS=%s OSVersion=%s Vendor=%s",
 			clientID.Name, clientID.Version, clientID.OS, clientID.OSVersion, clientID.Vendor)
 
+		// Store client ID and apply capability filtering
+		s.SetClientID(clientID)
+
 		// Check for Dovecot-style forwarding parameters in client ID
 		if s.isFromTrustedProxy() {
 			s.processForwardingParameters(clientID)

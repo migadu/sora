@@ -179,7 +179,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	// CONDSTORE functionality - only process if capability is enabled
-	if s.server.caps.Has(imap.CapCondStore) && criteria.ModSeq != nil {
+	if s.GetCapabilities().Has(imap.CapCondStore) && criteria.ModSeq != nil {
 		var highestModSeq uint64
 		for _, msg := range messages {
 			var msgModSeq int64
