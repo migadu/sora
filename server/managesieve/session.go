@@ -25,7 +25,6 @@ type ManageSieveSession struct {
 	mutexHelper   *server.MutexTimeoutHelper
 	server        *ManageSieveServer
 	conn          *net.Conn          // Connection to the client
-	*server.User                     // User associated with the session
 	authenticated bool               // Flag to indicate if the user has been authenticated
 	ctx           context.Context    // Context for this session
 	cancel        context.CancelFunc // Function to cancel the session's context
@@ -569,6 +568,9 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
+	
+	// Remove surrounding quotes if present (same as PUTSCRIPT)
+	name = strings.Trim(name, "\"")
 
 	// Acquire a read lock only to get the necessary session state.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -716,6 +718,9 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
+	
+	// Remove surrounding quotes if present (same as PUTSCRIPT)
+	name = strings.Trim(name, "\"")
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -775,7 +780,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	metrics.ManageSieveScriptsActivated.Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_setactive").Observe(time.Since(start).Seconds())
 
-	s.sendResponse("OK Script activated\r\n")
+	s.sendResponse("OK\r\n")
 	return true
 }
 
@@ -786,6 +791,9 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
+	
+	// Remove surrounding quotes if present (same as PUTSCRIPT)
+	name = strings.Trim(name, "\"")
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -833,13 +841,19 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 }
 
 func (s *ManageSieveSession) Close() error {
-	// Acquire write lock for cleanup
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
-	if !acquired {
-		s.Log("WARNING: failed to acquire write lock for Close operation")
-		// Continue with close even if we can't get the lock
-	} else {
-		defer release()
+	// Check if context is already canceled (during shutdown)
+	select {
+	case <-s.ctx.Done():
+		// Context is canceled, skip lock acquisition during shutdown
+	default:
+		// Acquire write lock for cleanup
+		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+		if !acquired {
+			s.Log("failed to acquire write lock within timeout")
+			// Continue with close even if we can't get the lock
+		} else {
+			defer release()
+		}
 	}
 
 	// Observe connection duration

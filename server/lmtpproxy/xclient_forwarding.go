@@ -43,11 +43,6 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// Send XCLIENT command to backend
 	xclientCommand := fmt.Sprintf("XCLIENT %s\r\n", xclientParams)
 
-	// Debug: Log the exact command being sent
-	log.Printf("[LMTP Proxy] Sending XCLIENT command to backend: %q", strings.TrimRight(xclientCommand, "\r\n"))
-	log.Printf("[LMTP Proxy] XCLIENT command bytes: %v", []byte(xclientCommand))
-	log.Printf("[LMTP Proxy] XCLIENT parameters breakdown: %+v", forwardingParams)
-
 	if _, err := writer.WriteString(xclientCommand); err != nil {
 		return fmt.Errorf("failed to write XCLIENT command: %v", err)
 	}
@@ -75,9 +70,6 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	}
 
 	response = strings.TrimRight(response, "\r\n")
-
-	// Debug: Log the exact response received
-	log.Printf("[LMTP Proxy] Received XCLIENT response from backend: %q", response)
 
 	if strings.HasPrefix(response, "250") {
 		log.Printf("[LMTP Proxy] XCLIENT forwarding completed successfully for %s: %s", s.username, xclientParams)

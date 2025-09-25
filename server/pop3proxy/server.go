@@ -36,6 +36,9 @@ type POP3ProxyServer struct {
 	prelookupConfig    *proxy.PreLookupConfig
 	sessionTimeout     time.Duration
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
+	
+	// Connection limiting
+	limiter *server.ConnectionLimiter
 }
 
 type POP3ProxyServerOptions struct {
@@ -61,6 +64,11 @@ type POP3ProxyServerOptions struct {
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
+	
+	// Connection limiting
+	MaxConnections      int      // Maximum total connections (0 = unlimited)
+	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
+	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -122,6 +130,12 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.AuthRateLimit, rdb, options.TrustedProxies)
 
+	// Initialize connection limiter with trusted networks
+	var limiter *server.ConnectionLimiter
+	if options.MaxConnections > 0 || options.MaxConnectionsPerIP > 0 {
+		limiter = server.NewConnectionLimiterWithTrustedNets("POP3-PROXY", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
+	}
+
 	server := &POP3ProxyServer{
 		name:               options.Name,
 		hostname:           hostname,
@@ -140,6 +154,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		prelookupConfig:    options.PreLookup,
 		sessionTimeout:     options.SessionTimeout,
 		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
+		limiter:            limiter,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided
@@ -193,6 +208,11 @@ func (s *POP3ProxyServer) Start() error {
 	}
 	defer listener.Close()
 
+	// Start connection limiter cleanup if enabled
+	if s.limiter != nil {
+		s.limiter.StartCleanup(s.appCtx)
+	}
+
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
@@ -208,6 +228,17 @@ func (s *POP3ProxyServer) Start() error {
 			}
 			// Otherwise, it's an unexpected error.
 			return fmt.Errorf("failed to accept connection: %w", err)
+		}
+
+		// Check connection limits before processing
+		var releaseConn func()
+		if s.limiter != nil {
+			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
+			if err != nil {
+				log.Printf("[POP3 Proxy %s] Connection rejected: %v", s.name, err)
+				conn.Close()
+				continue // Try to accept the next connection
+			}
 		}
 
 		// Create a new context for this session that inherits from app context
@@ -229,6 +260,12 @@ func (s *POP3ProxyServer) Start() error {
 
 		s.wg.Add(1)
 		go func() {
+			defer func() {
+				// Release connection limit when session ends
+				if releaseConn != nil {
+					releaseConn()
+				}
+			}()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[POP3 Proxy %s] Session panic recovered: %v", s.name, r)

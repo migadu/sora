@@ -62,11 +62,16 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 	writer.WriteString("+OK XCLIENT parameters accepted\r\n")
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted proxy
+// isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
 func (s *POP3Session) isFromTrustedProxy() bool {
-	// Get trusted proxies configuration from server PROXY protocol config
-	// This reuses the same trusted network logic as PROXY protocol
-	trustedProxies := server.GetTrustedProxiesWithFallback(s.server.trustedNetworks)
+	// Use the server's limiter trusted networks for XCLIENT command forwarding
+	// This ensures consistency with connection limiting behavior
+	if s.server.limiter == nil {
+		return false
+	}
 
-	return server.IsTrustedForwarding(*s.conn, trustedProxies)
+	// Extract connection address
+	conn := *s.conn
+	remoteAddr := conn.RemoteAddr()
+	return s.server.limiter.IsTrustedConnection(remoteAddr)
 }

@@ -27,6 +27,68 @@ import (
 
 const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
 
+// connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
+type connectionLimitingListener struct {
+	net.Listener
+	limiter *serverPkg.ConnectionLimiter
+	name    string
+}
+
+// Accept accepts connections and checks connection limits before returning them
+func (l *connectionLimitingListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+
+		// Extract real client IP and proxy info if this is a PROXY protocol connection
+		var realClientIP string
+		var proxyInfo *serverPkg.ProxyProtocolInfo
+		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
+			proxyInfo = proxyConn.GetProxyInfo()
+			if proxyInfo != nil && proxyInfo.SrcIP != "" {
+				realClientIP = proxyInfo.SrcIP
+			}
+		}
+
+		// Check connection limits with PROXY protocol support
+		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
+		if limitErr != nil {
+			log.Printf("[IMAP-%s] Connection rejected: %v", l.name, limitErr)
+			conn.Close()
+			continue // Try to accept the next connection
+		}
+
+		// Wrap the connection to ensure cleanup on close and preserve PROXY info
+		return &connectionLimitingConn{
+			Conn:        conn,
+			releaseFunc: releaseConn,
+			proxyInfo:   proxyInfo,
+		}, nil
+	}
+}
+
+// connectionLimitingConn wraps a net.Conn to ensure connection limit cleanup on close
+type connectionLimitingConn struct {
+	net.Conn
+	releaseFunc func()
+	proxyInfo   *serverPkg.ProxyProtocolInfo
+}
+
+// GetProxyInfo implements the same interface as proxyProtocolConn
+func (c *connectionLimitingConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
+	return c.proxyInfo
+}
+
+func (c *connectionLimitingConn) Close() error {
+	if c.releaseFunc != nil {
+		c.releaseFunc()
+		c.releaseFunc = nil // Prevent double release
+	}
+	return c.Conn.Close()
+}
+
 // maskingWriter is a wrapper for an io.Writer that redacts sensitive information.
 type maskingWriter struct {
 	w io.Writer
@@ -228,9 +290,24 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterSASLPassword: options.MasterSASLPassword,
 	}
 
-	// Create connection limiter with trusted networks from proxy configuration
-	trustedProxies := serverPkg.GetTrustedProxiesForServer(s.proxyReader)
-	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
+	// Create connection limiter with trusted networks from server configuration
+	// For IMAP backend:
+	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
+	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
+	var limiterTrustedNets []string
+	var limiterMaxPerIP int
+	
+	if options.ProxyProtocol {
+		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
+	} else {
+		// PROXY protocol disabled: use trusted networks for per-IP bypass
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = options.MaxConnectionsPerIP
+	}
+	
+	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	if s.appendLimit > 0 {
 		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
@@ -288,13 +365,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-	// Check connection limits
-	releaseConn, err := s.limiter.Accept(conn.NetConn().RemoteAddr())
-	if err != nil {
-		log.Printf("[IMAP] Connection rejected: %v", err)
-		return nil, nil, fmt.Errorf("connection limit exceeded: %w", err)
-	}
-
+	// Connection limits are now handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	totalCount := s.totalConnections.Add(1)
@@ -304,12 +375,11 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	metrics.ConnectionsCurrent.WithLabelValues("imap").Inc()
 
 	session := &IMAPSession{
-		server:      s,
-		conn:        conn,
-		ctx:         sessionCtx,
-		cancel:      sessionCancel,
-		releaseConn: releaseConn,
-		startTime:   time.Now(),
+		server:    s,
+		conn:      conn,
+		ctx:       sessionCtx,
+		cancel:    sessionCancel,
+		startTime: time.Now(),
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
@@ -317,6 +387,8 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	var proxyInfo *serverPkg.ProxyProtocolInfo
 	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
 		proxyInfo = proxyConn.GetProxyInfo()
+	} else if limitingConn, ok := netConn.(*connectionLimitingConn); ok {
+		proxyInfo = limitingConn.GetProxyInfo()
 	}
 
 	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -368,7 +440,14 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		}
 	}
 
-	return s.server.Serve(listener)
+	// Wrap listener with connection limiting
+	limitedListener := &connectionLimitingListener{
+		Listener: listener,
+		limiter:  s.limiter,
+		name:     s.name,
+	}
+
+	return s.server.Serve(limitedListener)
 }
 
 func (s *IMAPServer) Close() {

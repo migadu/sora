@@ -52,7 +52,12 @@ func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPer
 	}
 }
 
-// isTrustedConnection checks if connection is from trusted network
+// IsTrustedConnection checks if connection is from trusted network (public method)
+func (cl *ConnectionLimiter) IsTrustedConnection(remoteAddr net.Addr) bool {
+	return cl.isTrustedConnection(remoteAddr)
+}
+
+// isTrustedConnection checks if connection is from trusted network (internal method)
 func (cl *ConnectionLimiter) isTrustedConnection(remoteAddr net.Addr) bool {
 	if len(cl.trustedNets) == 0 {
 		return false
@@ -124,17 +129,30 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 	return nil
 }
 
-// Accept registers a new connection and returns a function to release it
-func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
-	err := cl.CanAccept(remoteAddr)
+// AcceptWithRealIP registers a new connection with support for PROXY protocol real client IP
+// remoteAddr is the direct connection address (proxy IP if proxied)
+// realClientIP is the actual client IP from PROXY protocol (empty string if not proxied)
+func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP string) (func(), error) {
+	err := cl.CanAcceptWithRealIP(remoteAddr, realClientIP)
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract IP from remote address
-	ip, _, err := net.SplitHostPort(remoteAddr.String())
-	if err != nil {
-		ip = remoteAddr.String()
+	// Determine which IP to use for per-IP tracking
+	var trackingIP string
+	isTrusted := cl.isTrustedConnection(remoteAddr)
+
+	if realClientIP != "" && !isTrusted {
+		// Use real client IP for per-IP limiting when not from trusted network
+		trackingIP = realClientIP
+	} else {
+		// Extract IP from remote address for per-IP tracking
+		ip, _, err := net.SplitHostPort(remoteAddr.String())
+		if err != nil {
+			trackingIP = remoteAddr.String()
+		} else {
+			trackingIP = ip
+		}
 	}
 
 	// Increment total counter
@@ -142,30 +160,40 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 	var perIP int64 = 0
 	var ipCounter *atomic.Int64
-	isTrusted := cl.isTrustedConnection(remoteAddr)
 
 	// Only track per-IP if limits are enabled (maxPerIP > 0) and not from trusted network
 	if cl.maxPerIP > 0 && !isTrusted {
 		// Increment per-IP counter
 		cl.mu.Lock()
 		var exists bool
-		ipCounter, exists = cl.perIPConnections[ip]
+		ipCounter, exists = cl.perIPConnections[trackingIP]
 		if !exists {
 			ipCounter = &atomic.Int64{}
-			cl.perIPConnections[ip] = ipCounter
+			cl.perIPConnections[trackingIP] = ipCounter
 		}
 		cl.mu.Unlock()
 
 		perIP = ipCounter.Add(1)
 
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, %d/%d from this IP",
-			cl.protocol, ip, total, cl.maxConnections, perIP, cl.maxPerIP)
+		if realClientIP != "" {
+			log.Printf("[%s-LIMITER] Connection accepted from %s (real client: %s) - Active connections: %d/%d total, %d/%d from client IP",
+				cl.protocol, remoteAddr.String(), realClientIP, total, cl.maxConnections, perIP, cl.maxPerIP)
+		} else {
+			log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, %d/%d from this IP",
+				cl.protocol, trackingIP, total, cl.maxConnections, perIP, cl.maxPerIP)
+		}
 	} else if isTrusted {
-		log.Printf("[%s-LIMITER] Connection accepted from %s (trusted network) - Active connections: %d/%d total, unlimited from trusted IP",
-			cl.protocol, ip, total, cl.maxConnections)
+		proxyIP, _, _ := net.SplitHostPort(remoteAddr.String())
+		if realClientIP != "" {
+			log.Printf("[%s-LIMITER] Connection accepted from %s (trusted proxy, real client: %s) - Active connections: %d/%d total, unlimited from trusted proxy",
+				cl.protocol, proxyIP, realClientIP, total, cl.maxConnections)
+		} else {
+			log.Printf("[%s-LIMITER] Connection accepted from %s (trusted network) - Active connections: %d/%d total, unlimited from trusted IP",
+				cl.protocol, proxyIP, total, cl.maxConnections)
+		}
 	} else {
 		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, unlimited from this IP",
-			cl.protocol, ip, total, cl.maxConnections)
+			cl.protocol, trackingIP, total, cl.maxConnections)
 	}
 
 	// Return cleanup function
@@ -179,18 +207,82 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 			if remaining <= 0 {
 				cl.mu.Lock()
 				if ipCounter.Load() <= 0 {
-					delete(cl.perIPConnections, ip)
+					delete(cl.perIPConnections, trackingIP)
 				}
 				cl.mu.Unlock()
 			}
 
-			log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, %d from this IP",
-				cl.protocol, ip, cl.currentTotal.Load(), remaining)
+			if realClientIP != "" {
+				log.Printf("[%s-LIMITER] Connection released from %s (real client: %s) - Active connections remaining: %d total, %d from client IP",
+					cl.protocol, remoteAddr.String(), realClientIP, cl.currentTotal.Load(), remaining)
+			} else {
+				log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, %d from this IP",
+					cl.protocol, trackingIP, cl.currentTotal.Load(), remaining)
+			}
 		} else {
-			log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, unlimited from this IP",
-				cl.protocol, ip, cl.currentTotal.Load())
+			if realClientIP != "" {
+				log.Printf("[%s-LIMITER] Connection released from %s (real client: %s) - Active connections remaining: %d total, unlimited from this connection",
+					cl.protocol, remoteAddr.String(), realClientIP, cl.currentTotal.Load())
+			} else {
+				log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, unlimited from this IP",
+					cl.protocol, trackingIP, cl.currentTotal.Load())
+			}
 		}
 	}, nil
+}
+
+// CanAcceptWithRealIP checks if a new connection can be accepted with PROXY protocol support
+func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClientIP string) error {
+	if cl.maxConnections <= 0 && cl.maxPerIP <= 0 {
+		return nil // No limits configured
+	}
+
+	// Check total connection limit
+	if cl.maxConnections > 0 {
+		current := cl.currentTotal.Load()
+		if current >= int64(cl.maxConnections) {
+			return fmt.Errorf("maximum connections reached (%d/%d)", current, cl.maxConnections)
+		}
+	}
+
+	// Check per-IP connection limit (skip if maxPerIP is 0, allowing unlimited per-IP for proxy scenarios)
+	// Also skip per-IP limits for trusted networks (proxies)
+	if cl.maxPerIP > 0 && !cl.isTrustedConnection(remoteAddr) {
+		// Determine which IP to check for per-IP limits
+		var checkIP string
+		if realClientIP != "" {
+			// Use real client IP for per-IP limiting when available
+			checkIP = realClientIP
+		} else {
+			// Extract IP from remote address
+			ip, _, err := net.SplitHostPort(remoteAddr.String())
+			if err != nil {
+				// Fallback to using the entire address if parsing fails
+				checkIP = remoteAddr.String()
+			} else {
+				checkIP = ip
+			}
+		}
+
+		cl.mu.RLock()
+		ipCounter, exists := cl.perIPConnections[checkIP]
+		cl.mu.RUnlock()
+
+		if exists {
+			current := ipCounter.Load()
+			if current >= int64(cl.maxPerIP) {
+				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Accept registers a new connection and returns a function to release it
+func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
+	// Use the enhanced method with empty real client IP for backward compatibility
+	return cl.AcceptWithRealIP(remoteAddr, "")
 }
 
 // GetStats returns current connection statistics

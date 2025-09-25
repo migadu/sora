@@ -41,6 +41,9 @@ type Server struct {
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *proxy.PreLookupConfig
 	remoteUseIDCommand bool // Whether backend supports IMAP ID command for forwarding
+	
+	// Connection limiting
+	limiter *server.ConnectionLimiter
 }
 
 // ServerOptions holds options for creating a new IMAP proxy server.
@@ -67,6 +70,11 @@ type ServerOptions struct {
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
+	
+	// Connection limiting
+	MaxConnections      int      // Maximum total connections (0 = unlimited)
+	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
+	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
 }
 
 // New creates a new IMAP proxy server.
@@ -131,6 +139,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
 
+	// Initialize connection limiter with trusted networks
+	var limiter *server.ConnectionLimiter
+	if opts.MaxConnections > 0 || opts.MaxConnectionsPerIP > 0 {
+		limiter = server.NewConnectionLimiterWithTrustedNets("IMAP-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+	}
+
 	return &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -153,6 +167,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		trustedProxies:     opts.TrustedProxies,
 		prelookupConfig:    opts.PreLookup,
 		remoteUseIDCommand: opts.RemoteUseIDCommand,
+		limiter:            limiter,
 	}, nil
 }
 
@@ -199,6 +214,11 @@ func (s *Server) Start() error {
 		log.Printf("* IMAP proxy [%s] listening on %s", s.name, s.addr)
 	}
 
+	// Start connection limiter cleanup if enabled
+	if s.limiter != nil {
+		s.limiter.StartCleanup(s.ctx)
+	}
+
 	return s.acceptConnections()
 }
 
@@ -215,9 +235,26 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
+		// Check connection limits before processing
+		var releaseConn func()
+		if s.limiter != nil {
+			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
+			if err != nil {
+				log.Printf("[IMAP Proxy %s] Connection rejected: %v", s.name, err)
+				conn.Close()
+				continue // Try to accept the next connection
+			}
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				// Release connection limit when session ends
+				if releaseConn != nil {
+					releaseConn()
+				}
+			}()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[IMAP Proxy %s] Session panic recovered: %v", s.name, r)

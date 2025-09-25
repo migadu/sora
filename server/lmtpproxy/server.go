@@ -42,6 +42,9 @@ type Server struct {
 
 	// Trusted networks for connection filtering
 	trustedNetworks []*net.IPNet
+	
+	// Connection limiting (total connections only, no per-IP for LMTP)
+	limiter *server.ConnectionLimiter
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -66,6 +69,9 @@ type ServerOptions struct {
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 	MaxMessageSize         int64
+	
+	// Connection limiting (total connections only, no per-IP for LMTP)
+	MaxConnections int // Maximum total connections (0 = unlimited)
 }
 
 // New creates a new LMTP proxy server.
@@ -135,6 +141,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		trustedNets = []*net.IPNet{}
 	}
 
+	// Initialize connection limiter for total connections only (no per-IP for LMTP)
+	var limiter *server.ConnectionLimiter
+	if opts.MaxConnections > 0 {
+		// For LMTP proxy: total connections only, no per-IP limiting, no trusted networks bypass
+		limiter = server.NewConnectionLimiterWithTrustedNets("LMTP-PROXY", opts.MaxConnections, 0, []string{})
+	}
+
 	return &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -156,6 +169,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		sessionTimeout:     opts.SessionTimeout,
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
+		limiter:            limiter,
 	}, nil
 }
 
@@ -200,6 +214,11 @@ func (s *Server) Start() error {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
 		log.Printf("* LMTP proxy [%s] listening on %s", s.name, s.addr)
+	}
+
+	// Start connection limiter cleanup if enabled
+	if s.limiter != nil {
+		s.limiter.StartCleanup(s.ctx)
 	}
 
 	return s.acceptConnections()
@@ -258,9 +277,26 @@ func (s *Server) acceptConnections() error {
 			continue
 		}
 
+		// Check total connection limits after trusted network verification
+		var releaseConn func()
+		if s.limiter != nil {
+			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
+			if err != nil {
+				log.Printf("[LMTP Proxy %s] Connection rejected from %s: %v", s.name, ip, err)
+				conn.Close()
+				continue // Try to accept the next connection
+			}
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				// Release connection limit when session ends
+				if releaseConn != nil {
+					releaseConn()
+				}
+			}()
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[LMTP Proxy %s] Session panic recovered: %v", s.name, r)

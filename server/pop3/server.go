@@ -114,9 +114,24 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		trustedNetworks:    options.TrustedNetworks,
 	}
 
-	// Create connection limiter with trusted networks from proxy configuration
-	trustedProxies := serverPkg.GetTrustedProxiesWithFallback(server.trustedNetworks)
-	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
+	// Create connection limiter with trusted networks from server configuration
+	// For POP3 backend:
+	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
+	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
+	var limiterTrustedNets []string
+	var limiterMaxPerIP int
+	
+	if options.ProxyProtocol {
+		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
+	} else {
+		// PROXY protocol disabled: use trusted networks for per-IP bypass
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = options.MaxConnectionsPerIP
+	}
+	
+	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
@@ -206,8 +221,18 @@ func (s *POP3Server) Start(errChan chan error) {
 			return
 		}
 
-		// Check connection limits
-		releaseConn, err := s.limiter.Accept(conn.RemoteAddr())
+		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
+		var proxyInfoForLimiting *serverPkg.ProxyProtocolInfo
+		var realClientIP string
+		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
+			proxyInfoForLimiting = proxyConn.GetProxyInfo()
+			if proxyInfoForLimiting != nil && proxyInfoForLimiting.SrcIP != "" {
+				realClientIP = proxyInfoForLimiting.SrcIP
+			}
+		}
+
+		// Check connection limits with PROXY protocol support
+		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
 			log.Printf("[POP3] Connection rejected: %v", err)
 			conn.Close()

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/managesieve"
@@ -66,6 +67,9 @@ func testExtensions(t *testing.T, configuredExtensions []string, expectedExtensi
 	go func() {
 		server.Start(errChan)
 	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
 
 	defer func() {
 		server.Close()

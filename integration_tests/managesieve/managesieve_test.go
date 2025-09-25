@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -218,7 +219,7 @@ func TestManageSieveScriptOperations(t *testing.T) {
 	// Test 4: GETSCRIPT - retrieve the script (just check it doesn't fail)
 	t.Log("=== Testing GETSCRIPT ===")
 	sendCommand(t, writer, "GETSCRIPT \"vacation\"")
-	response = readSimpleResponse(t, reader)
+	response = readGetScriptResponse(t, reader)
 	if strings.HasPrefix(response, "NO") {
 		t.Errorf("GETSCRIPT failed: %s", response)
 	} else {
@@ -240,7 +241,7 @@ func TestManageSieveScriptOperations(t *testing.T) {
 
 	// GETSCRIPT on deleted script should fail
 	sendCommand(t, writer, "GETSCRIPT \"vacation\"")
-	response = readSimpleResponse(t, reader)
+	response = readGetScriptResponse(t, reader)
 	if !strings.HasPrefix(response, "NO") {
 		t.Errorf("GETSCRIPT should fail for deleted script but got: %s", response)
 	} else {
@@ -265,7 +266,7 @@ func TestManageSieveScriptOperations(t *testing.T) {
 		t.Logf("DELETESCRIPT correctly failed for non-existent script")
 	}
 
-	t.Logf("Successfully completed comprehensive ManageSieve script operations test")
+	t.Log("Successfully completed comprehensive ManageSieve script operations test")
 }
 
 // Simple response reader that just gets the first line (for commands that return simple OK/NO)
@@ -278,6 +279,89 @@ func readSimpleResponse(t *testing.T, reader *bufio.Reader) string {
 	}
 
 	return strings.TrimSpace(response)
+}
+
+// readGetScriptResponse handles the multi-line response from GETSCRIPT command
+func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+
+	// Read the first line - should be either {length} or NO
+	firstLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read GETSCRIPT response: %v", err)
+	}
+	firstLine = strings.TrimSpace(firstLine)
+	
+	// If it starts with NO, it's an error response - return it directly
+	if strings.HasPrefix(firstLine, "NO") {
+		return firstLine
+	}
+	
+	// If it starts with {, it's a literal response - read the script content and OK
+	if strings.HasPrefix(firstLine, "{") && strings.HasSuffix(firstLine, "}") {
+		// Extract length from {length}
+		lengthStr := strings.Trim(firstLine, "{}")
+		length := 0
+		if n, err := fmt.Sscanf(lengthStr, "%d", &length); n != 1 || err != nil {
+			t.Fatalf("Invalid literal length in GETSCRIPT response: %s", firstLine)
+		}
+		
+		// Read the script content (exact number of bytes)
+		scriptBytes := make([]byte, length)
+		_, err = io.ReadFull(reader, scriptBytes)
+		if err != nil {
+			t.Fatalf("Failed to read script content: %v", err)
+		}
+		
+		// Read the final OK response
+		finalLine, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
+		}
+		
+		return strings.TrimSpace(finalLine)
+	}
+	
+	// Unexpected format - could be an OK from a previous command
+	if firstLine == "OK" {
+		// This might be a leftover OK response, try to read the actual GETSCRIPT response
+		t.Logf("Got unexpected OK, trying to read actual GETSCRIPT response")
+		actualLine, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read actual GETSCRIPT response after OK: %v", err)
+		}
+		firstLine = strings.TrimSpace(actualLine)
+		
+		// Try to process the actual response
+		if strings.HasPrefix(firstLine, "NO") {
+			return firstLine
+		}
+		if strings.HasPrefix(firstLine, "{") && strings.HasSuffix(firstLine, "}") {
+			// Process as literal response
+			lengthStr := strings.Trim(firstLine, "{}")
+			length := 0
+			if n, err := fmt.Sscanf(lengthStr, "%d", &length); n != 1 || err != nil {
+				t.Fatalf("Invalid literal length in GETSCRIPT response: %s", firstLine)
+			}
+			
+			scriptBytes := make([]byte, length)
+			_, err = io.ReadFull(reader, scriptBytes)
+			if err != nil {
+				t.Fatalf("Failed to read script content: %v", err)
+			}
+			
+			finalLine, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
+			}
+			
+			return strings.TrimSpace(finalLine)
+		}
+	}
+	
+	// Still unexpected format
+	t.Fatalf("Unexpected GETSCRIPT response format: %s", firstLine)
+	return ""
 }
 
 func TestManageSieveMultipleConnections(t *testing.T) {

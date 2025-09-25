@@ -114,9 +114,24 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// No default extensions - only use what's explicitly configured
 
-	// Create connection limiter with trusted networks from proxy configuration
-	trustedProxies := server.GetTrustedProxiesForServer(serverInstance.proxyReader)
-	serverInstance.limiter = server.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP, trustedProxies)
+	// Create connection limiter with trusted networks from server configuration
+	// For ManageSieve backend:
+	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
+	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
+	var limiterTrustedNets []string
+	var limiterMaxPerIP int
+	
+	if options.ProxyProtocol {
+		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
+	} else {
+		// PROXY protocol disabled: use trusted networks for per-IP bypass
+		limiterTrustedNets = options.TrustedNetworks
+		limiterMaxPerIP = options.MaxConnectionsPerIP
+	}
+	
+	serverInstance.limiter = server.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	// Set up TLS config if TLS is enabled and certificates are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
@@ -204,8 +219,18 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			return
 		}
 
-		// Check connection limits
-		releaseConn, err := s.limiter.Accept(conn.RemoteAddr())
+		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
+		var proxyInfoForLimiting *server.ProxyProtocolInfo
+		var realClientIP string
+		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
+			proxyInfoForLimiting = proxyConn.GetProxyInfo()
+			if proxyInfoForLimiting != nil && proxyInfoForLimiting.SrcIP != "" {
+				realClientIP = proxyInfoForLimiting.SrcIP
+			}
+		}
+
+		// Check connection limits with PROXY protocol support
+		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
 			log.Printf("[ManageSieve] Connection rejected: %v", err)
 			conn.Close()

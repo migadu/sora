@@ -22,6 +22,68 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
+type connectionLimitingListener struct {
+	net.Listener
+	limiter *server.ConnectionLimiter
+	name    string
+}
+
+// Accept accepts connections and checks connection limits before returning them
+func (l *connectionLimitingListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+
+		// Extract real client IP and proxy info if this is a PROXY protocol connection
+		var realClientIP string
+		var proxyInfo *server.ProxyProtocolInfo
+		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
+			proxyInfo = proxyConn.GetProxyInfo()
+			if proxyInfo != nil && proxyInfo.SrcIP != "" {
+				realClientIP = proxyInfo.SrcIP
+			}
+		}
+
+		// Check connection limits with PROXY protocol support
+		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
+		if limitErr != nil {
+			log.Printf("[LMTP-%s] Connection rejected: %v", l.name, limitErr)
+			conn.Close()
+			continue // Try to accept the next connection
+		}
+
+		// Wrap the connection to ensure cleanup on close and preserve PROXY info
+		return &connectionLimitingConn{
+			Conn:        conn,
+			releaseFunc: releaseConn,
+			proxyInfo:   proxyInfo,
+		}, nil
+	}
+}
+
+// connectionLimitingConn wraps a net.Conn to ensure connection limit cleanup on close
+type connectionLimitingConn struct {
+	net.Conn
+	releaseFunc func()
+	proxyInfo   *server.ProxyProtocolInfo
+}
+
+// GetProxyInfo implements the same interface as proxyProtocolConn
+func (c *connectionLimitingConn) GetProxyInfo() *server.ProxyProtocolInfo {
+	return c.proxyInfo
+}
+
+func (c *connectionLimitingConn) Close() error {
+	if c.releaseFunc != nil {
+		c.releaseFunc()
+		c.releaseFunc = nil // Prevent double release
+	}
+	return c.Conn.Close()
+}
+
 type LMTPServerBackend struct {
 	addr          string
 	name          string
@@ -105,8 +167,9 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration
+	// LMTP doesn't use per-IP connection limits, only total connection limits
 	limiterTrustedProxies := server.GetTrustedProxiesForServer(backend.proxyReader)
-	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", options.MaxConnections, options.MaxConnectionsPerIP, limiterTrustedProxies)
+	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", options.MaxConnections, 0, limiterTrustedProxies)
 
 	// Initialize Sieve script cache with a reasonable default size and TTL
 	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
@@ -244,13 +307,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
 	}
 
-	// Check connection limits
-	releaseConn, err := b.limiter.Accept(c.Conn().RemoteAddr())
-	if err != nil {
-		log.Printf("[LMTP] Connection rejected: %v", err)
-		return nil, fmt.Errorf("connection limit exceeded: %w", err)
-	}
-
+	// Connection limits are now handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(b.appCtx)
 
 	// Increment connection counters (in LMTP all connections are considered authenticated)
@@ -261,12 +318,11 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Inc()
 
 	s := &LMTPSession{
-		backend:     b,
-		conn:        c,
-		ctx:         sessionCtx,
-		cancel:      sessionCancel,
-		releaseConn: releaseConn,
-		startTime:   time.Now(),
+		backend:   b,
+		conn:      c,
+		ctx:       sessionCtx,
+		cancel:    sessionCancel,
+		startTime: time.Now(),
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
@@ -274,6 +330,8 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	var proxyInfo *server.ProxyProtocolInfo
 	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
 		proxyInfo = proxyConn.GetProxyInfo()
+	} else if limitingConn, ok := netConn.(*connectionLimitingConn); ok {
+		proxyInfo = limitingConn.GetProxyInfo()
 	}
 
 	clientIP, proxyIP := server.GetConnectionIPs(netConn, proxyInfo)
@@ -331,7 +389,14 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 		}
 	}
 
-	if err := b.server.Serve(listener); err != nil {
+	// Wrap listener with connection limiting
+	limitedListener := &connectionLimitingListener{
+		Listener: listener,
+		limiter:  b.limiter,
+		name:     b.name,
+	}
+
+	if err := b.server.Serve(limitedListener); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		if b.appCtx.Err() == nil {
 			errChan <- fmt.Errorf("LMTP server error: %w", err)

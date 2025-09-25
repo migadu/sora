@@ -38,15 +38,19 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	return serverID
 }
 
-// isFromTrustedProxy checks if the connection is from a trusted proxy that can send forwarding parameters
+// isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
 func (s *IMAPSession) isFromTrustedProxy() bool {
 	conn := s.conn.NetConn()
 
-	// Get trusted proxies configuration from server PROXY protocol config
-	// This reuses the same trusted network logic as PROXY protocol
-	trustedProxies := server.GetTrustedProxiesForServer(s.server.proxyReader)
+	// Use the server's limiter trusted networks for ID command forwarding
+	// This ensures consistency with connection limiting behavior
+	if s.server.limiter == nil {
+		return false
+	}
 
-	return server.IsTrustedForwarding(conn, trustedProxies)
+	// Extract IP from connection
+	remoteAddr := conn.RemoteAddr()
+	return s.server.limiter.IsTrustedConnection(remoteAddr)
 }
 
 // processForwardingParameters extracts and validates forwarding parameters from client ID
