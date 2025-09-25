@@ -126,7 +126,7 @@ func TestIMAP_ComprehensiveMailboxStatus(t *testing.T) {
 		t.Errorf("Expected 1 unseen message after adding, got %d", *statusData.NumUnseen)
 	}
 
-	t.Logf("INBOX status after adding messages - Messages: %v, Unseen: %v, UIDNext: %d, UIDValidity: %d, HighestModSeq: %d",
+	t.Logf("INBOX status after adding messages - Messages: %d, Unseen: %d, UIDNext: %d, UIDValidity: %d, HighestModSeq: %d",
 		statusData.NumMessages, statusData.NumUnseen, statusData.UIDNext, statusData.UIDValidity, statusData.HighestModSeq)
 
 	// Test 3: STATUS with selective options
