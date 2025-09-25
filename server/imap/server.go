@@ -296,7 +296,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
 	var limiterTrustedNets []string
 	var limiterMaxPerIP int
-	
+
 	if options.ProxyProtocol {
 		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
 		limiterTrustedNets = options.TrustedNetworks
@@ -306,7 +306,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		limiterTrustedNets = options.TrustedNetworks
 		limiterMaxPerIP = options.MaxConnectionsPerIP
 	}
-	
+
 	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	if s.appendLimit > 0 {

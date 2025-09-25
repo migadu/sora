@@ -117,7 +117,7 @@ func TestLMTPProxyMaxConnectionsLimit(t *testing.T) {
 		defer conn3.Close()
 		// Connection is accepted at TCP level but should be closed quickly by proxy limiter
 		time.Sleep(200 * time.Millisecond)
-		
+
 		// Try to read from connection - should fail if proxy closed it
 		conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 		buffer := make([]byte, 1024)
@@ -171,7 +171,7 @@ func TestLMTPProxyNoPerIPLimiting(t *testing.T) {
 		}
 		connections = append(connections, conn)
 		t.Logf("✓ Connection %d from same IP succeeded", i)
-		
+
 		// Brief pause between connections
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -181,7 +181,7 @@ func TestLMTPProxyNoPerIPLimiting(t *testing.T) {
 }
 
 // setupLMTPProxyWithConnectionLimits creates an LMTP proxy with connection limiting
-func setupLMTPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase, 
+func setupLMTPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase,
 	proxyAddr string, backendAddrs []string, maxConnections int, trustedProxies []string) *common.TestServer {
 	t.Helper()
 
@@ -201,7 +201,7 @@ func setupLMTPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 		SessionTimeout:         10 * time.Minute,
 		EnableAffinity:         false,
 		TrustedProxies:         trustedProxies, // These are the trusted networks that can connect
-		
+
 		// Connection limiting (total connections only for LMTP)
 		MaxConnections: maxConnections,
 	}
@@ -214,8 +214,8 @@ func setupLMTPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 	// Start proxy in background
 	errChan := make(chan error, 1)
 	go func() {
-		if err := proxy.Start(); err != nil && 
-		   !strings.Contains(err.Error(), "use of closed network connection") {
+		if err := proxy.Start(); err != nil &&
+			!strings.Contains(err.Error(), "use of closed network connection") {
 			errChan <- fmt.Errorf("LMTP proxy error: %w", err)
 		}
 	}()

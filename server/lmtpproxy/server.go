@@ -42,7 +42,7 @@ type Server struct {
 
 	// Trusted networks for connection filtering
 	trustedNetworks []*net.IPNet
-	
+
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	limiter *server.ConnectionLimiter
 }
@@ -69,7 +69,7 @@ type ServerOptions struct {
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 	MaxMessageSize         int64
-	
+
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
 }

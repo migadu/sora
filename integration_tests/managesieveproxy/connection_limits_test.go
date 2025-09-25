@@ -27,14 +27,14 @@ func TestManageSieveProxyPerIPConnectionLimiting(t *testing.T) {
 
 	// Set up ManageSieve proxy with connection limits
 	proxyAddress := common.GetRandomAddress(t)
-	
+
 	// Test scenario:
-	// - maxTotal=10, maxPerIP=2 
+	// - maxTotal=10, maxPerIP=2
 	// - trusted_networks=["192.168.1.0/24"] (specific trusted network, NOT localhost)
 	// - Connections from 127.0.0.1 should be limited to 2 per IP
 	// - Connections from 192.168.1.100 should be unlimited (trusted)
-	
-	proxy := setupManageSieveProxyWithConnectionLimits(t, backendServer.ResilientDB, proxyAddress, 
+
+	proxy := setupManageSieveProxyWithConnectionLimits(t, backendServer.ResilientDB, proxyAddress,
 		[]string{backendServer.Address}, 10, 2, []string{"192.168.1.0/24"})
 	defer proxy.Close()
 
@@ -44,7 +44,7 @@ func TestManageSieveProxyPerIPConnectionLimiting(t *testing.T) {
 
 	// Test 1: Connections from localhost (NOT in trusted networks) should be limited
 	t.Log("\n--- Test 1: Non-trusted IP (localhost) should be limited to maxPerIP ---")
-	
+
 	var connections []interface{} // We'll use net.Conn for TCP-level testing
 	defer func() {
 		for _, c := range connections {
@@ -81,7 +81,7 @@ func TestManageSieveProxyPerIPConnectionLimiting(t *testing.T) {
 		defer conn3.Close()
 		// Connection is accepted at TCP level but should be closed quickly by proxy limiter
 		time.Sleep(200 * time.Millisecond)
-		
+
 		// Try to perform a simple operation to test if connection is alive
 		isAlive := testManageSieveConnectionAlive(conn3)
 		if !isAlive {
@@ -110,7 +110,7 @@ func TestManageSieveProxyPerIPConnectionLimiting(t *testing.T) {
 	t.Log("\n--- Test 2: Trusted IP behavior (documented expectation) ---")
 	t.Log("Expected: Connections from 192.168.1.0/24 should bypass per-IP limits")
 	t.Log("Note: Integration test limitation - can't easily simulate different source IPs")
-	
+
 	// Test 3: Total connection limit should still apply
 	t.Log("\n--- Test 3: Total connection limit should be respected ---")
 	t.Log("This would require maxTotal connections, but limited by test resources")
@@ -118,8 +118,8 @@ func TestManageSieveProxyPerIPConnectionLimiting(t *testing.T) {
 }
 
 // setupManageSieveProxyWithConnectionLimits creates a ManageSieve proxy with connection limiting
-func setupManageSieveProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase, 
-	proxyAddr string, backendAddrs []string, maxConnections, maxConnectionsPerIP int, 
+func setupManageSieveProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase,
+	proxyAddr string, backendAddrs []string, maxConnections, maxConnectionsPerIP int,
 	trustedNetworks []string) *common.TestServer {
 	t.Helper()
 
@@ -146,7 +146,7 @@ func setupManageSieveProxyWithConnectionLimits(t *testing.T, rdb *resilient.Resi
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		
+
 		// Connection limiting options
 		MaxConnections:      maxConnections,
 		MaxConnectionsPerIP: maxConnectionsPerIP,
@@ -161,8 +161,8 @@ func setupManageSieveProxyWithConnectionLimits(t *testing.T, rdb *resilient.Resi
 	// Start proxy in background
 	errChan := make(chan error, 1)
 	go func() {
-		if err := proxy.Start(); err != nil && 
-		   !strings.Contains(err.Error(), "use of closed network connection") {
+		if err := proxy.Start(); err != nil &&
+			!strings.Contains(err.Error(), "use of closed network connection") {
 			errChan <- fmt.Errorf("ManageSieve proxy error: %w", err)
 		}
 	}()

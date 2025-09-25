@@ -24,11 +24,11 @@ const (
 )
 
 type HTTPAPITestServer struct {
-	URL         string
-	server      *httpapi.Server
-	rdb         *resilient.ResilientDatabase
-	cache       *cache.Cache
-	cleanup     func()
+	URL     string
+	server  *httpapi.Server
+	rdb     *resilient.ResilientDatabase
+	cache   *cache.Cache
+	cleanup func()
 }
 
 func (h *HTTPAPITestServer) Close() {
@@ -40,10 +40,10 @@ func (h *HTTPAPITestServer) Close() {
 // setupHTTPAPIServer creates a test HTTP API server
 func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	t.Helper()
-	
+
 	// Set up database
 	rdb := common.SetupTestDatabase(t)
-	
+
 	// Set up cache
 	cacheDir := t.TempDir()
 	sourceDB := &testSourceDB{rdb: rdb}
@@ -51,10 +51,10 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	if err != nil {
 		t.Fatalf("Failed to create test cache: %v", err)
 	}
-	
+
 	// Get random port
 	addr := common.GetRandomAddress(t)
-	
+
 	// Create server options
 	options := httpapi.ServerOptions{
 		Addr:         addr,
@@ -63,22 +63,22 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 		Cache:        testCache,
 		TLS:          false,
 	}
-	
+
 	// Create server
 	server, err := httpapi.New(rdb, options)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP API server: %v", err)
 	}
-	
+
 	// Start server in background
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
-	
+
 	go httpapi.Start(ctx, rdb, options, errChan)
-	
+
 	// Wait a bit for server to start
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Check if server started successfully
 	select {
 	case err := <-errChan:
@@ -87,14 +87,14 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	default:
 		// Server started successfully
 	}
-	
+
 	cleanup := func() {
 		cancel()
 		testCache.Close()
 	}
-	
+
 	baseURL := fmt.Sprintf("http://%s", addr)
-	
+
 	return &HTTPAPITestServer{
 		URL:     baseURL,
 		server:  server,
@@ -120,7 +120,7 @@ func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, 
 // HTTP client helpers
 func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, body interface{}) (*http.Response, []byte) {
 	t.Helper()
-	
+
 	var reqBody []byte
 	if body != nil {
 		var err error
@@ -129,34 +129,34 @@ func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, b
 			t.Fatalf("Failed to marshal request body: %v", err)
 		}
 	}
-	
+
 	url := h.URL + endpoint
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
-	
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+testAPIKey)
-	
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
 	}
-	
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 	resp.Body.Close()
-	
+
 	return resp, respBody
 }
 
 func (h *HTTPAPITestServer) expectJSON(t *testing.T, respBody []byte, target interface{}) {
 	t.Helper()
-	
+
 	if err := json.Unmarshal(respBody, target); err != nil {
 		t.Fatalf("Failed to unmarshal response: %v\nResponse body: %s", err, string(respBody))
 	}
@@ -164,10 +164,10 @@ func (h *HTTPAPITestServer) expectJSON(t *testing.T, respBody []byte, target int
 
 func (h *HTTPAPITestServer) expectError(t *testing.T, respBody []byte, expectedMessage string) {
 	t.Helper()
-	
+
 	var errorResp map[string]string
 	h.expectJSON(t, respBody, &errorResp)
-	
+
 	if !strings.Contains(errorResp["error"], expectedMessage) {
 		t.Errorf("Expected error message to contain %q, got: %s", expectedMessage, errorResp["error"])
 	}
@@ -178,58 +178,58 @@ func (h *HTTPAPITestServer) expectError(t *testing.T, respBody []byte, expectedM
 func TestAccountCRUD(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	testEmail := fmt.Sprintf("test-crud-%d@example.com", time.Now().UnixNano())
-	
+
 	// 1. Create account
 	reqBody := httpapi.CreateAccountRequest{
 		Email:    testEmail,
 		Password: "test-password-123",
 	}
-	
+
 	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
-	
+
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
 	}
-	
+
 	var result map[string]interface{}
 	server.expectJSON(t, body, &result)
-	
+
 	if result["email"] != testEmail {
 		t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 	}
-	
+
 	if result["message"] != "Account created successfully" {
 		t.Errorf("Expected success message, got %v", result["message"])
 	}
-	
+
 	// 2. Check account exists
 	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/exists", nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	if result["email"] != testEmail {
 		t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 	}
-	
+
 	if result["exists"] != true {
 		t.Errorf("Expected exists to be true, got %v", result["exists"])
 	}
-	
+
 	// 3. Get account details
 	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	// Should contain account details - check if email field exists in some form
 	if result["address"] != nil {
 		// API might return "address" instead of "email"
@@ -243,78 +243,78 @@ func TestAccountCRUD(t *testing.T) {
 	} else {
 		t.Errorf("Expected either email or address field in account details, got: %v", result)
 	}
-	
+
 	// 4. Update account
 	updateReq := httpapi.UpdateAccountRequest{
 		Password: "new-password-456",
 	}
-	
+
 	resp, body = server.makeRequest(t, "PUT", "/api/v1/accounts/"+testEmail, updateReq)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	if result["message"] != "Account updated successfully" {
 		t.Errorf("Expected success message, got %v", result["message"])
 	}
-	
+
 	// 5. List accounts
 	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts", nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	accounts, ok := result["accounts"].([]interface{})
 	if !ok {
 		t.Errorf("Expected accounts to be an array, got %T", result["accounts"])
 	}
-	
+
 	// Should contain at least our test account
 	if len(accounts) == 0 {
 		t.Error("Expected at least one account")
 	}
-	
+
 	total, ok := result["total"].(float64)
 	if !ok || int(total) != len(accounts) {
 		t.Errorf("Expected total to match accounts length, got total=%v, len=%d", result["total"], len(accounts))
 	}
-	
+
 	// 6. Delete account
 	resp, body = server.makeRequest(t, "DELETE", "/api/v1/accounts/"+testEmail, nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	if result["email"] != testEmail {
 		t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 	}
-	
+
 	if !strings.Contains(result["message"].(string), "soft-deleted successfully") {
 		t.Errorf("Expected soft-delete message, got %v", result["message"])
 	}
-	
+
 	// 7. Restore account
 	resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/restore", nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	if result["email"] != testEmail {
 		t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 	}
-	
+
 	if !strings.Contains(result["message"].(string), "restored successfully") {
 		t.Errorf("Expected restore message, got %v", result["message"])
 	}
@@ -323,10 +323,10 @@ func TestAccountCRUD(t *testing.T) {
 func TestMultiCredentialAccount(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	primaryEmail := fmt.Sprintf("primary-%d@example.com", time.Now().UnixNano())
 	secondaryEmail := fmt.Sprintf("secondary-%d@example.com", time.Now().UnixNano())
-	
+
 	// Create account with multiple credentials
 	reqBody := httpapi.CreateAccountRequest{
 		Credentials: []httpapi.CreateCredentialSpec{
@@ -344,77 +344,77 @@ func TestMultiCredentialAccount(t *testing.T) {
 			},
 		},
 	}
-	
+
 	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
-	
+
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
 	}
-	
+
 	var result map[string]interface{}
 	server.expectJSON(t, body, &result)
-	
+
 	if result["message"] != "Account created successfully with multiple credentials" {
 		t.Errorf("Expected multi-credential success message, got %v", result["message"])
 	}
-	
+
 	credentials, ok := result["credentials"].([]interface{})
 	if !ok || len(credentials) != 2 {
 		t.Errorf("Expected 2 credentials, got %v", result["credentials"])
 	}
-	
+
 	// List credentials for primary email
 	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+primaryEmail+"/credentials", nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	credentials, ok = result["credentials"].([]interface{})
 	if !ok || len(credentials) < 2 {
 		t.Errorf("Expected at least 2 credentials, got %v", result["credentials"])
 	}
-	
+
 	count, ok := result["count"].(float64)
 	if !ok || int(count) != len(credentials) {
 		t.Errorf("Expected count to match credentials length, got count=%v, len=%d", result["count"], len(credentials))
 	}
-	
+
 	// Add additional credential
 	additionalEmail := fmt.Sprintf("additional-%d@example.com", time.Now().UnixNano())
-	
+
 	addReq := httpapi.AddCredentialRequest{
 		Email:    additionalEmail,
 		Password: "additional-password",
 	}
-	
+
 	resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+primaryEmail+"/credentials", addReq)
-	
+
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	if result["new_email"] != additionalEmail {
 		t.Errorf("Expected new_email %s, got %v", additionalEmail, result["new_email"])
 	}
-	
+
 	if result["message"] != "Credential added successfully" {
 		t.Errorf("Expected success message, got %v", result["message"])
 	}
-	
+
 	// Get credential details
 	resp, body = server.makeRequest(t, "GET", "/api/v1/credentials/"+secondaryEmail, nil)
-	
+
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 	}
-	
+
 	server.expectJSON(t, body, &result)
-	
+
 	// Should contain credential details - check for either email or address field
 	if result["address"] != nil {
 		if result["address"] != secondaryEmail {
@@ -434,17 +434,17 @@ func TestMultiCredentialAccount(t *testing.T) {
 func TestConnectionManagement(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("list connections", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/connections", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		connections := []interface{}{}
 		if result["connections"] != nil {
 			var ok bool
@@ -453,50 +453,50 @@ func TestConnectionManagement(t *testing.T) {
 				t.Errorf("Expected connections to be an array, got %T", result["connections"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(connections) {
 			t.Errorf("Expected count to match connections length, got count=%v, len=%d", result["count"], len(connections))
 		}
 	})
-	
+
 	t.Run("get connection stats", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/connections/stats", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		// Should contain some stats fields - just verify we get a valid JSON response
 		// The exact fields returned depend on the actual server state
 	})
-	
+
 	t.Run("kick connections by criteria", func(t *testing.T) {
 		reqBody := map[string]string{
 			"protocol": "IMAP",
 		}
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/connections/kick", reqBody)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if !strings.Contains(result["message"].(string), "marked for termination") {
 			t.Errorf("Expected termination message, got %v", result["message"])
 		}
-		
+
 		if _, ok := result["connections_marked"]; !ok {
 			t.Error("Expected connections_marked field")
 		}
 	})
-	
+
 	// Create a test account to test user connections
 	testEmail := fmt.Sprintf("conn-test-%d@example.com", time.Now().UnixNano())
 	reqBody := httpapi.CreateAccountRequest{
@@ -504,21 +504,21 @@ func TestConnectionManagement(t *testing.T) {
 		Password: "test-password-123",
 	}
 	server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
-	
+
 	t.Run("get user connections", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/connections/user/"+testEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["email"] != testEmail {
 			t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 		}
-		
+
 		connections := []interface{}{}
 		if result["connections"] != nil {
 			var ok bool
@@ -527,7 +527,7 @@ func TestConnectionManagement(t *testing.T) {
 				t.Errorf("Expected connections to be an array, got %T", result["connections"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(connections) {
 			t.Errorf("Expected count to match connections length, got count=%v, len=%d", result["count"], len(connections))
@@ -540,31 +540,31 @@ func TestConnectionManagement(t *testing.T) {
 func TestCacheManagement(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("get cache stats", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/stats", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		// Should return valid JSON response with cache stats
 		// The exact fields returned depend on the cache state
 	})
-	
+
 	t.Run("get cache metrics - latest", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?latest=true", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		metrics := []interface{}{}
 		if result["metrics"] != nil {
 			var ok bool
@@ -573,51 +573,51 @@ func TestCacheManagement(t *testing.T) {
 				t.Errorf("Expected metrics to be an array, got %T", result["metrics"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(metrics) {
 			t.Errorf("Expected count to match metrics length, got count=%v, len=%d", result["count"], len(metrics))
 		}
 	})
-	
+
 	t.Run("get cache metrics - historical", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?limit=10", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		// Check that metrics field is an array if present
 		if result["metrics"] != nil {
 			if _, ok := result["metrics"].([]interface{}); !ok {
 				t.Errorf("Expected metrics to be an array, got %T", result["metrics"])
 			}
 		}
-		
+
 		// Verify we got a valid JSON response
 	})
-	
+
 	t.Run("purge cache", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "POST", "/api/v1/cache/purge", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if !strings.Contains(result["message"].(string), "purged successfully") {
 			t.Errorf("Expected purge success message, got %v", result["message"])
 		}
-		
+
 		if _, ok := result["stats_before"]; !ok {
 			t.Error("Expected stats_before field")
 		}
-		
+
 		if _, ok := result["stats_after"]; !ok {
 			t.Error("Expected stats_after field")
 		}
@@ -629,46 +629,46 @@ func TestCacheManagement(t *testing.T) {
 func TestHealthMonitoring(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("get health overview", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/health/overview", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		// Health overview should contain system-wide health information
 		// The exact structure depends on your implementation
 	})
-	
+
 	t.Run("get health overview for specific hostname", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/health/overview?hostname=test-host", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
 	})
-	
+
 	t.Run("get health statuses by host", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["hostname"] != "test-host" {
 			t.Errorf("Expected hostname test-host, got %v", result["hostname"])
 		}
-		
+
 		statuses := []interface{}{}
 		if result["statuses"] != nil {
 			var ok bool
@@ -677,46 +677,46 @@ func TestHealthMonitoring(t *testing.T) {
 				t.Errorf("Expected statuses to be an array, got %T", result["statuses"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(statuses) {
 			t.Errorf("Expected count to match statuses length, got count=%v, len=%d", result["count"], len(statuses))
 		}
 	})
-	
+
 	t.Run("get health status by component", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host/components/database", nil)
-		
+
 		// This might return 404 if no health status exists, which is okay for testing
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusOK, http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		if resp.StatusCode == http.StatusOK {
 			var result map[string]interface{}
 			server.expectJSON(t, body, &result)
 			// Should contain health status details
 		}
 	})
-	
+
 	t.Run("get health history", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host/components/database?history=true&limit=5", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["hostname"] != "test-host" {
 			t.Errorf("Expected hostname test-host, got %v", result["hostname"])
 		}
-		
+
 		if result["component"] != "database" {
 			t.Errorf("Expected component database, got %v", result["component"])
 		}
-		
+
 		history := []interface{}{}
 		if result["history"] != nil {
 			var ok bool
@@ -725,7 +725,7 @@ func TestHealthMonitoring(t *testing.T) {
 				t.Errorf("Expected history to be an array, got %T", result["history"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(history) {
 			t.Errorf("Expected count to match history length, got count=%v, len=%d", result["count"], len(history))
@@ -738,36 +738,36 @@ func TestHealthMonitoring(t *testing.T) {
 func TestUploaderMonitoring(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("get uploader status", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/status", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if _, ok := result["stats"]; !ok {
 			t.Error("Expected stats field in uploader status")
 		}
 	})
-	
+
 	t.Run("get uploader status with failed uploads", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/status?show_failed=true&failed_limit=5", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if _, ok := result["stats"]; !ok {
 			t.Error("Expected stats field")
 		}
-		
+
 		failedUploads := []interface{}{}
 		if result["failed_uploads"] != nil {
 			var ok bool
@@ -776,23 +776,23 @@ func TestUploaderMonitoring(t *testing.T) {
 				t.Errorf("Expected failed_uploads to be an array, got %T", result["failed_uploads"])
 			}
 		}
-		
+
 		failedCount, ok := result["failed_count"].(float64)
 		if !ok || int(failedCount) != len(failedUploads) {
 			t.Errorf("Expected failed_count to match failed_uploads length, got count=%v, len=%d", result["failed_count"], len(failedUploads))
 		}
 	})
-	
+
 	t.Run("get failed uploads", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/failed?limit=10", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		failedUploads := []interface{}{}
 		if result["failed_uploads"] != nil {
 			var ok bool
@@ -801,16 +801,16 @@ func TestUploaderMonitoring(t *testing.T) {
 				t.Errorf("Expected failed_uploads to be an array, got %T", result["failed_uploads"])
 			}
 		}
-		
+
 		count, ok := result["count"].(float64)
 		if !ok || int(count) != len(failedUploads) {
 			t.Errorf("Expected count to match failed_uploads length, got count=%v, len=%d", result["count"], len(failedUploads))
 		}
-		
+
 		if _, ok := result["limit"]; !ok {
 			t.Error("Expected limit field")
 		}
-		
+
 		if _, ok := result["max_attempts"]; !ok {
 			t.Error("Expected max_attempts field")
 		}
@@ -822,44 +822,44 @@ func TestUploaderMonitoring(t *testing.T) {
 func TestAuthStatistics(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("get auth stats - default window", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if _, ok := result["stats"]; !ok {
 			t.Error("Expected stats field")
 		}
-		
+
 		if _, ok := result["window"]; !ok {
 			t.Error("Expected window field")
 		}
-		
+
 		if _, ok := result["window_seconds"]; !ok {
 			t.Error("Expected window_seconds field")
 		}
 	})
-	
+
 	t.Run("get auth stats - custom window", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats?window=1h", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["window"] != "1h0m0s" {
 			t.Errorf("Expected window 1h0m0s, got %v", result["window"])
 		}
-		
+
 		windowSeconds, ok := result["window_seconds"].(float64)
 		if !ok || windowSeconds != 3600 {
 			t.Errorf("Expected window_seconds 3600, got %v", result["window_seconds"])
@@ -872,40 +872,40 @@ func TestAuthStatistics(t *testing.T) {
 func TestSystemConfiguration(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("get config info", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/config", nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["api_version"] != "v1" {
 			t.Errorf("Expected api_version v1, got %v", result["api_version"])
 		}
-		
+
 		if result["server_type"] != "sora-http-api" {
 			t.Errorf("Expected server_type sora-http-api, got %v", result["server_type"])
 		}
-		
+
 		featuresEnabled, ok := result["features_enabled"].(map[string]interface{})
 		if !ok {
 			t.Errorf("Expected features_enabled to be an object, got %T", result["features_enabled"])
 		}
-		
+
 		// Check that cache management is enabled since we have a cache
 		if featuresEnabled["cache_management"] != true {
 			t.Errorf("Expected cache_management to be enabled, got %v", featuresEnabled["cache_management"])
 		}
-		
+
 		endpoints, ok := result["endpoints"].(map[string]interface{})
 		if !ok {
 			t.Errorf("Expected endpoints to be an object, got %T", result["endpoints"])
 		}
-		
+
 		// Check that account management endpoints are listed
 		accountMgmt, ok := endpoints["account_management"].([]interface{})
 		if !ok || len(accountMgmt) == 0 {
@@ -919,206 +919,206 @@ func TestSystemConfiguration(t *testing.T) {
 func TestErrorScenarios(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	t.Run("unauthorized request - no API key", func(t *testing.T) {
 		url := server.URL + "/api/v1/accounts"
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		
+
 		// Don't set Authorization header
 		req.Header.Set("Content-Type", "application/json")
-		
+
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("Failed to make request: %v", err)
 		}
 		defer resp.Body.Close()
-		
+
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
-		
+
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusUnauthorized, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "Authorization header required")
 	})
-	
+
 	t.Run("unauthorized request - wrong API key", func(t *testing.T) {
 		url := server.URL + "/api/v1/accounts"
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
 		}
-		
+
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer wrong-api-key")
-		
+
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("Failed to make request: %v", err)
 		}
 		defer resp.Body.Close()
-		
+
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("Failed to read response body: %v", err)
 		}
-		
+
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusForbidden, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "Invalid API key")
 	})
-	
+
 	t.Run("account not found", func(t *testing.T) {
 		nonExistentEmail := "nonexistent@example.com"
-		
+
 		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/"+nonExistentEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "Account not found")
 	})
-	
+
 	t.Run("duplicate account creation", func(t *testing.T) {
 		testEmail := fmt.Sprintf("duplicate-test-%d@example.com", time.Now().UnixNano())
-		
+
 		reqBody := httpapi.CreateAccountRequest{
 			Email:    testEmail,
 			Password: "test-password-123",
 		}
-		
+
 		// Create account first time
 		resp1, body1 := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
 		if resp1.StatusCode != http.StatusCreated {
 			t.Errorf("First creation should succeed. Status: %d, Body: %s", resp1.StatusCode, string(body1))
 		}
-		
+
 		// Try to create same account again
 		resp2, body2 := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
-		
+
 		// The API might return 409 Conflict or 500 Internal Server Error depending on how it handles duplicates
 		if resp2.StatusCode != http.StatusConflict && resp2.StatusCode != http.StatusInternalServerError {
 			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusConflict, http.StatusInternalServerError, resp2.StatusCode, string(body2))
 		}
-		
+
 		// Check that it's some kind of error about the account existing or creation failing
 		bodyStr := string(body2)
 		if !strings.Contains(bodyStr, "already exists") && !strings.Contains(bodyStr, "Failed to create") && !strings.Contains(bodyStr, "unique") && !strings.Contains(bodyStr, "duplicate") {
 			t.Errorf("Expected error message about duplicate/existing account, got: %s", bodyStr)
 		}
 	})
-	
+
 	t.Run("invalid email format", func(t *testing.T) {
 		reqBody := httpapi.CreateAccountRequest{
 			Email:    "invalid-email-format",
 			Password: "test-password-123",
 		}
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
-		
+
 		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusInternalServerError {
 			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusBadRequest, http.StatusInternalServerError, resp.StatusCode, string(body))
 		}
-		
+
 		// Should contain some error about invalid email
 		if !strings.Contains(string(body), "error") {
 			t.Errorf("Expected error message, got: %s", string(body))
 		}
 	})
-	
+
 	t.Run("delete non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-delete@example.com"
-		
+
 		resp, body := server.makeRequest(t, "DELETE", "/api/v1/accounts/"+nonExistentEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("restore non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-restore@example.com"
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+nonExistentEmail+"/restore", nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("add credential to non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-primary@example.com"
-		
+
 		reqBody := httpapi.AddCredentialRequest{
 			Email:    "secondary@example.com",
 			Password: "password",
 		}
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+nonExistentEmail+"/credentials", reqBody)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("get credential for non-existent email", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-credential@example.com"
-		
+
 		resp, body := server.makeRequest(t, "GET", "/api/v1/credentials/"+nonExistentEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("delete non-existent credential", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-credential@example.com"
-		
+
 		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+nonExistentEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("invalid auth stats window", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats?window=invalid-duration", nil)
-		
+
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "Invalid window duration")
 	})
-	
+
 	t.Run("invalid cache metrics since parameter", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?since=invalid-time", nil)
-		
+
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "Invalid since parameter")
 	})
 }
@@ -1128,10 +1128,10 @@ func TestErrorScenarios(t *testing.T) {
 func TestCredentialManagementEdgeCases(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	primaryEmail := fmt.Sprintf("edge-primary-%d@example.com", time.Now().UnixNano())
 	secondaryEmail := fmt.Sprintf("edge-secondary-%d@example.com", time.Now().UnixNano())
-	
+
 	// Create account with multiple credentials
 	reqBody := httpapi.CreateAccountRequest{
 		Credentials: []httpapi.CreateCredentialSpec{
@@ -1149,74 +1149,74 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 			},
 		},
 	}
-	
+
 	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("Failed to create test account: %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	t.Run("add duplicate credential email", func(t *testing.T) {
 		addReq := httpapi.AddCredentialRequest{
 			Email:    secondaryEmail, // Already exists
 			Password: "new-password",
 		}
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+primaryEmail+"/credentials", addReq)
-		
+
 		if resp.StatusCode != http.StatusConflict {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusConflict, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "already exists")
 	})
-	
+
 	t.Run("try to delete primary credential", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+primaryEmail, nil)
-		
+
 		// Should not allow deleting primary credential if it would leave account without credentials
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "cannot delete")
 	})
-	
+
 	t.Run("delete secondary credential - should succeed", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+secondaryEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
-		
+
 		var result map[string]interface{}
 		server.expectJSON(t, body, &result)
-		
+
 		if result["email"] != secondaryEmail {
 			t.Errorf("Expected email %s, got %v", secondaryEmail, result["email"])
 		}
-		
+
 		if !strings.Contains(result["message"].(string), "deleted successfully") {
 			t.Errorf("Expected success message, got %v", result["message"])
 		}
 	})
-	
+
 	t.Run("verify credential was deleted", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/api/v1/credentials/"+secondaryEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "not found")
 	})
-	
+
 	t.Run("try to delete last remaining credential", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+primaryEmail, nil)
-		
+
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-		
+
 		server.expectError(t, body, "cannot delete")
 	})
 }
@@ -1226,84 +1226,84 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 func TestAccountLifecycle(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
-	
+
 	testEmail := fmt.Sprintf("lifecycle-test-%d@example.com", time.Now().UnixNano())
-	
+
 	t.Run("complete account lifecycle", func(t *testing.T) {
 		// 1. Create account
 		createReq := httpapi.CreateAccountRequest{
 			Email:    testEmail,
 			Password: "initial-password",
 		}
-		
+
 		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", createReq)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("Failed to create account: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		// 2. Verify account exists
 		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/exists", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to check account existence: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		var existsResult map[string]interface{}
 		server.expectJSON(t, body, &existsResult)
 		if existsResult["exists"] != true {
 			t.Errorf("Account should exist, got %v", existsResult["exists"])
 		}
-		
+
 		// 3. Update password
 		updateReq := httpapi.UpdateAccountRequest{
 			Password: "new-password",
 		}
-		
+
 		resp, body = server.makeRequest(t, "PUT", "/api/v1/accounts/"+testEmail, updateReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to update account: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		// 4. Add secondary credential
 		addCredReq := httpapi.AddCredentialRequest{
 			Email:    fmt.Sprintf("secondary-%s", testEmail),
 			Password: "secondary-password",
 		}
-		
+
 		resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/credentials", addCredReq)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("Failed to add credential: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		// 5. List credentials
 		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/credentials", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list credentials: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		var credsResult map[string]interface{}
 		server.expectJSON(t, body, &credsResult)
 		credentials := credsResult["credentials"].([]interface{})
 		if len(credentials) < 2 {
 			t.Errorf("Expected at least 2 credentials, got %d", len(credentials))
 		}
-		
+
 		// 6. Delete account (soft delete)
 		resp, body = server.makeRequest(t, "DELETE", "/api/v1/accounts/"+testEmail, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to delete account: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		// 7. Verify account is marked as deleted
 		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
 		// This might return different status codes depending on how soft delete is implemented
 		// The account might still be retrievable but marked as deleted
-		
+
 		// 8. Restore account
 		resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/restore", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to restore account: %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		// 9. Verify account is restored and accessible
 		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
 		if resp.StatusCode != http.StatusOK {

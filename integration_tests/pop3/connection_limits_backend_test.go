@@ -76,7 +76,7 @@ func TestPOP3BackendConnectionLimitsNoProxy(t *testing.T) {
 		t.Fatalf("First connection should succeed: %v", err)
 	}
 	connections = append(connections, conn1)
-	
+
 	// Read greeting
 	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buffer := make([]byte, 1024)
@@ -103,12 +103,12 @@ func TestPOP3BackendXCLIENTCommandTrustedNetworks(t *testing.T) {
 	// XCLIENT command behavior:
 	// - Only connections from trusted_networks can pass proxying info via XCLIENT command
 	// - Other connections: XCLIENT command returns error message
-	
+
 	t.Log("=== Testing POP3 Backend XCLIENT Command Trusted Networks ===")
 	t.Log("Expected behavior (documented due to integration test complexity):")
 	t.Log("1. Connections from trusted_networks: XCLIENT command forwarding parameters processed")
 	t.Log("2. Connections from non-trusted networks: XCLIENT command returns error")
 	t.Log("3. Error returned: '-ERR Connection not from trusted proxy'")
-	
+
 	t.Log("XCLIENT command trusted networks test completed")
 }

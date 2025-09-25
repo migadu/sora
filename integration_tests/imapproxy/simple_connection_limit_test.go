@@ -39,7 +39,7 @@ func TestIMAPProxySimpleConnectionLimit(t *testing.T) {
 	// Give a moment for the connection to be processed
 	time.Sleep(100 * time.Millisecond)
 
-	// Second connection from same IP should be REJECTED (maxPerIP=1)  
+	// Second connection from same IP should be REJECTED (maxPerIP=1)
 	t.Log("Attempting second connection from same IP (should be rejected)...")
 	conn2, err := net.Dial("tcp", proxyAddress)
 	if err != nil {
@@ -48,7 +48,7 @@ func TestIMAPProxySimpleConnectionLimit(t *testing.T) {
 		defer conn2.Close()
 		// Connection is accepted at TCP level but should be closed quickly by proxy limiter
 		time.Sleep(200 * time.Millisecond)
-		
+
 		// Try to read from connection - should fail if proxy closed it
 		conn2.SetReadDeadline(time.Now().Add(1 * time.Second))
 		buffer := make([]byte, 1024)

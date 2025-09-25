@@ -212,7 +212,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 				SELECT 1 FROM messages m
 				WHERE m.content_hash = message_contents.content_hash
 				  AND m.expunged_at IS NULL
-				  AND m.sent_date >= (now() - $1)
+				  AND m.sent_date >= (now() - $1::interval)
 			  )
 		)
 	`

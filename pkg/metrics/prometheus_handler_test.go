@@ -100,7 +100,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		// Reset and set up test data
 		ConnectionsTotal.Reset()
 		ConnectionsCurrent.Reset()
-		
+
 		ConnectionsTotal.WithLabelValues("imap").Add(100)
 		ConnectionsCurrent.WithLabelValues("imap").Set(25)
 
@@ -139,7 +139,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 	t.Run("histogram_metrics_format", func(t *testing.T) {
 		// Reset and set up histogram
 		ConnectionDuration.Reset()
-		
+
 		ConnectionDuration.WithLabelValues("imap").Observe(0.1)
 		ConnectionDuration.WithLabelValues("imap").Observe(1.0)
 		ConnectionDuration.WithLabelValues("imap").Observe(5.0)
@@ -184,7 +184,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 	t.Run("multiple_label_values", func(t *testing.T) {
 		// Reset and set up metrics with multiple label combinations
 		DBQueriesTotal.Reset()
-		
+
 		DBQueriesTotal.WithLabelValues("SELECT", "success", "read").Add(100)
 		DBQueriesTotal.WithLabelValues("INSERT", "failure", "write").Add(5)
 		DBQueriesTotal.WithLabelValues("UPDATE", "success", "write").Add(50)
@@ -223,14 +223,14 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 	t.Run("concurrent_access", func(t *testing.T) {
 		// Reset metrics
 		ConnectionsTotal.Reset()
-		
+
 		handler := promhttp.Handler()
 		server := httptest.NewServer(handler)
 		defer server.Close()
 
 		// Simulate concurrent metric updates and endpoint access
 		done := make(chan bool)
-		
+
 		// Goroutine updating metrics
 		go func() {
 			for i := 0; i < 100; i++ {
@@ -249,7 +249,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 					return
 				}
 				resp.Body.Close()
-				
+
 				if resp.StatusCode != http.StatusOK {
 					t.Errorf("Expected status 200, got %d", resp.StatusCode)
 				}
@@ -258,7 +258,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 
 		// Wait for metric updates to complete
 		<-done
-		
+
 		// Final check
 		resp, err := http.Get(server.URL)
 		if err != nil {
@@ -336,7 +336,7 @@ func TestPrometheusHandlerErrorCases(t *testing.T) {
 	t.Run("gatherer_error", func(t *testing.T) {
 		// Create a custom gatherer that returns an error
 		errorGatherer := &errorGatherer{}
-		
+
 		handler := promhttp.HandlerFor(errorGatherer, promhttp.HandlerOpts{})
 		server := httptest.NewServer(handler)
 		defer server.Close()
@@ -476,7 +476,6 @@ func TestPrometheusMetricsServer(t *testing.T) {
 	})
 }
 
-
 func TestMetricsWithRealWorldData(t *testing.T) {
 	t.Run("realistic_metrics_scenario", func(t *testing.T) {
 		// Reset all metrics
@@ -489,7 +488,7 @@ func TestMetricsWithRealWorldData(t *testing.T) {
 
 		// Simulate realistic server activity
 		protocols := []string{"imap", "pop3", "lmtp"}
-		
+
 		// Connection activity
 		for _, protocol := range protocols {
 			ConnectionsTotal.WithLabelValues(protocol).Add(1000)

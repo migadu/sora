@@ -36,7 +36,7 @@ type POP3ProxyServer struct {
 	prelookupConfig    *proxy.PreLookupConfig
 	sessionTimeout     time.Duration
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
-	
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 }
@@ -64,7 +64,7 @@ type POP3ProxyServerOptions struct {
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
-	
+
 	// Connection limiting
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)

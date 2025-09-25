@@ -120,7 +120,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
 	var limiterTrustedNets []string
 	var limiterMaxPerIP int
-	
+
 	if options.ProxyProtocol {
 		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
 		limiterTrustedNets = options.TrustedNetworks
@@ -130,7 +130,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		limiterTrustedNets = options.TrustedNetworks
 		limiterMaxPerIP = options.MaxConnectionsPerIP
 	}
-	
+
 	serverInstance.limiter = server.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	// Set up TLS config if TLS is enabled and certificates are provided

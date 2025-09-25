@@ -9,15 +9,14 @@ import (
 	"testing"
 )
 
-
 // Utility function tests
 
 func TestGetClientIP(t *testing.T) {
 	tests := []struct {
-		name           string
-		headers        map[string]string
-		remoteAddr     string
-		expectedIP     string
+		name       string
+		headers    map[string]string
+		remoteAddr string
+		expectedIP string
 	}{
 		{
 			name: "X-Forwarded-For single IP",
@@ -65,16 +64,16 @@ func TestGetClientIP(t *testing.T) {
 			expectedIP: "::1",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/", nil)
 			req.RemoteAddr = tt.remoteAddr
-			
+
 			for key, value := range tt.headers {
 				req.Header.Set(key, value)
 			}
-			
+
 			ip := getClientIP(req)
 			if ip != tt.expectedIP {
 				t.Errorf("getClientIP() = %v, want %v", ip, tt.expectedIP)
@@ -87,71 +86,71 @@ func TestAuthMiddleware(t *testing.T) {
 	server := &Server{
 		apiKey: "test-api-key-12345",
 	}
-	
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("success"))
 	})
-	
+
 	tests := []struct {
-		name               string
-		authHeader         string
-		expectedStatus     int
+		name                 string
+		authHeader           string
+		expectedStatus       int
 		expectedBodyContains string
 	}{
 		{
-			name:               "no auth header",
-			authHeader:         "",
-			expectedStatus:     http.StatusUnauthorized,
+			name:                 "no auth header",
+			authHeader:           "",
+			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header required",
 		},
 		{
-			name:               "invalid auth format",
-			authHeader:         "InvalidFormat",
-			expectedStatus:     http.StatusUnauthorized,
+			name:                 "invalid auth format",
+			authHeader:           "InvalidFormat",
+			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header must be 'Bearer",
 		},
 		{
-			name:               "wrong auth type",
-			authHeader:         "Basic dGVzdA==",
-			expectedStatus:     http.StatusUnauthorized,
+			name:                 "wrong auth type",
+			authHeader:           "Basic dGVzdA==",
+			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header must be 'Bearer",
 		},
 		{
-			name:               "invalid API key",
-			authHeader:         "Bearer wrong-key",
-			expectedStatus:     http.StatusForbidden,
+			name:                 "invalid API key",
+			authHeader:           "Bearer wrong-key",
+			expectedStatus:       http.StatusForbidden,
 			expectedBodyContains: "Invalid API key",
 		},
 		{
-			name:               "valid API key",
-			authHeader:         "Bearer test-api-key-12345",
-			expectedStatus:     http.StatusOK,
+			name:                 "valid API key",
+			authHeader:           "Bearer test-api-key-12345",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 		{
-			name:               "case insensitive bearer",
-			authHeader:         "bearer test-api-key-12345",
-			expectedStatus:     http.StatusOK,
+			name:                 "case insensitive bearer",
+			authHeader:           "bearer test-api-key-12345",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/test", nil)
 			if tt.authHeader != "" {
 				req.Header.Set("Authorization", tt.authHeader)
 			}
-			
+
 			rr := httptest.NewRecorder()
 			middleware := server.authMiddleware(handler)
 			middleware.ServeHTTP(rr, req)
-			
+
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("authMiddleware() status = %v, want %v", rr.Code, tt.expectedStatus)
 			}
-			
+
 			if !strings.Contains(rr.Body.String(), tt.expectedBodyContains) {
 				t.Errorf("authMiddleware() body = %v, want to contain %v", rr.Body.String(), tt.expectedBodyContains)
 			}
@@ -164,82 +163,82 @@ func TestAllowedHostsMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("success"))
 	})
-	
+
 	tests := []struct {
-		name               string
-		allowedHosts       []string
-		clientIP           string
-		expectedStatus     int
+		name                 string
+		allowedHosts         []string
+		clientIP             string
+		expectedStatus       int
 		expectedBodyContains string
 	}{
 		{
-			name:               "no restrictions - allow all",
-			allowedHosts:       []string{},
-			clientIP:           "192.168.1.100",
-			expectedStatus:     http.StatusOK,
+			name:                 "no restrictions - allow all",
+			allowedHosts:         []string{},
+			clientIP:             "192.168.1.100",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 		{
-			name:               "allowed IP - exact match",
-			allowedHosts:       []string{"192.168.1.100", "10.0.0.1"},
-			clientIP:           "192.168.1.100",
-			expectedStatus:     http.StatusOK,
+			name:                 "allowed IP - exact match",
+			allowedHosts:         []string{"192.168.1.100", "10.0.0.1"},
+			clientIP:             "192.168.1.100",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 		{
-			name:               "blocked IP - not in allowed list",
-			allowedHosts:       []string{"192.168.1.100", "10.0.0.1"},
-			clientIP:           "192.168.1.200",
-			expectedStatus:     http.StatusForbidden,
+			name:                 "blocked IP - not in allowed list",
+			allowedHosts:         []string{"192.168.1.100", "10.0.0.1"},
+			clientIP:             "192.168.1.200",
+			expectedStatus:       http.StatusForbidden,
 			expectedBodyContains: "Host not allowed",
 		},
 		{
-			name:               "allowed CIDR - IP in range",
-			allowedHosts:       []string{"192.168.1.0/24"},
-			clientIP:           "192.168.1.50",
-			expectedStatus:     http.StatusOK,
+			name:                 "allowed CIDR - IP in range",
+			allowedHosts:         []string{"192.168.1.0/24"},
+			clientIP:             "192.168.1.50",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 		{
-			name:               "blocked CIDR - IP outside range",
-			allowedHosts:       []string{"192.168.1.0/24"},
-			clientIP:           "192.168.2.50",
-			expectedStatus:     http.StatusForbidden,
+			name:                 "blocked CIDR - IP outside range",
+			allowedHosts:         []string{"192.168.1.0/24"},
+			clientIP:             "192.168.2.50",
+			expectedStatus:       http.StatusForbidden,
 			expectedBodyContains: "Host not allowed",
 		},
 		{
-			name:               "mixed allowed - IP matches CIDR",
-			allowedHosts:       []string{"10.0.0.1", "192.168.1.0/24"},
-			clientIP:           "192.168.1.100",
-			expectedStatus:     http.StatusOK,
+			name:                 "mixed allowed - IP matches CIDR",
+			allowedHosts:         []string{"10.0.0.1", "192.168.1.0/24"},
+			clientIP:             "192.168.1.100",
+			expectedStatus:       http.StatusOK,
 			expectedBodyContains: "success",
 		},
 		{
-			name:               "invalid CIDR - treated as exact IP",
-			allowedHosts:       []string{"192.168.1.0/invalid"},
-			clientIP:           "192.168.1.50",
-			expectedStatus:     http.StatusForbidden,
+			name:                 "invalid CIDR - treated as exact IP",
+			allowedHosts:         []string{"192.168.1.0/invalid"},
+			clientIP:             "192.168.1.50",
+			expectedStatus:       http.StatusForbidden,
 			expectedBodyContains: "Host not allowed",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			server := &Server{
 				allowedHosts: tt.allowedHosts,
 			}
-			
+
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.RemoteAddr = tt.clientIP + ":12345"
-			
+
 			rr := httptest.NewRecorder()
 			middleware := server.allowedHostsMiddleware(handler)
 			middleware.ServeHTTP(rr, req)
-			
+
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("allowedHostsMiddleware() status = %v, want %v", rr.Code, tt.expectedStatus)
 			}
-			
+
 			if !strings.Contains(rr.Body.String(), tt.expectedBodyContains) {
 				t.Errorf("allowedHostsMiddleware() body = %v, want to contain %v", rr.Body.String(), tt.expectedBodyContains)
 			}
@@ -249,7 +248,7 @@ func TestAllowedHostsMiddleware(t *testing.T) {
 
 func TestWriteJSON(t *testing.T) {
 	server := &Server{}
-	
+
 	tests := []struct {
 		name           string
 		status         int
@@ -279,20 +278,20 @@ func TestWriteJSON(t *testing.T) {
 			expectedBody:   "null",
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			server.writeJSON(rr, tt.status, tt.data)
-			
+
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("writeJSON() status = %v, want %v", rr.Code, tt.expectedStatus)
 			}
-			
+
 			if rr.Header().Get("Content-Type") != "application/json" {
 				t.Errorf("writeJSON() Content-Type = %v, want application/json", rr.Header().Get("Content-Type"))
 			}
-			
+
 			body := strings.TrimSpace(rr.Body.String())
 			if body != tt.expectedBody {
 				t.Errorf("writeJSON() body = %v, want %v", body, tt.expectedBody)
@@ -303,7 +302,7 @@ func TestWriteJSON(t *testing.T) {
 
 func TestWriteError(t *testing.T) {
 	server := &Server{}
-	
+
 	tests := []struct {
 		name           string
 		status         int
@@ -326,16 +325,16 @@ func TestWriteError(t *testing.T) {
 			expectedBody:   `{"error":"Internal server error"}`,
 		},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			server.writeError(rr, tt.status, tt.message)
-			
+
 			if rr.Code != tt.expectedStatus {
 				t.Errorf("writeError() status = %v, want %v", rr.Code, tt.expectedStatus)
 			}
-			
+
 			body := strings.TrimSpace(rr.Body.String())
 			if body != tt.expectedBody {
 				t.Errorf("writeError() body = %v, want %v", body, tt.expectedBody)
@@ -483,8 +482,8 @@ func TestUpdateAccountRequestValidation(t *testing.T) {
 			expectedError:  "Invalid JSON body",
 		},
 		{
-			name: "missing password and hash",
-			requestBody: UpdateAccountRequest{},
+			name:           "missing password and hash",
+			requestBody:    UpdateAccountRequest{},
 			expectedStatus: http.StatusBadRequest,
 			expectedError:  "Either password or password_hash is required",
 		},

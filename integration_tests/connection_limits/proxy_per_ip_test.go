@@ -53,7 +53,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	// Create IMAP server with PROXY protocol
 	// maxTotal=10, maxPerIP=1 - should allow only 1 connection per real client IP
 	trustedNetworks := []string{"127.0.0.0/8"} // Trust localhost for PROXY protocol
-	
+
 	imapServer, err := imap.New(
 		context.Background(), "test", "localhost", address,
 		&storage.S3Storage{}, rdb, uploadWorker, nil,
@@ -72,8 +72,8 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	// Start server
 	errChan := make(chan error, 1)
 	go func() {
-		if err := imapServer.Serve(address); err != nil && 
-		   !strings.Contains(err.Error(), "use of closed network connection") {
+		if err := imapServer.Serve(address); err != nil &&
+			!strings.Contains(err.Error(), "use of closed network connection") {
 			errChan <- fmt.Errorf("IMAP server error: %w", err)
 		}
 	}()
@@ -87,7 +87,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	t.Logf("Server config: maxTotal=10, maxPerIP=1, trustedNetworks=%v", trustedNetworks)
 
 	// Test scenario:
-	// - Proxy connects from 127.0.0.1 (trusted for PROXY protocol)  
+	// - Proxy connects from 127.0.0.1 (trusted for PROXY protocol)
 	// - Real client IP is 192.0.2.100 (NOT in trusted networks)
 	// - Should be limited to 1 connection per real client IP
 	// - Currently FAILS due to architectural issue
@@ -106,7 +106,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 
 	// Second connection from SAME real client IP should be REJECTED
 	t.Log("Attempting second connection from same real client IP (should be rejected)...")
-	
+
 	conn2, err := net.Dial("tcp", address)
 	if err != nil {
 		t.Fatalf("Failed to connect for second connection: %v", err)
@@ -118,7 +118,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	serverPort := 0
 	fmt.Sscanf(serverPortStr, "%d", &serverPort)
 	proxyHeader := generateProxyV1HeaderForAddr("192.0.2.100", 12346, serverHost, serverPort)
-	
+
 	_, err = conn2.Write([]byte(proxyHeader))
 	if err != nil {
 		t.Logf("Second connection was rejected during PROXY header send: %v", err)
@@ -140,7 +140,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 
 	// Third connection from DIFFERENT real client IP should succeed
 	t.Log("Attempting third connection from different real client IP (should succeed)...")
-	
+
 	conn3 := connectWithProxyHeaderToAddress(t, address, "192.0.2.101", 12345)
 	defer conn3.Close()
 
@@ -162,17 +162,17 @@ func generateProxyV1HeaderForAddr(clientIP string, clientPort int, serverIP stri
 // connectWithProxyHeaderToAddress connects and sends PROXY header
 func connectWithProxyHeaderToAddress(t *testing.T, address, clientIP string, clientPort int) net.Conn {
 	t.Helper()
-	
+
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
-	
+
 	// Parse server address
 	serverHost, serverPortStr, _ := net.SplitHostPort(address)
 	serverPort := 0
 	fmt.Sscanf(serverPortStr, "%d", &serverPort)
-	
+
 	// Send PROXY header
 	proxyHeader := generateProxyV1HeaderForAddr(clientIP, clientPort, serverHost, serverPort)
 	_, err = conn.Write([]byte(proxyHeader))
@@ -180,6 +180,6 @@ func connectWithProxyHeaderToAddress(t *testing.T, address, clientIP string, cli
 		conn.Close()
 		t.Fatalf("Failed to send PROXY header: %v", err)
 	}
-	
+
 	return conn
 }

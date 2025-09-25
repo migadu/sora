@@ -121,7 +121,7 @@ func TestPOP3ConnectionLimiterTotal(t *testing.T) {
 	}
 	connections = append(connections, conn1)
 
-	// Second connection should succeed  
+	// Second connection should succeed
 	conn2, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Failed to establish second connection: %v", err)
@@ -138,17 +138,17 @@ func TestPOP3ConnectionLimiterTotal(t *testing.T) {
 
 	// TCP connection succeeded, check if it's immediately closed
 	connections = append(connections, conn3)
-	
+
 	conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buffer := make([]byte, 100)
 	n, err := conn3.Read(buffer)
-	
+
 	// Connection should be closed by server or we get timeout/EOF
 	if err == nil && n > 0 {
 		response := string(buffer[:n])
 		t.Fatalf("Expected connection to be rejected, but got response: %s", strings.TrimSpace(response))
 	}
-	
+
 	// Any error (timeout, connection reset, EOF) indicates rejection as expected
 	t.Logf("Third connection properly handled (rejected): %v", err)
 }
@@ -158,7 +158,7 @@ func TestPOP3ConnectionLimiterPerIP(t *testing.T) {
 
 	// Note: This test documents that localhost (127.0.0.1) is treated as a trusted network
 	// and bypasses per-IP connection limits. This is the correct behavior.
-	
+
 	// Set up server with high total but 2 per IP
 	server, address := setupPOP3ServerWithConnectionLimits(t, 10, 2)
 	defer server.Close()
@@ -179,7 +179,7 @@ func TestPOP3ConnectionLimiterPerIP(t *testing.T) {
 	}
 	connections = append(connections, conn1)
 
-	// Second connection should succeed  
+	// Second connection should succeed
 	conn2, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Failed to establish second connection: %v", err)
@@ -193,21 +193,21 @@ func TestPOP3ConnectionLimiterPerIP(t *testing.T) {
 		t.Fatalf("Failed to establish third connection from localhost: %v", err)
 	}
 	connections = append(connections, conn3)
-	
+
 	// Read the welcome banner to confirm the connection is working
 	conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buffer := make([]byte, 100)
 	n, err := conn3.Read(buffer)
-	
+
 	// Connection should work fine from trusted networks (localhost)
 	if err != nil || n == 0 {
 		t.Fatalf("Expected connection to work from trusted network (localhost), but got error: %v", err)
 	}
-	
+
 	response := string(buffer[:n])
 	if !strings.Contains(response, "+OK") {
 		t.Fatalf("Expected POP3 welcome banner, but got: %s", strings.TrimSpace(response))
 	}
-	
+
 	t.Logf("Third connection from localhost succeeded as expected (trusted network): %s", strings.TrimSpace(response))
 }

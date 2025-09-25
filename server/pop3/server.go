@@ -120,7 +120,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
 	var limiterTrustedNets []string
 	var limiterMaxPerIP int
-	
+
 	if options.ProxyProtocol {
 		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
 		limiterTrustedNets = options.TrustedNetworks
@@ -130,7 +130,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		limiterTrustedNets = options.TrustedNetworks
 		limiterMaxPerIP = options.MaxConnectionsPerIP
 	}
-	
+
 	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided

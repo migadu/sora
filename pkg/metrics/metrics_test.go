@@ -61,7 +61,7 @@ func TestConnectionMetrics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.testFunc(tt.protocol)
-			
+
 			// Verify the metric was updated
 			switch tt.name {
 			case "connections_total_increment":
@@ -372,7 +372,7 @@ func TestHistogramBuckets(t *testing.T) {
 			testDuration: 0.05,
 		},
 		{
-			name:         "s3_operation_duration_buckets", 
+			name:         "s3_operation_duration_buckets",
 			histogram:    S3OperationDuration.WithLabelValues("PUT"),
 			expectedMin:  0.01,
 			expectedMax:  10.0,
@@ -398,9 +398,9 @@ func TestHistogramBuckets(t *testing.T) {
 			tt.histogram.Observe(tt.testDuration)
 
 			// For histograms, we can't easily verify the count using testutil.ToFloat64
-			// on the observer interface. Instead, we verify that the observation 
+			// on the observer interface. Instead, we verify that the observation
 			// doesn't cause a panic and that the histogram is functioning.
-			
+
 			// Record another observation to verify the histogram is working
 			tt.histogram.Observe(tt.testDuration + 0.1)
 		})

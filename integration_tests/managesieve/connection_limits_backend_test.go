@@ -23,7 +23,7 @@ func TestManageSieveBackendConnectionLimitsWithProxyProtocol(t *testing.T) {
 	t.Log("2. Direct connections should be rejected")
 	t.Log("3. Only connections with valid PROXY headers from trusted networks allowed")
 	t.Log("4. No per-IP limiting applies (only total connection limits)")
-	
+
 	t.Log("PROXY protocol backend connection limiting test completed")
 }
 
@@ -54,7 +54,7 @@ func TestManageSieveBackendConnectionLimitsNoProxy(t *testing.T) {
 		t.Fatalf("First connection should succeed: %v", err)
 	}
 	connections = append(connections, conn1)
-	
+
 	// Read greeting
 	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buffer := make([]byte, 1024)
@@ -80,12 +80,12 @@ func TestManageSieveBackendNoCommandForwarding(t *testing.T) {
 
 	// ManageSieve protocol doesn't have equivalent of IMAP ID or POP3 XCLIENT commands
 	// Parameter forwarding can only happen via PROXY protocol
-	
+
 	t.Log("=== Testing ManageSieve Backend Command-Based Parameter Forwarding ===")
 	t.Log("Expected behavior:")
 	t.Log("1. ManageSieve protocol has no ID or XCLIENT equivalent commands")
 	t.Log("2. Parameter forwarding only possible via PROXY protocol")
 	t.Log("3. No trusted network checks needed for commands (none exist)")
-	
+
 	t.Log("ManageSieve command forwarding test completed (N/A - no such commands exist)")
 }

@@ -26,13 +26,13 @@ func getTestConnectionAddress(bindAddress string) string {
 	if err != nil {
 		return bindAddress
 	}
-	
+
 	// If bound to all interfaces, we need to connect via 127.0.0.1 since that's what works
 	// The real issue is that we need a way to test connection limits without trusted network bypass
 	if host == "0.0.0.0" || host == "::" {
 		return net.JoinHostPort("127.0.0.1", port)
 	}
-	
+
 	return bindAddress
 }
 
@@ -54,7 +54,7 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
-	
+
 	// Get a random port but bind to all interfaces to allow testing from different IPs
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
@@ -135,7 +135,7 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 
 	// Get the connection address (may be different from bind address for testing)
 	connectionAddr := getTestConnectionAddress(address)
-	
+
 	// Create a custom test server struct that includes our cleanup function
 	testServer := &TestServerWithCleanup{
 		TestServer: &common.TestServer{
@@ -145,7 +145,7 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 		},
 		cleanupFunc: cleanup,
 	}
-	
+
 	return testServer, account
 }
 
@@ -155,7 +155,7 @@ func TestConnectionLimiterPerIP(t *testing.T) {
 	// This test demonstrates the connection limiter's behavior.
 	// Since localhost is in trusted networks by default (for operational reasons),
 	// we test the total connection limit instead which applies regardless of trust.
-	
+
 	// Set up server with only 2 total connections (this limit applies to all IPs including trusted ones for total count)
 	server, _ := setupIMAPServerWithConnectionLimits(t, 2, 10) // 2 total, 10 per IP
 	defer server.Close()
@@ -190,15 +190,15 @@ func TestConnectionLimiterPerIP(t *testing.T) {
 		t.Logf("Third connection rejected at network level (expected): %v", err)
 		return
 	}
-	
+
 	// TCP connection succeeded, but server should reject it at protocol level
 	connections = append(connections, conn3)
-	
+
 	// Try to read from connection with a short timeout - should get immediate close or error
 	conn3.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	buffer := make([]byte, 100)
 	n, err := conn3.Read(buffer)
-	
+
 	// Check if we got an IMAP error response indicating connection was rejected
 	if err == nil && n > 0 {
 		response := string(buffer[:n])
@@ -217,7 +217,7 @@ func TestConnectionLimiterPerIP(t *testing.T) {
 		// If we get a normal IMAP greeting, that's unexpected
 		t.Fatalf("Expected connection to be rejected by server, but got normal response: %s", strings.TrimSpace(response))
 	}
-	
+
 	// Any error (timeout, connection reset, EOF) also indicates rejection
 	t.Logf("Third connection rejected by server (connection closed): %v", err)
 }
@@ -231,7 +231,7 @@ func TestIMAPBackendTrustedNetworksBypassPerIPLimits(t *testing.T) {
 	// - This tests the default trusted networks behavior (localhost should be trusted)
 
 	// Set up server with high total connections but very low per-IP limit
-	server, _ := setupIMAPServerWithConnectionLimits(t, 10, 1) // maxTotal=10, maxPerIP=1  
+	server, _ := setupIMAPServerWithConnectionLimits(t, 10, 1) // maxTotal=10, maxPerIP=1
 	defer server.Close()
 
 	var connections []net.Conn
@@ -251,7 +251,7 @@ func TestIMAPBackendTrustedNetworksBypassPerIPLimits(t *testing.T) {
 			t.Fatalf("Connection %d from localhost failed (should succeed - trusted network): %v", i+1, err)
 		}
 		connections = append(connections, conn)
-		
+
 		// Read welcome banner to confirm connection works
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		buffer := make([]byte, 1000)
@@ -305,15 +305,15 @@ func TestConnectionLimiterTotal(t *testing.T) {
 		t.Logf("Third connection rejected at network level (expected): %v", err)
 		return
 	}
-	
+
 	// TCP connection succeeded, but server should reject it at protocol level
 	connections = append(connections, conn3)
-	
+
 	// Try to read from connection with a short timeout - should get immediate close or error
 	conn3.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	buffer := make([]byte, 100)
 	n, err := conn3.Read(buffer)
-	
+
 	// Check if we got an IMAP error response indicating connection was rejected
 	if err == nil && n > 0 {
 		response := string(buffer[:n])
@@ -332,7 +332,7 @@ func TestConnectionLimiterTotal(t *testing.T) {
 		// If we get a normal IMAP greeting, that's unexpected
 		t.Fatalf("Expected connection to be rejected by server, but got normal response: %s", strings.TrimSpace(response))
 	}
-	
+
 	// Any error (timeout, connection reset, EOF) also indicates rejection
 	t.Logf("Third connection rejected by server (connection closed): %v", err)
 }
@@ -348,7 +348,7 @@ func TestConnectionLimiterConcurrent(t *testing.T) {
 	const numGoroutines = 5
 	var wg sync.WaitGroup
 	results := make([]bool, numGoroutines) // true = successful connection, false = rejected
-	
+
 	// Try to make 5 concurrent connections from same IP (localhost)
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
@@ -361,18 +361,18 @@ func TestConnectionLimiterConcurrent(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			
+
 			// Try to read from connection to see if IMAP session was created successfully
 			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 			buffer := make([]byte, 100)
 			n, err := conn.Read(buffer)
-			
+
 			if err != nil {
 				// Connection was closed or failed to read
 				results[index] = false
 				return
 			}
-			
+
 			if n > 0 {
 				response := string(buffer[:n])
 				// Check if we got a SERVERBUG (connection rejected) or a normal greeting
@@ -386,7 +386,7 @@ func TestConnectionLimiterConcurrent(t *testing.T) {
 			} else {
 				results[index] = false // No data read
 			}
-			
+
 			// Hold connection briefly if successful
 			if results[index] {
 				time.Sleep(100 * time.Millisecond)
@@ -448,7 +448,7 @@ func TestConnectionLimiterRecovery(t *testing.T) {
 		conn3.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		buffer := make([]byte, 100)
 		n, readErr := conn3.Read(buffer)
-		
+
 		if readErr == nil && n > 0 {
 			response := string(buffer[:n])
 			if !strings.Contains(response, "SERVERBUG") {

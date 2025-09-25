@@ -13,10 +13,10 @@ func TestDomainTrackingBasic(t *testing.T) {
 	DomainConnectionCount.Reset()
 	DomainBytesTransferred.Reset()
 	DomainMessageCount.Reset()
-	
+
 	originalEnableDomain := EnableDomainMetrics
 	defer func() { EnableDomainMetrics = originalEnableDomain }()
-	
+
 	EnableDomainMetrics = true
 
 	t.Run("track_domain_command", func(t *testing.T) {
@@ -86,10 +86,10 @@ func TestDomainTrackingBasic(t *testing.T) {
 
 	t.Run("domain_tracking_disabled", func(t *testing.T) {
 		EnableDomainMetrics = false
-		
+
 		// Track some activity
 		TrackDomainCommand("imap", "disabled.com", "SELECT")
-		
+
 		// Should not be recorded
 		count := testutil.ToFloat64(DomainCommandCount.WithLabelValues("imap", "disabled.com", "SELECT"))
 		if count != 0 {
@@ -103,7 +103,7 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 	userStats = sync.Map{}
 	trackedUsers = sync.Map{}
 	trackedUserCount.Store(0)
-	
+
 	TopUserCommandCount.Reset()
 	TopUserConnectionCount.Reset()
 	HeavyUserOperations.Reset()
@@ -113,7 +113,7 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 	originalThreshold := UserMetricsThreshold
 	originalMaxUsers := MaxTrackedUsers
 	originalHashNames := HashUsernames
-	
+
 	defer func() {
 		EnableUserMetrics = originalEnableUser
 		UserMetricsThreshold = originalThreshold
@@ -128,7 +128,7 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 
 	t.Run("user_activity_below_threshold", func(t *testing.T) {
 		username := "lowuser@example.com"
-		
+
 		// Track activity below threshold
 		for i := 0; i < 3; i++ {
 			TrackUserActivity("imap", username, "command", 1)
@@ -152,7 +152,7 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 
 	t.Run("user_promotion_to_heavy_user", func(t *testing.T) {
 		username := "heavyuser@example.com"
-		
+
 		// Track activity above threshold
 		for i := 0; i < 6; i++ {
 			TrackUserActivity("imap", username, "command", 1)
@@ -178,14 +178,14 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 	t.Run("user_tracking_disabled", func(t *testing.T) {
 		EnableUserMetrics = false
 		username := "disabled@example.com"
-		
+
 		TrackUserActivity("imap", username, "command", 10)
-		
+
 		// Should not create any user stats
 		if _, ok := userStats.Load(username); ok {
 			t.Error("User stats should not be recorded when user tracking is disabled")
 		}
-		
+
 		if _, tracked := trackedUsers.Load(username); tracked {
 			t.Error("User should not be tracked when user tracking is disabled")
 		}
@@ -195,11 +195,11 @@ func TestUserActivityTrackingBasic(t *testing.T) {
 func TestHashingFunction(t *testing.T) {
 	t.Run("hash_consistency", func(t *testing.T) {
 		username := "test@example.com"
-		
+
 		HashUsernames = true
 		hash1 := hashUsername(username)
 		hash2 := hashUsername(username)
-		
+
 		if hash1 != hash2 {
 			t.Error("Hash function should be consistent")
 		}
@@ -207,10 +207,10 @@ func TestHashingFunction(t *testing.T) {
 
 	t.Run("hash_length", func(t *testing.T) {
 		username := "test@example.com"
-		
+
 		HashUsernames = true
 		hash := hashUsername(username)
-		
+
 		if len(hash) != 16 {
 			t.Errorf("Expected hash length 16, got %d", len(hash))
 		}
@@ -218,10 +218,10 @@ func TestHashingFunction(t *testing.T) {
 
 	t.Run("no_hash_when_disabled", func(t *testing.T) {
 		username := "nohash@example.com"
-		
+
 		HashUsernames = false
 		result := hashUsername(username)
-		
+
 		if result != username {
 			t.Errorf("Expected original username when hashing disabled, got %s", result)
 		}
@@ -238,7 +238,7 @@ func TestMetricsConfigurationBasic(t *testing.T) {
 	}{
 		EnableUserMetrics, EnableDomainMetrics, UserMetricsThreshold, MaxTrackedUsers, HashUsernames,
 	}
-	
+
 	defer func() {
 		EnableUserMetrics = originalConfig.EnableUserMetrics
 		EnableDomainMetrics = originalConfig.EnableDomainMetrics
@@ -249,7 +249,7 @@ func TestMetricsConfigurationBasic(t *testing.T) {
 
 	t.Run("configure_all_settings", func(t *testing.T) {
 		Configure(true, false, 100, 500, true)
-		
+
 		if !EnableUserMetrics {
 			t.Error("EnableUserMetrics should be true")
 		}
@@ -280,12 +280,12 @@ func TestUserStatsDataStructures(t *testing.T) {
 
 	t.Run("user_stats_concurrent_access", func(t *testing.T) {
 		username := "concurrent@example.com"
-		
+
 		// Simulate concurrent access
 		var wg sync.WaitGroup
 		numGoroutines := 10
 		incrementsPerGoroutine := 5
-		
+
 		for i := 0; i < numGoroutines; i++ {
 			wg.Add(1)
 			go func() {
@@ -295,9 +295,9 @@ func TestUserStatsDataStructures(t *testing.T) {
 				}
 			}()
 		}
-		
+
 		wg.Wait()
-		
+
 		// Verify final count
 		if statsVal, ok := userStats.Load(username); ok {
 			stats := statsVal.(*UserStats)
@@ -314,22 +314,22 @@ func TestUserStatsDataStructures(t *testing.T) {
 		// Reset
 		trackedUsers = sync.Map{}
 		trackedUserCount.Store(0)
-		
+
 		users := []string{"count1@example.com", "count2@example.com", "count3@example.com"}
-		
+
 		for _, username := range users {
 			for i := 0; i < 6; i++ {
 				TrackUserActivity("imap", username, "command", 1)
 			}
 		}
-		
+
 		// Count tracked users manually
 		manualCount := 0
 		trackedUsers.Range(func(key, value interface{}) bool {
 			manualCount++
 			return true
 		})
-		
+
 		atomicCount := int(trackedUserCount.Load())
 		if manualCount != atomicCount {
 			t.Errorf("Manual count (%d) should equal atomic count (%d)", manualCount, atomicCount)

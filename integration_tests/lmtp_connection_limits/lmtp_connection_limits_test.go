@@ -120,7 +120,7 @@ func TestLMTPConnectionLimiterTotal(t *testing.T) {
 	}
 	connections = append(connections, conn1)
 
-	// Second connection should succeed  
+	// Second connection should succeed
 	conn2, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Failed to establish second connection: %v", err)
@@ -137,17 +137,17 @@ func TestLMTPConnectionLimiterTotal(t *testing.T) {
 
 	// TCP connection succeeded, check if it's immediately closed
 	connections = append(connections, conn3)
-	
+
 	conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buffer := make([]byte, 100)
 	n, err := conn3.Read(buffer)
-	
+
 	// Connection should be closed by server or we get timeout/EOF
 	if err == nil && n > 0 {
 		response := string(buffer[:n])
 		t.Fatalf("Expected connection to be rejected, but got response: %s", strings.TrimSpace(response))
 	}
-	
+
 	// Any error (timeout, connection reset, EOF) indicates rejection as expected
 	t.Logf("Third connection properly handled (rejected): %v", err)
 }

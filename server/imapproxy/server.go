@@ -41,7 +41,7 @@ type Server struct {
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *proxy.PreLookupConfig
 	remoteUseIDCommand bool // Whether backend supports IMAP ID command for forwarding
-	
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 }
@@ -70,7 +70,7 @@ type ServerOptions struct {
 	PreLookup              *proxy.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
-	
+
 	// Connection limiting
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)

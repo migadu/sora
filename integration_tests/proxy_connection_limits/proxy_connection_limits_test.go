@@ -147,7 +147,7 @@ func connectWithProxyHeader(t *testing.T, address, clientIP string, clientPort i
 func TestProxyProtocolConnectionLimitsRealClientIP(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Test scenario: 
+	// Test scenario:
 	// - Server allows 10 total connections, 2 per IP
 	// - Connections come from untrusted proxy (10.0.0.1)
 	// - Real client IPs are 192.168.1.100 (should hit per-IP limit after 2 connections)
@@ -227,7 +227,7 @@ func TestProxyProtocolConnectionLimitsDifferentClientIPs(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Test scenario:
-	// - Server allows 10 total connections, 2 per IP  
+	// - Server allows 10 total connections, 2 per IP
 	// - All connections come from localhost (trusted proxy)
 	// - Real client IPs are different (192.168.1.100, 192.168.1.101)
 	// - Each real client IP should be allowed up to 2 connections
@@ -367,7 +367,7 @@ func TestProxyProtocolDifferentRealClientIPsAllowed(t *testing.T) {
 
 	// Test scenario:
 	// - PROXY protocol trusts localhost for header parsing
-	// - Connection limiting does NOT trust localhost (empty trusted networks)  
+	// - Connection limiting does NOT trust localhost (empty trusted networks)
 	// - Connections have different real client IPs via PROXY headers
 	// - Each real client IP should be allowed up to the per-IP limit
 
@@ -386,7 +386,7 @@ func TestProxyProtocolDifferentRealClientIPsAllowed(t *testing.T) {
 
 	// Test different real client IPs should each get their own per-IP limit
 	clientIPs := []string{"192.168.1.100", "192.168.1.101", "192.168.1.102"}
-	
+
 	for _, clientIP := range clientIPs {
 		// Two connections per client IP should succeed
 		for j := 0; j < 2; j++ {

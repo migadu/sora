@@ -568,7 +568,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
-	
+
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
 	name = strings.Trim(name, "\"")
 
@@ -718,7 +718,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
-	
+
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
 	name = strings.Trim(name, "\"")
 
@@ -791,7 +791,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
-	
+
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
 	name = strings.Trim(name, "\"")
 

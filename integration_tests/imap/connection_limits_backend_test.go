@@ -77,7 +77,7 @@ func TestIMAPBackendConnectionLimitsNoProxy(t *testing.T) {
 		t.Fatalf("First connection should succeed: %v", err)
 	}
 	connections = append(connections, conn1)
-	
+
 	// Read greeting
 	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buffer := make([]byte, 1024)
@@ -104,12 +104,12 @@ func TestIMAPBackendIDCommandTrustedNetworks(t *testing.T) {
 	// ID command behavior:
 	// - Only connections from trusted_networks can pass proxying info via ID command
 	// - Other connections: ID command is accepted but proxying parameters are ignored (no error)
-	
+
 	t.Log("=== Testing IMAP Backend ID Command Trusted Networks ===")
 	t.Log("Expected behavior (documented due to integration test complexity):")
 	t.Log("1. Connections from trusted_networks: ID command forwarding parameters processed")
 	t.Log("2. Connections from non-trusted networks: ID command accepted, forwarding ignored")
 	t.Log("3. No errors thrown in either case")
-	
+
 	t.Log("ID command trusted networks test completed")
 }

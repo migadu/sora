@@ -15,6 +15,7 @@ require (
 	github.com/k3a/html2text v1.2.1
 	github.com/minio/minio-go/v7 v7.0.89
 	github.com/prometheus/client_golang v1.23.0
+	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/crypto v0.38.0
 	lukechampine.com/blake3 v1.4.1
@@ -53,7 +54,6 @@ require (
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.65.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect

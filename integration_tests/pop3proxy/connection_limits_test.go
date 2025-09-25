@@ -27,14 +27,14 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 
 	// Set up POP3 proxy with connection limits
 	proxyAddress := common.GetRandomAddress(t)
-	
+
 	// Test scenario:
-	// - maxTotal=10, maxPerIP=2 
+	// - maxTotal=10, maxPerIP=2
 	// - trusted_networks=["192.168.1.0/24"] (specific trusted network, NOT localhost)
 	// - Connections from 127.0.0.1 should be limited to 2 per IP
 	// - Connections from 192.168.1.100 should be unlimited (trusted)
-	
-	proxy := setupPOP3ProxyWithConnectionLimits(t, backendServer.ResilientDB, proxyAddress, 
+
+	proxy := setupPOP3ProxyWithConnectionLimits(t, backendServer.ResilientDB, proxyAddress,
 		[]string{backendServer.Address}, 10, 2, []string{"192.168.1.0/24"})
 	defer proxy.Close()
 
@@ -44,7 +44,7 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 
 	// Test 1: Connections from localhost (NOT in trusted networks) should be limited
 	t.Log("\n--- Test 1: Non-trusted IP (localhost) should be limited to maxPerIP ---")
-	
+
 	var connections []interface{} // We'll use net.Conn for TCP-level testing
 	defer func() {
 		for _, c := range connections {
@@ -81,7 +81,7 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 		defer conn3.Close()
 		// Connection is accepted at TCP level but should be closed quickly by proxy limiter
 		time.Sleep(200 * time.Millisecond)
-		
+
 		// Try to perform a simple operation to test if connection is alive
 		isAlive := testPOP3ConnectionAlive(conn3)
 		if !isAlive {
@@ -110,7 +110,7 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 	t.Log("\n--- Test 2: Trusted IP behavior (documented expectation) ---")
 	t.Log("Expected: Connections from 192.168.1.0/24 should bypass per-IP limits")
 	t.Log("Note: Integration test limitation - can't easily simulate different source IPs")
-	
+
 	// Test 3: Total connection limit should still apply
 	t.Log("\n--- Test 3: Total connection limit should be respected ---")
 	t.Log("This would require maxTotal connections, but limited by test resources")
@@ -118,8 +118,8 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 }
 
 // setupPOP3ProxyWithConnectionLimits creates a POP3 proxy with connection limiting
-func setupPOP3ProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase, 
-	proxyAddr string, backendAddrs []string, maxConnections, maxConnectionsPerIP int, 
+func setupPOP3ProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDatabase,
+	proxyAddr string, backendAddrs []string, maxConnections, maxConnectionsPerIP int,
 	trustedNetworks []string) *common.TestServer {
 	t.Helper()
 
@@ -143,7 +143,7 @@ func setupPOP3ProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		
+
 		// NEW: Connection limiting options
 		MaxConnections:      maxConnections,
 		MaxConnectionsPerIP: maxConnectionsPerIP,
@@ -158,8 +158,8 @@ func setupPOP3ProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 	// Start proxy in background
 	errChan := make(chan error, 1)
 	go func() {
-		if err := proxy.Start(); err != nil && 
-		   !strings.Contains(err.Error(), "use of closed network connection") {
+		if err := proxy.Start(); err != nil &&
+			!strings.Contains(err.Error(), "use of closed network connection") {
 			errChan <- fmt.Errorf("POP3 proxy error: %w", err)
 		}
 	}()

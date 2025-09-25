@@ -170,7 +170,7 @@ func TestDBMetricsLabels(t *testing.T) {
 		DBTransactionsTotal.Reset()
 
 		validStatuses := []string{"commit", "rollback"}
-		
+
 		for _, status := range validStatuses {
 			DBTransactionsTotal.WithLabelValues(status).Inc()
 		}
@@ -245,7 +245,7 @@ func TestDBMetricsIntegration(t *testing.T) {
 		// Simulate unhealthy state
 		DBCircuitBreakerFailures.WithLabelValues("write").Add(5)
 		DBPoolExhaustion.WithLabelValues("write").Inc()
-		
+
 		// Circuit breaker opens
 		DBCircuitBreakerState.WithLabelValues("closed").Set(0)
 		DBCircuitBreakerState.WithLabelValues("open").Set(1)

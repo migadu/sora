@@ -291,12 +291,12 @@ func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
 		t.Fatalf("Failed to read GETSCRIPT response: %v", err)
 	}
 	firstLine = strings.TrimSpace(firstLine)
-	
+
 	// If it starts with NO, it's an error response - return it directly
 	if strings.HasPrefix(firstLine, "NO") {
 		return firstLine
 	}
-	
+
 	// If it starts with {, it's a literal response - read the script content and OK
 	if strings.HasPrefix(firstLine, "{") && strings.HasSuffix(firstLine, "}") {
 		// Extract length from {length}
@@ -305,23 +305,23 @@ func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
 		if n, err := fmt.Sscanf(lengthStr, "%d", &length); n != 1 || err != nil {
 			t.Fatalf("Invalid literal length in GETSCRIPT response: %s", firstLine)
 		}
-		
+
 		// Read the script content (exact number of bytes)
 		scriptBytes := make([]byte, length)
 		_, err = io.ReadFull(reader, scriptBytes)
 		if err != nil {
 			t.Fatalf("Failed to read script content: %v", err)
 		}
-		
+
 		// Read the final OK response
 		finalLine, err := reader.ReadString('\n')
 		if err != nil {
 			t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
 		}
-		
+
 		return strings.TrimSpace(finalLine)
 	}
-	
+
 	// Unexpected format - could be an OK from a previous command
 	if firstLine == "OK" {
 		// This might be a leftover OK response, try to read the actual GETSCRIPT response
@@ -331,7 +331,7 @@ func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
 			t.Fatalf("Failed to read actual GETSCRIPT response after OK: %v", err)
 		}
 		firstLine = strings.TrimSpace(actualLine)
-		
+
 		// Try to process the actual response
 		if strings.HasPrefix(firstLine, "NO") {
 			return firstLine
@@ -343,22 +343,22 @@ func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
 			if n, err := fmt.Sscanf(lengthStr, "%d", &length); n != 1 || err != nil {
 				t.Fatalf("Invalid literal length in GETSCRIPT response: %s", firstLine)
 			}
-			
+
 			scriptBytes := make([]byte, length)
 			_, err = io.ReadFull(reader, scriptBytes)
 			if err != nil {
 				t.Fatalf("Failed to read script content: %v", err)
 			}
-			
+
 			finalLine, err := reader.ReadString('\n')
 			if err != nil {
 				t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
 			}
-			
+
 			return strings.TrimSpace(finalLine)
 		}
 	}
-	
+
 	// Still unexpected format
 	t.Fatalf("Unexpected GETSCRIPT response format: %s", firstLine)
 	return ""

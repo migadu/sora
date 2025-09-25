@@ -12,7 +12,7 @@ func TestResourceContentionMetricsBasic(t *testing.T) {
 
 	t.Run("db_connection_pool_exhausted", func(t *testing.T) {
 		DBConnectionPoolExhausted.Add(3)
-		
+
 		count := testutil.ToFloat64(DBConnectionPoolExhausted)
 		if count != 3 {
 			t.Errorf("Expected 3 pool exhaustions, got %f", count)
@@ -278,7 +278,7 @@ func TestProxyMetrics(t *testing.T) {
 func TestBusinessMetrics(t *testing.T) {
 	t.Run("active_mailboxes", func(t *testing.T) {
 		ActiveMailboxes.Set(250)
-		
+
 		count := testutil.ToFloat64(ActiveMailboxes)
 		if count != 250 {
 			t.Errorf("Expected 250 active mailboxes, got %f", count)
