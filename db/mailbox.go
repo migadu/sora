@@ -382,7 +382,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, userI
 		err := tx.QueryRow(ctx, `
 			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
 			ON CONFLICT (account_id, name) DO UPDATE 
-			SET name = EXCLUDED.name -- This is a no-op to ensure RETURNING works
+			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
 			RETURNING id
 		`, userId, mailboxName, int64(uidValidity)).Scan(&mailboxID)
 

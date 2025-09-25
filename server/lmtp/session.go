@@ -42,41 +42,41 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 
 	c, err := smtp.DialTLS(s.backend.externalRelay, tlsConfig)
 	if err != nil {
+		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		return fmt.Errorf("failed to connect to external relay with TLS: %w", err)
 	}
 	defer c.Close()
 
-	if err := c.Mail(from, nil); err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to set sender: %w", err)
+	// Defer the failure metric increment to avoid multiple calls.
+	var relayErr error
+	defer func() {
+		if relayErr != nil {
+			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
+		}
+	}()
+
+	if relayErr = c.Mail(from, nil); relayErr != nil {
+		return fmt.Errorf("failed to set sender: %w", relayErr)
 	}
-	if err := c.Rcpt(to, nil); err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to set recipient: %w", err)
+	if relayErr = c.Rcpt(to, nil); relayErr != nil {
+		return fmt.Errorf("failed to set recipient: %w", relayErr)
 	}
 
-	wc, err := c.Data()
-	if err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to start data: %w", err)
+	wc, relayErr := c.Data()
+	if relayErr != nil {
+		return fmt.Errorf("failed to start data: %w", relayErr)
 	}
-	_, err = wc.Write(message)
-	if err != nil {
+	if _, relayErr = wc.Write(message); relayErr != nil {
 		// Attempt to close the data writer even if write fails, to send the final dot.
 		_ = wc.Close()
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to write message: %w", err)
+		return fmt.Errorf("failed to write message: %w", relayErr)
 	}
-	err = wc.Close()
-	if err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to close data writer: %w", err)
+	if relayErr = wc.Close(); relayErr != nil {
+		return fmt.Errorf("failed to close data writer: %w", relayErr)
 	}
 
-	err = c.Quit()
-	if err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to quit: %w", err)
+	if relayErr = c.Quit(); relayErr != nil {
+		return fmt.Errorf("failed to quit: %w", relayErr)
 	}
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()

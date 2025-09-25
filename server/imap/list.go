@@ -184,13 +184,8 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 		specialUseAttributeIfApplicable = imap.MailboxAttrJunk
 	}
 
-	// For LSUB, if a mailbox has a special-use flag, only include it if the
-	// client is explicitly asking for special-use mailboxes. This prevents
-	// auto-subscribed special mailboxes from appearing in a generic LSUB "*".
-	// We make an exception for INBOX, which is always expected.
-	if options.SelectSubscribed && isStandardSpecialMailbox && !options.ReturnSpecialUse && !options.SelectSpecialUse {
-		return nil
-	}
+	// Default mailboxes should always be visible to IMAP clients, regardless of special-use flags
+	// Only filter out special-use mailboxes if the client specifically requests filtering
 
 	if options.SelectSpecialUse && !isStandardSpecialMailbox {
 		return nil

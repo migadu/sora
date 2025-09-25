@@ -232,6 +232,7 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 		FROM messages m
 		JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
 		WHERE m.mailbox_id = $1
+		  AND m.uploaded = true
 		ORDER BY ms.seqnum
 	`
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
@@ -369,6 +370,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64
 		// Get the sorted messages (most recent first)
 		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria)
 		if err != nil {
+
 			log.Printf("[WARMUP] failed to get recent messages for mailbox '%s': %v", mailboxName, err)
 			continue
 		}

@@ -272,13 +272,14 @@ func (i *Importer) processSubscriptions() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("failed to get account: %w", err)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Ensure default mailboxes exist first
 	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		return fmt.Errorf("failed to create default mailboxes: %w", err)
+		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		// Don't fail the subscription processing, as mailboxes might already exist
 	}
 
 	// Process each subscribed folder
@@ -346,7 +347,7 @@ func (i *Importer) importSieveScript() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("failed to get account ID: %w", err)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
@@ -457,9 +458,15 @@ func (i *Importer) performDryRun() error {
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("failed to get account: %w", err)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
+
+	// Proactively ensure default mailboxes exist for this user
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		// Don't fail the dry run, as mailboxes might already exist
+	}
 
 	// Query the SQLite database for scanned messages
 
@@ -1099,10 +1106,17 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("failed to get user: %w", err)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 	log.Printf("Processing for user: email=%s, accountID=%d, userID=%d", address.FullAddress(), accountID, user.UserID())
+
+	// Proactively ensure default mailboxes exist for this user
+	// This prevents "mailbox not found" errors during import
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		// Don't fail the import, as mailboxes might already exist
+	}
 
 	mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
 	if err != nil {

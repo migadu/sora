@@ -1968,6 +1968,8 @@ func handleImportCommand() {
 	switch subcommand {
 	case "maildir":
 		handleImportMaildir()
+	case "s3":
+		handleImportS3()
 	case "--help", "-h":
 		printImportUsage()
 	default:
@@ -1984,12 +1986,16 @@ Usage:
   sora-admin import <subcommand> [options]
 
 Subcommands:
-  maildir  Import maildir data
+  maildir        Import maildir data
+  s3             Import messages from S3 storage (recovery scenario)
+  fix-subscriptions  Fix subscription status for default mailboxes
 
 Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir
   sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+  sora-admin import s3 --email user@example.com --dry-run
+  sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
@@ -3911,4 +3917,80 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+func handleImportS3() {
+	// Define flag set for S3 import
+	fs := flag.NewFlagSet("import s3", flag.ExitOnError)
+
+	// Define flags
+	email := fs.String("email", "", "Email address to import messages for")
+	batchSize := fs.Int("batch-size", 1000, "Number of S3 objects to process in each batch")
+	maxObjects := fs.Int("max-objects", 0, "Maximum number of objects to process (0 = unlimited)")
+	workers := fs.Int("workers", 5, "Number of concurrent workers")
+	dryRun := fs.Bool("dry-run", false, "Show what would be imported without making changes")
+	showProgress := fs.Bool("show-progress", true, "Show import progress")
+	forceReimport := fs.Bool("force-reimport", false, "Force reimport even if message already exists")
+	cleanupDB := fs.Bool("cleanup-db", true, "Cleanup temporary database when done")
+	importDelay := fs.Duration("import-delay", 0, "Delay between imports to control rate")
+	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
+	configPath := fs.String("config", "config.toml", "Path to configuration file")
+
+	// Parse the flags
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		log.Fatalf("Failed to parse flags: %v", err)
+	}
+
+	// Validate required flags
+	if *email == "" {
+		log.Fatal("--email is required (e.g., 'user@example.com')")
+	}
+
+	// Load configuration
+	var cfg AdminConfig
+	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		log.Fatalf("Failed to load config file: %v", err)
+	}
+
+	// Connect to resilient database
+	ctx := context.Background()
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	if err != nil {
+		log.Fatalf("Failed to initialize resilient database: %v", err)
+	}
+	defer rdb.Close()
+
+	// Connect to S3
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	if err != nil {
+		log.Fatalf("Failed to connect to S3: %v", err)
+	}
+	if cfg.S3.Encrypt {
+		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			log.Fatalf("Failed to enable S3 encryption: %v", err)
+		}
+	}
+
+	// Configure S3 importer options
+	options := S3ImporterOptions{
+		Email:             *email,
+		DryRun:            *dryRun,
+		BatchSize:         *batchSize,
+		MaxObjects:        *maxObjects,
+		ShowProgress:      *showProgress,
+		ForceReimport:     *forceReimport,
+		CleanupDB:         *cleanupDB,
+		ImportDelay:       *importDelay,
+		ContinuationToken: *continuationToken,
+		Workers:           *workers,
+	}
+
+	importer, err := NewS3Importer(rdb, s3, options)
+	if err != nil {
+		log.Fatalf("Failed to create S3 importer: %v", err)
+	}
+
+	if err := importer.Run(); err != nil {
+		log.Fatalf("Failed to import from S3: %v", err)
+	}
 }

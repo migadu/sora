@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"strings"
+
 	"github.com/emersion/go-imap/v2"
 
 	"github.com/migadu/sora/server"
@@ -17,9 +19,19 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 		// Store client ID and apply capability filtering
 		s.SetClientID(clientID)
 
+		// Log any additional (non-forwarding) fields from Raw data
+		if len(clientID.Raw) > 0 {
+			s.logAdditionalIDFields(clientID.Raw)
+		}
+
 		// Check for Dovecot-style forwarding parameters in client ID
-		if s.isFromTrustedProxy() {
-			s.processForwardingParameters(clientID)
+		// Only process forwarding parameters if the connection is from a trusted proxy
+		if s.isFromTrustedProxy() && len(clientID.Raw) > 0 {
+			// Extract only forwarding parameters (x-* prefixed fields)
+			forwardingFields := s.extractForwardingFields(clientID.Raw)
+			if len(forwardingFields) > 0 {
+				s.processForwardingParameters(forwardingFields)
+			}
 		}
 	} else {
 		s.Log("[ID] Client sent empty ID command")
@@ -56,14 +68,36 @@ func (s *IMAPSession) isFromTrustedProxy() bool {
 	return s.server.limiter.IsTrustedConnection(remoteAddr)
 }
 
-// processForwardingParameters extracts and validates forwarding parameters from client ID
-func (s *IMAPSession) processForwardingParameters(clientID *imap.IDData) {
-	if len(clientID.Raw) == 0 {
-		return
+// logAdditionalIDFields logs any additional ID fields that aren't forwarding parameters
+func (s *IMAPSession) logAdditionalIDFields(rawFields map[string]string) {
+	var nonForwardingFields []string
+	for key, value := range rawFields {
+		// Skip forwarding parameters (x-* prefixed fields)
+		if !strings.HasPrefix(key, "x-") {
+			nonForwardingFields = append(nonForwardingFields, key+"="+value)
+		}
 	}
 
-	// Parse forwarding parameters from the Raw map
-	forwardingParams := server.ParseIMAPID(clientID.Raw)
+	if len(nonForwardingFields) > 0 {
+		s.Log("[ID] Client identified as: %s", strings.Join(nonForwardingFields, ", "))
+	}
+}
+
+// extractForwardingFields extracts only the x-* prefixed fields for forwarding
+func (s *IMAPSession) extractForwardingFields(rawFields map[string]string) map[string]string {
+	forwardingFields := make(map[string]string)
+	for key, value := range rawFields {
+		if strings.HasPrefix(key, "x-") {
+			forwardingFields[key] = value
+		}
+	}
+	return forwardingFields
+}
+
+// processForwardingParameters extracts and validates forwarding parameters from filtered fields
+func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]string) {
+	// Parse forwarding parameters from the filtered forwarding fields
+	forwardingParams := server.ParseIMAPID(forwardingFields)
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {

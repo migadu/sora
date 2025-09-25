@@ -157,7 +157,6 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// Only call sessionTracker.Poll if we have meaningful updates to send
 	// This prevents sending empty updates that cause panics in the go-imap library
 	if !hasUpdates {
-		s.Log("[POLL] No updates to send, skipping sessionTracker.Poll")
 		return nil
 	}
 
