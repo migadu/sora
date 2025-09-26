@@ -12,6 +12,14 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
+// ClientCapabilityFilter defines capability filtering rules for specific clients
+type ClientCapabilityFilter struct {
+	ClientName    string   `toml:"client_name"`    // Client name pattern (regex)
+	ClientVersion string   `toml:"client_version"` // Client version pattern (regex)
+	DisableCaps   []string `toml:"disable_caps"`   // List of capabilities to disable
+	Reason        string   `toml:"reason"`         // Human-readable reason for the filter
+}
+
 // DatabaseEndpointConfig holds configuration for a single database endpoint
 type DatabaseEndpointConfig struct {
 	// List of database hosts for runtime failover/load balancing
@@ -775,6 +783,9 @@ type ServerConfig struct {
 
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
+
+	// Client capability filtering (IMAP specific)
+	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`
 }
 
 // ServersConfig holds all server configurations.

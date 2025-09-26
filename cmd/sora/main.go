@@ -594,6 +594,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupAsync:          deps.config.LocalCache.WarmupAsync,
 			WarmupTimeout:        deps.config.LocalCache.WarmupTimeout,
 			FTSRetention:         ftsRetention,
+			CapabilityFilters:    serverConfig.ClientFilters,
 		})
 	if err != nil {
 		errChan <- err

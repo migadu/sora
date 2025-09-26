@@ -12,6 +12,7 @@ import (
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 	imapserver "github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/uploader"
@@ -19,7 +20,7 @@ import (
 )
 
 // setupIMAPServerWithCapabilityFilters creates an IMAP server with custom capability filtering
-func setupIMAPServerWithCapabilityFilters(t *testing.T, filters []imapserver.ClientCapabilityFilter) (*common.TestServer, common.TestAccount) {
+func setupIMAPServerWithCapabilityFilters(t *testing.T, filters []config.ClientCapabilityFilter) (*common.TestServer, common.TestAccount) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -115,7 +116,7 @@ func TestIMAP_CapabilityFiltering(t *testing.T) {
 	// but the actual command handlers respect the per-session filtered capabilities
 
 	// Define capability filters to disable ESEARCH for iOS Apple Mail
-	filters := []imapserver.ClientCapabilityFilter{
+	filters := []config.ClientCapabilityFilter{
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
@@ -246,7 +247,7 @@ func TestIMAP_CapabilityFiltering_NoClientID(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Same filters as above
-	filters := []imapserver.ClientCapabilityFilter{
+	filters := []config.ClientCapabilityFilter{
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
@@ -360,7 +361,7 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 
 	// Define capability filters to disable multiple capabilities for iOS Apple Mail
 	// This matches the user's configuration and tests multiple capability filtering
-	filters := []imapserver.ClientCapabilityFilter{
+	filters := []config.ClientCapabilityFilter{
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
