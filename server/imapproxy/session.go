@@ -99,6 +99,9 @@ func (s *Session) handleConnection() {
 
 		line = strings.TrimRight(line, "\r\n")
 
+		// Log client command with password masking if debug is enabled
+		s.Log("C: %s\r\n", line)
+
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
 		if err != nil {
@@ -289,6 +292,14 @@ func (s *Session) sendResponse(response string) error {
 		return err
 	}
 	return s.clientWriter.Flush()
+}
+
+// Log logs a client command with password masking if debug is enabled.
+func (s *Session) Log(format string, args ...interface{}) {
+	if s.server.debugWriter != nil {
+		message := fmt.Sprintf(format, args...)
+		s.server.debugWriter.Write([]byte(message))
+	}
 }
 
 // authenticateUser authenticates the user against the database.

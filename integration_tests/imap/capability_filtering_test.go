@@ -3,8 +3,10 @@
 package imap_test
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -730,5 +732,156 @@ func TestIMAP_StandardSearch_ReturnsStandardResponse(t *testing.T) {
 	} else {
 		t.Logf("SUCCESS: Standard SEARCH command correctly received a standard response (Min=%d, Max=%d).",
 			searchData.Min, searchData.Max)
+	}
+}
+
+// TestIMAP_CapabilityFiltering_BeforeAfterID tests that ESEARCH capability filtering
+// works correctly both before and after client identification via ID command.
+// This reproduces the scenario where:
+// 1. Client performs ESEARCH before ID - should use server capabilities
+// 2. Client sends ID command - triggers capability filtering
+// 3. Client performs ESEARCH after ID - should respect filtered capabilities
+func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
+	// Setup capability filters
+	filters := []config.ClientCapabilityFilter{
+		{
+			ClientName:    "TestClientWithESEARCHDisabled",
+			ClientVersion: ".*",
+			DisableCaps:   []string{"ESEARCH"},
+			Reason:        "Test ESEARCH fallback",
+		},
+	}
+
+	// Setup test server
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	// Connect to server
+	conn, err := net.Dial("tcp", server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer conn.Close()
+
+	// Raw IMAP protocol handling
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Read greeting
+	greeting, _, err := reader.ReadLine()
+	if err != nil {
+		t.Fatalf("Failed to read greeting: %v", err)
+	}
+	t.Logf("Greeting: %s", greeting)
+
+	// Helper functions for IMAP protocol
+	sendCommand := func(tag, command string) {
+		fmt.Fprintf(writer, "%s %s\r\n", tag, command)
+		writer.Flush()
+		t.Logf("SENT: %s %s", tag, command)
+	}
+
+	readResponse := func(expectedTag string) []string {
+		var responses []string
+		for {
+			line, _, err := reader.ReadLine()
+			if err != nil {
+				t.Fatalf("Failed to read response: %v", err)
+			}
+			lineStr := string(line)
+			t.Logf("RECV: %s", lineStr)
+			responses = append(responses, lineStr)
+
+			if strings.HasPrefix(lineStr, expectedTag+" ") {
+				break
+			}
+		}
+		return responses
+	}
+
+	// Login
+	sendCommand("A01", fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+	readResponse("A01")
+
+	// Select INBOX
+	sendCommand("A02", "SELECT INBOX")
+	readResponse("A02")
+
+	// Add a test message
+	messageData := "From: test@example.com\r\nTo: " + account.Email + "\r\nSubject: Test Message\r\n\r\nTest content"
+	sendCommand("A03", fmt.Sprintf("APPEND INBOX {%d}", len(messageData)))
+
+	// Read continuation response
+	contLine, _, err := reader.ReadLine()
+	if err != nil {
+		t.Fatalf("Failed to read continuation: %v", err)
+	}
+	t.Logf("RECV: %s", contLine)
+
+	// Send message data
+	fmt.Fprintf(writer, "%s\r\n", messageData)
+	writer.Flush()
+	readResponse("A03")
+
+	// STEP 1: Perform ESEARCH before ID command
+	t.Logf("=== STEP 1: ESEARCH before ID command ===")
+	sendCommand("DI18", "UID SEARCH RETURN (ALL) UID 1:*")
+	beforeIDResponses := readResponse("DI18")
+
+	// Check if we got ESEARCH response (should be based on server capabilities)
+	var gotESEARCHBeforeID bool
+	for _, resp := range beforeIDResponses {
+		if strings.Contains(resp, "ESEARCH") {
+			gotESEARCHBeforeID = true
+			t.Logf("Before ID: Got ESEARCH response: %s", resp)
+			break
+		} else if strings.Contains(resp, "* SEARCH") {
+			t.Logf("Before ID: Got standard SEARCH response: %s", resp)
+			break
+		}
+	}
+
+	// STEP 2: Send ID command to trigger capability filtering
+	t.Logf("=== STEP 2: ID command to trigger filtering ===")
+	sendCommand("DX2", `ID ("name" "TestClientWithESEARCHDisabled" "version" "1.0")`)
+	readResponse("DX2")
+
+	// STEP 3: Perform ESEARCH after ID command
+	t.Logf("=== STEP 3: ESEARCH after ID command ===")
+	sendCommand("DI19", "UID SEARCH RETURN (ALL) UID 1:*")
+	afterIDResponses := readResponse("DI19")
+
+	// Check if we got standard SEARCH response (should be filtered)
+	var gotStandardAfterID bool
+	for _, resp := range afterIDResponses {
+		if strings.Contains(resp, "ESEARCH") {
+			t.Logf("After ID: Got ESEARCH response: %s", resp)
+		} else if strings.Contains(resp, "* SEARCH") {
+			gotStandardAfterID = true
+			t.Logf("After ID: Got standard SEARCH response: %s", resp)
+			break
+		}
+	}
+
+	// Verify the behavior
+	if gotESEARCHBeforeID {
+		t.Logf("✓ Before ID: Server used ESEARCH (server capabilities)")
+	} else {
+		t.Logf("✗ Before ID: Server did not use ESEARCH")
+	}
+
+	if gotStandardAfterID {
+		t.Logf("✓ After ID: Server used standard SEARCH (capability filtering applied)")
+	} else {
+		t.Errorf("✗ After ID: Server did not properly apply capability filtering - should use standard SEARCH")
+	}
+
+	// The test should verify that:
+	// 1. Before ID: Server behavior should be based on server capabilities (may vary)
+	// 2. After ID: Server should respect capability filtering and use standard SEARCH
+	if !gotStandardAfterID {
+		t.Errorf("FAILURE: Capability filtering not working properly after ID command")
+	} else {
+		t.Logf("SUCCESS: Capability filtering working correctly after ID command")
 	}
 }

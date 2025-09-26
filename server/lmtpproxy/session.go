@@ -95,6 +95,9 @@ func (s *Session) handleConnection() {
 		line = strings.TrimRight(line, "\r\n")
 		log.Printf("[LMTP Proxy] Client %s: %s", clientAddr, line)
 
+		// Log client command if debug is enabled
+		s.Log("C: %s\r\n", line)
+
 		// Use the shared command parser. LMTP commands do not have tags.
 		_, command, args, err := server.ParseLine(line, false)
 		if err != nil {
@@ -221,6 +224,14 @@ func (s *Session) sendResponse(response string) error {
 		return err
 	}
 	return s.clientWriter.Flush()
+}
+
+// Log logs a client command if debug is enabled.
+func (s *Session) Log(format string, args ...interface{}) {
+	if s.server.debugWriter != nil {
+		message := fmt.Sprintf(format, args...)
+		s.server.debugWriter.Write([]byte(message))
+	}
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.

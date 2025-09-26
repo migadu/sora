@@ -4,11 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -39,6 +43,54 @@ type POP3ProxyServer struct {
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
+
+	// Debug logging
+	debugWriter io.Writer
+}
+
+// maskingWriter wraps an io.Writer to mask sensitive information in POP3 commands
+type maskingWriter struct {
+	w io.Writer
+}
+
+// Write inspects the log output, and if it's a client command (prefixed with "C: "),
+// it attempts to mask sensitive parts of PASS and AUTH commands.
+func (mw *maskingWriter) Write(p []byte) (n int, err error) {
+	line := string(p)
+	originalLen := len(p)
+
+	// Only process client commands
+	if !strings.HasPrefix(line, "C: ") {
+		return mw.w.Write(p)
+	}
+
+	cmdLine := strings.TrimPrefix(line, "C: ")
+	trimmedCmdLine := strings.TrimRight(cmdLine, "\r\n")
+	parts := strings.Fields(trimmedCmdLine)
+	if len(parts) < 1 {
+		return mw.w.Write(p)
+	}
+
+	command := strings.ToUpper(parts[0])
+
+	// Use the helper to mask the command line
+	maskedCmdLine := helpers.MaskSensitive(trimmedCmdLine, command, "PASS", "AUTH")
+
+	// If the line was modified, write the masked version.
+	if maskedCmdLine != trimmedCmdLine {
+		maskedLine := "C: " + maskedCmdLine + "\r\n"
+		_, err = mw.w.Write([]byte(maskedLine))
+	} else {
+		// Otherwise, write the original line.
+		_, err = mw.w.Write(p)
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	// Always return the original length to prevent buffering issues
+	return originalLen, nil
 }
 
 type POP3ProxyServerOptions struct {
@@ -136,6 +188,12 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		limiter = server.NewConnectionLimiterWithTrustedNets("POP3-PROXY", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 	}
 
+	// Setup debug writer with password masking if debug is enabled
+	var debugWriter io.Writer
+	if options.Debug {
+		debugWriter = &maskingWriter{w: os.Stdout}
+	}
+
 	server := &POP3ProxyServer{
 		name:               options.Name,
 		hostname:           hostname,
@@ -155,6 +213,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		sessionTimeout:     options.SessionTimeout,
 		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
 		limiter:            limiter,
+		debugWriter:        debugWriter,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided

@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -45,6 +47,9 @@ type Server struct {
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	limiter *server.ConnectionLimiter
+
+	// Debug logging
+	debugWriter io.Writer
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -72,6 +77,9 @@ type ServerOptions struct {
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
+
+	// Debug logging
+	Debug bool // Enable debug logging
 }
 
 // New creates a new LMTP proxy server.
@@ -148,6 +156,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter = server.NewConnectionLimiterWithTrustedNets("LMTP-PROXY", opts.MaxConnections, 0, []string{})
 	}
 
+	// Setup debug writer if debug is enabled
+	var debugWriter io.Writer
+	if opts.Debug {
+		debugWriter = os.Stdout
+	}
+
 	return &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -170,6 +184,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
 		limiter:            limiter,
+		debugWriter:        debugWriter,
 	}, nil
 }
 

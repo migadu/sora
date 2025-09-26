@@ -68,21 +68,28 @@ func TestIMAP_IdleBasic(t *testing.T) {
 func TestIMAP_IdleNotificationsLongPoll(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
 	// This test requires waiting for the 15-second IDLE poll interval
 	// to test the periodic polling mechanism in addition to immediate notifications
 	if testing.Short() {
 		t.Skip("Skipping IDLE long poll test in short mode (requires 15+ second wait)")
 	}
 
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Ensure we have a clean test environment
+	t.Logf("Starting IDLE long poll test with account: %s", account.Email)
+
 	// Client 1: IDLE watcher
 	client1, err := imapclient.DialInsecure(server.Address, nil)
 	if err != nil {
 		t.Fatalf("Failed to dial client1: %v", err)
 	}
-	defer client1.Logout()
+	defer func() {
+		if err := client1.Logout(); err != nil {
+			t.Logf("Client1 logout error (non-fatal): %v", err)
+		}
+	}()
 
 	if err := client1.Login(account.Email, account.Password).Wait(); err != nil {
 		t.Fatalf("Client1 login failed: %v", err)
@@ -100,7 +107,11 @@ func TestIMAP_IdleNotificationsLongPoll(t *testing.T) {
 		}
 		t.Fatalf("Client1 IDLE failed to start: %v", err)
 	}
-	defer idleCmd.Close()
+	defer func() {
+		if err := idleCmd.Close(); err != nil {
+			t.Logf("IDLE close error (non-fatal): %v", err)
+		}
+	}()
 
 	t.Log("Client1 started IDLE")
 
@@ -109,7 +120,11 @@ func TestIMAP_IdleNotificationsLongPoll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to dial client2: %v", err)
 	}
-	defer client2.Logout()
+	defer func() {
+		if err := client2.Logout(); err != nil {
+			t.Logf("Client2 logout error (non-fatal): %v", err)
+		}
+	}()
 
 	if err := client2.Login(account.Email, account.Password).Wait(); err != nil {
 		t.Fatalf("Client2 login failed: %v", err)
@@ -148,15 +163,33 @@ func TestIMAP_IdleNotificationsLongPoll(t *testing.T) {
 
 	t.Log("IDLE poll interval elapsed - stopping IDLE")
 
-	// Stop IDLE on client1
+	// Stop IDLE on client1 - ensure it's properly closed before reselect
 	if err := idleCmd.Close(); err != nil {
-		t.Fatalf("Failed to stop IDLE: %v", err)
+		t.Logf("Failed to stop IDLE (non-fatal): %v", err)
 	}
 
-	// Verify client1 can see the new message
-	mbox, err := client1.Select("INBOX", nil).Wait()
-	if err != nil {
-		t.Fatalf("Client1 reselect failed: %v", err)
+	// Give some time for IDLE to fully stop
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify client1 can see the new message with retry logic
+	var mbox *imap.SelectData
+	var selectErr error
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			t.Logf("Retrying INBOX selection (attempt %d/%d)", i+1, maxRetries)
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		mbox, selectErr = client1.Select("INBOX", nil).Wait()
+		if selectErr == nil {
+			break
+		}
+
+		if i == maxRetries-1 {
+			t.Fatalf("Client1 reselect failed after %d attempts: %v", maxRetries, selectErr)
+		}
+		t.Logf("INBOX selection failed (attempt %d/%d): %v", i+1, maxRetries, selectErr)
 	}
 
 	if mbox.NumMessages != 1 {

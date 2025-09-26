@@ -4,11 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -44,6 +48,54 @@ type Server struct {
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
+
+	// Debug logging
+	debugWriter io.Writer
+}
+
+// maskingWriter wraps an io.Writer to mask sensitive information in IMAP commands
+type maskingWriter struct {
+	w io.Writer
+}
+
+// Write inspects the log output, and if it's a client command (prefixed with "C: "),
+// it attempts to mask sensitive parts of LOGIN or AUTHENTICATE commands.
+func (mw *maskingWriter) Write(p []byte) (n int, err error) {
+	line := string(p)
+	originalLen := len(p)
+
+	// Only process client commands
+	if !strings.HasPrefix(line, "C: ") {
+		return mw.w.Write(p)
+	}
+
+	cmdLine := strings.TrimPrefix(line, "C: ")
+	trimmedCmdLine := strings.TrimRight(cmdLine, "\r\n")
+	parts := strings.Fields(trimmedCmdLine)
+	if len(parts) < 2 { // Needs at least tag and command
+		return mw.w.Write(p)
+	}
+
+	command := strings.ToUpper(parts[1])
+
+	// Use the helper to mask the command line
+	maskedCmdLine := helpers.MaskSensitive(trimmedCmdLine, command, "LOGIN", "AUTHENTICATE")
+
+	// If the line was modified, write the masked version.
+	if maskedCmdLine != trimmedCmdLine {
+		maskedLine := "C: " + maskedCmdLine + "\r\n"
+		_, err = mw.w.Write([]byte(maskedLine))
+	} else {
+		// Otherwise, write the original line.
+		_, err = mw.w.Write(p)
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	// Always return the original length to prevent buffering issues
+	return originalLen, nil
 }
 
 // ServerOptions holds options for creating a new IMAP proxy server.
@@ -75,6 +127,9 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
+
+	// Debug logging
+	Debug bool // Enable debug logging with password masking
 }
 
 // New creates a new IMAP proxy server.
@@ -145,6 +200,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter = server.NewConnectionLimiterWithTrustedNets("IMAP-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
 	}
 
+	// Setup debug writer with password masking if debug is enabled
+	var debugWriter io.Writer
+	if opts.Debug {
+		debugWriter = &maskingWriter{w: os.Stdout}
+	}
+
 	return &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -168,6 +229,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		prelookupConfig:    opts.PreLookup,
 		remoteUseIDCommand: opts.RemoteUseIDCommand,
 		limiter:            limiter,
+		debugWriter:        debugWriter,
 	}, nil
 }
 

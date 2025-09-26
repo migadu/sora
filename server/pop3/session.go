@@ -90,7 +90,7 @@ func (s *POP3Session) handleConnection() {
 		parts := strings.Split(line, " ")
 		cmd := strings.ToUpper(parts[0])
 
-		s.Log("CLIENT COMMAND: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
+		s.Log("C: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
 
 		switch cmd {
 		case "CAPA":

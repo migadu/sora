@@ -77,6 +77,10 @@ func (s *POP3ProxySession) handleConnection() {
 		}
 
 		line = strings.TrimSpace(line)
+
+		// Log client command with password masking if debug is enabled
+		s.Log("C: %s\r\n", line)
+
 		parts := strings.Fields(line)
 		if len(parts) == 0 {
 			continue // Ignore empty lines
@@ -283,6 +287,14 @@ func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string
 		return true
 	}
 	return false
+}
+
+// Log logs a client command with password masking if debug is enabled.
+func (s *POP3ProxySession) Log(format string, args ...interface{}) {
+	if s.server.debugWriter != nil {
+		message := fmt.Sprintf(format, args...)
+		s.server.debugWriter.Write([]byte(message))
+	}
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {

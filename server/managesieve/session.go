@@ -101,7 +101,7 @@ func (s *ManageSieveSession) handleConnection() {
 		// If debug logging is active, it might log the raw command.
 		// This ensures that if any such logging exists, it will be of a masked line.
 		// This is a defensive change as the direct logging is not visible in this file.
-		s.Log(helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		s.Log("C: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
 		switch command {
 		case "CAPABILITY":
