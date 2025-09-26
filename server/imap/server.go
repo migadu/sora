@@ -372,10 +372,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	s.server = imapserver.New(&imapserver.Options{
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
-		InsecureAuth: !options.TLS,
+		InsecureAuth: true, // We handle TLS authentication ourselves
 		DebugWriter:  debugWriter,
 		Caps:         s.caps,
-		TLSConfig:    s.tlsConfig,
+		TLSConfig:    nil,
 	})
 
 	// Start connection limiter cleanup
