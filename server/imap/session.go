@@ -72,6 +72,7 @@ func (s *IMAPSession) SetClientID(clientID *imap.IDData) {
 func (s *IMAPSession) applyCapabilityFilters() {
 	// Start with the server's full capability set
 	s.sessionCaps = make(imap.CapSet)
+	originalCapCount := len(s.server.caps)
 	for cap := range s.server.caps {
 		s.sessionCaps[cap] = struct{}{}
 	}
@@ -81,10 +82,15 @@ func (s *IMAPSession) applyCapabilityFilters() {
 	}
 
 	// Apply capability filtering based on client identification
-	s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID)
+	disabledCaps := s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID)
 
-	s.Log("[CAPS] Applied capability filters for client %s %s: %d capabilities enabled",
-		s.clientID.Name, s.clientID.Version, len(s.sessionCaps))
+	if len(disabledCaps) > 0 {
+		s.Log("[CAPS] Applied capability filters for client %s %s: disabled %v, %d/%d capabilities enabled",
+			s.clientID.Name, s.clientID.Version, disabledCaps, len(s.sessionCaps), originalCapCount)
+	} else {
+		s.Log("[CAPS] No capability filters applied for client %s %s: all %d capabilities enabled",
+			s.clientID.Name, s.clientID.Version, len(s.sessionCaps))
+	}
 }
 
 func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error {

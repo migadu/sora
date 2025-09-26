@@ -50,16 +50,22 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 		All: nums,
 	}
 
-	// Handle ESORT options if provided
+	// Handle ESORT options if provided and capability is enabled
 	if options != nil {
-		if options.ReturnCount {
-			sortData.Count = uint32(len(nums))
-		}
-		if options.ReturnMin && len(nums) > 0 {
-			sortData.Min = nums[0]
-		}
-		if options.ReturnMax && len(nums) > 0 {
-			sortData.Max = nums[len(nums)-1]
+		if !s.GetCapabilities().Has(imap.CapESort) {
+			s.Log("[SORT] ESORT options ignored due to capability filtering")
+		} else {
+			s.Log("[SORT ESORT] ESORT options provided: Min=%v, Max=%v, All=%v, Count=%v",
+				options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
+			if options.ReturnCount {
+				sortData.Count = uint32(len(nums))
+			}
+			if options.ReturnMin && len(nums) > 0 {
+				sortData.Min = nums[0]
+			}
+			if options.ReturnMax && len(nums) > 0 {
+				sortData.Max = nums[len(nums)-1]
+			}
 		}
 	}
 

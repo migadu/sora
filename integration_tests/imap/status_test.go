@@ -3,12 +3,19 @@
 package imap_test
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
+	imapServer "github.com/migadu/sora/server/imap"
+	"github.com/migadu/sora/server/uploader"
+	"github.com/migadu/sora/storage"
 )
 
 // TestIMAP_ComprehensiveMailboxStatus tests comprehensive STATUS operations
@@ -158,4 +165,151 @@ func TestIMAP_ComprehensiveMailboxStatus(t *testing.T) {
 	}
 
 	t.Log("Comprehensive mailbox status test completed successfully")
+}
+
+// TestIMAP_StatusAppendLimit tests that STATUS correctly returns APPENDLIMIT
+func TestIMAP_StatusAppendLimit(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create custom server with specific AppendLimit
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	// Create a temporary directory for the uploader
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	// Create error channel for uploader
+	errCh := make(chan error, 1)
+
+	// Create UploadWorker for testing
+	uploadWorker, err := uploader.New(
+		context.Background(),
+		tempDir,              // path
+		10,                   // batchSize
+		1,                    // concurrency
+		3,                    // maxAttempts
+		time.Second,          // retryInterval
+		"test-instance",      // instanceID
+		rdb,                  // database
+		&storage.S3Storage{}, // S3 storage
+		nil,                  // cache (can be nil)
+		errCh,                // error channel
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+
+	// Set AppendLimit to 25MB (same as config.toml)
+	const expectedAppendLimit = 25 * 1024 * 1024 // 25MB in bytes
+
+	server, err := imapServer.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		&storage.S3Storage{},
+		rdb,
+		uploadWorker,
+		nil, // cache.Cache
+		imapServer.IMAPServerOptions{
+			AppendLimit: expectedAppendLimit,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	// Start server in background
+	errChan := make(chan error, 1)
+	go func() {
+		if err := server.Serve(address); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			errChan <- fmt.Errorf("IMAP server error: %w", err)
+		}
+	}()
+
+	// Set up cleanup function
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+		os.RemoveAll(tempDir)
+	}
+	defer cleanup()
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	c, err := imapclient.DialInsecure(address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Test 1: STATUS with AppendLimit option
+	statusData, err := c.Status("INBOX", &imap.StatusOptions{
+		AppendLimit: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS command with AppendLimit failed: %v", err)
+	}
+
+	if statusData.Mailbox != "INBOX" {
+		t.Errorf("Expected mailbox INBOX, got %s", statusData.Mailbox)
+	}
+
+	if statusData.AppendLimit == nil {
+		t.Fatal("AppendLimit should be populated when requested")
+	}
+
+	if *statusData.AppendLimit != expectedAppendLimit {
+		t.Errorf("Expected AppendLimit %d, got %d", expectedAppendLimit, *statusData.AppendLimit)
+	}
+
+	t.Logf("STATUS AppendLimit test passed - configured: %d bytes (25MB), returned: %d bytes",
+		expectedAppendLimit, *statusData.AppendLimit)
+
+	// Test 2: STATUS with mixed options including AppendLimit
+	statusData, err = c.Status("INBOX", &imap.StatusOptions{
+		NumMessages: true,
+		AppendLimit: true,
+		UIDNext:     true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS command with mixed options failed: %v", err)
+	}
+
+	if statusData.AppendLimit == nil {
+		t.Fatal("AppendLimit should be populated when requested in mixed options")
+	}
+
+	if *statusData.AppendLimit != expectedAppendLimit {
+		t.Errorf("Expected AppendLimit %d in mixed options, got %d", expectedAppendLimit, *statusData.AppendLimit)
+	}
+
+	if statusData.NumMessages == nil {
+		t.Error("NumMessages should be populated when requested")
+	}
+
+	if statusData.UIDNext == 0 {
+		t.Error("UIDNext should be populated when requested")
+	}
+
+	t.Logf("Mixed STATUS options test passed - AppendLimit: %d, NumMessages: %v, UIDNext: %d",
+		*statusData.AppendLimit, statusData.NumMessages, statusData.UIDNext)
+
+	t.Log("STATUS APPENDLIMIT integration test completed successfully")
 }

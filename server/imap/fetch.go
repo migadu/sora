@@ -239,14 +239,22 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 
 		if len(options.BinarySection) > 0 {
-			if err := s.handleBinarySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-				return err
+			if s.GetCapabilities().Has(imap.CapBinary) {
+				if err := s.handleBinarySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+					return err
+				}
+			} else {
+				s.Log("[FETCH] BINARY section requests ignored due to capability filtering")
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if err := s.handleBinarySectionSize(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-				return err
+			if s.GetCapabilities().Has(imap.CapBinary) {
+				if err := s.handleBinarySectionSize(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+					return err
+				}
+			} else {
+				s.Log("[FETCH] BINARY section size requests ignored due to capability filtering")
 			}
 		}
 	}

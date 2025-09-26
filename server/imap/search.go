@@ -65,12 +65,19 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	searchData := &imap.SearchData{}
-	searchData.Count = uint32(len(messages))
 
 	if options != nil {
-		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
-			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
-		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
+		// Check if session has ESEARCH capability - if not, ignore ESEARCH options
+		if !s.GetCapabilities().Has(imap.CapESearch) {
+			s.Log("[SEARCH] ESEARCH options ignored due to capability filtering, falling back to standard search")
+		} else {
+			s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
+				options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
+		}
+
+		if s.GetCapabilities().Has(imap.CapESearch) && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount) {
+			// Set count for ESEARCH responses
+			searchData.Count = uint32(len(messages))
 			if len(messages) > 0 {
 				if options.ReturnMin {
 					searchData.Min = uint32(messages[0].UID)
@@ -117,11 +124,13 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
 			// The go-imap library will include Count in ESEARCH responses when it's set
 
-		} else {
+		} else if s.GetCapabilities().Has(imap.CapESearch) {
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
 			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
+			// Set count for default ESEARCH responses
+			searchData.Count = uint32(len(messages))
 
 			// Include ALL for ESEARCH responses when there are results
 			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
@@ -150,9 +159,37 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					searchData.All = imap.SeqSet{}
 				}
 			}
+		} else {
+			// ESEARCH capability is filtered out, fall back to standard search behavior
+			s.Log("[SEARCH] Using standard search fallback due to capability filtering")
+			// Standard search always includes count and all results
+			searchData.Count = uint32(len(messages))
+			if len(messages) > 0 {
+				var uids imap.UIDSet
+				var seqNums imap.SeqSet
+				for _, msg := range messages {
+					uids.AddNum(msg.UID)
+					// Use our snapshot of sessionTracker which is thread-safe
+					if sessionTrackerSnapshot != nil {
+						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
+						seqNums.AddNum(encodedSeq)
+					} else {
+						// Fallback to just using the sequence number if session tracker isn't available
+						seqNums.AddNum(msg.Seq)
+					}
+				}
+
+				if numKind == imapserver.NumKindUID {
+					searchData.All = uids
+				} else {
+					searchData.All = seqNums
+				}
+			}
 		}
 	} else { // Standard SEARCH command (options == nil)
 		s.Log("[SEARCH] Standard SEARCH, returning ALL and COUNT.")
+		// Standard search always includes count and all results
+		searchData.Count = uint32(len(messages))
 		// Only populate the 'All' field if there are results, as the imap
 		// library can have issues encoding an empty (but non-nil) NumSet.
 		if len(messages) > 0 {

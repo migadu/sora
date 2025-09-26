@@ -63,6 +63,10 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.HighestModSeq {
 		statusData.HighestModSeq = summary.HighestModSeq
 	}
+	if options.AppendLimit && s.server.appendLimit > 0 {
+		limit := uint32(s.server.appendLimit)
+		statusData.AppendLimit = &limit
+	}
 
 	numMessagesStr := "n/a"
 	if statusData.NumMessages != nil {

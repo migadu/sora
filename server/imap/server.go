@@ -677,10 +677,12 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 	return nil
 }
 
-// filterCapabilitiesForClient applies client-specific capability filtering
-func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData) {
+// filterCapabilitiesForClient applies client-specific capability filtering and returns disabled capabilities
+func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData) []string {
+	var disabledCaps []string
+
 	if clientID == nil || len(s.capFilters) == 0 {
-		return // No client ID or no filters configured
+		return disabledCaps // No client ID or no filters configured
 	}
 
 	clientName := clientID.Name
@@ -697,12 +699,15 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 				cap := imap.Cap(capStr)
 				if _, exists := sessionCaps[cap]; exists {
 					delete(sessionCaps, cap)
+					disabledCaps = append(disabledCaps, capStr)
 					log.Printf("[IMAP] Disabled capability %s for client %s %s",
 						cap, clientName, clientVersion)
 				}
 			}
 		}
 	}
+
+	return disabledCaps
 }
 
 // clientMatches checks if a client matches the filter criteria
