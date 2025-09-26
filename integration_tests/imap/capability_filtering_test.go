@@ -580,3 +580,155 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 
 	t.Log("SUCCESS: iOS Apple Mail capability filtering test completed - ESEARCH, CONDSTORE, ESORT, and BINARY properly filtered at handler level")
 }
+
+// TestIMAP_CapabilityFiltering_ESEARCHFallback verifies that when ESEARCH is disabled,
+// the server correctly falls back to a standard SEARCH response.
+func TestIMAP_CapabilityFiltering_ESEARCHFallback(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Define a filter to disable ESEARCH for a test client
+	// Add a test message to have something to search
+	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
+		"To: %s\r\n"+
+		"Subject: Test ESEARCH Fallback\r\n"+
+		"Date: %s\r\n"+
+		"\r\n"+
+		"This is a test message for ESEARCH fallback verification.\r\n",
+		"test@example.com", time.Now().Format(time.RFC1123))
+
+	filters := []config.ClientCapabilityFilter{
+		{
+			ClientName:    "TestClientWithESEARCHDisabled",
+			ClientVersion: ".*",
+			DisableCaps:   []string{"ESEARCH"},
+			Reason:        "Test ESEARCH fallback",
+		},
+	}
+
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	// Identify as the test client
+	if _, err := c.ID(&imap.IDData{Name: "TestClientWithESEARCHDisabled"}).Wait(); err != nil {
+		t.Fatalf("ID command failed: %v", err)
+	}
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Append the test message
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+	if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		t.Fatalf("Failed to close append command: %v", err)
+	}
+	if _, err := appendCmd.Wait(); err != nil {
+		t.Fatalf("Failed to wait for append command: %v", err)
+	}
+
+	// Issue a SEARCH command with ESEARCH options. Since ESEARCH is disabled for this client,
+	// the server should fall back to a standard SEARCH.
+	cmd := c.Search(&imap.SearchCriteria{Text: []string{"fallback"}}, &imap.SearchOptions{ReturnCount: true, ReturnMin: true, ReturnMax: true})
+	searchData, err := cmd.Wait()
+	if err != nil {
+		t.Fatalf("Search command failed: %v", err)
+	}
+
+	// A standard SEARCH response will not populate the Min or Max fields.
+	// This is how we verify the fallback was successful.
+	if searchData.Min > 0 || searchData.Max > 0 {
+		t.Errorf("FAILURE: Received ESEARCH response (Min=%d, Max=%d), but expected standard SEARCH fallback.",
+			searchData.Min, searchData.Max)
+	} else {
+		t.Logf("SUCCESS: ESEARCH fallback is working. Min and Max are zero as expected for a standard SEARCH response (Min=%d, Max=%d).",
+			searchData.Min, searchData.Max)
+	}
+}
+
+// TestIMAP_StandardSearch_ReturnsStandardResponse verifies that a standard SEARCH
+// command (with no ESEARCH options) correctly receives a standard `* SEARCH`
+// response, not an `* ESEARCH` response. This test runs with all capabilities enabled.
+func TestIMAP_StandardSearch_ReturnsStandardResponse(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// No capability filters - all capabilities should be enabled
+	filters := []config.ClientCapabilityFilter{}
+
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	// No ID command - client remains unidentified, so all capabilities should be available
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add a test message to have something to search
+	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
+		"To: %s\r\n"+
+		"Subject: Test Standard Search\r\n"+
+		"Date: %s\r\n"+
+		"\r\n"+
+		"This is a test message for standard search verification.\r\n",
+		account.Email, time.Now().Format(time.RFC1123))
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+	if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		t.Fatalf("Failed to close append command: %v", err)
+	}
+	if _, err := appendCmd.Wait(); err != nil {
+		t.Fatalf("Failed to wait for append command: %v", err)
+	}
+
+	// Issue a standard SEARCH command (options are nil)
+	cmd := c.Search(&imap.SearchCriteria{Text: []string{"Test"}}, nil)
+
+	// A standard SEARCH command should result in a standard response, where Min and Max are zero.
+	searchData, err := cmd.Wait()
+	if err != nil {
+		t.Fatalf("Standard SEARCH command failed: %v", err)
+	}
+
+	// Log the search results
+	foundMessages := searchData.AllSeqNums()
+	t.Logf("Standard SEARCH found %d messages", len(foundMessages))
+	t.Logf("Search Count: %d", searchData.Count)
+	t.Logf("Search Min: %d (should be 0 for standard search)", searchData.Min)
+	t.Logf("Search Max: %d (should be 0 for standard search)", searchData.Max)
+
+	// For a standard SEARCH command (no ESEARCH options), Min and Max should be zero
+	if searchData.Min > 0 || searchData.Max > 0 {
+		t.Errorf("FAILURE: Received ESEARCH response (Min=%d, Max=%d) for a standard SEARCH command.",
+			searchData.Min, searchData.Max)
+	} else {
+		t.Logf("SUCCESS: Standard SEARCH command correctly received a standard response (Min=%d, Max=%d).",
+			searchData.Min, searchData.Max)
+	}
+}

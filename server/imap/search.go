@@ -159,50 +159,30 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					searchData.All = imap.SeqSet{}
 				}
 			}
-		} else {
-			// ESEARCH capability is filtered out, fall back to standard search behavior
-			s.Log("[SEARCH] Using standard search fallback due to capability filtering")
-			// Standard search always includes count and all results
-			searchData.Count = uint32(len(messages))
-			if len(messages) > 0 {
-				var uids imap.UIDSet
-				var seqNums imap.SeqSet
-				for _, msg := range messages {
-					uids.AddNum(msg.UID)
-					// Use our snapshot of sessionTracker which is thread-safe
-					if sessionTrackerSnapshot != nil {
-						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
-						seqNums.AddNum(encodedSeq)
-					} else {
-						// Fallback to just using the sequence number if session tracker isn't available
-						seqNums.AddNum(msg.Seq)
-					}
-				}
-
-				if numKind == imapserver.NumKindUID {
-					searchData.All = uids
-				} else {
-					searchData.All = seqNums
-				}
-			}
+		} else { // ESEARCH capability is filtered out, fall back to standard search behavior
+			s.Log("[SEARCH] Using standard search fallback due to capability filtering.")
+			// Fall through to standard search response logic
 		}
-	} else { // Standard SEARCH command (options == nil)
-		s.Log("[SEARCH] Standard SEARCH, returning ALL and COUNT.")
-		// Standard search always includes count and all results
-		searchData.Count = uint32(len(messages))
-		// Only populate the 'All' field if there are results, as the imap
-		// library can have issues encoding an empty (but non-nil) NumSet.
+	}
+
+	// Standard SEARCH response logic (for both explicit standard SEARCH and ESEARCH fallback).
+	// To generate a standard `* SEARCH` response, we only populate the `All` field.
+	// The go-imap/v2 library will correctly generate an untagged `* SEARCH` response.
+	// If we populated `Count`, it would incorrectly generate an `* ESEARCH` response.
+	if options == nil {
+		s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
+	}
+
+	if len(messages) > 0 {
 		if len(messages) > 0 {
 			var uids imap.UIDSet
 			var seqNums imap.SeqSet
 			for _, msg := range messages {
 				uids.AddNum(msg.UID)
-				// Use our snapshot of sessionTracker which is thread-safe
 				if sessionTrackerSnapshot != nil {
 					encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
 					seqNums.AddNum(encodedSeq)
 				} else {
-					// Fallback to just using the sequence number if session tracker isn't available
 					seqNums.AddNum(msg.Seq)
 				}
 			}
@@ -213,6 +193,9 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				searchData.All = seqNums
 			}
 		}
+		// If ESEARCH options were provided but the capability is disabled, we must return
+		// the standard search data. Otherwise, the server would send no response.
+		return searchData, nil
 	}
 
 	// CONDSTORE functionality - only process if capability is enabled
