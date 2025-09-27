@@ -1,0 +1,338 @@
+Return-Path: <me=dejanstrbac.com@b.wordpress.com>
+Delivered-To: me@dejanstrbac.com
+Received: from 88c8f3cc293f ([10.0.9.12])
+	by 5a8e36027823 (Dovecot) with LMTP id iWVzMN8tVFhaHAAAc990bg
+	for <me@dejanstrbac.com>; Fri, 16 Dec 2016 18:09:35 +0000
+Received: from aspmx1.migadu.com ([10.0.9.7])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	by 88c8f3cc293f (Dovecot) with LMTP id 3chZLN8tVFhAVgAAGJlQsw
+	; Fri, 16 Dec 2016 18:09:35 +0000
+Received: (Migadu outbound); Fri, 16 Dec 2016 18:09:35 +0000
+Authentication-Results: aspmx1.migadu.com; spf=pass smtp.mailfrom=b.wordpress.com; dkim=pass header.i=@wordpress.com
+Received-SPF: Pass (aspmx1.migadu.com: domain of b.wordpress.com designates 192.0.97.161 as permitted sender) receiver=aspmx1.migadu.com; identity=mailfrom; client-ip=192.0.97.161; helo=smtp1.dca.wordpress.com; envelope-from=<me=dejanstrbac.com@b.wordpress.com>
+Received-SPF: None (aspmx1.migadu.com: domain of smtp1.dca.wordpress.com does not designate 192.0.97.161 as permitted sender) receiver=aspmx1.migadu.com; identity=helo; client-ip=192.0.97.161; helo=smtp1.dca.wordpress.com; envelope-from=<me=dejanstrbac.com@b.wordpress.com>
+Received: from smtp1.dca.wordpress.com (smtp1.dca.wordpress.com [192.0.97.161])
+	by aspmx1.migadu.com (Haraka/2.8.10) with ESMTPS id C1068C2C-DC17-4C91-AC66-A7055439DF14.1
+	envelope-from <me=dejanstrbac.com@b.wordpress.com>
+	(version=TLSv1/SSLv3 cipher=ECDHE-RSA-AES256-GCM-SHA384 verify=FAIL);
+	Fri, 16 Dec 2016 18:09:27 +0000
+Received: from wordpress.com (unknown [192.0.84.35])
+	by smtp1.dca.wordpress.com (Postfix) with ESMTP id 3tgJGp07p3zMm6V
+	for <me@dejanstrbac.com>; Fri, 16 Dec 2016 18:09:05 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=wordpress.com; s=my5;
+	t=1481911746; bh=oeunH5KpWIjMuxkiB4r6y/fUSvG0mhAZbwv1FWESPj8=;
+	h=Date:To:From:Subject:List-Help:List-Unsubscribe:List-Subscribe:
+	 List-Archive:From;
+	b=FHcqgOqq2XWpzeWDm/mBy8QCaltol0zlge6PAx8+ZLXzVuSlz8+rMPhYwDAhorG5L
+	 wZ+Xe5tPYug/MfRKVcvGxjPYYWhiKz3+bo6PTusVPgxb+SJgnUZ982bfC/6baRNHLN
+	 Cz7yyl2CXZSvd8hTOL3Vxyg4pRt3rQNF2dkjRIW0=
+Date: Fri, 16 Dec 2016 18:09:03 +0000
+To: me@dejanstrbac.com
+From: =?UTF-8?B?TWlsb3MuaW8=?= <donotreply@wordpress.com>
+Subject: =?UTF-8?B?W05ldyBwb3N0XSDQmtCw0LrQviDRgdCw0Lwg0LjQt9C70LXRh9C40L4g0LDRgdGC0LzRgyDQv9GA0LjRgNC+0LTQvdC40Lwg0L/Rg9GC0LXQvCwg0YHQutC40L3Rg9C+INGB0LUg0YHQsCDRgdCy0LjRhSDQu9C10LrQvtCy0LAg0Lgg0L3QtdC+0YfQtdC60LjQstCw0L3QviDRgdC80LDRmtC40L4g0LrQuNC70LDQttGD?=
+Message-ID: <66211245.4549.0@wordpress.com>
+List-Help: <https://en.support.wordpress.com/following/>
+List-Unsubscribe: <https://subscribe.wordpress.com/?key=07af85066397f313ba38211ef0b6a757&amp;email=me%40dejanstrbac.com&amp;b=aDLqmdmewQ%5DF%7Cn%5Dz%2Fj0a-pR.d%26-pptYd5O%25W2vZ35r%5DOLsY_0R>
+List-Subscribe: <http://milos.io>
+List-Archive: <http://milos.io>
+Precedence: bulk
+X-Automattic-Destination: bWVAZGVqYW5zdHJiYWMuY29t
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+	boundary="b1_7e57e9d50ad11e646da5e5d6edbd6d70"
+X-Rspamd-Bar: ----
+X-Rspamd-Report: 
+X-Rspamd-Score: -3.509558
+X-Haraka-Karma: score: -4, good: 0, bad: 292, connections: 293, history: -292, awards: 007,004,005,183,182, fail:all_bad
+
+This is a multi-part message in MIME format.
+
+--b1_7e57e9d50ad11e646da5e5d6edbd6d70
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+Post       : =D0=9A=D0=B0=D0=BA=D0=BE =D1=81=D0=B0=D0=BC =D0=B8=D0=B7=D0=
+=BB=D0=B5=D1=87=D0=B8=D0=BE =D0=B0=D1=81=D1=82=D0=BC=D1=83 =D0=BF=D1=80=
+=D0=B8=D1=80=D0=BE=D0=B4=D0=BD=D0=B8=D0=BC =D0=BF=D1=83=D1=82=D0=B5=D0=
+=BC, =D1=81=D0=BA=D0=B8=D0=BD=D1=83=D0=BE =D1=81=D0=B5 =D1=81=D0=B0 =D1=
+=81=D0=B2=D0=B8=D1=85 =D0=BB=D0=B5=D0=BA=D0=BE=D0=B2=D0=B0 =D0=B8 =D0=BD=
+=D0=B5=D0=BE=D1=87=D0=B5=D0=BA=D0=B8=D0=B2=D0=B0=D0=BD=D0=BE =D1=81=D0=
+=BC=D0=B0=D1=9A=D0=B8=D0=BE =D0=BA=D0=B8=D0=BB=D0=B0=D0=B6=D1=83=0AURL     =
+   : http://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%=
+b7%d0%bb%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%8=
+0%d0%b8%d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/=0APos=
+ted     : December 16, 2016 at 7:08 pm=0AAuthor     : Dragan Lali=C4=87=0AC=
+ategories : =D0=B8=D1=81=D1=85=D1=80=D0=B0=D0=BD=D0=BE=D0=BC =D0=B4=D0=
+=BE =D0=B7=D0=B4=D1=80=D0=B0=D0=B2=D1=99=D0=B0=0A=0A=D0=9A=D0=B0=D0=BA=
+=D0=BE =D1=81=D0=B0=D0=BC =D0=BF=D0=BE=D1=81=D0=BB=D0=B5 6 =D0=B3=D0=BE=
+=D0=B4=D0=B8=D0=BD=D0=B0 =D0=BA=D0=BE=D1=80=D0=B8=D1=88=D1=9B=D0=B5=D1=
+=9A=D0=B0 =D0=BF=D1=83=D0=BC=D0=BF=D0=B8=D1=86=D0=B5, =D0=B8=D0=B7=D0=BB=
+=D0=B5=D1=87=D0=B8=D0=BE =D0=B0=D1=81=D1=82=D0=BC=D1=83 =D0=B7=D0=B0 =D1=
+=81=D0=B0=D0=BC=D0=BE =D0=BD=D0=B5=D0=B4=D0=B5=D1=99=D1=83 =D0=B4=D0=B0=
+=D0=BD=D0=B0, =D0=BF=D1=80=D0=B8=D1=80=D0=BE=D0=B4=D0=BD=D0=B8=D0=BC =D0=
+=BF=D1=83=D1=82=D0=B5=D0=BC =D0=BF=D1=80=D0=BE=D0=BC=D0=B5=D0=BD=D0=BE=
+=D0=BC=C2=A0=D0=B8=D1=81=D1=85=D1=80=D0=B0=D0=BD=D0=B5 =D0=B8 =D1=81=D0=
+=BA=D0=B8=D0=BD=D1=83=D0=BE =D1=81=D0=B5 =D1=81=D0=B0 =D1=81=D0=B2=D0=B8=
+=D1=85 =D0=BB=D0=B5=D0=BA=D0=BE=D0=B2=D0=B0. =D0=9F=D1=80=D0=B8 =D1=82=
+=D0=BE=D0=BC =D1=81=D0=B0=D0=BC =D1=83=D1=81=D0=BF=D1=83=D1=82 =D0=B8=D0=
+=B7=D0=B3=D1=83=D0=B1=D0=B8=D0=BE 15=D0=BA=D0=B3 =D1=82=D0=B5=D0=B6=D0=
+=B8=D0=BD=D0=B5, =D0=B8=D0=B0=D0=BA=D0=BE =D0=BC=D0=B8 =D1=82=D0=BE =D0=
+=BD=D0=B8=D1=98=D0=B5 =D0=B1=D0=B8=D0=BE =D1=86=D0=B8=D1=99.=0A=0ARead more=
+ of this post ( http://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc=
+-%d0%b8%d0%b7%d0%bb%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-=
+%d0%bf%d1%80%d0%b8%d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d=
+0%b5/#more-4549 )=0A=0AAdd a comment to this post: http://milos.io/%d0%ba%d=
+0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%b7%d0%bb%d0%b5%d1%87%d0%b8%d0=
+%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%80%d0%b8%d1%80%d0%be%d0%b4%d0%=
+bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/#respond=0A=0A-- =0A=0A=0AManage Su=
+bscriptions=0Ahttps://subscribe.wordpress.com/?key=3D07af85066397f313ba3821=
+1ef0b6a757&email=3Dme%40dejanstrbac.com=0A=0AUnsubscribe:=0Ahttps://subscri=
+be.wordpress.com/?key=3D07af85066397f313ba38211ef0b6a757&email=3Dme%40dejan=
+strbac.com&b=3DaDLqmdmewQ%5DF%7Cn%5Dz%2Fj0a-pR.d%26-pptYd5O%25W2vZ35r%5DOLs=
+Y_0R=0A
+
+--b1_7e57e9d50ad11e646da5e5d6edbd6d70
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.=
+w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">=0A<html xmlns=3D"http://www.=
+w3.org/1999/xhtml">=0A<head>=0A=09<style type=3D"text/css" media=3D"all">=
+=0A=09a:hover {=09color: red;=09}=0A=09a {=0A=09=09text-decoration: none;=
+=0A=09=09color: #0088cc;=0A=09}=0A=09=0A=09a.primaryactionlink:link, a.prim=
+aryactionlink:visited { background-color: #2585B2; color: #fff; }=0A=09a.pr=
+imaryactionlink:hover, a.primaryactionlink:active { background-color: #1172=
+9E !important; color: #fff !important; }=0A=0A/*=0A =09@media only screen a=
+nd (max-device-width: 480px) { =0A=09=09 .post { min-width: 700px !importan=
+t; }=0A=09}=0A*/=0A=09</style>=0A=09<title>WordPress.com</title>=0A=09<!--[=
+if gte mso 12]>=0A=09<style type=3D"text/css" media=3D"all">=0A=09body {=0A=
+=09font-family: arial;=0A=09font-size: 0.8em;=0A=09}=0A=09.post, .comment {=
+=0A=09background-color: white !important;=0A=09line-height: 1.4em !importan=
+t;=0A=09}=0A=09</style>=09=0A=09<![endif]-->=0A=09<meta http-equiv=3D"Conte=
+nt-Type" content=3D"text/html; charset=3Dutf-8" />=0A</head>=0A=0A<body cla=
+ss=3D'subscription-body-tag'>=0A=0A<table border=3D"0" cellspacing=3D"0" ce=
+llpadding=3D"0" bgcolor=3D"#DDDDDD"  style=3D"width: 100%; background: #DDD=
+DDD;">=0A=09<tr>=0A=09=09<td>=0A=09=09=09=09=09<span style=3D"display:none =
+!important">=0A=09=09=09=09Dragan Lali=C4=87 posted: "=D0=9A=D0=B0=D0=BA=
+=D0=BE =D1=81=D0=B0=D0=BC =D0=BF=D0=BE=D1=81=D0=BB=D0=B5 6 =D0=B3=D0=BE=
+=D0=B4=D0=B8=D0=BD=D0=B0 =D0=BA=D0=BE=D1=80=D0=B8=D1=88=D1=9B=D0=B5=D1=
+=9A=D0=B0 =D0=BF=D1=83=D0=BC=D0=BF=D0=B8=D1=86=D0=B5, =D0=B8=D0=B7=D0=BB=
+=D0=B5=D1=87=D0=B8=D0=BE =D0=B0=D1=81=D1=82=D0=BC=D1=83 =D0=B7=D0=B0 =D1=
+=81=D0=B0=D0=BC=D0=BE =D0=BD=D0=B5=D0=B4=D0=B5=D1=99=D1=83 =D0=B4=D0=B0=
+=D0=BD=D0=B0, =D0=BF=D1=80=D0=B8=D1=80=D0=BE=D0=B4=D0=BD=D0=B8=D0=BC =D0=
+=BF=D1=83=D1=82=D0=B5=D0=BC =D0=BF=D1=80=D0=BE=D0=BC=D0=B5=D0=BD=D0=BE=
+=D0=BC=C2=A0=D0=B8=D1=81=D1=85=D1=80=D0=B0=D0=BD=D0=B5 =D0=B8 =D1=81=D0=
+=BA=D0=B8=D0=BD=D1=83=D0=BE =D1=81=D0=B5 =D1=81=D0=B0 =D1=81=D0=B2=D0=B8=
+=D1=85 =D0=BB=D0=B5=D0=BA=D0=BE=D0=B2=D0=B0. =D0=9F=D1=80=D0=B8 =D1=82=
+=D0=BE=D0=BC =D1=81=D0=B0=D0=BC =D1=83=D1=81=D0=BF=D1=83=D1=82 =D0=B8=D0=
+=B7=D0=B3=D1=83=D0=B1=D0=B8=D0=BE 15=D0=BA=D0=B3 =D1=82=D0=B5=D0=B6=D0=
+=B8=D0=BD=D0=B5, =D0=B8=D0=B0=D0=BA=D0=BE =D0=BC=D0=B8 =D1=82=D0=BE =D0=
+=BD=D0=B8=D1=98=D0=B5 =D0=B1=D0=B8=D0=BE =D1=86=D0=B8=D1=99.
+
+=D0=9E=D0=B2=D0=BE =D1=98=D0=B5 =D0=BC=D0=BE=D1=98=D0=B0 =D0=BB=D0=B8=D1=
+=87=D0=BD=D0=B0 =D0=BF=D1=80=D0=B8=D1=87=D0=B0 =D0=BE =D0=BF=D0=BE=D0=B1=
+=D0=B5=D0=B4=D0=B8. =D0=9D=D0=B5 =D0=B7=D0=BD=D0=B0=D0=BC =D0=B4=D0=B0 =
+=D0=BB=D0=B8 =D1=9B"=09=09=09</span>=0A=09=09=09=09=09=09<table border=3D"0=
+" cellspacing=3D"0" cellpadding=3D"0" align=3D'center'  class=3D"subscribe-=
+body" style=3D"width: 100%; padding: 10px">=0A=09=09=09=09<tr>=0A=09=09=09=
+=09=09<td>=0A=09=09=09=09=09=09=09=09=09=09=09=09<div style=3D"direction: l=
+tr; max-width: 600px; margin: 0 auto; overflow: hidden;">=0A=09=09=09=09=09=
+=09=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"0" bgcolor=3D"#f=
+fffff"  class=3D"subscribe-wrapper" style=3D"width: 100%; background-color:=
+ #fff; text-align: left; max-width: 1024px; min-width: 320px; margin: 0 aut=
+o;">=0A=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09<td>=0A=09=
+=09=09=09=09=09=09=09=09=09<table border=3D"0" cellspacing=3D"0" cellpaddin=
+g=3D"0" height=3D"8" background=3D"https://s0.wp.com/i/emails/stripes.gif" =
+ class=3D"subscribe-header-wrap" style=3D"width: 100%; background-image: ur=
+l(https://s0.wp.com/i/emails/stripes.gif); background-repeat: repeat-x; bac=
+kground-color: #43A4D0; height: 8px;">=0A=09=09=09=09=09=09=09=09=09=09=09<=
+tr>=0A=09=09=09=09=09=09=09=09=09=09=09=09<td></td>=0A=09=09=09=09=09=09=09=
+=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=
+=09=09=09=09=09=09=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"0=
+"  class=3D"subscribe-header" style=3D"width: 100%; color: #08c; font-size:=
+ 1.6em; background-color: #EFEFEF; border-bottom: 1px solid #DDD; margin: 0=
+; padding: 0;">=0A=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09<td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09<h2 clas=
+s=3D"subscribe-title" style=3D"margin: .4em 0 .3em; font-size: 1.8em; font-=
+size: 16px!important; line-height: 1; font-weight: 400; color: #464646; fon=
+t-family: &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin:=
+ 5px 20px!important; padding: 0;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09New post on <strong>Milos.io</strong>=09=09=09=09=09=09=09=09=09=09=
+=09=09=09</h2>=0A=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09<td style=3D"text-align: right;">=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09=09<img border=3D"0" class=3D"head-avatar" src=3D"http=
+://s0.wp.com/i/emails/blavatar.png" alt=3D""  width=3D"32" height=3D"32" / =
+style=3D"vertical-align: middle; margin: 5px 20px 5px 0; vertical-align: mi=
+ddle;">=0A=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=
+=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=
+=09=09=09=09=09=09=09<table style=3D"width: 100%"  border=3D"0" cellspacing=
+=3D"0" cellpadding=3D"20" bgcolor=3D"#ffffff">=0A=09=09=09=09=09=09=09=09=
+=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=09<td>=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09=09<table style=3D"width: 100%"  border=3D"0" cellspac=
+ing=3D"0" cellpadding=3D"0">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09<t=
+r>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<td valign=3D"top" class=
+=3D"the-post">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09<table style=3D"width: 100%"  bor=
+der=3D"0" cellspacing=3D"0" cellpadding=3D"0">=0A=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09<td style=3D"width: 60px !important; white-space: nowr=
+ap; vertical-align: top;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09<a href=3D"http://milos.io/?author=3D4"  style=3D"text-decor=
+ation: underline; color: #2585B2; display: block; margin-right: 10px;"><img=
+ border=3D"0" alt=3D'' src=3D'http://2.gravatar.com/avatar/25b9fe4b51670079=
+7e69296bac80eaf2?s=3D50&#038;d=3Dhttp%3A%2F%2F2.gravatar.com%2Favatar%2Fad5=
+16503a11cd5ca435acc9bb6523536%3Fs%3D50&#038;r=3DG' class=3D'avatar avatar-5=
+0' height=3D'50' width=3D'50' /></a>=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09<h2 class=3D"post-title"  style=3D"margin: .4em 0 .3em; font-size: 1.=
+8em; font-size: 1.6em; color: #555; margin: 0; font-size: 20px;"><a href=3D=
+"http://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%b7%d=
+0%bb%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%80%d0=
+%b8%d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/" style=3D=
+"text-decoration: underline; color: #2585B2; text-decoration: none !importa=
+nt;">=D0=9A=D0=B0=D0=BA=D0=BE =D1=81=D0=B0=D0=BC =D0=B8=D0=B7=D0=BB=D0=
+=B5=D1=87=D0=B8=D0=BE =D0=B0=D1=81=D1=82=D0=BC=D1=83 =D0=BF=D1=80=D0=B8=
+=D1=80=D0=BE=D0=B4=D0=BD=D0=B8=D0=BC =D0=BF=D1=83=D1=82=D0=B5=D0=BC, =D1=
+=81=D0=BA=D0=B8=D0=BD=D1=83=D0=BE =D1=81=D0=B5 =D1=81=D0=B0 =D1=81=D0=B2=
+=D0=B8=D1=85 =D0=BB=D0=B5=D0=BA=D0=BE=D0=B2=D0=B0 =D0=B8 =D0=BD=D0=B5=D0=
+=BE=D1=87=D0=B5=D0=BA=D0=B8=D0=B2=D0=B0=D0=BD=D0=BE =D1=81=D0=BC=D0=B0=
+=D1=9A=D0=B8=D0=BE&nbsp;=D0=BA=D0=B8=D0=BB=D0=B0=D0=B6=D1=83</a></h2>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<span style=3D"col=
+or: #888;">by <a href=3D"http://milos.io/?author=3D4"  style=3D"text-decora=
+tion: underline; color: #2585B2; color: #888 !important;">Dragan Lali=C4=
+=87</a> </span>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+</td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</table>=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09<div class=3D"post-content" style=3D"direction: ltr; margin-top: 1=
+em; max-width: 560px;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<p style=3D"direct=
+ion: ltr; font-size: 14px; line-height: 1.4em; color: #444; font-family: &q=
+uot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;"  =
+class=3D"p1">=D0=9A=D0=B0=D0=BA=D0=BE =D1=81=D0=B0=D0=BC =D0=BF=D0=BE=D1=
+=81=D0=BB=D0=B5 6 =D0=B3=D0=BE=D0=B4=D0=B8=D0=BD=D0=B0 =D0=BA=D0=BE=D1=
+=80=D0=B8=D1=88=D1=9B=D0=B5=D1=9A=D0=B0 =D0=BF=D1=83=D0=BC=D0=BF=D0=B8=
+=D1=86=D0=B5, =D0=B8=D0=B7=D0=BB=D0=B5=D1=87=D0=B8=D0=BE =D0=B0=D1=81=D1=
+=82=D0=BC=D1=83 =D0=B7=D0=B0 =D1=81=D0=B0=D0=BC=D0=BE =D0=BD=D0=B5=D0=B4=
+=D0=B5=D1=99=D1=83 =D0=B4=D0=B0=D0=BD=D0=B0, =D0=BF=D1=80=D0=B8=D1=80=D0=
+=BE=D0=B4=D0=BD=D0=B8=D0=BC =D0=BF=D1=83=D1=82=D0=B5=D0=BC =D0=BF=D1=80=
+=D0=BE=D0=BC=D0=B5=D0=BD=D0=BE=D0=BC=C2=A0=D0=B8=D1=81=D1=85=D1=80=D0=B0=
+=D0=BD=D0=B5 =D0=B8 =D1=81=D0=BA=D0=B8=D0=BD=D1=83=D0=BE =D1=81=D0=B5 =
+=D1=81=D0=B0 =D1=81=D0=B2=D0=B8=D1=85 =D0=BB=D0=B5=D0=BA=D0=BE=D0=B2=D0=
+=B0. =D0=9F=D1=80=D0=B8 =D1=82=D0=BE=D0=BC =D1=81=D0=B0=D0=BC =D1=83=D1=
+=81=D0=BF=D1=83=D1=82 =D0=B8=D0=B7=D0=B3=D1=83=D0=B1=D0=B8=D0=BE 15=D0=
+=BA=D0=B3 =D1=82=D0=B5=D0=B6=D0=B8=D0=BD=D0=B5, =D0=B8=D0=B0=D0=BA=D0=BE =
+=D0=BC=D0=B8 =D1=82=D0=BE =D0=BD=D0=B8=D1=98=D0=B5 =D0=B1=D0=B8=D0=BE =
+=D1=86=D0=B8=D1=99.</p>=0A<p style=3D"direction: ltr; font-size: 14px; line=
+-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helve=
+tica, Arial, sans-serif; margin: 0 0 1em;"  class=3D"p4"> <a style=3D"text-=
+decoration: underline; color: #2585B2;"  href=3D"http://milos.io/%d0%ba%d0%=
+b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%b7%d0%bb%d0%b5%d1%87%d0%b8%d0%b=
+e-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%80%d0%b8%d1%80%d0%be%d0%b4%d0%bd=
+%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/#more-4549" class=3D"more-link">Read =
+more of this post</a></p>=0A<div style=3D"direction: ltr; clear: both"></di=
+v>=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09</div>=0A=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<div class=
+=3D"meta"  style=3D"direction: ltr; color: #999; font-size: .9em; margin-to=
+p: 4px; line-height: 160%; padding: 15px 0 15px; border-top: 1px solid #eee=
+; border-bottom: 1px solid #eee; overflow: hidden">=0A=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09<strong><a style=3D"text-decoration: under=
+line; color: #2585B2;"  href=3D"http://milos.io/?author=3D4">Dragan Lali=
+=C4=87</a></strong> | December 16, 2016 at 7:08 pm | Categories: <a style=
+=3D"text-decoration: underline; color: #2585B2;"  href=3D"http://milos.io/?=
+taxonomy=3Dcategory&amp;term=3D%25d0%25b8%25d1%2581%25d1%2585%25d1%2580%25d=
+0%25b0%25d0%25bd%25d0%25be%25d0%25bc-%25d0%25b4%25d0%25be-%25d0%25b7%25d0%2=
+5b4%25d1%2580%25d0%25b0%25d0%25b2%25d1%2599%25d0%25b0">=D0=B8=D1=81=D1=
+=85=D1=80=D0=B0=D0=BD=D0=BE=D0=BC =D0=B4=D0=BE =D0=B7=D0=B4=D1=80=D0=B0=
+=D0=B2=D1=99=D0=B0</a>=0A | URL: <a style=3D"text-decoration: underline; co=
+lor: #2585B2;"  href=3D"http://wp.me/p4tOzj-1bn">http://wp.me/p4tOzj-1bn</a=
+>=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</div>=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<p class=3D"sub=
+scribe-action-links"  style=3D"direction: ltr; font-size: 14px; line-height=
+: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, A=
+rial, sans-serif; margin: 0 0 1em; font-size: 14px; color: #666; padding: 0=
+; width: auto; padding-top: 1em; padding-bottom: 0em; margin-bottom: 0; mar=
+gin-left: 0; padding-left: 0;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<table class=3D"auto-width" border=3D"0" cellspacing=3D"0" cell=
+padding=3D"0" style=3D"width: 100%; width: auto">=0A=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09<td style=3D"width: 10px;"><a href=3D"http://milos.=
+io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%b7%d0%bb%d0%b5%d1%=
+87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%80%d0%b8%d1%80%d0%b=
+e%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/#respond" style=3D"text-=
+decoration: underline; color: #2585B2; -moz-border-radius: 10em; -webkit-bo=
+rder-radius: 10em; border-radius: 10em; border: 1px solid #11729E; text-dec=
+oration: none; color: #fff; text-shadow: 0 1px 0 #11729E; background-color:=
+ #2585B2; padding: 5px 15px; font-size: 16px; line-height: 1.4em; font-fami=
+ly: Helvetica Neue, Helvetica, Arial, sans-serif; font-weight: normal; marg=
+in-left: 0; white-space: nowrap;">Comment</a></td>=0A=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09<td>&nbsp;&nbsp;&nbsp;<a class=3D"subscribe-action-link" hre=
+f=3D"http://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%=
+b7%d0%bb%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%8=
+0%d0%b8%d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/#comme=
+nts" style=3D"text-decoration: underline; color: #2585B2; text-decoration: =
+underline">See all comments</a></td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09</table>=0A=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09</p>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09</table=
+>=0A=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=09=09=
+=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=09=09=
+=09=09=09=09=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"20" bgc=
+olor=3D"#efefef"  class=3D"subscribe-wrapper-sub" style=3D"width: 100%; bac=
+kground-color: #efefef; text-align: left; border-top: 1px solid #ddd;">=0A=
+=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09<td class=3D"subscribe-content"  style=3D"border-top: 1px solid #f3f3f3;=
+ color: #888; font-family: &quot;Helvetica Neue&quot;, Helvetica, Arial, sa=
+ns-serif; font-size: 14px; background: #efefef;">=0A=09=09=09=09=09=09=09=
+=09=09=09=09=09=09<p style=3D"direction: ltr; font-size: 14px; line-height:=
+ 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, Ar=
+ial, sans-serif; margin: 0 0 1em; font-size: 12px; line-height: 1.4em; marg=
+in: 0px 0px 10px 0px;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09<a styl=
+e=3D"text-decoration: underline; color: #2585B2;"  href=3D"https://subscrib=
+e.wordpress.com/?key=3D07af85066397f313ba38211ef0b6a757&amp;email=3Dme%40de=
+janstrbac.com&amp;b=3DaDLqmdmewQ%5DF%7Cn%5Dz%2Fj0a-pR.d%26-pptYd5O%25W2vZ35=
+r%5DOLsY_0R">Unsubscribe</a> to no longer receive posts from Milos.io.<br/>=
+=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09Change your email settings at =
+<a style=3D"text-decoration: underline; color: #2585B2;"  href=3D"https://s=
+ubscribe.wordpress.com/?key=3D07af85066397f313ba38211ef0b6a757&amp;email=3D=
+me%40dejanstrbac.com">Manage Subscriptions</a>.=09=09=09=09=09=09=09=09=09=
+=09=09=09=09</p>=0A=0A=09=09=09=09=09=09=09=09=09=09=09=09=09<p style=3D"di=
+rection: ltr; font-size: 14px; line-height: 1.4em; color: #444; font-family=
+: &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em=
+; font-size: 12px; line-height: 1.4em; margin: 0px 0px 0px 0px;">=0A=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09<strong>Trouble clicking?</strong> Copy=
+ and paste this URL into your browser: <br />=0A=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09<a style=3D"text-decoration: underline; color: #2585B2;"  hr=
+ef=3D"http://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0=
+%b7%d0%bb%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%=
+80%d0%b8%d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/">htt=
+p://milos.io/%d0%ba%d0%b0%d0%ba%d0%be-%d1%81%d0%b0%d0%bc-%d0%b8%d0%b7%d0%bb=
+%d0%b5%d1%87%d0%b8%d0%be-%d0%b0%d1%81%d1%82%d0%bc%d1%83-%d0%bf%d1%80%d0%b8%=
+d1%80%d0%be%d0%b4%d0%bd%d0%b8%d0%bc-%d0%bf%d1%83%d1%82%d0%b5/</a>=0A=09=09=
+=09=09=09=09=09=09=09=09=09=09=09</p>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=
+=09=09=09</table>=0A=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=
+=09=09</tr>=0A=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=09=09=09=09<tabl=
+e border=3D"0" cellspacing=3D"0" cellpadding=3D"0" height=3D"3" background=
+=3D"https://s0.wp.com/i/emails/stripes.gif"  class=3D"subscribe-footer-wrap=
+" style=3D"width: 100%; background-image: url(https://s0.wp.com/i/emails/st=
+ripes.gif); background-repeat: repeat-x; background-color: #43A4D0; height:=
+ 3px;">=0A=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09<td></t=
+d>=0A=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09</table>=0A=09=09=
+=09=09=09=09</div>=0A=09=09=09=09=09</td>=0A=09=09=09=09</tr>=0A=09=09=09</=
+table>=0A=0A=09=09=09=0A=09=09=09<br />=0A=09=09</td>=0A=09</tr>=0A</table>=
+=0A=0A<img alt=3D"" border=3D"0" src=3D"http://pixel.wp.com/b.gif?blog=3D66=
+211245&#038;post=3D4549&#038;subd=3Dmilos.io&#038;ref=3D&#038;email=3D1&#03=
+8;email_o=3Djetpack&#038;host=3Djetpack.wordpress.com" width=3D"1" height=
+=3D"1" /></body></html>=0A
+
+
+--b1_7e57e9d50ad11e646da5e5d6edbd6d70--
+

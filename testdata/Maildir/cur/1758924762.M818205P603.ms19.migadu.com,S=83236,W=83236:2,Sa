@@ -1,0 +1,1893 @@
+Return-Path: <bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net>
+Delivered-To: me@dejanstrbac.com
+Received: from mp0 ([2001:41d0:2:4a6f::])
+	(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits))
+	by ms0.migadu.com with LMTPS
+	id CKvsLQeXLGEr/QAAgWs5BA
+	(envelope-from <bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net>)
+	for <me@dejanstrbac.com>; Mon, 30 Aug 2021 10:29:59 +0200
+Received: from aspmx1.migadu.com ([2001:41d0:2:4a6f::])
+	(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits))
+	by mp0 with LMTPS
+	id sP6zKQeXLGEgXAAA1q6Kng
+	(envelope-from <bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net>)
+	for <me@dejanstrbac.com>; Mon, 30 Aug 2021 08:29:59 +0000
+Received: from mail175.atl101.mcdlv.net (mail175.atl101.mcdlv.net [198.2.130.175])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES256-GCM-SHA384 (256/256 bits))
+	(No client certificate requested)
+	by aspmx1.migadu.com (Postfix) with ESMTPS id A0C1F213A
+	for <me@dejanstrbac.com>; Mon, 30 Aug 2021 10:29:58 +0200 (CEST)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=nngroup.com; s=k1;
+	t=1630312196; i=alertbox@nngroup.com;
+	bh=fvMph0oU9u1y0gF/gb2ORF6AoC89Z7wGom1S8bkGeXI=;
+	h=Subject:From:Reply-To:To:Date:Message-ID:List-ID:List-Unsubscribe:
+	 List-Unsubscribe-Post:Content-Type:MIME-Version;
+	b=x8mEQErj6qNQTgLI1SC53JhSQnyROqffEJ7pGd6ydz8RNK17foibK7XeQijWPH/Gs
+	 okxTuLLydushFVGslHNqKyCaiMKO5oPsCME2RW929nQX6LepKh/xyZDHPIJUc+QFYW
+	 CeI4k/CxgZPQ1bwtn+oK8DnMOS14xqs3Nbjua91A=
+Received: from localhost (localhost [127.0.0.1])
+	by mail175.atl101.mcdlv.net (Mailchimp) with ESMTP id 4Gyk5c4rdqzNCdjHJ
+	for <me@dejanstrbac.com>; Mon, 30 Aug 2021 08:29:56 +0000 (GMT)
+Subject: =?utf-8?Q?Service=20Blueprints=20|=C2=A0Quantitative=20Research=3A=20Study=20Guide=20|=20Video=20Game=20Design=20and=20User=20Experience=20|=20Don=27t=20Overthink=20UX=20ROI?=
+From: =?utf-8?Q?Jakob=20Nielsen?= <alertbox@nngroup.com>
+Reply-To: =?utf-8?Q?Jakob=20Nielsen?= <alertbox@nngroup.com>
+To: =?utf-8?Q?Dejan=20Strbac?= <me@dejanstrbac.com>
+Date: Mon, 30 Aug 2021 08:29:45 +0000
+Message-ID: <538d934a891681a5d850bb4e5.919af5c3e3.20210830082935.5707cee75b.4de32895@mail175.atl101.mcdlv.net>
+X-Mailer: MailChimp Mailer - **CID5707cee75b919af5c3e3**
+X-Campaign: mailchimp538d934a891681a5d850bb4e5.5707cee75b
+X-campaignid: mailchimp538d934a891681a5d850bb4e5.5707cee75b
+X-Report-Abuse: Please report abuse for this campaign here: https://mailchimp.com/contact/abuse/?u=538d934a891681a5d850bb4e5&id=5707cee75b&e=919af5c3e3
+X-MC-User: 538d934a891681a5d850bb4e5
+Feedback-ID: 8522993:8522993.163062:us4:mc
+List-ID: 538d934a891681a5d850bb4e5mc list <538d934a891681a5d850bb4e5.37433.list-id.mcsv.net>
+X-Accounttype: pd
+List-Unsubscribe: <https://nngroup.us4.list-manage.com/unsubscribe?u=538d934a891681a5d850bb4e5&id=7f29a2b335&e=919af5c3e3&c=5707cee75b>, <mailto:unsubscribe-mc.us4_538d934a891681a5d850bb4e5.5707cee75b-919af5c3e3@mailin.mcsv.net?subject=unsubscribe>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+Content-Type: multipart/alternative; boundary="_----------=_MCPart_1257904941"
+MIME-Version: 1.0
+X-Migadu-Flow: FLOW_IN
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=dejanstrbac.com;
+	s=key2; t=1630312199; h=from:from:reply-to:reply-to:subject:subject:date:date:
+	 message-id:message-id:to:to:cc:mime-version:mime-version:
+	 content-type:content-type:list-id:list-unsubscribe:
+	 list-unsubscribe-post:dkim-signature;
+	bh=fvMph0oU9u1y0gF/gb2ORF6AoC89Z7wGom1S8bkGeXI=;
+	b=LkdD7rbLPyJ97yYY6mbQ1qtlaD02YQvppvMdY6rAr/X/TlwsS719pwyD1obh7LUZ/XIfY+
+	5LyLWyfnp69JbQTl6CiXFkryh6hwD84TAeMd4u17eGsrEy1rCi+ZEGRTm2VAJhm+jC+xPi
+	3bkCjkUw98ebqNwWRQVxboxLShrfiME=
+ARC-Seal: i=1; s=key2; d=dejanstrbac.com; t=1630312199; a=rsa-sha256;
+	cv=none;
+	b=KT554/q5AL8xU2kljxVsdxoFz5+oe7e4cqsUAUn0IUbIa8N8aM7H9D0Y1FuPnNibdTol9g
+	pC3n3tqG+ucJHBL4XcWmlHQySE76PSiwQASGE8K5dPxCiOeZ9SgovqMA3Wyk9Xlxorc2De
+	arGeQckW3C2xvTfjSvHmrY6cA5BAmYQ=
+ARC-Authentication-Results: i=1;
+	aspmx1.migadu.com;
+	dkim=pass header.d=nngroup.com header.s=k1 header.b=x8mEQErj;
+	dmarc=pass (policy=reject) header.from=nngroup.com;
+	spf=pass (aspmx1.migadu.com: domain of bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net designates 198.2.130.175 as permitted sender) smtp.mailfrom=bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net
+X-Migadu-Spam-Score: 1.17
+Authentication-Results: aspmx1.migadu.com;
+	dkim=pass header.d=nngroup.com header.s=k1 header.b=x8mEQErj;
+	dmarc=pass (policy=reject) header.from=nngroup.com;
+	spf=pass (aspmx1.migadu.com: domain of bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net designates 198.2.130.175 as permitted sender) smtp.mailfrom=bounce-mc.us4_8522993.163062-919af5c3e3@mail175.atl101.mcdlv.net
+X-Migadu-Queue-Id: A0C1F213A
+X-Spam-Score: 1.17
+X-Migadu-Scanner: scn0.migadu.com
+
+This is a multi-part message in MIME format
+
+--_----------=_MCPart_1257904941
+Content-Type: text/plain; charset="utf-8"; format="fixed"
+Content-Transfer-Encoding: quoted-printable
+
+Start with a small-to-medium experience=2C that is known to be problematic=
+=2C comes with existing data=2C will be redesigned soon=2C and that you ca=
+n control.
+
+=E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=
+=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=
+=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=
+=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=
+=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=
+=8C  =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=
+=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C  =E2=80=8C =E2=80=8C =E2=80=
+=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C =E2=80=8C=
+ =E2=80=8C =E2=80=8C =E2=80=8C
+View this email in your browser (https://mailchi.mp/nngroup/10-heuristics-=
+ux-to-dev-ratio-start-with-designops-ux-best-practices-remote-card-sort-16=
+3062?e=3D919af5c3e3)
+NN/g Newsletter
+New Articles
+https://www.nngroup.com/articles/service-blueprints-choose-what-experience=
+/?utm_source=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_1=
+2_08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701
+
+
+** Service Blueprints: How to Choose What Experience to Visualize (https:/=
+/www.nngroup.com/articles/service-blueprints-choose-what-experience/?utm_s=
+ource=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52=
+_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)
+------------------------------------------------------------
+
+
+**
+------------------------------------------------------------
+Start with a small-to-medium experience=2C that is known to be problematic=
+=2C comes with existing data=2C will be redesigned soon=2C and that you ca=
+n control.
+
+
+**
+------------------------------------------------------------
+
+
+** 5 min read
+------------------------------------------------------------
+https://www.nngroup.com/articles/quantitative-research-study-guide/?utm_so=
+urce=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_=
+COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701
+
+
+** Quantitative Research: Study Guide (https://www.nngroup.com/articles/qu=
+antitative-research-study-guide/?utm_source=3DAlertbox&utm_campaign=3D5707=
+cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=
+=3D0_7f29a2b335-5707cee75b-40301701)
+------------------------------------------------------------
+
+
+**
+------------------------------------------------------------
+Unsure where to start? Use this collection of links to our articles and vi=
+deos to learn about quant research=2C quant usability testing=2C analytics=
+=2C and analyzing data.
+
+
+**
+------------------------------------------------------------
+
+
+** 7 min read
+------------------------------------------------------------
+New Videos
+
+
+** =F0=9F=8E=A5 Video Game Design and User Experience (https://www.nngroup=
+=2Ecom/videos/video-game-design-ux/?utm_source=3DAlertbox&utm_campaign=3D570=
+7cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_ter=
+m=3D0_7f29a2b335-5707cee75b-40301701)
+------------------------------------------------------------
+
+
+**
+------------------------------------------------------------
+Video game design is a special case of user interface design=2C with some=
+ differences (especially in user goals) but also many similarities with mo=
+re traditional UX design problems and methods.
+5 min video
+
+
+** =F0=9F=8E=A5 Don't Overthink UX ROI (https://www.nngroup.com/videos/don=
+t-overthink-ux-roi/?utm_source=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_=
+CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b3=
+35-5707cee75b-40301701)
+------------------------------------------------------------
+
+
+**
+------------------------------------------------------------
+It can be hard to calculate the return on investment (ROI) for user experi=
+ence design improvements. But don't get bogged down in less-important deta=
+ils: often simple metrics can give a good-enough estimate to justify UX in=
+vestments.
+2 min video
+Virtual UX Training
+Americas/Europe (https://www.nngroup.com/training/august/?utm_source=3DAle=
+rtbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&ut=
+m_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)
+August 28 =E2=80=93 September 3
+Full-day courses
+
+America/Europe/Middle East (https://www.nngroup.com/training/september/?ut=
+m_source=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08=
+_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)   (https://www.nngroup.com/training/september/?utm_source=3DAlert=
+box&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_=
+medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)
+September 18 =E2=80=93 October 1
+Half-day courses
+
+America/Europe/Middle East   (https://www.nngroup.com/series-ux-vision-str=
+ategy/?utm_source=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020=
+_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b=
+-40301701)
+UX Vision and Strategy Series
+October 18 =E2=80=93 October 22
+Half-day courses
+
+America/Europe/Middle East   (https://www.nngroup.com/qualitative-series/?=
+utm_source=3DAlertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_=
+08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)
+Qualitative Research Series
+November 15 =E2=80=93 November 19
+Half-day courses
+
+Americas/Europe (https://www.nngroup.com/training/november/?utm_source=3DA=
+lertbox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&=
+utm_medium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)
+October 31 =E2=80=93 November 5
+Full-day courses
+
+Full event program (https://nngroup.us4.list-manage.com/track/click?u=3D53=
+8d934a891681a5d850bb4e5&id=3Da594b9e8a9&e=3D48052d3858&utm_source=3DAlertb=
+ox&utm_campaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_m=
+edium=3Demail&utm_term=3D0_7f29a2b335-5707cee75b-40301701)  describ=
+ing all full-day UX training courses and the virtual conference format.
+
+We're Hiring!
+
+
+** UX Specialists (entry-level or experienced=2C remote) (https://www.nngr=
+oup.com/news/item/job-openings/?utm_source=3DAlertbox&utm_campaign=3D5707c=
+ee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=
+=3D0_7f29a2b335-5707cee75b-40301701)
+------------------------------------------------------------
+
+
+**
+------------------------------------------------------------
+Nielsen Norman Group has openings for User Experience Specialists (both de=
+signers and researchers=2C seeking both entry-level and experienced applic=
+ants). Read the job description and see how to apply (https://www.nngroup.=
+com/news/item/job-openings/?utm_source=3DAlertbox&utm_campaign=3D5707cee75=
+b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_=
+7f29a2b335-5707cee75b-40301701) .
+
+Deadline to apply: Today=2C August 30=2C 2021
+
+=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=
+=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=
+=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D=3D
+You are receiving this newsletter because you subscribed at
+** https://www.nngroup.com/articles/subscribe?utm_source=3DAlertbox&utm_ca=
+mpaign=3D5707cee75b-EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3De=
+mail&utm_term=3D0_7f29a2b335-5707cee75b-40301701 (https://www.nngro=
+up.com/articles/subscribe?utm_source=3DAlertbox&utm_campaign=3D5707cee75b-=
+EMAIL_CAMPAIGN_2020_11_12_08_52_COPY_01&utm_medium=3Demail&utm_term=3D0_7f=
+29a2b335-5707cee75b-40301701)
+
+48105 Warm Springs Blvd.=2C Fremont=2C CA 94539-7498=2C USA
+Copyright 2020 Nielsen Norman Group=2C All rights reserved
+** Manage preferences (https://nngroup.us4.list-manage.com/profile?u=3D538=
+d934a891681a5d850bb4e5&id=3D7f29a2b335&e=3D919af5c3e3&c=3D5707cee75b)
+or ** unsubscribe (https://nngroup.us4.list-manage.com/unsubscribe?u=3D538=
+d934a891681a5d850bb4e5&id=3D7f29a2b335&e=3D919af5c3e3&c=3D5707cee75b)
+=2E
+--_----------=_MCPart_1257904941
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<!doctype html>
+<html xmlns=3D"http://www.w3.org/1999/xhtml" xmlns:v=3D"urn:schemas-micros=
+oft-com:vml" xmlns:o=3D"urn:schemas-microsoft-com:office:office">
+    <head>
+        <!-- NAME: 1:2:1 COLUMN -->
+        <!--[if gte mso 15]>
+        <xml>
+            <o:OfficeDocumentSettings>
+            <o:AllowPNG/>
+            <o:PixelsPerInch>96</o:PixelsPerInch>
+            </o:OfficeDocumentSettings>
+        </xml>
+        <![endif]-->
+        <meta charset=3D"UTF-8">
+        <meta http-equiv=3D"X-UA-Compatible" content=3D"IE=3Dedge">
+        <meta name=3D"viewport" content=3D"width=3Ddevice-width=2C initial=
+-scale=3D1">
+        <title>Service Blueprints |=C2=A0Quantitative Research: Study Guid=
+e | Video Game Design and User Experience | Don't Overthink UX ROI</title>
+
+    <style type=3D"text/css">
+=09=09p{
+=09=09=09margin:10px 0;
+=09=09=09padding:0;
+=09=09}
+=09=09table{
+=09=09=09border-collapse:collapse;
+=09=09}
+=09=09h1=2Ch2=2Ch3=2Ch4=2Ch5=2Ch6{
+=09=09=09display:block;
+=09=09=09margin:0;
+=09=09=09padding:0;
+=09=09}
+=09=09img=2Ca img{
+=09=09=09border:0;
+=09=09=09height:auto;
+=09=09=09outline:none;
+=09=09=09text-decoration:none;
+=09=09}
+=09=09body=2C#bodyTable=2C#bodyCell{
+=09=09=09height:100%;
+=09=09=09margin:0;
+=09=09=09padding:0;
+=09=09=09width:100%;
+=09=09}
+=09=09.mcnPreviewText{
+=09=09=09display:none !important;
+=09=09}
+=09=09#outlook a{
+=09=09=09padding:0;
+=09=09}
+=09=09img{
+=09=09=09-ms-interpolation-mode:bicubic;
+=09=09}
+=09=09table{
+=09=09=09mso-table-lspace:0pt;
+=09=09=09mso-table-rspace:0pt;
+=09=09}
+=09=09.ReadMsgBody{
+=09=09=09width:100%;
+=09=09}
+=09=09.ExternalClass{
+=09=09=09width:100%;
+=09=09}
+=09=09p=2Ca=2Cli=2Ctd=2Cblockquote{
+=09=09=09mso-line-height-rule:exactly;
+=09=09}
+=09=09a[href^=3Dtel]=2Ca[href^=3Dsms]{
+=09=09=09color:inherit;
+=09=09=09cursor:default;
+=09=09=09text-decoration:none;
+=09=09}
+=09=09p=2Ca=2Cli=2Ctd=2Cbody=2Ctable=2Cblockquote{
+=09=09=09-ms-text-size-adjust:100%;
+=09=09=09-webkit-text-size-adjust:100%;
+=09=09}
+=09=09.ExternalClass=2C.ExternalClass p=2C.ExternalClass td=2C.ExternalCla=
+ss div=2C.ExternalClass span=2C.ExternalClass font{
+=09=09=09line-height:100%;
+=09=09}
+=09=09a[x-apple-data-detectors]{
+=09=09=09color:inherit !important;
+=09=09=09text-decoration:none !important;
+=09=09=09font-size:inherit !important;
+=09=09=09font-family:inherit !important;
+=09=09=09font-weight:inherit !important;
+=09=09=09line-height:inherit !important;
+=09=09}
+=09=09#bodyCell{
+=09=09=09padding:10px;
+=09=09}
+=09=09.templateContainer{
+=09=09=09max-width:600px !important;
+=09=09}
+=09=09a.mcnButton{
+=09=09=09display:block;
+=09=09}
+=09=09.mcnImage=2C.mcnRetinaImage{
+=09=09=09vertical-align:bottom;
+=09=09}
+=09=09.mcnTextContent{
+=09=09=09word-break:break-word;
+=09=09}
+=09=09.mcnTextContent img{
+=09=09=09height:auto !important;
+=09=09}
+=09=09.mcnDividerBlock{
+=09=09=09table-layout:fixed !important;
+=09=09}
+=09=09body=2C#bodyTable{
+=09=09=09background-color:#fafafa;
+=09=09}
+=09=09#bodyCell{
+=09=09=09border-top:0;
+=09=09}
+=09=09.templateContainer{
+=09=09=09border:0;
+=09=09}
+=09=09h1{
+=09=09=09color:#000000;
+=09=09=09font-family:Arial=2C 'Helvetica Neue'=2C Helvetica=2C sans-serif;
+=09=09=09font-size:18px;
+=09=09=09font-style:normal;
+=09=09=09font-weight:bold;
+=09=09=09line-height:125%;
+=09=09=09letter-spacing:0px;
+=09=09=09text-align:left;
+=09=09}
+=09=09h2{
+=09=09=09color:#000000;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:18px;
+=09=09=09font-style:normal;
+=09=09=09font-weight:bold;
+=09=09=09line-height:125%;
+=09=09=09letter-spacing:normal;
+=09=09=09text-align:left;
+=09=09}
+=09=09h3{
+=09=09=09color:#ffffff;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:7px;
+=09=09=09font-style:normal;
+=09=09=09font-weight:normal;
+=09=09=09line-height:100%;
+=09=09=09letter-spacing:normal;
+=09=09=09text-align:left;
+=09=09}
+=09=09h4{
+=09=09=09color:#676767;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:14px;
+=09=09=09font-style:normal;
+=09=09=09font-weight:normal;
+=09=09=09line-height:200%;
+=09=09=09letter-spacing:normal;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templatePreheader{
+=09=09=09background-color:#fafafa;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:0;
+=09=09=09border-bottom:0;
+=09=09=09padding-top:0px;
+=09=09=09padding-bottom:0px;
+=09=09}
+=09=09#templatePreheader .mcnTextContent=2C#templatePreheader .mcnTextCont=
+ent p{
+=09=09=09color:#656565;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:12px;
+=09=09=09line-height:150%;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templatePreheader .mcnTextContent a=2C#templatePreheader .mcnTextCo=
+ntent p a{
+=09=09=09color:#656565;
+=09=09=09font-weight:normal;
+=09=09=09text-decoration:underline;
+=09=09}
+=09=09#templateHeader{
+=09=09=09background-color:#ffffff;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:0;
+=09=09=09border-bottom:1px none #e5e5e4;
+=09=09=09padding-top:10px;
+=09=09=09padding-bottom:0px;
+=09=09}
+=09=09#templateHeader .mcnTextContent=2C#templateHeader .mcnTextContent p{
+=09=09=09color:#202020;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:16px;
+=09=09=09line-height:150%;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templateHeader .mcnTextContent a=2C#templateHeader .mcnTextContent=
+ p a{
+=09=09=09color:#0180a5;
+=09=09=09font-weight:normal;
+=09=09=09text-decoration:underline;
+=09=09}
+=09=09#templateUpperBody{
+=09=09=09background-color:#ffffff;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:0;
+=09=09=09border-bottom:0;
+=09=09=09padding-top:12px;
+=09=09=09padding-bottom:0px;
+=09=09}
+=09=09#templateUpperBody .mcnTextContent=2C#templateUpperBody .mcnTextCont=
+ent p{
+=09=09=09color:#231f20;
+=09=09=09font-family:Arial=2C 'Helvetica Neue'=2C Helvetica=2C sans-serif;
+=09=09=09font-size:18px;
+=09=09=09line-height:125%;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templateUpperBody .mcnTextContent a=2C#templateUpperBody .mcnTextCo=
+ntent p a{
+=09=09=09color:#0180a5;
+=09=09=09font-weight:normal;
+=09=09=09text-decoration:none;
+=09=09}
+=09=09#templateColumns{
+=09=09=09background-color:#ffffff;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:0;
+=09=09=09border-bottom:0;
+=09=09=09padding-top:0;
+=09=09=09padding-bottom:0;
+=09=09}
+=09=09#templateColumns .columnContainer .mcnTextContent=2C#templateColumns=
+ .columnContainer .mcnTextContent p{
+=09=09=09color:#202020;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:16px;
+=09=09=09line-height:150%;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templateColumns .columnContainer .mcnTextContent a=2C#templateColum=
+ns .columnContainer .mcnTextContent p a{
+=09=09=09color:#0180a5;
+=09=09=09font-weight:bold;
+=09=09=09text-decoration:none;
+=09=09}
+=09=09#templateLowerBody{
+=09=09=09background-color:#ffffff;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:0;
+=09=09=09border-bottom:0;
+=09=09=09padding-top:0px;
+=09=09=09padding-bottom:20px;
+=09=09}
+=09=09#templateLowerBody .mcnTextContent=2C#templateLowerBody .mcnTextCont=
+ent p{
+=09=09=09color:#202020;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:14px;
+=09=09=09line-height:150%;
+=09=09=09text-align:left;
+=09=09}
+=09=09#templateLowerBody .mcnTextContent a=2C#templateLowerBody .mcnTextCo=
+ntent p a{
+=09=09=09color:#0180a5;
+=09=09=09font-weight:bold;
+=09=09=09text-decoration:none;
+=09=09}
+=09=09#templateFooter{
+=09=09=09background-color:#f6f6f6;
+=09=09=09background-image:none;
+=09=09=09background-repeat:no-repeat;
+=09=09=09background-position:center;
+=09=09=09background-size:cover;
+=09=09=09border-top:1px solid #e5e5e5;
+=09=09=09border-bottom:0;
+=09=09=09padding-top:10px;
+=09=09=09padding-bottom:10px;
+=09=09}
+=09=09#templateFooter .mcnTextContent=2C#templateFooter .mcnTextContent p{
+=09=09=09color:#000000;
+=09=09=09font-family:Helvetica;
+=09=09=09font-size:12px;
+=09=09=09line-height:150%;
+=09=09=09text-align:center;
+=09=09}
+=09=09#templateFooter .mcnTextContent a=2C#templateFooter .mcnTextContent=
+ p a{
+=09=09=09color:#000000;
+=09=09=09font-weight:normal;
+=09=09=09text-decoration:underline;
+=09=09}
+=09@media only screen and (min-width:768px){
+=09=09.templateContainer{
+=09=09=09width:600px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09body=2Ctable=2Ctd=2Cp=2Ca=2Cli=2Cblockquote{
+=09=09=09-webkit-text-size-adjust:none !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09body{
+=09=09=09width:100% !important;
+=09=09=09min-width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.columnWrapper{
+=09=09=09max-width:100% !important;
+=09=09=09width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnRetinaImage{
+=09=09=09max-width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImage{
+=09=09=09width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnCartContainer=2C.mcnCaptionTopContent=2C.mcnRecContentContainer=
+=2C.mcnCaptionBottomContent=2C.mcnTextContentContainer=2C.mcnBoxedTextCont=
+entContainer=2C.mcnImageGroupContentContainer=2C.mcnCaptionLeftTextContent=
+Container=2C.mcnCaptionRightTextContentContainer=2C.mcnCaptionLeftImageCon=
+tentContainer=2C.mcnCaptionRightImageContentContainer=2C.mcnImageCardLeftT=
+extContentContainer=2C.mcnImageCardRightTextContentContainer=2C.mcnImageCa=
+rdLeftImageContentContainer=2C.mcnImageCardRightImageContentContainer{
+=09=09=09max-width:100% !important;
+=09=09=09width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnBoxedTextContentContainer{
+=09=09=09min-width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageGroupContent{
+=09=09=09padding:9px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnCaptionLeftContentOuter .mcnTextContent=2C.mcnCaptionRightConten=
+tOuter .mcnTextContent{
+=09=09=09padding-top:9px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageCardTopImageContent=2C.mcnCaptionBottomContent:last-child .=
+mcnCaptionBottomImageContent=2C.mcnCaptionBlockInner .mcnCaptionTopContent=
+:last-child .mcnTextContent{
+=09=09=09padding-top:18px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageCardBottomImageContent{
+=09=09=09padding-bottom:9px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageGroupBlockInner{
+=09=09=09padding-top:0 !important;
+=09=09=09padding-bottom:0 !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageGroupBlockOuter{
+=09=09=09padding-top:9px !important;
+=09=09=09padding-bottom:9px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnTextContent=2C.mcnBoxedTextContentColumn{
+=09=09=09padding-right:18px !important;
+=09=09=09padding-left:18px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnImageCardLeftImageContent=2C.mcnImageCardRightImageContent{
+=09=09=09padding-right:18px !important;
+=09=09=09padding-bottom:0 !important;
+=09=09=09padding-left:18px !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcpreview-image-uploader{
+=09=09=09display:none !important;
+=09=09=09width:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09h1{
+=09=09=09font-size:18px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09h2{
+=09=09=09font-size:18px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09h3{
+=09=09=09font-size:9px;
+=09=09=09line-height:100% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09h4{
+=09=09=09font-size:16px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09.mcnBoxedTextContentContainer .mcnTextContent=2C.mcnBoxedTextContent=
+Container .mcnTextContent p{
+=09=09=09font-size:14px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templatePreheader{
+=09=09=09display:block !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templatePreheader .mcnTextContent=2C#templatePreheader .mcnTextCont=
+ent p{
+=09=09=09font-size:12px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templateHeader .mcnTextContent=2C#templateHeader .mcnTextContent p{
+=09=09=09font-size:16px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templateUpperBody .mcnTextContent=2C#templateUpperBody .mcnTextCont=
+ent p{
+=09=09=09font-size:16px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templateColumns .columnContainer .mcnTextContent=2C#templateColumns=
+ .columnContainer .mcnTextContent p{
+=09=09=09font-size:16px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templateLowerBody .mcnTextContent=2C#templateLowerBody .mcnTextCont=
+ent p{
+=09=09=09font-size:16px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}=09@media only screen and (max-width: 480px){
+=09=09#templateFooter .mcnTextContent=2C#templateFooter .mcnTextContent p{
+=09=09=09font-size:12px !important;
+=09=09=09line-height:150% !important;
+=09=09}
+
+}</style></head>
+    <body style=3D"height: 100%;margin: 0;padding: 0;width: 100%;-ms-text-=
+size-adjust: 100%;-webkit-text-size-adjust: 100%;background-color: #fafafa=
+;">
+        <!--
+-->
+        <!--[if !gte mso 9]><!----><span class=3D"mcnPreviewText" style=
+=3D"display:none; font-size:0px; line-height:0px; max-height:0px; max-widt=
+h:0px; opacity:0; overflow:hidden; visibility:hidden; mso-hide:all;">Start=
+ with a small-to-medium experience=2C that is known to be problematic=2C c=
+omes with existing data=2C will be redesigned soon=2C and that you can con=
+trol.</span><!--<![endif]-->
+        <!--
+-->
+        <center>
+            <table align=3D"center" border=3D"0" cellpadding=3D"0" cellspa=
+cing=3D"0" height=3D"100%" width=3D"100%" id=3D"bodyTable" style=3D"border=
+-collapse: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-s=
+ize-adjust: 100%;-webkit-text-size-adjust: 100%;height: 100%;margin: 0;pad=
+ding: 0;width: 100%;background-color: #fafafa;">
+                <tr>
+                    <td align=3D"center" valign=3D"top" id=3D"bodyCell" st=
+yle=3D"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-te=
+xt-size-adjust: 100%;height: 100%;margin: 0;padding: 10px;width: 100%;bord=
+er-top: 0;">
+                        <!-- BEGIN TEMPLATE // -->
+                        <!--[if (gte mso 9)|(IE)]>
+                        <table align=3D"center" border=3D"0" cellspacing=
+=3D"0" cellpadding=3D"0" width=3D"600" style=3D"width:600px;">
+                        <tr>
+                        <td align=3D"center" valign=3D"top" width=3D"600"=
+ style=3D"width:600px;">
+                        <![endif]-->
+                        <table border=3D"0" cellpadding=3D"0" cellspacing=
+=3D"0" width=3D"100%" class=3D"templateContainer" style=3D"border-collapse=
+: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjus=
+t: 100%;-webkit-text-size-adjust: 100%;border: 0;max-width: 600px !importa=
+nt;">
+                            <tr>
+                                <td valign=3D"top" id=3D"templatePreheader=
+" style=3D"background:#fafafa none no-repeat center/cover;mso-line-height-=
+rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;ba=
+ckground-color: #fafafa;background-image: none;background-repeat: no-repea=
+t;background-position: center;background-size: cover;border-top: 0;border-=
+bottom: 0;padding-top: 0px;padding-bottom: 0px;"><table border=3D"0" cellp=
+adding=3D"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnTextBlock" style=
+=3D"min-width: 100%;border-collapse: collapse;mso-table-lspace: 0pt;mso-ta=
+ble-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;=
+">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding: 0px 18px 9px;text-align: center;mso-line-height-rule: exactly=
+;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;word-break: bre=
+ak-word;color: #656565;font-family: Helvetica;font-size: 12px;line-height:=
+ 150%;">
+
+                            <div style=3D"display: none; max-height: 0px;=
+ overflow: hidden;">
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp=
+;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbs=
+p;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp=
+;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbs=
+p;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp=
+;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbs=
+p;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=
+=E2=80=8C&nbsp;&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=
+=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=
+=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;=E2=80=8C&nbsp;
+</div>
+<div style=3D"text-align: left;"><a href=3D"https://mailchi.mp/nngroup/10-=
+heuristics-ux-to-dev-ratio-start-with-designops-ux-best-practices-remote-c=
+ard-sort-163062?e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-r=
+ule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;col=
+or: #656565;font-weight: normal;text-decoration: underline;">View this ema=
+il in your browser</a></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                            </tr>
+                            <tr>
+                                <td valign=3D"top" id=3D"templateHeader" s=
+tyle=3D"background:#ffffff none no-repeat center/cover;mso-line-height-rul=
+e: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;backg=
+round-color: #ffffff;background-image: none;background-repeat: no-repeat;b=
+ackground-position: center;background-size: cover;border-top: 0;border-bot=
+tom: 1px none #e5e5e4;padding-top: 10px;padding-bottom: 0px;"><table borde=
+r=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnIma=
+geBlock" style=3D"min-width: 100%;border-collapse: collapse;mso-table-lspa=
+ce: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size=
+-adjust: 100%;">
+    <tbody class=3D"mcnImageBlockOuter">
+            <tr>
+                <td valign=3D"top" style=3D"padding: 9px;mso-line-height-r=
+ule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;" c=
+lass=3D"mcnImageBlockInner">
+                    <table align=3D"left" width=3D"100%" border=3D"0" cell=
+padding=3D"0" cellspacing=3D"0" class=3D"mcnImageContentContainer" style=
+=3D"min-width: 100%;border-collapse: collapse;mso-table-lspace: 0pt;mso-ta=
+ble-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;=
+">
+                        <tbody><tr>
+                            <td class=3D"mcnImageContent" valign=3D"top" s=
+tyle=3D"padding-right: 9px;padding-left: 9px;padding-top: 0;padding-bottom=
+: 0;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;">
+
+
+                                        <img align=3D"left" alt=3D"NN/g Ne=
+wsletter" src=3D"https://mcusercontent.com/538d934a891681a5d850bb4e5/image=
+s/aa978a7c-f37c-4edf-81d4-db0cce6bfe70.png" width=3D"270.71999999999997" s=
+tyle=3D"max-width: 1046px;padding-bottom: 0px;vertical-align: bottom;displ=
+ay: inline !important;border-radius: 0%;border: 0;height: auto;outline: no=
+ne;text-decoration: none;-ms-interpolation-mode: bicubic;" class=3D"mcnIma=
+ge">
+
+
+                            </td>
+                        </tr>
+                    </tbody></table>
+                </td>
+            </tr>
+    </tbody>
+</table></td>
+                            </tr>
+                            <tr>
+                                <td valign=3D"top" id=3D"templateUpperBody=
+" style=3D"background:#ffffff none no-repeat center/cover;mso-line-height-=
+rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;ba=
+ckground-color: #ffffff;background-image: none;background-repeat: no-repea=
+t;background-position: center;background-size: cover;border-top: 0;border-=
+bottom: 0;padding-top: 12px;padding-bottom: 0px;"><table border=3D"0" cell=
+padding=3D"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnTextBlock" styl=
+e=3D"min-width: 100%;border-collapse: collapse;mso-table-lspace: 0pt;mso-t=
+able-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%=
+;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #231f20;font-family: Arial=
+=2C 'Helvetica Neue'=2C Helvetica=2C sans-serif;font-size: 18px;line-heigh=
+t: 125%;text-align: left;">
+
+                            <div style=3D"text-align: left;"><span style=
+=3D"font-family:arial=2Chelvetica neue=2Chelvetica=2Csans-serif"><span sty=
+le=3D"font-size:18px"><strong>New Articles</strong></span></span></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnDividerBlock" style=3D"min-width: 100%;border-collapse: c=
+ollapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust:=
+ 100%;-webkit-text-size-adjust: 100%;table-layout: fixed !important;">
+    <tbody class=3D"mcnDividerBlockOuter">
+        <tr>
+            <td class=3D"mcnDividerBlockInner" style=3D"min-width: 100%;pa=
+dding: 0px 18px 2px;mso-line-height-rule: exactly;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;">
+                <table class=3D"mcnDividerContent" border=3D"0" cellpaddin=
+g=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"min-width: 100%;border-t=
+op: 1px solid #E5E5E4;border-collapse: collapse;mso-table-lspace: 0pt;mso-=
+table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100=
+%;">
+                    <tbody><tr>
+                        <td style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                            <span></span>
+                        </td>
+                    </tr>
+                </tbody></table>
+<!--
+                <td class=3D"mcnDividerBlockInner" style=3D"padding: 18px;=
+">
+                <hr class=3D"mcnDividerContent" style=3D"border-bottom-col=
+or:none; border-left-color:none; border-right-color:none; border-bottom-wi=
+dth:0; border-left-width:0; border-right-width:0; margin-top:0; margin-rig=
+ht:0; margin-bottom:0; margin-left:0;" />
+-->
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                            </tr>
+                            <tr>
+                                <td valign=3D"top" id=3D"templateColumns"=
+ style=3D"background:#ffffff none no-repeat center/cover;mso-line-height-r=
+ule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;bac=
+kground-color: #ffffff;background-image: none;background-repeat: no-repeat=
+;background-position: center;background-size: cover;border-top: 0;border-b=
+ottom: 0;padding-top: 0;padding-bottom: 0;">
+                                    <!--[if (gte mso 9)|(IE)]>
+                                    <table align=3D"center" border=3D"0" c=
+ellspacing=3D"0" cellpadding=3D"0" width=3D"600" style=3D"width:600px;">
+                                    <tr>
+                                    <td align=3D"center" valign=3D"top" wi=
+dth=3D"300" style=3D"width:300px;">
+                                    <![endif]-->
+                                    <table align=3D"left" border=3D"0" cel=
+lpadding=3D"0" cellspacing=3D"0" width=3D"300" class=3D"columnWrapper" sty=
+le=3D"border-collapse: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0p=
+t;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                                        <tr>
+                                            <td valign=3D"top" class=3D"co=
+lumnContainer" style=3D"mso-line-height-rule: exactly;-ms-text-size-adjust=
+: 100%;-webkit-text-size-adjust: 100%;"><table border=3D"0" cellpadding=3D=
+"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnCaptionBlock" style=3D"bo=
+rder-collapse: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-te=
+xt-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnCaptionBlockOuter">
+        <tr>
+            <td class=3D"mcnCaptionBlockInner" valign=3D"top" style=3D"pad=
+ding: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit=
+-text-size-adjust: 100%;">
+
+
+<table align=3D"left" border=3D"0" cellpadding=3D"0" cellspacing=3D"0" cla=
+ss=3D"mcnCaptionBottomContent" style=3D"border-collapse: collapse;mso-tabl=
+e-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-tex=
+t-size-adjust: 100%;">
+    <tbody><tr>
+        <td class=3D"mcnCaptionBottomImageContent" align=3D"left" valign=
+=3D"top" style=3D"padding: 0 9px 9px 9px;mso-line-height-rule: exactly;-ms=
+-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+
+
+            <a href=3D"https://nngroup.us4.list-manage.com/track/click?u=
+=3D538d934a891681a5d850bb4e5&id=3D6675a2f688&e=3D919af5c3e3" title=3D"" c=
+lass=3D"" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+
+
+            <img alt=3D"" src=3D"https://mcusercontent.com/538d934a891681a=
+5d850bb4e5/images/4ae60fc4-b61c-a125-14e8-d0f9f2ed6d5e.png" width=3D"264"=
+ style=3D"max-width: 1101px;border: 1px none;border-radius: 0%;height: aut=
+o;outline: none;text-decoration: none;-ms-interpolation-mode: bicubic;vert=
+ical-align: bottom;" class=3D"mcnImage">
+            </a>
+
+        </td>
+    </tr>
+    <tr>
+        <td class=3D"mcnTextContent" valign=3D"top" style=3D"padding: 0px=
+ 9px;font-size: 14px;mso-line-height-rule: exactly;-ms-text-size-adjust: 1=
+00%;-webkit-text-size-adjust: 100%;word-break: break-word;color: #202020;f=
+ont-family: Helvetica;line-height: 150%;text-align: left;" width=3D"264">
+            <h2 class=3D"null" style=3D"text-align: left;display: block;ma=
+rgin: 0;padding: 0;color: #000000;font-family: Helvetica;font-size: 18px;f=
+ont-style: normal;font-weight: bold;line-height: 125%;letter-spacing: norm=
+al;"><a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d93=
+4a891681a5d850bb4e5&id=3D9f32d999bf&e=3D919af5c3e3" target=3D"_blank" sty=
+le=3D"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-tex=
+t-size-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none=
+;">Service Blueprints: How to Choose What Experience to Visualize</a></h2>
+
+<h3 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #ff=
+ffff;font-family: Helvetica;font-size: 7px;font-style: normal;font-weight:=
+ normal;line-height: 100%;letter-spacing: normal;text-align: left;">&nbsp;=
+</h3>
+
+<div>Start with a small-to-medium experience=2C that is known to be proble=
+matic=2C comes with existing data=2C will be redesigned soon=2C and that y=
+ou can control.
+<h3 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #ff=
+ffff;font-family: Helvetica;font-size: 7px;font-style: normal;font-weight:=
+ normal;line-height: 100%;letter-spacing: normal;text-align: left;">&nbsp;=
+</h3>
+
+<h4 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #67=
+6767;font-family: Helvetica;font-size: 14px;font-style: normal;font-weight=
+: normal;line-height: 200%;letter-spacing: normal;text-align: left;"><span=
+ style=3D"color:#676767">5 min read</span></h4>
+</div>
+
+        </td>
+    </tr>
+</tbody></table>
+
+
+
+
+
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                                        </tr>
+                                    </table>
+                                    <!--[if (gte mso 9)|(IE)]>
+                                    </td>
+                                    <td align=3D"center" valign=3D"top" wi=
+dth=3D"300" style=3D"width:300px;">
+                                    <![endif]-->
+                                    <table align=3D"left" border=3D"0" cel=
+lpadding=3D"0" cellspacing=3D"0" width=3D"300" class=3D"columnWrapper" sty=
+le=3D"border-collapse: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0p=
+t;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                                        <tr>
+                                            <td valign=3D"top" class=3D"co=
+lumnContainer" style=3D"mso-line-height-rule: exactly;-ms-text-size-adjust=
+: 100%;-webkit-text-size-adjust: 100%;"><table border=3D"0" cellpadding=3D=
+"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnCaptionBlock" style=3D"bo=
+rder-collapse: collapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-te=
+xt-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnCaptionBlockOuter">
+        <tr>
+            <td class=3D"mcnCaptionBlockInner" valign=3D"top" style=3D"pad=
+ding: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit=
+-text-size-adjust: 100%;">
+
+
+<table align=3D"left" border=3D"0" cellpadding=3D"0" cellspacing=3D"0" cla=
+ss=3D"mcnCaptionBottomContent" style=3D"border-collapse: collapse;mso-tabl=
+e-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-tex=
+t-size-adjust: 100%;">
+    <tbody><tr>
+        <td class=3D"mcnCaptionBottomImageContent" align=3D"left" valign=
+=3D"top" style=3D"padding: 0 9px 9px 9px;mso-line-height-rule: exactly;-ms=
+-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+
+
+            <a href=3D"https://nngroup.us4.list-manage.com/track/click?u=
+=3D538d934a891681a5d850bb4e5&id=3D744ca025e5&e=3D919af5c3e3" title=3D"" c=
+lass=3D"" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+
+
+            <img alt=3D"" src=3D"https://mcusercontent.com/538d934a891681a=
+5d850bb4e5/images/23b436f7-1db2-c6d2-8078-d513c0fa185e.png" width=3D"264"=
+ style=3D"max-width: 1101px;border: 1px none;border-radius: 0%;height: aut=
+o;outline: none;text-decoration: none;-ms-interpolation-mode: bicubic;vert=
+ical-align: bottom;" class=3D"mcnImage">
+            </a>
+
+        </td>
+    </tr>
+    <tr>
+        <td class=3D"mcnTextContent" valign=3D"top" style=3D"padding: 0px=
+ 9px;font-size: 14px;mso-line-height-rule: exactly;-ms-text-size-adjust: 1=
+00%;-webkit-text-size-adjust: 100%;word-break: break-word;color: #202020;f=
+ont-family: Helvetica;line-height: 150%;text-align: left;" width=3D"264">
+            <h2 class=3D"null" style=3D"text-align: left;display: block;ma=
+rgin: 0;padding: 0;color: #000000;font-family: Helvetica;font-size: 18px;f=
+ont-style: normal;font-weight: bold;line-height: 125%;letter-spacing: norm=
+al;"><a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d93=
+4a891681a5d850bb4e5&id=3Dd5b20931d9&e=3D919af5c3e3" target=3D"_blank" sty=
+le=3D"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-tex=
+t-size-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none=
+;">Quantitative Research: Study Guide</a></h2>
+
+<h3 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #ff=
+ffff;font-family: Helvetica;font-size: 7px;font-style: normal;font-weight:=
+ normal;line-height: 100%;letter-spacing: normal;text-align: left;">&nbsp;=
+</h3>
+
+<div>Unsure where to start? Use this collection of links to our articles a=
+nd videos to learn about quant research=2C quant usability testing=2C anal=
+ytics=2C and analyzing data.
+<h3 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #ff=
+ffff;font-family: Helvetica;font-size: 7px;font-style: normal;font-weight:=
+ normal;line-height: 100%;letter-spacing: normal;text-align: left;">&nbsp;=
+</h3>
+
+<h4 class=3D"null" style=3D"display: block;margin: 0;padding: 0;color: #67=
+6767;font-family: Helvetica;font-size: 14px;font-style: normal;font-weight=
+: normal;line-height: 200%;letter-spacing: normal;text-align: left;"><span=
+ style=3D"color:#676767">7 min read</span></h4>
+</div>
+
+        </td>
+    </tr>
+</tbody></table>
+
+
+
+
+
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                                        </tr>
+                                    </table>
+                                    <!--[if (gte mso 9)|(IE)]>
+                                    </td>
+                                    </tr>
+                                    </table>
+                                    <![endif]-->
+                                </td>
+                            </tr>
+                            <tr>
+                                <td valign=3D"top" id=3D"templateLowerBody=
+" style=3D"background:#ffffff none no-repeat center/cover;mso-line-height-=
+rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;ba=
+ckground-color: #ffffff;background-image: none;background-repeat: no-repea=
+t;background-position: center;background-size: cover;border-top: 0;border-=
+bottom: 0;padding-top: 0px;padding-bottom: 20px;"><table border=3D"0" cell=
+padding=3D"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnTextBlock" styl=
+e=3D"min-width: 100%;border-collapse: collapse;mso-table-lspace: 0pt;mso-t=
+able-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%=
+;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <div style=3D"text-align: left;"><br>
+<span style=3D"font-family:arial=2Chelvetica neue=2Chelvetica=2Csans-serif=
+"><span style=3D"font-size:18px"><strong>New Videos</strong></span></span>=
+</div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnDividerBlock" style=3D"min-width: 100%;border-collapse: c=
+ollapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust:=
+ 100%;-webkit-text-size-adjust: 100%;table-layout: fixed !important;">
+    <tbody class=3D"mcnDividerBlockOuter">
+        <tr>
+            <td class=3D"mcnDividerBlockInner" style=3D"min-width: 100%;pa=
+dding: 0px 18px 2px;mso-line-height-rule: exactly;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;">
+                <table class=3D"mcnDividerContent" border=3D"0" cellpaddin=
+g=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"min-width: 100%;border-t=
+op: 1px solid #E5E5E4;border-collapse: collapse;mso-table-lspace: 0pt;mso-=
+table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100=
+%;">
+                    <tbody><tr>
+                        <td style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                            <span></span>
+                        </td>
+                    </tr>
+                </tbody></table>
+<!--
+                <td class=3D"mcnDividerBlockInner" style=3D"padding: 18px;=
+">
+                <hr class=3D"mcnDividerContent" style=3D"border-bottom-col=
+or:none; border-left-color:none; border-right-color:none; border-bottom-wi=
+dth:0; border-left-width:0; border-right-width:0; margin-top:0; margin-rig=
+ht:0; margin-bottom:0; margin-left:0;" />
+-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <h2 class=3D"null" style=3D"text-align: left;d=
+isplay: block;margin: 0;padding: 0;color: #000000;font-family: Helvetica;f=
+ont-size: 18px;font-style: normal;font-weight: bold;line-height: 125%;lett=
+er-spacing: normal;"><strong><a href=3D"https://nngroup.us4.list-manage.co=
+m/track/click?u=3D538d934a891681a5d850bb4e5&id=3D3e67cb09cb&e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-text-size-=
+adjust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;font-weight: bo=
+ld;text-decoration: none;">=F0=9F=8E=A5 Video Game Design and User Experie=
+nce</a></strong></h2>
+
+<h3 class=3D"null" style=3D"text-align: left;display: block;margin: 0;padd=
+ing: 0;color: #ffffff;font-family: Helvetica;font-size: 7px;font-style: no=
+rmal;font-weight: normal;line-height: 100%;letter-spacing: normal;">&nbsp;=
+</h3>
+
+<div style=3D"text-align: left;">Video game design is a special case of us=
+er interface design=2C with some differences (especially in user goals) bu=
+t also many similarities with more traditional UX design problems and meth=
+ods.</div>
+
+<div style=3D"text-align: left;"><span style=3D"color:#808080">5 min video=
+</span></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <h2 class=3D"null" style=3D"text-align: left;d=
+isplay: block;margin: 0;padding: 0;color: #000000;font-family: Helvetica;f=
+ont-size: 18px;font-style: normal;font-weight: bold;line-height: 125%;lett=
+er-spacing: normal;"><strong><a href=3D"https://nngroup.us4.list-manage.co=
+m/track/click?u=3D538d934a891681a5d850bb4e5&id=3D7052336674&e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-text-size-=
+adjust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;font-weight: bo=
+ld;text-decoration: none;">=F0=9F=8E=A5 Don't Overthink UX ROI</a></strong=
+></h2>
+
+<h3 class=3D"null" style=3D"text-align: left;display: block;margin: 0;padd=
+ing: 0;color: #ffffff;font-family: Helvetica;font-size: 7px;font-style: no=
+rmal;font-weight: normal;line-height: 100%;letter-spacing: normal;">&nbsp;=
+</h3>
+
+<div style=3D"text-align: left;">It can be hard to calculate the return on=
+ investment (ROI) for user experience design improvements. But don't get b=
+ogged down in less-important details: often simple metrics can give a good=
+-enough estimate to justify UX investments.</div>
+
+<div style=3D"text-align: left;"><span style=3D"color:#808080">2 min video=
+</span></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <div style=3D"text-align: left;"><br>
+<span style=3D"font-family:arial=2Chelvetica neue=2Chelvetica=2Csans-serif=
+"><span style=3D"font-size:18px"><strong>Virtual UX Training</strong></spa=
+n></span></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnDividerBlock" style=3D"min-width: 100%;border-collapse: c=
+ollapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust:=
+ 100%;-webkit-text-size-adjust: 100%;table-layout: fixed !important;">
+    <tbody class=3D"mcnDividerBlockOuter">
+        <tr>
+            <td class=3D"mcnDividerBlockInner" style=3D"min-width: 100%;pa=
+dding: 0px 18px 2px;mso-line-height-rule: exactly;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;">
+                <table class=3D"mcnDividerContent" border=3D"0" cellpaddin=
+g=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"min-width: 100%;border-t=
+op: 1px solid #E5E5E4;border-collapse: collapse;mso-table-lspace: 0pt;mso-=
+table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100=
+%;">
+                    <tbody><tr>
+                        <td style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                            <span></span>
+                        </td>
+                    </tr>
+                </tbody></table>
+<!--
+                <td class=3D"mcnDividerBlockInner" style=3D"padding: 18px;=
+">
+                <hr class=3D"mcnDividerContent" style=3D"border-bottom-col=
+or:none; border-left-color:none; border-right-color:none; border-bottom-wi=
+dth:0; border-left-width:0; border-right-width:0; margin-top:0; margin-rig=
+ht:0; margin-bottom:0; margin-left:0;" />
+-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding: 0px 18px 9px;line-height: 150%;mso-line-height-rule: exactly;=
+-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;word-break: brea=
+k-word;color: #202020;font-family: Helvetica;font-size: 14px;text-align: l=
+eft;">
+
+                            <div style=3D"text-align: left;"><a href=3D"ht=
+tps://nngroup.us4.list-manage.com/track/click?u=3D538d934a891681a5d850bb4e=
+5&id=3D7c4351e84f&e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-hei=
+ght-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100=
+%;color: #0180a5;font-weight: bold;text-decoration: none;">Americas/Europe=
+</a><br>
+<em>August 28 =E2=80=93 September 3</em><br>
+Full-day courses<br>
+<br>
+<a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d934a891=
+681a5d850bb4e5&id=3Dc32b742b6d&e=3D919af5c3e3" target=3D"_blank" style=3D=
+"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none;">Am=
+erica/Europe/Middle East</a><a href=3D"https://nngroup.us4.list-manage.com=
+/track/click?u=3D538d934a891681a5d850bb4e5&id=3D7eb5dd5ca9&e=3D919af5c3e3=
+" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-text-size-a=
+djust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;font-weight: bol=
+d;text-decoration: none;">&nbsp;</a>&nbsp;<br>
+<em>September 18 =E2=80=93 October 1</em><br>
+Half-day courses<br>
+<br>
+<a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d934a891=
+681a5d850bb4e5&id=3D17023bc603&e=3D919af5c3e3" target=3D"_blank" style=3D=
+"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none;">Am=
+erica/Europe/Middle East&nbsp;&nbsp;</a><br>
+UX Vision and Strategy Series<br>
+<em>October 18 =E2=80=93 October 22</em><br>
+Half-day courses<br>
+<br>
+<a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d934a891=
+681a5d850bb4e5&id=3D587a971030&e=3D919af5c3e3" target=3D"_blank" style=3D=
+"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none;">Am=
+erica/Europe/Middle East&nbsp;&nbsp;</a><br>
+Qualitative Research Series<br>
+<em>November 15 =E2=80=93 November 19</em><br>
+Half-day courses<br>
+<br>
+<a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d934a891=
+681a5d850bb4e5&id=3D98843978b8&e=3D919af5c3e3" target=3D"_blank" style=3D=
+"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;color: #0180a5;font-weight: bold;text-decoration: none;">Am=
+ericas/Europe</a>&nbsp;<br>
+<em>October 31&nbsp;=E2=80=93 November 5</em><br>
+Full-day courses<br>
+<br>
+<a data-saferedirecturl=3D"https://www.google.com/url?q=3Dhttps://nngroup.=
+us4.list-manage.com/track/click?u%3D538d934a891681a5d850bb4e5%26id%3Da594b=
+9e8a9%26e%3D48052d3858&amp;source=3Dgmail&amp;ust=3D1602882025986000&amp;u=
+sg=3DAFQjCNEHNhDqY9w9bbjM-nCxHx3ZdWYfFA" href=3D"https://nngroup.us4.list-=
+manage.com/track/click?u=3D538d934a891681a5d850bb4e5&id=3D220e79034c&e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-t=
+ext-size-adjust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;font-w=
+eight: bold;text-decoration: none;">Full event program</a>&nbsp;describing=
+ all full-day UX training courses and the virtual conference format.<br>
+&nbsp;</div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <div style=3D"text-align: left;"><span style=
+=3D"font-family:arial=2Chelvetica neue=2Chelvetica=2Csans-serif"><span sty=
+le=3D"font-size:18px"><strong>We're Hiring!</strong></span></span></div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnDividerBlock" style=3D"min-width: 100%;border-collapse: c=
+ollapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust:=
+ 100%;-webkit-text-size-adjust: 100%;table-layout: fixed !important;">
+    <tbody class=3D"mcnDividerBlockOuter">
+        <tr>
+            <td class=3D"mcnDividerBlockInner" style=3D"min-width: 100%;pa=
+dding: 0px 18px 2px;mso-line-height-rule: exactly;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;">
+                <table class=3D"mcnDividerContent" border=3D"0" cellpaddin=
+g=3D"0" cellspacing=3D"0" width=3D"100%" style=3D"min-width: 100%;border-t=
+op: 1px solid #E5E5E4;border-collapse: collapse;mso-table-lspace: 0pt;mso-=
+table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100=
+%;">
+                    <tbody><tr>
+                        <td style=3D"mso-line-height-rule: exactly;-ms-tex=
+t-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+                            <span></span>
+                        </td>
+                    </tr>
+                </tbody></table>
+<!--
+                <td class=3D"mcnDividerBlockInner" style=3D"padding: 18px;=
+">
+                <hr class=3D"mcnDividerContent" style=3D"border-bottom-col=
+or:none; border-left-color:none; border-right-color:none; border-bottom-wi=
+dth:0; border-left-width:0; border-right-width:0; margin-top:0; margin-rig=
+ht:0; margin-bottom:0; margin-left:0;" />
+-->
+            </td>
+        </tr>
+    </tbody>
+</table><table border=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"1=
+00%" class=3D"mcnTextBlock" style=3D"min-width: 100%;border-collapse: coll=
+apse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100=
+%;-webkit-text-size-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #202020;font-family: Helve=
+tica;font-size: 14px;line-height: 150%;text-align: left;">
+
+                            <h2 class=3D"null" style=3D"text-align: left;d=
+isplay: block;margin: 0;padding: 0;color: #000000;font-family: Helvetica;f=
+ont-size: 18px;font-style: normal;font-weight: bold;line-height: 125%;lett=
+er-spacing: normal;"><strong><a href=3D"https://nngroup.us4.list-manage.co=
+m/track/click?u=3D538d934a891681a5d850bb4e5&id=3D75b640090d&e=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-ms-text-size-=
+adjust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;font-weight: bo=
+ld;text-decoration: none;">UX Specialists (entry-level or experienced=2C r=
+emote)</a></strong></h2>
+
+<h3 class=3D"null" style=3D"text-align: left;display: block;margin: 0;padd=
+ing: 0;color: #ffffff;font-family: Helvetica;font-size: 7px;font-style: no=
+rmal;font-weight: normal;line-height: 100%;letter-spacing: normal;">&nbsp;=
+</h3>
+
+<div style=3D"text-align: left;">Nielsen Norman Group has openings for Use=
+r Experience Specialists (both designers and researchers=2C seeking both e=
+ntry-level and experienced applicants). <a href=3D"https://nngroup.us4.lis=
+t-manage.com/track/click?u=3D538d934a891681a5d850bb4e5&id=3Db365eb2136&e=
+=3D919af5c3e3" target=3D"_blank" style=3D"mso-line-height-rule: exactly;-=
+ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;color: #0180a5;fo=
+nt-weight: bold;text-decoration: none;">Read the job&nbsp;description and=
+ see how to apply</a>.<br>
+&nbsp;<br>
+Deadline to apply: <strong>Today=2C</strong> August 30=2C 2021</div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                            </tr>
+                            <tr>
+                                <td valign=3D"top" id=3D"templateFooter" s=
+tyle=3D"background:#f6f6f6 none no-repeat center/cover;mso-line-height-rul=
+e: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;backg=
+round-color: #f6f6f6;background-image: none;background-repeat: no-repeat;b=
+ackground-position: center;background-size: cover;border-top: 1px solid #e=
+5e5e5;border-bottom: 0;padding-top: 10px;padding-bottom: 10px;"><table bor=
+der=3D"0" cellpadding=3D"0" cellspacing=3D"0" width=3D"100%" class=3D"mcnT=
+extBlock" style=3D"min-width: 100%;border-collapse: collapse;mso-table-lsp=
+ace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;">
+    <tbody class=3D"mcnTextBlockOuter">
+        <tr>
+            <td valign=3D"top" class=3D"mcnTextBlockInner" style=3D"paddin=
+g-top: 9px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webki=
+t-text-size-adjust: 100%;">
+              =09<!--[if mso]>
+=09=09=09=09<table align=3D"left" border=3D"0" cellspacing=3D"0" cellpaddi=
+ng=3D"0" width=3D"100%" style=3D"width:100%;">
+=09=09=09=09<tr>
+=09=09=09=09<![endif]-->
+=09=09=09
+=09=09=09=09<!--[if mso]>
+=09=09=09=09<td valign=3D"top" width=3D"600" style=3D"width:600px;">
+=09=09=09=09<![endif]-->
+                <table align=3D"left" border=3D"0" cellpadding=3D"0" cells=
+pacing=3D"0" style=3D"max-width: 100%;min-width: 100%;border-collapse: col=
+lapse;mso-table-lspace: 0pt;mso-table-rspace: 0pt;-ms-text-size-adjust: 10=
+0%;-webkit-text-size-adjust: 100%;" width=3D"100%" class=3D"mcnTextContent=
+Container">
+                    <tbody><tr>
+
+                        <td valign=3D"top" class=3D"mcnTextContent" style=
+=3D"padding-top: 0;padding-right: 18px;padding-bottom: 9px;padding-left: 1=
+8px;mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-=
+size-adjust: 100%;word-break: break-word;color: #000000;font-family: Helve=
+tica;font-size: 12px;line-height: 150%;text-align: center;">
+
+                            <div style=3D"text-align: left;">You are recei=
+ving this newsletter because you subscribed at<br>
+<a href=3D"https://nngroup.us4.list-manage.com/track/click?u=3D538d934a891=
+681a5d850bb4e5&id=3D63b86a74ac&e=3D919af5c3e3" target=3D"_blank" style=3D=
+"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-siz=
+e-adjust: 100%;color: #000000;font-weight: normal;text-decoration: underli=
+ne;">https://www.nngroup.com/articles/subscribe</a><br>
+<br>
+48105 Warm Springs Blvd.=2C Fremont=2C CA 94539-7498=2C USA<br>
+Copyright 2020&nbsp;Nielsen Norman Group=2C All rights reserved<br>
+<a href=3D"https://nngroup.us4.list-manage.com/profile?u=3D538d934a891681a=
+5d850bb4e5&id=3D7f29a2b335&e=3D919af5c3e3&c=3D5707cee75b" style=3D"mso-line-=
+height-rule: exactly;-ms-text-size-adjust: 100%;-webkit-text-size-adjust:=
+ 100%;color: #000000;font-weight: normal;text-decoration: underline;">Mana=
+ge preferences</a> or <a href=3D"https://nngroup.us4.list-manage.com/unsub=
+scribe?u=3D538d934a891681a5d850bb4e5&id=3D7f29a2b335&e=3D919af5c3e3&c=3D5707=
+cee75b" style=3D"mso-line-height-rule: exactly;-ms-text-size-adjust: 100%;=
+-webkit-text-size-adjust: 100%;color: #000000;font-weight: normal;text-dec=
+oration: underline;">unsubscribe</a>.</div>
+
+                        </td>
+                    </tr>
+                </tbody></table>
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</td>
+=09=09=09=09<![endif]-->
+
+=09=09=09=09<!--[if mso]>
+=09=09=09=09</tr>
+=09=09=09=09</table>
+=09=09=09=09<![endif]-->
+            </td>
+        </tr>
+    </tbody>
+</table></td>
+                            </tr>
+                        </table>
+                        <!--[if (gte mso 9)|(IE)]>
+                        </td>
+                        </tr>
+                        </table>
+                        <![endif]-->
+                        <!-- // END TEMPLATE -->
+                    </td>
+                </tr>
+            </table>
+        </center>
+    <img src=3D"https://nngroup.us4.list-manage.com/track/open.php?u=3D538=
+d934a891681a5d850bb4e5&id=3D5707cee75b&e=3D919af5c3e3" height=3D"1" width=
+=3D"1"></body>
+</html>
+--_----------=_MCPart_1257904941--

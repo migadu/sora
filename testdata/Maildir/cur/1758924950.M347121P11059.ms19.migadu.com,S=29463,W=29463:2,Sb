@@ -1,0 +1,400 @@
+Return-Path: <me=dejanstrbac.com@b.wordpress.com>
+Delivered-To: me@dejanstrbac.com
+Received: from 28eb9c16ae8f ([10.0.9.11])
+	by 5a8e36027823 (Dovecot) with LMTP id 8fNsHSZmO1inFQAAc990bg
+	for <me@dejanstrbac.com>; Sun, 27 Nov 2016 23:03:02 +0000
+Received: from aspmx1.migadu.com ([10.0.9.8])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	by 28eb9c16ae8f (Dovecot) with LMTP id 0MQLLlJjO1gSLQAAvBa+Bw
+	; Sun, 27 Nov 2016 23:03:02 +0000
+Received: (Migadu outbound); Sun, 27 Nov 2016 23:03:02 +0000
+Authentication-Results: aspmx1.migadu.com; iprev=pass; spf=pass smtp.mailfrom=b.wordpress.com; dkim=pass header.i=@wordpress.com
+Received-SPF: Pass (aspmx1.migadu.com: domain of b.wordpress.com designates 192.0.96.41 as permitted sender) receiver=aspmx1.migadu.com; identity=mailfrom; client-ip=192.0.96.41; helo=smtp2.dca.wordpress.com; envelope-from=<me=dejanstrbac.com@b.wordpress.com>
+Received-SPF: None (aspmx1.migadu.com: domain of smtp2.dca.wordpress.com does not designate 192.0.96.41 as permitted sender) receiver=aspmx1.migadu.com; identity=helo; client-ip=192.0.96.41; helo=smtp2.dca.wordpress.com; envelope-from=<me=dejanstrbac.com@b.wordpress.com>
+Received: from smtp2.dca.wordpress.com (smtp2.dca.wordpress.com [192.0.96.41])
+	by aspmx1.migadu.com (Haraka/2.8.8) with ESMTPS id 4A5A0103-83B8-4F86-883E-F326CBEDCE84.1
+	envelope-from <me=dejanstrbac.com@b.wordpress.com>
+	(version=TLSv1/SSLv3 cipher=ECDHE-RSA-AES256-GCM-SHA384 verify=NO);
+	Sun, 27 Nov 2016 23:02:51 +0000
+Received: from wordpress.com (unknown [192.0.81.14])
+	by smtp2.dca.wordpress.com (Postfix) with ESMTP id 3tRlh95hvPzPlJk
+	for <me@dejanstrbac.com>; Sun, 27 Nov 2016 23:02:33 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=wordpress.com; s=my5;
+	t=1480287753; bh=ln8imfhMW7sk5uaFp11GR+ZHOwN+DsKzHUkp/RWgiRU=;
+	h=Date:To:From:Subject:List-Help:List-Unsubscribe:List-Subscribe:
+	 List-Archive:From;
+	b=XlOcdvmtl5sEr6WoX7En/OpWSSvPrhm2m6na9h2G7xIAR7EhI25ml2EQOtyrbLefX
+	 lpmh9OgTaHu2L+IdG9FMTkXG+otalk9no1oxh8Cv8faJNHWiI+1Ye467RimRiBOK1D
+	 ab3HqLIUHDAIMae+i+vRqu81uenEs0iayosKZ8OI=
+Date: Sun, 27 Nov 2016 23:02:30 +0000
+To: me@dejanstrbac.com
+From: =?UTF-8?B?TWlsb3MuaW8=?= <donotreply@wordpress.com>
+Subject: =?UTF-8?B?W05ldyBwb3N0XSBLYWtvIGplIG5hc3RhbGEgcGVzbWEg4oCcRGltaXRyaWplLCBzaW5lIE1pdHJl4oCd?=
+Message-ID: <66211245.4336.0@wordpress.com>
+List-Help: <https://en.support.wordpress.com/following/>
+List-Unsubscribe: <https://subscribe.wordpress.com/?key=07af85066397f313ba38211ef0b6a757&amp;email=me%40dejanstrbac.com&amp;b=LcR.KVxMn9h.%5B88pL8b7y%2F%2CJaHLX%2C17oMpx%5BX%5DwM%2Bdj%7Ejr%5Bk4a9>
+List-Subscribe: <http://milos.io>
+List-Archive: <http://milos.io>
+Precedence: bulk
+X-Automattic-Destination: bWVAZGVqYW5zdHJiYWMuY29t
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+	boundary="b1_71112c1a7c7e0f7986d6ee8d36fdb8e1"
+X-Haraka-FCrDNS: smtp2.dca.wordpress.com
+X-Rspamd-Bar: ++
+X-Rspamd-Report: 
+X-Rspamd-Score: 1.2
+X-Haraka-Karma: score: -3, good: 0, bad: 1108, connections: 1115, history: -1108, awards: 007,004,005,131,183,182, fail:all_bad
+
+This is a multi-part message in MIME format.
+
+--b1_71112c1a7c7e0f7986d6ee8d36fdb8e1
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+Post   : Kako je nastala pesma &#8220;Dimitrije, sine Mitre&#8221;=0AURL   =
+ : http://milos.io/kako-je-nastala-pesma-dimitrije-sine-mitre/=0APosted : N=
+ovember 28, 2016 at 12:02 am=0AAuthor : Milos Stanic=0ATags   : dimitrije s=
+ine, istorija, ljubavna pri=C4=8Da, sevdah=0A=0ADugo se smatralo da je pozn=
+ata pesma "Dimitrije, sine Mitre" narodna pesma. Me=C4=91utim, skoro smo sa=
+znali da nije. Autor pesme je Stana Avramovi=C4=87 Karaminga iz Vranja. Sta=
+na je bila jako ugledna vranjanska peva=C4=8Dica i uzor mnogim kasnije pozn=
+atim peva=C4=8Dima.=0A=0Ahttp://milos.io/wp-content/uploads/2016/11/stana-k=
+araminga.jpg=0A=0AStana je umrla 1969. godine i na sahrani su po njenoj =
+=C5=BEelji svirali ovu njenu=C2=A0pesmu. Ona ju je ceo =C5=BEivot malo menj=
+ala i bilo je par verzija pesme. Pred samu smrt je rekla prijateljima "Sve =
+nesam rekla, sve i neje za pesmu..." i ispri=C4=8Dala kako je pesma nastala=
+.=0A=0APesma je inspirisana pri=C4=8Dom=C2=A0o Dimitriju koji je bio njen b=
+rat od tetke=C2=A0i Stani po kojoj je ona kasnije dobila ime. Karamingin ot=
+ac Toma je bio ujak Dimitriju.=C2=A0Za pri=C4=8Du je saznala od majke koja =
+joj ju je tek na samrti ispri=C4=8Dala.=0A=0ADimitrije je o=C5=BEenio Stanu=
+ za koju se pri=C4=8Da da je bila najlep=C5=A1a devojka od Vranja do Ni=
+=C5=A1a. Mnogo su se voleli, ali nisu mogli da imaju dece. Kako su godine p=
+rolazile polako je porodica po=C4=8Dela da zanoveta, pa bi recimo kada bi k=
+renuli u crkvu nedeljom svekrva Bosa govorila=C2=A0"'Ajde sine, 'ajde pa i =
+dete dovedi".=0A=0AVremenom je i Dimitrije po=C4=8Deo da prebacuje =C5=
+=BEeni "Badava, Stano, tvoja lepota, kad nisi rodila mu=C5=A1ko ili =C5=
+=BEensko. Svi se kunu u decu, a ja u tebe!"=0A=0AOd nesre=C4=87e koja ju je=
+ izjedala Stana re=C5=A1i da sebi oduzme =C5=BEivot i obesi se. Me=C4=91uti=
+m, za to sazna ujak Toma i poku=C5=A1a da joj pomogne tako =C5=A1to je posa=
+vetuje=C2=A0da tajno zatrudni sa drugim =C4=8Dovekom kako bi porodica ponov=
+o bila sretna.=0A=0ATako i bude, Stana zatrudne u =C4=8Detrdesetoj godini s=
+a drugim =C4=8Dovekom. Polako se vra=C4=87ala sre=C4=87a u porodicu, svi su=
+ je pazili i =C4=8Duvali od posla da bi iznela trudno=C4=87u. Me=C4=91utim,=
+ poro=C4=91aj je bio te=C5=BEak i Stana umre na poro=C4=91aju. Dete je pre=
+=C5=BEivelo...=0A=0ASedam dana kasnije=C2=A0ujka Toma re=C5=A1i da ka=C5=
+=BEe istinu Dimitriju:=0A=0A"Pre nego =C5=A1to odemo na Stanin grob, moram =
+ne=C5=A1to da ti ka=C5=BEem. Izjedosmo Stanu, prvo tvoja majka, pa ti i ond=
+a ja.".=0A=0ADimitrije je bio zbunjen.=0A=0A"Tako je. Tvoja majka, =C5=
+=A1to je kinjila. Ti =C5=A1to si nerodan, a ja =C5=A1to sam je savetovao s =
+koga da ide. Da zna=C5=A1, dete nije tvoje."=0A=0ADimitrije bi =C4=8Dvrst, =
+pa odgovori ujaku "Ako, ujko. Nema veze. Mi smo hteli dete da usvojimo, a o=
+vo je bar moja Stana rodila."=0A=0ASutradan, na grobu, pred ro=C4=91acima d=
+ok su Stani davali prvu subotu, Dimitrije re=C4=8De: "Ovde, pored moje Stan=
+e da me pokopate..." i pre nego =C5=A1te je iko mogao da ga spre=C4=8Di, iz=
+vadi pi=C5=A1tolj i ubije se.=0A=0ATri dana nakon=C2=A0smrti Stane i Dimitr=
+ija, od tuge umre i njegova majka Bosa, malo kasnije i Toma.=0A=0ATako je S=
+tana Karaminga izgubila oca. Za se=C4=87anje sastavila je kratku ali kao pl=
+anina veliku=C2=A0pesmu o svojoj tetki i njenom sinu Dimitriju. Do svoje os=
+me decenije je krila pozadinu pesme jer govori=C2=A0o zloj sudbini porodice=
+ i o samoubistvu.=0A=0AZa kraj preslu=C5=A1ajte pesmu i razmislite o pozadi=
+ni pesme.=0A=0AEvo par pesama ( https://www.youtube.com/results?search_quer=
+y=3Dstana+karaminga )  koje su snimljene u izvo=C4=91enju Stane Karaminge.=
+=0A=0AAdd a comment to this post: http://milos.io/kako-je-nastala-pesma-dim=
+itrije-sine-mitre/#respond=0A=0A-- =0A=0A=0AManage Subscriptions=0Ahttps://=
+subscribe.wordpress.com/?key=3D07af85066397f313ba38211ef0b6a757&email=3Dme%=
+40dejanstrbac.com=0A=0AUnsubscribe:=0Ahttps://subscribe.wordpress.com/?key=
+=3D07af85066397f313ba38211ef0b6a757&email=3Dme%40dejanstrbac.com&b=3DLcR.KV=
+xMn9h.%5B88pL8b7y%2F%2CJaHLX%2C17oMpx%5BX%5DwM%2Bdj%7Ejr%5Bk4a9=0A
+
+--b1_71112c1a7c7e0f7986d6ee8d36fdb8e1
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.=
+w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">=0A<html xmlns=3D"http://www.=
+w3.org/1999/xhtml">=0A<head>=0A=09<style type=3D"text/css" media=3D"all">=
+=0A=09a:hover {=09color: red;=09}=0A=09a {=0A=09=09text-decoration: none;=
+=0A=09=09color: #0088cc;=0A=09}=0A=09=0A=09a.primaryactionlink:link, a.prim=
+aryactionlink:visited { background-color: #2585B2; color: #fff; }=0A=09a.pr=
+imaryactionlink:hover, a.primaryactionlink:active { background-color: #1172=
+9E !important; color: #fff !important; }=0A=0A/*=0A =09@media only screen a=
+nd (max-device-width: 480px) { =0A=09=09 .post { min-width: 700px !importan=
+t; }=0A=09}=0A*/=0A=09</style>=0A=09<title>WordPress.com</title>=0A=09<!--[=
+if gte mso 12]>=0A=09<style type=3D"text/css" media=3D"all">=0A=09body {=0A=
+=09font-family: arial;=0A=09font-size: 0.8em;=0A=09}=0A=09.post, .comment {=
+=0A=09background-color: white !important;=0A=09line-height: 1.4em !importan=
+t;=0A=09}=0A=09</style>=09=0A=09<![endif]-->=0A=09<meta http-equiv=3D"Conte=
+nt-Type" content=3D"text/html; charset=3Dutf-8" />=0A</head>=0A=0A<body cla=
+ss=3D'subscription-body-tag'>=0A=0A<table border=3D"0" cellspacing=3D"0" ce=
+llpadding=3D"0" bgcolor=3D"#DDDDDD"  style=3D"width: 100%; background: #DDD=
+DDD;">=0A=09<tr>=0A=09=09<td>=0A=09=09=09=09=09<span style=3D"display:none =
+!important">=0A=09=09=09=09Milos Stanic posted: "Dugo se smatralo da je poz=
+nata pesma "Dimitrije, sine Mitre" narodna pesma. Me=C4=91utim, skoro smo s=
+aznali da nije. Autor pesme je Stana Avramovi=C4=87 Karaminga iz Vranja. St=
+ana je bila jako ugledna vranjanska peva=C4=8Dica i uzor mnogim kasnije poz=
+natim peva=C4=8Dima.
+
+"=09=09=09</span>=0A=09=09=09=09=09=09<table border=3D"0" cellspacing=3D"0"=
+ cellpadding=3D"0" align=3D'center'  class=3D"subscribe-body" style=3D"widt=
+h: 100%; padding: 10px">=0A=09=09=09=09<tr>=0A=09=09=09=09=09<td>=0A=09=09=
+=09=09=09=09=09=09=09=09=09=09<div style=3D"direction: ltr; max-width: 600p=
+x; margin: 0 auto; overflow: hidden;">=0A=09=09=09=09=09=09=09<table border=
+=3D"0" cellspacing=3D"0" cellpadding=3D"0" bgcolor=3D"#ffffff"  class=3D"su=
+bscribe-wrapper" style=3D"width: 100%; background-color: #fff; text-align: =
+left; max-width: 1024px; min-width: 320px; margin: 0 auto;">=0A=09=09=09=09=
+=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09<td>=0A=09=09=09=09=09=09=09=
+=09=09=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"0" height=3D"=
+8" background=3D"https://s0.wp.com/i/emails/stripes.gif"  class=3D"subscrib=
+e-header-wrap" style=3D"width: 100%; background-image: url(https://s0.wp.co=
+m/i/emails/stripes.gif); background-repeat: repeat-x; background-color: #43=
+A4D0; height: 8px;">=0A=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09<td></td>=0A=09=09=09=09=09=09=09=09=09=09=09</tr>=
+=0A=09=09=09=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=09=09=09=09=09=09=
+=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"0"  class=3D"subscr=
+ibe-header" style=3D"width: 100%; color: #08c; font-size: 1.6em; background=
+-color: #EFEFEF; border-bottom: 1px solid #DDD; margin: 0; padding: 0;">=0A=
+=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09<td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09<h2 class=3D"subscribe-tit=
+le" style=3D"margin: .4em 0 .3em; font-size: 1.8em; font-size: 16px!importa=
+nt; line-height: 1; font-weight: 400; color: #464646; font-family: &quot;He=
+lvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 5px 20px!importan=
+t; padding: 0;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09New post on <s=
+trong>Milos.io</strong>=09=09=09=09=09=09=09=09=09=09=09=09=09</h2>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09<td style=3D"text-align: right;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09<img border=3D"0" class=3D"head-avatar" src=3D"http://s0.wp.com/i/emails=
+/blavatar.png" alt=3D""  width=3D"32" height=3D"32" / style=3D"vertical-ali=
+gn: middle; margin: 5px 20px 5px 0; vertical-align: middle;">=0A=09=09=09=
+=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09</tr>=
+=0A=09=09=09=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=09=09=09=09=09=09=
+=09<table style=3D"width: 100%"  border=3D"0" cellspacing=3D"0" cellpadding=
+=3D"20" bgcolor=3D"#ffffff">=0A=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09<td>=0A=09=09=09=09=09=09=09=09=09=09=09=
+=09=09<table style=3D"width: 100%"  border=3D"0" cellspacing=3D"0" cellpadd=
+ing=3D"0">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09<td valign=3D"top" class=3D"the-post">=0A=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09<table style=3D"width: 100%"  border=3D"0" cellspac=
+ing=3D"0" cellpadding=3D"0">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<tr>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09<td style=3D"width: 60px !important; white-space: nowrap; vertical-align=
+: top;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<a h=
+ref=3D"http://milos.io/?author=3D2"  style=3D"text-decoration: underline; c=
+olor: #2585B2; display: block; margin-right: 10px;"><img border=3D"0" alt=
+=3D'' src=3D'http://0.gravatar.com/avatar/338be50a15d2e7e2fa3b4830dfaf880c?=
+s=3D50&#038;d=3Dhttp%3A%2F%2F0.gravatar.com%2Favatar%2Fad516503a11cd5ca435a=
+cc9bb6523536%3Fs%3D50&#038;r=3DG' class=3D'avatar avatar-50' height=3D'50' =
+width=3D'50' /></a>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<td>=
+=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<h2 class=3D=
+"post-title"  style=3D"margin: .4em 0 .3em; font-size: 1.8em; font-size: 1.=
+6em; color: #555; margin: 0; font-size: 20px;"><a href=3D"http://milos.io/k=
+ako-je-nastala-pesma-dimitrije-sine-mitre/" style=3D"text-decoration: under=
+line; color: #2585B2; text-decoration: none !important;">Kako je nastala pe=
+sma &#8220;Dimitrije, sine&nbsp;Mitre&#8221;</a></h2>=0A=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09<span style=3D"color: #888;">by <=
+a href=3D"http://milos.io/?author=3D2"  style=3D"text-decoration: underline=
+; color: #2585B2; color: #888 !important;">Milos Stanic</a> </span>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09</table>=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<div class=
+=3D"post-content" style=3D"direction: ltr; margin-top: 1em; max-width: 560p=
+x;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09<p style=3D"direction: ltr; font-siz=
+e: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue=
+&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Dugo se smatralo da=
+ je poznata pesma "Dimitrije, sine Mitre" narodna pesma. Me=C4=91utim, skor=
+o smo saznali da nije. Autor pesme je Stana Avramovi=C4=87 Karaminga iz Vra=
+nja. Stana je bila jako ugledna vranjanska peva=C4=8Dica i uzor mnogim kasn=
+ije poznatim peva=C4=8Dima.</p>=0A<p style=3D"direction: ltr; font-size: 14=
+px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot=
+;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">=0A<div data-shortcode=
+=3D"caption" id=3D"attachment_4337"   class=3D"wp-captions alignnone" style=
+=3D"direction: ltr;  text-align: center; padding: 4px; background-color: wh=
+ite; border: 1px solid #ccc"><a style=3D"text-decoration: underline; color:=
+ #2585B2;"  href=3D"http://milos.io/wp-content/uploads/2016/11/stana-karami=
+nga.jpg"><img border=3D"0" style=3D"max-width: 100%; height: auto; margin-b=
+ottom: 12px;" class=3D"size-full wp-image-4337" src=3D"http://milos.io/wp-c=
+ontent/uploads/2016/11/stana-karaminga.jpg" alt=3D"Slika KUD Sevdah - u sre=
+dini se nalazi Stana Avramovi=C4=87 Karaminga" /></a>=0A<p style=3D"directi=
+on: ltr; font-size: 14px; line-height: 1.4em; color: #444; font-family: &qu=
+ot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;"  c=
+lass=3D"wp-caption-text">Slika KUD Sevdah - u sredini se nalazi Stana Avram=
+ovi=C4=87 Karaminga</p>=0A</div>=0A<p style=3D"direction: ltr; font-size: 1=
+4px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quo=
+t;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Stana je umrla 1969. go=
+dine i na sahrani su po njenoj =C5=BEelji svirali ovu njenu=C2=A0pesmu. Ona=
+ ju je ceo =C5=BEivot malo menjala i bilo je par verzija pesme. Pred samu s=
+mrt je rekla prijateljima "<em>Sve nesam rekla, sve i neje za pesmu...</em>=
+" i ispri=C4=8Dala kako je pesma nastala.</p>=0A<p style=3D"direction: ltr;=
+ font-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helve=
+tica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Pesma je i=
+nspirisana pri=C4=8Dom=C2=A0o Dimitriju koji je bio njen brat od tetke=
+=C2=A0i Stani po kojoj je ona kasnije dobila ime. Karamingin otac Toma je b=
+io ujak Dimitriju.=C2=A0Za pri=C4=8Du je saznala od majke koja joj ju je te=
+k na samrti ispri=C4=8Dala.</p>=0A<p style=3D"direction: ltr; font-size: 14=
+px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot=
+;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Dimitrije je o=C5=BEenio=
+ Stanu za koju se pri=C4=8Da da je bila najlep=C5=A1a devojka od Vranja do =
+Ni=C5=A1a. Mnogo su se voleli, ali nisu mogli da imaju dece. Kako su godine=
+ prolazile polako je porodica po=C4=8Dela da zanoveta, pa bi recimo kada bi=
+ krenuli u crkvu nedeljom svekrva Bosa govorila=C2=A0"'<em>Ajde sine, 'ajde=
+ pa i dete dovedi</em>".</p>=0A<p style=3D"direction: ltr; font-size: 14px;=
+ line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, =
+Helvetica, Arial, sans-serif; margin: 0 0 1em;">Vremenom je i Dimitrije po=
+=C4=8Deo da prebacuje =C5=BEeni "<em>Badava, Stano, tvoja lepota, kad nisi =
+rodila mu=C5=A1ko ili =C5=BEensko. Svi se kunu u decu, a ja u tebe!</em>"</=
+p>=0A<p style=3D"direction: ltr; font-size: 14px; line-height: 1.4em; color=
+: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-ser=
+if; margin: 0 0 1em;">Od nesre=C4=87e koja ju je izjedala Stana re=C5=A1i d=
+a sebi oduzme =C5=BEivot i obesi se. Me=C4=91utim, za to sazna ujak Toma i =
+poku=C5=A1a da joj pomogne tako =C5=A1to je posavetuje=C2=A0da tajno zatrud=
+ni sa drugim =C4=8Dovekom kako bi porodica ponovo bila sretna.</p>=0A<p sty=
+le=3D"direction: ltr; font-size: 14px; line-height: 1.4em; color: #444; fon=
+t-family: &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin:=
+ 0 0 1em;">Tako i bude, Stana zatrudne u =C4=8Detrdesetoj godini sa drugim =
+=C4=8Dovekom. Polako se vra=C4=87ala sre=C4=87a u porodicu, svi su je pazil=
+i i =C4=8Duvali od posla da bi iznela trudno=C4=87u. Me=C4=91utim, poro=
+=C4=91aj je bio te=C5=BEak i Stana umre na poro=C4=91aju. Dete je pre=C5=
+=BEivelo...</p>=0A<p style=3D"direction: ltr; font-size: 14px; line-height:=
+ 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, Ar=
+ial, sans-serif; margin: 0 0 1em;">Sedam dana kasnije=C2=A0ujka Toma re=
+=C5=A1i da ka=C5=BEe istinu Dimitriju:</p>=0A<p style=3D"direction: ltr; fo=
+nt-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helvetic=
+a Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">"Pre nego =
+=C5=A1to odemo na Stanin grob, moram ne=C5=A1to da ti ka=C5=BEem. Izjedosmo=
+ Stanu, prvo tvoja majka, pa ti i onda ja.".</p>=0A<p style=3D"direction: l=
+tr; font-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;He=
+lvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Dimitri=
+je je bio zbunjen.</p>=0A<p style=3D"direction: ltr; font-size: 14px; line-=
+height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvet=
+ica, Arial, sans-serif; margin: 0 0 1em;">"Tako je. Tvoja majka, =C5=A1to j=
+e kinjila. Ti =C5=A1to si nerodan, a ja =C5=A1to sam je savetovao s koga da=
+ ide. Da zna=C5=A1, dete nije tvoje."</p>=0A<p style=3D"direction: ltr; fon=
+t-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica=
+ Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Dimitrije bi =
+=C4=8Dvrst, pa odgovori ujaku "Ako, ujko. Nema veze. Mi smo hteli dete da u=
+svojimo, a ovo je bar moja Stana rodila."</p>=0A<p style=3D"direction: ltr;=
+ font-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helve=
+tica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Sutradan, =
+na grobu, pred ro=C4=91acima dok su Stani davali prvu subotu, Dimitrije re=
+=C4=8De: "Ovde, pored moje Stane da me pokopate..." i pre nego =C5=A1te je =
+iko mogao da ga spre=C4=8Di, izvadi pi=C5=A1tolj i ubije se.</p>=0A<p style=
+=3D"direction: ltr; font-size: 14px; line-height: 1.4em; color: #444; font-=
+family: &quot;Helvetica Neue&quot;, Helvetica, Arial, sans-serif; margin: 0=
+ 0 1em;">Tri dana nakon=C2=A0smrti Stane i Dimitrija, od tuge umre i njegov=
+a majka Bosa, malo kasnije i Toma.</p>=0A<p style=3D"direction: ltr; font-s=
+ize: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Ne=
+ue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Tako je Stana Kar=
+aminga izgubila oca. Za se=C4=87anje sastavila je kratku ali kao planina ve=
+liku=C2=A0pesmu o svojoj tetki i njenom sinu Dimitriju. Do svoje osme decen=
+ije je krila pozadinu pesme jer govori=C2=A0o zloj sudbini porodice i o sam=
+oubistvu.</p>=0A<p style=3D"direction: ltr; font-size: 14px; line-height: 1=
+.4em; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, Aria=
+l, sans-serif; margin: 0 0 1em;">Za kraj preslu=C5=A1ajte pesmu i razmislit=
+e o pozadini pesme.</p>=0A</p>=0A<p style=3D"direction: ltr; font-size: 14p=
+x; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&quot;=
+, Helvetica, Arial, sans-serif; margin: 0 0 1em;">Evo <a style=3D"text-deco=
+ration: underline; color: #2585B2;"  href=3D"https://www.youtube.com/result=
+s?search_query=3Dstana+karaminga" target=3D"_blank">par pesama</a> koje su =
+snimljene u izvo=C4=91enju Stane Karaminge.</p>=0A<div style=3D"direction: =
+ltr; clear: both"></div>=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</div>=0A=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09<div class=3D"meta"  style=3D"direction: ltr; color: #999; font-si=
+ze: .9em; margin-top: 4px; line-height: 160%; padding: 15px 0 15px; border-=
+top: 1px solid #eee; border-bottom: 1px solid #eee; overflow: hidden">=0A=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<strong><a style=3D"t=
+ext-decoration: underline; color: #2585B2;"  href=3D"http://milos.io/?autho=
+r=3D2">Milos Stanic</a></strong> | November 28, 2016 at 12:02 am | Tags: <a=
+ style=3D"text-decoration: underline; color: #2585B2;"  href=3D"http://milo=
+s.io/?taxonomy=3Dpost_tag&amp;term=3Ddimitrije-sine">dimitrije sine</a>, <a=
+ style=3D"text-decoration: underline; color: #2585B2;"  href=3D"http://milo=
+s.io/?taxonomy=3Dpost_tag&amp;term=3Distorija">istorija</a>, <a style=3D"te=
+xt-decoration: underline; color: #2585B2;"  href=3D"http://milos.io/?taxono=
+my=3Dpost_tag&amp;term=3Dljubavna-prica">ljubavna pri=C4=8Da</a>, <a style=
+=3D"text-decoration: underline; color: #2585B2;"  href=3D"http://milos.io/?=
+taxonomy=3Dpost_tag&amp;term=3Dsevdah">sevdah</a>=0A | URL: <a style=3D"tex=
+t-decoration: underline; color: #2585B2;"  href=3D"http://wp.me/p4tOzj-17W"=
+>http://wp.me/p4tOzj-17W</a>=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09</div>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=0A=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=0A=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<p class=3D"subscribe-action-links"  style=3D"direction: ltr; f=
+ont-size: 14px; line-height: 1.4em; color: #444; font-family: &quot;Helveti=
+ca Neue&quot;, Helvetica, Arial, sans-serif; margin: 0 0 1em; font-size: 14=
+px; color: #666; padding: 0; width: auto; padding-top: 1em; padding-bottom:=
+ 0em; margin-bottom: 0; margin-left: 0; padding-left: 0;">=0A=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09<table class=3D"auto-width" border=
+=3D"0" cellspacing=3D"0" cellpadding=3D"0" style=3D"width: 100%; width: aut=
+o">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09<td style=3D"width: 10px=
+;"><a href=3D"http://milos.io/kako-je-nastala-pesma-dimitrije-sine-mitre/#r=
+espond" style=3D"text-decoration: underline; color: #2585B2; -moz-border-ra=
+dius: 10em; -webkit-border-radius: 10em; border-radius: 10em; border: 1px s=
+olid #11729E; text-decoration: none; color: #fff; text-shadow: 0 1px 0 #117=
+29E; background-color: #2585B2; padding: 5px 15px; font-size: 16px; line-he=
+ight: 1.4em; font-family: Helvetica Neue, Helvetica, Arial, sans-serif; fon=
+t-weight: normal; margin-left: 0; white-space: nowrap;">Comment</a></td>=0A=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09<td>&nbsp;&nbsp;&nbsp;<a class=3D"subsc=
+ribe-action-link" href=3D"http://milos.io/kako-je-nastala-pesma-dimitrije-s=
+ine-mitre/#comments" style=3D"text-decoration: underline; color: #2585B2; t=
+ext-decoration: underline">See all comments</a></td>=0A=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</tr>=
+=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</table>=0A=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09</p>=0A=09=09=09=09=09=09=09=09=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=
+=09=09=09=09</table>=0A=09=09=09=09=09=09=09=09=09=09=09=09</td>=0A=09=09=
+=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09=09=09=09</table>=
+=0A=0A=09=09=09=09=09=09=09=09=09=09<table border=3D"0" cellspacing=3D"0" c=
+ellpadding=3D"20" bgcolor=3D"#efefef"  class=3D"subscribe-wrapper-sub" styl=
+e=3D"width: 100%; background-color: #efefef; text-align: left; border-top: =
+1px solid #ddd;">=0A=09=09=09=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=
+=09=09=09=09=09=09=09<td class=3D"subscribe-content"  style=3D"border-top: =
+1px solid #f3f3f3; color: #888; font-family: &quot;Helvetica Neue&quot;, He=
+lvetica, Arial, sans-serif; font-size: 14px; background: #efefef;">=0A=09=
+=09=09=09=09=09=09=09=09=09=09=09=09<p style=3D"direction: ltr; font-size: =
+14px; line-height: 1.4em; color: #444; font-family: &quot;Helvetica Neue&qu=
+ot;, Helvetica, Arial, sans-serif; margin: 0 0 1em; font-size: 12px; line-h=
+eight: 1.4em; margin: 0px 0px 10px 0px;">=0A=09=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<a style=3D"text-decoration: underline; color: #2585B2;"  href=
+=3D"https://subscribe.wordpress.com/?key=3D07af85066397f313ba38211ef0b6a757=
+&amp;email=3Dme%40dejanstrbac.com&amp;b=3DLcR.KVxMn9h.%5B88pL8b7y%2F%2CJaHL=
+X%2C17oMpx%5BX%5DwM%2Bdj%7Ejr%5Bk4a9">Unsubscribe</a> to no longer receive =
+posts from Milos.io.<br/>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09Chang=
+e your email settings at <a style=3D"text-decoration: underline; color: #25=
+85B2;"  href=3D"https://subscribe.wordpress.com/?key=3D07af85066397f313ba38=
+211ef0b6a757&amp;email=3Dme%40dejanstrbac.com">Manage Subscriptions</a>.=09=
+=09=09=09=09=09=09=09=09=09=09=09=09</p>=0A=0A=09=09=09=09=09=09=09=09=09=
+=09=09=09=09<p style=3D"direction: ltr; font-size: 14px; line-height: 1.4em=
+; color: #444; font-family: &quot;Helvetica Neue&quot;, Helvetica, Arial, s=
+ans-serif; margin: 0 0 1em; font-size: 12px; line-height: 1.4em; margin: 0p=
+x 0px 0px 0px;">=0A=09=09=09=09=09=09=09=09=09=09=09=09=09=09<strong>Troubl=
+e clicking?</strong> Copy and paste this URL into your browser: <br />=0A=
+=09=09=09=09=09=09=09=09=09=09=09=09=09=09<a style=3D"text-decoration: unde=
+rline; color: #2585B2;"  href=3D"http://milos.io/kako-je-nastala-pesma-dimi=
+trije-sine-mitre/">http://milos.io/kako-je-nastala-pesma-dimitrije-sine-mit=
+re/</a>=0A=09=09=09=09=09=09=09=09=09=09=09=09=09</p>=0A=09=09=09=09=09=09=
+=09=09=09=09=09=09</td>=0A=09=09=09=09=09=09=09=09=09=09=09</tr>=0A=09=09=
+=09=09=09=09=09=09=09=09</table>=0A=09=09=09=09=09=09=09=09=09</td>=0A=09=
+=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=09</table>=0A=0A=09=09=09=
+=09=09=09=09<table border=3D"0" cellspacing=3D"0" cellpadding=3D"0" height=
+=3D"3" background=3D"https://s0.wp.com/i/emails/stripes.gif"  class=3D"subs=
+cribe-footer-wrap" style=3D"width: 100%; background-image: url(https://s0.w=
+p.com/i/emails/stripes.gif); background-repeat: repeat-x; background-color:=
+ #43A4D0; height: 3px;">=0A=09=09=09=09=09=09=09=09<tr>=0A=09=09=09=09=09=
+=09=09=09=09<td></td>=0A=09=09=09=09=09=09=09=09</tr>=0A=09=09=09=09=09=09=
+=09</table>=0A=09=09=09=09=09=09</div>=0A=09=09=09=09=09</td>=0A=09=09=09=
+=09</tr>=0A=09=09=09</table>=0A=0A=09=09=09=0A=09=09=09<br />=0A=09=09</td>=
+=0A=09</tr>=0A</table>=0A=0A<img alt=3D"" border=3D"0" src=3D"http://pixel.=
+wp.com/b.gif?blog=3D66211245&#038;post=3D4336&#038;subd=3Dmilos.io&#038;ref=
+=3D&#038;email=3D1&#038;email_o=3Djetpack&#038;host=3Djetpack.wordpress.com=
+" width=3D"1" height=3D"1" /></body></html>=0A
+
+
+--b1_71112c1a7c7e0f7986d6ee8d36fdb8e1--
+
