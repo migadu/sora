@@ -117,7 +117,7 @@ func TestIMAP_TLS_NoSTARTTLSCapability(t *testing.T) {
 
 	// Test that when TLS is enabled for direct TLS connections,
 	// STARTTLS capability is NOT advertised
-	server, account := setupIMAPServerWithTLS(t, true, "../../sora0.migadu.com.crt", "../../sora0.migadu.com.key")
+	server, account := setupIMAPServerWithTLS(t, true, "../../integration_tests/sora.crt", "../../integration_tests/sora.key")
 	defer server.Close()
 
 	// Create TLS connection
@@ -243,7 +243,7 @@ func TestIMAP_TLS_AuthenticationFix(t *testing.T) {
 	// when connecting over TLS. The bug was that InsecureAuth was incorrectly
 	// configured, causing authentication to be blocked even on TLS connections.
 
-	server, account := setupIMAPServerWithTLS(t, true, "../../sora0.migadu.com.crt", "../../sora0.migadu.com.key")
+	server, account := setupIMAPServerWithTLS(t, true, "../../integration_tests/sora.crt", "../../integration_tests/sora.key")
 	defer server.Close()
 
 	// Create TLS connection
@@ -293,7 +293,7 @@ func TestIMAP_TLS_SecurityEnforcement(t *testing.T) {
 
 	// Set up server with TLS enabled but connect with plain connection
 	// This should fail authentication
-	server, _ := setupIMAPServerWithTLS(t, true, "../../sora0.migadu.com.crt", "../../sora0.migadu.com.key")
+	server, _ := setupIMAPServerWithTLS(t, true, "../../integration_tests/sora.crt", "../../integration_tests/sora.key")
 	defer server.Close()
 
 	// Try to connect with a plain connection to a TLS-enabled server
@@ -343,7 +343,7 @@ func TestIMAP_TLS_ArchitectureValidation(t *testing.T) {
 	// The fix was to realize: tlsConfig != nil → tls.Listen → all connections are TLS
 	// This test ensures that architectural guarantee continues to work.
 
-	server, account := setupIMAPServerWithTLS(t, true, "../../sora0.migadu.com.crt", "../../sora0.migadu.com.key")
+	server, account := setupIMAPServerWithTLS(t, true, "../../integration_tests/sora.crt", "../../integration_tests/sora.key")
 	defer server.Close()
 
 	// Connect via TLS - this tests that tls.Listen accepts TLS connections
