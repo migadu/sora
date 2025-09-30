@@ -806,33 +806,38 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 }
 
 // clientMatches checks if a client matches the filter criteria
+// A filter matches if ANY of the following are true:
+// 1. JA4 fingerprint matches (if specified in filter)
+// 2. Client name/version match (if specified in filter)
 func (s *IMAPServer) clientMatches(clientName, clientVersion, tlsFingerprint string, filter ClientCapabilityFilter) bool {
-	// If filter specifies TLS fingerprint, it MUST match
+	// Check if JA4 fingerprint matches (if filter specifies one)
 	if filter.ja4FingerprintRegexp != nil {
-		if tlsFingerprint == "" || !filter.ja4FingerprintRegexp.MatchString(tlsFingerprint) {
-			return false
-		}
-		// TLS fingerprint matched - this is sufficient for a match
-		// Client name and version are optional when TLS fingerprint is specified
-		if filter.clientNameRegexp == nil && filter.clientVersionRegexp == nil {
+		if tlsFingerprint != "" && filter.ja4FingerprintRegexp.MatchString(tlsFingerprint) {
+			// JA4 match is sufficient - return true immediately
 			return true
 		}
 	}
 
-	// Match client name pattern using pre-compiled regex (if specified and we have client info)
+	// Check if client name/version match (if filter specifies them)
+	clientNameMatches := true // Default to true if not specified
 	if filter.clientNameRegexp != nil {
 		if clientName == "" || !filter.clientNameRegexp.MatchString(clientName) {
-			return false
+			clientNameMatches = false
 		}
 	}
 
-	// Match client version pattern using pre-compiled regex (if specified and we have client info)
+	clientVersionMatches := true // Default to true if not specified
 	if filter.clientVersionRegexp != nil {
 		if clientVersion == "" || !filter.clientVersionRegexp.MatchString(clientVersion) {
-			return false
+			clientVersionMatches = false
 		}
 	}
 
-	// All specified filters matched (or no filters specified, which shouldn't happen due to validation)
-	return true
+	// Client name/version match if both specified criteria are met
+	if filter.clientNameRegexp != nil || filter.clientVersionRegexp != nil {
+		return clientNameMatches && clientVersionMatches
+	}
+
+	// If we reach here, no filter criteria were specified (shouldn't happen due to validation)
+	return false
 }
