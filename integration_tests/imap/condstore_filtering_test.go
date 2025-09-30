@@ -19,7 +19,7 @@ import (
 
 // TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID tests that CONDSTORE fragments are properly
 // filtered for iOS clients when the config disables it.
-// 
+//
 // Test scenario:
 // 1. Client connects and logs in (no ID command yet)
 // 2. Client performs SELECT - should include CONDSTORE fragments (HighestModSeq)
@@ -153,20 +153,20 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 
 	// Additional verification: Add a message and verify that subsequent operations also respect filtering
 	t.Logf("=== STEP 4: Add message and verify CONDSTORE filtering persists ===")
-	
+
 	// Add a test message to trigger potential CONDSTORE responses
 	messageData := fmt.Sprintf("From: test@example.com\r\nTo: %s\r\nSubject: Test CONDSTORE Filtering\r\nDate: %s\r\n\r\nThis is a test message for CONDSTORE filtering verification.",
 		account.Email, time.Now().Format(time.RFC1123))
-	
+
 	sendCommand("A05", fmt.Sprintf("APPEND INBOX {%d}", len(messageData)))
-	
+
 	// Read continuation response
 	contLine, _, err := reader.ReadLine()
 	if err != nil {
 		t.Fatalf("Failed to read continuation: %v", err)
 	}
 	t.Logf("RECV: %s", contLine)
-	
+
 	// Send message data
 	fmt.Fprintf(writer, "%s\r\n", messageData)
 	writer.Flush()
@@ -199,11 +199,11 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 
 	// STEP 5: Test FETCH command with CONDSTORE fragments
 	t.Logf("=== STEP 5: Test FETCH with CONDSTORE filtering ===")
-	
+
 	// Test FETCH with MODSEQ attribute - should not return MODSEQ when CONDSTORE is filtered
 	sendCommand("A07", "FETCH 1 (FLAGS MODSEQ)")
 	fetchResponses := readResponse("A07")
-	
+
 	var foundModSeqInFetch bool
 	for _, resp := range fetchResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -211,20 +211,20 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 			t.Logf("FETCH response includes MODSEQ: %s", resp)
 		}
 	}
-	
+
 	if foundModSeqInFetch {
 		t.Errorf("✗ FAILURE: FETCH response includes MODSEQ when CONDSTORE should be filtered")
 	} else {
 		t.Logf("✓ SUCCESS: FETCH correctly excludes MODSEQ when CONDSTORE is filtered")
 	}
 
-	// STEP 6: Test STORE command with CONDSTORE fragments  
+	// STEP 6: Test STORE command with CONDSTORE fragments
 	t.Logf("=== STEP 6: Test STORE with CONDSTORE filtering ===")
-	
+
 	// STORE command that would normally return MODSEQ with CONDSTORE
 	sendCommand("A08", "STORE 1 +FLAGS (\\Seen)")
 	storeResponses := readResponse("A08")
-	
+
 	var foundModSeqInStore bool
 	for _, resp := range storeResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -232,7 +232,7 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 			t.Logf("STORE response includes MODSEQ: %s", resp)
 		}
 	}
-	
+
 	if foundModSeqInStore {
 		t.Errorf("✗ FAILURE: STORE response includes MODSEQ when CONDSTORE should be filtered")
 	} else {
@@ -241,11 +241,11 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 
 	// STEP 7: Test SEARCH with CONDSTORE filtering
 	t.Logf("=== STEP 7: Test SEARCH with CONDSTORE filtering ===")
-	
+
 	// Add another message to have something to search for
 	messageData2 := fmt.Sprintf("From: test2@example.com\r\nTo: %s\r\nSubject: Another Test Message\r\nDate: %s\r\n\r\nSecond test message.",
 		account.Email, time.Now().Format(time.RFC1123))
-	
+
 	sendCommand("A09", fmt.Sprintf("APPEND INBOX {%d}", len(messageData2)))
 	contLine2, _, err := reader.ReadLine()
 	if err != nil {
@@ -255,11 +255,11 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 	fmt.Fprintf(writer, "%s\r\n", messageData2)
 	writer.Flush()
 	readResponse("A09")
-	
+
 	// Search with MODSEQ criteria - should work but not return MODSEQ-specific data when filtered
 	sendCommand("A10", "SEARCH MODSEQ 1")
 	searchResponses := readResponse("A10")
-	
+
 	var foundCondstoreInSearch bool
 	for _, resp := range searchResponses {
 		// Look for any CONDSTORE-specific extensions in search response
@@ -268,7 +268,7 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 			t.Logf("SEARCH response includes CONDSTORE data: %s", resp)
 		}
 	}
-	
+
 	if foundCondstoreInSearch {
 		t.Errorf("✗ FAILURE: SEARCH response includes CONDSTORE extensions when should be filtered")
 	} else {
@@ -277,18 +277,18 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 
 	// STEP 8: Test UNCHANGEDSINCE with STORE (should be ignored when CONDSTORE filtered)
 	t.Logf("=== STEP 8: Test STORE with UNCHANGEDSINCE (should be ignored when CONDSTORE filtered) ===")
-	
+
 	// This should be ignored/fail gracefully when CONDSTORE is filtered
 	sendCommand("A11", "STORE 1 (UNCHANGEDSINCE 1) +FLAGS (\\Flagged)")
 	unchangedSinceResponses := readResponse("A11")
-	
+
 	for _, resp := range unchangedSinceResponses {
 		// Check if it failed due to CONDSTORE being filtered
 		if strings.Contains(resp, "A11 BAD") || strings.Contains(resp, "A11 NO") {
 			t.Logf("STORE UNCHANGEDSINCE correctly rejected: %s", resp)
 		}
 	}
-	
+
 	// When CONDSTORE is filtered, UNCHANGEDSINCE should either be ignored or rejected
 	// The exact behavior may vary, but it shouldn't include MODSEQ in responses
 	var hasModSeqInUnchangedSince bool
@@ -297,7 +297,7 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 			hasModSeqInUnchangedSince = true
 		}
 	}
-	
+
 	if hasModSeqInUnchangedSince {
 		t.Errorf("✗ FAILURE: STORE UNCHANGEDSINCE includes MODSEQ when CONDSTORE should be filtered")
 	} else {
@@ -517,7 +517,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		messageData := fmt.Sprintf("From: test%d@example.com\r\nTo: %s\r\nSubject: Test Message %d\r\nDate: %s\r\n\r\nTest message content %d.",
 			i, account.Email, i, time.Now().Format(time.RFC1123), i)
-		
+
 		sendCommand(fmt.Sprintf("A%02d", i+2), fmt.Sprintf("APPEND INBOX {%d}", len(messageData)))
 		contLine, _, err := reader.ReadLine()
 		if err != nil {
@@ -538,7 +538,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test FETCH before ID - should include MODSEQ
 	sendCommand("A06", "FETCH 1:2 (FLAGS MODSEQ)")
 	fetchBeforeResponses := readResponse("A06")
-	
+
 	var foundModSeqBeforeID bool
 	for _, resp := range fetchBeforeResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -550,7 +550,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test STORE before ID - should include MODSEQ in response
 	sendCommand("A07", "STORE 1 +FLAGS (\\Seen)")
 	storeBeforeResponses := readResponse("A07")
-	
+
 	var foundModSeqInStoreBeforeID bool
 	for _, resp := range storeBeforeResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -562,7 +562,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test SEARCH with MODSEQ before ID - should work normally
 	sendCommand("A08", "SEARCH MODSEQ 1")
 	searchBeforeResponses := readResponse("A08")
-	
+
 	var searchWorkedBeforeID bool
 	for _, resp := range searchBeforeResponses {
 		if strings.Contains(resp, "A08 OK") {
@@ -600,7 +600,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test FETCH after ID - should NOT include MODSEQ
 	sendCommand("A10", "FETCH 1:2 (FLAGS MODSEQ)")
 	fetchAfterResponses := readResponse("A10")
-	
+
 	var foundModSeqAfterID bool
 	for _, resp := range fetchAfterResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -612,7 +612,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test STORE after ID - should NOT include MODSEQ in response
 	sendCommand("A11", "STORE 2 +FLAGS (\\Flagged)")
 	storeAfterResponses := readResponse("A11")
-	
+
 	var foundModSeqInStoreAfterID bool
 	for _, resp := range storeAfterResponses {
 		if strings.Contains(resp, "MODSEQ") && strings.Contains(resp, "FETCH") {
@@ -624,7 +624,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test SEARCH with MODSEQ after ID - should handle gracefully
 	sendCommand("A12", "SEARCH MODSEQ 1")
 	searchAfterResponses := readResponse("A12")
-	
+
 	var searchWorkedAfterID bool
 	var searchFailedAfterID bool
 	for _, resp := range searchAfterResponses {
@@ -639,7 +639,7 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 	// Test STORE with UNCHANGEDSINCE after ID - should be rejected or ignore MODSEQ
 	sendCommand("A13", "STORE 1 (UNCHANGEDSINCE 1) +FLAGS (\\Draft)")
 	unchangedSinceAfterResponses := readResponse("A13")
-	
+
 	var hasModSeqInUnchangedSinceAfter bool
 	for _, resp := range unchangedSinceAfterResponses {
 		if strings.Contains(resp, "MODSEQ") {

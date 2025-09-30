@@ -32,8 +32,9 @@ const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
 // ClientCapabilityFilter extends the config.ClientCapabilityFilter with compiled regex patterns
 type ClientCapabilityFilter struct {
 	config.ClientCapabilityFilter
-	clientNameRegexp    *regexp.Regexp
-	clientVersionRegexp *regexp.Regexp
+	clientNameRegexp     *regexp.Regexp
+	clientVersionRegexp  *regexp.Regexp
+	ja4FingerprintRegexp *regexp.Regexp
 }
 
 // connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
@@ -216,6 +217,7 @@ type IMAPServerOptions struct {
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
+	log.Printf("[IMAP-INIT] Creating server %q: TLS=%v, Cert=%q, Key=%q", name, options.TLS, options.TLSCertFile, options.TLSKeyFile)
 	// Validate required dependencies
 	if s3 == nil {
 		return nil, fmt.Errorf("S3 storage is required for IMAP server")
@@ -328,6 +330,15 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 				filter.clientVersionRegexp = re
 			}
 		}
+		if filter.JA4Fingerprint != "" && isValid {
+			re, err := regexp.Compile(filter.JA4Fingerprint)
+			if err != nil {
+				log.Printf("[IMAP] WARNING: invalid ja4_fingerprint regex pattern '%s' in capability filter, skipping filter: %v", filter.JA4Fingerprint, err)
+				isValid = false
+			} else {
+				filter.ja4FingerprintRegexp = re
+			}
+		}
 
 		// Only add the filter if all regex patterns are valid
 		if isValid {
@@ -365,6 +376,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+		log.Printf("[IMAP] Loading TLS certificate from %s and %s", options.TLSCertFile, options.TLSKeyFile)
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -431,7 +443,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 
 	// Initialize session with full server capabilities
-	// These will be filtered when client ID is received via ID command
+	// These will be filtered in GetCapabilities() when JA4 fingerprint becomes available
 	session.sessionCaps = make(imap.CapSet)
 	for cap := range s.caps {
 		session.sessionCaps[cap] = struct{}{}
@@ -444,6 +456,51 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		proxyInfo = proxyConn.GetProxyInfo()
 	} else if limitingConn, ok := netConn.(*connectionLimitingConn); ok {
 		proxyInfo = limitingConn.GetProxyInfo()
+	}
+
+	// Extract JA4 fingerprint if this is a JA4-enabled TLS connection
+	// Need to unwrap connection layers to get to the underlying JA4 connection
+	var ja4Conn interface{ GetJA4Fingerprint() (string, error) }
+	currentConn := netConn
+	for currentConn != nil {
+		if jc, ok := currentConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
+			ja4Conn = jc
+			break
+		}
+		// Try to unwrap by checking for common wrapper patterns
+		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+			currentConn = wrapper.Unwrap()
+		} else if proxy, ok := currentConn.(*proxyProtocolConn); ok {
+			currentConn = proxy.Conn
+		} else if limiting, ok := currentConn.(*connectionLimitingConn); ok {
+			currentConn = limiting.Conn
+		} else {
+			break
+		}
+	}
+
+	if ja4Conn != nil {
+		// ja4Conn embeds *tls.Conn, so we can call Handshake() directly
+		// Check if it has the Handshake method
+		if handshaker, ok := ja4Conn.(interface{ Handshake() error }); ok {
+			if err := handshaker.Handshake(); err != nil {
+				log.Printf("[IMAP] TLS handshake failed: %v", err)
+			} else {
+				log.Printf("[IMAP] TLS handshake completed, checking for JA4...")
+				// Now the JA4 should be available
+				if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
+					session.ja4Fingerprint = fingerprint
+					log.Printf("[IMAP] JA4 fingerprint captured: %q", session.ja4Fingerprint)
+					// Apply filters to sessionCaps
+					session.applyCapabilityFilters()
+				} else {
+					log.Printf("[IMAP] JA4 fingerprint still not available after handshake: err=%v", err)
+				}
+			}
+		} else {
+			// Store ja4Conn for later
+			session.ja4Conn = ja4Conn
+		}
 	}
 
 	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -461,7 +518,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	authCount := s.authenticatedConnections.Load()
 	session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
-
 	return session, greeting, nil
 }
 
@@ -470,11 +526,15 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	var err error
 
 	if s.tlsConfig != nil {
-		listener, err = tls.Listen("tcp", imapAddr, s.tlsConfig)
+		// Create base TCP listener
+		tcpListener, err := net.Listen("tcp", imapAddr)
 		if err != nil {
-			return fmt.Errorf("failed to create TLS listener: %w", err)
+			return fmt.Errorf("failed to create TCP listener: %w", err)
 		}
-		log.Printf("* IMAP [%s] listening with TLS on %s", s.name, imapAddr)
+
+		// Wrap with JA4 TLS listener for fingerprinting
+		listener = serverPkg.NewJA4TLSListener(tcpListener, s.tlsConfig)
+		log.Printf("* IMAP [%s] listening with TLS (JA4 fingerprinting enabled) on %s", s.name, imapAddr)
 	} else {
 		listener, err = net.Listen("tcp", imapAddr)
 		if err != nil {
@@ -706,24 +766,29 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 }
 
 // filterCapabilitiesForClient applies client-specific capability filtering and returns disabled capabilities
-func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData) []string {
+func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, clientID *imap.IDData, tlsFingerprint string) []string {
 	var disabledCaps []string
 
-	if clientID == nil || len(s.capFilters) == 0 {
-		return disabledCaps // No client ID or no filters configured
+	if len(s.capFilters) == 0 {
+		return disabledCaps // No filters configured
 	}
 
-	clientName := clientID.Name
-	clientVersion := clientID.Version
+	// Extract client info
+	var clientName, clientVersion string
+	if clientID != nil {
+		clientName = clientID.Name
+		clientVersion = clientID.Version
+	}
 
 	// Apply each matching filter
-	log.Printf("[IMAP] Checking %d capability filters for client %s %s", len(s.capFilters), clientName, clientVersion)
+	log.Printf("[IMAP] Checking %d capability filters (clientName=%q, clientVersion=%q, tlsFingerprint=%q)",
+		len(s.capFilters), clientName, clientVersion, tlsFingerprint)
 	for i, filter := range s.capFilters {
-		log.Printf("[IMAP] Filter %d: ClientName=%q, ClientVersion=%q, DisableCaps=%v",
-			i, filter.ClientName, filter.ClientVersion, filter.DisableCaps)
-		if s.clientMatches(clientName, clientVersion, filter) {
-			log.Printf("[IMAP] Applying capability filter for client %s %s: %s",
-				clientName, clientVersion, filter.Reason)
+		log.Printf("[IMAP] Filter %d: ClientName=%q, ClientVersion=%q, JA4Fingerprint=%q, DisableCaps=%v",
+			i, filter.ClientName, filter.ClientVersion, filter.JA4Fingerprint, filter.DisableCaps)
+		if s.clientMatches(clientName, clientVersion, tlsFingerprint, filter) {
+			log.Printf("[IMAP] Applying capability filter: %s (clientName=%s, clientVersion=%s, tlsFingerprint=%s)",
+				filter.Reason, clientName, clientVersion, tlsFingerprint)
 
 			// Disable specified capabilities
 			for _, capStr := range filter.DisableCaps {
@@ -731,8 +796,7 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 				if _, exists := sessionCaps[cap]; exists {
 					delete(sessionCaps, cap)
 					disabledCaps = append(disabledCaps, capStr)
-					log.Printf("[IMAP] Disabled capability %s for client %s %s",
-						cap, clientName, clientVersion)
+					log.Printf("[IMAP] Disabled capability %s (reason: %s)", cap, filter.Reason)
 				}
 			}
 		}
@@ -742,22 +806,33 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 }
 
 // clientMatches checks if a client matches the filter criteria
-func (s *IMAPServer) clientMatches(clientName, clientVersion string, filter ClientCapabilityFilter) bool {
-	// Match client name pattern using pre-compiled regex
+func (s *IMAPServer) clientMatches(clientName, clientVersion, tlsFingerprint string, filter ClientCapabilityFilter) bool {
+	// If filter specifies TLS fingerprint, it MUST match
+	if filter.ja4FingerprintRegexp != nil {
+		if tlsFingerprint == "" || !filter.ja4FingerprintRegexp.MatchString(tlsFingerprint) {
+			return false
+		}
+		// TLS fingerprint matched - this is sufficient for a match
+		// Client name and version are optional when TLS fingerprint is specified
+		if filter.clientNameRegexp == nil && filter.clientVersionRegexp == nil {
+			return true
+		}
+	}
+
+	// Match client name pattern using pre-compiled regex (if specified and we have client info)
 	if filter.clientNameRegexp != nil {
-		if !filter.clientNameRegexp.MatchString(clientName) {
-			// This is not an error, just a non-match. No log needed unless debugging is on.
+		if clientName == "" || !filter.clientNameRegexp.MatchString(clientName) {
 			return false
 		}
 	}
 
-	// Match client version pattern using pre-compiled regex
+	// Match client version pattern using pre-compiled regex (if specified and we have client info)
 	if filter.clientVersionRegexp != nil {
-		if !filter.clientVersionRegexp.MatchString(clientVersion) {
-			// This is not an error, just a non-match. No log needed unless debugging is on.
+		if clientVersion == "" || !filter.clientVersionRegexp.MatchString(clientVersion) {
 			return false
 		}
 	}
 
+	// All specified filters matched (or no filters specified, which shouldn't happen due to validation)
 	return true
 }

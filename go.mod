@@ -10,6 +10,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.24.0
+	github.com/exaring/ja4plus v0.0.2
 	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/gorilla/mux v1.8.1
@@ -27,7 +28,7 @@ require (
 // Use forked versions until upstreams are updated
 replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43
 
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20250927222914-2bbf15207517
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20250930122835-3a336d542d7d
 
 replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20250924085942-8257c76f9245
 

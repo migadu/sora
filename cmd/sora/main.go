@@ -446,34 +446,6 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 
 	// Start all configured servers dynamically
 	for _, server := range allServers {
-		// Format server type name for display
-		displayType := ""
-		switch server.Type {
-		case "imap":
-			displayType = "IMAP"
-		case "lmtp":
-			displayType = "LMTP"
-		case "pop3":
-			displayType = "POP3"
-		case "managesieve":
-			displayType = "ManageSieve"
-		case "metrics":
-			displayType = "Metrics"
-		case "imap_proxy":
-			displayType = "IMAP proxy"
-		case "pop3_proxy":
-			displayType = "POP3 proxy"
-		case "managesieve_proxy":
-			displayType = "ManageSieve proxy"
-		case "lmtp_proxy":
-			displayType = "LMTP proxy"
-		case "http_api":
-			displayType = "HTTP API"
-		default:
-			displayType = strings.ToUpper(server.Type)
-		}
-
-		log.Printf(" * %s [%s] listening on %s", displayType, server.Name, server.Addr)
 		switch server.Type {
 		case "imap":
 			go startDynamicIMAPServer(ctx, deps, server, errChan)
