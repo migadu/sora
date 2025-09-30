@@ -147,11 +147,44 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	}
 
 	var highestUID int64
-	// Atomically increment and get the new highest UID for the mailbox.
-	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
-	if err != nil {
-		log.Printf("[DB] failed to update highest UID: %v", err)
-		return 0, 0, consts.ErrDBUpdateFailed
+	var uidToUse int64
+
+	// If we have a preserved UID, use it; otherwise generate a new one
+	if options.PreservedUID != nil {
+		uidToUse = int64(*options.PreservedUID)
+
+		// Update highest_uid if preserved UID is higher
+		err = tx.QueryRow(ctx, `
+			UPDATE mailboxes 
+			SET highest_uid = GREATEST(highest_uid, $2)
+			WHERE id = $1 
+			RETURNING highest_uid`,
+			options.MailboxID, uidToUse).Scan(&highestUID)
+		if err != nil {
+			log.Printf("[DB] failed to update highest UID with preserved UID: %v", err)
+			return 0, 0, consts.ErrDBUpdateFailed
+		}
+
+		// If we have a preserved UIDVALIDITY, update it
+		if options.PreservedUIDValidity != nil {
+			_, err = tx.Exec(ctx, `
+				UPDATE mailboxes 
+				SET uid_validity = $2
+				WHERE id = $1`,
+				options.MailboxID, *options.PreservedUIDValidity)
+			if err != nil {
+				log.Printf("[DB] failed to update UIDVALIDITY: %v", err)
+				return 0, 0, consts.ErrDBUpdateFailed
+			}
+		}
+	} else {
+		// Atomically increment and get the new highest UID for the mailbox.
+		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
+		if err != nil {
+			log.Printf("[DB] failed to update highest UID: %v", err)
+			return 0, 0, consts.ErrDBUpdateFailed
+		}
+		uidToUse = highestUID
 	}
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
@@ -223,7 +256,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"mailbox_path":    options.MailboxName,
 		"s3_domain":       options.S3Domain,
 		"s3_localpart":    options.S3Localpart,
-		"uid":             highestUID,
+		"uid":             uidToUse,
 		"message_id":      saneMessageID,
 		"content_hash":    options.ContentHash,
 		"flags":           bitwiseFlags,

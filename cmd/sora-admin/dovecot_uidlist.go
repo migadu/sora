@@ -156,18 +156,18 @@ func parseUIDMapping(line string, uidlist *DovecotUIDList) error {
 		return fmt.Errorf("missing filename")
 	}
 
-	// Extract the base filename without flags
+	// Extract the base filename without flags and size info
 	// The filename may be like: 1276528487.M364837P9451.kurkku,S=1355,W=1394:2,
-	// We want to extract just: 1276528487.M364837P9451.kurkku
+	// We want to extract: 1276528487.M364837P9451.kurkku (remove both size info and flags)
 	baseFilename := filename
 
-	// First, remove anything after the first comma (size info like ,S=1355,W=1394)
-	if idx := strings.Index(baseFilename, ","); idx > 0 {
+	// Remove anything after colon (flags like :2,S)
+	if idx := strings.Index(baseFilename, ":"); idx > 0 {
 		baseFilename = baseFilename[:idx]
 	}
 
-	// Then remove anything after colon (flags like :2,S)
-	if idx := strings.Index(baseFilename, ":"); idx > 0 {
+	// Remove size information (like ,S=1355,W=1394)
+	if idx := strings.Index(baseFilename, ",S="); idx > 0 {
 		baseFilename = baseFilename[:idx]
 	}
 
@@ -189,13 +189,32 @@ func (u *DovecotUIDList) GetUIDForFile(filename string) (uint32, bool) {
 		return uid, true
 	}
 
-	// Try base filename without flags
+	// Extract base filename and try various forms
 	baseFilename := filepath.Base(filename)
-	if idx := strings.LastIndex(baseFilename, ":"); idx > 0 {
-		baseFilename = baseFilename[:idx]
+
+	// Try base filename as-is (without path)
+	if uid, ok := u.UIDMappings[baseFilename]; ok {
+		return uid, true
 	}
 
-	uid, ok := u.UIDMappings[baseFilename]
+	// Remove flags (:2,S) if present
+	cleanFilename := baseFilename
+	if idx := strings.LastIndex(cleanFilename, ":"); idx > 0 {
+		cleanFilename = cleanFilename[:idx]
+	}
+
+	// Try without flags
+	if uid, ok := u.UIDMappings[cleanFilename]; ok {
+		return uid, true
+	}
+
+	// Remove size information (,S=1355,W=1394) if present
+	if idx := strings.Index(cleanFilename, ",S="); idx > 0 {
+		cleanFilename = cleanFilename[:idx]
+	}
+
+	// Try without size info and flags
+	uid, ok := u.UIDMappings[cleanFilename]
 	return uid, ok
 }
 

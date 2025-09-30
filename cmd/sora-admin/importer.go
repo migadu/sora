@@ -49,6 +49,7 @@ type ImporterOptions struct {
 	SievePath     string        // Path to Sieve script file to import
 	PreserveUIDs  bool          // Preserve UIDs from dovecot-uidlist files
 	FTSRetention  time.Duration // FTS retention period to skip old messages
+	TestMode      bool          // Skip S3 uploads for testing (messages stored in DB only)
 }
 
 // Importer handles the maildir import process.
@@ -1208,22 +1209,38 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	if i.options.PreserveUIDs {
 		// Find the maildir path for this mailbox
 		maildirPath := filepath.Dir(filepath.Dir(path)) // Go up from cur/new to maildir folder
+		log.Printf("DEBUG: Looking for UID preservation: path=%s, maildirPath=%s, filename=%s", path, maildirPath, filename)
 
 		if uidList, ok := i.dovecotUIDLists[maildirPath]; ok && uidList != nil {
+			log.Printf("DEBUG: Found UID list for %s with %d mappings", maildirPath, len(uidList.UIDMappings))
 			if uid, found := uidList.GetUIDForFile(filename); found {
 				preservedUID = &uid
 				preservedUIDValidity = &uidList.UIDValidity
 				log.Printf("Using preserved UID %d for %s (UIDVALIDITY=%d)", uid, filename, uidList.UIDValidity)
 			} else {
-				log.Printf("No preserved UID found for %s in dovecot-uidlist", filename)
+				log.Printf("No preserved UID found for %s in dovecot-uidlist (tried %d mappings)", filename, len(uidList.UIDMappings))
 			}
+		} else {
+			log.Printf("DEBUG: No UID list found for maildirPath=%s (available: %v)", maildirPath, func() []string {
+				var keys []string
+				for k := range i.dovecotUIDLists {
+					keys = append(keys, k)
+				}
+				return keys
+			}())
 		}
 	}
 
 	// --- Robust Import Flow ---
-	// Step 1: Queue the message in the database. This is a transactional write
-	// that creates the message metadata and a pending_uploads record. This is the
-	// "commit point" for the message's existence.
+	// Step 1: Insert the message in the database with UID preservation
+	// Debug logging for UID preservation
+	if preservedUID != nil {
+		log.Printf("[IMPORTER] DEBUG: About to insert with preserved UID=%d", *preservedUID)
+	}
+	if preservedUIDValidity != nil {
+		log.Printf("[IMPORTER] DEBUG: About to insert with preserved UIDVALIDITY=%d", *preservedUIDValidity)
+	}
+
 	hostname, _ := os.Hostname()
 	msgID, uid, err := i.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
@@ -1266,21 +1283,30 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		return fmt.Errorf("failed to queue message in database: %w", err)
 	}
 
-	// Step 2: Now that the message is safely queued, upload its content to S3.
-	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
-	s3Err := i.s3.Put(s3Key, bytes.NewReader(content), size)
-	if s3Err != nil {
-		// S3 upload failed. The message remains in the 'pending_uploads' queue.
-		// It can be retried by re-running the import. No S3 orphan was created.
-		return fmt.Errorf("failed to upload to S3. Message is queued in DB for retry on next run: %w", s3Err)
-	}
+	// Step 2: Upload content to S3 (skip in test mode)
+	if i.options.TestMode || i.s3 == nil {
+		// In test mode, skip S3 upload and mark as complete directly
+		err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
+		if err != nil {
+			return fmt.Errorf("test mode: failed to finalize message in DB: %w", err)
+		}
+	} else {
+		// Normal mode: upload to S3
+		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
+		s3Err := i.s3.Put(s3Key, bytes.NewReader(content), size)
+		if s3Err != nil {
+			// S3 upload failed. The message remains in the 'pending_uploads' queue.
+			// It can be retried by re-running the import. No S3 orphan was created.
+			return fmt.Errorf("failed to upload to S3. Message is queued in DB for retry on next run: %w", s3Err)
+		}
 
-	// Step 3: Finalize the upload in the database.
-	err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
-	if err != nil {
-		// The S3 object exists, but we failed to mark it as complete in the DB.
-		// The message remains in the 'pending_uploads' queue and can be retried.
-		return fmt.Errorf("S3 upload succeeded, but failed to finalize in DB. Message is queued for retry on next run: %w", err)
+		// Step 3: Finalize the upload in the database.
+		err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
+		if err != nil {
+			// The S3 object exists, but we failed to mark it as complete in the DB.
+			// The message remains in the 'pending_uploads' queue and can be retried.
+			return fmt.Errorf("S3 upload succeeded, but failed to finalize in DB. Message is queued for retry on next run: %w", err)
+		}
 	}
 
 	atomic.AddInt64(&i.importedMessages, 1)
