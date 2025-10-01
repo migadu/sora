@@ -265,7 +265,7 @@ func (s *Server) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
 
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
-	log.Println("[ManageSieve Proxy] Stopping server...")
+	log.Printf("* ManageSieve Proxy [%s] stopping...", s.name)
 
 	s.cancel()
 
@@ -281,9 +281,9 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Println("[ManageSieve Proxy] Server stopped gracefully")
+		log.Printf("* ManageSieve Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
-		log.Println("[ManageSieve Proxy] Server stop timeout")
+		log.Printf("ManageSieve Proxy [%s] Server stop timeout", s.name)
 	}
 
 	return nil

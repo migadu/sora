@@ -209,7 +209,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// Check if the context was cancelled during authentication logic
 			if s.ctx.Err() != nil {
-				s.Log("[LOGIN] context cancelled, aborting session update")
+				s.Log("[LOGIN] request aborted, aborting session update")
 				continue
 			}
 
@@ -424,7 +424,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// Check if context was cancelled during handshake
 			if s.ctx.Err() != nil {
-				s.Log("[STARTTLS] context cancelled after handshake, aborting session update")
+				s.Log("[STARTTLS] request aborted after handshake, aborting session update")
 				return
 			}
 
@@ -514,7 +514,7 @@ func (s *ManageSieveSession) handleCapability() bool {
 func (s *ManageSieveSession) handleListScripts() bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.Log("[LISTSCRIPTS] context cancelled, aborting command")
+		s.Log("[LISTSCRIPTS] request aborted, aborting command")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -564,7 +564,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 func (s *ManageSieveSession) handleGetScript(name string) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.Log("[GETSCRIPT] context cancelled, aborting command")
+		s.Log("[GETSCRIPT] request aborted, aborting command")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -606,7 +606,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	start := time.Now()
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.Log("[PUTSCRIPT] context cancelled, aborting command")
+		s.Log("[PUTSCRIPT] request aborted, aborting command")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -714,7 +714,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	start := time.Now()
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.Log("[SETACTIVE] context cancelled, aborting command")
+		s.Log("[SETACTIVE] request aborted, aborting command")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -787,7 +787,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.Log("[DELETESCRIPT] context cancelled, aborting command")
+		s.Log("[DELETESCRIPT] request aborted, aborting command")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -1066,7 +1066,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 	// Check if the context was cancelled during authentication logic
 	if s.ctx.Err() != nil {
-		s.Log("[AUTH] context cancelled, aborting session update")
+		s.Log("[AUTH] request aborted, aborting session update")
 		return false
 	}
 

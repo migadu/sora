@@ -16,9 +16,10 @@ type Session struct {
 	RemoteIP string // Real client IP (from PROXY protocol or direct connection)
 	ProxyIP  string // Proxy IP (only set when connection comes through PROXY protocol)
 	*User
-	HostName string
-	Protocol string
-	Stats    ConnectionStatsProvider
+	HostName   string
+	ServerName string // Name of the server instance (e.g., "imap0", "pop3-backend")
+	Protocol   string
+	Stats      ConnectionStatsProvider
 
 	// Parameter forwarding support (Dovecot-style)
 	ForwardingParams *ForwardingParams // Forwarded connection parameters
@@ -38,11 +39,19 @@ func (s *Session) Log(format string, args ...interface{}) {
 		connInfo = fmt.Sprintf("remote=%s", s.RemoteIP)
 	}
 
+	// Build protocol prefix with server name if available
+	var protocolPrefix string
+	if s.ServerName != "" {
+		protocolPrefix = fmt.Sprintf("%s-%s", s.Protocol, s.ServerName)
+	} else {
+		protocolPrefix = s.Protocol
+	}
+
 	if s.Stats != nil {
 		if s.Protocol == "LMTP" {
 			// LMTP has no authenticated sessions
-			log.Printf("%s %s user=%s session=%s conn_total=%d: %s",
-				s.Protocol,
+			log.Printf("[%s] %s user=%s session=%s conn_total=%d: %s",
+				protocolPrefix,
 				connInfo,
 				user,
 				s.Id,
@@ -50,8 +59,8 @@ func (s *Session) Log(format string, args ...interface{}) {
 				fmt.Sprintf(format, args...),
 			)
 		} else {
-			log.Printf("%s %s user=%s session=%s conn_total=%d conn_auth=%d: %s",
-				s.Protocol,
+			log.Printf("[%s] %s user=%s session=%s conn_total=%d conn_auth=%d: %s",
+				protocolPrefix,
 				connInfo,
 				user,
 				s.Id,
@@ -61,8 +70,8 @@ func (s *Session) Log(format string, args ...interface{}) {
 			)
 		}
 	} else {
-		log.Printf("%s %s user=%s session=%s: %s",
-			s.Protocol,
+		log.Printf("[%s] %s user=%s session=%s: %s",
+			protocolPrefix,
 			connInfo,
 			user,
 			s.Id,

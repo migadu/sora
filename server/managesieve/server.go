@@ -150,7 +150,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		if !options.TLSVerify {
 			serverInstance.tlsConfig.InsecureSkipVerify = true
-			log.Printf("WARNING: TLS certificate verification disabled for ManageSieve server")
+			log.Printf("ManageSieve [%s] WARNING: TLS certificate verification disabled", name)
 		}
 	}
 
@@ -195,28 +195,29 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("* ManageSieve server shutting down due to context cancellation")
+		log.Printf("* ManageSieve [%s] stopping", s.name)
 		listener.Close()
 	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if the error is due to the listener being closed
-			if s.appCtx.Err() != nil {
-				log.Printf("* ManageSieve server closed: %v", s.appCtx.Err())
-				return
-			}
-
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				log.Printf("[ManageSieve] %v, rejecting connection", err)
+				log.Printf("ManageSieve [%s] %v, rejecting connection", s.name, err)
 				continue // Continue accepting other connections
 			}
 
-			// For other errors, this might be a fatal server error
-			errChan <- err
-			return
+			// Check if the error is due to the listener being closed (graceful shutdown)
+			select {
+			case <-s.appCtx.Done():
+				log.Printf("* ManageSieve [%s] server stopped gracefully", s.name)
+				return
+			default:
+				// For other errors, this might be a fatal server error
+				errChan <- err
+				return
+			}
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
@@ -232,7 +233,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			log.Printf("[ManageSieve] Connection rejected: %v", err)
+			log.Printf("ManageSieve [%s] Connection rejected: %v", s.name, err)
 			conn.Close()
 			continue
 		}
@@ -269,6 +270,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		session.RemoteIP = clientIP
 		session.ProxyIP = proxyIP
 		session.Protocol = "ManageSieve"
+		session.ServerName = s.name
 		session.Id = idgen.New()
 		session.HostName = session.server.hostname
 		session.Stats = s // Set the server as the Stats provider
@@ -289,15 +291,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			remoteInfo = session.RemoteIP
 		}
 		// Log connection with connection counters
-		log.Printf("* ManageSieve new connection from %s (connections: total=%d, authenticated=%d)",
-			remoteInfo, totalCount, authCount)
+		log.Printf("* ManageSieve [%s] new connection from %s (connections: total=%d, authenticated=%d)",
+			s.name, remoteInfo, totalCount, authCount)
 
 		go session.handleConnection()
 	}
 }
 
 func (s *ManageSieveServer) Close() {
-	log.Printf("* ManageSieve server closing")
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -342,14 +343,16 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., server.ErrNoProxyHeader)
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, server.ErrNoProxyHeader) {
-			log.Printf("[ManageSieve] No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
+			// Note: We don't have access to server name in this listener, use generic ManageSieve
+			log.Printf("ManageSieve No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
 
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
-		log.Printf("[ManageSieve] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+		// Note: We don't have access to server name in this listener, use generic ManageSieve
+		log.Printf("ManageSieve PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
 		continue
 	}
 }

@@ -73,7 +73,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("[IMAP Proxy] Warning: failed to clear read deadline after ID response: %v", err)
+			log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline after ID response: %v", s.server.name, err)
 		}
 	}()
 
@@ -88,9 +88,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 
 		// Log the backend's ID response for debugging
 		if strings.HasPrefix(response, "* ID") {
-			log.Printf("[IMAP Proxy] Backend ID response: %s", response)
+			log.Printf("IMAP Proxy [%s] Backend ID response: %s", s.server.name, response)
 		} else if strings.HasPrefix(response, tag+" OK") {
-			log.Printf("[IMAP Proxy] ID forwarding completed successfully for %s", s.username)
+			log.Printf("IMAP Proxy [%s] ID forwarding completed successfully for %s", s.server.name, s.username)
 			break
 		} else if strings.HasPrefix(response, tag+" NO") || strings.HasPrefix(response, tag+" BAD") {
 			return fmt.Errorf("backend rejected ID command: %s", response)

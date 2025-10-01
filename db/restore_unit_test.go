@@ -480,7 +480,7 @@ func TestRestoreMessagesParams_PriorityOfFilters(t *testing.T) {
 		Email:       "user@example.com",
 		MessageIDs:  []int64{1, 2, 3},
 		MailboxPath: stringPtr("INBOX"), // Should be ignored
-		Since:       timePtr(now),        // Should be ignored
+		Since:       timePtr(now),       // Should be ignored
 	}
 
 	// Document the expected behavior

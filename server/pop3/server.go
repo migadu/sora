@@ -153,7 +153,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			log.Printf("WARNING: Client TLS certificate verification is not enforced for POP3 server (tls_verify=false)")
+			log.Printf("POP3 [%s] WARNING: Client TLS certificate verification is not enforced (tls_verify=false)", name)
 		}
 	}
 
@@ -197,28 +197,29 @@ func (s *POP3Server) Start(errChan chan error) {
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("* POP3 server shutting down due to context cancellation")
+		log.Printf("* POP3 [%s] stopping", s.name)
 		listener.Close()
 	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if the error is due to the listener being closed
-			if s.appCtx.Err() != nil {
-				log.Printf("* POP3 server closed: %v", s.appCtx.Err())
-				return
-			}
-
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				log.Printf("[POP3] %v, rejecting connection", err)
+				log.Printf("POP3 [%s] %v, rejecting connection", s.name, err)
 				continue // Continue accepting other connections
 			}
 
-			// For other errors, this might be a fatal server error
-			errChan <- err
-			return
+			// Check if the error is due to the listener being closed (graceful shutdown)
+			select {
+			case <-s.appCtx.Done():
+				log.Printf("* POP3 [%s] server stopped gracefully", s.name)
+				return
+			default:
+				// For other errors, this might be a fatal server error
+				errChan <- err
+				return
+			}
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
@@ -234,7 +235,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			log.Printf("[POP3] Connection rejected: %v", err)
+			log.Printf("POP3 [%s] Connection rejected: %v", s.name, err)
 			conn.Close()
 			continue
 		}
@@ -270,6 +271,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.RemoteIP = clientIP
 		session.ProxyIP = proxyIP
 		session.Protocol = "POP3"
+		session.ServerName = s.name
 		session.Id = idgen.New()
 		session.HostName = s.hostname
 		session.Stats = s
@@ -282,15 +284,14 @@ func (s *POP3Server) Start(errChan chan error) {
 		} else {
 			remoteInfo = session.RemoteIP
 		}
-		log.Printf("* POP3 new connection from %s (connections: total=%d, authenticated=%d)",
-			remoteInfo, totalCount, authCount)
+		log.Printf("* POP3 [%s] new connection from %s (connections: total=%d, authenticated=%d)",
+			s.name, remoteInfo, totalCount, authCount)
 
 		go session.handleConnection()
 	}
 }
 
 func (s *POP3Server) Close() {
-	log.Printf("* POP3 server closing")
 	// Cancel the app context if it's still active
 	// This will propagate to all session contexts
 	if s.cancel != nil {
@@ -337,6 +338,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
+			// Note: We don't have access to server name in this listener, use generic POP3
 			log.Printf("[POP3] No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
@@ -344,6 +346,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
+		// Note: We don't have access to server name in this listener, use generic POP3
 		log.Printf("[POP3] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
 		continue
 	}

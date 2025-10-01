@@ -503,7 +503,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 		terminationPollInterval = 30 * time.Second
 	}
 
-	log.Printf("[%s Proxy %s] Starting connection tracker.", protocol, serverName)
+	log.Printf("* %s Proxy [%s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		rdb,
@@ -610,7 +610,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down LMTP server...")
+		log.Printf("Shutting down LMTP server %s...\n", serverConfig.Name)
 		if err := lmtpServer.Close(); err != nil {
 			log.Printf("Error closing LMTP server: %v", err)
 		}
@@ -650,7 +650,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down POP3 server...")
+		log.Printf("Shutting down POP3 server %s...\n", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -694,7 +694,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down ManageSieve server...")
+		log.Printf("Shutting down ManageSieve server %s...\n", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -713,7 +713,7 @@ func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerCo
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down metrics server...")
+		log.Printf("Shutting down metrics server %s...\n", serverConfig.Name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
@@ -778,7 +778,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down IMAP proxy server...")
+		log.Printf("Shutting down IMAP proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -839,7 +839,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down POP3 proxy server...")
+		log.Printf("Shutting down POP3 proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -897,7 +897,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down ManageSieve proxy server...")
+		log.Printf("Shutting down ManageSieve proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -950,7 +950,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down LMTP proxy server...")
+		log.Printf("Shutting down LMTP proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -964,6 +964,7 @@ func startDynamicHTTPAPIServer(ctx context.Context, deps *serverDependencies, se
 	}
 
 	options := httpapi.ServerOptions{
+		Name:         serverConfig.Name,
 		Addr:         serverConfig.Addr,
 		APIKey:       serverConfig.APIKey,
 		AllowedHosts: serverConfig.AllowedHosts,

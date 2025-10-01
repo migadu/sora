@@ -59,7 +59,7 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("[LMTP Proxy] Warning: failed to clear read deadline after XCLIENT response: %v", err)
+			log.Printf("LMTP Proxy [%s] Warning: failed to clear read deadline after XCLIENT response: %v", s.server.name, err)
 		}
 	}()
 
@@ -72,10 +72,10 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	response = strings.TrimRight(response, "\r\n")
 
 	if strings.HasPrefix(response, "250") {
-		log.Printf("[LMTP Proxy] XCLIENT forwarding completed successfully for %s: %s", s.username, xclientParams)
+		log.Printf("LMTP Proxy [%s] XCLIENT forwarding completed successfully for %s: %s", s.server.name, s.username, xclientParams)
 	} else if strings.HasPrefix(response, "220") {
 		// XCLIENT succeeded - server reset session and sent new greeting
-		log.Printf("[LMTP Proxy] XCLIENT accepted, server reset session with new greeting: %s", response)
+		log.Printf("LMTP Proxy [%s] XCLIENT accepted, server reset session with new greeting: %s", s.server.name, response)
 
 		// After XCLIENT, the session resets and we need to send LHLO again
 		lhloCommand := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
@@ -93,7 +93,7 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 				return fmt.Errorf("failed to read LHLO response after XCLIENT: %v", err)
 			}
 			lhloResponse = strings.TrimRight(lhloResponse, "\r\n")
-			log.Printf("[LMTP Proxy] Backend LHLO after XCLIENT response: %s", lhloResponse)
+			log.Printf("LMTP Proxy [%s] Backend LHLO after XCLIENT response: %s", s.server.name, lhloResponse)
 
 			// Check if this is the final response line (doesn't have "-" after status code)
 			if len(lhloResponse) >= 3 && lhloResponse[3] != '-' {
@@ -101,12 +101,12 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 			}
 		}
 
-		log.Printf("[LMTP Proxy] XCLIENT forwarding and session reset completed successfully for %s", s.username)
+		log.Printf("LMTP Proxy [%s] XCLIENT forwarding and session reset completed successfully for %s", s.server.name, s.username)
 	} else if strings.HasPrefix(response, "550") || strings.HasPrefix(response, "5") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {
 		// Unexpected response - log but don't fail
-		log.Printf("[LMTP Proxy] Unexpected XCLIENT response from backend: %s", response)
+		log.Printf("LMTP Proxy [%s] Unexpected XCLIENT response from backend: %s", s.server.name, response)
 	}
 
 	return nil

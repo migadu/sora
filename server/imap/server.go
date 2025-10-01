@@ -65,7 +65,7 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if limitErr != nil {
-			log.Printf("[IMAP-%s] Connection rejected: %v", l.name, limitErr)
+			log.Printf("IMAP [%s] Connection rejected: %v", l.name, limitErr)
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -217,7 +217,7 @@ type IMAPServerOptions struct {
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
-	log.Printf("[IMAP-INIT] Creating server %q: TLS=%v, Cert=%q, Key=%q", name, options.TLS, options.TLSCertFile, options.TLSKeyFile)
+	log.Printf("IMAP [%s] Creating server: TLS=%v, Cert=%q, Key=%q", name, options.TLS, options.TLSCertFile, options.TLSKeyFile)
 	// Validate required dependencies
 	if s3 == nil {
 		return nil, fmt.Errorf("S3 storage is required for IMAP server")
@@ -256,7 +256,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	warmupTimeout := 5 * time.Minute // Default timeout
 	if options.WarmupTimeout != "" {
 		if parsed, err := helpers.ParseDuration(options.WarmupTimeout); err != nil {
-			log.Printf("[IMAP] WARNING: invalid warmup_timeout '%s': %v. Using default of %v", options.WarmupTimeout, err, warmupTimeout)
+			log.Printf("IMAP [%s] WARNING: invalid warmup_timeout '%s': %v. Using default of %v", name, options.WarmupTimeout, err, warmupTimeout)
 		} else {
 			warmupTimeout = parsed
 		}
@@ -315,7 +315,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		if filter.ClientName != "" {
 			re, err := regexp.Compile(filter.ClientName)
 			if err != nil {
-				log.Printf("[IMAP] WARNING: invalid client_name regex pattern '%s' in capability filter, skipping filter: %v", filter.ClientName, err)
+				log.Printf("IMAP [%s] WARNING: invalid client_name regex pattern '%s' in capability filter, skipping filter: %v", name, filter.ClientName, err)
 				isValid = false
 			} else {
 				filter.clientNameRegexp = re
@@ -324,7 +324,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		if filter.ClientVersion != "" && isValid {
 			re, err := regexp.Compile(filter.ClientVersion)
 			if err != nil {
-				log.Printf("[IMAP] WARNING: invalid client_version regex pattern '%s' in capability filter, skipping filter: %v", filter.ClientVersion, err)
+				log.Printf("IMAP [%s] WARNING: invalid client_version regex pattern '%s' in capability filter, skipping filter: %v", name, filter.ClientVersion, err)
 				isValid = false
 			} else {
 				filter.clientVersionRegexp = re
@@ -333,7 +333,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		if filter.JA4Fingerprint != "" && isValid {
 			re, err := regexp.Compile(filter.JA4Fingerprint)
 			if err != nil {
-				log.Printf("[IMAP] WARNING: invalid ja4_fingerprint regex pattern '%s' in capability filter, skipping filter: %v", filter.JA4Fingerprint, err)
+				log.Printf("IMAP [%s] WARNING: invalid ja4_fingerprint regex pattern '%s' in capability filter, skipping filter: %v", name, filter.JA4Fingerprint, err)
 				isValid = false
 			} else {
 				filter.ja4FingerprintRegexp = re
@@ -376,7 +376,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		log.Printf("[IMAP] Loading TLS certificate from %s and %s", options.TLSCertFile, options.TLSKeyFile)
+		log.Printf("IMAP [%s] Loading TLS certificate from %s and %s", name, options.TLSCertFile, options.TLSKeyFile)
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
@@ -384,7 +384,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 		// Warn if the certificate chain is incomplete.
 		if len(cert.Certificate) < 2 {
-			log.Printf("[IMAP] WARNING: The loaded TLS certificate file '%s' contains only one certificate. For full client compatibility, it should contain the full certificate chain (leaf + intermediates).", options.TLSCertFile)
+			log.Printf("IMAP [%s] WARNING: The loaded TLS certificate file '%s' contains only one certificate. For full client compatibility, it should contain the full certificate chain (leaf + intermediates).", name, options.TLSCertFile)
 		}
 
 		s.tlsConfig = &tls.Config{
@@ -399,7 +399,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			log.Printf("WARNING: Client TLS certificate verification is not enforced for IMAP server (tls_verify=false)")
+			log.Printf("IMAP [%s] WARNING: Client TLS certificate verification is not enforced (tls_verify=false)", name)
 		}
 	}
 
@@ -484,17 +484,17 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		// Check if it has the Handshake method
 		if handshaker, ok := ja4Conn.(interface{ Handshake() error }); ok {
 			if err := handshaker.Handshake(); err != nil {
-				log.Printf("[IMAP] TLS handshake failed: %v", err)
+				log.Printf("IMAP [%s] TLS handshake failed: %v", s.name, err)
 			} else {
-				log.Printf("[IMAP] TLS handshake completed, checking for JA4...")
+				log.Printf("IMAP [%s] TLS handshake completed, checking for JA4...", s.name)
 				// Now the JA4 should be available
 				if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 					session.ja4Fingerprint = fingerprint
-					log.Printf("[IMAP] JA4 fingerprint captured: %q", session.ja4Fingerprint)
+					log.Printf("IMAP [%s] JA4 fingerprint captured: %q", s.name, session.ja4Fingerprint)
 					// Apply filters to sessionCaps
 					session.applyCapabilityFilters()
 				} else {
-					log.Printf("[IMAP] JA4 fingerprint still not available after handshake: err=%v", err)
+					log.Printf("IMAP [%s] JA4 fingerprint still not available after handshake: err=%v", s.name, err)
 				}
 			}
 		} else {
@@ -507,6 +507,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.RemoteIP = clientIP
 	session.ProxyIP = proxyIP
 	session.Protocol = "IMAP"
+	session.ServerName = s.name
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
@@ -562,7 +563,15 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		name:     s.name,
 	}
 
-	return s.server.Serve(limitedListener)
+	err = s.server.Serve(limitedListener)
+
+	// Check if this was a graceful shutdown
+	if s.appCtx.Err() != nil {
+		log.Printf("* IMAP [%s] server stopped gracefully", s.name)
+		return nil
+	}
+
+	return err
 }
 
 func (s *IMAPServer) Close() {
@@ -610,6 +619,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
+			// Note: We don't have access to server name in this listener, use generic IMAP
 			log.Printf("[IMAP] No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
@@ -617,6 +627,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
+		// Note: We don't have access to server name in this listener, use generic IMAP
 		log.Printf("[IMAP] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
 		continue
 	}
@@ -639,8 +650,8 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		return nil
 	}
 
-	log.Printf("[IMAP] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)",
-		userID, messageCount, mailboxNames, async, s.warmupTimeout)
+	log.Printf("IMAP [%s] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)",
+		s.name, userID, messageCount, mailboxNames, async, s.warmupTimeout)
 
 	warmupFunc := func() {
 		// Add timeout to prevent runaway warmup operations
@@ -649,25 +660,25 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		// Get recent message content hashes from database through cache
 		messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, userID, mailboxNames, messageCount)
 		if err != nil {
-			log.Printf("[IMAP] failed to get recent messages for warmup: %v", err)
+			log.Printf("IMAP [%s] failed to get recent messages for warmup: %v", s.name, err)
 			return
 		}
 
 		totalHashes := 0
 		for mailbox, hashes := range messageHashes {
 			totalHashes += len(hashes)
-			log.Printf("[IMAP] warmup found %d messages in mailbox '%s'", len(hashes), mailbox)
+			log.Printf("IMAP [%s] warmup found %d messages in mailbox '%s'", s.name, len(hashes), mailbox)
 		}
 
 		if totalHashes == 0 {
-			log.Printf("[IMAP] no messages found for warmup")
+			log.Printf("IMAP [%s] no messages found for warmup", s.name)
 			return
 		}
 
 		// Get user's primary email for S3 key construction
 		address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, userID)
 		if err != nil {
-			log.Printf("[IMAP] warmup: failed to get primary address for account %d: %v", userID, err)
+			log.Printf("IMAP [%s] warmup: failed to get primary address for account %d: %v", s.name, userID, err)
 			return
 		}
 
@@ -680,7 +691,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				// Check for context cancellation
 				select {
 				case <-warmupCtx.Done():
-					log.Printf("[IMAP] warmup cancelled for user %d: %v", userID, warmupCtx.Err())
+					log.Printf("IMAP [%s] warmup cancelled for user %d: %v", s.name, userID, warmupCtx.Err())
 					return
 				default:
 					// Continue processing
@@ -689,7 +700,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				// Check if already in cache
 				exists, err := s.cache.Exists(contentHash)
 				if err != nil {
-					log.Printf("[IMAP] warmup: error checking existence of %s: %v", contentHash, err)
+					log.Printf("IMAP [%s] warmup: error checking existence of %s: %v", s.name, contentHash, err)
 					continue
 				}
 
@@ -712,10 +723,10 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 						select {
 						case <-time.After(backoffTime):
 						case <-warmupCtx.Done():
-							log.Printf("[IMAP] warmup cancelled during retry backoff for user %d", userID)
+							log.Printf("IMAP [%s] warmup cancelled during retry backoff for user %d", s.name, userID)
 							return
 						}
-						log.Printf("[IMAP] warmup: retrying S3 fetch for %s (attempt %d/%d)", contentHash, attempt+1, maxRetries)
+						log.Printf("IMAP [%s] warmup: retrying S3 fetch for %s (attempt %d/%d)", s.name, contentHash, attempt+1, maxRetries)
 					}
 
 					reader, err := s.s3.GetWithRetry(ctx, s3Key)
@@ -737,14 +748,14 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				}
 
 				if fetchErr != nil {
-					log.Printf("[IMAP] warmup: failed to fetch content %s from S3 after %d attempts: %v", contentHash, maxRetries, fetchErr)
+					log.Printf("IMAP [%s] warmup: failed to fetch content %s from S3 after %d attempts: %v", s.name, contentHash, maxRetries, fetchErr)
 					continue
 				}
 
 				// Store in cache
 				err = s.cache.Put(contentHash, data)
 				if err != nil {
-					log.Printf("[IMAP] warmup: failed to cache content %s: %v", contentHash, err)
+					log.Printf("IMAP [%s] warmup: failed to cache content %s: %v", s.name, contentHash, err)
 					continue
 				}
 
@@ -752,8 +763,8 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 			}
 		}
 
-		log.Printf("[IMAP] warmup completed for user %d: %d messages cached, %d skipped (already cached)",
-			userID, warmedCount, skippedCount)
+		log.Printf("IMAP [%s] warmup completed for user %d: %d messages cached, %d skipped (already cached)",
+			s.name, userID, warmedCount, skippedCount)
 	}
 
 	if async {
@@ -781,14 +792,14 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 	}
 
 	// Apply each matching filter
-	log.Printf("[IMAP] Checking %d capability filters (clientName=%q, clientVersion=%q, tlsFingerprint=%q)",
-		len(s.capFilters), clientName, clientVersion, tlsFingerprint)
+	log.Printf("IMAP [%s] Checking %d capability filters (clientName=%q, clientVersion=%q, tlsFingerprint=%q)",
+		s.name, len(s.capFilters), clientName, clientVersion, tlsFingerprint)
 	for i, filter := range s.capFilters {
-		log.Printf("[IMAP] Filter %d: ClientName=%q, ClientVersion=%q, JA4Fingerprint=%q, DisableCaps=%v",
-			i, filter.ClientName, filter.ClientVersion, filter.JA4Fingerprint, filter.DisableCaps)
+		log.Printf("IMAP [%s] Filter %d: ClientName=%q, ClientVersion=%q, JA4Fingerprint=%q, DisableCaps=%v",
+			s.name, i, filter.ClientName, filter.ClientVersion, filter.JA4Fingerprint, filter.DisableCaps)
 		if s.clientMatches(clientName, clientVersion, tlsFingerprint, filter) {
-			log.Printf("[IMAP] Applying capability filter: %s (clientName=%s, clientVersion=%s, tlsFingerprint=%s)",
-				filter.Reason, clientName, clientVersion, tlsFingerprint)
+			log.Printf("IMAP [%s] Applying capability filter: %s (clientName=%s, clientVersion=%s, tlsFingerprint=%s)",
+				s.name, filter.Reason, clientName, clientVersion, tlsFingerprint)
 
 			// Disable specified capabilities
 			for _, capStr := range filter.DisableCaps {
@@ -796,7 +807,7 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 				if _, exists := sessionCaps[cap]; exists {
 					delete(sessionCaps, cap)
 					disabledCaps = append(disabledCaps, capStr)
-					log.Printf("[IMAP] Disabled capability %s (reason: %s)", cap, filter.Reason)
+					log.Printf("IMAP [%s] Disabled capability %s (reason: %s)", s.name, cap, filter.Reason)
 				}
 			}
 		}

@@ -53,7 +53,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before proceeding
 	if s.ctx.Err() != nil {
-		s.Log("[MOVE] context cancelled before message retrieval, aborting operation")
+		s.Log("[MOVE] request aborted before message retrieval, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",
@@ -72,7 +72,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before attempting the move
 	if s.ctx.Err() != nil {
-		s.Log("[MOVE] context cancelled before moving messages, aborting operation")
+		s.Log("[MOVE] request aborted before moving messages, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",

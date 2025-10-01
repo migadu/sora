@@ -70,7 +70,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Check if the context is still valid before proceeding with flag updates
 	if s.ctx.Err() != nil {
-		s.Log("[STORE] context cancelled before flag updates, aborting operation")
+		s.Log("[STORE] request aborted before flag updates, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during store operation",
@@ -134,7 +134,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Before responding with fetches, check if context is still valid
 	if s.ctx.Err() != nil {
-		s.Log("[STORE] context cancelled after flag updates, response will be incomplete")
+		s.Log("[STORE] request aborted after flag updates, response will be incomplete")
 		return nil
 	}
 

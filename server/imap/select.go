@@ -14,7 +14,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.Log("[SELECT] attempting to select mailbox: %s", mboxName)
 
 	if s.ctx.Err() != nil {
-		s.Log("[SELECT] context cancelled before selecting mailbox '%s'", mboxName)
+		s.Log("[SELECT] request aborted before selecting mailbox '%s'", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
 
@@ -114,7 +114,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	// Check again if the context was cancelled during DB operations
 	if s.ctx.Err() != nil {
-		s.Log("[SELECT] context cancelled during mailbox '%s' selection, aborting state update", mboxName)
+		s.Log("[SELECT] request aborted during mailbox '%s' selection, aborting state update", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 

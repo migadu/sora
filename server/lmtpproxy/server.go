@@ -336,7 +336,7 @@ func (s *Server) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
 
 // Stop stops the LMTP proxy server.
 func (s *Server) Stop() error {
-	log.Println("* LMTP proxy stopping...")
+	log.Printf("* LMTP Proxy [%s] stopping...", s.name)
 
 	s.cancel()
 
@@ -352,9 +352,9 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Println("* LMTP proxy stopped gracefully")
+		log.Printf("* LMTP Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
-		log.Println("[LMTP Proxy] stop timeout")
+		log.Printf("LMTP Proxy [%s] Server stop timeout", s.name)
 	}
 
 	return nil

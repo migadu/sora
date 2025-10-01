@@ -54,7 +54,7 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("[POP3 Proxy] Warning: failed to clear read deadline after XCLIENT response: %v", err)
+			log.Printf("POP3 Proxy [%s] Warning: failed to clear read deadline after XCLIENT response: %v", s.server.name, err)
 		}
 	}()
 
@@ -67,12 +67,12 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	response = strings.TrimRight(response, "\r\n")
 
 	if strings.HasPrefix(response, "+OK") {
-		log.Printf("[POP3 Proxy] XCLIENT forwarding completed successfully for %s: %s", s.username, xclientParams)
+		log.Printf("POP3 Proxy [%s] XCLIENT forwarding completed successfully for %s: %s", s.server.name, s.username, xclientParams)
 	} else if strings.HasPrefix(response, "-ERR") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {
 		// Unexpected response - log but don't fail
-		log.Printf("[POP3 Proxy] Unexpected XCLIENT response from backend: %s", response)
+		log.Printf("POP3 Proxy [%s] Unexpected XCLIENT response from backend: %s", s.server.name, response)
 	}
 
 	return nil

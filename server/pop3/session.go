@@ -135,7 +135,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting USER command")
+				s.Log("WARNING: request aborted, aborting USER command")
 				return
 			}
 
@@ -186,7 +186,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting PASS command")
+				s.Log("WARNING: request aborted, aborting PASS command")
 				return
 			}
 
@@ -359,7 +359,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting STAT command")
+				s.Log("WARNING: request aborted, aborting STAT command")
 				return
 			}
 
@@ -404,7 +404,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting LIST command")
+				s.Log("WARNING: request aborted, aborting LIST command")
 				return
 			}
 
@@ -491,7 +491,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting UIDL command")
+				s.Log("WARNING: request aborted, aborting UIDL command")
 				return
 			}
 
@@ -630,7 +630,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting TOP command")
+				s.Log("WARNING: request aborted, aborting TOP command")
 				return
 			}
 
@@ -832,7 +832,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting RETR command")
+				s.Log("WARNING: request aborted, aborting RETR command")
 				return
 			}
 
@@ -1003,7 +1003,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting RSET command")
+				s.Log("WARNING: request aborted, aborting RSET command")
 				return
 			}
 
@@ -1036,7 +1036,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting DELE command")
+				s.Log("WARNING: request aborted, aborting DELE command")
 				return
 			}
 
@@ -1151,7 +1151,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting AUTH command")
+				s.Log("WARNING: request aborted, aborting AUTH command")
 				return
 			}
 
@@ -1502,7 +1502,7 @@ func (s *POP3Session) handleConnection() {
 			s.Log("QUIT: Command received, starting message expunge process")
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: context cancelled, aborting QUIT command")
+				s.Log("WARNING: request aborted, aborting QUIT command")
 				return
 			}
 
@@ -1670,8 +1670,8 @@ func (s *POP3Session) Close() error {
 
 func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	if s.ctx.Err() != nil {
-		s.Log("context cancelled, aborting message body fetch")
-		return nil, fmt.Errorf("context cancelled")
+		s.Log("request aborted, aborting message body fetch")
+		return nil, fmt.Errorf("request aborted")
 	}
 
 	if msg.IsUploaded {

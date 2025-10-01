@@ -341,7 +341,7 @@ func (s *Server) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
 
 // Stop stops the IMAP proxy server.
 func (s *Server) Stop() error {
-	log.Println("* IMAP proxy stopping...")
+	log.Printf("* IMAP Proxy [%s] stopping...", s.name)
 
 	s.cancel()
 
@@ -357,9 +357,9 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Println("* IMAP proxy stopped gracefully")
+		log.Printf("* IMAP Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
-		log.Println("[IMAP Proxy] Server stop timeout")
+		log.Printf("IMAP Proxy [%s] Server stop timeout", s.name)
 	}
 
 	return nil

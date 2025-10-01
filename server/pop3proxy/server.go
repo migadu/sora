@@ -342,7 +342,7 @@ func (s *POP3ProxyServer) SetConnectionTracker(tracker *proxy.ConnectionTracker)
 }
 
 func (s *POP3ProxyServer) Stop() error {
-	log.Printf("* POP3 proxy [%s] server closing", s.name)
+	log.Printf("* POP3 Proxy [%s] stopping...", s.name)
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -355,9 +355,9 @@ func (s *POP3ProxyServer) Stop() error {
 
 	select {
 	case <-done:
-		log.Println("[POP3 Proxy] Server stopped gracefully")
+		log.Printf("* POP3 Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
-		log.Println("[POP3 Proxy] Server stop timeout")
+		log.Printf("POP3 Proxy [%s] Server stop timeout", s.name)
 	}
 
 	return nil

@@ -150,7 +150,7 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 
 			select {
 			case <-ctx.Done():
-				log.Println("[UPLOADER] context cancelled")
+				log.Println("[UPLOADER] request aborted")
 				return nil
 			case sem <- struct{}{}:
 				wg.Add(1)
@@ -181,7 +181,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Check for context cancellation early
 	select {
 	case <-ctx.Done():
-		log.Printf("[UPLOADER] context cancelled during upload of hash %s", upload.ContentHash)
+		log.Printf("[UPLOADER] request aborted during upload of hash %s", upload.ContentHash)
 		return
 	default:
 	}

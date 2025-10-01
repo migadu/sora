@@ -254,7 +254,7 @@ func TestImporter_DovecotUIDPreservation(t *testing.T) {
 
 	// In TestMode, PendingUpload records are created and then immediately completed
 	// We verify that the import process completed the uploads properly
-	
+
 	// Check if messages are marked as uploaded (since TestMode completes uploads immediately)
 	uploadedCount := 0
 	for _, msg := range messages {
@@ -340,7 +340,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 	// For this test, let's manually insert messages and verify PendingUpload creation
 	// since the current importer logic either succeeds completely or fails completely
 	// Let's test the database function directly
-	
+
 	// Get account info for verification
 	ctx := context.Background()
 	address, err := server.NewAddress(testEmail)
@@ -351,28 +351,28 @@ func TestImporter_PendingUploads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to get account ID: %v", err)
 	}
-	
+
 	// Parse one message file to test PendingUpload creation
 	testMsgPath := filepath.Join(maildirPath, "cur")
 	entries, err := os.ReadDir(testMsgPath)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("No message files found in test maildir")
 	}
-	
+
 	// Use the first message file for testing
 	msgFilePath := filepath.Join(testMsgPath, entries[0].Name())
-	
+
 	// Calculate hash for the message
 	hash, size, err := hashFile(msgFilePath)
 	if err != nil {
 		t.Fatalf("Failed to hash message file: %v", err)
 	}
-	
+
 	t.Logf("Testing with message file: %s (hash=%s, size=%d)", entries[0].Name(), hash[:12], size)
-	
+
 	// Create INBOX mailbox if it doesn't exist
 	user := server.NewUser(address, accountID)
-	
+
 	// Try to get INBOX mailbox, create if it doesn't exist
 	inboxMailbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
 	if err != nil {
@@ -381,22 +381,22 @@ func TestImporter_PendingUploads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create INBOX mailbox: %v", err)
 		}
-		
+
 		// Now get the created mailbox
 		inboxMailbox, err = rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
 		if err != nil {
 			t.Fatalf("Failed to get INBOX mailbox after creation: %v", err)
 		}
 	}
-	
+
 	// Test direct database insertion with PendingUpload
 	hostname, _ := os.Hostname()
-	
+
 	// For testing purposes, we'll create minimal data for the message
 	messageID := fmt.Sprintf("<%d@test.example.com>", time.Now().UnixNano())
 	subject := "Test Message for PendingUpload"
 	sentDate := time.Now()
-	
+
 	// Create minimal recipients data
 	recipients := []helpers.Recipient{
 		{
@@ -405,15 +405,15 @@ func TestImporter_PendingUploads(t *testing.T) {
 			AddressType:  "from",
 		},
 	}
-	
-	// Create minimal body structure  
+
+	// Create minimal body structure
 	bodyStructurePart := &imap.BodyStructureSinglePart{
 		Type:    "text",
 		Subtype: "plain",
 		Size:    uint32(size),
 	}
 	var bodyStructure imap.BodyStructure = bodyStructurePart
-	
+
 	// Insert message with PendingUpload using the resilient database wrapper
 	insertOptions := &db.InsertMessageOptions{
 		UserID:        user.UserID(),
@@ -433,20 +433,20 @@ func TestImporter_PendingUploads(t *testing.T) {
 		PlaintextBody: "",
 		Flags:         []imap.Flag{},
 	}
-	
+
 	pendingUpload := db.PendingUpload{
 		InstanceID:  hostname,
 		ContentHash: hash,
 		Size:        size,
 		AccountID:   user.UserID(),
 	}
-	
+
 	// Insert the message with PendingUpload
 	msgID, uid, err := rdb.InsertMessageWithRetry(ctx, insertOptions, pendingUpload)
 	if err != nil {
 		t.Fatalf("Failed to insert message with PendingUpload: %v", err)
 	}
-	
+
 	t.Logf("Successfully inserted message: ID=%d, UID=%d, Hash=%s", msgID, uid, hash[:12])
 
 	// Check if PendingUpload records were created despite the failure
@@ -488,7 +488,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 		WHERE account_id = $1 AND expunged_at IS NULL
 		LIMIT 1
 	`, accountID).Scan(&foundMsgID, &foundUID, &foundHash, &foundUploaded)
-	
+
 	if err != nil {
 		t.Fatalf("Failed to query inserted message: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 		t.Errorf("Message should not be marked as uploaded initially: uploaded=%v", foundUploaded)
 	}
 
-	t.Logf("✅ Message correctly inserted: id=%d, uid=%d, hash=%s, uploaded=%v", 
+	t.Logf("✅ Message correctly inserted: id=%d, uid=%d, hash=%s, uploaded=%v",
 		foundMsgID, foundUID, foundHash[:12], foundUploaded)
 
 	// Summary

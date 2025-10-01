@@ -61,7 +61,7 @@ func (s *Session) handleConnection() {
 	defer s.close()
 
 	clientAddr := s.clientConn.RemoteAddr().String()
-	log.Printf("[ManageSieve Proxy] New connection from %s", clientAddr)
+	log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
 
 	// Send initial greeting with capabilities
 	s.sendGreeting()
@@ -72,7 +72,7 @@ func (s *Session) handleConnection() {
 		// Set a read deadline for the client command to prevent idle connections.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to set read deadline for %s: %v", clientAddr, err)
+				log.Printf("ManageSieve Proxy [%s] Failed to set read deadline for %s: %v", s.server.name, clientAddr, err)
 				return
 			}
 		}
@@ -81,12 +81,12 @@ func (s *Session) handleConnection() {
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("[ManageSieve Proxy] Client %s timed out waiting for command", clientAddr)
+				log.Printf("ManageSieve Proxy [%s] Client %s timed out waiting for command", s.server.name, clientAddr)
 				s.sendResponse(`NO "Idle timeout"`)
 				return
 			}
 			if err != io.EOF {
-				log.Printf("[ManageSieve Proxy] Error reading from client %s: %v", clientAddr, err)
+				log.Printf("ManageSieve Proxy [%s] Error reading from client %s: %v", s.server.name, clientAddr, err)
 			}
 			return
 		}
@@ -106,7 +106,7 @@ func (s *Session) handleConnection() {
 			continue
 		}
 
-		log.Printf("[ManageSieve Proxy] Client %s: %s", clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		log.Printf("ManageSieve Proxy [%s] Client %s: %s", s.server.name, clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 		switch command {
 		case "AUTHENTICATE":
 			if len(args) < 1 || strings.ToUpper(server.UnquoteString(args[0])) != "PLAIN" {
@@ -128,7 +128,7 @@ func (s *Session) handleConnection() {
 				// Read SASL response
 				saslLine, err = s.clientReader.ReadString('\n')
 				if err != nil {
-					log.Printf("[ManageSieve Proxy] Error reading SASL response: %v", err)
+					log.Printf("ManageSieve Proxy [%s] Error reading SASL response: %v", s.server.name, err)
 					return
 				}
 				// The response to a continuation can also be a quoted string.
@@ -164,7 +164,7 @@ func (s *Session) handleConnection() {
 			password := parts[2]
 
 			if err := s.authenticateUser(authnID, password); err != nil {
-				log.Printf("[ManageSieve Proxy] Authentication failed for %s: %v", authnID, err)
+				log.Printf("ManageSieve Proxy [%s] Authentication failed for %s: %v", s.server.name, authnID, err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				s.sendResponse(`NO "Authentication failed"`)
@@ -175,14 +175,14 @@ func (s *Session) handleConnection() {
 
 			// Connect to backend and authenticate
 			if err := s.connectToBackendAndAuth(); err != nil {
-				log.Printf("[ManageSieve Proxy] Backend connection/auth failed for %s: %v", authnID, err)
+				log.Printf("ManageSieve Proxy [%s] Backend connection/auth failed for %s: %v", s.server.name, authnID, err)
 				s.sendResponse(`NO "Backend server temporarily unavailable"`)
 				continue
 			}
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to register connection for %s: %v", authnID, err)
+				log.Printf("ManageSieve Proxy [%s] Failed to register connection for %s: %v", s.server.name, authnID, err)
 			}
 
 			s.sendResponse(`OK "Authenticated"`)
@@ -212,16 +212,16 @@ func (s *Session) handleConnection() {
 	// its own connection lifetime.
 	if s.server.sessionTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("[ManageSieve Proxy] Warning: failed to clear read deadline for %s: %v", clientAddr, err)
+			log.Printf("ManageSieve Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, clientAddr, err)
 		}
 	}
 
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
-		log.Printf("[ManageSieve Proxy] Starting proxy for user %s", s.username)
+		log.Printf("ManageSieve Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
 		s.startProxy()
 	} else {
-		log.Printf("[ManageSieve Proxy] Cannot start proxy for user %s: no backend connection", s.username)
+		log.Printf("ManageSieve Proxy [%s] Cannot start proxy for user %s: no backend connection", s.server.name, s.username)
 	}
 }
 
@@ -231,7 +231,7 @@ func (s *Session) handleAuthError(response string) bool {
 	s.errorCount++
 	s.sendResponse(response)
 	if s.errorCount >= maxAuthErrors {
-		log.Printf("[ManageSieve Proxy] Too many authentication errors from %s, dropping connection.", s.clientConn.RemoteAddr())
+		log.Printf("ManageSieve Proxy [%s] Too many authentication errors from %s, dropping connection.", s.server.name, s.clientConn.RemoteAddr())
 		// Send a final error message before closing.
 		s.sendResponse(`NO "Too many invalid commands"`)
 		return true
@@ -280,17 +280,17 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	// Try prelookup authentication/routing first if configured
-	log.Printf("[ManageSieve Proxy] Attempting authentication for user %s via prelookup", username)
+	log.Printf("ManageSieve Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
 	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 	if err != nil {
-		log.Printf("[ManageSieve Proxy] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", username, err)
+		log.Printf("ManageSieve Proxy [%s] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", s.server.name, username, err)
 		// Fallthrough to main DB auth
 	} else {
 		switch authResult {
 		case proxy.AuthSuccess:
 			// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
-			log.Printf("[ManageSieve Proxy] Prelookup authentication successful for %s, AccountID: %d (prelookup)", username, routingInfo.AccountID)
+			log.Printf("ManageSieve Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
 			s.accountID = routingInfo.AccountID
 			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 			s.routingInfo = routingInfo
@@ -302,19 +302,19 @@ func (s *Session) authenticateUser(username, password string) error {
 
 		case proxy.AuthFailed:
 			// User found in prelookup, but password was wrong. Reject immediately.
-			log.Printf("[ManageSieve Proxy] Prelookup authentication failed for %s (bad password)", username)
+			log.Printf("ManageSieve Proxy [%s] Prelookup authentication failed for %s (bad password)", s.server.name, username)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed")
 
 		case proxy.AuthUserNotFound:
 			// User not in prelookup DB. Fallthrough to main DB auth.
-			log.Printf("[ManageSieve Proxy] User '%s' not found in prelookup. Falling back to main DB.", username)
+			log.Printf("ManageSieve Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
 		}
 	}
 
 	// Fallback/default: Authenticate against the main database.
-	log.Printf("[ManageSieve Proxy] Authenticating user %s via main database", username)
+	log.Printf("ManageSieve Proxy [%s] Authenticating user %s via main database", s.server.name, username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
@@ -357,7 +357,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		ProxyName:          "ManageSieve Proxy",
 	})
 	if err != nil {
-		log.Printf("[ManageSieve Proxy] Error determining route for %s: %v", s.username, err)
+		log.Printf("ManageSieve Proxy [%s] Error determining route for %s: %v", s.server.name, s.username, err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -401,9 +401,9 @@ func (s *Session) connectToBackendAndAuth() error {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer updateCancel()
 		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
-			log.Printf("[ManageSieve Proxy] Failed to update server affinity for %s: %v", s.username, err)
+			log.Printf("ManageSieve Proxy [%s] Failed to update server affinity for %s: %v", s.server.name, s.username, err)
 		} else {
-			log.Printf("[ManageSieve Proxy] Updated server affinity for %s to %s", s.username, actualAddr)
+			log.Printf("ManageSieve Proxy [%s] Updated server affinity for %s to %s", s.server.name, s.username, actualAddr)
 		}
 	}
 
@@ -452,7 +452,7 @@ func (s *Session) authenticateToBackend() error {
 		return fmt.Errorf("backend authentication failed: %s", response)
 	}
 
-	log.Printf("[ManageSieve Proxy] Backend authentication successful for user %s", s.username)
+	log.Printf("ManageSieve Proxy [%s] Backend authentication successful for user %s", s.server.name, s.username)
 
 	return nil
 }
@@ -460,7 +460,7 @@ func (s *Session) authenticateToBackend() error {
 // startProxy starts bidirectional proxying between client and backend.
 func (s *Session) startProxy() {
 	if s.backendConn == nil {
-		log.Printf("[ManageSieve Proxy] backend connection not established for %s", s.username)
+		log.Printf("ManageSieve Proxy [%s] backend connection not established for %s", s.server.name, s.username)
 		return
 	}
 
@@ -481,7 +481,7 @@ func (s *Session) startProxy() {
 		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
 		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
-			log.Printf("[ManageSieve Proxy] Error copying from client to backend: %v", err)
+			log.Printf("ManageSieve Proxy [%s] Error copying from client to backend: %v", s.server.name, err)
 		}
 	}()
 
@@ -495,7 +495,7 @@ func (s *Session) startProxy() {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			log.Printf("[ManageSieve Proxy] Error copying from backend to client: %v", err)
+			log.Printf("ManageSieve Proxy [%s] Error copying from backend to client: %v", s.server.name, err)
 		}
 	}()
 
@@ -526,7 +526,7 @@ func (s *Session) close() {
 
 		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "ManageSieve", clientAddr); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to unregister connection for %s: %v", s.username, err)
+				log.Printf("ManageSieve Proxy [%s] Failed to unregister connection for %s: %v", s.server.name, s.username, err)
 			}
 		}
 	}
@@ -572,11 +572,11 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 		shouldTerminate, err := s.server.connTracker.CheckTermination(checkCtx, s.accountID, "ManageSieve", clientAddr)
 		if err != nil {
-			log.Printf("[ManageSieve Proxy] Failed to check termination for %s: %v", s.username, err)
+			log.Printf("ManageSieve Proxy [%s] Failed to check termination for %s: %v", s.server.name, s.username, err)
 			return false
 		}
 		if shouldTerminate {
-			log.Printf("[ManageSieve Proxy] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.username, clientAddr, s.serverAddr)
+			log.Printf("ManageSieve Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.server.name, s.username, clientAddr, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return true
@@ -587,14 +587,14 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			log.Printf("[ManageSieve Proxy] Received kick notification for %s", s.username)
+			log.Printf("ManageSieve Proxy [%s] Received kick notification for %s", s.server.name, s.username)
 			if checkAndTerminate() {
 				return
 			}
 		case <-activityTicker.C:
 			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "ManageSieve", clientAddr); err != nil {
-				log.Printf("[ManageSieve Proxy] Failed to update activity for %s: %v", s.username, err)
+				log.Printf("ManageSieve Proxy [%s] Failed to update activity for %s: %v", s.server.name, s.username, err)
 			}
 			cancel()
 		case <-ctx.Done():

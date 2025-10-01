@@ -228,8 +228,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			// Check for context cancellation in the loop
 			select {
 			case <-ctx.Done():
-				log.Println("[CLEANUP] context cancelled during S3 cleanup")
-				return fmt.Errorf("context cancelled during S3 cleanup")
+				log.Println("[CLEANUP] request aborted during S3 cleanup")
+				return fmt.Errorf("request aborted during S3 cleanup")
 			default:
 			}
 

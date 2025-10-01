@@ -129,8 +129,8 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 // RestoreMessagesParams defines the criteria for restoring messages
 type RestoreMessagesParams struct {
 	Email       string
-	MessageIDs  []int64   // Specific message IDs to restore
-	MailboxPath *string   // Restore all messages from this mailbox
+	MessageIDs  []int64    // Specific message IDs to restore
+	MailboxPath *string    // Restore all messages from this mailbox
 	Since       *time.Time // Restore messages deleted since this time
 	Until       *time.Time // Restore messages deleted until this time
 }

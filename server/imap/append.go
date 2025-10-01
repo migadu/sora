@@ -182,7 +182,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection
 	if s.ctx.Err() != nil {
-		s.Log("[APPEND] context cancelled after message insertion, aborting session state update")
+		s.Log("[APPEND] request aborted after message insertion, aborting session state update")
 		// We've already inserted the message successfully, so still return success
 		success = true
 		return &imap.AppendData{
@@ -208,7 +208,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {
-		s.Log("[APPEND] context cancelled during mutex acquisition, aborting session state update")
+		s.Log("[APPEND] request aborted during mutex acquisition, aborting session state update")
 		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
