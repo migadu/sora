@@ -801,3 +801,185 @@ func TestRestoreMessages_PreservesMessageMetadata(t *testing.T) {
 	assert.Equal(t, original.Size, restored.Size, "Size should be preserved")
 	assert.Equal(t, original.ContentHash, restored.ContentHash, "Content hash should be preserved")
 }
+
+// TestRestoreMessages_SameMessageIDInDifferentMailboxes tests that we can restore
+// messages with the same message_id to different mailboxes (e.g., INBOX and Trash),
+// and that the \Deleted flag is properly cleared on restoration
+func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, testEmail, inboxID, _ := setupRestoreTestDatabase(t)
+	ctx := context.Background()
+
+	// Create Trash mailbox
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	err = db.CreateMailbox(ctx, tx, accountID, "Trash", nil)
+	require.NoError(t, err)
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	trash, err := db.GetMailboxByName(ctx, accountID, "Trash")
+	require.NoError(t, err)
+	trashID := trash.ID
+
+	// Insert a message in INBOX
+	now := time.Now()
+	msgOpts := &InsertMessageOptions{
+		UserID:       accountID,
+		MailboxID:    inboxID,
+		MailboxName:  "INBOX",
+		MessageID:    "<test@example.com>",
+		ContentHash:  "hash123",
+		S3Domain:     "example.com",
+		S3Localpart:  "user",
+		Flags:        []imap.Flag{imap.FlagSeen},
+		InternalDate: now,
+		Size:         1024,
+		Subject:      "Test Message",
+		SentDate:     now,
+	}
+
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	upload := PendingUpload{
+		AccountID:   accountID,
+		ContentHash: "hash123",
+		InstanceID:  "test-instance",
+		Size:        1024,
+		Attempts:    0,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	inboxMsgID, inboxUID, err := db.InsertMessage(ctx, tx2, msgOpts, upload)
+	require.NoError(t, err)
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Copy the message to Trash (simulating a user action)
+	tx3, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx3.Rollback(ctx)
+
+	uids := []imap.UID{imap.UID(inboxUID)}
+	copiedUIDs, err := db.CopyMessages(ctx, tx3, &uids, inboxID, trashID, accountID)
+	require.NoError(t, err)
+	require.Len(t, copiedUIDs, 1)
+
+	err = tx3.Commit(ctx)
+	require.NoError(t, err)
+
+	// Get the Trash message ID
+	var trashMsgID int64
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT id FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NULL",
+		trashID, "<test@example.com>").Scan(&trashMsgID)
+	require.NoError(t, err)
+
+	// Now delete (expunge) both messages and set the \Deleted flag
+	tx4, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx4.Rollback(ctx)
+
+	// Mark both as expunged and set \Deleted flag (bit 8)
+	_, err = tx4.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = NOW(),
+		    flags = flags | 8
+		WHERE id IN ($1, $2)
+	`, inboxMsgID, trashMsgID)
+	require.NoError(t, err)
+
+	err = tx4.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify both are expunged with \Deleted flag
+	var inboxFlags, trashFlags int
+	var inboxExpunged, trashExpunged bool
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT flags, expunged_at IS NOT NULL FROM messages WHERE id = $1",
+		inboxMsgID).Scan(&inboxFlags, &inboxExpunged)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT flags, expunged_at IS NOT NULL FROM messages WHERE id = $1",
+		trashMsgID).Scan(&trashFlags, &trashExpunged)
+	require.NoError(t, err)
+
+	assert.True(t, inboxExpunged, "INBOX message should be expunged")
+	assert.True(t, trashExpunged, "Trash message should be expunged")
+	assert.Equal(t, FlagDeleted, inboxFlags&FlagDeleted, "INBOX message should have \\Deleted flag")
+	assert.Equal(t, FlagDeleted, trashFlags&FlagDeleted, "Trash message should have \\Deleted flag")
+
+	// Now restore BOTH messages (one to INBOX, one to Trash)
+	tx5, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx5.Rollback(ctx)
+
+	restoreParams := RestoreMessagesParams{
+		Email:      testEmail,
+		MessageIDs: []int64{inboxMsgID, trashMsgID},
+	}
+	restoredCount, err := db.RestoreMessages(ctx, tx5, restoreParams)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), restoredCount, "Should restore both messages")
+
+	err = tx5.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify both are restored
+	var inboxRestoredFlags, trashRestoredFlags int
+	var inboxRestoredExpunged, trashRestoredExpunged bool
+	var inboxMailboxID, trashRestoredMailboxID int64
+
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT flags, expunged_at IS NOT NULL, mailbox_id FROM messages WHERE id = $1",
+		inboxMsgID).Scan(&inboxRestoredFlags, &inboxRestoredExpunged, &inboxMailboxID)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT flags, expunged_at IS NOT NULL, mailbox_id FROM messages WHERE id = $1",
+		trashMsgID).Scan(&trashRestoredFlags, &trashRestoredExpunged, &trashRestoredMailboxID)
+	require.NoError(t, err)
+
+	// Both messages should be restored (expunged_at = NULL)
+	assert.False(t, inboxRestoredExpunged, "INBOX message should be restored (not expunged)")
+	assert.False(t, trashRestoredExpunged, "Trash message should be restored (not expunged)")
+
+	// Both should be in their original mailboxes
+	assert.Equal(t, inboxID, inboxMailboxID, "INBOX message should be in INBOX")
+	assert.Equal(t, trashID, trashRestoredMailboxID, "Trash message should be in Trash")
+
+	// \Deleted flag should be cleared on both
+	assert.Equal(t, 0, inboxRestoredFlags&FlagDeleted, "INBOX message should NOT have \\Deleted flag after restore")
+	assert.Equal(t, 0, trashRestoredFlags&FlagDeleted, "Trash message should NOT have \\Deleted flag after restore")
+
+	// Verify we can query both active messages with our specific message_id
+	var count int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE message_id = $1 AND expunged_at IS NULL AND account_id = $2",
+		"<test@example.com>", accountID).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count, "Should have 2 active messages with the same message_id in different mailboxes")
+
+	// Verify one is in INBOX and one is in Trash
+	var inboxCount, trashCount int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE message_id = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
+		"<test@example.com>", inboxID).Scan(&inboxCount)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE message_id = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
+		"<test@example.com>", trashID).Scan(&trashCount)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, inboxCount, "Should have exactly 1 message in INBOX")
+	assert.Equal(t, 1, trashCount, "Should have exactly 1 message in Trash")
+}

@@ -75,6 +75,21 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
 	}
 
+	// Delete any expunged messages in the destination mailbox that have the same message_id
+	// as the messages we're about to copy. This prevents unique constraint violations.
+	deleteResult, err := tx.Exec(ctx, `
+		DELETE FROM messages
+		WHERE mailbox_id = $1
+		  AND message_id IN (SELECT message_id FROM messages WHERE id = ANY($2))
+	`, destMailboxID, messageIDs)
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to delete conflicting tombstones in destination mailbox: %v", err)
+		return nil, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
+	}
+	if deleteResult.RowsAffected() > 0 {
+		log.Printf("[DB] Deleted %d conflicting message(s) from destination mailbox before copy", deleteResult.RowsAffected())
+	}
+
 	// Batch insert the copied messages
 	_, err = tx.Exec(ctx, `
 		INSERT INTO messages (
@@ -243,6 +258,21 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
+
+	// Delete any expunged messages in the mailbox that have the same message_id
+	// This prevents unique constraint violations when appending messages that were previously expunged
+	deleteResult, err := tx.Exec(ctx, `
+		DELETE FROM messages
+		WHERE mailbox_id = $1
+		  AND message_id = $2
+	`, options.MailboxID, saneMessageID)
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to delete conflicting tombstones: %v", err)
+		return 0, 0, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
+	}
+	if deleteResult.RowsAffected() > 0 {
+		log.Printf("[DB] Deleted %d conflicting message(s) from mailbox before append", deleteResult.RowsAffected())
+	}
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages

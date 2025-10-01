@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -250,14 +251,73 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		mailboxIDMap[mailboxPath] = mailboxID
 	}
 
+	// Collect all message IDs being restored to exclude them from duplicate checks
+	restoringMessageIDs := make([]int64, len(messagesToRestore))
+	for i, msg := range messagesToRestore {
+		restoringMessageIDs[i] = msg.id
+	}
+
 	// Restore messages by clearing expunged_at and updating mailbox_id
 	var restoredCount int64
+	var skippedCount int64
 	for _, msg := range messagesToRestore {
 		targetMailboxID := mailboxIDMap[msg.mailboxPath]
 
+		// Get the message_id for this message
+		var messageIDToRestore string
+		err := tx.QueryRow(ctx, `SELECT message_id FROM messages WHERE id = $1`, msg.id).Scan(&messageIDToRestore)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get message_id for message %d: %w", msg.id, err)
+		}
+
+		// Check if a non-expunged message with the same message_id already exists in the TARGET mailbox
+		// EXCLUDING other messages in this restoration batch (to allow restoring multiple copies)
+		// If so, skip restoration to avoid duplicate active copies in the same mailbox
+		// Note: It's valid to have the same message_id in different mailboxes (e.g., INBOX + Sent)
+		var existingCount int
+		err = tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM messages
+			WHERE account_id = $1
+			  AND mailbox_id = $2
+			  AND expunged_at IS NULL
+			  AND message_id = $3
+			  AND id != ALL($4)
+		`, accountID, targetMailboxID, messageIDToRestore, restoringMessageIDs).Scan(&existingCount)
+
+		if err != nil {
+			return 0, fmt.Errorf("failed to check for existing message in target mailbox: %w", err)
+		}
+
+		if existingCount > 0 {
+			// A non-expunged copy already exists in the target mailbox, skip restoration
+			log.Printf("[DB] Skipping message restoration: message already exists in target mailbox '%s'", msg.mailboxPath)
+			skippedCount++
+			continue
+		}
+
+		// Delete any expunged messages with the same message_id in the target mailbox
+		// This prevents unique constraint violations when restoring
+		// (e.g., when a message was moved from INBOX to Trash, the old INBOX row is expunged,
+		// and the Trash row might also be expunged later, leaving expunged tombstones in both mailboxes)
+		deleteResult, err := tx.Exec(ctx, `
+			DELETE FROM messages
+			WHERE account_id = $1
+			  AND mailbox_id = $2
+			  AND message_id = $3
+			  AND id != $4
+		`, accountID, targetMailboxID, messageIDToRestore, msg.id)
+		if err != nil {
+			return 0, fmt.Errorf("failed to delete conflicting messages: %w", err)
+		}
+		if deleteResult.RowsAffected() > 0 {
+			log.Printf("[DB] Deleted %d conflicting message(s) with message_id='%s' from mailbox '%s' before restoration",
+				deleteResult.RowsAffected(), messageIDToRestore, msg.mailboxPath)
+		}
+
 		// Get next UID for the mailbox
 		var nextUID int64
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE mailboxes
 			SET highest_uid = highest_uid + 1
 			WHERE id = $1
@@ -267,13 +327,16 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to get next UID for mailbox: %w", err)
 		}
 
-		// Restore the message
+		// Restore the message and clear the \Deleted flag
+		// FlagDeleted = 8 (bit 3), so we use bitwise AND with NOT 8 to clear it
 		result, err := tx.Exec(ctx, `
 			UPDATE messages
 			SET expunged_at = NULL,
 			    expunged_modseq = NULL,
 			    mailbox_id = $2,
 			    uid = $3,
+			    flags = flags & ~8,
+			    flags_changed_at = now(),
 			    updated_at = now(),
 			    updated_modseq = nextval('messages_modseq')
 			WHERE id = $1
@@ -283,6 +346,10 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		}
 
 		restoredCount += result.RowsAffected()
+	}
+
+	if skippedCount > 0 {
+		log.Printf("[DB] Skipped restoring %d messages that already exist in target mailboxes", skippedCount)
 	}
 
 	return restoredCount, nil

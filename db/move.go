@@ -93,6 +93,24 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
 	}
 
+	// Delete any expunged messages in the destination mailbox that have the same message_id
+	// as the messages we're about to move. This prevents unique constraint violations when
+	// moving messages that had previously been moved from/to this mailbox.
+	// For example: INBOX->Trash (creates tombstone in INBOX), then later Trash->INBOX would
+	// fail because the old INBOX tombstone still exists.
+	deleteResult, err := tx.Exec(ctx, `
+		DELETE FROM messages
+		WHERE mailbox_id = $1
+		  AND message_id IN (SELECT message_id FROM messages WHERE id = ANY($2))
+	`, destMailboxID, messageIDs)
+	if err != nil {
+		log.Printf("[DB] ERROR: failed to delete conflicting tombstones in destination mailbox: %v", err)
+		return nil, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
+	}
+	if deleteResult.RowsAffected() > 0 {
+		log.Printf("[DB] Deleted %d conflicting message(s) from destination mailbox before move", deleteResult.RowsAffected())
+	}
+
 	// Batch insert the moved messages into the destination mailbox.
 	// This single query is much more efficient than inserting in a loop.
 	// It also fixes a bug where s3_domain, s3_localpart, and the correct
