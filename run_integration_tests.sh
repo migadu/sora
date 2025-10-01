@@ -153,17 +153,17 @@ main() {
     
     # Parse command line arguments
     SKIP_DB_CHECK=false
-    PROTOCOLS=()
+    SCOPES=()
     VERBOSE=false
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             --skip-db-check)
                 SKIP_DB_CHECK=true
                 shift
                 ;;
-            --protocol)
-                PROTOCOLS+=("$2")
+            --scope)
+                SCOPES+=("$2")
                 shift 2
                 ;;
             --verbose|-v)
@@ -175,14 +175,22 @@ main() {
                 echo ""
                 echo "Options:"
                 echo "  --skip-db-check    Skip database connectivity checks"
-                echo "  --protocol PROTO   Run tests for specific protocol (imap, lmtp, pop3, imapproxy, lmtpproxy, pop3proxy)"
+                echo "  --scope SCOPE      Run tests for specific scope"
                 echo "  --verbose, -v      Enable verbose output"
                 echo "  --help, -h         Show this help message"
                 echo ""
+                echo "Available scopes:"
+                echo "  Core: imap, lmtp, pop3, managesieve, httpapi, config"
+                echo "  Proxy: imapproxy, lmtpproxy, pop3proxy, managesieveproxy"
+                echo "  Limits: connection_limits, lmtp_connection_limits, pop3_connection_limits,"
+                echo "          managesieve_connection_limits, proxy_connection_limits"
+                echo ""
                 echo "Examples:"
-                echo "  $0                 # Run all integration tests"
-                echo "  $0 --protocol imap # Run only IMAP tests"
-                echo "  $0 --verbose       # Run with verbose output"
+                echo "  $0                          # Run all integration tests"
+                echo "  $0 --scope imap             # Run only IMAP tests"
+                echo "  $0 --scope httpapi          # Run only HTTP API tests"
+                echo "  $0 --scope connection_limits     # Run only connection limit tests"
+                echo "  $0 --verbose                # Run with verbose output"
                 exit 0
                 ;;
             *)
@@ -192,10 +200,16 @@ main() {
                 ;;
         esac
     done
-    
-    # Set default protocols if none specified
-    if [ ${#PROTOCOLS[@]} -eq 0 ]; then
-        PROTOCOLS=("imap" "lmtp" "pop3" "imapproxy" "lmtpproxy" "pop3proxy")
+
+    # Set default scopes if none specified
+    if [ ${#SCOPES[@]} -eq 0 ]; then
+        SCOPES=(
+            "imap" "lmtp" "pop3" "managesieve"
+            "imapproxy" "lmtpproxy" "pop3proxy" "managesieveproxy"
+            "connection_limits" "lmtp_connection_limits" "pop3_connection_limits"
+            "managesieve_connection_limits" "proxy_connection_limits"
+            "httpapi" "config"
+        )
     fi
     
     # Check prerequisites unless skipped
@@ -205,16 +219,16 @@ main() {
     
     # Store original directory
     ORIGINAL_DIR=$(pwd)
-    
-    # Run tests for each protocol
+
+    # Run tests for each scope
     overall_result=0
-    for protocol in "${PROTOCOLS[@]}"; do
-        test_path="$ORIGINAL_DIR/integration_tests/$protocol"
-        
-        if run_test_suite "$test_path" "$protocol"; then
-            print_success "$protocol integration tests completed successfully"
+    for scope in "${SCOPES[@]}"; do
+        test_path="$ORIGINAL_DIR/integration_tests/$scope"
+
+        if run_test_suite "$test_path" "$scope"; then
+            print_success "$scope integration tests completed successfully"
         else
-            print_error "$protocol integration tests failed"
+            print_error "$scope integration tests failed"
             overall_result=1
         fi
         echo

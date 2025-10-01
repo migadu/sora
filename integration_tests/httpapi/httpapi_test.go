@@ -1311,3 +1311,256 @@ func TestAccountLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// Test Message Restoration Endpoints
+func TestMessageRestoration(t *testing.T) {
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	testEmail := fmt.Sprintf("test-restore-%d@example.com", time.Now().UnixNano())
+	ctx := context.Background()
+
+	// 1. Create test account
+	createReq := httpapi.CreateAccountRequest{
+		Email:    testEmail,
+		Password: "test-password",
+	}
+	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", createReq)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Failed to create account: %d - %s", resp.StatusCode, string(body))
+	}
+
+	// Get account ID using direct database access
+	var accountID int64
+	err := server.rdb.GetDatabase().GetReadPool().QueryRow(ctx,
+		"SELECT account_id FROM credentials WHERE address = $1",
+		testEmail).Scan(&accountID)
+	if err != nil {
+		t.Fatalf("Failed to get account ID: %v", err)
+	}
+
+	// 2. Create mailboxes
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		"INSERT INTO mailboxes (account_id, name, uid_validity, path) VALUES ($1, $2, extract(epoch from now())::bigint, $3) RETURNING id",
+		accountID, "INBOX", "INBOX").Scan(new(int64))
+	if err != nil {
+		t.Fatalf("Failed to create INBOX: %v", err)
+	}
+
+	var archiveID int64
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		"INSERT INTO mailboxes (account_id, name, uid_validity, path) VALUES ($1, $2, extract(epoch from now())::bigint, $3) RETURNING id",
+		accountID, "INBOX/Archive", "INBOX/Archive").Scan(&archiveID)
+	if err != nil {
+		t.Fatalf("Failed to create Archive: %v", err)
+	}
+
+	// 3. Create and delete test messages directly in database
+	// Insert message 1 in INBOX (with \Seen flag = 1)
+	var msgID1, msgID2, msgID3 int64
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
+		 created_modseq, expunged_at)
+		 VALUES ($1, (SELECT id FROM mailboxes WHERE account_id = $1 AND name = 'INBOX'), 'INBOX', 1,
+		 'test', 'test1', 'test-hash-1', 'Test message 1', '<msg1@test.com>', '[]'::jsonb, ''::bytea,
+		 NOW(), NOW(), 100, 1, 1, NOW())
+		 RETURNING id`, accountID).Scan(&msgID1)
+	if err != nil {
+		t.Fatalf("Failed to insert message 1: %v", err)
+	}
+
+	// Insert message 2 in INBOX (no flags)
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
+		 created_modseq, expunged_at)
+		 VALUES ($1, (SELECT id FROM mailboxes WHERE account_id = $1 AND name = 'INBOX'), 'INBOX', 2,
+		 'test', 'test2', 'test-hash-2', 'Test message 2', '<msg2@test.com>', '[]'::jsonb, ''::bytea,
+		 NOW(), NOW(), 200, 0, 2, NOW())
+		 RETURNING id`, accountID).Scan(&msgID2)
+	if err != nil {
+		t.Fatalf("Failed to insert message 2: %v", err)
+	}
+
+	// Insert message 3 in Archive (with \Flagged flag = 4)
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
+		 created_modseq, expunged_at)
+		 VALUES ($1, $2, 'INBOX/Archive', 1, 'test', 'test3', 'test-hash-3', 'Test message 3', '<msg3@test.com>',
+		 '[]'::jsonb, ''::bytea, NOW(), NOW(), 300, 4, 3, NOW())
+		 RETURNING id`, accountID, archiveID).Scan(&msgID3)
+	if err != nil {
+		t.Fatalf("Failed to insert message 3: %v", err)
+	}
+
+	// 5. List all deleted messages
+	t.Run("ListAllDeletedMessages", func(t *testing.T) {
+		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/messages/deleted", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		messages := result["messages"].([]interface{})
+		total := int(result["total"].(float64))
+
+		if total != 3 {
+			t.Errorf("Expected 3 deleted messages, got %d", total)
+		}
+		if len(messages) != 3 {
+			t.Errorf("Expected 3 messages in array, got %d", len(messages))
+		}
+
+		// Verify message structure (Go structs are serialized with capital letter field names)
+		msg := messages[0].(map[string]interface{})
+		if msg["ID"] == nil {
+			t.Error("Message should have ID")
+		}
+		if msg["MailboxPath"] == nil {
+			t.Error("Message should have MailboxPath")
+		}
+		if msg["Subject"] == nil {
+			t.Error("Message should have Subject")
+		}
+		if msg["ExpungedAt"] == nil {
+			t.Error("Message should have ExpungedAt")
+		}
+	})
+
+	// 6. List deleted messages filtered by mailbox
+	t.Run("ListDeletedMessagesByMailbox", func(t *testing.T) {
+		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/deleted?mailbox=INBOX", testEmail)
+		resp, body := server.makeRequest(t, "GET", endpoint, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		total := int(result["total"].(float64))
+		if total != 2 {
+			t.Errorf("Expected 2 deleted messages from INBOX, got %d", total)
+		}
+	})
+
+	// 7. List deleted messages with limit
+	t.Run("ListDeletedMessagesWithLimit", func(t *testing.T) {
+		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/deleted?limit=1", testEmail)
+		resp, body := server.makeRequest(t, "GET", endpoint, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		messages := result["messages"].([]interface{})
+		if len(messages) != 1 {
+			t.Errorf("Expected 1 message with limit=1, got %d", len(messages))
+		}
+	})
+
+	// 8. Restore specific messages by ID
+	t.Run("RestoreMessagesByID", func(t *testing.T) {
+		restoreReq := map[string]interface{}{
+			"message_ids": []int64{msgID1, msgID2},
+		}
+
+		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		restored := int(result["restored"].(float64))
+		if restored != 2 {
+			t.Errorf("Expected 2 messages restored, got %d", restored)
+		}
+
+		// Verify messages are no longer in deleted list
+		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/messages/deleted", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		server.expectJSON(t, body, &result)
+		total := int(result["total"].(float64))
+		if total != 1 {
+			t.Errorf("Expected 1 deleted message remaining, got %d", total)
+		}
+	})
+
+	// 9. Restore by mailbox
+	t.Run("RestoreMessagesByMailbox", func(t *testing.T) {
+		// Insert another deleted message in Archive
+		var msgID4 int64
+		err := server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+			`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+			 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
+			 created_modseq, expunged_at)
+			 VALUES ($1, $2, 'INBOX/Archive', 2, 'test', 'test4', 'test-hash-4', 'Test message 4', '<msg4@test.com>',
+			 '[]'::jsonb, ''::bytea, NOW(), NOW(), 400, 0, 4, NOW())
+			 RETURNING id`, accountID, archiveID).Scan(&msgID4)
+		if err != nil {
+			t.Fatalf("Failed to insert message 4: %v", err)
+		}
+
+		// Now we have msg3 and msg4 deleted in Archive
+		restoreReq := map[string]interface{}{
+			"mailbox": "INBOX/Archive",
+		}
+
+		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		restored := int(result["restored"].(float64))
+		if restored != 2 {
+			t.Errorf("Expected 2 messages restored from Archive, got %d", restored)
+		}
+	})
+
+	// 10. Test error cases
+	t.Run("RestoreWithoutCriteria", func(t *testing.T) {
+		restoreReq := map[string]interface{}{}
+
+		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected 400 Bad Request, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		server.expectError(t, body, "At least one filter is required")
+	})
+
+	t.Run("ListDeletedForNonExistentAccount", func(t *testing.T) {
+		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/nonexistent@example.com/messages/deleted", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("Expected 404 Not Found, got %d - %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("RestoreForNonExistentAccount", func(t *testing.T) {
+		restoreReq := map[string]interface{}{
+			"message_ids": []int64{999999},
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/nonexistent@example.com/messages/restore", restoreReq)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("Expected 404 Not Found, got %d - %s", resp.StatusCode, string(body))
+		}
+	})
+}

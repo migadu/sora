@@ -136,7 +136,12 @@ func TestIMAP_CapabilityFiltering(t *testing.T) {
 	}
 	defer c.Logout()
 
-	// Send ID command to identify as iOS Apple Mail
+	// Login first - capability filtering is only applied after authentication
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Send ID command to identify as iOS Apple Mail - this triggers filtering
 	clientID := &imap.IDData{
 		Name:      "com.apple.email.maild",
 		Version:   "3826.300.87.2.22",
@@ -152,24 +157,20 @@ func TestIMAP_CapabilityFiltering(t *testing.T) {
 
 	t.Logf("Server ID response: %+v", serverID)
 
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Test CAPABILITY command after LOGIN - ESEARCH should be filtered out
+	// Test CAPABILITY command after ID - ESEARCH should be filtered out
 	caps, err := c.Capability().Wait()
 	if err != nil {
 		t.Fatalf("CAPABILITY command failed: %v", err)
 	}
 
-	// IMPORTANT: The CAPABILITY response still advertises ESEARCH (by design)
-	// This prevents client compatibility issues. The filtering happens at the command handler level.
+	// After capability filtering, ESEARCH is removed from CAPABILITY response
+	// The filtering happens at both advertisement and handler levels
 	hasESEARCH := caps.Has(imap.CapESearch)
 
 	if hasESEARCH {
-		t.Logf("EXPECTED: CAPABILITY response still advertises ESEARCH (prevents client issues)")
+		t.Errorf("ESEARCH capability should be removed from CAPABILITY response after filtering")
 	} else {
-		t.Errorf("ESEARCH capability should still be advertised in CAPABILITY response")
+		t.Logf("EXPECTED: CAPABILITY response correctly removed ESEARCH after filtering")
 	}
 
 	// Verify that the server applied capability filtering internally (check logs above)
@@ -423,12 +424,13 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 
 	t.Logf("After ID command - ESEARCH: %t, CONDSTORE: %t", hasESEARCH, hasCONDSTORE)
 
-	// CAPABILITY response should still advertise these capabilities (by design)
-	if !hasESEARCH {
-		t.Error("ESEARCH capability should still be advertised in CAPABILITY response")
+	// After capability filtering, filtered capabilities should be removed from CAPABILITY response
+	// This is the current implementation - capabilities are removed from advertisement
+	if hasESEARCH {
+		t.Error("ESEARCH capability should be removed from CAPABILITY response after filtering")
 	}
-	if !hasCONDSTORE {
-		t.Error("CONDSTORE capability should still be advertised in CAPABILITY response")
+	if hasCONDSTORE {
+		t.Error("CONDSTORE capability should be removed from CAPABILITY response after filtering")
 	}
 
 	// Select INBOX to enable CONDSTORE tests
@@ -616,13 +618,14 @@ func TestIMAP_CapabilityFiltering_ESEARCHFallback(t *testing.T) {
 	}
 	defer c.Logout()
 
-	// Identify as the test client
-	if _, err := c.ID(&imap.IDData{Name: "TestClientWithESEARCHDisabled"}).Wait(); err != nil {
-		t.Fatalf("ID command failed: %v", err)
-	}
-
+	// Login first - capability filtering is only applied after authentication
 	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
 		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Identify as the test client - this triggers capability filtering
+	if _, err := c.ID(&imap.IDData{Name: "TestClientWithESEARCHDisabled", Version: "1.0"}).Wait(); err != nil {
+		t.Fatalf("ID command failed: %v", err)
 	}
 
 	// Select INBOX

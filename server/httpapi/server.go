@@ -156,6 +156,10 @@ func (s *Server) setupRoutes() *mux.Router {
 	v1.HandleFunc("/credentials/{email}", s.handleGetCredential).Methods("GET")
 	v1.HandleFunc("/credentials/{email}", s.handleDeleteCredential).Methods("DELETE")
 
+	// Message restoration routes
+	v1.HandleFunc("/accounts/{email}/messages/deleted", s.handleListDeletedMessages).Methods("GET")
+	v1.HandleFunc("/accounts/{email}/messages/restore", s.handleRestoreMessages).Methods("POST")
+
 	// Connection management routes
 	v1.HandleFunc("/connections", s.handleListConnections).Methods("GET")
 	v1.HandleFunc("/connections/stats", s.handleConnectionStats).Methods("GET")
@@ -1152,6 +1156,157 @@ func (s *Server) handleAuthStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Message restoration handlers
+
+func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	email := vars["email"]
+	ctx := r.Context()
+
+	// Parse query parameters
+	mailboxPath := r.URL.Query().Get("mailbox")
+	since := r.URL.Query().Get("since")
+	until := r.URL.Query().Get("until")
+	limitStr := r.URL.Query().Get("limit")
+
+	// Build parameters
+	params := db.ListDeletedMessagesParams{
+		Email: email,
+		Limit: 100, // default limit
+	}
+
+	if mailboxPath != "" {
+		params.MailboxPath = &mailboxPath
+	}
+
+	if since != "" {
+		sinceTime, err := parseTimeParam(since)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid since parameter: %v", err))
+			return
+		}
+		params.Since = &sinceTime
+	}
+
+	if until != "" {
+		untilTime, err := parseTimeParam(until)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid until parameter: %v", err))
+			return
+		}
+		params.Until = &untilTime
+	}
+
+	if limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit < 0 {
+			s.writeError(w, http.StatusBadRequest, "Invalid limit parameter")
+			return
+		}
+		params.Limit = limit
+	}
+
+	// List deleted messages
+	messages, err := s.rdb.ListDeletedMessagesWithRetry(ctx, params)
+	if err != nil {
+		if strings.Contains(err.Error(), "account not found") {
+			s.writeError(w, http.StatusNotFound, "Account not found")
+			return
+		}
+		log.Printf("HTTP API: Error listing deleted messages: %v", err)
+		s.writeError(w, http.StatusInternalServerError, "Error listing deleted messages")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"email":    email,
+		"messages": messages,
+		"total":    len(messages),
+	})
+}
+
+func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	vars := mux.Vars(r)
+	email := vars["email"]
+	ctx := r.Context()
+
+	var req struct {
+		MessageIDs  []int64 `json:"message_ids,omitempty"`
+		MailboxPath *string `json:"mailbox,omitempty"`
+		Since       *string `json:"since,omitempty"`
+		Until       *string `json:"until,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	// Validate that at least one filter is provided
+	hasFilter := len(req.MessageIDs) > 0 || req.MailboxPath != nil || req.Since != nil || req.Until != nil
+	if !hasFilter {
+		s.writeError(w, http.StatusBadRequest, "At least one filter is required (message_ids, mailbox, since, or until)")
+		return
+	}
+
+	// Build parameters
+	params := db.RestoreMessagesParams{
+		Email:       email,
+		MessageIDs:  req.MessageIDs,
+		MailboxPath: req.MailboxPath,
+	}
+
+	if req.Since != nil {
+		sinceTime, err := parseTimeParam(*req.Since)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid since parameter: %v", err))
+			return
+		}
+		params.Since = &sinceTime
+	}
+
+	if req.Until != nil {
+		untilTime, err := parseTimeParam(*req.Until)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid until parameter: %v", err))
+			return
+		}
+		params.Until = &untilTime
+	}
+
+	// Restore messages
+	count, err := s.rdb.RestoreMessagesWithRetry(ctx, params)
+	if err != nil {
+		if strings.Contains(err.Error(), "account not found") {
+			s.writeError(w, http.StatusNotFound, "Account not found")
+			return
+		}
+		log.Printf("HTTP API: Error restoring messages: %v", err)
+		s.writeError(w, http.StatusInternalServerError, "Error restoring messages")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"email":    email,
+		"restored": count,
+		"message":  fmt.Sprintf("Successfully restored %d message(s)", count),
+	})
+}
+
+// parseTimeParam parses a time string in YYYY-MM-DD or RFC3339 format
+func parseTimeParam(value string) (time.Time, error) {
+	// Try parsing as YYYY-MM-DD first
+	if t, err := time.Parse("2006-01-02", value); err == nil {
+		return t, nil
+	}
+	// Try parsing as RFC3339
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("invalid date format (use YYYY-MM-DD or RFC3339)")
+}
+
 func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 	// Return basic configuration information (non-sensitive)
 	// This is useful for debugging and system information
@@ -1166,6 +1321,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			"health_monitoring":     true,
 			"auth_statistics":       true,
 			"uploader_monitoring":   true,
+			"message_restoration":   true,
 		},
 		"endpoints": map[string][]string{
 			"account_management": {
@@ -1181,6 +1337,10 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"credential_management": {
 				"GET /api/v1/credentials/{email}",
+			},
+			"message_restoration": {
+				"GET /api/v1/accounts/{email}/messages/deleted",
+				"POST /api/v1/accounts/{email}/messages/restore",
 			},
 			"connection_management": {
 				"GET /api/v1/connections",

@@ -478,6 +478,105 @@ components:
               type: integer
               example: 3
 
+    DeletedMessage:
+      type: object
+      description: "Information about a deleted message that can be restored."
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 12345
+          description: "Unique message ID"
+        uid:
+          type: integer
+          format: int64
+          example: 42
+          description: "IMAP UID (will change if restored)"
+        content_hash:
+          type: string
+          example: "blake3_abc123..."
+          description: "BLAKE3 hash of message content"
+        mailbox_path:
+          type: string
+          example: "INBOX/Archive"
+          description: "Original mailbox path"
+        mailbox_id:
+          type: integer
+          format: int64
+          nullable: true
+          example: 5
+          description: "Mailbox ID (null if mailbox was deleted)"
+        subject:
+          type: string
+          example: "Meeting notes"
+        message_id:
+          type: string
+          example: "<abc@example.com>"
+          description: "RFC822 Message-ID header"
+        internal_date:
+          type: string
+          format: date-time
+          example: "2023-06-15T10:30:00Z"
+          description: "IMAP internal date"
+        expunged_at:
+          type: string
+          format: date-time
+          example: "2023-06-20T14:00:00Z"
+          description: "When the message was deleted"
+        size:
+          type: integer
+          example: 4096
+          description: "Message size in bytes"
+
+    ListDeletedMessagesResponse:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeletedMessage'
+        total:
+          type: integer
+          example: 15
+          description: "Total number of messages returned"
+
+    RestoreMessagesRequest:
+      type: object
+      description: "Request to restore deleted messages. Must specify either message_ids or at least one filter (mailbox, since, until)."
+      properties:
+        message_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          example: [12345, 12346, 12347]
+          description: "Specific message IDs to restore (takes priority over filters)"
+        mailbox:
+          type: string
+          example: "INBOX/Archive"
+          description: "Restore all deleted messages from this mailbox"
+        since:
+          type: string
+          format: date-time
+          example: "2023-06-01T00:00:00Z"
+          description: "Restore messages deleted after this time"
+        until:
+          type: string
+          format: date-time
+          example: "2023-06-30T23:59:59Z"
+          description: "Restore messages deleted before this time"
+
+    RestoreMessagesResponse:
+      type: object
+      properties:
+        restored:
+          type: integer
+          example: 5
+          description: "Number of messages restored"
+        message:
+          type: string
+          example: "Successfully restored 5 messages"
+
 # Global security requirement
 security:
   - ApiKeyAuth: []
@@ -814,6 +913,192 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountExists'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/messages/deleted:
+    get:
+      tags:
+        - Message Restoration
+      summary: List deleted messages for an account
+      description: |
+        Retrieves a list of soft-deleted messages that can be restored. Messages are kept during the grace period before permanent deletion.
+        Supports filtering by mailbox, deletion time range, and result limit.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "Account email address"
+          schema:
+            type: string
+            format: email
+        - name: mailbox
+          in: query
+          required: false
+          description: "Filter by mailbox path (e.g., 'INBOX', 'INBOX/Archive')"
+          schema:
+            type: string
+          example: "INBOX/Archive"
+        - name: since
+          in: query
+          required: false
+          description: "Show messages deleted after this time (RFC3339 or YYYY-MM-DD format)"
+          schema:
+            type: string
+          example: "2023-06-01T00:00:00Z"
+        - name: until
+          in: query
+          required: false
+          description: "Show messages deleted before this time (RFC3339 or YYYY-MM-DD format)"
+          schema:
+            type: string
+          example: "2023-06-30T23:59:59Z"
+        - name: limit
+          in: query
+          required: false
+          description: "Maximum number of messages to return (default: 100)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of deleted messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListDeletedMessagesResponse'
+              examples:
+                success:
+                  summary: Successful response with deleted messages
+                  value:
+                    messages:
+                      - id: 12345
+                        uid: 42
+                        content_hash: "blake3_abc123..."
+                        mailbox_path: "INBOX/Archive"
+                        mailbox_id: 5
+                        subject: "Meeting notes"
+                        message_id: "<abc@example.com>"
+                        internal_date: "2023-06-15T10:30:00Z"
+                        expunged_at: "2023-06-20T14:00:00Z"
+                        size: 4096
+                      - id: 12346
+                        uid: 43
+                        content_hash: "blake3_def456..."
+                        mailbox_path: "INBOX"
+                        mailbox_id: null
+                        subject: "Old email"
+                        message_id: "<def@example.com>"
+                        internal_date: "2023-06-10T08:15:00Z"
+                        expunged_at: "2023-06-21T09:00:00Z"
+                        size: 2048
+                    total: 2
+        '400':
+          description: Invalid request parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_time:
+                  summary: Invalid time format
+                  value:
+                    error: "Invalid time format for 'since' parameter"
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/messages/restore:
+    post:
+      tags:
+        - Message Restoration
+      summary: Restore deleted messages
+      description: |
+        Restores soft-deleted messages for an account. Messages can be restored by:
+        - Specific message IDs (takes priority)
+        - Mailbox path (all deleted messages from that mailbox)
+        - Time range (messages deleted within the range)
+
+        At least one criterion must be provided. Restored messages will be assigned new UIDs but preserve all other metadata and flags.
+        If the original mailbox was deleted, it will be automatically recreated.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "Account email address"
+          schema:
+            type: string
+            format: email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreMessagesRequest'
+            examples:
+              by_ids:
+                summary: Restore specific messages by ID
+                value:
+                  message_ids: [12345, 12346, 12347]
+              by_mailbox:
+                summary: Restore all deleted messages from a mailbox
+                value:
+                  mailbox: "INBOX/Archive"
+              by_time_range:
+                summary: Restore messages deleted in a time range
+                value:
+                  since: "2023-06-01T00:00:00Z"
+                  until: "2023-06-30T23:59:59Z"
+              combined:
+                summary: Restore using multiple criteria
+                value:
+                  mailbox: "INBOX"
+                  since: "2023-06-15T00:00:00Z"
+      responses:
+        '200':
+          description: Messages restored successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreMessagesResponse'
+              examples:
+                success:
+                  summary: Successful restoration
+                  value:
+                    restored: 5
+                    message: "Successfully restored 5 messages"
+        '400':
+          description: Invalid request. No restoration criteria provided or invalid parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                no_criteria:
+                  summary: No restoration criteria
+                  value:
+                    error: "Must specify either message_ids or at least one filter (mailbox, since, until)"
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:

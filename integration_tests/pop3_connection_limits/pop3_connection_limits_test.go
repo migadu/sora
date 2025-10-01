@@ -70,6 +70,7 @@ func setupPOP3ServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 		pop3.POP3ServerOptions{
 			MaxConnections:      maxTotal,
 			MaxConnectionsPerIP: maxPerIP,
+			TrustedNetworks:     []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 		},
 	)
 	if err != nil {

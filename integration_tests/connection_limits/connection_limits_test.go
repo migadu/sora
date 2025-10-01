@@ -103,6 +103,7 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 		imap.IMAPServerOptions{
 			MaxConnections:      maxTotal,
 			MaxConnectionsPerIP: maxPerIP,
+			TrustedNetworks:     []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 		},
 	)
 	if err != nil {

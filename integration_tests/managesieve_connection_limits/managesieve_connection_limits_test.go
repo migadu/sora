@@ -38,6 +38,7 @@ func setupManageSieveServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP
 		managesieve.ManageSieveServerOptions{
 			MaxConnections:      maxTotal,
 			MaxConnectionsPerIP: maxPerIP,
+			TrustedNetworks:     []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 			AuthRateLimit: server.AuthRateLimiterConfig{
 				Enabled: false, // Disable for testing
 			},
