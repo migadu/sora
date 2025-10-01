@@ -184,3 +184,30 @@ func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Contex
 	}
 	return result.([]db.Message), nil
 }
+
+// --- Message Restoration Wrappers ---
+
+func (rd *ResilientDatabase) ListDeletedMessagesWithRetry(ctx context.Context, params db.ListDeletedMessagesParams) ([]db.DeletedMessage, error) {
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).ListDeletedMessages(ctx, params)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.DeletedMessage{}, nil
+	}
+	return result.([]db.DeletedMessage), nil
+}
+
+func (rd *ResilientDatabase) RestoreMessagesWithRetry(ctx context.Context, params db.RestoreMessagesParams) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(true).RestoreMessages(ctx, tx, params)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
