@@ -133,8 +133,9 @@ func (s *ManageSieveSession) handleConnection() {
 				s.sendResponse("NO Syntax: LOGIN address password\r\n")
 				continue
 			}
-			userAddress := parts[1]
-			password := parts[2]
+			// Remove quotes if present
+			userAddress := server.UnquoteString(parts[1])
+			password := server.UnquoteString(parts[2])
 
 			address, err := server.NewAddress(userAddress)
 			if err != nil {
@@ -474,7 +475,11 @@ func (s *ManageSieveSession) handleConnection() {
 			}()
 
 			s.sendResponse("OK Goodbye\r\n")
-			s.Close()
+			s.writer.Flush()
+
+			// Close connection directly without lock acquisition
+			// We don't need lock protection during explicit LOGOUT
+			s.closeWithoutLock()
 			success = true
 			return
 
@@ -570,7 +575,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = strings.Trim(name, "\"")
+	name = server.UnquoteString(name)
 
 	// Acquire a read lock only to get the necessary session state.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -612,7 +617,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	}
 
 	// Validate script name - must not be empty and should be a valid identifier
-	name = strings.Trim(name, "\"") // Remove surrounding quotes if present
+	name = server.UnquoteString(name) // Remove surrounding quotes if present
 	if name == "" {
 		s.sendResponse("NO Script name cannot be empty\r\n")
 		return false
@@ -720,7 +725,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = strings.Trim(name, "\"")
+	name = server.UnquoteString(name)
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -793,7 +798,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = strings.Trim(name, "\"")
+	name = server.UnquoteString(name)
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -840,22 +845,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	return true
 }
 
-func (s *ManageSieveSession) Close() error {
-	// Check if context is already canceled (during shutdown)
-	select {
-	case <-s.ctx.Done():
-		// Context is canceled, skip lock acquisition during shutdown
-	default:
-		// Acquire write lock for cleanup
-		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
-		if !acquired {
-			s.Log("failed to acquire write lock within timeout")
-			// Continue with close even if we can't get the lock
-		} else {
-			defer release()
-		}
-	}
-
+func (s *ManageSieveSession) closeWithoutLock() error {
 	// Observe connection duration
 	metrics.ConnectionDuration.WithLabelValues("managesieve").Observe(time.Since(s.startTime).Seconds())
 
@@ -898,6 +888,25 @@ func (s *ManageSieveSession) Close() error {
 	return nil
 }
 
+func (s *ManageSieveSession) Close() error {
+	// Check if context is already canceled (during shutdown)
+	select {
+	case <-s.ctx.Done():
+		// Context is canceled, skip lock acquisition during shutdown
+		return s.closeWithoutLock()
+	default:
+		// Acquire write lock for cleanup
+		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+		if !acquired {
+			s.Log("failed to acquire write lock within timeout")
+			// Continue with close even if we can't get the lock
+			return s.closeWithoutLock()
+		}
+		defer release()
+		return s.closeWithoutLock()
+	}
+}
+
 func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	start := time.Now()
 	success := false
@@ -914,7 +923,9 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		return false
 	}
 
-	mechanism := strings.ToUpper(parts[1])
+	// Remove quotes from mechanism if present
+	mechanism := server.UnquoteString(parts[1])
+	mechanism = strings.ToUpper(mechanism)
 	if mechanism != "PLAIN" {
 		s.sendResponse("NO Unsupported authentication mechanism\r\n")
 		return false
@@ -923,8 +934,8 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// Check if initial response is provided
 	var authData string
 	if len(parts) > 2 {
-		// Initial response provided - need to decode from base64
-		authData = parts[2]
+		// Initial response provided - remove quotes and decode from base64
+		authData = server.UnquoteString(parts[2])
 	} else {
 		// No initial response, send continuation
 		s.sendResponse("\"\"\r\n")
@@ -943,6 +954,9 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			s.sendResponse("NO Authentication cancelled\r\n")
 			return false
 		}
+
+		// Remove quotes if present in continuation response
+		authData = server.UnquoteString(authData)
 	}
 
 	// Decode base64

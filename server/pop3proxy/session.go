@@ -106,7 +106,8 @@ func (s *POP3ProxySession) handleConnection() {
 				}
 				continue
 			}
-			s.username = parts[1]
+			// Remove quotes if present for compatibility
+			s.username = server.UnquoteString(parts[1])
 			writer.WriteString("+OK User accepted\r\n")
 			writer.Flush()
 
@@ -123,7 +124,8 @@ func (s *POP3ProxySession) handleConnection() {
 				}
 				continue
 			}
-			password := parts[1]
+			// Remove quotes if present for compatibility
+			password := server.UnquoteString(parts[1])
 
 			if err := s.authenticate(s.username, password); err != nil {
 				// Check if the error is due to a backend connection failure.
@@ -164,7 +166,9 @@ func (s *POP3ProxySession) handleConnection() {
 				continue
 			}
 
-			mechanism := strings.ToUpper(parts[1])
+			// Remove quotes from mechanism if present for compatibility
+			mechanism := server.UnquoteString(parts[1])
+			mechanism = strings.ToUpper(mechanism)
 			if mechanism != "PLAIN" {
 				if s.handleAuthError(writer, "-ERR Unsupported authentication mechanism\r\n") {
 					return
@@ -174,8 +178,8 @@ func (s *POP3ProxySession) handleConnection() {
 
 			var authData string
 			if len(parts) > 2 {
-				// Initial response provided
-				authData = parts[2]
+				// Initial response provided - remove quotes if present
+				authData = server.UnquoteString(parts[2])
 			} else {
 				// Request the authentication data
 				writer.WriteString("+ \r\n")
@@ -189,6 +193,8 @@ func (s *POP3ProxySession) handleConnection() {
 					continue
 				}
 				authData = strings.TrimSpace(authLine)
+				// Remove quotes if present in continuation response
+				authData = server.UnquoteString(authData)
 			}
 
 			// Check for cancellation

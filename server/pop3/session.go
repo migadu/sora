@@ -160,7 +160,9 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// We will only accept email addresses as address
-			newUserAddress, err := server.NewAddress(parts[1])
+			// Remove quotes if present for compatibility
+			username := server.UnquoteString(parts[1])
+			newUserAddress, err := server.NewAddress(username)
 			if err != nil {
 				s.Log("error: %v", err)
 				if s.handleClientError(writer, fmt.Sprintf("-ERR %s\r\n", err.Error())) {
@@ -217,6 +219,9 @@ func (s *POP3Session) handleConnection() {
 
 			s.Log("authentication attempt for %s", userAddress.FullAddress())
 
+			// Remove quotes from password if present for compatibility
+			password := server.UnquoteString(parts[1])
+
 			// Get connection and proxy info for rate limiting
 			netConn := *s.conn
 			var proxyInfo *server.ProxyProtocolInfo
@@ -247,7 +252,7 @@ func (s *POP3Session) handleConnection() {
 			authSuccess := false
 			var userID int64
 			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				if userAddress.FullAddress() == string(s.server.masterSASLUsername) && parts[1] == string(s.server.masterSASLPassword) {
+				if userAddress.FullAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
 					s.Log("[PASS] Master password authentication successful for '%s'", userAddress.FullAddress())
 					authSuccess = true
 					// For master password, we need to get the user ID
@@ -269,7 +274,7 @@ func (s *POP3Session) handleConnection() {
 
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
-				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.FullAddress(), parts[1])
+				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.FullAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -1180,7 +1185,9 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			mechanism := strings.ToUpper(parts[1])
+			// Remove quotes from mechanism if present for compatibility
+			mechanism := server.UnquoteString(parts[1])
+			mechanism = strings.ToUpper(mechanism)
 			if mechanism != "PLAIN" {
 				if s.handleClientError(writer, "-ERR Unsupported authentication mechanism\r\n") {
 					return
@@ -1191,8 +1198,8 @@ func (s *POP3Session) handleConnection() {
 			// Check if initial response is provided
 			var authData string
 			if len(parts) > 2 {
-				// Initial response provided
-				authData = parts[2]
+				// Initial response provided - remove quotes if present
+				authData = server.UnquoteString(parts[2])
 			} else {
 				// Request the authentication data
 				writer.WriteString("+ \r\n")
@@ -1208,6 +1215,8 @@ func (s *POP3Session) handleConnection() {
 					continue
 				}
 				authData = strings.TrimSpace(authLine)
+				// Remove quotes if present in continuation response
+				authData = server.UnquoteString(authData)
 			}
 
 			// Check for cancellation
@@ -1550,7 +1559,10 @@ func (s *POP3Session) handleConnection() {
 
 			writer.WriteString("+OK Goodbye\r\n")
 			writer.Flush()
-			s.Close()
+
+			// Close connection directly without lock acquisition
+			// We don't need lock protection during explicit QUIT
+			s.closeWithoutLock()
 			success = true
 			return
 
@@ -1607,24 +1619,7 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 	return false
 }
 
-func (s *POP3Session) Close() error {
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
-	if !acquired {
-		s.Log("failed to acquire write lock within timeout")
-		// Still close the connection even if we can't acquire the lock
-		(*s.conn).Close()
-		// Release connection from limiter
-		if s.releaseConn != nil {
-			s.releaseConn()
-			s.releaseConn = nil // Prevent double release
-		}
-		if s.cancel != nil {
-			s.cancel()
-		}
-		return nil
-	}
-	defer release()
-
+func (s *POP3Session) closeWithoutLock() error {
 	metrics.ConnectionDuration.WithLabelValues("pop3").Observe(time.Since(s.startTime).Seconds())
 
 	totalCount := s.server.totalConnections.Add(-1)
@@ -1666,6 +1661,17 @@ func (s *POP3Session) Close() error {
 			totalCount, authCount)
 	}
 	return nil
+}
+
+func (s *POP3Session) Close() error {
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	if !acquired {
+		s.Log("failed to acquire write lock within timeout")
+		// Still close the connection even if we can't acquire the lock
+		return s.closeWithoutLock()
+	}
+	defer release()
+	return s.closeWithoutLock()
 }
 
 func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
