@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,7 +80,7 @@ type Importer struct {
 func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ImporterOptions) (*Importer, error) {
 	// Create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
-	log.Printf("Using maildir database: %s", dbPath)
+	logger.Infof("Using maildir database: %s", dbPath)
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -127,7 +127,7 @@ func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 	// Parse Dovecot keywords if Dovecot mode is enabled
 	if options.Dovecot {
 		if err := importer.parseDovecotKeywords(); err != nil {
-			log.Printf("Warning: Failed to parse dovecot-keywords: %v", err)
+			logger.Infof("Warning: Failed to parse dovecot-keywords: %v", err)
 			// Don't fail creation for keyword parsing errors
 		}
 	}
@@ -142,12 +142,12 @@ func (i *Importer) Close() error {
 			return fmt.Errorf("failed to close maildir database: %w", err)
 		}
 		if i.options.CleanupDB {
-			log.Printf("Cleaning up import database: %s", i.dbPath)
+			logger.Infof("Cleaning up import database: %s", i.dbPath)
 			if err := os.Remove(i.dbPath); err != nil {
 				return fmt.Errorf("failed to remove maildir database file: %w", err)
 			}
 		} else {
-			log.Printf("Maildir database saved at: %s", i.dbPath)
+			logger.Infof("Maildir database saved at: %s", i.dbPath)
 		}
 	}
 	return nil
@@ -160,7 +160,7 @@ func (i *Importer) Run() error {
 	// Process Dovecot subscriptions if Dovecot mode is enabled
 	if i.options.Dovecot {
 		if err := i.processSubscriptions(); err != nil {
-			log.Printf("Warning: Failed to process subscriptions: %v", err)
+			logger.Infof("Warning: Failed to process subscriptions: %v", err)
 			// Don't fail the import for subscription errors
 		}
 	}
@@ -168,11 +168,11 @@ func (i *Importer) Run() error {
 	// Import Sieve script if provided
 	if i.options.SievePath != "" {
 		if err := i.importSieveScript(); err != nil {
-			log.Printf("Warning: Failed to import Sieve script: %v", err)
+			logger.Infof("Warning: Failed to import Sieve script: %v", err)
 		}
 	}
 
-	log.Println("Scanning maildir...")
+	logger.Info("Scanning maildir...")
 	if err := i.scanMaildir(); err != nil {
 		return fmt.Errorf("failed to scan maildir: %w", err)
 	}
@@ -189,20 +189,20 @@ func (i *Importer) Run() error {
 
 	// Set totalMessages to the actual count in database
 	atomic.StoreInt64(&i.totalMessages, totalCount)
-	log.Printf("Found %d new messages to import (%d already on S3)", totalCount, alreadyOnS3)
+	logger.Infof("Found %d new messages to import (%d already on S3)", totalCount, alreadyOnS3)
 
 	if i.options.DryRun {
-		log.Println("DRY RUN: Analyzing what would be imported...")
+		logger.Info("DRY RUN: Analyzing what would be imported...")
 		return i.performDryRun()
 	}
 
 	// Only proceed with import if we have messages
 	if totalCount == 0 {
-		log.Println("No messages to import")
+		logger.Info("No messages to import")
 		return nil
 	}
 
-	log.Printf("Starting import process for %d messages...", totalCount)
+	logger.Infof("Starting import process for %d messages...", totalCount)
 	if err := i.importMessages(); err != nil {
 		return fmt.Errorf("failed to import messages: %w", err)
 	}
@@ -216,11 +216,11 @@ func (i *Importer) processSubscriptions() error {
 
 	// Check if subscriptions file exists
 	if _, err := os.Stat(subscriptionsPath); os.IsNotExist(err) {
-		log.Printf("No subscriptions file found at %s, skipping subscription processing", subscriptionsPath)
+		logger.Infof("No subscriptions file found at %s, skipping subscription processing", subscriptionsPath)
 		return nil
 	}
 
-	log.Printf("Processing Dovecot subscriptions from: %s", subscriptionsPath)
+	logger.Infof("Processing Dovecot subscriptions from: %s", subscriptionsPath)
 
 	// Read the subscriptions file
 	content, err := os.ReadFile(subscriptionsPath)
@@ -265,11 +265,11 @@ func (i *Importer) processSubscriptions() error {
 	}
 
 	if len(folders) == 0 {
-		log.Printf("No folders found in subscriptions file")
+		logger.Infof("No folders found in subscriptions file")
 		return nil
 	}
 
-	log.Printf("Found %d subscribed folders: %v", len(folders), folders)
+	logger.Infof("Found %d subscribed folders: %v", len(folders), folders)
 
 	// Get user context for database operations
 	ctx := context.Background()
@@ -286,7 +286,7 @@ func (i *Importer) processSubscriptions() error {
 
 	// Ensure default mailboxes exist first
 	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the subscription processing, as mailboxes might already exist
 	}
 
@@ -297,28 +297,28 @@ func (i *Importer) processSubscriptions() error {
 		mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
-				log.Printf("Creating missing mailbox: %s", folderName)
+				logger.Infof("Creating missing mailbox: %s", folderName)
 				if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), folderName, nil); err != nil {
-					log.Printf("Warning: Failed to create mailbox %s: %v", folderName, err)
+					logger.Infof("Warning: Failed to create mailbox %s: %v", folderName, err)
 					continue
 				}
 				// Get the newly created mailbox
 				mailbox, err = i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
 				if err != nil {
-					log.Printf("Warning: Failed to get newly created mailbox %s: %v", folderName, err)
+					logger.Infof("Warning: Failed to get newly created mailbox %s: %v", folderName, err)
 					continue
 				}
 			} else {
-				log.Printf("Warning: Failed to check mailbox %s: %v", folderName, err)
+				logger.Infof("Warning: Failed to check mailbox %s: %v", folderName, err)
 				continue
 			}
 		}
 
 		// Subscribe the user to the folder
 		if err := i.rdb.SetMailboxSubscribedWithRetry(ctx, mailbox.ID, user.UserID(), true); err != nil {
-			log.Printf("Warning: Failed to subscribe to mailbox %s: %v", folderName, err)
+			logger.Infof("Warning: Failed to subscribe to mailbox %s: %v", folderName, err)
 		} else {
-			log.Printf("Successfully subscribed to mailbox: %s", folderName)
+			logger.Infof("Successfully subscribed to mailbox: %s", folderName)
 		}
 	}
 
@@ -329,16 +329,16 @@ func (i *Importer) processSubscriptions() error {
 func (i *Importer) importSieveScript() error {
 	// Check if file exists (follow symlinks if present)
 	if _, err := os.Stat(i.options.SievePath); os.IsNotExist(err) {
-		log.Printf("Sieve script file does not exist, ignoring: %s", i.options.SievePath)
+		logger.Infof("Sieve script file does not exist, ignoring: %s", i.options.SievePath)
 		return nil
 	}
 
 	if i.options.DryRun {
-		log.Printf("DRY RUN: Would import Sieve script from: %s", i.options.SievePath)
+		logger.Infof("DRY RUN: Would import Sieve script from: %s", i.options.SievePath)
 		return nil
 	}
 
-	log.Printf("Importing Sieve script from: %s", i.options.SievePath)
+	logger.Infof("Importing Sieve script from: %s", i.options.SievePath)
 
 	// Read the script content
 	scriptContent, err := os.ReadFile(i.options.SievePath)
@@ -367,7 +367,7 @@ func (i *Importer) importSieveScript() error {
 
 	scriptName := "imported"
 	if existingScript != nil {
-		log.Printf("User already has an active Sieve script named '%s', it will be replaced", existingScript.Name)
+		logger.Infof("User already has an active Sieve script named '%s', it will be replaced", existingScript.Name)
 		scriptName = existingScript.Name
 	}
 
@@ -381,14 +381,14 @@ func (i *Importer) importSieveScript() error {
 		if err != nil {
 			return fmt.Errorf("failed to update existing Sieve script: %w", err)
 		}
-		log.Printf("Updated existing Sieve script '%s'", scriptName)
+		logger.Infof("Updated existing Sieve script '%s'", scriptName)
 	case consts.ErrDBNotFound:
 		// Create new script
 		script, err = i.rdb.CreateScriptWithRetry(ctx, user.UserID(), scriptName, string(scriptContent))
 		if err != nil {
 			return fmt.Errorf("failed to create Sieve script: %w", err)
 		}
-		log.Printf("Created new Sieve script '%s'", scriptName)
+		logger.Infof("Created new Sieve script '%s'", scriptName)
 	default:
 		return fmt.Errorf("failed to check for existing script by name: %w", err)
 	}
@@ -398,7 +398,7 @@ func (i *Importer) importSieveScript() error {
 		return fmt.Errorf("failed to activate Sieve script: %w", err)
 	}
 
-	log.Printf("Successfully imported and activated Sieve script '%s' for user %s", scriptName, i.email)
+	logger.Infof("Successfully imported and activated Sieve script '%s' for user %s", scriptName, i.email)
 	return nil
 }
 
@@ -408,11 +408,11 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	// Check if keywords file exists
 	if _, err := os.Stat(keywordsPath); os.IsNotExist(err) {
-		log.Printf("No dovecot-keywords file found at %s, custom keywords will not be imported", keywordsPath)
+		logger.Infof("No dovecot-keywords file found at %s, custom keywords will not be imported", keywordsPath)
 		return nil
 	}
 
-	log.Printf("Parsing Dovecot keywords from: %s", keywordsPath)
+	logger.Infof("Parsing Dovecot keywords from: %s", keywordsPath)
 
 	content, err := os.ReadFile(keywordsPath)
 	if err != nil {
@@ -431,14 +431,14 @@ func (i *Importer) parseDovecotKeywords() error {
 		// Parse format: "ID keyword_name"
 		parts := strings.SplitN(line, " ", 2)
 		if len(parts) != 2 {
-			log.Printf("Warning: Skipping malformed dovecot-keywords line: %s", line)
+			logger.Infof("Warning: Skipping malformed dovecot-keywords line: %s", line)
 			continue
 		}
 
 		// Parse the ID
 		id, err := strconv.Atoi(parts[0])
 		if err != nil {
-			log.Printf("Warning: Invalid keyword ID in line: %s", line)
+			logger.Infof("Warning: Invalid keyword ID in line: %s", line)
 			continue
 		}
 
@@ -448,7 +448,7 @@ func (i *Importer) parseDovecotKeywords() error {
 	}
 
 	if keywordCount > 0 {
-		log.Printf("Loaded %d Dovecot custom keywords", keywordCount)
+		logger.Infof("Loaded %d Dovecot custom keywords", keywordCount)
 	}
 
 	return nil
@@ -472,7 +472,7 @@ func (i *Importer) performDryRun() error {
 
 	// Proactively ensure default mailboxes exist for this user
 	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the dry run, as mailboxes might already exist
 	}
 
@@ -492,7 +492,7 @@ func (i *Importer) performDryRun() error {
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
-			log.Printf("Failed to scan row: %v", err)
+			logger.Infof("Failed to scan row: %v", err)
 			continue
 		}
 
@@ -533,7 +533,7 @@ func (i *Importer) performDryRun() error {
 			if !i.options.ForceReimport {
 				alreadyExists, err = i.isMessageAlreadyImported(ctx, hash, mailboxObj.ID)
 				if err != nil {
-					log.Printf("Error checking if message exists: %v", err)
+					logger.Infof("Error checking if message exists: %v", err)
 				}
 			}
 		}
@@ -716,7 +716,7 @@ func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 						// Add custom keyword as IMAP flag
 						flags = append(flags, imap.Flag(keywordName))
 					} else {
-						log.Printf("Warning: Unknown keyword ID %d (char %c) in filename: %s", keywordID, char, filename)
+						logger.Infof("Warning: Unknown keyword ID %d (char %c) in filename: %s", keywordID, char, filename)
 					}
 				}
 			}
@@ -876,7 +876,7 @@ func (i *Importer) scanMaildir() error {
 			// Validate the mailbox name doesn't contain problematic characters
 			// that will cause UTF-7 encoding issues when sent to IMAP clients
 			if strings.ContainsAny(mailboxName, "\t\r\n") {
-				log.Printf("Warning: Skipping mailbox with invalid characters: %s", mailboxName)
+				logger.Infof("Warning: Skipping mailbox with invalid characters: %s", mailboxName)
 				return nil
 			}
 
@@ -898,11 +898,11 @@ func (i *Importer) scanMaildir() error {
 			}
 		}
 
-		log.Printf("Processing maildir folder: %s -> mailbox: '%s' (contains '/' delimiter: %v)", relPath, mailboxName, strings.Contains(mailboxName, "/"))
+		logger.Infof("Processing maildir folder: %s -> mailbox: '%s' (contains '/' delimiter: %v)", relPath, mailboxName, strings.Contains(mailboxName, "/"))
 
 		// Check if this mailbox should be imported
 		if !i.shouldImportMailbox(mailboxName) {
-			log.Printf("Skipping mailbox %s (filtered)", mailboxName)
+			logger.Infof("Skipping mailbox %s (filtered)", mailboxName)
 			return nil
 		}
 
@@ -911,7 +911,7 @@ func (i *Importer) scanMaildir() error {
 		for _, subDir := range []string{"cur", "new"} {
 			messages, err := os.ReadDir(filepath.Join(path, subDir))
 			if err != nil {
-				log.Printf("Failed to read directory %s: %v", filepath.Join(path, subDir), err)
+				logger.Infof("Failed to read directory %s: %v", filepath.Join(path, subDir), err)
 				continue
 			}
 
@@ -932,13 +932,13 @@ func (i *Importer) scanMaildir() error {
 				// Use streaming hash function
 				hash, size, err := hashFile(messagePath)
 				if err != nil {
-					log.Printf("Failed to hash file %s: %v", messagePath, err)
+					logger.Infof("Failed to hash file %s: %v", messagePath, err)
 					continue
 				}
 
 				// Validate message
 				if err := validateMessage(size); err != nil {
-					log.Printf("Invalid message %s: %v", messagePath, err)
+					logger.Infof("Invalid message %s: %v", messagePath, err)
 					atomic.AddInt64(&i.skippedMessages, 1)
 					continue
 				}
@@ -947,7 +947,7 @@ func (i *Importer) scanMaildir() error {
 				result, err := i.db.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
 					messagePath, filename, hash, size, mailboxName)
 				if err != nil {
-					log.Printf("Failed to insert message into sqlite db: %v", err)
+					logger.Infof("Failed to insert message into sqlite db: %v", err)
 					continue
 				}
 
@@ -955,14 +955,14 @@ func (i *Importer) scanMaildir() error {
 
 				rowsAffected, err := result.RowsAffected()
 				if err != nil {
-					log.Printf("Failed to get rows affected: %v", err)
+					logger.Infof("Failed to get rows affected: %v", err)
 					continue
 				}
 				if rowsAffected > 0 {
 					atomic.AddInt64(&i.totalMessages, 1)
 				} else {
 					// Message already exists in SQLite, but still count it
-					log.Printf("Message already in SQLite database: %s", filename)
+					logger.Infof("Message already in SQLite database: %s", filename)
 				}
 			}
 		}
@@ -971,10 +971,10 @@ func (i *Importer) scanMaildir() error {
 		if i.options.PreserveUIDs {
 			uidList, err := ParseDovecotUIDList(path)
 			if err != nil {
-				log.Printf("Warning: Failed to parse dovecot-uidlist in %s: %v", path, err)
+				logger.Infof("Warning: Failed to parse dovecot-uidlist in %s: %v", path, err)
 			} else if uidList != nil {
 				i.dovecotUIDLists[path] = uidList
-				log.Printf("Loaded dovecot-uidlist for %s: UIDVALIDITY=%d, NextUID=%d, %d mappings",
+				logger.Infof("Loaded dovecot-uidlist for %s: UIDVALIDITY=%d, NextUID=%d, %d mappings",
 					mailboxName, uidList.UIDValidity, uidList.NextUID, len(uidList.UIDMappings))
 			}
 		}
@@ -988,11 +988,11 @@ func (i *Importer) scanMaildir() error {
 func (i *Importer) importMessages() error {
 	// totalMessages is already set in Run() after scanning
 	if i.totalMessages == 0 {
-		log.Println("No messages to import")
+		logger.Info("No messages to import")
 		return nil
 	}
 
-	log.Printf("Processing %d messages from database", i.totalMessages)
+	logger.Infof("Processing %d messages from database", i.totalMessages)
 
 	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path")
 	if err != nil {
@@ -1026,13 +1026,13 @@ func (i *Importer) importMessages() error {
 					}
 
 					if retry < 2 { // Don't delay after last attempt
-						log.Printf("%s Import attempt %d/3 failed for %s: %v, retrying...", i.getProgressPrefix(), retry+1, j.path, err)
+						logger.Infof("%s Import attempt %d/3 failed for %s: %v, retrying...", i.getProgressPrefix(), retry+1, j.path, err)
 						time.Sleep(time.Duration(retry+1) * time.Second) // Exponential backoff
 					}
 				}
 
 				if err != nil {
-					log.Printf("%s Failed to import message %s after 3 attempts: %v", i.getProgressPrefix(), j.path, err)
+					logger.Infof("%s Failed to import message %s after 3 attempts: %v", i.getProgressPrefix(), j.path, err)
 					atomic.AddInt64(&i.failedMessages, 1)
 				}
 			}
@@ -1044,7 +1044,7 @@ func (i *Importer) importMessages() error {
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
-			log.Printf("Failed to scan row: %v", err)
+			logger.Infof("Failed to scan row: %v", err)
 			continue
 		}
 
@@ -1097,7 +1097,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// Check if file still exists on disk
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		atomic.AddInt64(&i.skippedMessages, 1)
-		log.Printf("%s File no longer exists on disk, skipping: %s", i.getProgressPrefix(), path)
+		logger.Infof("%s File no longer exists on disk, skipping: %s", i.getProgressPrefix(), path)
 		return nil
 	}
 
@@ -1117,18 +1117,18 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
-	log.Printf("Processing for user: email=%s, accountID=%d, userID=%d", address.FullAddress(), accountID, user.UserID())
+	logger.Infof("Processing for user: email=%s, accountID=%d, userID=%d", address.FullAddress(), accountID, user.UserID())
 
 	// Proactively ensure default mailboxes exist for this user
 	// This prevents "mailbox not found" errors during import
 	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		log.Printf("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
+		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the import, as mailboxes might already exist
 	}
 
 	mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
 	if err != nil {
-		log.Printf("Mailbox '%s' not found for user %d, creating it", mailboxName, user.UserID())
+		logger.Infof("Mailbox '%s' not found for user %d, creating it", mailboxName, user.UserID())
 		// Create mailbox if it doesn't exist
 		if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), mailboxName, nil); err != nil {
 			return fmt.Errorf("failed to create mailbox '%s': %w", mailboxName, err)
@@ -1137,9 +1137,9 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		if err != nil {
 			return fmt.Errorf("failed to get mailbox '%s' after creation: %w", mailboxName, err)
 		}
-		log.Printf("Created mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
+		logger.Infof("Created mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
 	} else {
-		log.Printf("Using existing mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
+		logger.Infof("Using existing mailbox '%s' with ID %d (database name: '%s')", mailboxName, mailbox.ID, mailbox.Name)
 	}
 
 	// Check if this message is already imported
@@ -1150,7 +1150,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 	if alreadyImported {
 		if !i.options.ForceReimport {
-			log.Printf("%s Message already exists in DB, skipping: %s", i.getProgressPrefix(), path)
+			logger.Infof("%s Message already exists in DB, skipping: %s", i.getProgressPrefix(), path)
 			atomic.AddInt64(&i.skippedMessages, 1)
 			return nil
 		}
@@ -1162,7 +1162,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			return fmt.Errorf("failed to delete existing message for re-import: %w", err)
 		}
 		if deleted > 0 {
-			log.Printf("%s Deleted %d existing message(s) for re-import (hash: %s, mailbox: %s)", i.getProgressPrefix(), deleted, hash[:12], mailboxName)
+			logger.Infof("%s Deleted %d existing message(s) for re-import (hash: %s, mailbox: %s)", i.getProgressPrefix(), deleted, hash[:12], mailboxName)
 		}
 	}
 
@@ -1216,19 +1216,19 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	if i.options.PreserveUIDs {
 		// Find the maildir path for this mailbox
 		maildirPath := filepath.Dir(filepath.Dir(path)) // Go up from cur/new to maildir folder
-		log.Printf("DEBUG: Looking for UID preservation: path=%s, maildirPath=%s, filename=%s", path, maildirPath, filename)
+		logger.Infof("DEBUG: Looking for UID preservation: path=%s, maildirPath=%s, filename=%s", path, maildirPath, filename)
 
 		if uidList, ok := i.dovecotUIDLists[maildirPath]; ok && uidList != nil {
-			log.Printf("DEBUG: Found UID list for %s with %d mappings", maildirPath, len(uidList.UIDMappings))
+			logger.Infof("DEBUG: Found UID list for %s with %d mappings", maildirPath, len(uidList.UIDMappings))
 			if uid, found := uidList.GetUIDForFile(filename); found {
 				preservedUID = &uid
 				preservedUIDValidity = &uidList.UIDValidity
-				log.Printf("Using preserved UID %d for %s (UIDVALIDITY=%d)", uid, filename, uidList.UIDValidity)
+				logger.Infof("Using preserved UID %d for %s (UIDVALIDITY=%d)", uid, filename, uidList.UIDValidity)
 			} else {
-				log.Printf("No preserved UID found for %s in dovecot-uidlist (tried %d mappings)", filename, len(uidList.UIDMappings))
+				logger.Infof("No preserved UID found for %s in dovecot-uidlist (tried %d mappings)", filename, len(uidList.UIDMappings))
 			}
 		} else {
-			log.Printf("DEBUG: No UID list found for maildirPath=%s (available: %v)", maildirPath, func() []string {
+			logger.Infof("DEBUG: No UID list found for maildirPath=%s (available: %v)", maildirPath, func() []string {
 				var keys []string
 				for k := range i.dovecotUIDLists {
 					keys = append(keys, k)
@@ -1242,10 +1242,10 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// Step 1: Insert the message in the database with UID preservation
 	// Debug logging for UID preservation
 	if preservedUID != nil {
-		log.Printf("[IMPORTER] DEBUG: About to insert with preserved UID=%d", *preservedUID)
+		logger.Infof("[IMPORTER] DEBUG: About to insert with preserved UID=%d", *preservedUID)
 	}
 	if preservedUIDValidity != nil {
-		log.Printf("[IMPORTER] DEBUG: About to insert with preserved UIDVALIDITY=%d", *preservedUIDValidity)
+		logger.Infof("[IMPORTER] DEBUG: About to insert with preserved UIDVALIDITY=%d", *preservedUIDValidity)
 	}
 
 	hostname, _ := os.Hostname()
@@ -1283,7 +1283,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			// This can happen if another process imported the message between our check and insert (race condition).
 			// It's safe to skip, as no S3 orphan was created.
-			log.Printf("%s Message already exists in DB (race condition?), skipping: %s", i.getProgressPrefix(), path)
+			logger.Infof("%s Message already exists in DB (race condition?), skipping: %s", i.getProgressPrefix(), path)
 			atomic.AddInt64(&i.skippedMessages, 1)
 			return nil
 		}
@@ -1320,12 +1320,12 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	_, err = i.db.Exec("UPDATE messages SET s3_uploaded = 1, s3_uploaded_at = ? WHERE hash = ? AND mailbox = ?",
 		time.Now(), hash, mailbox.Name)
 	if err != nil {
-		log.Printf("Warning: Failed to mark message as uploaded in SQLite: %v", err)
+		logger.Infof("Warning: Failed to mark message as uploaded in SQLite: %v", err)
 		// Don't fail the import - message is already on S3
 	}
 
 	atomic.AddInt64(&i.importedMessages, 1)
-	log.Printf("%s Successfully imported message: msgID=%d, uid=%d, mailbox=%s", i.getProgressPrefix(), msgID, uid, mailbox.Name)
+	logger.Infof("%s Successfully imported message: msgID=%d, uid=%d, mailbox=%s", i.getProgressPrefix(), msgID, uid, mailbox.Name)
 
 	// Add delay if configured to control rate
 	if i.options.ImportDelay > 0 {

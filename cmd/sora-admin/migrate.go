@@ -6,8 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io/fs"
-	"log"
 	"os"
 	"strconv"
 	"time"
@@ -85,21 +85,21 @@ func handleMigrateUp(ctx context.Context) {
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize migration tool: %v", err)
+		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
 	if err := acquireExclusiveLock(ctx, db); err != nil {
-		log.Fatalf("Failed to acquire exclusive lock: %v", err)
+		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
 	// Use a background context for deferred cleanup to ensure it runs even if the primary context is cancelled.
 	defer releaseExclusiveLock(context.Background(), db)
 
-	log.Println("Applying UP migrations...")
+	logger.Info("Applying UP migrations...")
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		log.Fatalf("Failed to apply UP migrations: %v", err)
+		logger.Fatalf("Failed to apply UP migrations: %v", err)
 	}
-	log.Println("Migrations applied successfully.")
+	logger.Info("Migrations applied successfully.")
 	showVersion(m)
 }
 
@@ -116,12 +116,12 @@ func handleMigrateDown(ctx context.Context) {
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize migration tool: %v", err)
+		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
 	if err := acquireExclusiveLock(ctx, db); err != nil {
-		log.Fatalf("Failed to acquire exclusive lock: %v", err)
+		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
 	defer releaseExclusiveLock(context.Background(), db)
 
@@ -129,27 +129,27 @@ func handleMigrateDown(ctx context.Context) {
 		version, dirty, err := m.Version()
 		if err != nil {
 			if errors.Is(err, migrate.ErrNilVersion) {
-				log.Println("No migrations to revert.")
+				logger.Info("No migrations to revert.")
 				showVersion(m)
 				return
 			}
-			log.Fatalf("Failed to get current migration version: %v", err)
+			logger.Fatalf("Failed to get current migration version: %v", err)
 		}
 		if dirty {
-			log.Fatalf("Database is in a dirty state (version %d). Please fix manually with 'force' command.", version)
+			logger.Fatalf("Database is in a dirty state (version %d). Please fix manually with 'force' command.", version)
 		}
 
-		log.Printf("Reverting all %d migration(s)...\n", version)
+		logger.Infof("Reverting all %d migration(s)...\n", version)
 		if err := m.Steps(-int(version)); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-			log.Fatalf("Failed to revert all migrations: %v", err)
+			logger.Fatalf("Failed to revert all migrations: %v", err)
 		}
 	} else {
-		log.Printf("Reverting %d migration(s)...\n", *limit)
+		logger.Infof("Reverting %d migration(s)...\n", *limit)
 		if err := m.Steps(-(*limit)); err != nil {
-			log.Fatalf("Failed to revert migrations: %v", err)
+			logger.Fatalf("Failed to revert migrations: %v", err)
 		}
 	}
-	log.Println("Migrations reverted successfully.")
+	logger.Info("Migrations reverted successfully.")
 	showVersion(m)
 }
 
@@ -164,7 +164,7 @@ func handleMigrateVersion(ctx context.Context) {
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize migration tool: %v", err)
+		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
@@ -187,25 +187,25 @@ func handleMigrateForce(ctx context.Context) {
 
 	version, err := strconv.Atoi(fs.Arg(0))
 	if err != nil {
-		log.Fatalf("Invalid version number: %v", err)
+		logger.Fatalf("Invalid version number: %v", err)
 	}
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize migration tool: %v", err)
+		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
 
 	if err := acquireExclusiveLock(ctx, db); err != nil {
-		log.Fatalf("Failed to acquire exclusive lock: %v", err)
+		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
 	}
 	defer releaseExclusiveLock(context.Background(), db)
 
-	log.Printf("Forcing database version to %d...", version)
+	logger.Infof("Forcing database version to %d...", version)
 	if err := m.Force(version); err != nil {
-		log.Fatalf("Failed to force version: %v", err)
+		logger.Fatalf("Failed to force version: %v", err)
 	}
-	log.Println("Version forced successfully.")
+	logger.Info("Version forced successfully.")
 	showVersion(m)
 }
 
@@ -213,7 +213,7 @@ func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrat
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("WARNING: configuration file '%s' not found. Using defaults.", configPath)
+			logger.Infof("WARNING: configuration file '%s' not found. Using defaults.", configPath)
 		} else {
 			return nil, nil, fmt.Errorf("error parsing configuration file '%s': %w", configPath, err)
 		}
@@ -285,7 +285,7 @@ func acquireExclusiveLock(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("could not acquire exclusive database lock. Is a sora server instance already running?")
 	}
 
-	log.Println("Acquired exclusive database lock for migration.")
+	logger.Info("Acquired exclusive database lock for migration.")
 	return nil
 }
 
@@ -297,11 +297,11 @@ func releaseExclusiveLock(ctx context.Context, db *sql.DB) {
 
 	err := db.QueryRowContext(queryCtx, "SELECT pg_advisory_unlock($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
 	if err != nil {
-		log.Printf("WARN: failed to release advisory lock after migration: %v", err)
+		logger.Infof("WARN: failed to release advisory lock after migration: %v", err)
 	} else if unlocked {
-		log.Println("Released exclusive database lock.")
+		logger.Info("Released exclusive database lock.")
 	} else {
-		log.Printf("WARN: pg_advisory_unlock reported lock was not held at time of release.")
+		logger.Infof("WARN: pg_advisory_unlock reported lock was not held at time of release.")
 	}
 }
 
@@ -309,18 +309,18 @@ func showVersion(m *migrate.Migrate) {
 	version, dirty, err := m.Version()
 	if err != nil {
 		if errors.Is(err, migrate.ErrNilVersion) {
-			log.Println("Current migration version: none")
+			logger.Info("Current migration version: none")
 			return
 		}
-		log.Printf("Failed to get migration version: %v", err)
+		logger.Infof("Failed to get migration version: %v", err)
 		return
 	}
 
-	log.Printf("Current migration version: %d", version)
+	logger.Infof("Current migration version: %d", version)
 	if dirty {
-		log.Println("Dirty state: YES (Database may be in an inconsistent state. Use 'force' to fix.)")
+		logger.Info("Dirty state: YES (Database may be in an inconsistent state. Use 'force' to fix.)")
 	} else {
-		log.Println("Dirty state: no")
+		logger.Info("Dirty state: no")
 	}
 }
 
@@ -328,7 +328,7 @@ func showVersion(m *migrate.Migrate) {
 type migrationLogger struct{}
 
 func (l *migrationLogger) Printf(format string, v ...interface{}) {
-	log.Printf("[MIGRATE] "+format, v...)
+	logger.Infof("[MIGRATE] "+format, v...)
 }
 
 func (l *migrationLogger) Verbose() bool {

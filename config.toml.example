@@ -1,17 +1,24 @@
 # SORA MAIL SERVER - CONFIGURATION FILE
 # =============================================================================
-# 
+#
 # This is the main configuration file for Sora, a hackable IMAP server built
 # with Go and PostgreSQL. This file contains all available configuration
 # options with detailed explanations and examples.
 #
-# IMPORTANT: 
+# IMPORTANT:
 # - Copy this file to config.toml and modify the values for your deployment
 # - All sections and options are documented with their default values
 # - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
 # - Size values accept common suffixes: "1gb", "100mb", "5kb"
 
-log_output = "stderr"         # Log destination. Options: "stderr", "stdout", "syslog", or "/path/to/file.log".
+# LOGGING CONFIGURATION
+# =============================================================================
+# Structured logging configuration using zap logger for better observability.
+
+[logging]
+output = "stderr"         # Log destination: "stderr", "stdout", "syslog", or "/path/to/file.log"
+format = "console"        # Log format: "json" for structured JSON logs, "console" for human-readable output
+level = "info"            # Log level: "debug", "info", "warn", "error"
 
 
 # DATABASE CONFIGURATION

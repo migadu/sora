@@ -4,18 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
-	"log/syslog"
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
@@ -63,7 +61,6 @@ func main() {
 	showVersion := flag.Bool("version", false, "Show version information and exit")
 	flag.BoolVar(showVersion, "v", false, "Show version information and exit")
 	configPath := flag.String("config", "config.toml", "Path to TOML configuration file")
-	fLogOutput := flag.String("logoutput", cfg.LogOutput, "Log output destination: 'syslog', 'stderr', 'stdout', or file path")
 	flag.Parse()
 
 	if *showVersion {
@@ -74,22 +71,32 @@ func main() {
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
-	// Apply command-line flag overrides
-	finalLogOutput := cfg.LogOutput
-	if isFlagSet("logoutput") {
-		finalLogOutput = *fLogOutput
+	// Initialize logging with zap logger
+	logFile, err := logger.Initialize(cfg.Logging)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SORA: Warning initializing logger: %v\n", err)
 	}
-
-	// Initialize logging
-	logFile := initializeLogging(finalLogOutput)
 	if logFile != nil {
 		defer func(f *os.File) {
+			logger.Sync() // Flush any buffered log entries
 			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
 			if err := f.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
 			}
 		}(logFile)
+	} else {
+		defer logger.Sync() // Still sync even without a log file
 	}
+
+	// Print startup banner
+	logger.Println("")
+	logger.Println(" ▗▄▄▖ ▗▄▖ ▗▄▄▖  ▗▄▖  ")
+	logger.Println("▐▌   ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌ ")
+	logger.Println(" ▝▀▚▖▐▌ ▐▌▐▛▀▚▖▐▛▀▜▌ ")
+	logger.Println("▗▄▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌ ")
+	logger.Println("")
+	logger.Infof("SORA application starting (version %s, commit: %s, built: %s)", version, commit, date)
+	logger.Infof("Logging format: %s, level: %s", cfg.Logging.Format, cfg.Logging.Level)
 
 	// Set up context and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -99,14 +106,14 @@ func main() {
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-signalChan
-		log.Printf("Received signal: %s, shutting down...", sig)
+		logger.Infof("Received signal: %s, shutting down...", sig)
 		cancel()
 	}()
 
 	// Initialize all core services
-	deps, err := initializeServices(ctx, cfg, errorHandler)
-	if err != nil {
-		errorHandler.FatalError("initialize services", err)
+	deps, initErr := initializeServices(ctx, cfg, errorHandler)
+	if initErr != nil {
+		errorHandler.FatalError("initialize services", initErr)
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -131,82 +138,25 @@ func main() {
 	}
 }
 
-// initializeLogging sets up the logging system based on the configuration
-func initializeLogging(finalLogOutput string) *os.File {
-	var logFile *os.File
-	var initialLogMessage string
-
-	switch finalLogOutput {
-	case "stdout":
-		log.SetOutput(os.Stdout)
-		initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to standard output (selected by '%s').", finalLogOutput)
-	case "syslog":
-		if runtime.GOOS != "windows" {
-			syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "sora")
-			if err != nil {
-				log.Printf("WARNING: failed to connect to syslog (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, err)
-				initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog connection failed, selected by '%s').", finalLogOutput)
-			} else {
-				log.SetOutput(syslogWriter)
-				log.SetFlags(0) // syslog handles timestamps
-				defer syslogWriter.Close()
-				initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to syslog (selected by '%s').", finalLogOutput)
-			}
-		} else {
-			log.Printf("WARNING: syslog logging is not supported on Windows (specified by '%s'). Logging will fall back to standard error.", finalLogOutput)
-			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (syslog not supported on this OS, selected by '%s').", finalLogOutput)
-		}
-	case "stderr":
-		initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to standard error (selected by '%s').", finalLogOutput)
-	default:
-		// Assume it's a file path
-		var openErr error
-		logFile, openErr = os.OpenFile(finalLogOutput, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if openErr != nil {
-			log.Printf("WARNING: failed to open log file '%s' (specified by '%s'): %v. Logging will fall back to standard error.", finalLogOutput, finalLogOutput, openErr)
-			initialLogMessage = fmt.Sprintf("SORA application starting. Logging to standard error (failed to open log file '%s', selected by '%s').", finalLogOutput, finalLogOutput)
-			logFile = nil // Ensure logFile is nil if open failed
-		} else {
-			log.SetOutput(logFile)
-
-			// Redirect both stdout and stderr to the log file
-			// This ensures all output (including panics, direct writes, and error handler output) goes to the file
-			os.Stdout = logFile
-			os.Stderr = logFile
-
-			// Keep standard log flags (date, time) for file logging
-			initialLogMessage = fmt.Sprintf("SORA application starting. Logging initialized to file '%s' (selected by '%s').", finalLogOutput, finalLogOutput)
-		}
-	}
-	log.Println(initialLogMessage)
-
-	log.Println("")
-	log.Println(" ▗▄▄▖ ▗▄▖ ▗▄▄▖  ▗▄▖  ")
-	log.Println("▐▌   ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌ ")
-	log.Println(" ▝▀▚▖▐▌ ▐▌▐▛▀▚▖▐▛▀▜▌ ")
-	log.Println("▗▄▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌ ")
-	log.Println("")
-
-	return logFile
-}
-
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
 	if err := config.LoadConfigFromFile(configPath, cfg); err != nil {
 		if os.IsNotExist(err) {
-			if isFlagSet("config") { // User explicitly set -config
+			// If default config doesn't exist, that's okay - use defaults
+			if configPath == "config.toml" {
+				logger.Infof("WARNING: default configuration file '%s' not found. Using application defaults.", configPath)
+			} else {
+				// User specified a config file that doesn't exist - that's an error
 				errorHandler.ConfigError(configPath, err)
 				os.Exit(errorHandler.WaitForExit())
-			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using application defaults.", configPath)
 			}
 		} else {
 			errorHandler.ConfigError(configPath, err)
 			os.Exit(errorHandler.WaitForExit())
 		}
 	} else {
-		log.Printf("loaded configuration from %s", configPath)
+		logger.Infof("loaded configuration from %s", configPath)
 	}
 
 	// Get all configured servers
@@ -244,7 +194,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
-	log.Printf("Found %d configured servers", len(allServers))
+	logger.Infof("Found %d configured servers", len(allServers))
 }
 
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
@@ -280,7 +230,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.ValidationError("S3 endpoint", fmt.Errorf("S3 endpoint not specified"))
 			os.Exit(errorHandler.WaitForExit())
 		}
-		log.Printf("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
+		logger.Infof("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
 		var err error
 		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 		if err != nil {
@@ -298,25 +248,25 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	// Initialize the resilient database with runtime failover
-	log.Printf("Connecting to database with resilient failover configuration")
+	logger.Infof("Connecting to database with resilient failover configuration")
 	var err error
 	deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 	if err != nil {
-		log.Printf("Failed to initialize resilient database: %v", err)
+		logger.Infof("Failed to initialize resilient database: %v", err)
 		os.Exit(1)
 	}
 
 	// Start the new aggregated metrics and health monitoring for all managed pools
 	deps.resilientDB.StartPoolMetrics(ctx)
 	deps.resilientDB.StartPoolHealthMonitoring(ctx)
-	log.Printf("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+	logger.Infof("Database resilience features initialized: failover, circuit breakers, pool monitoring")
 
 	// Initialize health monitoring
-	log.Printf("Initializing health monitoring...")
+	logger.Infof("Initializing health monitoring...")
 	healthIntegration := health.NewHealthIntegration(deps.resilientDB)
 
 	if storageServicesNeeded {
-		log.Println("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
+		logger.Info("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
 
 		// Register S3 health check
 		healthIntegration.RegisterS3Check(deps.storage)
@@ -380,7 +330,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		metricsInterval := cfg.LocalCache.GetMetricsIntervalWithDefault()
 		metricsRetention := cfg.LocalCache.GetMetricsRetentionWithDefault()
 
-		log.Printf("[CACHE] starting metrics collection with interval: %v", metricsInterval)
+		logger.Infof("[CACHE] starting metrics collection with interval: %v", metricsInterval)
 		go func() {
 			metricsTicker := time.NewTicker(metricsInterval)
 			cleanupTicker := time.NewTicker(24 * time.Hour)
@@ -396,13 +346,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					uptimeSeconds := int64(time.Since(metrics.StartTime).Seconds())
 
 					if err := deps.resilientDB.StoreCacheMetricsWithRetry(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
-						log.Printf("[CACHE] WARNING: failed to store metrics: %v", err)
+						logger.Infof("[CACHE] WARNING: failed to store metrics: %v", err)
 					}
 				case <-cleanupTicker.C:
 					if deleted, err := deps.resilientDB.CleanupOldCacheMetricsWithRetry(ctx, metricsRetention); err != nil {
-						log.Printf("[CACHE] WARNING: failed to cleanup old metrics: %v", err)
+						logger.Infof("[CACHE] WARNING: failed to cleanup old metrics: %v", err)
 					} else if deleted > 0 {
-						log.Printf("[CACHE] cleaned up %d old cache metrics records", deleted)
+						logger.Infof("[CACHE] cleaned up %d old cache metrics records", deleted)
 					}
 				}
 			}
@@ -429,12 +379,12 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 		deps.uploadWorker.Start(ctx)
 	} else {
-		log.Println("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
+		logger.Info("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
 	}
 
 	// Start health monitoring
 	healthIntegration.Start(ctx)
-	log.Printf("Health monitoring started - collecting metrics every 30-60 seconds")
+	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
 
 	return deps, nil
 }
@@ -476,7 +426,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		case "http_api":
 			go startDynamicHTTPAPIServer(ctx, deps, server, errChan)
 		default:
-			log.Printf("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
+			logger.Infof("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
 		}
 	}
 
@@ -493,17 +443,17 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 
 	updateInterval, err := trackingConfig.GetUpdateInterval()
 	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking update_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.UpdateInterval, protocol, serverName, err)
+		logger.Infof("WARNING: invalid connection_tracking update_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.UpdateInterval, protocol, serverName, err)
 		updateInterval = 10 * time.Second
 	}
 
 	terminationPollInterval, err := trackingConfig.GetTerminationPollInterval()
 	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.TerminationPollInterval, protocol, serverName, err)
+		logger.Infof("WARNING: invalid connection_tracking termination_poll_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.TerminationPollInterval, protocol, serverName, err)
 		terminationPollInterval = 30 * time.Second
 	}
 
-	log.Printf("* %s Proxy [%s] Starting connection tracker.", protocol, serverName)
+	logger.Infof("* %s Proxy [%s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		rdb,
@@ -517,17 +467,6 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 	server.SetConnectionTracker(tracker)
 	tracker.Start()
 	return tracker
-}
-
-// Helper function to check if a flag was explicitly set on the command line
-func isFlagSet(name string) bool {
-	isSet := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			isSet = true
-		}
-	})
-	return isSet
 }
 
 // Dynamic server functions
@@ -610,9 +549,9 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down LMTP server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down LMTP server %s...\n", serverConfig.Name)
 		if err := lmtpServer.Close(); err != nil {
-			log.Printf("Error closing LMTP server: %v", err)
+			logger.Infof("Error closing LMTP server: %v", err)
 		}
 	}()
 
@@ -650,7 +589,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down POP3 server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down POP3 server %s...\n", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -694,7 +633,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down ManageSieve server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down ManageSieve server %s...\n", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -713,11 +652,11 @@ func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerCo
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down metrics server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down metrics server %s...\n", serverConfig.Name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Error shutting down metrics server: %v", err)
+			logger.Infof("Error shutting down metrics server: %v", err)
 		}
 	}()
 
@@ -778,7 +717,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down IMAP proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down IMAP proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -839,7 +778,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down POP3 proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down POP3 proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -897,7 +836,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down ManageSieve proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down ManageSieve proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -950,7 +889,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Shutting down LMTP proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down LMTP proxy server %s...\n", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -959,7 +898,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 func startDynamicHTTPAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
 	if serverConfig.APIKey == "" {
-		log.Printf("WARNING: HTTP API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
+		logger.Infof("WARNING: HTTP API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
 		return
 	}
 

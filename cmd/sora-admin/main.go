@@ -6,7 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"os"
 	"os/signal"
 	"strings"
@@ -494,7 +494,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -544,12 +544,12 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
@@ -557,13 +557,13 @@ Examples:
 	if *credentials != "" {
 		// Create account with multiple credentials
 		if err := createAccountWithCredentials(cfg, *credentials); err != nil {
-			log.Fatalf("Failed to create account with credentials: %v", err)
+			logger.Fatalf("Failed to create account with credentials: %v", err)
 		}
 		fmt.Printf("Successfully created account with multiple credentials\n")
 	} else {
 		// Create account with single credential (always as primary identity)
 		if err := createAccount(cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
-			log.Fatalf("Failed to create account: %v", err)
+			logger.Fatalf("Failed to create account: %v", err)
 		}
 		fmt.Printf("Successfully created account: %s\n", *email)
 	}
@@ -607,7 +607,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -655,18 +655,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Add the credential
 	if err := addCredential(cfg, *primaryIdentity, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
-		log.Fatalf("Failed to add credential: %v", err)
+		logger.Fatalf("Failed to add credential: %v", err)
 	}
 
 	fmt.Printf("Successfully added credential: %s to account with primary identity: %s\n", *email, *primaryIdentity)
@@ -755,7 +755,7 @@ func createAccountWithCredentials(cfg AdminConfig, credentialsJSON string) error
 		return err
 	}
 
-	log.Printf("Created account with ID %d and %d credentials", accountID, len(credentials))
+	logger.Infof("Created account with ID %d and %d credentials", accountID, len(credentials))
 	return nil
 }
 
@@ -796,7 +796,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -804,18 +804,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// List connections
 	if err := listConnections(cfg, *userEmail, *protocol, *instanceID); err != nil {
-		log.Fatalf("Failed to list connections: %v", err)
+		logger.Fatalf("Failed to list connections: %v", err)
 	}
 }
 
@@ -953,7 +953,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate that at least one filter is specified
@@ -986,18 +986,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Kick connections
 	if err := kickConnections(cfg, *userEmail, *protocol, *server, *clientAddr, *all, *confirm); err != nil {
-		log.Fatalf("Failed to kick connections: %v", err)
+		logger.Fatalf("Failed to kick connections: %v", err)
 	}
 }
 
@@ -1179,7 +1179,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -1221,18 +1221,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Update the account
 	if err := updateAccount(cfg, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
-		log.Fatalf("Failed to update account: %v", err)
+		logger.Fatalf("Failed to update account: %v", err)
 	}
 
 	// Print appropriate success message based on what was updated
@@ -1277,7 +1277,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -1298,18 +1298,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Delete the account
 	if err := deleteAccount(cfg, *email); err != nil {
-		log.Fatalf("Failed to delete account: %v", err)
+		logger.Fatalf("Failed to delete account: %v", err)
 	}
 
 	fmt.Printf("Successfully soft-deleted account: %s. It will be permanently removed after the grace period.\n", *email)
@@ -1386,7 +1386,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -1401,18 +1401,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// List the credentials
 	if err := listCredentials(cfg, *email); err != nil {
-		log.Fatalf("Failed to list credentials: %v", err)
+		logger.Fatalf("Failed to list credentials: %v", err)
 	}
 }
 
@@ -1482,7 +1482,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -1497,18 +1497,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Delete the credential
 	if err := deleteCredential(cfg, *email); err != nil {
-		log.Fatalf("Failed to delete credential: %v", err)
+		logger.Fatalf("Failed to delete credential: %v", err)
 	}
 
 	fmt.Printf("Successfully deleted credential: %s\n", *email)
@@ -1562,7 +1562,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -1570,18 +1570,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// List accounts
 	if err := listAccounts(cfg); err != nil {
-		log.Fatalf("Failed to list accounts: %v", err)
+		logger.Fatalf("Failed to list accounts: %v", err)
 	}
 }
 
@@ -1662,7 +1662,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -1677,18 +1677,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Restore the account
 	if err := restoreAccount(cfg, *email); err != nil {
-		log.Fatalf("Failed to restore account: %v", err)
+		logger.Fatalf("Failed to restore account: %v", err)
 	}
 
 	fmt.Printf("Successfully restored account: %s\n", *email)
@@ -1727,7 +1727,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	if *email == "" {
@@ -1742,18 +1742,18 @@ Examples:
 		// Check if this is a file not found error and if so, be more flexible.
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show the account details
 	if err := showAccount(cfg, *email, *jsonOutput); err != nil {
-		log.Fatalf("Failed to show account: %v", err)
+		logger.Fatalf("Failed to show account: %v", err)
 	}
 }
 
@@ -1866,7 +1866,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	if *email == "" {
@@ -1881,18 +1881,18 @@ Examples:
 		// Check if this is a file not found error and if so, be more flexible.
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show the credential details
 	if err := showCredential(cfg, *email, *jsonOutput); err != nil {
-		log.Fatalf("Failed to show credential: %v", err)
+		logger.Fatalf("Failed to show credential: %v", err)
 	}
 }
 
@@ -2045,7 +2045,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required flags
@@ -2061,12 +2061,12 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
@@ -2075,21 +2075,21 @@ Examples:
 	if *since != "" {
 		t, err := parseTimeFlag(*since)
 		if err != nil {
-			log.Fatalf("Invalid --since value: %v", err)
+			logger.Fatalf("Invalid --since value: %v", err)
 		}
 		sinceTime = &t
 	}
 	if *until != "" {
 		t, err := parseTimeFlag(*until)
 		if err != nil {
-			log.Fatalf("Invalid --until value: %v", err)
+			logger.Fatalf("Invalid --until value: %v", err)
 		}
 		untilTime = &t
 	}
 
 	// List deleted messages
 	if err := listDeletedMessages(cfg, *email, mailbox, sinceTime, untilTime, *limit); err != nil {
-		log.Fatalf("Failed to list deleted messages: %v", err)
+		logger.Fatalf("Failed to list deleted messages: %v", err)
 	}
 }
 
@@ -2147,7 +2147,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required flags
@@ -2171,12 +2171,12 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
@@ -2188,7 +2188,7 @@ Examples:
 			part = strings.TrimSpace(part)
 			var id int64
 			if _, err := fmt.Sscanf(part, "%d", &id); err != nil {
-				log.Fatalf("Invalid message ID '%s': %v", part, err)
+				logger.Fatalf("Invalid message ID '%s': %v", part, err)
 			}
 			messageIDs = append(messageIDs, id)
 		}
@@ -2199,21 +2199,21 @@ Examples:
 	if *since != "" {
 		t, err := parseTimeFlag(*since)
 		if err != nil {
-			log.Fatalf("Invalid --since value: %v", err)
+			logger.Fatalf("Invalid --since value: %v", err)
 		}
 		sinceTime = &t
 	}
 	if *until != "" {
 		t, err := parseTimeFlag(*until)
 		if err != nil {
-			log.Fatalf("Invalid --until value: %v", err)
+			logger.Fatalf("Invalid --until value: %v", err)
 		}
 		untilTime = &t
 	}
 
 	// Restore messages
 	if err := restoreMessages(cfg, *email, mailbox, messageIDs, sinceTime, untilTime, *confirm); err != nil {
-		log.Fatalf("Failed to restore messages: %v", err)
+		logger.Fatalf("Failed to restore messages: %v", err)
 	}
 }
 
@@ -2524,7 +2524,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command name and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -2575,12 +2575,12 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
@@ -2588,25 +2588,25 @@ Examples:
 	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
-		log.Fatalf("Failed to initialize resilient database: %v", err)
+		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
 	defer rdb.Close()
 
 	// Connect to S3
 	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 	if err != nil {
-		log.Fatalf("Failed to connect to S3: %v", err)
+		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
 	if cfg.S3.Encrypt {
 		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
-			log.Fatalf("Failed to enable S3 encryption: %v", err)
+			logger.Fatalf("Failed to enable S3 encryption: %v", err)
 		}
 	}
 
 	// Get FTS retention from config
 	ftsRetention, err := cfg.Cleanup.GetFTSRetention()
 	if err != nil {
-		log.Fatalf("Failed to parse FTS retention: %v", err)
+		logger.Fatalf("Failed to parse FTS retention: %v", err)
 	}
 
 	// Create importer options
@@ -2628,11 +2628,11 @@ Examples:
 
 	importer, err := NewImporter(*maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
-		log.Fatalf("Failed to create importer: %v", err)
+		logger.Fatalf("Failed to create importer: %v", err)
 	}
 
 	if err := importer.Run(); err != nil {
-		log.Fatalf("Failed to import maildir: %v", err)
+		logger.Fatalf("Failed to import maildir: %v", err)
 	}
 }
 
@@ -2736,7 +2736,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command name and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate required arguments
@@ -2787,12 +2787,12 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
@@ -2800,18 +2800,18 @@ Examples:
 	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
-		log.Fatalf("Failed to initialize resilient database: %v", err)
+		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
 	defer rdb.Close()
 
 	// Connect to S3
 	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 	if err != nil {
-		log.Fatalf("Failed to connect to S3: %v", err)
+		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
 	if cfg.S3.Encrypt {
 		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
-			log.Fatalf("Failed to enable S3 encryption: %v", err)
+			logger.Fatalf("Failed to enable S3 encryption: %v", err)
 		}
 	}
 
@@ -2833,11 +2833,11 @@ Examples:
 
 	exporter, err := NewExporter(*maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
-		log.Fatalf("Failed to create exporter: %v", err)
+		logger.Fatalf("Failed to create exporter: %v", err)
 	}
 
 	if err := exporter.Run(); err != nil {
-		log.Fatalf("Failed to export maildir: %v", err)
+		logger.Fatalf("Failed to export maildir: %v", err)
 	}
 }
 
@@ -2870,7 +2870,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -2878,18 +2878,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show cache stats
 	if err := showCacheStats(cfg); err != nil {
-		log.Fatalf("Failed to show cache stats: %v", err)
+		logger.Fatalf("Failed to show cache stats: %v", err)
 	}
 }
 
@@ -2922,7 +2922,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -2930,18 +2930,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Purge cache
 	if err := purgeCacheWithConfirmation(cfg, *confirm); err != nil {
-		log.Fatalf("Failed to purge cache: %v", err)
+		logger.Fatalf("Failed to purge cache: %v", err)
 	}
 }
 
@@ -3075,7 +3075,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -3083,18 +3083,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show uploader status
 	if err := showUploaderStatus(cfg, *showFailed, *failedLimit); err != nil {
-		log.Fatalf("Failed to show uploader status: %v", err)
+		logger.Fatalf("Failed to show uploader status: %v", err)
 	}
 }
 
@@ -3240,7 +3240,7 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Load configuration
@@ -3248,18 +3248,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show connection statistics
 	if err := showConnectionStats(cfg, *userEmail, *server, *cleanupStale, *staleMinutes, *showDetail); err != nil {
-		log.Fatalf("Failed to show connection stats: %v", err)
+		logger.Fatalf("Failed to show connection stats: %v", err)
 	}
 }
 
@@ -3436,19 +3436,19 @@ Examples:
 
 	err := fs.Parse(os.Args[2:])
 	if err != nil {
-		log.Fatalf("Failed to parse flags: %v", err)
+		logger.Fatalf("Failed to parse flags: %v", err)
 	}
 
 	// Parse window duration
 	window, err := time.ParseDuration(*windowDuration)
 	if err != nil {
-		log.Fatalf("Invalid window duration '%s': %v", *windowDuration, err)
+		logger.Fatalf("Invalid window duration '%s': %v", *windowDuration, err)
 	}
 
 	// Load configuration
 	var adminConfig AdminConfig
 	if _, err := toml.DecodeFile(*configPath, &adminConfig); err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatalf("Failed to load config: %v", err)
 	}
 
 	// Create context for database operations
@@ -3457,7 +3457,7 @@ Examples:
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database, false, false)
 	if err != nil {
-		log.Fatalf("Failed to initialize resilient database: %v", err)
+		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
 	defer rdb.Close()
 
@@ -3469,7 +3469,7 @@ Examples:
 	if *showStats {
 		stats, err := rdb.GetAuthAttemptsStatsWithRetry(ctx, window)
 		if err != nil {
-			log.Printf("Failed to get auth statistics: %v", err)
+			logger.Infof("Failed to get auth statistics: %v", err)
 		} else {
 			fmt.Printf("Overall Statistics (last %s):\n", window)
 			fmt.Printf("  Total Attempts:     %v\n", stats["total_attempts"])
@@ -3486,7 +3486,7 @@ Examples:
 	if *showBlocked {
 		blocked, err := rdb.GetBlockedIPsWithRetry(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
 		if err != nil {
-			log.Printf("Failed to get blocked IPs: %v", err)
+			logger.Infof("Failed to get blocked IPs: %v", err)
 		} else {
 			if len(blocked) > 0 {
 				fmt.Printf("Currently Blocked (exceeding thresholds):\n")
@@ -3606,7 +3606,7 @@ Examples:
 	// Parse command arguments (skip program name, command name, and subcommand name)
 	args := os.Args[3:]
 	if err := fs.Parse(args); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Validate time window format for history
@@ -3621,11 +3621,11 @@ Examples:
 					duration = d * 24
 				} else {
 					// The inner parse failed, so the format is invalid.
-					log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+					logger.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
 				}
 			} else {
 				// The original parse failed and it's not a 'd' unit we can handle.
-				log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+				logger.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
 			}
 		}
 		sinceTime = time.Now().Add(-duration)
@@ -3635,13 +3635,13 @@ Examples:
 	cfg := AdminConfig{}
 	if _, err := os.Stat(*configPath); err == nil {
 		if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	} else {
 		if isFlagSet(fs, "config") {
-			log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+			logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 		} else {
-			log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 		}
 	}
 
@@ -3649,17 +3649,17 @@ Examples:
 	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
-		log.Fatalf("Failed to initialize resilient database: %v", err)
+		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
 	defer rdb.Close()
 
 	if *jsonOutput {
 		if err := showHealthStatusJSON(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
-			log.Fatalf("Failed to show health status: %v", err)
+			logger.Fatalf("Failed to show health status: %v", err)
 		}
 	} else {
 		if err := showHealthStatus(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
-			log.Fatalf("Failed to show health status: %v", err)
+			logger.Fatalf("Failed to show health status: %v", err)
 		}
 	}
 }
@@ -4019,13 +4019,13 @@ Examples:
 
 	// Parse the remaining arguments (skip the command and subcommand name)
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
 	// Parse since duration
 	sinceDuration, err := helpers.ParseDuration(*since)
 	if err != nil {
-		log.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
+		logger.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
 	}
 
 	// Load configuration
@@ -4033,18 +4033,18 @@ Examples:
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
-				log.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				log.Printf("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
 			}
 		} else {
-			log.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	}
 
 	// Show cache metrics
 	if err := showCacheMetrics(cfg, *instanceID, sinceDuration, *showHistory, *limit, *jsonOutput); err != nil {
-		log.Fatalf("Failed to show cache metrics: %v", err)
+		logger.Fatalf("Failed to show cache metrics: %v", err)
 	}
 }
 
@@ -4266,7 +4266,7 @@ Examples:
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(configFile, &cfg); err != nil {
-		log.Fatalf("Failed to load config file: %v", err)
+		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
 	// Mask secrets if requested
@@ -4288,17 +4288,17 @@ Examples:
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(cfg); err != nil {
-			log.Fatalf("Failed to encode config as JSON: %v", err)
+			logger.Fatalf("Failed to encode config as JSON: %v", err)
 		}
 	case "pretty":
 		printPrettyConfig(cfg)
 	case "toml":
 		encoder := toml.NewEncoder(os.Stdout)
 		if err := encoder.Encode(cfg); err != nil {
-			log.Fatalf("Failed to encode config as TOML: %v", err)
+			logger.Fatalf("Failed to encode config as TOML: %v", err)
 		}
 	default:
-		log.Fatalf("Unknown format: %s (supported: toml, json, pretty)", format)
+		logger.Fatalf("Unknown format: %s (supported: toml, json, pretty)", format)
 	}
 }
 
@@ -4383,36 +4383,36 @@ func handleImportS3() {
 
 	// Parse the flags
 	if err := fs.Parse(os.Args[3:]); err != nil {
-		log.Fatalf("Failed to parse flags: %v", err)
+		logger.Fatalf("Failed to parse flags: %v", err)
 	}
 
 	// Validate required flags
 	if *email == "" {
-		log.Fatal("--email is required (e.g., 'user@example.com')")
+		logger.Fatal("--email is required (e.g., 'user@example.com')")
 	}
 
 	// Load configuration
 	var cfg AdminConfig
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
-		log.Fatalf("Failed to load config file: %v", err)
+		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
 	// Connect to resilient database
 	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
-		log.Fatalf("Failed to initialize resilient database: %v", err)
+		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
 	defer rdb.Close()
 
 	// Connect to S3
 	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
 	if err != nil {
-		log.Fatalf("Failed to connect to S3: %v", err)
+		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
 	if cfg.S3.Encrypt {
 		if err := s3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
-			log.Fatalf("Failed to enable S3 encryption: %v", err)
+			logger.Fatalf("Failed to enable S3 encryption: %v", err)
 		}
 	}
 
@@ -4432,10 +4432,10 @@ func handleImportS3() {
 
 	importer, err := NewS3Importer(rdb, s3, options)
 	if err != nil {
-		log.Fatalf("Failed to create S3 importer: %v", err)
+		logger.Fatalf("Failed to create S3 importer: %v", err)
 	}
 
 	if err := importer.Run(); err != nil {
-		log.Fatalf("Failed to import from S3: %v", err)
+		logger.Fatalf("Failed to import from S3: %v", err)
 	}
 }

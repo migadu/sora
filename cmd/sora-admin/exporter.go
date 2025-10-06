@@ -4,8 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,7 +66,7 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 
 	// Use the shared SQLite database in the maildir path
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
-	log.Printf("Using maildir database: %s", dbPath)
+	logger.Infof("Using maildir database: %s", dbPath)
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -116,7 +116,7 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 func (exporter *Exporter) Close() error {
 	if exporter.db != nil {
 		exporter.db.Close()
-		log.Printf("Maildir database saved at: %s", exporter.dbPath)
+		logger.Infof("Maildir database saved at: %s", exporter.dbPath)
 	}
 	return nil
 }
@@ -139,7 +139,7 @@ func (exporter *Exporter) Run() error {
 	}
 	user := server.NewUser(address, accountID)
 
-	log.Printf("Exporting messages for user: %s (account ID: %d)", address.FullAddress(), accountID)
+	logger.Infof("Exporting messages for user: %s (account ID: %d)", address.FullAddress(), accountID)
 
 	// Get mailboxes to export
 	mailboxes, err := exporter.getMailboxesToExport(ctx, user.UserID())
@@ -148,14 +148,14 @@ func (exporter *Exporter) Run() error {
 	}
 
 	if len(mailboxes) == 0 {
-		log.Println("No mailboxes to export")
+		logger.Info("No mailboxes to export")
 		return nil
 	}
 
-	log.Printf("Found %d mailboxes to export", len(mailboxes))
+	logger.Infof("Found %d mailboxes to export", len(mailboxes))
 
 	if exporter.options.DryRun {
-		log.Println("DRY RUN: Analyzing what would be exported...")
+		logger.Info("DRY RUN: Analyzing what would be exported...")
 		return exporter.performDryRun(ctx, user.UserID(), mailboxes)
 	}
 
@@ -168,9 +168,9 @@ func (exporter *Exporter) Run() error {
 
 	// Export messages from each mailbox
 	for _, mbox := range mailboxes {
-		log.Printf("Exporting mailbox: %s", mbox.Name)
+		logger.Infof("Exporting mailbox: %s", mbox.Name)
 		if err := exporter.exportMailbox(ctx, mbox); err != nil {
-			log.Printf("Failed to export mailbox %s: %v", mbox.Name, err)
+			logger.Infof("Failed to export mailbox %s: %v", mbox.Name, err)
 			// Continue with other mailboxes
 		}
 	}
@@ -178,14 +178,14 @@ func (exporter *Exporter) Run() error {
 	// Export Dovecot files if requested
 	if exporter.options.Dovecot {
 		if err := exporter.exportDovecotFiles(mailboxes); err != nil {
-			log.Printf("Warning: Failed to export Dovecot files: %v", err)
+			logger.Infof("Warning: Failed to export Dovecot files: %v", err)
 		}
 	}
 
 	// Generate dovecot-uidlist files if requested
 	if exporter.options.ExportUIDList {
 		if err := exporter.generateDovecotUIDLists(mailboxes); err != nil {
-			log.Printf("Warning: Failed to generate dovecot-uidlist files: %v", err)
+			logger.Infof("Warning: Failed to generate dovecot-uidlist files: %v", err)
 		}
 	}
 
@@ -400,11 +400,11 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 	}
 
 	if summary.NumMessages == 0 {
-		log.Printf("No messages in mailbox %s", mailbox.Name)
+		logger.Infof("No messages in mailbox %s", mailbox.Name)
 		return nil
 	}
 
-	log.Printf("Found %d messages in mailbox %s", summary.NumMessages, mailbox.Name)
+	logger.Infof("Found %d messages in mailbox %s", summary.NumMessages, mailbox.Name)
 	atomic.AddInt64(&exporter.totalMessages, int64(summary.NumMessages))
 
 	// Get all messages in the mailbox using a full sequence set
@@ -436,13 +436,13 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 					}
 
 					if retry < 2 { // Don't delay after last attempt
-						log.Printf("%s Export attempt %d/3 failed for UID %d: %v, retrying...", exporter.getProgressPrefix(), retry+1, msg.UID, err)
+						logger.Infof("%s Export attempt %d/3 failed for UID %d: %v, retrying...", exporter.getProgressPrefix(), retry+1, msg.UID, err)
 						time.Sleep(time.Duration(retry+1) * time.Second) // Exponential backoff
 					}
 				}
 
 				if err != nil {
-					log.Printf("%s Failed to export message UID %d after 3 attempts: %v", exporter.getProgressPrefix(), msg.UID, err)
+					logger.Infof("%s Failed to export message UID %d after 3 attempts: %v", exporter.getProgressPrefix(), msg.UID, err)
 					atomic.AddInt64(&exporter.failedMessages, 1)
 				}
 			}
@@ -480,7 +480,7 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 
 	if alreadyExported && !exporter.options.OverwriteFlags {
 		atomic.AddInt64(&exporter.skippedMessages, 1)
-		log.Printf("%s Message already exported (hash: %s), skipping", exporter.getProgressPrefix(), msg.ContentHash[:12])
+		logger.Infof("%s Message already exported (hash: %s), skipping", exporter.getProgressPrefix(), msg.ContentHash[:12])
 		return nil
 	}
 
@@ -510,9 +510,9 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 		// Use existing filename from database (either for update or recreation)
 		filename = existingFilename
 		if alreadyExported {
-			log.Printf("%s Updating existing file with new flags: %s", exporter.getProgressPrefix(), filename)
+			logger.Infof("%s Updating existing file with new flags: %s", exporter.getProgressPrefix(), filename)
 		} else {
-			log.Printf("%s Recreating missing file with original filename: %s", exporter.getProgressPrefix(), filename)
+			logger.Infof("%s Recreating missing file with original filename: %s", exporter.getProgressPrefix(), filename)
 		}
 	} else {
 		// Generate new filename
@@ -545,16 +545,16 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 
 	// Set file modification time to internal date
 	if err := os.Chtimes(targetPath, msg.InternalDate, msg.InternalDate); err != nil {
-		log.Printf("Warning: Failed to set file times: %v", err)
+		logger.Infof("Warning: Failed to set file times: %v", err)
 	}
 
 	// Record export in database
 	if err := exporter.recordExport(msg.ContentHash, mailboxName, filename, targetPath, int64(msg.Size)); err != nil {
-		log.Printf("Warning: Failed to record export: %v", err)
+		logger.Infof("Warning: Failed to record export: %v", err)
 	}
 
 	atomic.AddInt64(&exporter.exportedMessages, 1)
-	log.Printf("%s Successfully exported message: UID=%d, mailbox=%s, file=%s", exporter.getProgressPrefix(), msg.UID, mailboxName, filename)
+	logger.Infof("%s Successfully exported message: UID=%d, mailbox=%s, file=%s", exporter.getProgressPrefix(), msg.UID, mailboxName, filename)
 
 	// Collect UID mapping for dovecot-uidlist generation if enabled
 	if exporter.options.ExportUIDList {
@@ -649,7 +649,7 @@ func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, 
 
 	// Check if the file still exists on disk
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		log.Printf("File in database but not on disk, will recreate with original filename: %s", filename)
+		logger.Infof("File in database but not on disk, will recreate with original filename: %s", filename)
 		return false, filename, nil // Return the original filename for reuse
 	}
 
@@ -673,7 +673,7 @@ func (exporter *Exporter) exportDovecotFiles(mailboxes []*db.DBMailbox) error {
 		return fmt.Errorf("failed to export subscriptions: %w", err)
 	}
 
-	log.Println("Exported Dovecot subscriptions file")
+	logger.Info("Exported Dovecot subscriptions file")
 	return nil
 }
 
@@ -732,7 +732,7 @@ func (exporter *Exporter) printSummary() error {
 
 // generateDovecotUIDLists generates dovecot-uidlist files for all exported mailboxes
 func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) error {
-	log.Println("Generating dovecot-uidlist files...")
+	logger.Info("Generating dovecot-uidlist files...")
 
 	exporter.mu.Lock()
 	defer exporter.mu.Unlock()
@@ -754,7 +754,7 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 		// If no UIDVALIDITY found, generate one based on current timestamp
 		if uidValidity == 0 {
 			uidValidity = uint32(time.Now().Unix())
-			log.Printf("Warning: No UIDVALIDITY found for mailbox %s, using generated value: %d", mailboxName, uidValidity)
+			logger.Infof("Warning: No UIDVALIDITY found for mailbox %s, using generated value: %d", mailboxName, uidValidity)
 		}
 
 		// Create DovecotUIDList from mappings
@@ -773,7 +773,7 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 			return fmt.Errorf("failed to write dovecot-uidlist for mailbox %s: %w", mailboxName, err)
 		}
 
-		log.Printf("Generated dovecot-uidlist for mailbox %s: %d messages, UIDVALIDITY=%d, NextUID=%d",
+		logger.Infof("Generated dovecot-uidlist for mailbox %s: %d messages, UIDVALIDITY=%d, NextUID=%d",
 			mailboxName, len(mappings), uidValidity, uidList.NextUID)
 	}
 

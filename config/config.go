@@ -806,9 +806,16 @@ type ServersConfig struct {
 	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
 }
 
+// LoggingConfig holds logging configuration
+type LoggingConfig struct {
+	Output string `toml:"output"` // Log output: "stderr", "stdout", "syslog", or file path
+	Format string `toml:"format"` // Log format: "json" or "console"
+	Level  string `toml:"level"`  // Log level: "debug", "info", "warn", "error"
+}
+
 // Config holds all configuration for the application.
 type Config struct {
-	LogOutput  string           `toml:"log_output"`
+	Logging    LoggingConfig    `toml:"logging"`
 	Database   DatabaseConfig   `toml:"database"`
 	S3         S3Config         `toml:"s3"`
 	LocalCache LocalCacheConfig `toml:"local_cache"`
@@ -823,7 +830,11 @@ type Config struct {
 // NewDefaultConfig creates a Config struct with default values.
 func NewDefaultConfig() Config {
 	return Config{
-		LogOutput: "syslog",
+		Logging: LoggingConfig{
+			Output: "stderr",  // Default to stderr
+			Format: "console", // Default to console format
+			Level:  "info",    // Default to info level
+		},
 		Database: DatabaseConfig{
 			QueryTimeout:  "30s",
 			SearchTimeout: "1m",
