@@ -74,6 +74,7 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 	}
 
 	// Create the same table structure as importer uses
+	// s3_uploaded tracks whether the message has been successfully uploaded to S3
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,11 +83,14 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 			hash TEXT NOT NULL,
 			size INTEGER NOT NULL,
 			mailbox TEXT NOT NULL,
+			s3_uploaded INTEGER DEFAULT 0,
+			s3_uploaded_at TIMESTAMP,
 			UNIQUE(hash, mailbox),
 			UNIQUE(filename, mailbox)
 		);
 		CREATE INDEX IF NOT EXISTS idx_mailbox ON messages(mailbox);
 		CREATE INDEX IF NOT EXISTS idx_hash ON messages(hash);
+		CREATE INDEX IF NOT EXISTS idx_s3_uploaded ON messages(s3_uploaded);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create exported_messages table: %w", err)
@@ -652,12 +656,12 @@ func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, 
 	return true, filename, nil
 }
 
-// recordExport records that a message was exported
+// recordExport records that a message was exported and marks it as present on S3
 func (exporter *Exporter) recordExport(contentHash, mailbox, filename, path string, size int64) error {
 	_, err := exporter.db.Exec(
-		`INSERT OR REPLACE INTO messages (hash, mailbox, filename, path, size) 
-		 VALUES (?, ?, ?, ?, ?)`,
-		contentHash, mailbox, filename, path, size,
+		`INSERT OR REPLACE INTO messages (hash, mailbox, filename, path, size, s3_uploaded, s3_uploaded_at)
+		 VALUES (?, ?, ?, ?, ?, 1, ?)`,
+		contentHash, mailbox, filename, path, size, time.Now(),
 	)
 	return err
 }

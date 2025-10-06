@@ -88,6 +88,7 @@ func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 	}
 
 	// Create the table for storing message information.
+	// s3_uploaded tracks whether the message has been successfully uploaded to S3
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,11 +97,14 @@ func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 			hash TEXT NOT NULL,
 			size INTEGER NOT NULL,
 			mailbox TEXT NOT NULL,
+			s3_uploaded INTEGER DEFAULT 0,
+			s3_uploaded_at TIMESTAMP,
 			UNIQUE(hash, mailbox),
 			UNIQUE(filename, mailbox)
 		);
 		CREATE INDEX IF NOT EXISTS idx_mailbox ON messages(mailbox);
 		CREATE INDEX IF NOT EXISTS idx_hash ON messages(hash);
+		CREATE INDEX IF NOT EXISTS idx_s3_uploaded ON messages(s3_uploaded);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create messages table: %w", err)
@@ -173,16 +177,19 @@ func (i *Importer) Run() error {
 		return fmt.Errorf("failed to scan maildir: %w", err)
 	}
 
-	// After scanning, count total messages in SQLite database (including existing ones)
-	var totalCount int64
-	countErr := i.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&totalCount)
+	// After scanning, count only NEW (not yet on S3) messages in SQLite database
+	var totalCount, alreadyOnS3 int64
+	countErr := i.db.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
 	if countErr != nil {
 		return fmt.Errorf("failed to count messages in database: %w", countErr)
 	}
 
+	// Also count messages already on S3 for logging
+	i.db.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 1").Scan(&alreadyOnS3)
+
 	// Set totalMessages to the actual count in database
 	atomic.StoreInt64(&i.totalMessages, totalCount)
-	log.Printf("Found %d total messages in database", totalCount)
+	log.Printf("Found %d new messages to import (%d already on S3)", totalCount, alreadyOnS3)
 
 	if i.options.DryRun {
 		log.Println("DRY RUN: Analyzing what would be imported...")
@@ -469,9 +476,9 @@ func (i *Importer) performDryRun() error {
 		// Don't fail the dry run, as mailboxes might already exist
 	}
 
-	// Query the SQLite database for scanned messages
+	// Query the SQLite database for messages not yet on S3
 
-	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path")
+	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path")
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
@@ -987,7 +994,7 @@ func (i *Importer) importMessages() error {
 
 	log.Printf("Processing %d messages from database", i.totalMessages)
 
-	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path")
+	rows, err := i.db.Query("SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path")
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
@@ -1307,6 +1314,14 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			// The message remains in the 'pending_uploads' queue and can be retried.
 			return fmt.Errorf("S3 upload succeeded, but failed to finalize in DB. Message is queued for retry on next run: %w", err)
 		}
+	}
+
+	// Mark message as uploaded to S3 in SQLite cache
+	_, err = i.db.Exec("UPDATE messages SET s3_uploaded = 1, s3_uploaded_at = ? WHERE hash = ? AND mailbox = ?",
+		time.Now(), hash, mailbox.Name)
+	if err != nil {
+		log.Printf("Warning: Failed to mark message as uploaded in SQLite: %v", err)
+		// Don't fail the import - message is already on S3
 	}
 
 	atomic.AddInt64(&i.importedMessages, 1)
