@@ -181,6 +181,7 @@ main() {
                 echo ""
                 echo "Available scopes:"
                 echo "  Core: imap, lmtp, pop3, managesieve, httpapi, config"
+                echo "  Admin: sora-admin (importer/exporter tests)"
                 echo "  Proxy: imapproxy, lmtpproxy, pop3proxy, managesieveproxy"
                 echo "  Limits: connection_limits, lmtp_connection_limits, pop3_connection_limits,"
                 echo "          managesieve_connection_limits, proxy_connection_limits"
@@ -188,6 +189,7 @@ main() {
                 echo "Examples:"
                 echo "  $0                          # Run all integration tests"
                 echo "  $0 --scope imap             # Run only IMAP tests"
+                echo "  $0 --scope sora-admin       # Run only importer/exporter tests"
                 echo "  $0 --scope httpapi          # Run only HTTP API tests"
                 echo "  $0 --scope connection_limits     # Run only connection limit tests"
                 echo "  $0 --verbose                # Run with verbose output"
@@ -209,6 +211,7 @@ main() {
             "connection_limits" "lmtp_connection_limits" "pop3_connection_limits"
             "managesieve_connection_limits" "proxy_connection_limits"
             "httpapi" "config"
+            "sora-admin"
         )
     fi
     
@@ -223,7 +226,12 @@ main() {
     # Run tests for each scope
     overall_result=0
     for scope in "${SCOPES[@]}"; do
-        test_path="$ORIGINAL_DIR/integration_tests/$scope"
+        # Special handling for sora-admin tests
+        if [ "$scope" = "sora-admin" ]; then
+            test_path="$ORIGINAL_DIR/cmd/sora-admin"
+        else
+            test_path="$ORIGINAL_DIR/integration_tests/$scope"
+        fi
 
         if run_test_suite "$test_path" "$scope"; then
             print_success "$scope integration tests completed successfully"

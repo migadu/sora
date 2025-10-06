@@ -90,10 +90,48 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 		);
 		CREATE INDEX IF NOT EXISTS idx_mailbox ON messages(mailbox);
 		CREATE INDEX IF NOT EXISTS idx_hash ON messages(hash);
-		CREATE INDEX IF NOT EXISTS idx_s3_uploaded ON messages(s3_uploaded);
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create exported_messages table: %w", err)
+	}
+
+	// Migrate existing databases: add s3_uploaded columns if they don't exist
+	// Check if s3_uploaded column exists
+	var columnExists bool
+	err = db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('messages')
+		WHERE name='s3_uploaded'
+	`).Scan(&columnExists)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for s3_uploaded column: %w", err)
+	}
+
+	if !columnExists {
+		logger.Info("Migrating SQLite database: adding s3_uploaded columns")
+		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded INTEGER DEFAULT 1`)
+		if err != nil {
+			return nil, fmt.Errorf("failed to add s3_uploaded column: %w", err)
+		}
+
+		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded_at TIMESTAMP`)
+		if err != nil {
+			return nil, fmt.Errorf("failed to add s3_uploaded_at column: %w", err)
+		}
+
+		// Mark all existing messages as uploaded (they were in old DB, so they're on S3)
+		_, err = db.Exec(`UPDATE messages SET s3_uploaded_at = CURRENT_TIMESTAMP WHERE s3_uploaded_at IS NULL`)
+		if err != nil {
+			return nil, fmt.Errorf("failed to mark existing messages as uploaded: %w", err)
+		}
+
+		logger.Info("SQLite database migration completed successfully - all existing messages marked as uploaded")
+	}
+
+	// Create index after migration (idempotent operation)
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_s3_uploaded ON messages(s3_uploaded)`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create s3_uploaded index: %w", err)
 	}
 
 	exporter := &Exporter{
