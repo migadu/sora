@@ -83,7 +83,7 @@ func testInitialImport(t *testing.T, maildirPath, email string, rdb *resilient.R
 		TestMode:      true,  // Skip actual S3 uploads
 	}
 
-	importer, err := NewImporter(maildirPath, email, 1, rdb, s3, options)
+	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
 	if err != nil {
 		t.Fatalf("Failed to create importer: %v", err)
 	}
@@ -121,7 +121,7 @@ func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilien
 		TestMode:      true,
 	}
 
-	importer, err := NewImporter(maildirPath, email, 1, rdb, s3, options)
+	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
 	if err != nil {
 		t.Fatalf("Failed to create importer: %v", err)
 	}
@@ -168,7 +168,7 @@ func testIncrementalImport(t *testing.T, maildirPath, email string, rdb *resilie
 		TestMode:      true,
 	}
 
-	importer, err := NewImporter(maildirPath, email, 1, rdb, s3, options)
+	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
 	if err != nil {
 		t.Fatalf("Failed to create importer: %v", err)
 	}

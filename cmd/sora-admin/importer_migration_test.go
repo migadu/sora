@@ -55,7 +55,7 @@ func TestSQLiteMigration(t *testing.T) {
 			CleanupDB: false,
 		}
 
-		importer, err := NewImporter(maildirPath, testEmail, 1, rdb, mockS3, options)
+		importer, err := NewImporter(context.Background(), maildirPath, testEmail, 1, rdb, mockS3, options)
 		if err != nil {
 			t.Fatalf("Failed to create importer: %v", err)
 		}

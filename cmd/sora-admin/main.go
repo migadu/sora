@@ -117,31 +117,31 @@ func main() {
 
 	switch command {
 	case "accounts":
-		handleAccountsCommand()
+		handleAccountsCommand(ctx)
 	case "credentials":
-		handleCredentialsCommand()
+		handleCredentialsCommand(ctx)
 	case "cache":
-		handleCacheCommand()
+		handleCacheCommand(ctx)
 	case "stats":
-		handleStatsCommand()
+		handleStatsCommand(ctx)
 	case "connections":
-		handleConnectionsCommand()
+		handleConnectionsCommand(ctx)
 	case "health":
-		handleHealthCommand()
+		handleHealthCommand(ctx)
 	case "config":
-		handleConfigCommand()
+		handleConfigCommand(ctx)
 	case "migrate":
 		handleMigrateCommand(ctx)
 	case "version":
 		printVersion()
 	case "import":
-		handleImportCommand()
+		handleImportCommand(ctx)
 	case "export":
-		handleExportCommand()
+		handleExportCommand(ctx)
 	case "uploader":
-		handleUploaderCommand()
+		handleUploaderCommand(ctx)
 	case "messages":
-		handleMessagesCommand()
+		handleMessagesCommand(ctx)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -151,7 +151,7 @@ func main() {
 	}
 }
 
-func handleAccountsCommand() {
+func handleAccountsCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printAccountsUsage()
 		os.Exit(1)
@@ -160,17 +160,17 @@ func handleAccountsCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "create":
-		handleCreateAccount()
+		handleCreateAccount(ctx)
 	case "list":
-		handleListAccounts()
+		handleListAccounts(ctx)
 	case "show":
-		handleShowAccount()
+		handleShowAccount(ctx)
 	case "update":
-		handleUpdateAccount()
+		handleUpdateAccount(ctx)
 	case "delete":
-		handleDeleteAccount()
+		handleDeleteAccount(ctx)
 	case "restore":
-		handleRestoreAccount()
+		handleRestoreAccount(ctx)
 	case "help", "--help", "-h":
 		printAccountsUsage()
 	default:
@@ -180,7 +180,7 @@ func handleAccountsCommand() {
 	}
 }
 
-func handleCredentialsCommand() {
+func handleCredentialsCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printCredentialsUsage()
 		os.Exit(1)
@@ -189,13 +189,13 @@ func handleCredentialsCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "add":
-		handleAddCredential()
+		handleAddCredential(ctx)
 	case "list":
-		handleListCredentials()
+		handleListCredentials(ctx)
 	case "show":
-		handleShowCredential()
+		handleShowCredential(ctx)
 	case "delete":
-		handleDeleteCredential()
+		handleDeleteCredential(ctx)
 	case "help", "--help", "-h":
 		printCredentialsUsage()
 	default:
@@ -205,7 +205,7 @@ func handleCredentialsCommand() {
 	}
 }
 
-func handleCacheCommand() {
+func handleCacheCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printCacheUsage()
 		os.Exit(1)
@@ -214,11 +214,11 @@ func handleCacheCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "stats":
-		handleCacheStats()
+		handleCacheStats(ctx)
 	case "metrics":
-		handleCacheMetrics()
+		handleCacheMetrics(ctx)
 	case "purge":
-		handleCachePurge()
+		handleCachePurge(ctx)
 	case "help", "--help", "-h":
 		printCacheUsage()
 	default:
@@ -228,7 +228,7 @@ func handleCacheCommand() {
 	}
 }
 
-func handleStatsCommand() {
+func handleStatsCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printStatsUsage()
 		os.Exit(1)
@@ -237,9 +237,9 @@ func handleStatsCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "auth":
-		handleAuthStats()
+		handleAuthStats(ctx)
 	case "connection":
-		handleConnectionStats()
+		handleConnectionStats(ctx)
 	case "help", "--help", "-h":
 		printStatsUsage()
 	default:
@@ -249,7 +249,7 @@ func handleStatsCommand() {
 	}
 }
 
-func handleConnectionsCommand() {
+func handleConnectionsCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printConnectionsUsage()
 		os.Exit(1)
@@ -258,9 +258,9 @@ func handleConnectionsCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "list":
-		handleListConnections()
+		handleListConnections(ctx)
 	case "kick":
-		handleKickConnections()
+		handleKickConnections(ctx)
 	case "help", "--help", "-h":
 		printConnectionsUsage()
 	default:
@@ -270,7 +270,7 @@ func handleConnectionsCommand() {
 	}
 }
 
-func handleUploaderCommand() {
+func handleUploaderCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printUploaderUsage()
 		os.Exit(1)
@@ -279,7 +279,7 @@ func handleUploaderCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "status":
-		handleUploaderStatus()
+		handleUploaderStatus(ctx)
 	case "help", "--help", "-h":
 		printUploaderUsage()
 	default:
@@ -453,7 +453,7 @@ Use 'sora-admin uploader <subcommand> --help' for detailed help.
 `)
 }
 
-func handleCreateAccount() {
+func handleCreateAccount(ctx context.Context) {
 	// Parse accounts create specific flags
 	fs := flag.NewFlagSet("accounts create", flag.ExitOnError)
 
@@ -556,20 +556,20 @@ Examples:
 	// Create the account
 	if *credentials != "" {
 		// Create account with multiple credentials
-		if err := createAccountWithCredentials(cfg, *credentials); err != nil {
+		if err := createAccountWithCredentials(ctx, cfg, *credentials); err != nil {
 			logger.Fatalf("Failed to create account with credentials: %v", err)
 		}
 		fmt.Printf("Successfully created account with multiple credentials\n")
 	} else {
 		// Create account with single credential (always as primary identity)
-		if err := createAccount(cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
+		if err := createAccount(ctx, cfg, *email, *password, *passwordHash, true, *hashType); err != nil {
 			logger.Fatalf("Failed to create account: %v", err)
 		}
 		fmt.Printf("Successfully created account: %s\n", *email)
 	}
 }
 
-func handleAddCredential() {
+func handleAddCredential(ctx context.Context) {
 	// Parse add-credential specific flags
 	fs := flag.NewFlagSet("credentials add", flag.ExitOnError)
 
@@ -665,15 +665,14 @@ Examples:
 	}
 
 	// Add the credential
-	if err := addCredential(cfg, *primaryIdentity, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
+	if err := addCredential(ctx, cfg, *primaryIdentity, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
 		logger.Fatalf("Failed to add credential: %v", err)
 	}
 
 	fmt.Printf("Successfully added credential: %s to account with primary identity: %s\n", *email, *primaryIdentity)
 }
 
-func createAccount(cfg AdminConfig, email, password, passwordHash string, isPrimary bool, hashType string) error {
-	ctx := context.Background()
+func createAccount(ctx context.Context, cfg AdminConfig, email, password, passwordHash string, isPrimary bool, hashType string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -707,8 +706,7 @@ type CredentialInput struct {
 	HashType     string `json:"hash_type,omitempty"`
 }
 
-func createAccountWithCredentials(cfg AdminConfig, credentialsJSON string) error {
-	ctx := context.Background()
+func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credentialsJSON string) error {
 
 	// Parse credentials JSON
 	var credentialInputs []CredentialInput
@@ -759,7 +757,7 @@ func createAccountWithCredentials(cfg AdminConfig, credentialsJSON string) error
 	return nil
 }
 
-func handleListConnections() {
+func handleListConnections(ctx context.Context) {
 	// Parse connections list specific flags
 	fs := flag.NewFlagSet("connections list", flag.ExitOnError)
 
@@ -814,13 +812,12 @@ Examples:
 	}
 
 	// List connections
-	if err := listConnections(cfg, *userEmail, *protocol, *instanceID); err != nil {
+	if err := listConnections(ctx, cfg, *userEmail, *protocol, *instanceID); err != nil {
 		logger.Fatalf("Failed to list connections: %v", err)
 	}
 }
 
-func listConnections(cfg AdminConfig, userEmail, protocol, instanceID string) error {
-	ctx := context.Background()
+func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, instanceID string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -909,7 +906,7 @@ func listConnections(cfg AdminConfig, userEmail, protocol, instanceID string) er
 	return nil
 }
 
-func handleKickConnections() {
+func handleKickConnections(ctx context.Context) {
 	// Parse kick-connections specific flags
 	fs := flag.NewFlagSet("connections kick", flag.ExitOnError)
 
@@ -996,13 +993,12 @@ Examples:
 	}
 
 	// Kick connections
-	if err := kickConnections(cfg, *userEmail, *protocol, *server, *clientAddr, *all, *confirm); err != nil {
+	if err := kickConnections(ctx, cfg, *userEmail, *protocol, *server, *clientAddr, *all, *confirm); err != nil {
 		logger.Fatalf("Failed to kick connections: %v", err)
 	}
 }
 
-func kickConnections(cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
-	ctx := context.Background()
+func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1107,8 +1103,7 @@ func matches(conn db.ConnectionInfo, criteria db.TerminationCriteria, all bool) 
 	return criteria.Email != "" || criteria.Protocol != "" || criteria.ServerAddr != "" || criteria.ClientAddr != ""
 }
 
-func addCredential(cfg AdminConfig, primaryIdentity, email, password, passwordHash string, makePrimary bool, hashType string) error {
-	ctx := context.Background()
+func addCredential(ctx context.Context, cfg AdminConfig, primaryIdentity, email, password, passwordHash string, makePrimary bool, hashType string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1141,7 +1136,7 @@ func addCredential(cfg AdminConfig, primaryIdentity, email, password, passwordHa
 	return nil
 }
 
-func handleUpdateAccount() {
+func handleUpdateAccount(ctx context.Context) {
 	// Parse update-account specific flags
 	fs := flag.NewFlagSet("accounts update", flag.ExitOnError)
 
@@ -1231,7 +1226,7 @@ Examples:
 	}
 
 	// Update the account
-	if err := updateAccount(cfg, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
+	if err := updateAccount(ctx, cfg, *email, *password, *passwordHash, *makePrimary, *hashType); err != nil {
 		logger.Fatalf("Failed to update account: %v", err)
 	}
 
@@ -1245,7 +1240,7 @@ Examples:
 	}
 }
 
-func handleDeleteAccount() {
+func handleDeleteAccount(ctx context.Context) {
 	// Parse delete-account specific flags
 	fs := flag.NewFlagSet("accounts delete", flag.ExitOnError)
 
@@ -1308,15 +1303,14 @@ Examples:
 	}
 
 	// Delete the account
-	if err := deleteAccount(cfg, *email); err != nil {
+	if err := deleteAccount(ctx, cfg, *email); err != nil {
 		logger.Fatalf("Failed to delete account: %v", err)
 	}
 
 	fmt.Printf("Successfully soft-deleted account: %s. It will be permanently removed after the grace period.\n", *email)
 }
 
-func deleteAccount(cfg AdminConfig, email string) error {
-	ctx := context.Background()
+func deleteAccount(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1333,8 +1327,7 @@ func deleteAccount(cfg AdminConfig, email string) error {
 	return nil
 }
 
-func updateAccount(cfg AdminConfig, email, password, passwordHash string, makePrimary bool, hashType string) error {
-	ctx := context.Background()
+func updateAccount(ctx context.Context, cfg AdminConfig, email, password, passwordHash string, makePrimary bool, hashType string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1359,7 +1352,7 @@ func updateAccount(cfg AdminConfig, email, password, passwordHash string, makePr
 	return nil
 }
 
-func handleListCredentials() {
+func handleListCredentials(ctx context.Context) {
 	// Parse list-credentials specific flags
 	fs := flag.NewFlagSet("credentials list", flag.ExitOnError)
 
@@ -1411,13 +1404,12 @@ Examples:
 	}
 
 	// List the credentials
-	if err := listCredentials(cfg, *email); err != nil {
+	if err := listCredentials(ctx, cfg, *email); err != nil {
 		logger.Fatalf("Failed to list credentials: %v", err)
 	}
 }
 
-func listCredentials(cfg AdminConfig, email string) error {
-	ctx := context.Background()
+func listCredentials(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1450,7 +1442,7 @@ func listCredentials(cfg AdminConfig, email string) error {
 	return nil
 }
 
-func handleDeleteCredential() {
+func handleDeleteCredential(ctx context.Context) {
 	// Parse delete-credential specific flags
 	fs := flag.NewFlagSet("credentials delete", flag.ExitOnError)
 
@@ -1507,15 +1499,14 @@ Examples:
 	}
 
 	// Delete the credential
-	if err := deleteCredential(cfg, *email); err != nil {
+	if err := deleteCredential(ctx, cfg, *email); err != nil {
 		logger.Fatalf("Failed to delete credential: %v", err)
 	}
 
 	fmt.Printf("Successfully deleted credential: %s\n", *email)
 }
 
-func deleteCredential(cfg AdminConfig, email string) error {
-	ctx := context.Background()
+func deleteCredential(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1532,7 +1523,7 @@ func deleteCredential(cfg AdminConfig, email string) error {
 	return nil
 }
 
-func handleListAccounts() {
+func handleListAccounts(ctx context.Context) {
 	// Parse list-accounts specific flags
 	fs := flag.NewFlagSet("accounts list", flag.ExitOnError)
 
@@ -1580,13 +1571,12 @@ Examples:
 	}
 
 	// List accounts
-	if err := listAccounts(cfg); err != nil {
+	if err := listAccounts(ctx, cfg); err != nil {
 		logger.Fatalf("Failed to list accounts: %v", err)
 	}
 }
 
-func listAccounts(cfg AdminConfig) error {
-	ctx := context.Background()
+func listAccounts(ctx context.Context, cfg AdminConfig) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1634,7 +1624,7 @@ func listAccounts(cfg AdminConfig) error {
 	return nil
 }
 
-func handleRestoreAccount() {
+func handleRestoreAccount(ctx context.Context) {
 	// Parse accounts restore specific flags
 	fs := flag.NewFlagSet("accounts restore", flag.ExitOnError)
 
@@ -1687,14 +1677,14 @@ Examples:
 	}
 
 	// Restore the account
-	if err := restoreAccount(cfg, *email); err != nil {
+	if err := restoreAccount(ctx, cfg, *email); err != nil {
 		logger.Fatalf("Failed to restore account: %v", err)
 	}
 
 	fmt.Printf("Successfully restored account: %s\n", *email)
 }
 
-func handleShowAccount() {
+func handleShowAccount(ctx context.Context) {
 	// Parse show-account specific flags
 	fs := flag.NewFlagSet("accounts show", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the account to show")
@@ -1752,13 +1742,12 @@ Examples:
 	}
 
 	// Show the account details
-	if err := showAccount(cfg, *email, *jsonOutput); err != nil {
+	if err := showAccount(ctx, cfg, *email, *jsonOutput); err != nil {
 		logger.Fatalf("Failed to show account: %v", err)
 	}
 }
 
-func restoreAccount(cfg AdminConfig, email string) error {
-	ctx := context.Background()
+func restoreAccount(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1775,8 +1764,7 @@ func restoreAccount(cfg AdminConfig, email string) error {
 	return nil
 }
 
-func showAccount(cfg AdminConfig, email string, jsonOutput bool) error {
-	ctx := context.Background()
+func showAccount(ctx context.Context, cfg AdminConfig, email string, jsonOutput bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1832,7 +1820,7 @@ func showAccount(cfg AdminConfig, email string, jsonOutput bool) error {
 	return nil
 }
 
-func handleShowCredential() {
+func handleShowCredential(ctx context.Context) {
 	// Parse show-credential specific flags
 	fs := flag.NewFlagSet("credentials show", flag.ExitOnError)
 	email := fs.String("email", "", "Email address (credential) to show details for")
@@ -1891,13 +1879,12 @@ Examples:
 	}
 
 	// Show the credential details
-	if err := showCredential(cfg, *email, *jsonOutput); err != nil {
+	if err := showCredential(ctx, cfg, *email, *jsonOutput); err != nil {
 		logger.Fatalf("Failed to show credential: %v", err)
 	}
 }
 
-func showCredential(cfg AdminConfig, email string, jsonOutput bool) error {
-	ctx := context.Background()
+func showCredential(ctx context.Context, cfg AdminConfig, email string, jsonOutput bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -1961,7 +1948,7 @@ func isFlagSet(fs *flag.FlagSet, name string) bool {
 	return isSet
 }
 
-func handleMessagesCommand() {
+func handleMessagesCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printMessagesUsage()
 		os.Exit(1)
@@ -1970,9 +1957,9 @@ func handleMessagesCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "list-deleted":
-		handleListDeletedMessages()
+		handleListDeletedMessages(ctx)
 	case "restore":
-		handleRestoreMessages()
+		handleRestoreMessages(ctx)
 	case "help", "--help", "-h":
 		printMessagesUsage()
 	default:
@@ -2002,7 +1989,7 @@ Use 'sora-admin messages <subcommand> --help' for detailed help.
 `)
 }
 
-func handleListDeletedMessages() {
+func handleListDeletedMessages(ctx context.Context) {
 	// Parse list-deleted-messages specific flags
 	fs := flag.NewFlagSet("messages list-deleted", flag.ExitOnError)
 
@@ -2088,12 +2075,12 @@ Examples:
 	}
 
 	// List deleted messages
-	if err := listDeletedMessages(cfg, *email, mailbox, sinceTime, untilTime, *limit); err != nil {
+	if err := listDeletedMessages(ctx, cfg, *email, mailbox, sinceTime, untilTime, *limit); err != nil {
 		logger.Fatalf("Failed to list deleted messages: %v", err)
 	}
 }
 
-func handleRestoreMessages() {
+func handleRestoreMessages(ctx context.Context) {
 	// Parse restore-messages specific flags
 	fs := flag.NewFlagSet("messages restore", flag.ExitOnError)
 
@@ -2212,7 +2199,7 @@ Examples:
 	}
 
 	// Restore messages
-	if err := restoreMessages(cfg, *email, mailbox, messageIDs, sinceTime, untilTime, *confirm); err != nil {
+	if err := restoreMessages(ctx, cfg, *email, mailbox, messageIDs, sinceTime, untilTime, *confirm); err != nil {
 		logger.Fatalf("Failed to restore messages: %v", err)
 	}
 }
@@ -2229,8 +2216,7 @@ func parseTimeFlag(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid date format (use YYYY-MM-DD or RFC3339)")
 }
 
-func listDeletedMessages(cfg AdminConfig, email string, mailbox *string, since *time.Time, until *time.Time, limit int) error {
-	ctx := context.Background()
+func listDeletedMessages(ctx context.Context, cfg AdminConfig, email string, mailbox *string, since *time.Time, until *time.Time, limit int) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -2307,8 +2293,7 @@ func listDeletedMessages(cfg AdminConfig, email string, mailbox *string, since *
 	return nil
 }
 
-func restoreMessages(cfg AdminConfig, email string, mailbox *string, messageIDs []int64, since *time.Time, until *time.Time, confirm bool) error {
-	ctx := context.Background()
+func restoreMessages(ctx context.Context, cfg AdminConfig, email string, mailbox *string, messageIDs []int64, since *time.Time, until *time.Time, confirm bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -2403,7 +2388,7 @@ func restoreMessages(cfg AdminConfig, email string, mailbox *string, messageIDs 
 	return nil
 }
 
-func handleImportCommand() {
+func handleImportCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printImportUsage()
 		os.Exit(1)
@@ -2412,9 +2397,9 @@ func handleImportCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "maildir":
-		handleImportMaildir()
+		handleImportMaildir(ctx)
 	case "s3":
-		handleImportS3()
+		handleImportS3(ctx)
 	case "--help", "-h":
 		printImportUsage()
 	default:
@@ -2446,7 +2431,7 @@ Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
 }
 
-func handleImportMaildir() {
+func handleImportMaildir(ctx context.Context) {
 	// Parse import specific flags
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 
@@ -2585,7 +2570,6 @@ Examples:
 	}
 
 	// Connect to resilient database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
@@ -2626,7 +2610,7 @@ Examples:
 		FTSRetention:  ftsRetention,
 	}
 
-	importer, err := NewImporter(*maildirPath, *email, *jobs, rdb, s3, options)
+	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
 		logger.Fatalf("Failed to create importer: %v", err)
 	}
@@ -2636,7 +2620,7 @@ Examples:
 	}
 }
 
-func handleExportCommand() {
+func handleExportCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printExportUsage()
 		os.Exit(1)
@@ -2645,7 +2629,7 @@ func handleExportCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "maildir":
-		handleExportMaildir()
+		handleExportMaildir(ctx)
 	case "--help", "-h":
 		printExportUsage()
 	default:
@@ -2673,7 +2657,7 @@ Use 'sora-admin export <subcommand> --help' for detailed help.
 `)
 }
 
-func handleExportMaildir() {
+func handleExportMaildir(ctx context.Context) {
 	// Parse export specific flags
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 
@@ -2797,7 +2781,6 @@ Examples:
 	}
 
 	// Connect to resilient database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
@@ -2831,7 +2814,7 @@ Examples:
 		ExportUIDList:  exportUIDListEnabled,
 	}
 
-	exporter, err := NewExporter(*maildirPath, *email, *jobs, rdb, s3, options)
+	exporter, err := NewExporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
 	if err != nil {
 		logger.Fatalf("Failed to create exporter: %v", err)
 	}
@@ -2841,7 +2824,7 @@ Examples:
 	}
 }
 
-func handleCacheStats() {
+func handleCacheStats(ctx context.Context) {
 	// Parse cache-stats specific flags
 	fs := flag.NewFlagSet("cache stats", flag.ExitOnError)
 
@@ -2888,12 +2871,12 @@ Examples:
 	}
 
 	// Show cache stats
-	if err := showCacheStats(cfg); err != nil {
+	if err := showCacheStats(ctx, cfg); err != nil {
 		logger.Fatalf("Failed to show cache stats: %v", err)
 	}
 }
 
-func handleCachePurge() {
+func handleCachePurge(ctx context.Context) {
 	// Parse cache-purge specific flags
 	fs := flag.NewFlagSet("cache purge", flag.ExitOnError)
 
@@ -2940,12 +2923,12 @@ Examples:
 	}
 
 	// Purge cache
-	if err := purgeCacheWithConfirmation(cfg, *confirm); err != nil {
+	if err := purgeCacheWithConfirmation(ctx, cfg, *confirm); err != nil {
 		logger.Fatalf("Failed to purge cache: %v", err)
 	}
 }
 
-func showCacheStats(cfg AdminConfig) error {
+func showCacheStats(ctx context.Context, cfg AdminConfig) error {
 	// Parse cache configuration using defaulting methods
 	capacityBytes := cfg.LocalCache.GetCapacityWithDefault()
 	maxObjectSizeBytes := cfg.LocalCache.GetMaxObjectSizeWithDefault()
@@ -2953,7 +2936,6 @@ func showCacheStats(cfg AdminConfig) error {
 	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
@@ -2986,7 +2968,7 @@ func showCacheStats(cfg AdminConfig) error {
 	return nil
 }
 
-func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
+func purgeCacheWithConfirmation(ctx context.Context, cfg AdminConfig, autoConfirm bool) error {
 	if !autoConfirm {
 		fmt.Printf("This will remove ALL cached objects from %s\n", cfg.LocalCache.Path)
 		fmt.Printf("This action cannot be undone. Are you sure? (y/N): ")
@@ -3009,7 +2991,6 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
@@ -3040,7 +3021,7 @@ func purgeCacheWithConfirmation(cfg AdminConfig, autoConfirm bool) error {
 	return nil
 }
 
-func handleUploaderStatus() {
+func handleUploaderStatus(ctx context.Context) {
 	// Parse uploader status specific flags
 	fs := flag.NewFlagSet("uploader status", flag.ExitOnError)
 
@@ -3093,14 +3074,13 @@ Examples:
 	}
 
 	// Show uploader status
-	if err := showUploaderStatus(cfg, *showFailed, *failedLimit); err != nil {
+	if err := showUploaderStatus(ctx, cfg, *showFailed, *failedLimit); err != nil {
 		logger.Fatalf("Failed to show uploader status: %v", err)
 	}
 }
 
-func showUploaderStatus(cfg AdminConfig, showFailed bool, failedLimit int) error {
+func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, failedLimit int) error {
 	// Connect to database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
@@ -3194,7 +3174,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func handleConnectionStats() {
+func handleConnectionStats(ctx context.Context) {
 	// Parse connection-stats specific flags
 	fs := flag.NewFlagSet("stats connection", flag.ExitOnError)
 
@@ -3258,13 +3238,12 @@ Examples:
 	}
 
 	// Show connection statistics
-	if err := showConnectionStats(cfg, *userEmail, *server, *cleanupStale, *staleMinutes, *showDetail); err != nil {
+	if err := showConnectionStats(ctx, cfg, *userEmail, *server, *cleanupStale, *staleMinutes, *showDetail); err != nil {
 		logger.Fatalf("Failed to show connection stats: %v", err)
 	}
 }
 
-func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanupStale bool, staleMinutes int, showDetail bool) error {
-	ctx := context.Background()
+func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, serverFilter string, cleanupStale bool, staleMinutes int, showDetail bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -3401,7 +3380,7 @@ func showConnectionStats(cfg AdminConfig, userEmail, serverFilter string, cleanu
 	return nil
 }
 
-func handleAuthStats() {
+func handleAuthStats(ctx context.Context) {
 	// Parse auth-stats specific flags
 	fs := flag.NewFlagSet("stats auth", flag.ExitOnError)
 	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
@@ -3452,7 +3431,6 @@ Examples:
 	}
 
 	// Create context for database operations
-	ctx := context.Background()
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database, false, false)
@@ -3521,7 +3499,7 @@ Examples:
 	}
 }
 
-func handleHealthCommand() {
+func handleHealthCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printHealthUsage()
 		os.Exit(1)
@@ -3530,7 +3508,7 @@ func handleHealthCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "status":
-		handleHealthStatus()
+		handleHealthStatus(ctx)
 	case "--help", "-h":
 		printHealthUsage()
 	default:
@@ -3558,7 +3536,7 @@ Use 'sora-admin health <subcommand> --help' for detailed help.
 `)
 }
 
-func handleHealthStatus() {
+func handleHealthStatus(ctx context.Context) {
 	fs := flag.NewFlagSet("health", flag.ExitOnError)
 
 	// Command-specific flags
@@ -3646,7 +3624,6 @@ Examples:
 	}
 
 	// Connect to resilient database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
@@ -3978,7 +3955,7 @@ func getStatusColor(status db.ComponentStatus) string {
 	}
 }
 
-func handleCacheMetrics() {
+func handleCacheMetrics(ctx context.Context) {
 	// Parse cache-metrics specific flags
 	fs := flag.NewFlagSet("cache metrics", flag.ExitOnError)
 
@@ -4043,14 +4020,13 @@ Examples:
 	}
 
 	// Show cache metrics
-	if err := showCacheMetrics(cfg, *instanceID, sinceDuration, *showHistory, *limit, *jsonOutput); err != nil {
+	if err := showCacheMetrics(ctx, cfg, *instanceID, sinceDuration, *showHistory, *limit, *jsonOutput); err != nil {
 		logger.Fatalf("Failed to show cache metrics: %v", err)
 	}
 }
 
-func showCacheMetrics(cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
+func showCacheMetrics(ctx context.Context, cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
 	// Connect to database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
@@ -4197,7 +4173,7 @@ func showHistoricalCacheMetrics(ctx context.Context, rdb *resilient.ResilientDat
 	return nil
 }
 
-func handleConfigCommand() {
+func handleConfigCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
 		printConfigUsage()
 		os.Exit(1)
@@ -4206,7 +4182,7 @@ func handleConfigCommand() {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "dump":
-		handleConfigDump()
+		handleConfigDump(ctx)
 	case "--help", "-h":
 		printConfigUsage()
 	default:
@@ -4234,7 +4210,7 @@ Use 'sora-admin config <subcommand> --help' for detailed help.
 `)
 }
 
-func handleConfigDump() {
+func handleConfigDump(ctx context.Context) {
 	// Parse config-dump specific flags
 	var configFile, format string
 	var maskSecrets bool
@@ -4364,7 +4340,7 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-func handleImportS3() {
+func handleImportS3(ctx context.Context) {
 	// Define flag set for S3 import
 	fs := flag.NewFlagSet("import s3", flag.ExitOnError)
 
@@ -4398,7 +4374,6 @@ func handleImportS3() {
 	}
 
 	// Connect to resilient database
-	ctx := context.Background()
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)

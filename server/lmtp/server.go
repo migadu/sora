@@ -1,3 +1,89 @@
+// Package lmtp implements an LMTP (Local Mail Transfer Protocol) server.
+//
+// LMTP is a variant of SMTP designed for local mail delivery. This package
+// provides an LMTP server with:
+//   - RFC 2033 LMTP protocol support
+//   - SIEVE script execution (RFC 5228)
+//   - Vacation responses (RFC 5230)
+//   - TLS support (STARTTLS)
+//   - Authentication (PLAIN, LOGIN)
+//   - Content deduplication via BLAKE3 hashing
+//   - Async S3 upload of message bodies
+//
+// # LMTP vs SMTP
+//
+// LMTP differs from SMTP in two key ways:
+//  1. Returns per-recipient status (not single final status)
+//  2. Does not perform mail queuing (immediate delivery)
+//
+// This makes LMTP ideal for local delivery where the MTA (e.g., Postfix)
+// handles queuing and retries.
+//
+// # Starting an LMTP Server
+//
+//	cfg := &config.LMTPConfig{
+//		Addr:    ":24",
+//		MaxConnections: 100,
+//	}
+//	srv, err := lmtp.NewServer(cfg, db, s3)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	// Start listener
+//	go srv.ListenAndServe(ctx)
+//
+// # Message Delivery Flow
+//
+//  1. Client connects and sends LHLO
+//  2. Client sends MAIL FROM and RCPT TO
+//  3. Client sends DATA with message content
+//  4. Server computes BLAKE3 hash of message body
+//  5. Server executes SIEVE scripts for filtering
+//  6. Server stores message metadata in PostgreSQL
+//  7. Server queues message body for S3 upload
+//  8. Server returns per-recipient status
+//
+// # SIEVE Script Execution
+//
+// SIEVE scripts are executed during delivery for each recipient:
+//
+//	require ["fileinto", "reject", "vacation"];
+//
+//	# File messages from boss into Important folder
+//	if address :is "from" "boss@example.com" {
+//	    fileinto "Important";
+//	}
+//
+//	# Send vacation response
+//	vacation :days 7 "I'm on vacation";
+//
+// Supported SIEVE extensions:
+//   - fileinto: Deliver to specific mailbox
+//   - reject: Reject message with error
+//   - vacation: Send auto-reply (with tracking)
+//   - envelope: Test envelope addresses
+//
+// # Content Deduplication
+//
+// Messages are deduplicated using BLAKE3 hashes. When the same message
+// is delivered to multiple recipients, it's stored once in S3 and
+// referenced multiple times in the database.
+//
+// # Error Handling
+//
+// LMTP returns per-recipient status codes:
+//   - 250: Message delivered successfully
+//   - 450: Temporary failure (retry)
+//   - 550: Permanent failure (reject)
+//
+// # Integration with Postfix
+//
+// Configure Postfix to use LMTP for local delivery:
+//
+//	# main.cf
+//	mailbox_transport = lmtp:inet:127.0.0.1:24
+//	lmtp_destination_concurrency_limit = 10
 package lmtp
 
 import (

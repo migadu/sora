@@ -85,8 +85,16 @@ func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, pa
 }
 
 // Connect attempts to connect to a remote server with round-robin and failover
+// Deprecated: Use ConnectWithContext instead to properly propagate context cancellation
 func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, error) {
-	return cm.ConnectWithProxy(context.Background(), preferredAddr, "", 0, "", 0, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
+	defer cancel()
+	return cm.ConnectWithProxy(ctx, preferredAddr, "", 0, "", 0, nil)
+}
+
+// ConnectWithContext attempts to connect to a remote server with proper context propagation
+func (cm *ConnectionManager) ConnectWithContext(ctx context.Context, preferredAddr string) (net.Conn, string, error) {
+	return cm.ConnectWithProxy(ctx, preferredAddr, "", 0, "", 0, nil)
 }
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
@@ -505,7 +513,15 @@ func (cm *ConnectionManager) shouldRetry(addr string) bool {
 }
 
 // ConnectToSpecific attempts to connect to a specific server address
+// Deprecated: Use ConnectToSpecificWithContext instead to properly propagate context cancellation
 func (cm *ConnectionManager) ConnectToSpecific(addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
+	defer cancel()
+	return cm.ConnectToSpecificWithContext(ctx, addr)
+}
+
+// ConnectToSpecificWithContext attempts to connect to a specific server address with proper context propagation
+func (cm *ConnectionManager) ConnectToSpecificWithContext(ctx context.Context, addr string) (net.Conn, error) {
 	// Check if the address is in our list
 	found := false
 	for _, remoteAddr := range cm.remoteAddrs {
@@ -519,7 +535,7 @@ func (cm *ConnectionManager) ConnectToSpecific(addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("address %s not in remote addresses list", addr)
 	}
 
-	return cm.dial(context.Background(), addr)
+	return cm.dial(ctx, addr)
 }
 
 // IsRemoteTLS returns whether remote connections use TLS

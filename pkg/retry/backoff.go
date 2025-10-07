@@ -1,3 +1,37 @@
+// Package retry provides exponential backoff retry logic with jitter.
+//
+// This package implements configurable retry strategies for transient failures:
+//   - Exponential backoff with optional jitter
+//   - Maximum retry attempts
+//   - Context-aware cancellation
+//   - Customizable backoff parameters
+//
+// # Usage
+//
+//	cfg := retry.BackoffConfig{
+//		InitialInterval: 100 * time.Millisecond,
+//		MaxInterval:     5 * time.Second,
+//		Multiplier:      2.0,
+//		Jitter:          true,
+//		MaxRetries:      5,
+//	}
+//
+//	err := retry.WithBackoff(ctx, cfg, func() error {
+//		return makeAPICall()
+//	})
+//
+// # Jitter
+//
+// Jitter adds randomness to prevent thundering herd problems when
+// multiple clients retry simultaneously. With jitter enabled, the
+// actual delay is: baseDelay * (0.5 + random(0, 0.5))
+//
+// # Integration
+//
+// Used throughout the codebase for:
+//   - Database connection retries
+//   - S3 API call retries
+//   - Network operation retries
 package retry
 
 import (

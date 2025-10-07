@@ -1,3 +1,85 @@
+// Package resilient provides resilient database operations with automatic failover and retry.
+//
+// This package wraps the db package with production-grade resilience features:
+//   - Automatic failover between multiple database pools
+//   - Circuit breakers to prevent cascading failures
+//   - Exponential backoff retry with jitter
+//   - Health monitoring and automatic recovery
+//   - Connection pooling with read/write separation
+//   - Transient error detection and retry
+//
+// # Architecture
+//
+// The ResilientDatabase wraps multiple database pools and automatically
+// routes operations to healthy backends. If a pool fails, traffic is
+// redirected to healthy pools while the failed pool recovers.
+//
+//	┌─────────────────────┐
+//	│ ResilientDatabase   │
+//	├─────────────────────┤
+//	│ - Failover Manager  │
+//	│ - Circuit Breakers  │
+//	│ - Retry Logic       │
+//	└──────────┬──────────┘
+//	           │
+//	    ┌──────┴──────┐
+//	    │             │
+//	┌───▼───┐    ┌───▼───┐
+//	│ Pool1 │    │ Pool2 │
+//	│ (RW)  │    │ (RW)  │
+//	└───────┘    └───────┘
+//
+// # Usage
+//
+//	// Create resilient database with failover
+//	cfg := &config.DatabaseConfig{
+//		Endpoints: []config.DatabaseEndpointConfig{
+//			{Hosts: []string{"db1:5432", "db2:5432"}},
+//			{Hosts: []string{"db3:5432", "db4:5432"}},
+//		},
+//		Database: "sora_mail_db",
+//	}
+//	rdb, err := resilient.NewResilientDatabase(ctx, cfg, true, true)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	defer rdb.Close()
+//
+//	// Operations automatically retry on transient failures
+//	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, userID, "INBOX")
+//
+// # Retry Configuration
+//
+// Each operation has customized retry settings based on its characteristics:
+//   - Read operations: Fast retries, more attempts
+//   - Write operations: Slower retries, fewer attempts
+//   - Critical operations: No retries (e.g., UID allocation)
+//
+// # Health Monitoring
+//
+// Health checks run in the background, marking pools as healthy/unhealthy:
+//
+//	status := rdb.HealthStatus()
+//	if status.Status != "healthy" {
+//		log.Printf("Database unhealthy: %s", status.Message)
+//	}
+//
+// # Circuit Breakers
+//
+// Circuit breakers protect against cascading failures:
+//   - Closed: Normal operation
+//   - Open: Too many failures, reject immediately
+//   - Half-open: Testing recovery
+//
+// # Transient Error Detection
+//
+// The package automatically detects and retries transient errors:
+//   - Connection errors
+//   - Timeout errors
+//   - Deadlock errors
+//   - Serialization failures
+//
+// Permanent errors (e.g., constraint violations) are not retried.
 package resilient
 
 import (

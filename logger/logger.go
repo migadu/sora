@@ -1,3 +1,77 @@
+// Package logger provides structured logging for the Sora email server.
+//
+// This package wraps zap (https://github.com/uber-go/zap) for high-performance
+// structured logging with support for multiple outputs:
+//   - Console (stdout/stderr)
+//   - File (with automatic rotation)
+//   - Syslog (local or remote)
+//
+// # Initialization
+//
+// Initialize the logger once at application startup:
+//
+//	cfg := config.LoggingConfig{
+//		Output: "file",
+//		File:   "/var/log/sora/sora.log",
+//		Level:  "info",
+//		Format: "json",
+//	}
+//	logFile, err := logger.Initialize(cfg)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	defer logFile.Close()
+//
+// # Usage
+//
+// Use the package-level functions for logging:
+//
+//	logger.Info("Server started successfully")
+//	logger.Infof("Listening on %s", addr)
+//	logger.Warn("High memory usage detected")
+//	logger.Error("Failed to connect to database", err)
+//	logger.Fatal("Critical error, shutting down")
+//
+// # Structured Logging
+//
+// For structured fields, use the With* functions:
+//
+//	logger.With(
+//		"user_id", 123,
+//		"mailbox", "INBOX",
+//		"message_count", 42,
+//	).Info("Mailbox access")
+//
+// # Log Levels
+//
+// Supported levels (in order of severity):
+//   - debug: Detailed information for debugging
+//   - info: General informational messages
+//   - warn: Warning messages for potential issues
+//   - error: Error messages for failures
+//   - fatal: Critical errors that cause shutdown
+//
+// # Output Formats
+//
+// Two formats are supported:
+//   - json: Machine-readable structured JSON
+//   - console: Human-readable colored output
+//
+// # Syslog Integration
+//
+// For syslog output:
+//
+//	cfg := config.LoggingConfig{
+//		Output:     "syslog",
+//		SyslogAddr: "localhost:514",  // or "/dev/log" for local
+//		SyslogTag:  "sora",
+//		Level:      "info",
+//	}
+//
+// # Performance
+//
+// The logger uses zap's high-performance structured logging with minimal
+// allocations. It can handle millions of logs per second.
 package logger
 
 import (

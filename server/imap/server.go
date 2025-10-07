@@ -1,3 +1,80 @@
+// Package imap implements an IMAP4rev1 server with modern extensions.
+//
+// This package provides a production-ready IMAP server implementation with:
+//   - IMAP4rev1 (RFC 3501) core protocol
+//   - IDLE (RFC 2177) for push notifications
+//   - MOVE (RFC 6851) for efficient message moving
+//   - ESEARCH (RFC 4731) for extended search
+//   - COMPRESS=DEFLATE (RFC 4978) for bandwidth optimization
+//   - QUOTA (RFC 2087) for mailbox quota management
+//   - Full UTF-8 support
+//   - TLS/STARTTLS support
+//   - SASL authentication (PLAIN, LOGIN)
+//
+// # Server Architecture
+//
+// The server uses a connection-per-client model with goroutines.
+// Each connection has a state machine tracking authentication and
+// mailbox selection:
+//
+//	NOT AUTHENTICATED → AUTHENTICATED → SELECTED → LOGOUT
+//
+// # Starting an IMAP Server
+//
+//	cfg := &config.IMAPConfig{
+//		Addr:    ":143",
+//		TLSAddr: ":993",
+//		MaxConnections: 1000,
+//	}
+//	srv, err := imap.NewServer(cfg, db, s3, cache)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	// Start listeners
+//	go srv.ListenAndServe(ctx)
+//	go srv.ListenAndServeTLS(ctx, certFile, keyFile)
+//
+// # Supported Commands
+//
+// Pre-authentication:
+//   - CAPABILITY: List server capabilities
+//   - STARTTLS: Upgrade to TLS
+//   - LOGIN: Authenticate with username/password
+//
+// Authenticated:
+//   - SELECT/EXAMINE: Select a mailbox
+//   - CREATE/DELETE/RENAME: Mailbox management
+//   - SUBSCRIBE/UNSUBSCRIBE: Subscription management
+//   - LIST/LSUB: Mailbox listing
+//   - STATUS: Query mailbox status
+//   - APPEND: Add message to mailbox
+//
+// Selected:
+//   - FETCH: Retrieve message data
+//   - STORE: Modify message flags
+//   - SEARCH/ESEARCH: Search messages
+//   - COPY/MOVE: Copy or move messages
+//   - EXPUNGE: Permanently delete messages
+//   - IDLE: Wait for mailbox changes
+//
+// # IDLE Implementation
+//
+// The IDLE command allows clients to receive real-time updates:
+//
+//	C: A001 IDLE
+//	S: + idling
+//	... server sends EXISTS/EXPUNGE as changes occur ...
+//	C: DONE
+//	S: A001 OK IDLE terminated
+//
+// # Performance Features
+//
+//   - Connection pooling to PostgreSQL
+//   - Local cache for frequently accessed messages
+//   - Batch operations for FETCH and SEARCH
+//   - COMPRESS=DEFLATE reduces bandwidth by ~70%
+//   - Efficient UID handling with sequence caching
 package imap
 
 import (

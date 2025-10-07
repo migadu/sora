@@ -1,4 +1,65 @@
-// storage/s3_storage.go
+// Package storage provides S3-compatible object storage for email message bodies.
+//
+// This package implements message body storage with features including:
+//   - Client-side AES-256-GCM encryption
+//   - Content deduplication using BLAKE3 hashes
+//   - Circuit breaker for resilience
+//   - Automatic retry with exponential backoff
+//   - Health monitoring and metrics
+//
+// # Storage Architecture
+//
+// Message bodies are stored in S3 using content-addressable storage.
+// Each message is identified by its BLAKE3 hash, enabling automatic
+// deduplication when the same message is delivered to multiple recipients.
+//
+// # Encryption
+//
+// When encryption is enabled, messages are encrypted client-side using
+// AES-256-GCM before upload. The encryption key is configured in config.toml
+// and should be a 32-byte hex-encoded string.
+//
+// # Usage Example
+//
+//	// Initialize storage
+//	s3, err := storage.New(
+//		"s3.amazonaws.com",
+//		"access-key",
+//		"secret-key",
+//		"my-bucket",
+//		true,  // use TLS
+//		false, // debug mode
+//	)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	// Enable encryption (optional)
+//	key, _ := hex.DecodeString("your-32-byte-hex-key")
+//	s3.SetEncryptionKey(key)
+//
+//	// Store a message body
+//	hash := "blake3-content-hash"
+//	err = s3.PutObject(ctx, hash, messageBody)
+//
+//	// Retrieve a message body
+//	body, err := s3.GetObject(ctx, hash)
+//
+// # Circuit Breaker
+//
+// The storage client includes a circuit breaker that prevents cascading
+// failures when S3 becomes unavailable. The circuit opens after consecutive
+// failures and enters a half-open state for testing recovery.
+//
+// # Health Monitoring
+//
+// Health status can be queried to determine if the storage backend is
+// operational:
+//
+//	status := s3.HealthStatus()
+//	if status.Status != "healthy" {
+//		log.Printf("Storage unhealthy: %s", status.Message)
+//	}
 package storage
 
 import (

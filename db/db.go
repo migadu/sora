@@ -1,3 +1,59 @@
+// Package db provides PostgreSQL database operations for the Sora email server.
+//
+// This package implements the data access layer with support for:
+//   - Connection pooling with read/write separation
+//   - Automatic failover between database hosts
+//   - Schema migrations using embedded SQL files
+//   - Full-text search with PostgreSQL pg_trgm
+//   - Background workers for cleanup and S3 uploads
+//   - Comprehensive retry logic and resilience patterns
+//
+// # Database Schema
+//
+// The schema includes tables for accounts, credentials, mailboxes, messages,
+// SIEVE scripts, vacation tracking, and authentication rate limiting.
+// See db/migrations/*.sql for the complete schema definition.
+//
+// # Connection Management
+//
+// The package uses pgxpool for efficient connection pooling:
+//
+//	cfg := &config.DatabaseConfig{
+//		Endpoints: []config.DatabaseEndpointConfig{
+//			{Hosts: []string{"localhost:5432"}},
+//		},
+//		Database: "sora_mail_db",
+//		MaxConns: 50,
+//	}
+//	db, err := NewDatabase(ctx, cfg)
+//
+// # Message Operations
+//
+// Common operations include appending messages, fetching message data,
+// searching with full-text indexes, and managing flags:
+//
+//	// Append a message
+//	msg := &Message{
+//		MailboxID:    mailboxID,
+//		ContentHash:  hash,
+//		Size:         len(body),
+//		InternalDate: time.Now(),
+//	}
+//	uid, err := db.AppendMessage(ctx, msg)
+//
+//	// Search messages
+//	results, err := db.SearchMessages(ctx, mailboxID, criteria)
+//
+// # Background Workers
+//
+// Two background workers run continuously:
+//   - Cleaner: Permanently deletes expunged messages after grace period
+//   - Upload Worker: Processes queued S3 uploads in batches
+//
+// Start workers with:
+//
+//	db.StartCleanupWorker(ctx, 5*time.Minute, 24*time.Hour)
+//	db.StartUploadWorker(ctx, 100, 5*time.Second)
 package db
 
 import (

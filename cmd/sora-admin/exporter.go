@@ -37,6 +37,7 @@ type ExporterOptions struct {
 
 // Exporter handles the maildir export process.
 type Exporter struct {
+	ctx         context.Context // Context for cancellation support
 	maildirPath string
 	email       string
 	jobs        int
@@ -58,7 +59,7 @@ type Exporter struct {
 }
 
 // NewExporter creates a new Exporter instance.
-func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ExporterOptions) (*Exporter, error) {
+func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ExporterOptions) (*Exporter, error) {
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
@@ -135,6 +136,7 @@ func NewExporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 	}
 
 	exporter := &Exporter{
+		ctx:         ctx,
 		maildirPath: maildirPath,
 		email:       email,
 		jobs:        jobs,
@@ -163,15 +165,13 @@ func (exporter *Exporter) Close() error {
 func (exporter *Exporter) Run() error {
 	defer exporter.Close()
 
-	ctx := context.Background()
-
 	// Get user information
 	address, err := server.NewAddress(exporter.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := exporter.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	accountID, err := exporter.rdb.GetAccountIDByAddressWithRetry(exporter.ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
@@ -180,7 +180,7 @@ func (exporter *Exporter) Run() error {
 	logger.Infof("Exporting messages for user: %s (account ID: %d)", address.FullAddress(), accountID)
 
 	// Get mailboxes to export
-	mailboxes, err := exporter.getMailboxesToExport(ctx, user.UserID())
+	mailboxes, err := exporter.getMailboxesToExport(exporter.ctx, user.UserID())
 	if err != nil {
 		return fmt.Errorf("failed to get mailboxes: %w", err)
 	}
@@ -194,7 +194,7 @@ func (exporter *Exporter) Run() error {
 
 	if exporter.options.DryRun {
 		logger.Info("DRY RUN: Analyzing what would be exported...")
-		return exporter.performDryRun(ctx, user.UserID(), mailboxes)
+		return exporter.performDryRun(exporter.ctx, user.UserID(), mailboxes)
 	}
 
 	// Create mailbox directories
@@ -207,7 +207,7 @@ func (exporter *Exporter) Run() error {
 	// Export messages from each mailbox
 	for _, mbox := range mailboxes {
 		logger.Infof("Exporting mailbox: %s", mbox.Name)
-		if err := exporter.exportMailbox(ctx, mbox); err != nil {
+		if err := exporter.exportMailbox(exporter.ctx, mbox); err != nil {
 			logger.Infof("Failed to export mailbox %s: %v", mbox.Name, err)
 			// Continue with other mailboxes
 		}
@@ -465,6 +465,14 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 		go func() {
 			defer wg.Done()
 			for msg := range jobs {
+				// Check for cancellation before processing each message
+				select {
+				case <-exporter.ctx.Done():
+					logger.Info("Export worker cancelled by user")
+					return
+				default:
+				}
+
 				// Retry logic: try up to 3 times
 				var err error
 				for retry := 0; retry < 3; retry++ {
@@ -489,6 +497,16 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 
 	// Feed jobs to workers
 	for _, msg := range messages {
+		// Check for cancellation
+		select {
+		case <-exporter.ctx.Done():
+			logger.Info("Export job submission cancelled by user")
+			close(jobs)
+			wg.Wait()
+			return exporter.ctx.Err()
+		default:
+		}
+
 		// Apply date filter if specified
 		if exporter.options.StartDate != nil && msg.InternalDate.Before(*exporter.options.StartDate) {
 			atomic.AddInt64(&exporter.skippedMessages, 1)

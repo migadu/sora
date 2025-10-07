@@ -91,7 +91,7 @@ func TestImporter_DovecotUIDPreservation(t *testing.T) {
 	}
 
 	// Create importer
-	importer, err := NewImporter(maildirPath, testEmail, 1, rdb, s3Storage, options)
+	importer, err := NewImporter(context.Background(), maildirPath, testEmail, 1, rdb, s3Storage, options)
 	if err != nil {
 		t.Fatalf("Failed to create importer: %v", err)
 	}

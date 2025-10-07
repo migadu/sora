@@ -1,3 +1,89 @@
+// Package config provides configuration management for the Sora email server.
+//
+// Configuration is loaded from TOML files with support for:
+//   - Multiple database endpoints with failover
+//   - Protocol-specific server settings (IMAP, LMTP, POP3, ManageSieve)
+//   - Proxy mode for horizontal scaling
+//   - TLS configuration with custom certificates
+//   - Connection limits and rate limiting
+//   - Client capability filtering (e.g., by JA4 fingerprint)
+//   - S3 storage configuration
+//   - Logging options (file, syslog, console)
+//
+// # Configuration File
+//
+// The default configuration file is config.toml. Example:
+//
+//	[database]
+//	[[database.endpoints]]
+//	hosts = ["db1.example.com:5432", "db2.example.com:5432"]
+//	user = "sora"
+//	password = "secret"
+//	database = "sora_mail_db"
+//	max_conns = 50
+//
+//	[s3]
+//	endpoint = "s3.amazonaws.com"
+//	bucket = "email-bodies"
+//	encryption_key = "hex-encoded-32-byte-key"
+//
+//	[servers.imap]
+//	start = true
+//	addr = ":143"
+//	tls_addr = ":993"
+//
+// # Loading Configuration
+//
+//	cfg := &config.Config{}
+//	if _, err := toml.DecodeFile("config.toml", cfg); err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	// Validate configuration
+//	if err := cfg.Validate(); err != nil {
+//		log.Fatal(err)
+//	}
+//
+// # Proxy Mode
+//
+// For horizontal scaling, configure proxy mode:
+//
+//	[servers.imap_proxy]
+//	start = true
+//	addr = ":1143"
+//	remote_addrs = ["backend1:143", "backend2:143", "backend3:143"]
+//	affinity_method = "consistent_hash"  # or "round_robin"
+//
+// The proxy distributes connections across backends with optional
+// consistent hashing for session affinity.
+//
+// # Client Capability Filtering
+//
+// Filter capabilities for specific clients or TLS fingerprints:
+//
+//	[[capability_filters]]
+//	client_name = "BrokenClient"
+//	ja4_fingerprint = "t13d.*"
+//	disable_caps = ["IDLE", "NOTIFY"]
+//	reason = "Client has buggy IDLE implementation"
+//
+// # TLS Configuration
+//
+// Configure TLS with custom certificates:
+//
+//	[tls]
+//	cert_file = "/path/to/cert.pem"
+//	key_file = "/path/to/key.pem"
+//	min_version = "1.2"
+//	ciphers = ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]
+//
+// # Connection Limits
+//
+// Prevent resource exhaustion with connection limits:
+//
+//	[servers.imap]
+//	max_connections = 1000        # Total connections
+//	max_connections_per_ip = 10   # Per IP address
 package config
 
 import (

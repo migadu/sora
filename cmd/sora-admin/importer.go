@@ -54,6 +54,7 @@ type ImporterOptions struct {
 
 // Importer handles the maildir import process.
 type Importer struct {
+	ctx         context.Context // Context for cancellation support
 	maildirPath string
 	email       string
 	jobs        int
@@ -77,7 +78,7 @@ type Importer struct {
 }
 
 // NewImporter creates a new Importer instance.
-func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ImporterOptions) (*Importer, error) {
+func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ImporterOptions) (*Importer, error) {
 	// Create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	logger.Infof("Using maildir database: %s", dbPath)
@@ -149,6 +150,7 @@ func NewImporter(maildirPath, email string, jobs int, rdb *resilient.ResilientDa
 	}
 
 	importer := &Importer{
+		ctx:             ctx,
 		maildirPath:     maildirPath,
 		email:           email,
 		jobs:            jobs,
@@ -310,20 +312,19 @@ func (i *Importer) processSubscriptions() error {
 	logger.Infof("Found %d subscribed folders: %v", len(folders), folders)
 
 	// Get user context for database operations
-	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Ensure default mailboxes exist first
-	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.UserID()); err != nil {
 		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the subscription processing, as mailboxes might already exist
 	}
@@ -332,16 +333,16 @@ func (i *Importer) processSubscriptions() error {
 	for _, folderName := range folders {
 
 		// Check if mailbox exists, create if needed
-		mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
+		mailbox, err := i.rdb.GetMailboxByNameWithRetry(i.ctx, user.UserID(), folderName)
 		if err != nil {
 			if err == consts.ErrMailboxNotFound {
 				logger.Infof("Creating missing mailbox: %s", folderName)
-				if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), folderName, nil); err != nil {
+				if err := i.rdb.CreateMailboxWithRetry(i.ctx, user.UserID(), folderName, nil); err != nil {
 					logger.Infof("Warning: Failed to create mailbox %s: %v", folderName, err)
 					continue
 				}
 				// Get the newly created mailbox
-				mailbox, err = i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), folderName)
+				mailbox, err = i.rdb.GetMailboxByNameWithRetry(i.ctx, user.UserID(), folderName)
 				if err != nil {
 					logger.Infof("Warning: Failed to get newly created mailbox %s: %v", folderName, err)
 					continue
@@ -353,7 +354,7 @@ func (i *Importer) processSubscriptions() error {
 		}
 
 		// Subscribe the user to the folder
-		if err := i.rdb.SetMailboxSubscribedWithRetry(ctx, mailbox.ID, user.UserID(), true); err != nil {
+		if err := i.rdb.SetMailboxSubscribedWithRetry(i.ctx, mailbox.ID, user.UserID(), true); err != nil {
 			logger.Infof("Warning: Failed to subscribe to mailbox %s: %v", folderName, err)
 		} else {
 			logger.Infof("Successfully subscribed to mailbox: %s", folderName)
@@ -385,20 +386,19 @@ func (i *Importer) importSieveScript() error {
 	}
 
 	// Get user context for database operations
-	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Check if user already has an active script
-	existingScript, err := i.rdb.GetActiveScriptWithRetry(ctx, user.UserID())
+	existingScript, err := i.rdb.GetActiveScriptWithRetry(i.ctx, user.UserID())
 	if err != nil && err != consts.ErrDBNotFound {
 		return fmt.Errorf("failed to check for existing active script: %w", err)
 	}
@@ -411,18 +411,18 @@ func (i *Importer) importSieveScript() error {
 
 	// Create or update the script
 	var script *db.SieveScript
-	existingByName, err := i.rdb.GetScriptByNameWithRetry(ctx, scriptName, user.UserID())
+	existingByName, err := i.rdb.GetScriptByNameWithRetry(i.ctx, scriptName, user.UserID())
 	switch err {
 	case nil:
 		// Script with this name exists, update it
-		script, err = i.rdb.UpdateScriptWithRetry(ctx, existingByName.ID, user.UserID(), scriptName, string(scriptContent))
+		script, err = i.rdb.UpdateScriptWithRetry(i.ctx, existingByName.ID, user.UserID(), scriptName, string(scriptContent))
 		if err != nil {
 			return fmt.Errorf("failed to update existing Sieve script: %w", err)
 		}
 		logger.Infof("Updated existing Sieve script '%s'", scriptName)
 	case consts.ErrDBNotFound:
 		// Create new script
-		script, err = i.rdb.CreateScriptWithRetry(ctx, user.UserID(), scriptName, string(scriptContent))
+		script, err = i.rdb.CreateScriptWithRetry(i.ctx, user.UserID(), scriptName, string(scriptContent))
 		if err != nil {
 			return fmt.Errorf("failed to create Sieve script: %w", err)
 		}
@@ -432,7 +432,7 @@ func (i *Importer) importSieveScript() error {
 	}
 
 	// Activate the script
-	if err := i.rdb.SetScriptActiveWithRetry(ctx, script.ID, user.UserID(), true); err != nil {
+	if err := i.rdb.SetScriptActiveWithRetry(i.ctx, script.ID, user.UserID(), true); err != nil {
 		return fmt.Errorf("failed to activate Sieve script: %w", err)
 	}
 
@@ -496,20 +496,19 @@ func (i *Importer) parseDovecotKeywords() error {
 func (i *Importer) performDryRun() error {
 	fmt.Printf("\n=== DRY RUN: Import Analysis ===\n\n")
 
-	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
 	user := server.NewUser(address, accountID)
 
 	// Proactively ensure default mailboxes exist for this user
-	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.UserID()); err != nil {
 		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the dry run, as mailboxes might already exist
 	}
@@ -565,11 +564,11 @@ func (i *Importer) performDryRun() error {
 		}
 
 		// Check if message already exists in Sora
-		mailboxObj, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailbox)
+		mailboxObj, err := i.rdb.GetMailboxByNameWithRetry(i.ctx, user.UserID(), mailbox)
 		var alreadyExists bool
 		if err == nil {
 			if !i.options.ForceReimport {
-				alreadyExists, err = i.isMessageAlreadyImported(ctx, hash, mailboxObj.ID)
+				alreadyExists, err = i.isMessageAlreadyImported(hash, mailboxObj.ID)
 				if err != nil {
 					logger.Infof("Error checking if message exists: %v", err)
 				}
@@ -813,9 +812,9 @@ func (i *Importer) shouldImportMailbox(mailboxName string) bool {
 }
 
 // isMessageAlreadyImported checks if a message with the given hash already exists in the Sora database.
-func (i *Importer) isMessageAlreadyImported(ctx context.Context, hash string, mailboxID int64) (bool, error) {
+func (i *Importer) isMessageAlreadyImported(hash string, mailboxID int64) (bool, error) {
 	var count int
-	err := i.rdb.QueryRowWithRetry(ctx,
+	err := i.rdb.QueryRowWithRetry(i.ctx,
 		"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND mailbox_id = $2 AND expunged_at IS NULL",
 		hash, mailboxID).Scan(&count)
 	if err != nil {
@@ -1055,6 +1054,14 @@ func (i *Importer) importMessages() error {
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				// Check for cancellation before processing each message
+				select {
+				case <-i.ctx.Done():
+					logger.Info("Import worker cancelled by user")
+					return
+				default:
+				}
+
 				// Retry logic: try up to 3 times
 				var err error
 				for retry := 0; retry < 3; retry++ {
@@ -1079,6 +1086,16 @@ func (i *Importer) importMessages() error {
 
 	// Feed jobs to workers
 	for rows.Next() {
+		// Check for cancellation before processing each row
+		select {
+		case <-i.ctx.Done():
+			logger.Info("Import cancelled by user, stopping job submission")
+			close(jobs)
+			wg.Wait()
+			return i.ctx.Err()
+		default:
+		}
+
 		var path, filename, hash, mailbox string
 		var size int64
 		if err := rows.Scan(&path, &filename, &hash, &size, &mailbox); err != nil {
@@ -1144,13 +1161,12 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
-	ctx := context.Background()
 	address, err := server.NewAddress(i.email)
 	if err != nil {
 		return fmt.Errorf("invalid email address: %w", err)
 	}
 
-	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
 	if err != nil {
 		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", i.email, err, i.email)
 	}
@@ -1159,19 +1175,19 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 	// Proactively ensure default mailboxes exist for this user
 	// This prevents "mailbox not found" errors during import
-	if err := i.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+	if err := i.rdb.CreateDefaultMailboxesWithRetry(i.ctx, user.UserID()); err != nil {
 		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", i.email, err)
 		// Don't fail the import, as mailboxes might already exist
 	}
 
-	mailbox, err := i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
+	mailbox, err := i.rdb.GetMailboxByNameWithRetry(i.ctx, user.UserID(), mailboxName)
 	if err != nil {
 		logger.Infof("Mailbox '%s' not found for user %d, creating it", mailboxName, user.UserID())
 		// Create mailbox if it doesn't exist
-		if err := i.rdb.CreateMailboxWithRetry(ctx, user.UserID(), mailboxName, nil); err != nil {
+		if err := i.rdb.CreateMailboxWithRetry(i.ctx, user.UserID(), mailboxName, nil); err != nil {
 			return fmt.Errorf("failed to create mailbox '%s': %w", mailboxName, err)
 		}
-		mailbox, err = i.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), mailboxName)
+		mailbox, err = i.rdb.GetMailboxByNameWithRetry(i.ctx, user.UserID(), mailboxName)
 		if err != nil {
 			return fmt.Errorf("failed to get mailbox '%s' after creation: %w", mailboxName, err)
 		}
@@ -1181,7 +1197,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	}
 
 	// Check if this message is already imported
-	alreadyImported, err := i.isMessageAlreadyImported(ctx, hash, mailbox.ID)
+	alreadyImported, err := i.isMessageAlreadyImported(hash, mailbox.ID)
 	if err != nil {
 		return fmt.Errorf("failed to check if message is already imported: %w", err)
 	}
@@ -1195,7 +1211,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 
 		// ForceReimport is true: delete the existing message before proceeding.
 		// This requires a `DeleteMessageByHashAndMailbox` method in the db package.
-		deleted, err := i.rdb.DeleteMessageByHashAndMailboxWithRetry(ctx, user.UserID(), mailbox.ID, hash)
+		deleted, err := i.rdb.DeleteMessageByHashAndMailboxWithRetry(i.ctx, user.UserID(), mailbox.ID, hash)
 		if err != nil {
 			return fmt.Errorf("failed to delete existing message for re-import: %w", err)
 		}
@@ -1287,7 +1303,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	}
 
 	hostname, _ := os.Hostname()
-	msgID, uid, err := i.rdb.InsertMessageWithRetry(ctx,
+	msgID, uid, err := i.rdb.InsertMessageWithRetry(i.ctx,
 		&db.InsertMessageOptions{
 			UserID:               user.UserID(),
 			MailboxID:            mailbox.ID,
@@ -1331,7 +1347,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	// Step 2: Upload content to S3 (skip in test mode)
 	if i.options.TestMode || i.s3 == nil {
 		// In test mode, skip S3 upload and mark as complete directly
-		err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
+		err = i.rdb.CompleteS3UploadWithRetry(i.ctx, hash, user.UserID())
 		if err != nil {
 			return fmt.Errorf("test mode: failed to finalize message in DB: %w", err)
 		}
@@ -1346,7 +1362,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		}
 
 		// Step 3: Finalize the upload in the database.
-		err = i.rdb.CompleteS3UploadWithRetry(ctx, hash, user.UserID())
+		err = i.rdb.CompleteS3UploadWithRetry(i.ctx, hash, user.UserID())
 		if err != nil {
 			// The S3 object exists, but we failed to mark it as complete in the DB.
 			// The message remains in the 'pending_uploads' queue and can be retried.

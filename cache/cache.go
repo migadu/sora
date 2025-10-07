@@ -1,3 +1,69 @@
+// Package cache provides a local filesystem cache for frequently accessed S3 objects.
+//
+// The cache reduces latency and S3 API calls by maintaining local copies of
+// message bodies that are accessed frequently. It includes:
+//   - SQLite-based metadata tracking
+//   - LRU eviction based on size limits
+//   - Metrics for hit/miss ratios
+//   - Automatic warming for recently accessed mailboxes
+//   - Content deduplication at read level
+//
+// # Cache Architecture
+//
+// The cache stores message bodies in a local directory structure with
+// an SQLite database tracking metadata (access times, sizes, hashes).
+// When a message is requested:
+//
+//  1. Check local cache (fast path)
+//  2. On miss, fetch from S3
+//  3. Store in cache for future access
+//  4. Track metrics for monitoring
+//
+// # Usage Example
+//
+//	// Initialize cache
+//	cache, err := cache.NewCache(
+//		"/var/cache/sora",
+//		sourceDB,
+//		10*1024*1024*1024, // 10 GB max size
+//	)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//
+//	// Get from cache (returns Reader)
+//	reader, err := cache.Get(ctx, contentHash)
+//	if err != nil {
+//		// Not in cache, fetch from S3
+//	}
+//	defer reader.Close()
+//
+//	// Put into cache
+//	err = cache.Put(ctx, contentHash, messageBody)
+//
+//	// Warm cache for a mailbox
+//	err = cache.WarmCache(ctx, userID, []string{"INBOX"}, 100)
+//
+// # Metrics
+//
+// The cache tracks:
+//   - Hit/miss ratios
+//   - Total size
+//   - Access patterns
+//   - Eviction statistics
+//
+// Access metrics via:
+//
+//	stats := cache.Stats()
+//	fmt.Printf("Hit ratio: %.2f%%\n", stats.HitRatio*100)
+//
+// # Cache Warming
+//
+// For better performance, warm the cache when a user logs in:
+//
+//	cache.WarmCache(ctx, userID, []string{"INBOX", "Sent"}, 50)
+//
+// This pre-loads the 50 most recent messages from specified mailboxes.
 package cache
 
 import (

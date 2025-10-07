@@ -1,3 +1,48 @@
+// Package circuitbreaker implements the circuit breaker pattern for resilient service calls.
+//
+// A circuit breaker prevents cascading failures by temporarily blocking calls to
+// a failing service, giving it time to recover. The breaker has three states:
+//
+//   - Closed: Normal operation, calls pass through
+//   - Open: Too many failures, calls fail immediately
+//   - Half-Open: Testing if service has recovered
+//
+// # State Transitions
+//
+//	CLOSED --[threshold failures]--> OPEN
+//	OPEN --[timeout elapsed]--> HALF_OPEN
+//	HALF_OPEN --[success]--> CLOSED
+//	HALF_OPEN --[failure]--> OPEN
+//
+// # Usage
+//
+//	// Create circuit breaker
+//	cb := circuitbreaker.New(circuitbreaker.Config{
+//		FailureThreshold: 5,        // Open after 5 failures
+//		SuccessThreshold: 2,        // Close after 2 successes in half-open
+//		Timeout:          30*time.Second,  // Try recovery after 30s
+//		MaxRequests:      3,        // Allow 3 requests in half-open
+//	})
+//
+//	// Protect a function call
+//	err := cb.Call(func() error {
+//		return makeServiceCall()
+//	})
+//	if err == circuitbreaker.ErrOpenState {
+//		// Circuit breaker is open, service is unavailable
+//	}
+//
+// # Monitoring
+//
+//	state := cb.State()
+//	stats := cb.Stats()
+//	fmt.Printf("Failures: %d, Successes: %d\n",
+//		stats.ConsecutiveFailures, stats.ConsecutiveSuccesses)
+//
+// # Integration
+//
+// Used by storage and database packages to prevent cascading failures
+// when S3 or PostgreSQL become temporarily unavailable.
 package circuitbreaker
 
 import (
