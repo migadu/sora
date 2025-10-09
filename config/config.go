@@ -905,6 +905,25 @@ type LoggingConfig struct {
 	Level  string `toml:"level"`  // Log level: "debug", "info", "warn", "error"
 }
 
+// MetadataConfig holds IMAP METADATA extension limits (RFC 5464).
+type MetadataConfig struct {
+	// MaxEntrySize is the maximum size in bytes for a single metadata entry value.
+	// Default: 65536 (64KB). RFC 5464 recommends servers impose reasonable limits.
+	MaxEntrySize int `toml:"max_entry_size"`
+
+	// MaxEntriesPerMailbox is the maximum number of metadata entries per mailbox.
+	// Default: 100. Prevents excessive storage usage.
+	MaxEntriesPerMailbox int `toml:"max_entries_per_mailbox"`
+
+	// MaxEntriesPerServer is the maximum number of server-level metadata entries per account.
+	// Default: 50. Server metadata is stored per-account.
+	MaxEntriesPerServer int `toml:"max_entries_per_server"`
+
+	// MaxTotalSize is the maximum total size in bytes for all metadata per account.
+	// Default: 1048576 (1MB). Prevents quota exhaustion.
+	MaxTotalSize int `toml:"max_total_size"`
+}
+
 // Config holds all configuration for the application.
 type Config struct {
 	Logging    LoggingConfig    `toml:"logging"`
@@ -914,6 +933,7 @@ type Config struct {
 	Cleanup    CleanupConfig    `toml:"cleanup"`
 	Servers    ServersConfig    `toml:"servers"`
 	Uploader   UploaderConfig   `toml:"uploader"`
+	Metadata   MetadataConfig   `toml:"metadata"`
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
@@ -986,6 +1006,12 @@ func NewDefaultConfig() Config {
 			WarmupMessageCount: 50,
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
+		},
+		Metadata: MetadataConfig{
+			MaxEntrySize:         65536,   // 64KB per entry
+			MaxEntriesPerMailbox: 100,     // 100 entries per mailbox
+			MaxEntriesPerServer:  50,      // 50 server-level entries per account
+			MaxTotalSize:         1048576, // 1MB total per account
 		},
 		Servers: ServersConfig{
 			TrustedNetworks: []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"},

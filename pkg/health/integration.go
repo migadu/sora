@@ -147,7 +147,14 @@ type PrelookupHealthChecker interface {
 	HealthCheck(ctx context.Context) error
 }
 
+// PrelookupWithCircuitBreaker interface for prelookup clients with circuit breaker
+type PrelookupWithCircuitBreaker interface {
+	PrelookupHealthChecker
+	GetCircuitBreaker() *circuitbreaker.CircuitBreaker
+}
+
 // RegisterPrelookupCheck registers a health check for the prelookup database
+// If the client has a circuit breaker, it will also register a circuit breaker check
 func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHealthChecker, serverName string) {
 	checkName := "prelookup_database"
 	if serverName != "" {
@@ -162,6 +169,17 @@ func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHea
 		Check:    prelookupClient.HealthCheck,
 	}
 	hi.monitor.RegisterCheck(prelookupCheck)
+
+	// If the client has a circuit breaker, register it too
+	if clientWithBreaker, ok := prelookupClient.(PrelookupWithCircuitBreaker); ok {
+		if breaker := clientWithBreaker.GetCircuitBreaker(); breaker != nil {
+			cbName := "prelookup_circuit_breaker"
+			if serverName != "" {
+				cbName = fmt.Sprintf("prelookup_circuit_breaker_%s", serverName)
+			}
+			hi.RegisterCircuitBreakerCheck(cbName, breaker)
+		}
+	}
 }
 
 func (hi *HealthIntegration) storeHealthStatus(componentName string, status ComponentStatus) {

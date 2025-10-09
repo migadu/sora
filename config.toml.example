@@ -146,6 +146,18 @@ auth_attempts_retention = "7d"  # How long to retain authentication attempt logs
 health_status_retention = "30d" # How long to retain health status history in the database.
 
 
+# METADATA LIMITS CONFIGURATION
+# =============================================================================
+# IMAP METADATA extension (RFC 5464) limits to prevent storage abuse.
+# These limits apply per-account and help protect against excessive metadata usage.
+
+[metadata]
+max_entry_size = 65536         # Maximum size per metadata entry (64KB). Prevents huge single values.
+max_entries_per_mailbox = 100  # Maximum number of metadata entries per mailbox. Prevents entry spam.
+max_entries_per_server = 50    # Maximum number of server-level metadata entries per account.
+max_total_size = 1048576       # Maximum total metadata size per account (1MB). Overall quota protection.
+
+
 # GLOBAL SERVERS CONFIGURATION
 # =============================================================================
 # Global settings that apply to all protocol servers.

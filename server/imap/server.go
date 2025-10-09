@@ -242,6 +242,12 @@ type IMAPServer struct {
 	ftsRetention       time.Duration
 	version            string
 
+	// Metadata limits (RFC 5464)
+	metadataMaxEntrySize         int
+	metadataMaxEntriesPerMailbox int
+	metadataMaxEntriesPerServer  int
+	metadataMaxTotalSize         int
+
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
@@ -294,6 +300,11 @@ type IMAPServerOptions struct {
 	CapabilityFilters []config.ClientCapabilityFilter
 	// Version information
 	Version string
+	// Metadata limits (RFC 5464)
+	MetadataMaxEntrySize         int
+	MetadataMaxEntriesPerMailbox int
+	MetadataMaxEntriesPerServer  int
+	MetadataMaxTotalSize         int
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -343,24 +354,28 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	s := &IMAPServer{
-		hostname:           hostname,
-		name:               name,
-		appCtx:             appCtx,
-		addr:               imapAddr,
-		rdb:                rdb,
-		s3:                 resilientS3,
-		uploader:           uploadWorker,
-		cache:              cache,
-		appendLimit:        options.AppendLimit,
-		ftsRetention:       options.FTSRetention,
-		version:            options.Version,
-		authLimiter:        authLimiter,
-		proxyReader:        proxyReader,
-		enableWarmup:       options.EnableWarmup,
-		warmupMessageCount: options.WarmupMessageCount,
-		warmupMailboxes:    options.WarmupMailboxes,
-		warmupAsync:        options.WarmupAsync,
-		warmupTimeout:      warmupTimeout,
+		hostname:                     hostname,
+		name:                         name,
+		appCtx:                       appCtx,
+		addr:                         imapAddr,
+		rdb:                          rdb,
+		s3:                           resilientS3,
+		uploader:                     uploadWorker,
+		cache:                        cache,
+		appendLimit:                  options.AppendLimit,
+		ftsRetention:                 options.FTSRetention,
+		version:                      options.Version,
+		metadataMaxEntrySize:         options.MetadataMaxEntrySize,
+		metadataMaxEntriesPerMailbox: options.MetadataMaxEntriesPerMailbox,
+		metadataMaxEntriesPerServer:  options.MetadataMaxEntriesPerServer,
+		metadataMaxTotalSize:         options.MetadataMaxTotalSize,
+		authLimiter:                  authLimiter,
+		proxyReader:                  proxyReader,
+		enableWarmup:                 options.EnableWarmup,
+		warmupMessageCount:           options.WarmupMessageCount,
+		warmupMailboxes:              options.WarmupMailboxes,
+		warmupAsync:                  options.WarmupAsync,
+		warmupTimeout:                warmupTimeout,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:     struct{}{},
 			imap.CapLiteralPlus:   struct{}{},
@@ -380,6 +395,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapChildren:      struct{}{},
 			imap.CapID:            struct{}{},
 			imap.CapNamespace:     struct{}{},
+			imap.CapMetadata:      struct{}{},
 		},
 		masterUsername:     options.MasterUsername,
 		masterPassword:     options.MasterPassword,

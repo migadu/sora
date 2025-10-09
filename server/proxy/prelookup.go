@@ -753,6 +753,11 @@ func (c *PreLookupClient) HealthCheck(ctx context.Context) error {
 	return c.pool.Ping(ctx)
 }
 
+// GetCircuitBreaker returns the circuit breaker for health monitoring
+func (c *PreLookupClient) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
+	return c.breaker
+}
+
 // isRetryableError checks if an error is transient and the operation can be retried.
 func isRetryableError(err error) bool {
 	if err == nil {
