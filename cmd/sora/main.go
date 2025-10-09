@@ -556,6 +556,13 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
+	maxMessageSize, err := serverConfig.GetMaxMessageSize()
+	if err != nil {
+		logger.Infof("LMTP [%s] Invalid max_message_size: %v, using default (50MB)",
+			serverConfig.Name, err)
+		maxMessageSize = 50 * 1024 * 1024
+	}
+
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		ExternalRelay:        serverConfig.ExternalRelay,
 		TLSVerify:            serverConfig.TLSVerify,
@@ -570,6 +577,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		ProxyProtocolTimeout: proxyProtocolTimeout,
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 		FTSRetention:         ftsRetention,
+		MaxMessageSize:       maxMessageSize,
 	})
 
 	if err != nil {
@@ -603,6 +611,13 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("POP3 [%s] Invalid command timeout: %v, using default (2 minutes)",
+			serverConfig.Name, err)
+		commandTimeout = 2 * time.Minute
+	}
+
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
 		Debug:                serverConfig.Debug,
 		TLS:                  serverConfig.TLS,
@@ -618,6 +633,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:        authRateLimit,
 		SessionMemoryLimit:   sessionMemoryLimit,
+		CommandTimeout:       commandTimeout,
 	})
 
 	if err != nil {
@@ -644,6 +660,13 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("ManageSieve [%s] Invalid command timeout: %v, using default (3 minutes)",
+			serverConfig.Name, err)
+		commandTimeout = 3 * time.Minute
+	}
+
 	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
 		InsecureAuth:         serverConfig.InsecureAuth,
 		TLSVerify:            serverConfig.TLSVerify,
@@ -662,6 +685,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTimeout: proxyProtocolTimeout,
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:        authRateLimit,
+		CommandTimeout:       commandTimeout,
 	})
 
 	if err != nil {

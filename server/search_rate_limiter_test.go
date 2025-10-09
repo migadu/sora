@@ -177,7 +177,6 @@ func TestSearchRateLimiter_Cleanup(t *testing.T) {
 	// Test with very short cleanup interval for testing
 	limiter := NewSearchRateLimiter("TEST", 10, 100*time.Millisecond)
 	require.NotNil(t, limiter)
-	limiter.cleanupInterval = 200 * time.Millisecond // Override for testing
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -191,6 +190,9 @@ func TestSearchRateLimiter_Cleanup(t *testing.T) {
 	// Wait long enough for inactivity threshold (30 minutes in real code,
 	// but we'll manually trigger cleanup for testing)
 	time.Sleep(50 * time.Millisecond)
+
+	// Stop the cleanup goroutine before manually manipulating the map
+	limiter.Stop()
 
 	// Manually run cleanup with modified inactivity threshold
 	limiter.mu.Lock()
@@ -258,7 +260,7 @@ func TestSearchRateLimiter_RetryAfterMessage(t *testing.T) {
 	// Error message should contain helpful information
 	errMsg := err.Error()
 	assert.Contains(t, errMsg, "search rate limit exceeded")
-	assert.Contains(t, errMsg, "2 searches") // Limit count
+	assert.Contains(t, errMsg, "2 searches")  // Limit count
 	assert.Contains(t, errMsg, "please wait") // Retry guidance
 }
 

@@ -253,16 +253,16 @@ func TestSessionMemoryTracker_RealWorldScenario(t *testing.T) {
 
 	// Fetch messages one at a time (streaming pattern)
 	messageSizes := []int64{
-		1024,      // 1KB
-		5120,      // 5KB
-		102400,    // 100KB
-		512000,    // 500KB
-		1048576,   // 1MB
-		2097152,   // 2MB
-		5242880,   // 5MB
-		10485760,  // 10MB
-		15728640,  // 15MB
-		20971520,  // 20MB
+		1024,     // 1KB
+		5120,     // 5KB
+		102400,   // 100KB
+		512000,   // 500KB
+		1048576,  // 1MB
+		2097152,  // 2MB
+		5242880,  // 5MB
+		10485760, // 10MB
+		15728640, // 15MB
+		20971520, // 20MB
 	}
 
 	peakSeen := int64(0)

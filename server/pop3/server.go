@@ -51,6 +51,9 @@ type POP3Server struct {
 
 	// Memory limiting
 	sessionMemoryLimit int64
+
+	// Command timeout
+	commandTimeout time.Duration
 }
 
 type POP3ServerOptions struct {
@@ -67,7 +70,8 @@ type POP3ServerOptions struct {
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
 	TrustedNetworks      []string // Global trusted networks for parameter forwarding
 	AuthRateLimit        serverPkg.AuthRateLimiterConfig
-	SessionMemoryLimit   int64 // Memory limit per session in bytes
+	SessionMemoryLimit   int64         // Memory limit per session in bytes
+	CommandTimeout       time.Duration // Maximum time for a single command to execute
 }
 
 func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -117,6 +121,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		authLimiter:        authLimiter,
 		trustedNetworks:    options.TrustedNetworks,
 		sessionMemoryLimit: options.SessionMemoryLimit,
+		commandTimeout:     options.CommandTimeout,
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -164,6 +169,11 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 	// Start connection limiter cleanup
 	server.limiter.StartCleanup(serverCtx)
+
+	// Initialize command timeout metrics
+	if server.commandTimeout > 0 {
+		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("pop3").Set(server.commandTimeout.Seconds())
+	}
 
 	return server, nil
 }

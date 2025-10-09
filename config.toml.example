@@ -292,6 +292,10 @@ tls_verify = true
 proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
 
+# --- MESSAGE SIZE LIMITING ---
+# Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
+max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+
 
 # POP3 SERVER EXAMPLE
 # =============================================================================
@@ -321,6 +325,10 @@ proxy_protocol_timeout = "5s"
 # Per-session memory limit to prevent memory exhaustion attacks (POP3 RETR/TOP commands)
 session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
 
+# --- COMMAND TIMEOUT ---
+# Maximum time allowed for a single POP3 command to execute (protects against Slowloris-style attacks)
+command_timeout = "2m"            # Default: 2 minutes (e.g., "30s", "5m"). Fast commands like STAT/LIST complete quickly.
+
 
 # MANAGESIEVE SERVER EXAMPLE
 # =============================================================================
@@ -349,6 +357,10 @@ proxy_protocol_timeout = "5s"
 # Same configuration available as shown in IMAP example above
 # [server.auth_rate_limit]
 # enabled = false
+
+# --- COMMAND TIMEOUT ---
+# Maximum time allowed for a single ManageSieve command to execute (protects against Slowloris-style attacks)
+command_timeout = "3m"            # Default: 3 minutes (e.g., "30s", "5m"). PUTSCRIPT/GETSCRIPT may transfer larger scripts.
 
 
 # IMAP PROXY EXAMPLE

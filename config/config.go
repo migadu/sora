@@ -599,22 +599,22 @@ func (c *LMTPProxyServerConfig) GetRemotePort() (int, error) {
 
 // IMAPServerConfig holds IMAP server configuration.
 type IMAPServerConfig struct {
-	Start                   bool                  `toml:"start"`
-	Addr                    string                `toml:"addr"`
-	AppendLimit             string                `toml:"append_limit"`
-	MaxConnections          int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP     int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterUsername          string                `toml:"master_username"`
-	MasterPassword          string                `toml:"master_password"`
-	MasterSASLUsername      string                `toml:"master_sasl_username"`
-	MasterSASLPassword      string                `toml:"master_sasl_password"`
-	TLS                     bool                  `toml:"tls"`
-	TLSCertFile             string                `toml:"tls_cert_file"`
-	TLSKeyFile              string                `toml:"tls_key_file"`
-	TLSVerify               bool                  `toml:"tls_verify"`
-	AuthRateLimit           AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
-	SearchRateLimitPerMin   int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow   string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
+	Start                 bool                  `toml:"start"`
+	Addr                  string                `toml:"addr"`
+	AppendLimit           string                `toml:"append_limit"`
+	MaxConnections        int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP   int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterUsername        string                `toml:"master_username"`
+	MasterPassword        string                `toml:"master_password"`
+	MasterSASLUsername    string                `toml:"master_sasl_username"`
+	MasterSASLPassword    string                `toml:"master_sasl_password"`
+	TLS                   bool                  `toml:"tls"`
+	TLSCertFile           string                `toml:"tls_cert_file"`
+	TLSKeyFile            string                `toml:"tls_key_file"`
+	TLSVerify             bool                  `toml:"tls_verify"`
+	AuthRateLimit         AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
+	SearchRateLimitPerMin int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
 }
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
@@ -652,6 +652,15 @@ type POP3ServerConfig struct {
 	TLSKeyFile          string                `toml:"tls_key_file"`
 	TLSVerify           bool                  `toml:"tls_verify"`
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	CommandTimeout      string                `toml:"command_timeout"` // Maximum time for a single command to execute (default: 2m)
+}
+
+// GetCommandTimeout parses the command timeout duration for POP3
+func (c *POP3ServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if c.CommandTimeout == "" {
+		return 2 * time.Minute, nil // Default: 2 minutes for POP3 commands
+	}
+	return helpers.ParseDuration(c.CommandTimeout)
 }
 
 // ManageSieveServerConfig holds ManageSieve server configuration.
@@ -671,6 +680,15 @@ type ManageSieveServerConfig struct {
 	TLSKeyFile          string                `toml:"tls_key_file"`
 	TLSVerify           bool                  `toml:"tls_verify"`
 	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	CommandTimeout      string                `toml:"command_timeout"` // Maximum time for a single command to execute (default: 3m)
+}
+
+// GetCommandTimeout parses the command timeout duration for ManageSieve
+func (c *ManageSieveServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if c.CommandTimeout == "" {
+		return 3 * time.Minute, nil // Default: 3 minutes for ManageSieve commands
+	}
+	return helpers.ParseDuration(c.CommandTimeout)
 }
 
 // IMAPProxyServerConfig holds IMAP proxy server configuration.
@@ -842,6 +860,7 @@ type ServerConfig struct {
 	// LMTP specific
 	ExternalRelay  string `toml:"external_relay,omitempty"`
 	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
+	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
@@ -861,7 +880,6 @@ type ServerConfig struct {
 	EnableAffinity         bool        `toml:"enable_affinity,omitempty"`
 	AffinityStickiness     float64     `toml:"affinity_stickiness,omitempty"`
 	AffinityValidity       string      `toml:"affinity_validity,omitempty"`
-	MaxMessageSize         string      `toml:"max_message_size,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`
@@ -882,10 +900,11 @@ type ServerConfig struct {
 	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
 
 	// Auth rate limiting (embedded)
-	AuthRateLimit           *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
-	SearchRateLimitPerMin   int                    `toml:"search_rate_limit_per_min,omitempty"`   // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow   string                 `toml:"search_rate_limit_window,omitempty"`    // Search rate limit time window (default: 1m)
-	SessionMemoryLimit      string                 `toml:"session_memory_limit,omitempty"`        // Per-session memory limit (default: 100mb, 0=unlimited)
+	AuthRateLimit         *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+	SearchRateLimitPerMin int                    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow string                 `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
+	SessionMemoryLimit    string                 `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
+	CommandTimeout        string                 `toml:"command_timeout,omitempty"`           // Per-command execution timeout (default: protocol-specific)
 
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
@@ -1338,6 +1357,13 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	return helpers.ParseSize(s.MaxScriptSize)
 }
 
+func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
+	if s.MaxMessageSize == "" {
+		return 50 * 1024 * 1024, nil // 50MB default
+	}
+	return helpers.ParseSize(s.MaxMessageSize)
+}
+
 func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
 	if s.ConnectTimeout == "" {
 		return 30 * time.Second, nil
@@ -1371,13 +1397,6 @@ func (s *ServerConfig) GetAffinityValidity() (time.Duration, error) {
 	return helpers.ParseDuration(s.AffinityValidity)
 }
 
-func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
-	if s.MaxMessageSize == "" {
-		return 52428800, nil // 50MB default
-	}
-	return helpers.ParseSize(s.MaxMessageSize)
-}
-
 func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	if s.ProxyProtocolTimeout == "" {
 		return 5 * time.Second, nil // 5 second default
@@ -1399,6 +1418,24 @@ func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 		return 100 * 1024 * 1024, nil // Default: 100MB
 	}
 	return helpers.ParseSize(s.SessionMemoryLimit)
+}
+
+// GetCommandTimeout parses the command timeout duration with protocol-specific defaults
+func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if s.CommandTimeout == "" {
+		// Protocol-specific defaults
+		switch s.Type {
+		case "pop3", "pop3_proxy":
+			return 2 * time.Minute, nil // 2 minutes for POP3
+		case "imap", "imap_proxy":
+			return 5 * time.Minute, nil // 5 minutes for IMAP
+		case "managesieve", "managesieve_proxy":
+			return 3 * time.Minute, nil // 3 minutes for ManageSieve
+		default:
+			return 2 * time.Minute, nil // Default: 2 minutes
+		}
+	}
+	return helpers.ParseDuration(s.CommandTimeout)
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

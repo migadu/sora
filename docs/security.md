@@ -118,6 +118,28 @@ The session memory tracker:
 
 When a session exceeds its memory limit, the operation fails gracefully with a clear error message, protecting the server from out-of-memory conditions.
 
+### Message Size Limits
+
+To prevent memory exhaustion from oversized messages:
+
+**IMAP APPEND**: Configurable via `append_limit` (default: 25MB)
+```toml
+[servers.imap]
+append_limit = "25mb"  # Maximum size for IMAP APPEND operations
+```
+
+**LMTP Delivery**: Configurable via `max_message_size` (default: 50MB)
+```toml
+[servers.lmtp]
+max_message_size = "50mb"  # Maximum size for incoming messages
+```
+
+When a message exceeds the configured limit:
+- **IMAP**: Returns `[TOOBIG]` response code (RFC 7889)
+- **LMTP**: Returns 552 error code (message size exceeds limit)
+
+**Security Note**: LMTP's `max_message_size` is critical for preventing memory exhaustion attacks. The limit is enforced before loading the message into memory using `io.LimitReader`, protecting against attempts to send multi-GB emails that could OOM the server.
+
 ### Connection Limits
 
 Each protocol server supports configurable connection limits:

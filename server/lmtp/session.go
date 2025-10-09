@@ -267,10 +267,29 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	var buf bytes.Buffer
-	_, err := io.Copy(&buf, r)
+
+	// Limit the read if max_message_size is configured
+	var reader io.Reader = r
+	if s.backend.maxMessageSize > 0 {
+		// Add 1 byte to detect when limit is exceeded
+		reader = io.LimitReader(r, s.backend.maxMessageSize+1)
+	}
+
+	_, err := io.Copy(&buf, reader)
 	if err != nil {
 		return s.InternalError("failed to read message: %v", err)
 	}
+
+	// Check if message exceeds configured limit
+	if s.backend.maxMessageSize > 0 && int64(buf.Len()) > s.backend.maxMessageSize {
+		s.Log("message size %d bytes exceeds limit of %d bytes", buf.Len(), s.backend.maxMessageSize)
+		return &smtp.SMTPError{
+			Code:         552,
+			EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", s.backend.maxMessageSize),
+		}
+	}
+
 	s.Log("message data read successfully (%d bytes)", buf.Len())
 
 	// Use the full message bytes as received for hashing, size, and header extraction.

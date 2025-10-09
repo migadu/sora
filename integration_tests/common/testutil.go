@@ -635,6 +635,59 @@ func SetupPOP3ServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	}, account
 }
 
+// SetupPOP3ServerWithTimeout sets up a POP3 server with a custom command timeout for testing
+func SetupPOP3ServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	server, err := pop3.New(
+		context.Background(),
+		"test-timeout",
+		"localhost",
+		address,
+		&storage.S3Storage{},
+		rdb,
+		nil, // uploader.UploadWorker
+		nil, // cache.Cache
+		pop3.POP3ServerOptions{
+			CommandTimeout: commandTimeout,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 server with timeout: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("POP3 server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}
+
 // SetupLMTPServerWithPROXY sets up an LMTP server with PROXY protocol support for proxy testing
 func SetupLMTPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
@@ -862,4 +915,56 @@ func SetupManageSieveServer(t *testing.T) (*TestServer, TestAccount) {
 func init() {
 	// Reduce log noise during tests
 	log.SetOutput(os.Stderr)
+}
+
+// SetupManageSieveServerWithTimeout sets up a ManageSieve server with a custom command timeout for testing
+func SetupManageSieveServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	server, err := managesieve.New(
+		context.Background(),
+		"test-timeout",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth:        true, // Enable PLAIN auth for testing
+			SupportedExtensions: []string{"fileinto", "vacation", "envelope", "variables"},
+			CommandTimeout:      commandTimeout,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server with timeout: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("ManageSieve server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
 }

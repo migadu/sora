@@ -13,13 +13,13 @@ import (
 // SearchRateLimiter provides per-user rate limiting for search operations
 // to prevent DoS attacks via excessive search queries
 type SearchRateLimiter struct {
-	mu               sync.RWMutex
-	userSearches     map[int64]*UserSearchTracker
-	maxPerMinute     int
-	window           time.Duration
-	cleanupInterval  time.Duration
-	stopCleanup      chan struct{}
-	protocol         string
+	mu              sync.RWMutex
+	userSearches    map[int64]*UserSearchTracker
+	maxPerMinute    int
+	window          time.Duration
+	cleanupInterval time.Duration
+	stopCleanup     chan struct{}
+	protocol        string
 }
 
 // UserSearchTracker tracks search operations for a single user

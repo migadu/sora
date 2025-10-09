@@ -46,6 +46,9 @@ type ManageSieveServer struct {
 
 	// Authentication rate limiting
 	authLimiter server.AuthLimiter
+
+	// Command timeout
+	commandTimeout time.Duration
 }
 
 type ManageSieveServerOptions struct {
@@ -66,6 +69,7 @@ type ManageSieveServerOptions struct {
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
 	TrustedNetworks      []string // Global trusted networks for parameter forwarding
 	AuthRateLimit        server.AuthRateLimiterConfig
+	CommandTimeout       time.Duration // Maximum time for a single command to execute
 }
 
 func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -110,6 +114,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		masterSASLPassword:  []byte(options.MasterSASLPassword),
 		proxyReader:         proxyReader,
 		authLimiter:         authLimiter,
+		commandTimeout:      options.CommandTimeout,
 	}
 
 	// No default extensions - only use what's explicitly configured
@@ -156,6 +161,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// Start connection limiter cleanup
 	serverInstance.limiter.StartCleanup(serverCtx)
+
+	// Initialize command timeout metrics
+	if serverInstance.commandTimeout > 0 {
+		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
+	}
 
 	return serverInstance, nil
 }

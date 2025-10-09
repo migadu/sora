@@ -171,18 +171,19 @@ func (c *connectionLimitingConn) Close() error {
 }
 
 type LMTPServerBackend struct {
-	addr          string
-	name          string
-	hostname      string
-	rdb           *resilient.ResilientDatabase
-	s3            *storage.S3Storage
-	uploader      *uploader.UploadWorker
-	server        *smtp.Server
-	appCtx        context.Context
-	externalRelay string
-	tlsConfig     *tls.Config
-	debug         bool
-	ftsRetention  time.Duration
+	addr           string
+	name           string
+	hostname       string
+	rdb            *resilient.ResilientDatabase
+	s3             *storage.S3Storage
+	uploader       *uploader.UploadWorker
+	server         *smtp.Server
+	appCtx         context.Context
+	externalRelay  string
+	tlsConfig      *tls.Config
+	debug          bool
+	ftsRetention   time.Duration
+	maxMessageSize int64 // Maximum size for incoming messages
 
 	// Connection counters
 	totalConnections atomic.Int64
@@ -215,6 +216,7 @@ type LMTPServerOptions struct {
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
 	TrustedNetworks      []string // Global trusted networks for parameter forwarding
 	FTSRetention         time.Duration
+	MaxMessageSize       int64 // Maximum size for incoming messages in bytes
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -239,17 +241,18 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	backend := &LMTPServerBackend{
-		addr:          addr,
-		name:          name,
-		appCtx:        appCtx,
-		hostname:      hostname,
-		rdb:           rdb,
-		s3:            s3,
-		uploader:      uploadWorker,
-		externalRelay: options.ExternalRelay,
-		debug:         options.Debug,
-		ftsRetention:  options.FTSRetention,
-		proxyReader:   proxyReader,
+		addr:           addr,
+		name:           name,
+		appCtx:         appCtx,
+		hostname:       hostname,
+		rdb:            rdb,
+		s3:             s3,
+		uploader:       uploadWorker,
+		externalRelay:  options.ExternalRelay,
+		debug:          options.Debug,
+		ftsRetention:   options.FTSRetention,
+		maxMessageSize: options.MaxMessageSize,
+		proxyReader:    proxyReader,
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration

@@ -103,6 +103,13 @@ func (s *ManageSieveSession) handleConnection() {
 		// This is a defensive change as the direct logging is not visible in this file.
 		s.Log("C: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
+		// Set command execution deadline
+		commandDeadline := time.Time{} // Zero time means no deadline
+		if s.server.commandTimeout > 0 {
+			commandDeadline = time.Now().Add(s.server.commandTimeout)
+		}
+		(*s.conn).SetDeadline(commandDeadline)
+
 		switch command {
 		case "CAPABILITY":
 			start := time.Now()
@@ -486,6 +493,27 @@ func (s *ManageSieveSession) handleConnection() {
 		default:
 			s.sendResponse("NO Unknown command\r\n")
 		}
+
+		// Flush response and check for timeout
+		if err := s.writer.Flush(); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.Log("command %s exceeded timeout (%v)", command, s.server.commandTimeout)
+
+				// Track timeout event in metrics
+				metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", command).Inc()
+
+				// Try to send error message if possible
+				(*s.conn).SetDeadline(time.Now().Add(5 * time.Second)) // Brief window to send error
+				s.sendResponse("NO Command exceeded timeout\r\n")
+				s.writer.Flush()
+				return
+			}
+			s.Log("error flushing response for %s: %v", command, err)
+			return
+		}
+
+		// Clear deadline after successful command completion
+		(*s.conn).SetDeadline(time.Time{})
 	}
 }
 

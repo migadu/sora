@@ -64,6 +64,7 @@ func (s *POP3Session) handleConnection() {
 	var userAddress *server.Address
 
 	for {
+		// Set idle timeout for reading command
 		(*s.conn).SetReadDeadline(time.Now().Add(Pop3IdleTimeout))
 
 		line, err := reader.ReadString('\n')
@@ -92,6 +93,14 @@ func (s *POP3Session) handleConnection() {
 		cmd := strings.ToUpper(parts[0])
 
 		s.Log("C: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
+
+		// Set command execution deadline
+		// Clear any previous deadline, then set command timeout
+		commandDeadline := time.Time{} // Zero time means no deadline
+		if s.server.commandTimeout > 0 {
+			commandDeadline = time.Now().Add(s.server.commandTimeout)
+		}
+		(*s.conn).SetDeadline(commandDeadline)
 
 		switch cmd {
 		case "CAPA":
@@ -1601,7 +1610,27 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(fmt.Sprintf("-ERR Unknown command: %s\r\n", cmd))
 			s.Log("unknown command: %s", cmd)
 		}
-		writer.Flush()
+
+		// Flush response and check for timeout
+		if err := writer.Flush(); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.Log("command %s exceeded timeout (%v)", cmd, s.server.commandTimeout)
+
+				// Track timeout event in metrics
+				metrics.CommandTimeoutsTotal.WithLabelValues("pop3", cmd).Inc()
+
+				// Try to send error message if possible
+				(*s.conn).SetDeadline(time.Now().Add(5 * time.Second)) // Brief window to send error
+				writer.WriteString(fmt.Sprintf("-ERR Command %s exceeded timeout\r\n", cmd))
+				writer.Flush()
+				return
+			}
+			s.Log("error flushing response for %s: %v", cmd, err)
+			return
+		}
+
+		// Clear deadline after successful command completion
+		(*s.conn).SetDeadline(time.Time{})
 	}
 }
 

@@ -105,9 +105,26 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "sora_command_duration_seconds",
 			Help:    "Duration of commands by protocol in seconds",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0},
 		},
 		[]string{"protocol", "command"},
+	)
+
+	// Command timeout metrics
+	CommandTimeoutsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_command_timeouts_total",
+			Help: "Total number of commands that exceeded timeout threshold",
+		},
+		[]string{"protocol", "command"},
+	)
+
+	CommandTimeoutThresholdSeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_command_timeout_threshold_seconds",
+			Help: "Configured command timeout threshold in seconds by protocol",
+		},
+		[]string{"protocol"},
 	)
 )
 

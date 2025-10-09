@@ -279,25 +279,25 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
-	Debug                bool
-	TLS                  bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	TLSVerify            bool
-	MasterUsername       []byte
-	MasterPassword       []byte
-	MasterSASLUsername   []byte
-	MasterSASLPassword   []byte
-	AppendLimit          int64
-	MaxConnections       int
-	MaxConnectionsPerIP  int
-	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
-	TrustedNetworks         []string // Global trusted networks for parameter forwarding
-	AuthRateLimit           serverPkg.AuthRateLimiterConfig
-	SearchRateLimitPerMin   int           // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow   time.Duration // Search rate limit time window
-	SessionMemoryLimit      int64         // Per-session memory limit in bytes (0=unlimited)
+	Debug                 bool
+	TLS                   bool
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSVerify             bool
+	MasterUsername        []byte
+	MasterPassword        []byte
+	MasterSASLUsername    []byte
+	MasterSASLPassword    []byte
+	AppendLimit           int64
+	MaxConnections        int
+	MaxConnectionsPerIP   int
+	ProxyProtocol         bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
+	TrustedNetworks       []string // Global trusted networks for parameter forwarding
+	AuthRateLimit         serverPkg.AuthRateLimiterConfig
+	SearchRateLimitPerMin int           // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow time.Duration // Search rate limit time window
+	SessionMemoryLimit    int64         // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
