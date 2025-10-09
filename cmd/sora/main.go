@@ -388,6 +388,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	deps.healthIntegration.Start(ctx)
 	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
 
+	// Start metrics collector for database statistics
+	metricsCollector := metrics.NewCollector(deps.resilientDB, 60*time.Second)
+	go metricsCollector.Start(ctx)
+
 	return deps, nil
 }
 
@@ -485,6 +489,20 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
+	// Parse search rate limit window
+	searchRateLimitWindow, err := serverConfig.GetSearchRateLimitWindow()
+	if err != nil {
+		logger.Infof("IMAP [%s] Invalid search rate limit window: %v, using default (1 minute)", serverConfig.Name, err)
+		searchRateLimitWindow = time.Minute
+	}
+
+	// Parse session memory limit
+	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
+	if err != nil {
+		logger.Infof("IMAP [%s] Invalid session memory limit: %v, using default (100MB)", serverConfig.Name, err)
+		sessionMemoryLimit = 100 * 1024 * 1024
+	}
+
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:                        serverConfig.Debug,
@@ -503,6 +521,9 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			ProxyProtocolTimeout:         proxyProtocolTimeout,
 			TrustedNetworks:              deps.config.Servers.TrustedNetworks,
 			AuthRateLimit:                authRateLimit,
+			SearchRateLimitPerMin:        serverConfig.SearchRateLimitPerMin,
+			SearchRateLimitWindow:        searchRateLimitWindow,
+			SessionMemoryLimit:           sessionMemoryLimit,
 			EnableWarmup:                 deps.config.LocalCache.EnableWarmup,
 			WarmupMessageCount:           deps.config.LocalCache.WarmupMessageCount,
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
@@ -575,6 +596,13 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
+	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
+	if err != nil {
+		logger.Infof("POP3 [%s] Invalid session memory limit: %v, using default (100MB)",
+			serverConfig.Name, err)
+		sessionMemoryLimit = 100 * 1024 * 1024
+	}
+
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
 		Debug:                serverConfig.Debug,
 		TLS:                  serverConfig.TLS,
@@ -589,6 +617,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		ProxyProtocolTimeout: proxyProtocolTimeout,
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:        authRateLimit,
+		SessionMemoryLimit:   sessionMemoryLimit,
 	})
 
 	if err != nil {

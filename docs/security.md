@@ -42,6 +42,8 @@ fast_block_duration = "5m"
 
 This system tracks failed login attempts per IP and per username, introducing progressive delays and temporary blocks to thwart attackers.
 
+**Security Note**: The rate limiter implements a "fail-closed" security policy. If the database becomes unavailable, authentication attempts will be denied to prevent attackers from bypassing rate limiting by causing database errors. The rate limiter will automatically retry database access after the configured `db_error_threshold` period (default: 1 minute).
+
 ## PROXY Protocol
 
 When running Sora behind a load balancer or proxy, the server will only see the proxy's IP address. The PROXY protocol solves this by prepending a header to the connection that contains the real client IP.
@@ -65,3 +67,64 @@ encryption_key = "YOUR-SECRET-32-BYTE-HEX-ENCODED-KEY-HERE"
 ```
 
 **CRITICAL**: If you enable this, you **must** back up the `encryption_key`. If this key is lost, all encrypted message data will be permanently unrecoverable.
+
+## Resource Limits and DoS Protection
+
+Sora includes built-in protections against resource exhaustion attacks:
+
+### Search Result Limits
+
+To prevent memory exhaustion from large search operations:
+- **MaxSearchResults**: Limited to 1,000 messages per search (down from 5,000)
+- **MaxComplexSortResults**: Limited to 500 messages for expensive JSONB-based sorts
+
+These limits are enforced at the database layer and cannot be bypassed by clients. For mailboxes with more messages, clients should use more specific search criteria or implement pagination.
+
+### Search Rate Limiting
+
+Sora includes per-user search rate limiting to prevent DoS attacks via excessive search queries:
+
+```toml
+[servers.imap]
+search_rate_limit_per_min = 10  # Maximum searches per minute (0 = disabled)
+search_rate_limit_window = "1m" # Time window for rate limiting
+```
+
+When a user exceeds the limit, they receive a clear error message indicating how long to wait before trying again. The rate limiter:
+- Tracks searches per user (not per IP)
+- Uses a sliding time window
+- Automatically cleans up inactive user tracking
+- Is disabled by default (set `search_rate_limit_per_min` to enable)
+
+### Session Memory Limits
+
+Each IMAP and POP3 session has a configurable memory limit to prevent memory exhaustion attacks:
+
+```toml
+[servers.imap]
+session_memory_limit = "100mb"  # Maximum memory per session (default: 100mb, 0 = unlimited)
+
+[servers.pop3]
+session_memory_limit = "100mb"  # Maximum memory per session (default: 100mb, 0 = unlimited)
+```
+
+The session memory tracker:
+- **IMAP**: Monitors memory usage for FETCH and SEARCH operations
+- **POP3**: Monitors memory usage for RETR and TOP operations
+- Enforces limits before allocating large message bodies
+- Automatically frees memory when operations complete
+- Logs peak memory usage on session close
+- Exports Prometheus metrics for monitoring
+
+When a session exceeds its memory limit, the operation fails gracefully with a clear error message, protecting the server from out-of-memory conditions.
+
+### Connection Limits
+
+Each protocol server supports configurable connection limits:
+```toml
+[servers.imap]
+max_connections = 1000          # Total connections
+max_connections_per_ip = 10     # Per IP address
+```
+
+These limits prevent connection exhaustion attacks and ensure fair resource allocation across users.

@@ -67,8 +67,8 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract script name from path: /user/v1/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/v1/filters/", "")
+	// Extract script name from path: /user/filters/{name}
+	name := extractPathParam(r.URL.Path, "/user/filters/", "")
 	name, err = url.QueryUnescape(name)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
@@ -113,8 +113,8 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract script name from path: /user/v1/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/v1/filters/", "")
+	// Extract script name from path: /user/filters/{name}
+	name := extractPathParam(r.URL.Path, "/user/filters/", "")
 	name, err = url.QueryUnescape(name)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
@@ -171,8 +171,8 @@ func (s *Server) handleDeleteFilter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract script name from path: /user/v1/filters/{name}
-	name := extractPathParam(r.URL.Path, "/user/v1/filters/", "")
+	// Extract script name from path: /user/filters/{name}
+	name := extractPathParam(r.URL.Path, "/user/filters/", "")
 	name, err = url.QueryUnescape(name)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")
@@ -211,8 +211,8 @@ func (s *Server) handleActivateFilter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract script name from path: /user/v1/filters/{name}/activate
-	name := extractPathParam(r.URL.Path, "/user/v1/filters/", "/activate")
+	// Extract script name from path: /user/filters/{name}/activate
+	name := extractPathParam(r.URL.Path, "/user/filters/", "/activate")
 	name, err = url.QueryUnescape(name)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid script name")

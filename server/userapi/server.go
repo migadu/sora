@@ -159,22 +159,22 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no authentication required)
-	mux.HandleFunc("/user/v1/auth/login", routeHandler("POST", s.handleLogin))
-	mux.HandleFunc("/user/v1/auth/refresh", routeHandler("POST", s.handleRefreshToken))
+	mux.HandleFunc("/user/auth/login", routeHandler("POST", s.handleLogin))
+	mux.HandleFunc("/user/auth/refresh", routeHandler("POST", s.handleRefreshToken))
 
 	// Mailbox operations
-	mux.Handle("/user/v1/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
+	mux.Handle("/user/mailboxes", s.jwtAuthMiddleware(multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListMailboxes,
 		"POST": s.handleCreateMailbox,
 	})))
-	mux.Handle("/user/v1/mailboxes/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMailboxWithName)))
+	mux.Handle("/user/mailboxes/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMailboxWithName)))
 
 	// Message operations
-	mux.Handle("/user/v1/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
+	mux.Handle("/user/messages/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleMessageOperations)))
 
 	// Sieve filter operations
-	mux.Handle("/user/v1/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
-	mux.Handle("/user/v1/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
+	mux.Handle("/user/filters", s.jwtAuthMiddleware(routeHandler("GET", s.handleListFilters)))
+	mux.Handle("/user/filters/", s.jwtAuthMiddleware(http.HandlerFunc(s.handleFilterOperations)))
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)

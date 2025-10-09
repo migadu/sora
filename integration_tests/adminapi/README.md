@@ -2,7 +2,7 @@
 
 This directory contains comprehensive integration tests for the Sora HTTP Admin API server (`http_admin_api` server type).
 
-**Base Path:** `/admin/v1/*`
+**Base Path:** `/admin/*`
 
 **Authentication:** API key (Bearer token)
 

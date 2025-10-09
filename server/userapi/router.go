@@ -6,7 +6,7 @@ import (
 )
 
 // extractPathParam extracts a path parameter from the URL
-// For example, from "/user/v1/mailboxes/INBOX/messages" with prefix "/user/v1/mailboxes/"
+// For example, from "/user/mailboxes/INBOX/messages" with prefix "/user/mailboxes/"
 // and suffix "/messages", it extracts "INBOX"
 func extractPathParam(path, prefix, suffix string) string {
 	// Remove prefix
@@ -27,7 +27,7 @@ func extractPathParam(path, prefix, suffix string) string {
 }
 
 // extractLastPathSegment extracts the last segment from a path
-// For example, from "/user/v1/messages/123", it extracts "123"
+// For example, from "/user/messages/123", it extracts "123"
 func extractLastPathSegment(path string) string {
 	parts := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	if len(parts) == 0 {

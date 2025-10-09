@@ -136,7 +136,7 @@ func TestAuthentication(t *testing.T) {
 			"password": tc.TestUser.Password,
 		}
 
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -159,7 +159,7 @@ func TestAuthentication(t *testing.T) {
 			"password": "wrongpassword",
 		}
 
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 401, got %d", resp.StatusCode)
 		}
@@ -171,7 +171,7 @@ func TestAuthentication(t *testing.T) {
 			"password": "password",
 		}
 
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 401, got %d", resp.StatusCode)
 		}
@@ -184,7 +184,7 @@ func TestAuthentication(t *testing.T) {
 			"password": tc.TestUser.Password,
 		}
 
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		var loginResp map[string]interface{}
 		parseJSON(t, resp, &loginResp)
 		oldToken := loginResp["token"].(string)
@@ -197,7 +197,7 @@ func TestAuthentication(t *testing.T) {
 			"token": oldToken,
 		}
 
-		resp = tc.makeRequest(t, "POST", "/user/v1/auth/refresh", refreshReq)
+		resp = tc.makeRequest(t, "POST", "/user/auth/refresh", refreshReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -227,13 +227,13 @@ func TestMailboxOperations(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
 	t.Run("ListMailboxes_Default", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -255,7 +255,7 @@ func TestMailboxOperations(t *testing.T) {
 			"name": fmt.Sprintf("TestFolder-%d", time.Now().Unix()),
 		}
 
-		resp := tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 		if resp.StatusCode != http.StatusCreated {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -273,7 +273,7 @@ func TestMailboxOperations(t *testing.T) {
 	})
 
 	t.Run("DeleteMailbox_ProtectINBOX", func(t *testing.T) {
-		resp := tc.makeRequest(t, "DELETE", "/user/v1/mailboxes/INBOX", nil)
+		resp := tc.makeRequest(t, "DELETE", "/user/mailboxes/INBOX", nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("Expected status 403 for INBOX deletion, got %d", resp.StatusCode)
 		}
@@ -283,7 +283,7 @@ func TestMailboxOperations(t *testing.T) {
 		oldToken := tc.JWTToken
 		tc.JWTToken = ""
 
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes", nil)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 401, got %d", resp.StatusCode)
 		}
@@ -301,17 +301,17 @@ func TestMessageOperations(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
 	// Create INBOX for message tests
 	createReq := map[string]string{"name": "INBOX"}
-	tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+	tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 
 	t.Run("ListMessages_EmptyMailbox", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/messages", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/messages", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -341,7 +341,7 @@ func TestMessageOperations(t *testing.T) {
 	})
 
 	t.Run("ListMessages_WithPagination", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/messages?limit=10&offset=0", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/messages?limit=10&offset=0", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -361,7 +361,7 @@ func TestMessageOperations(t *testing.T) {
 	})
 
 	t.Run("SearchMessages", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search?q=test", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -377,7 +377,7 @@ func TestMessageOperations(t *testing.T) {
 	})
 
 	t.Run("SearchMessages_MissingQuery", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search", nil)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected status 400, got %d", resp.StatusCode)
 		}
@@ -393,7 +393,7 @@ func TestMailboxSubscriptions(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
@@ -403,13 +403,13 @@ func TestMailboxSubscriptions(t *testing.T) {
 	createReq := map[string]string{
 		"name": mailboxName,
 	}
-	resp = tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+	resp = tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("Failed to create test mailbox: status %d", resp.StatusCode)
 	}
 
 	t.Run("SubscribeToMailbox", func(t *testing.T) {
-		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/v1/mailboxes/%s/subscribe", mailboxName), nil)
+		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/mailboxes/%s/subscribe", mailboxName), nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -419,7 +419,7 @@ func TestMailboxSubscriptions(t *testing.T) {
 	})
 
 	t.Run("UnsubscribeFromMailbox", func(t *testing.T) {
-		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/v1/mailboxes/%s/unsubscribe", mailboxName), nil)
+		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/mailboxes/%s/unsubscribe", mailboxName), nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -430,9 +430,9 @@ func TestMailboxSubscriptions(t *testing.T) {
 
 	t.Run("ListSubscribedMailboxes", func(t *testing.T) {
 		// Subscribe first
-		tc.makeRequest(t, "POST", fmt.Sprintf("/user/v1/mailboxes/%s/subscribe", mailboxName), nil)
+		tc.makeRequest(t, "POST", fmt.Sprintf("/user/mailboxes/%s/subscribe", mailboxName), nil)
 
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes?subscribed=true", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes?subscribed=true", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -457,7 +457,7 @@ func TestAuthenticationEdgeCases(t *testing.T) {
 		loginReq := map[string]string{
 			"password": "password",
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected status 400, got %d", resp.StatusCode)
 		}
@@ -467,7 +467,7 @@ func TestAuthenticationEdgeCases(t *testing.T) {
 		loginReq := map[string]string{
 			"email": tc.TestUser.Email,
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected status 400, got %d", resp.StatusCode)
 		}
@@ -478,7 +478,7 @@ func TestAuthenticationEdgeCases(t *testing.T) {
 			"email":    "",
 			"password": "",
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 		// Either 400 or 401 is acceptable
 		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 400 or 401, got %d", resp.StatusCode)
@@ -489,7 +489,7 @@ func TestAuthenticationEdgeCases(t *testing.T) {
 		refreshReq := map[string]string{
 			"token": "invalid.jwt.token",
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/refresh", refreshReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/refresh", refreshReq)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 401, got %d", resp.StatusCode)
 		}
@@ -497,7 +497,7 @@ func TestAuthenticationEdgeCases(t *testing.T) {
 
 	t.Run("RefreshToken_MissingToken", func(t *testing.T) {
 		refreshReq := map[string]string{}
-		resp := tc.makeRequest(t, "POST", "/user/v1/auth/refresh", refreshReq)
+		resp := tc.makeRequest(t, "POST", "/user/auth/refresh", refreshReq)
 		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("Expected status 400 or 401, got %d", resp.StatusCode)
 		}
@@ -513,7 +513,7 @@ func TestMailboxEdgeCases(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
@@ -525,13 +525,13 @@ func TestMailboxEdgeCases(t *testing.T) {
 		}
 
 		// Create first time
-		resp := tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("Failed to create mailbox first time: status %d", resp.StatusCode)
 		}
 
 		// Try to create again - should fail
-		resp = tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+		resp = tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 		if resp.StatusCode != http.StatusConflict && resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected status 409 or 400 for duplicate, got %d", resp.StatusCode)
 		}
@@ -541,14 +541,14 @@ func TestMailboxEdgeCases(t *testing.T) {
 		createReq := map[string]string{
 			"name": "",
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected status 400, got %d", resp.StatusCode)
 		}
 	})
 
 	t.Run("DeleteMailbox_Nonexistent", func(t *testing.T) {
-		resp := tc.makeRequest(t, "DELETE", "/user/v1/mailboxes/NonexistentFolder123", nil)
+		resp := tc.makeRequest(t, "DELETE", "/user/mailboxes/NonexistentFolder123", nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 404, got %d", resp.StatusCode)
 		}
@@ -559,7 +559,7 @@ func TestMailboxEdgeCases(t *testing.T) {
 		createReq := map[string]string{
 			"name": mailboxName,
 		}
-		resp := tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 		// Should succeed or fail based on implementation
 		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusBadRequest {
 			defer resp.Body.Close()
@@ -578,7 +578,7 @@ func TestMessageRetrieval(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
@@ -588,7 +588,7 @@ func TestMessageRetrieval(t *testing.T) {
 
 	t.Run("GetMessage_Details", func(t *testing.T) {
 		// Try to get message with ID 1 (may not exist)
-		resp := tc.makeRequest(t, "GET", "/user/v1/messages/1", nil)
+		resp := tc.makeRequest(t, "GET", "/user/messages/1", nil)
 		// Either 200 (exists) or 404 (doesn't exist) is acceptable
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
@@ -604,7 +604,7 @@ func TestMessageRetrieval(t *testing.T) {
 	})
 
 	t.Run("GetMessage_Body", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/messages/1/body", nil)
+		resp := tc.makeRequest(t, "GET", "/user/messages/1/body", nil)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
@@ -614,21 +614,21 @@ func TestMessageRetrieval(t *testing.T) {
 	})
 
 	t.Run("GetMessage_BodyHTML", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/messages/1/body?format=html", nil)
+		resp := tc.makeRequest(t, "GET", "/user/messages/1/body?format=html", nil)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
 	})
 
 	t.Run("GetMessage_BodyText", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/messages/1/body?format=text", nil)
+		resp := tc.makeRequest(t, "GET", "/user/messages/1/body?format=text", nil)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
 	})
 
 	t.Run("GetMessage_Raw", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/messages/1/raw", nil)
+		resp := tc.makeRequest(t, "GET", "/user/messages/1/raw", nil)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
@@ -651,7 +651,7 @@ func TestMessageFlags(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
@@ -663,7 +663,7 @@ func TestMessageFlags(t *testing.T) {
 		updateReq := map[string]interface{}{
 			"add_flags": []string{"Seen", "Flagged"},
 		}
-		resp := tc.makeRequest(t, "PATCH", "/user/v1/messages/1", updateReq)
+		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
@@ -673,7 +673,7 @@ func TestMessageFlags(t *testing.T) {
 		updateReq := map[string]interface{}{
 			"remove_flags": []string{"Draft"},
 		}
-		resp := tc.makeRequest(t, "PATCH", "/user/v1/messages/1", updateReq)
+		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
@@ -684,14 +684,14 @@ func TestMessageFlags(t *testing.T) {
 			"add_flags":    []string{"Seen"},
 			"remove_flags": []string{"Draft"},
 		}
-		resp := tc.makeRequest(t, "PATCH", "/user/v1/messages/1", updateReq)
+		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
 	})
 
 	t.Run("DeleteMessage", func(t *testing.T) {
-		resp := tc.makeRequest(t, "DELETE", "/user/v1/messages/1", nil)
+		resp := tc.makeRequest(t, "DELETE", "/user/messages/1", nil)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
@@ -707,7 +707,7 @@ func TestSieveFilters(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
@@ -719,7 +719,7 @@ if header :contains "Subject" "[SPAM]" {
 }`
 
 	t.Run("ListFilters_Empty", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/filters", nil)
+		resp := tc.makeRequest(t, "GET", "/user/filters", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -739,7 +739,7 @@ if header :contains "Subject" "[SPAM]" {
 		createReq := map[string]string{
 			"script": filterContent,
 		}
-		resp := tc.makeRequest(t, "PUT", fmt.Sprintf("/user/v1/filters/%s", filterName), createReq)
+		resp := tc.makeRequest(t, "PUT", fmt.Sprintf("/user/filters/%s", filterName), createReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -749,7 +749,7 @@ if header :contains "Subject" "[SPAM]" {
 	})
 
 	t.Run("GetFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", fmt.Sprintf("/user/v1/filters/%s", filterName), nil)
+		resp := tc.makeRequest(t, "GET", fmt.Sprintf("/user/filters/%s", filterName), nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -778,7 +778,7 @@ if header :contains "Subject" "[SPAM]" {
 		updateReq := map[string]string{
 			"script": updatedContent,
 		}
-		resp := tc.makeRequest(t, "PUT", fmt.Sprintf("/user/v1/filters/%s", filterName), updateReq)
+		resp := tc.makeRequest(t, "PUT", fmt.Sprintf("/user/filters/%s", filterName), updateReq)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -788,7 +788,7 @@ if header :contains "Subject" "[SPAM]" {
 	})
 
 	t.Run("ActivateFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/v1/filters/%s/activate", filterName), nil)
+		resp := tc.makeRequest(t, "POST", fmt.Sprintf("/user/filters/%s/activate", filterName), nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -798,7 +798,7 @@ if header :contains "Subject" "[SPAM]" {
 	})
 
 	t.Run("GetCapabilities", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/filters/capabilities", nil)
+		resp := tc.makeRequest(t, "GET", "/user/filters/capabilities", nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -817,7 +817,7 @@ if header :contains "Subject" "[SPAM]" {
 	})
 
 	t.Run("DeleteFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "DELETE", fmt.Sprintf("/user/v1/filters/%s", filterName), nil)
+		resp := tc.makeRequest(t, "DELETE", fmt.Sprintf("/user/filters/%s", filterName), nil)
 		if resp.StatusCode != http.StatusOK {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -827,7 +827,7 @@ if header :contains "Subject" "[SPAM]" {
 	})
 
 	t.Run("GetFilter_AfterDelete", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", fmt.Sprintf("/user/v1/filters/%s", filterName), nil)
+		resp := tc.makeRequest(t, "GET", fmt.Sprintf("/user/filters/%s", filterName), nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 404 after deletion, got %d", resp.StatusCode)
 		}
@@ -843,17 +843,17 @@ func TestSearchFunctionality(t *testing.T) {
 		"email":    tc.TestUser.Email,
 		"password": tc.TestUser.Password,
 	}
-	resp := tc.makeRequest(t, "POST", "/user/v1/auth/login", loginReq)
+	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
 	var loginResp map[string]interface{}
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
 	// Create INBOX for search tests
 	createReq := map[string]string{"name": "INBOX"}
-	tc.makeRequest(t, "POST", "/user/v1/mailboxes", createReq)
+	tc.makeRequest(t, "POST", "/user/mailboxes", createReq)
 
 	t.Run("Search_BasicQuery", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search?q=test", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -867,7 +867,7 @@ func TestSearchFunctionality(t *testing.T) {
 	})
 
 	t.Run("Search_WithFromFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search?q=test&from=sender@example.com", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&from=sender@example.com", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -878,7 +878,7 @@ func TestSearchFunctionality(t *testing.T) {
 	})
 
 	t.Run("Search_WithSubjectFilter", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search?q=test&subject=important", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&subject=important", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -889,7 +889,7 @@ func TestSearchFunctionality(t *testing.T) {
 	})
 
 	t.Run("Search_UnseenOnly", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/INBOX/search?q=test&unseen=true", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?q=test&unseen=true", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
@@ -900,7 +900,7 @@ func TestSearchFunctionality(t *testing.T) {
 	})
 
 	t.Run("Search_NonexistentMailbox", func(t *testing.T) {
-		resp := tc.makeRequest(t, "GET", "/user/v1/mailboxes/NonexistentFolder/search?q=test", nil)
+		resp := tc.makeRequest(t, "GET", "/user/mailboxes/NonexistentFolder/search?q=test", nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected status 404, got %d", resp.StatusCode)
 		}

@@ -267,7 +267,6 @@ func TestProtocolSpecificMetrics(t *testing.T) {
 	// Reset metrics
 	LMTPExternalRelay.Reset()
 	IMAPIdleConnections.Set(0)
-	IMAPMailboxOperations.Reset()
 
 	t.Run("lmtp_external_relay", func(t *testing.T) {
 		LMTPExternalRelay.WithLabelValues("success").Add(50)
@@ -284,23 +283,13 @@ func TestProtocolSpecificMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("imap_metrics", func(t *testing.T) {
+	t.Run("imap_idle_connections", func(t *testing.T) {
 		IMAPIdleConnections.Set(25)
-		IMAPMailboxOperations.WithLabelValues("SELECT").Add(100)
-		IMAPMailboxOperations.WithLabelValues("FETCH").Add(500)
 
 		idleCount := testutil.ToFloat64(IMAPIdleConnections)
-		selectCount := testutil.ToFloat64(IMAPMailboxOperations.WithLabelValues("SELECT"))
-		fetchCount := testutil.ToFloat64(IMAPMailboxOperations.WithLabelValues("FETCH"))
 
 		if idleCount != 25 {
 			t.Errorf("Expected IDLE connections to be 25, got %f", idleCount)
-		}
-		if selectCount != 100 {
-			t.Errorf("Expected SELECT operations to be 100, got %f", selectCount)
-		}
-		if fetchCount != 500 {
-			t.Errorf("Expected FETCH operations to be 500, got %f", fetchCount)
 		}
 	})
 
@@ -339,14 +328,6 @@ func TestBackgroundWorkerMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("cleaner_messages_deleted", func(t *testing.T) {
-		CleanerMessagesDeleted.Add(1500)
-
-		deletedCount := testutil.ToFloat64(CleanerMessagesDeleted)
-		if deletedCount != 1500 {
-			t.Errorf("Expected deleted messages to be 1500, got %f", deletedCount)
-		}
-	})
 }
 
 func TestHistogramBuckets(t *testing.T) {
@@ -377,13 +358,6 @@ func TestHistogramBuckets(t *testing.T) {
 			expectedMin:  0.01,
 			expectedMax:  10.0,
 			testDuration: 2.5,
-		},
-		{
-			name:         "imap_search_duration_buckets",
-			histogram:    IMAPSearchDuration,
-			expectedMin:  0.01,
-			expectedMax:  10.0,
-			testDuration: 0.8,
 		},
 	}
 
@@ -489,4 +463,118 @@ func TestMetricsOutput(t *testing.T) {
 	if !foundS3 {
 		t.Error("Expected to find sora_s3_operations_total metric in output")
 	}
+}
+
+// Test newly implemented database metrics
+func TestDatabaseQueriesTotal(t *testing.T) {
+	DBQueriesTotal.Reset()
+
+	t.Run("track_query_success", func(t *testing.T) {
+		DBQueriesTotal.WithLabelValues("fetch_message_body", "success", "read").Inc()
+		count := testutil.ToFloat64(DBQueriesTotal.WithLabelValues("fetch_message_body", "success", "read"))
+		if count != 1 {
+			t.Errorf("Expected 1 successful query, got %f", count)
+		}
+	})
+
+	t.Run("track_query_error", func(t *testing.T) {
+		DBQueriesTotal.WithLabelValues("search_messages", "error", "read").Inc()
+		count := testutil.ToFloat64(DBQueriesTotal.WithLabelValues("search_messages", "error", "read"))
+		if count != 1 {
+			t.Errorf("Expected 1 failed query, got %f", count)
+		}
+	})
+
+	t.Run("track_write_queries", func(t *testing.T) {
+		DBQueriesTotal.WithLabelValues("insert_message", "success", "write").Add(5)
+		count := testutil.ToFloat64(DBQueriesTotal.WithLabelValues("insert_message", "success", "write"))
+		if count != 5 {
+			t.Errorf("Expected 5 write queries, got %f", count)
+		}
+	})
+}
+
+// Test cache metrics
+// Test S3 operations metrics
+func TestS3OperationsTotal(t *testing.T) {
+	S3OperationsTotal.Reset()
+
+	t.Run("s3_put_success", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("PUT", "success").Add(10)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("PUT", "success"))
+		if count != 10 {
+			t.Errorf("Expected 10 successful PUTs, got %f", count)
+		}
+	})
+
+	t.Run("s3_put_error", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("PUT", "error").Add(2)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("PUT", "error"))
+		if count != 2 {
+			t.Errorf("Expected 2 failed PUTs, got %f", count)
+		}
+	})
+
+	t.Run("s3_get_success", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("GET", "success").Add(50)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("GET", "success"))
+		if count != 50 {
+			t.Errorf("Expected 50 successful GETs, got %f", count)
+		}
+	})
+
+	t.Run("s3_get_error", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("GET", "error").Add(5)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("GET", "error"))
+		if count != 5 {
+			t.Errorf("Expected 5 failed GETs, got %f", count)
+		}
+	})
+
+	t.Run("s3_delete_success", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("DELETE", "success").Add(8)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("DELETE", "success"))
+		if count != 8 {
+			t.Errorf("Expected 8 successful DELETEs, got %f", count)
+		}
+	})
+
+	t.Run("s3_delete_skipped", func(t *testing.T) {
+		S3OperationsTotal.WithLabelValues("DELETE", "skipped").Add(3)
+		count := testutil.ToFloat64(S3OperationsTotal.WithLabelValues("DELETE", "skipped"))
+		if count != 3 {
+			t.Errorf("Expected 3 skipped DELETEs, got %f", count)
+		}
+	})
+}
+
+// Test account/mailbox total gauges
+func TestAccountMailboxGauges(t *testing.T) {
+	AccountsTotal.Set(0)
+	MailboxesTotal.Set(0)
+
+	t.Run("accounts_total", func(t *testing.T) {
+		AccountsTotal.Set(100)
+		count := testutil.ToFloat64(AccountsTotal)
+		if count != 100 {
+			t.Errorf("Expected 100 accounts, got %f", count)
+		}
+	})
+
+	t.Run("mailboxes_total", func(t *testing.T) {
+		MailboxesTotal.Set(450)
+		count := testutil.ToFloat64(MailboxesTotal)
+		if count != 450 {
+			t.Errorf("Expected 450 mailboxes, got %f", count)
+		}
+	})
+
+	t.Run("accounts_increment", func(t *testing.T) {
+		AccountsTotal.Set(100)
+		AccountsTotal.Inc()
+		count := testutil.ToFloat64(AccountsTotal)
+		if count != 101 {
+			t.Errorf("Expected 101 accounts after increment, got %f", count)
+		}
+	})
 }

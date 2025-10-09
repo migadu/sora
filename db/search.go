@@ -16,11 +16,11 @@ import (
 const (
 	// MaxSearchResults limits search queries to prevent memory exhaustion on large mailboxes
 	// This is a safety limit - IMAP clients should use reasonable search criteria
-	MaxSearchResults = 5000
+	MaxSearchResults = 1000
 
 	// MaxComplexSortResults limits expensive sorting operations (JSONB sorts, etc.)
 	// Lower limit due to per-row JSONB processing overhead
-	MaxComplexSortResults = 1000
+	MaxComplexSortResults = 500
 )
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
@@ -450,8 +450,15 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	start := time.Now()
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, finalQueryString, whereArgs)
-	// Record the duration with appropriate label
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
 	metrics.DBQueryDuration.WithLabelValues(metricsLabel, "read").Observe(time.Since(start).Seconds())
+	metrics.DBQueriesTotal.WithLabelValues(metricsLabel, status, "read").Inc()
+
 	if err != nil {
 		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)

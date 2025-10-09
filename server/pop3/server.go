@@ -48,6 +48,9 @@ type POP3Server struct {
 
 	// XCLIENT is always enabled but limited to trusted networks
 	trustedNetworks []string
+
+	// Memory limiting
+	sessionMemoryLimit int64
 }
 
 type POP3ServerOptions struct {
@@ -64,6 +67,7 @@ type POP3ServerOptions struct {
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
 	TrustedNetworks      []string // Global trusted networks for parameter forwarding
 	AuthRateLimit        serverPkg.AuthRateLimiterConfig
+	SessionMemoryLimit   int64 // Memory limit per session in bytes
 }
 
 func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -112,6 +116,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		proxyReader:        proxyReader,
 		authLimiter:        authLimiter,
 		trustedNetworks:    options.TrustedNetworks,
+		sessionMemoryLimit: options.SessionMemoryLimit,
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -250,6 +255,9 @@ func (s *POP3Server) Start(errChan chan error) {
 		metrics.ConnectionsTotal.WithLabelValues("pop3").Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("pop3").Inc()
 
+		// Initialize memory tracker with configured limit
+		memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
+
 		session := &POP3Session{
 			server:      s,
 			conn:        &conn,
@@ -259,6 +267,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			language:    "en", // Default language
 			releaseConn: releaseConn,
 			startTime:   time.Now(),
+			memTracker:  memTracker,
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available

@@ -193,6 +193,9 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 		)
 		if err != nil {
 			metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
+			metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
+		} else {
+			metrics.S3OperationsTotal.WithLabelValues("PUT", "success").Inc()
 		}
 		metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 		return err
@@ -209,6 +212,9 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	)
 	if err != nil {
 		metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
+		metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
+	} else {
+		metrics.S3OperationsTotal.WithLabelValues("PUT", "success").Inc()
 	}
 	metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 	return err
@@ -266,6 +272,7 @@ func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
 func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 	object, err := s.Client.GetObject(context.Background(), s.BucketName, key, minio.GetObjectOptions{})
 	if err != nil {
+		metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 		return nil, err
 	}
 
@@ -273,6 +280,7 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 	if s.Encrypt {
 		encryptedData, err := io.ReadAll(object)
 		if err != nil {
+			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			return nil, fmt.Errorf("failed to read encrypted data: %w", err)
 		}
 
@@ -283,12 +291,15 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 
 		decryptedData, err := s.decryptData(encryptedData)
 		if err != nil {
+			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			return nil, fmt.Errorf("failed to decrypt data: %w", err)
 		}
 
+		metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
 		return io.NopCloser(bytes.NewReader(decryptedData)), nil
 	}
 
+	metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
 	return object, nil
 }
 
@@ -298,14 +309,22 @@ func (s *S3Storage) Delete(key string) error {
 	exists, versionId, err := s.Exists(key)
 	if err != nil {
 		log.Printf("[STORAGE] error checking existence of object %s: %v", key, err)
+		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
 		return err
 	}
 	if !exists {
 		// Object does not exist, consider it successfully "deleted"
 		log.Printf("[STORAGE] object %s does not exist in S3, skipping deletion.", key)
+		metrics.S3OperationsTotal.WithLabelValues("DELETE", "skipped").Inc()
 		return nil
 	}
-	return s.Client.RemoveObject(context.Background(), s.BucketName, key, minio.RemoveObjectOptions{VersionID: versionId})
+	err = s.Client.RemoveObject(context.Background(), s.BucketName, key, minio.RemoveObjectOptions{VersionID: versionId})
+	if err != nil {
+		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
+	} else {
+		metrics.S3OperationsTotal.WithLabelValues("DELETE", "success").Inc()
+	}
+	return err
 }
 
 // classifyS3Error classifies S3 errors for metrics tracking

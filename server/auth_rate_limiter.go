@@ -168,24 +168,27 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 	}
 	a.blockMu.RUnlock()
 
-	// Regular rate limiting check (database if healthy, otherwise allow)
+	// Regular rate limiting check (database if healthy, otherwise deny)
 	if a.shouldCheckDatabase() {
 		ipCount, usernameCount, err := a.db.GetFailedAttemptsCountSeparateWindowsWithRetry(
 			ctx, ip, username, a.config.IPWindowDuration, a.config.UsernameWindowDuration)
 
 		if err != nil {
 			a.markDBUnhealthy()
-			log.Printf("[%s-AUTH-LIMITER] Warning: database check failed, using cache-only: %v", a.protocol, err)
-		} else {
-			if a.config.MaxAttemptsPerIP > 0 && ipCount >= a.config.MaxAttemptsPerIP {
-				return fmt.Errorf("too many failed authentication attempts from IP %s (%d/%d in %v)",
-					ip, ipCount, a.config.MaxAttemptsPerIP, a.config.IPWindowDuration)
-			}
+			log.Printf("[%s-AUTH-LIMITER] CRITICAL: database check failed, denying authentication for security: %v", a.protocol, err)
+			// Fail closed - deny authentication when database is unavailable
+			// This prevents attackers from bypassing rate limiting by causing DB errors
+			return fmt.Errorf("authentication rate limiting unavailable, access temporarily denied for security")
+		}
 
-			if a.config.MaxAttemptsPerUsername > 0 && username != "" && usernameCount >= a.config.MaxAttemptsPerUsername {
-				return fmt.Errorf("too many failed authentication attempts for user %s (%d/%d in %v)",
-					username, usernameCount, a.config.MaxAttemptsPerUsername, a.config.UsernameWindowDuration)
-			}
+		if a.config.MaxAttemptsPerIP > 0 && ipCount >= a.config.MaxAttemptsPerIP {
+			return fmt.Errorf("too many failed authentication attempts from IP %s (%d/%d in %v)",
+				ip, ipCount, a.config.MaxAttemptsPerIP, a.config.IPWindowDuration)
+		}
+
+		if a.config.MaxAttemptsPerUsername > 0 && username != "" && usernameCount >= a.config.MaxAttemptsPerUsername {
+			return fmt.Errorf("too many failed authentication attempts for user %s (%d/%d in %v)",
+				username, usernameCount, a.config.MaxAttemptsPerUsername, a.config.UsernameWindowDuration)
 		}
 	}
 

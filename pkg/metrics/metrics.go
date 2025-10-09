@@ -156,27 +156,11 @@ var (
 	)
 
 	// IMAP-specific
-	IMAPSearchDuration = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "sora_imap_search_duration_seconds",
-			Help:    "Duration of IMAP search operations in seconds",
-			Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0},
-		},
-	)
-
 	IMAPIdleConnections = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_imap_idle_connections_current",
 			Help: "Current number of IMAP connections in IDLE state",
 		},
-	)
-
-	IMAPMailboxOperations = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_imap_mailbox_operations_total",
-			Help: "Total number of IMAP mailbox operations",
-		},
-		[]string{"operation"},
 	)
 
 	// ManageSieve-specific
@@ -213,20 +197,6 @@ var (
 		},
 	)
 
-	CleanerMessagesDeleted = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "sora_cleaner_messages_deleted_total",
-			Help: "Total number of messages deleted by cleaner",
-		},
-	)
-
-	CleanerRuntime = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "sora_cleaner_runtime_seconds",
-			Help:    "Duration of cleaner runs in seconds",
-			Buckets: []float64{1.0, 5.0, 10.0, 30.0, 60.0, 300.0},
-		},
-	)
 )
 
 // Health status metrics
@@ -254,5 +224,25 @@ var (
 			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
 		},
 		[]string{"component", "hostname"},
+	)
+)
+
+// Session memory metrics
+var (
+	SessionMemoryPeakBytes = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_session_memory_peak_bytes",
+			Help:    "Peak memory allocated by session during its lifetime in bytes",
+			Buckets: []float64{1024, 10240, 102400, 1048576, 10485760, 52428800, 104857600}, // 1KB to 100MB
+		},
+		[]string{"protocol"},
+	)
+
+	SessionMemoryLimitExceeded = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_session_memory_limit_exceeded_total",
+			Help: "Total number of times session memory limit was exceeded",
+		},
+		[]string{"protocol"},
 	)
 )

@@ -137,34 +137,34 @@ Provides common test infrastructure:
 ## API Endpoints Tested
 
 ### Public Endpoints (No Auth)
-- `POST /user/v1/auth/login` - Authenticate and get JWT
-- `POST /user/v1/auth/refresh` - Refresh JWT token
+- `POST /user/auth/login` - Authenticate and get JWT
+- `POST /user/auth/refresh` - Refresh JWT token
 
 ### Protected Endpoints (Require JWT)
 
 #### Mailboxes
-- `GET /user/v1/mailboxes` - List mailboxes (with ?subscribed=true filter)
-- `POST /user/v1/mailboxes` - Create new mailbox
-- `DELETE /user/v1/mailboxes/{name}` - Delete mailbox
-- `POST /user/v1/mailboxes/{name}/subscribe` - Subscribe to mailbox
-- `POST /user/v1/mailboxes/{name}/unsubscribe` - Unsubscribe from mailbox
+- `GET /user/mailboxes` - List mailboxes (with ?subscribed=true filter)
+- `POST /user/mailboxes` - Create new mailbox
+- `DELETE /user/mailboxes/{name}` - Delete mailbox
+- `POST /user/mailboxes/{name}/subscribe` - Subscribe to mailbox
+- `POST /user/mailboxes/{name}/unsubscribe` - Unsubscribe from mailbox
 
 #### Messages
-- `GET /user/v1/mailboxes/{name}/messages` - List messages (with pagination)
-- `GET /user/v1/mailboxes/{name}/search` - Search messages (with filters)
-- `GET /user/v1/messages/{id}` - Get message details (JSON)
-- `GET /user/v1/messages/{id}/body` - Get message body (HTML or text)
-- `GET /user/v1/messages/{id}/raw` - Get raw RFC822 message
-- `PATCH /user/v1/messages/{id}` - Update message flags
-- `DELETE /user/v1/messages/{id}` - Delete message
+- `GET /user/mailboxes/{name}/messages` - List messages (with pagination)
+- `GET /user/mailboxes/{name}/search` - Search messages (with filters)
+- `GET /user/messages/{id}` - Get message details (JSON)
+- `GET /user/messages/{id}/body` - Get message body (HTML or text)
+- `GET /user/messages/{id}/raw` - Get raw RFC822 message
+- `PATCH /user/messages/{id}` - Update message flags
+- `DELETE /user/messages/{id}` - Delete message
 
 #### Sieve Filters
-- `GET /user/v1/filters` - List all filter scripts
-- `GET /user/v1/filters/{name}` - Get specific filter script
-- `PUT /user/v1/filters/{name}` - Create or update filter script
-- `DELETE /user/v1/filters/{name}` - Delete filter script
-- `POST /user/v1/filters/{name}/activate` - Activate filter script
-- `GET /user/v1/filters/capabilities` - Get Sieve capabilities
+- `GET /user/filters` - List all filter scripts
+- `GET /user/filters/{name}` - Get specific filter script
+- `PUT /user/filters/{name}` - Create or update filter script
+- `DELETE /user/filters/{name}` - Delete filter script
+- `POST /user/filters/{name}/activate` - Activate filter script
+- `GET /user/filters/capabilities` - Get Sieve capabilities
 
 ## Example Test Output
 

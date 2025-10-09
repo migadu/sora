@@ -258,6 +258,12 @@ type IMAPServer struct {
 	// Authentication rate limiting
 	authLimiter serverPkg.AuthLimiter
 
+	// Search rate limiting
+	searchRateLimiter *serverPkg.SearchRateLimiter
+
+	// Session memory limit
+	sessionMemoryLimit int64
+
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
 
@@ -287,8 +293,11 @@ type IMAPServerOptions struct {
 	MaxConnectionsPerIP  int
 	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
-	TrustedNetworks      []string // Global trusted networks for parameter forwarding
-	AuthRateLimit        serverPkg.AuthRateLimiterConfig
+	TrustedNetworks         []string // Global trusted networks for parameter forwarding
+	AuthRateLimit           serverPkg.AuthRateLimiterConfig
+	SearchRateLimitPerMin   int           // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow   time.Duration // Search rate limit time window
+	SessionMemoryLimit      int64         // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -343,6 +352,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
+	// Initialize search rate limiter
+	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
+
 	// Parse warmup timeout with default fallback
 	warmupTimeout := 5 * time.Minute // Default timeout
 	if options.WarmupTimeout != "" {
@@ -370,6 +382,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metadataMaxEntriesPerServer:  options.MetadataMaxEntriesPerServer,
 		metadataMaxTotalSize:         options.MetadataMaxTotalSize,
 		authLimiter:                  authLimiter,
+		searchRateLimiter:            searchRateLimiter,
+		sessionMemoryLimit:           options.SessionMemoryLimit,
 		proxyReader:                  proxyReader,
 		enableWarmup:                 options.EnableWarmup,
 		warmupMessageCount:           options.WarmupMessageCount,
@@ -531,12 +545,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	metrics.ConnectionsTotal.WithLabelValues("imap").Inc()
 	metrics.ConnectionsCurrent.WithLabelValues("imap").Inc()
 
+	// Initialize memory tracker with configured limit
+	memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
+
 	session := &IMAPSession{
-		server:    s,
-		conn:      conn,
-		ctx:       sessionCtx,
-		cancel:    sessionCancel,
-		startTime: time.Now(),
+		server:     s,
+		conn:       conn,
+		ctx:        sessionCtx,
+		cancel:     sessionCancel,
+		startTime:  time.Now(),
+		memTracker: memTracker,
 	}
 
 	// Initialize session with full server capabilities

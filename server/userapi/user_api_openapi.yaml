@@ -623,7 +623,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT token obtained from /user/v1/auth/login
+      description: JWT token obtained from /user/auth/login
 
   parameters:
     MailboxName:

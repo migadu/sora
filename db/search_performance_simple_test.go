@@ -173,8 +173,8 @@ func TestPerformanceTimingValidation(t *testing.T) {
 
 // TestSearchLimitConstants tests that search limit constants are reasonable
 func TestSearchLimitConstants(t *testing.T) {
-	assert.Equal(t, 5000, MaxSearchResults, "MaxSearchResults should be 5000")
-	assert.Equal(t, 1000, MaxComplexSortResults, "MaxComplexSortResults should be 1000")
+	assert.Equal(t, 1000, MaxSearchResults, "MaxSearchResults should be 1000")
+	assert.Equal(t, 500, MaxComplexSortResults, "MaxComplexSortResults should be 500")
 	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than regular limit")
 
 	// Test that limits are reasonable for performance

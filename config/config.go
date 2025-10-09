@@ -599,20 +599,30 @@ func (c *LMTPProxyServerConfig) GetRemotePort() (int, error) {
 
 // IMAPServerConfig holds IMAP server configuration.
 type IMAPServerConfig struct {
-	Start               bool                  `toml:"start"`
-	Addr                string                `toml:"addr"`
-	AppendLimit         string                `toml:"append_limit"`
-	MaxConnections      int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterUsername      string                `toml:"master_username"`
-	MasterPassword      string                `toml:"master_password"`
-	MasterSASLUsername  string                `toml:"master_sasl_username"`
-	MasterSASLPassword  string                `toml:"master_sasl_password"`
-	TLS                 bool                  `toml:"tls"`
-	TLSCertFile         string                `toml:"tls_cert_file"`
-	TLSKeyFile          string                `toml:"tls_key_file"`
-	TLSVerify           bool                  `toml:"tls_verify"`
-	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
+	Start                   bool                  `toml:"start"`
+	Addr                    string                `toml:"addr"`
+	AppendLimit             string                `toml:"append_limit"`
+	MaxConnections          int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP     int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterUsername          string                `toml:"master_username"`
+	MasterPassword          string                `toml:"master_password"`
+	MasterSASLUsername      string                `toml:"master_sasl_username"`
+	MasterSASLPassword      string                `toml:"master_sasl_password"`
+	TLS                     bool                  `toml:"tls"`
+	TLSCertFile             string                `toml:"tls_cert_file"`
+	TLSKeyFile              string                `toml:"tls_key_file"`
+	TLSVerify               bool                  `toml:"tls_verify"`
+	AuthRateLimit           AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
+	SearchRateLimitPerMin   int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow   string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
+}
+
+// GetSearchRateLimitWindow parses the search rate limit window duration
+func (i *IMAPServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
+	if i.SearchRateLimitWindow == "" {
+		return time.Minute, nil // Default: 1 minute
+	}
+	return helpers.ParseDuration(i.SearchRateLimitWindow)
 }
 
 // LMTPServerConfig holds LMTP server configuration.
@@ -872,7 +882,10 @@ type ServerConfig struct {
 	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
 
 	// Auth rate limiting (embedded)
-	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+	AuthRateLimit           *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+	SearchRateLimitPerMin   int                    `toml:"search_rate_limit_per_min,omitempty"`   // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow   string                 `toml:"search_rate_limit_window,omitempty"`    // Search rate limit time window (default: 1m)
+	SessionMemoryLimit      string                 `toml:"session_memory_limit,omitempty"`        // Per-session memory limit (default: 100mb, 0=unlimited)
 
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
@@ -1370,6 +1383,22 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 		return 5 * time.Second, nil // 5 second default
 	}
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
+}
+
+// GetSearchRateLimitWindow parses the search rate limit window duration
+func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
+	if s.SearchRateLimitWindow == "" {
+		return time.Minute, nil // Default: 1 minute
+	}
+	return helpers.ParseDuration(s.SearchRateLimitWindow)
+}
+
+// GetSessionMemoryLimit parses the session memory limit
+func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
+	if s.SessionMemoryLimit == "" {
+		return 100 * 1024 * 1024, nil // Default: 100MB
+	}
+	return helpers.ParseSize(s.SessionMemoryLimit)
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

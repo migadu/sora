@@ -24,7 +24,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract message ID from path: /user/v1/messages/{id}
+	// Extract message ID from path: /user/messages/{id}
 	messageIDStr := extractLastPathSegment(r.URL.Path)
 	messageID, err := strconv.ParseInt(messageIDStr, 10, 64)
 	if err != nil {
@@ -58,13 +58,13 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract message ID from path: /user/v1/messages/{id}/body
+	// Extract message ID from path: /user/messages/{id}/body
 	messageIDStr := extractLastPathSegment(r.URL.Path)
 	// Remove "/body" suffix if present
 	if idx := len(messageIDStr) - 5; idx >= 0 && messageIDStr[idx:] == "/body" {
 		messageIDStr = messageIDStr[:idx]
 	}
-	messageIDStr = extractPathParam(r.URL.Path, "/user/v1/messages/", "/body")
+	messageIDStr = extractPathParam(r.URL.Path, "/user/messages/", "/body")
 	messageID, err := strconv.ParseInt(messageIDStr, 10, 64)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid message ID")
@@ -165,8 +165,8 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract message ID from path: /user/v1/messages/{id}/raw
-	messageIDStr := extractPathParam(r.URL.Path, "/user/v1/messages/", "/raw")
+	// Extract message ID from path: /user/messages/{id}/raw
+	messageIDStr := extractPathParam(r.URL.Path, "/user/messages/", "/raw")
 	messageID, err := strconv.ParseInt(messageIDStr, 10, 64)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "Invalid message ID")

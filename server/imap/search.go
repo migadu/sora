@@ -7,6 +7,18 @@ import (
 )
 
 func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+	// Check search rate limit first (before any expensive operations)
+	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
+		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.UserID()); err != nil {
+			s.Log("[SEARCH] Rate limited: %v", err)
+			metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "rate_limited", "client_error").Inc()
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: err.Error(),
+			}
+		}
+	}
+
 	// First safely read and decode session state
 	var selectedMailboxID int64
 	var currentNumMessages uint32
@@ -62,6 +74,16 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		s.Log("[SEARCH] final error after retries: %v", err)
 		s.classifyAndTrackError("SEARCH", err, nil)
 		return nil, s.internalError("failed to search messages: %v", err)
+	}
+
+	// Track memory for search results (approximate: 200 bytes per message metadata)
+	resultMemory := int64(len(messages) * 200)
+	if s.memTracker != nil && resultMemory > 0 {
+		if allocErr := s.memTracker.Allocate(resultMemory); allocErr != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+			return nil, s.internalError("session memory limit exceeded: %v", allocErr)
+		}
+		defer s.memTracker.Free(resultMemory)
 	}
 
 	searchData := &imap.SearchData{}

@@ -231,6 +231,13 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 	var bodyData []byte
 	var bodyDataFetched bool
 
+	// Defer memory cleanup for this message's body data
+	defer func() {
+		if bodyDataFetched && bodyData != nil && s.memTracker != nil {
+			s.memTracker.Free(int64(len(bodyData)))
+		}
+	}()
+
 	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		if len(options.BodySection) > 0 {
 			if err := s.handleBodySections(m, &bodyData, &bodyDataFetched, options, msg, selectedMailboxID); err != nil {
@@ -501,6 +508,13 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		data, err := s.server.cache.Get(msg.ContentHash)
 		if err == nil && data != nil {
 			s.Log("[FETCH] cache hit for UID %d", msg.UID)
+			// Track memory usage for cached data
+			if s.memTracker != nil {
+				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+					metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+					return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+				}
+			}
 			return data, nil
 		}
 
@@ -522,6 +536,15 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// Track memory usage for S3 data
+		if s.memTracker != nil {
+			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+			}
+		}
+
 		_ = s.server.cache.Put(msg.ContentHash, data)
 		return data, nil
 	}
@@ -536,6 +559,15 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	if data == nil {
 		return nil, fmt.Errorf("message UID %d not found on disk", msg.UID)
 	}
+
+	// Track memory usage for disk data
+	if s.memTracker != nil {
+		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+		}
+	}
+
 	return data, nil
 }
 

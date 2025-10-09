@@ -49,7 +49,7 @@ The User API uses JWT (JSON Web Tokens) for authentication. Tokens are obtained 
 ### Authentication Flow
 
 ```
-1. Client → POST /user/v1/auth/login (email + password)
+1. Client → POST /user/auth/login (email + password)
 2. Server → Returns JWT token with expiration
 3. Client → Includes JWT in Authorization header for all requests
 4. Token expires → Client refreshes token or re-authenticates
@@ -57,7 +57,7 @@ The User API uses JWT (JSON Web Tokens) for authentication. Tokens are obtained 
 
 ### Login
 
-**Endpoint:** `POST /user/v1/auth/login`
+**Endpoint:** `POST /user/auth/login`
 
 **Request:**
 ```json
@@ -78,7 +78,7 @@ The User API uses JWT (JSON Web Tokens) for authentication. Tokens are obtained 
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8081/user/v1/auth/login \
+curl -X POST http://localhost:8081/user/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "email": "user@example.com",
@@ -98,13 +98,13 @@ curl -X POST http://localhost:8081/user/v1/auth/login \
 Include the JWT token in the `Authorization` header for all authenticated requests:
 
 ```bash
-curl http://localhost:8081/user/v1/mailboxes \
+curl http://localhost:8081/user/mailboxes \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 ```
 
 ### Token Refresh
 
-**Endpoint:** `POST /user/v1/auth/refresh`
+**Endpoint:** `POST /user/auth/refresh`
 
 Exchange a valid (not expired) token for a new one with extended expiration.
 
@@ -136,7 +136,7 @@ The default base URL depends on your configuration:
 - **Development**: `http://localhost:8081/user/v1`
 - **Production**: `https://mail.example.com/user/v1`
 
-All endpoints are prefixed with `/user/v1/`.
+All endpoints are prefixed with `/user/`.
 
 ## API Endpoints
 
@@ -144,7 +144,7 @@ All endpoints are prefixed with `/user/v1/`.
 
 #### Login
 
-**Endpoint:** `POST /user/v1/auth/login`
+**Endpoint:** `POST /user/auth/login`
 
 Authenticate with email and password to receive a JWT token.
 
@@ -171,7 +171,7 @@ Authenticate with email and password to receive a JWT token.
 
 #### Refresh Token
 
-**Endpoint:** `POST /user/v1/auth/refresh`
+**Endpoint:** `POST /user/auth/refresh`
 
 Get a new token before the current one expires.
 
@@ -197,7 +197,7 @@ Get a new token before the current one expires.
 
 #### List Mailboxes
 
-**Endpoint:** `GET /user/v1/mailboxes`
+**Endpoint:** `GET /user/mailboxes`
 
 List all mailboxes with message counts and metadata.
 
@@ -232,17 +232,17 @@ List all mailboxes with message counts and metadata.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/mailboxes \
+curl http://localhost:8081/user/mailboxes \
   -H "Authorization: Bearer your-jwt-token"
 
 # Only subscribed mailboxes
-curl http://localhost:8081/user/v1/mailboxes?subscribed=true \
+curl http://localhost:8081/user/mailboxes?subscribed=true \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Create Mailbox
 
-**Endpoint:** `POST /user/v1/mailboxes`
+**Endpoint:** `POST /user/mailboxes`
 
 Create a new mailbox.
 
@@ -263,7 +263,7 @@ Create a new mailbox.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8081/user/v1/mailboxes \
+curl -X POST http://localhost:8081/user/mailboxes \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -282,7 +282,7 @@ curl -X POST http://localhost:8081/user/v1/mailboxes \
 
 #### Delete Mailbox
 
-**Endpoint:** `DELETE /user/v1/mailboxes/{name}`
+**Endpoint:** `DELETE /user/mailboxes/{name}`
 
 Delete a mailbox. **INBOX cannot be deleted.**
 
@@ -295,11 +295,11 @@ Delete a mailbox. **INBOX cannot be deleted.**
 
 **Example:**
 ```bash
-curl -X DELETE http://localhost:8081/user/v1/mailboxes/Archive \
+curl -X DELETE http://localhost:8081/user/mailboxes/Archive \
   -H "Authorization: Bearer your-jwt-token"
 
 # For hierarchical mailboxes, URL-encode the path
-curl -X DELETE http://localhost:8081/user/v1/mailboxes/Archive%2F2024 \
+curl -X DELETE http://localhost:8081/user/mailboxes/Archive%2F2024 \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -309,7 +309,7 @@ curl -X DELETE http://localhost:8081/user/v1/mailboxes/Archive%2F2024 \
 
 #### Subscribe to Mailbox
 
-**Endpoint:** `POST /user/v1/mailboxes/{name}/subscribe`
+**Endpoint:** `POST /user/mailboxes/{name}/subscribe`
 
 Mark a mailbox as subscribed.
 
@@ -322,13 +322,13 @@ Mark a mailbox as subscribed.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8081/user/v1/mailboxes/Archive/subscribe \
+curl -X POST http://localhost:8081/user/mailboxes/Archive/subscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Unsubscribe from Mailbox
 
-**Endpoint:** `POST /user/v1/mailboxes/{name}/unsubscribe`
+**Endpoint:** `POST /user/mailboxes/{name}/unsubscribe`
 
 Mark a mailbox as unsubscribed.
 
@@ -341,7 +341,7 @@ Mark a mailbox as unsubscribed.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8081/user/v1/mailboxes/Spam/unsubscribe \
+curl -X POST http://localhost:8081/user/mailboxes/Spam/unsubscribe \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -349,7 +349,7 @@ curl -X POST http://localhost:8081/user/v1/mailboxes/Spam/unsubscribe \
 
 #### List Messages
 
-**Endpoint:** `GET /user/v1/mailboxes/{name}/messages`
+**Endpoint:** `GET /user/mailboxes/{name}/messages`
 
 List messages in a mailbox with pagination.
 
@@ -384,21 +384,21 @@ List messages in a mailbox with pagination.
 **Example:**
 ```bash
 # First page (messages 1-50)
-curl http://localhost:8081/user/v1/mailboxes/INBOX/messages \
+curl http://localhost:8081/user/mailboxes/INBOX/messages \
   -H "Authorization: Bearer your-jwt-token"
 
 # Second page (messages 51-100)
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/messages?limit=50&offset=50" \
+curl "http://localhost:8081/user/mailboxes/INBOX/messages?limit=50&offset=50" \
   -H "Authorization: Bearer your-jwt-token"
 
 # Only unseen messages
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/messages?unseen=true" \
+curl "http://localhost:8081/user/mailboxes/INBOX/messages?unseen=true" \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Get Message Details
 
-**Endpoint:** `GET /user/v1/messages/{id}`
+**Endpoint:** `GET /user/messages/{id}`
 
 Get full message details in JSON format.
 
@@ -435,13 +435,13 @@ Get full message details in JSON format.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/messages/12345 \
+curl http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Get Message Body
 
-**Endpoint:** `GET /user/v1/messages/{id}/body`
+**Endpoint:** `GET /user/messages/{id}/body`
 
 Get message body in HTML or text format.
 
@@ -459,17 +459,17 @@ Content-Type: text/html
 **Example:**
 ```bash
 # Get HTML body
-curl http://localhost:8081/user/v1/messages/12345/body?format=html \
+curl http://localhost:8081/user/messages/12345/body?format=html \
   -H "Authorization: Bearer your-jwt-token"
 
 # Get plain text body
-curl http://localhost:8081/user/v1/messages/12345/body?format=text \
+curl http://localhost:8081/user/messages/12345/body?format=text \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Get Raw Message
 
-**Endpoint:** `GET /user/v1/messages/{id}/raw`
+**Endpoint:** `GET /user/messages/{id}/raw`
 
 Get raw RFC822 message source.
 
@@ -488,7 +488,7 @@ Let's meet tomorrow at 2pm.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/messages/12345/raw \
+curl http://localhost:8081/user/messages/12345/raw \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -500,7 +500,7 @@ curl http://localhost:8081/user/v1/messages/12345/raw \
 
 #### Update Message Flags
 
-**Endpoint:** `PATCH /user/v1/messages/{id}`
+**Endpoint:** `PATCH /user/messages/{id}`
 
 Add or remove flags from a message.
 
@@ -529,7 +529,7 @@ Add or remove flags from a message.
 **Example:**
 ```bash
 # Mark as read and flagged
-curl -X PATCH http://localhost:8081/user/v1/messages/12345 \
+curl -X PATCH http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -537,7 +537,7 @@ curl -X PATCH http://localhost:8081/user/v1/messages/12345 \
   }'
 
 # Remove draft flag
-curl -X PATCH http://localhost:8081/user/v1/messages/12345 \
+curl -X PATCH http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -547,7 +547,7 @@ curl -X PATCH http://localhost:8081/user/v1/messages/12345 \
 
 #### Delete Message
 
-**Endpoint:** `DELETE /user/v1/messages/{id}`
+**Endpoint:** `DELETE /user/messages/{id}`
 
 Delete a message (mark as deleted and expunge).
 
@@ -560,7 +560,7 @@ Delete a message (mark as deleted and expunge).
 
 **Example:**
 ```bash
-curl -X DELETE http://localhost:8081/user/v1/messages/12345 \
+curl -X DELETE http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -570,7 +570,7 @@ curl -X DELETE http://localhost:8081/user/v1/messages/12345 \
 
 #### Search Messages
 
-**Endpoint:** `GET /user/v1/mailboxes/{name}/search`
+**Endpoint:** `GET /user/mailboxes/{name}/search`
 
 Full-text search messages in a mailbox.
 
@@ -605,19 +605,19 @@ Full-text search messages in a mailbox.
 **Examples:**
 ```bash
 # Basic text search
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/search?q=meeting" \
+curl "http://localhost:8081/user/mailboxes/INBOX/search?q=meeting" \
   -H "Authorization: Bearer your-jwt-token"
 
 # Search with sender filter
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/search?q=project&from=boss@example.com" \
+curl "http://localhost:8081/user/mailboxes/INBOX/search?q=project&from=boss@example.com" \
   -H "Authorization: Bearer your-jwt-token"
 
 # Search unseen messages only
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/search?q=urgent&unseen=true" \
+curl "http://localhost:8081/user/mailboxes/INBOX/search?q=urgent&unseen=true" \
   -H "Authorization: Bearer your-jwt-token"
 
 # Search with subject filter
-curl "http://localhost:8081/user/v1/mailboxes/INBOX/search?q=report&subject=quarterly" \
+curl "http://localhost:8081/user/mailboxes/INBOX/search?q=report&subject=quarterly" \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -633,7 +633,7 @@ Sieve is a mail filtering language for server-side email rules. The User API all
 
 #### List Filters
 
-**Endpoint:** `GET /user/v1/filters`
+**Endpoint:** `GET /user/filters`
 
 List all Sieve filter scripts.
 
@@ -655,13 +655,13 @@ List all Sieve filter scripts.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/filters \
+curl http://localhost:8081/user/filters \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Get Filter
 
-**Endpoint:** `GET /user/v1/filters/{name}`
+**Endpoint:** `GET /user/filters/{name}`
 
 Get a specific Sieve filter script.
 
@@ -679,13 +679,13 @@ Get a specific Sieve filter script.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/filters/spam-filter \
+curl http://localhost:8081/user/filters/spam-filter \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Create or Update Filter
 
-**Endpoint:** `PUT /user/v1/filters/{name}`
+**Endpoint:** `PUT /user/filters/{name}`
 
 Create a new filter or update an existing one.
 
@@ -705,7 +705,7 @@ Create a new filter or update an existing one.
 
 **Example:**
 ```bash
-curl -X PUT http://localhost:8081/user/v1/filters/spam-filter \
+curl -X PUT http://localhost:8081/user/filters/spam-filter \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -751,7 +751,7 @@ if allof (
 
 #### Delete Filter
 
-**Endpoint:** `DELETE /user/v1/filters/{name}`
+**Endpoint:** `DELETE /user/filters/{name}`
 
 Delete a Sieve filter script.
 
@@ -764,13 +764,13 @@ Delete a Sieve filter script.
 
 **Example:**
 ```bash
-curl -X DELETE http://localhost:8081/user/v1/filters/old-filter \
+curl -X DELETE http://localhost:8081/user/filters/old-filter \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Activate Filter
 
-**Endpoint:** `POST /user/v1/filters/{name}/activate`
+**Endpoint:** `POST /user/filters/{name}/activate`
 
 Set a filter script as the active script. Only one script can be active at a time.
 
@@ -783,13 +783,13 @@ Set a filter script as the active script. Only one script can be active at a tim
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8081/user/v1/filters/spam-filter/activate \
+curl -X POST http://localhost:8081/user/filters/spam-filter/activate \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
 #### Get Sieve Capabilities
 
-**Endpoint:** `GET /user/v1/filters/capabilities`
+**Endpoint:** `GET /user/filters/capabilities`
 
 Get supported Sieve extensions and capabilities.
 
@@ -810,7 +810,7 @@ Get supported Sieve extensions and capabilities.
 
 **Example:**
 ```bash
-curl http://localhost:8081/user/v1/filters/capabilities \
+curl http://localhost:8081/user/filters/capabilities \
   -H "Authorization: Bearer your-jwt-token"
 ```
 
@@ -880,7 +880,7 @@ All errors return a JSON object with an `error` field:
 
 ```javascript
 // 1. Login
-const loginResponse = await fetch('http://localhost:8081/user/v1/auth/login', {
+const loginResponse = await fetch('http://localhost:8081/user/auth/login', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -891,27 +891,27 @@ const loginResponse = await fetch('http://localhost:8081/user/v1/auth/login', {
 const { token } = await loginResponse.json();
 
 // 2. List mailboxes
-const mailboxesResponse = await fetch('http://localhost:8081/user/v1/mailboxes', {
+const mailboxesResponse = await fetch('http://localhost:8081/user/mailboxes', {
   headers: { 'Authorization': `Bearer ${token}` }
 });
 const { mailboxes } = await mailboxesResponse.json();
 
 // 3. Get messages from INBOX
 const messagesResponse = await fetch(
-  'http://localhost:8081/user/v1/mailboxes/INBOX/messages?limit=50&offset=0',
+  'http://localhost:8081/user/mailboxes/INBOX/messages?limit=50&offset=0',
   { headers: { 'Authorization': `Bearer ${token}` }}
 );
 const { messages, total } = await messagesResponse.json();
 
 // 4. Read a specific message
 const messageResponse = await fetch(
-  `http://localhost:8081/user/v1/messages/${messages[0].id}`,
+  `http://localhost:8081/user/messages/${messages[0].id}`,
   { headers: { 'Authorization': `Bearer ${token}` }}
 );
 const message = await messageResponse.json();
 
 // 5. Mark as read
-await fetch(`http://localhost:8081/user/v1/messages/${messages[0].id}`, {
+await fetch(`http://localhost:8081/user/messages/${messages[0].id}`, {
   method: 'PATCH',
   headers: {
     'Authorization': `Bearer ${token}`,
@@ -928,7 +928,7 @@ await fetch(`http://localhost:8081/user/v1/messages/${messages[0].id}`, {
 ```swift
 // Swift/iOS example
 func fetchMessages(mailbox: String, offset: Int = 0, limit: Int = 50) async throws -> MessageList {
-    var request = URLRequest(url: URL(string: "http://localhost:8081/user/v1/mailboxes/\(mailbox)/messages?limit=\(limit)&offset=\(offset)")!)
+    var request = URLRequest(url: URL(string: "http://localhost:8081/user/mailboxes/\(mailbox)/messages?limit=\(limit)&offset=\(offset)")!)
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
     let (data, _) = try await URLSession.shared.data(for: request)
@@ -950,7 +950,7 @@ import requests
 
 def search_messages(token, mailbox, query, from_email=None, unseen_only=False):
     """Search messages with filters"""
-    url = f"http://localhost:8081/user/v1/mailboxes/{mailbox}/search"
+    url = f"http://localhost:8081/user/mailboxes/{mailbox}/search"
     headers = {"Authorization": f"Bearer {token}"}
     params = {"q": query}
 

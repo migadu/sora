@@ -158,42 +158,42 @@ func (s *Server) setupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	// Account management routes
-	mux.HandleFunc("/admin/v1/accounts", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/accounts", multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListAccounts,
 		"POST": s.handleCreateAccount,
 	}))
-	mux.HandleFunc("/admin/v1/accounts/", s.handleAccountOperations)
+	mux.HandleFunc("/admin/accounts/", s.handleAccountOperations)
 
 	// Credential management routes
-	mux.HandleFunc("/admin/v1/credentials/", s.handleCredentialOperations)
+	mux.HandleFunc("/admin/credentials/", s.handleCredentialOperations)
 
 	// Connection management routes
-	mux.HandleFunc("/admin/v1/connections", routeHandler("GET", s.handleListConnections))
-	mux.HandleFunc("/admin/v1/connections/stats", routeHandler("GET", s.handleConnectionStats))
-	mux.HandleFunc("/admin/v1/connections/kick", routeHandler("POST", s.handleKickConnections))
-	mux.HandleFunc("/admin/v1/connections/user/", routeHandler("GET", s.handleGetUserConnections))
+	mux.HandleFunc("/admin/connections", routeHandler("GET", s.handleListConnections))
+	mux.HandleFunc("/admin/connections/stats", routeHandler("GET", s.handleConnectionStats))
+	mux.HandleFunc("/admin/connections/kick", routeHandler("POST", s.handleKickConnections))
+	mux.HandleFunc("/admin/connections/user/", routeHandler("GET", s.handleGetUserConnections))
 
 	// Cache management routes
-	mux.HandleFunc("/admin/v1/cache/stats", routeHandler("GET", s.handleCacheStats))
-	mux.HandleFunc("/admin/v1/cache/metrics", routeHandler("GET", s.handleCacheMetrics))
-	mux.HandleFunc("/admin/v1/cache/purge", routeHandler("POST", s.handleCachePurge))
+	mux.HandleFunc("/admin/cache/stats", routeHandler("GET", s.handleCacheStats))
+	mux.HandleFunc("/admin/cache/metrics", routeHandler("GET", s.handleCacheMetrics))
+	mux.HandleFunc("/admin/cache/purge", routeHandler("POST", s.handleCachePurge))
 
 	// Uploader routes
-	mux.HandleFunc("/admin/v1/uploader/status", routeHandler("GET", s.handleUploaderStatus))
-	mux.HandleFunc("/admin/v1/uploader/failed", routeHandler("GET", s.handleFailedUploads))
+	mux.HandleFunc("/admin/uploader/status", routeHandler("GET", s.handleUploaderStatus))
+	mux.HandleFunc("/admin/uploader/failed", routeHandler("GET", s.handleFailedUploads))
 
 	// Authentication statistics routes
-	mux.HandleFunc("/admin/v1/auth/stats", routeHandler("GET", s.handleAuthStats))
+	mux.HandleFunc("/admin/auth/stats", routeHandler("GET", s.handleAuthStats))
 
 	// Health monitoring routes
-	mux.HandleFunc("/admin/v1/health/overview", routeHandler("GET", s.handleHealthOverview))
-	mux.HandleFunc("/admin/v1/health/servers/", s.handleHealthOperations)
+	mux.HandleFunc("/admin/health/overview", routeHandler("GET", s.handleHealthOverview))
+	mux.HandleFunc("/admin/health/servers/", s.handleHealthOperations)
 
 	// System configuration and status routes
-	mux.HandleFunc("/admin/v1/config", routeHandler("GET", s.handleConfigInfo))
+	mux.HandleFunc("/admin/config", routeHandler("GET", s.handleConfigInfo))
 
 	// Mail delivery route
-	mux.HandleFunc("/admin/v1/mail/deliver", routeHandler("POST", s.handleDeliverMail))
+	mux.HandleFunc("/admin/mail/deliver", routeHandler("POST", s.handleDeliverMail))
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
@@ -587,8 +587,8 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}/exists
-	email := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/exists")
+	// Extract email from path: /admin/accounts/{email}/exists
+	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/exists")
 
 	ctx := r.Context()
 
@@ -606,7 +606,7 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}
+	// Extract email from path: /admin/accounts/{email}
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
@@ -626,7 +626,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/v1/accounts/{email}
+	// Extract email from path: /admin/accounts/{email}
 	email := extractLastPathSegment(r.URL.Path)
 
 	var req UpdateAccountRequest
@@ -668,7 +668,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}
+	// Extract email from path: /admin/accounts/{email}
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
@@ -695,8 +695,8 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}/restore
-	email := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/restore")
+	// Extract email from path: /admin/accounts/{email}/restore
+	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/restore")
 	ctx := r.Context()
 
 	err := s.rdb.RestoreAccountWithRetry(ctx, email)
@@ -723,8 +723,8 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/v1/accounts/{email}/credentials
-	primaryEmail := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/credentials")
+	// Extract email from path: /admin/accounts/{email}/credentials
+	primaryEmail := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
 
 	var req AddCredentialRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -789,8 +789,8 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}/credentials
-	email := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/credentials")
+	// Extract email from path: /admin/accounts/{email}/credentials
+	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/credentials")
 
 	ctx := r.Context()
 
@@ -813,7 +813,7 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/credentials/{email}
+	// Extract email from path: /admin/credentials/{email}
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
@@ -833,7 +833,7 @@ func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/credentials/{email}
+	// Extract email from path: /admin/credentials/{email}
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
@@ -921,7 +921,7 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/connections/user/{email}
+	// Extract email from path: /admin/connections/user/{email}
 	email := extractLastPathSegment(r.URL.Path)
 
 	ctx := r.Context()
@@ -1070,8 +1070,8 @@ func (s *Server) handleHealthOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealthStatusByHost(w http.ResponseWriter, r *http.Request) {
-	// Extract hostname from path: /admin/v1/health/servers/{hostname}
-	hostname := extractPathParam(r.URL.Path, "/admin/v1/health/servers/", "")
+	// Extract hostname from path: /admin/health/servers/{hostname}
+	hostname := extractPathParam(r.URL.Path, "/admin/health/servers/", "")
 
 	ctx := r.Context()
 
@@ -1090,10 +1090,10 @@ func (s *Server) handleHealthStatusByHost(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Request) {
-	// Extract hostname and component from path: /admin/v1/health/servers/{hostname}/components/{component}
+	// Extract hostname and component from path: /admin/health/servers/{hostname}/components/{component}
 	path := r.URL.Path
 	// Remove prefix to get "{hostname}/components/{component}"
-	remaining := strings.TrimPrefix(path, "/admin/v1/health/servers/")
+	remaining := strings.TrimPrefix(path, "/admin/health/servers/")
 	// Split by "/components/"
 	parts := strings.Split(remaining, "/components/")
 	if len(parts) != 2 {
@@ -1276,8 +1276,8 @@ func (s *Server) handleAuthStats(w http.ResponseWriter, r *http.Request) {
 // Message restoration handlers
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/v1/accounts/{email}/messages/deleted
-	email := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/messages/deleted")
+	// Extract email from path: /admin/accounts/{email}/messages/deleted
+	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
 	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
@@ -1345,8 +1345,8 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/v1/accounts/{email}/messages/restore
-	email := extractPathParam(r.URL.Path, "/admin/v1/accounts/", "/messages/restore")
+	// Extract email from path: /admin/accounts/{email}/messages/restore
+	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
 	email, _ = url.QueryUnescape(email) // Decode URL-encoded characters
 	ctx := r.Context()
 
@@ -1431,7 +1431,6 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 	// This is useful for debugging and system information
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"api_version": "v1",
 		"server_type": "sora-http-api",
 		"features_enabled": map[string]bool{
 			"account_management":    true,
@@ -1444,46 +1443,46 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 		},
 		"endpoints": map[string][]string{
 			"account_management": {
-				"POST /api/v1/accounts",
-				"GET /api/v1/accounts",
-				"GET /api/v1/accounts/{email}",
-				"PUT /api/v1/accounts/{email}",
-				"DELETE /api/v1/accounts/{email}",
-				"POST /api/v1/accounts/{email}/restore",
-				"GET /api/v1/accounts/{email}/exists",
-				"POST /api/v1/accounts/{email}/credentials",
-				"GET /api/v1/accounts/{email}/credentials",
+				"POST /admin/accounts",
+				"GET /admin/accounts",
+				"GET /admin/accounts/{email}",
+				"PUT /admin/accounts/{email}",
+				"DELETE /admin/accounts/{email}",
+				"POST /admin/accounts/{email}/restore",
+				"GET /admin/accounts/{email}/exists",
+				"POST /admin/accounts/{email}/credentials",
+				"GET /admin/accounts/{email}/credentials",
 			},
 			"credential_management": {
-				"GET /api/v1/credentials/{email}",
+				"GET /admin/credentials/{email}",
 			},
 			"message_restoration": {
-				"GET /api/v1/accounts/{email}/messages/deleted",
-				"POST /api/v1/accounts/{email}/messages/restore",
+				"GET /admin/accounts/{email}/messages/deleted",
+				"POST /admin/accounts/{email}/messages/restore",
 			},
 			"connection_management": {
-				"GET /api/v1/connections",
-				"GET /api/v1/connections/stats",
-				"POST /api/v1/connections/kick",
-				"GET /api/v1/connections/user/{email}",
+				"GET /admin/connections",
+				"GET /admin/connections/stats",
+				"POST /admin/connections/kick",
+				"GET /admin/connections/user/{email}",
 			},
 			"cache_management": {
-				"GET /api/v1/cache/stats",
-				"GET /api/v1/cache/metrics",
-				"POST /api/v1/cache/purge",
+				"GET /admin/cache/stats",
+				"GET /admin/cache/metrics",
+				"POST /admin/cache/purge",
 			},
 			"health_monitoring": {
-				"GET /api/v1/health/overview",
-				"GET /api/v1/health/servers/{hostname}",
-				"GET /api/v1/health/servers/{hostname}/components/{component}",
+				"GET /admin/health/overview",
+				"GET /admin/health/servers/{hostname}",
+				"GET /admin/health/servers/{hostname}/components/{component}",
 			},
 			"uploader_monitoring": {
-				"GET /api/v1/uploader/status",
-				"GET /api/v1/uploader/failed",
+				"GET /admin/uploader/status",
+				"GET /admin/uploader/failed",
 			},
 			"system_information": {
-				"GET /api/v1/auth/stats",
-				"GET /api/v1/config",
+				"GET /admin/auth/stats",
+				"GET /admin/config",
 			},
 		},
 	})

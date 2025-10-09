@@ -64,7 +64,7 @@ Include the API key in the `Authorization` header:
 
 ```bash
 curl -H "Authorization: Bearer your-secret-api-key-here" \
-     http://localhost:8080/admin/v1/accounts
+     http://localhost:8080/admin/accounts
 ```
 
 **Response on Invalid/Missing API Key:**
@@ -82,7 +82,7 @@ The default base URL depends on your configuration:
 - **Development**: `http://localhost:8080/admin/v1`
 - **Production**: `https://your-domain.com/admin/v1`
 
-All endpoints are prefixed with `/admin/v1/`.
+All endpoints are prefixed with `/admin/`.
 
 ## API Endpoints
 
@@ -92,7 +92,7 @@ Manage email accounts including creation, retrieval, updates, and deletion.
 
 #### Create Account
 
-**Endpoint:** `POST /admin/v1/accounts`
+**Endpoint:** `POST /admin/accounts`
 
 Create a new email account with either a single credential or multiple credentials.
 
@@ -141,7 +141,7 @@ Create a new email account with either a single credential or multiple credentia
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8080/admin/v1/accounts \
+curl -X POST http://localhost:8080/admin/accounts \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -152,7 +152,7 @@ curl -X POST http://localhost:8080/admin/v1/accounts \
 
 #### Get Account Details
 
-**Endpoint:** `GET /admin/v1/accounts/{email}`
+**Endpoint:** `GET /admin/accounts/{email}`
 
 Retrieve detailed information about an account including credentials, mailbox count, and message count.
 
@@ -185,13 +185,13 @@ Retrieve detailed information about an account including credentials, mailbox co
 
 **Example:**
 ```bash
-curl http://localhost:8080/admin/v1/accounts/user@example.com \
+curl http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key"
 ```
 
 #### Update Account Password
 
-**Endpoint:** `PUT /admin/v1/accounts/{email}`
+**Endpoint:** `PUT /admin/accounts/{email}`
 
 Update the password for a specific credential.
 
@@ -218,7 +218,7 @@ Update the password for a specific credential.
 
 **Example:**
 ```bash
-curl -X PUT http://localhost:8080/admin/v1/accounts/user@example.com \
+curl -X PUT http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -228,7 +228,7 @@ curl -X PUT http://localhost:8080/admin/v1/accounts/user@example.com \
 
 #### Delete Account (Soft Delete)
 
-**Endpoint:** `DELETE /admin/v1/accounts/{email}`
+**Endpoint:** `DELETE /admin/accounts/{email}`
 
 Soft delete an account. The account is marked as deleted but data is retained during the grace period.
 
@@ -242,13 +242,13 @@ Soft delete an account. The account is marked as deleted but data is retained du
 
 **Example:**
 ```bash
-curl -X DELETE http://localhost:8080/admin/v1/accounts/user@example.com \
+curl -X DELETE http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key"
 ```
 
 #### Restore Deleted Account
 
-**Endpoint:** `POST /admin/v1/accounts/{email}/restore`
+**Endpoint:** `POST /admin/accounts/{email}/restore`
 
 Restore a soft-deleted account within the grace period.
 
@@ -262,13 +262,13 @@ Restore a soft-deleted account within the grace period.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8080/admin/v1/accounts/user@example.com/restore \
+curl -X POST http://localhost:8080/admin/accounts/user@example.com/restore \
   -H "Authorization: Bearer your-api-key"
 ```
 
 #### Check Account Existence
 
-**Endpoint:** `GET /admin/v1/accounts/{email}/exists`
+**Endpoint:** `GET /admin/accounts/{email}/exists`
 
 Check if a credential with the given email exists.
 
@@ -282,13 +282,13 @@ Check if a credential with the given email exists.
 
 **Example:**
 ```bash
-curl http://localhost:8080/admin/v1/accounts/user@example.com/exists \
+curl http://localhost:8080/admin/accounts/user@example.com/exists \
   -H "Authorization: Bearer your-api-key"
 ```
 
 #### Add Credential (Alias) to Account
 
-**Endpoint:** `POST /admin/v1/accounts/{email}/credentials`
+**Endpoint:** `POST /admin/accounts/{email}/credentials`
 
 Add a new email alias to an existing account.
 
@@ -310,7 +310,7 @@ Add a new email alias to an existing account.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8080/admin/v1/accounts/user@example.com/credentials \
+curl -X POST http://localhost:8080/admin/accounts/user@example.com/credentials \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -325,7 +325,7 @@ Manage individual credentials (email addresses) associated with accounts.
 
 #### Get Credential Details
 
-**Endpoint:** `GET /admin/v1/credentials/{email}`
+**Endpoint:** `GET /admin/credentials/{email}`
 
 Retrieve detailed information about a specific credential and its associated account.
 
@@ -350,7 +350,7 @@ Retrieve detailed information about a specific credential and its associated acc
 
 #### Delete Credential
 
-**Endpoint:** `DELETE /admin/v1/credentials/{email}`
+**Endpoint:** `DELETE /admin/credentials/{email}`
 
 Delete a specific credential. Cannot delete primary or last remaining credential.
 
@@ -368,7 +368,7 @@ Monitor and manage active client connections to the mail server.
 
 #### List Active Connections
 
-**Endpoint:** `GET /admin/v1/connections`
+**Endpoint:** `GET /admin/connections`
 
 Retrieve all active connections across all protocols.
 
@@ -395,7 +395,7 @@ Retrieve all active connections across all protocols.
 
 #### Get Connection Statistics
 
-**Endpoint:** `GET /admin/v1/connections/stats`
+**Endpoint:** `GET /admin/connections/stats`
 
 Get aggregated statistics about active connections.
 
@@ -418,7 +418,7 @@ Get aggregated statistics about active connections.
 
 #### Terminate Connections
 
-**Endpoint:** `POST /admin/v1/connections/kick`
+**Endpoint:** `POST /admin/connections/kick`
 
 Mark connections for termination based on criteria.
 
@@ -443,7 +443,7 @@ Mark connections for termination based on criteria.
 
 **Example (Kick all connections for a user):**
 ```bash
-curl -X POST http://localhost:8080/admin/v1/connections/kick \
+curl -X POST http://localhost:8080/admin/connections/kick \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -453,7 +453,7 @@ curl -X POST http://localhost:8080/admin/v1/connections/kick \
 
 #### Get User Connections
 
-**Endpoint:** `GET /admin/v1/connections/user/{email}`
+**Endpoint:** `GET /admin/connections/user/{email}`
 
 Get all active connections for a specific user.
 
@@ -472,7 +472,7 @@ Monitor and manage the local filesystem cache for message bodies.
 
 #### Get Cache Statistics
 
-**Endpoint:** `GET /admin/v1/cache/stats`
+**Endpoint:** `GET /admin/cache/stats`
 
 Get current cache statistics including size, items, and hit/miss ratios.
 
@@ -491,7 +491,7 @@ Get current cache statistics including size, items, and hit/miss ratios.
 
 #### Get Cache Performance Metrics
 
-**Endpoint:** `GET /admin/v1/cache/metrics`
+**Endpoint:** `GET /admin/cache/metrics`
 
 Get historical cache performance metrics.
 
@@ -522,7 +522,7 @@ Get historical cache performance metrics.
 
 #### Purge Cache
 
-**Endpoint:** `POST /admin/v1/cache/purge`
+**Endpoint:** `POST /admin/cache/purge`
 
 Clear the entire cache. Returns statistics before and after purge.
 
@@ -547,7 +547,7 @@ Monitor the background S3 upload queue and failed uploads.
 
 #### Get Uploader Status
 
-**Endpoint:** `GET /admin/v1/uploader/status`
+**Endpoint:** `GET /admin/uploader/status`
 
 Get status of the S3 upload queue.
 
@@ -574,7 +574,7 @@ Get status of the S3 upload queue.
 
 #### Get Failed Uploads
 
-**Endpoint:** `GET /admin/v1/uploader/failed`
+**Endpoint:** `GET /admin/uploader/failed`
 
 Get list of failed S3 uploads.
 
@@ -606,7 +606,7 @@ Monitor authentication attempts and track potential security issues.
 
 #### Get Authentication Statistics
 
-**Endpoint:** `GET /admin/v1/auth/stats`
+**Endpoint:** `GET /admin/auth/stats`
 
 Get statistics about authentication attempts.
 
@@ -636,7 +636,7 @@ Monitor system health across components and instances.
 
 #### Get System Health Overview
 
-**Endpoint:** `GET /admin/v1/health/overview`
+**Endpoint:** `GET /admin/health/overview`
 
 Get overall system health status.
 
@@ -658,7 +658,7 @@ Get overall system health status.
 
 #### Get Server Health Status
 
-**Endpoint:** `GET /admin/v1/health/servers/{hostname}`
+**Endpoint:** `GET /admin/health/servers/{hostname}`
 
 Get health status for all components on a specific server.
 
@@ -688,7 +688,7 @@ Get health status for all components on a specific server.
 
 #### Get Component Health Status
 
-**Endpoint:** `GET /admin/v1/health/servers/{hostname}/components/{component}`
+**Endpoint:** `GET /admin/health/servers/{hostname}/components/{component}`
 
 Get current or historical health status for a specific component.
 
@@ -729,7 +729,7 @@ Get API configuration and available endpoints.
 
 #### Get API Configuration
 
-**Endpoint:** `GET /admin/v1/config`
+**Endpoint:** `GET /admin/config`
 
 Get API version, features, and available endpoints.
 
@@ -759,7 +759,7 @@ Deliver mail programmatically via HTTP as an alternative to LMTP.
 
 #### Deliver Mail
 
-**Endpoint:** `POST /admin/v1/mail/deliver`
+**Endpoint:** `POST /admin/mail/deliver`
 
 Deliver an RFC822 message to one or more recipients. Supports Sieve filtering.
 
@@ -811,7 +811,7 @@ Deliver an RFC822 message to one or more recipients. Supports Sieve filtering.
 
 **Example:**
 ```bash
-curl -X POST http://localhost:8080/admin/v1/mail/deliver \
+curl -X POST http://localhost:8080/admin/mail/deliver \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -832,7 +832,7 @@ Restore soft-deleted messages within the grace period.
 
 #### List Deleted Messages
 
-**Endpoint:** `GET /admin/v1/accounts/{email}/messages/deleted`
+**Endpoint:** `GET /admin/accounts/{email}/messages/deleted`
 
 List messages that have been soft-deleted and can be restored.
 
@@ -865,7 +865,7 @@ List messages that have been soft-deleted and can be restored.
 
 #### Restore Deleted Messages
 
-**Endpoint:** `POST /admin/v1/accounts/{email}/messages/restore`
+**Endpoint:** `POST /admin/accounts/{email}/messages/restore`
 
 Restore deleted messages by ID or criteria.
 
@@ -958,7 +958,7 @@ All errors return a JSON object with an `error` field:
 
 ```bash
 # 1. Create account
-curl -X POST http://localhost:8080/admin/v1/accounts \
+curl -X POST http://localhost:8080/admin/accounts \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -967,7 +967,7 @@ curl -X POST http://localhost:8080/admin/v1/accounts \
   }'
 
 # 2. Add an alias
-curl -X POST http://localhost:8080/admin/v1/accounts/john@example.com/credentials \
+curl -X POST http://localhost:8080/admin/accounts/john@example.com/credentials \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -976,11 +976,11 @@ curl -X POST http://localhost:8080/admin/v1/accounts/john@example.com/credential
   }'
 
 # 3. Get account details
-curl http://localhost:8080/admin/v1/accounts/john@example.com \
+curl http://localhost:8080/admin/accounts/john@example.com \
   -H "Authorization: Bearer your-api-key"
 
 # 4. Update password
-curl -X PUT http://localhost:8080/admin/v1/accounts/john@example.com \
+curl -X PUT http://localhost:8080/admin/accounts/john@example.com \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -988,11 +988,11 @@ curl -X PUT http://localhost:8080/admin/v1/accounts/john@example.com \
   }'
 
 # 5. Soft delete account
-curl -X DELETE http://localhost:8080/admin/v1/accounts/john@example.com \
+curl -X DELETE http://localhost:8080/admin/accounts/john@example.com \
   -H "Authorization: Bearer your-api-key"
 
 # 6. Restore account (within grace period)
-curl -X POST http://localhost:8080/admin/v1/accounts/john@example.com/restore \
+curl -X POST http://localhost:8080/admin/accounts/john@example.com/restore \
   -H "Authorization: Bearer your-api-key"
 ```
 
@@ -1000,23 +1000,23 @@ curl -X POST http://localhost:8080/admin/v1/accounts/john@example.com/restore \
 
 ```bash
 # Get overall health
-curl http://localhost:8080/admin/v1/health/overview \
+curl http://localhost:8080/admin/health/overview \
   -H "Authorization: Bearer your-api-key"
 
 # Get server-specific health
-curl http://localhost:8080/admin/v1/health/servers/mail-server-01 \
+curl http://localhost:8080/admin/health/servers/mail-server-01 \
   -H "Authorization: Bearer your-api-key"
 
 # Get component health history
-curl "http://localhost:8080/admin/v1/health/servers/mail-server-01/components/database_write?history=true&limit=50" \
+curl "http://localhost:8080/admin/health/servers/mail-server-01/components/database_write?history=true&limit=50" \
   -H "Authorization: Bearer your-api-key"
 
 # Get cache statistics
-curl http://localhost:8080/admin/v1/cache/stats \
+curl http://localhost:8080/admin/cache/stats \
   -H "Authorization: Bearer your-api-key"
 
 # Get uploader status
-curl "http://localhost:8080/admin/v1/uploader/status?show_failed=true" \
+curl "http://localhost:8080/admin/uploader/status?show_failed=true" \
   -H "Authorization: Bearer your-api-key"
 ```
 
@@ -1024,19 +1024,19 @@ curl "http://localhost:8080/admin/v1/uploader/status?show_failed=true" \
 
 ```bash
 # List all connections
-curl http://localhost:8080/admin/v1/connections \
+curl http://localhost:8080/admin/connections \
   -H "Authorization: Bearer your-api-key"
 
 # Get connection statistics
-curl http://localhost:8080/admin/v1/connections/stats \
+curl http://localhost:8080/admin/connections/stats \
   -H "Authorization: Bearer your-api-key"
 
 # Get user connections
-curl http://localhost:8080/admin/v1/connections/user/john@example.com \
+curl http://localhost:8080/admin/connections/user/john@example.com \
   -H "Authorization: Bearer your-api-key"
 
 # Kick user connections
-curl -X POST http://localhost:8080/admin/v1/connections/kick \
+curl -X POST http://localhost:8080/admin/connections/kick \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1048,7 +1048,7 @@ curl -X POST http://localhost:8080/admin/v1/connections/kick \
 
 ```bash
 # Deliver a simple message
-curl -X POST http://localhost:8080/admin/v1/mail/deliver \
+curl -X POST http://localhost:8080/admin/mail/deliver \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1057,7 +1057,7 @@ curl -X POST http://localhost:8080/admin/v1/mail/deliver \
   }'
 
 # Deliver to multiple recipients
-curl -X POST http://localhost:8080/admin/v1/mail/deliver \
+curl -X POST http://localhost:8080/admin/mail/deliver \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{

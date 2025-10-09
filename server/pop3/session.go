@@ -45,6 +45,7 @@ type POP3Session struct {
 	releaseConn    func()             // Function to release connection from limiter
 	useMasterDB    bool               // Pin session to master DB after a write to ensure consistency
 	startTime      time.Time
+	memTracker     *server.SessionMemoryTracker // Memory usage tracker for this session
 }
 
 func (s *POP3Session) handleConnection() {
@@ -768,6 +769,10 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				continue
 			}
+			// Auto-free memory after processing
+			if s.memTracker != nil && bodyData != nil {
+				defer s.memTracker.Free(int64(len(bodyData)))
+			}
 
 			// Normalize line endings for consistent processing
 			messageStr := string(bodyData)
@@ -957,6 +962,10 @@ func (s *POP3Session) handleConnection() {
 				}
 				writer.Flush()
 				continue
+			}
+			// Auto-free memory after processing
+			if s.memTracker != nil && bodyData != nil {
+				defer s.memTracker.Free(int64(len(bodyData)))
 			}
 			s.Log("retrieved message body for UID %d", msg.UID)
 
@@ -1622,6 +1631,15 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 func (s *POP3Session) closeWithoutLock() error {
 	metrics.ConnectionDuration.WithLabelValues("pop3").Observe(time.Since(s.startTime).Seconds())
 
+	// Log and record peak memory usage
+	if s.memTracker != nil {
+		peak := s.memTracker.Peak()
+		metrics.SessionMemoryPeakBytes.WithLabelValues("pop3").Observe(float64(peak))
+		if peak > 0 {
+			s.Log("session memory - peak: %s", server.FormatBytes(peak))
+		}
+	}
+
 	totalCount := s.server.totalConnections.Add(-1)
 	var authCount int64 = 0
 
@@ -1685,6 +1703,13 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		data, err := s.server.cache.Get(msg.ContentHash)
 		if err == nil && data != nil {
 			log.Printf("[CACHE] hit for UID %d", msg.UID)
+			// Track memory usage for cached data
+			if s.memTracker != nil {
+				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+					metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+					return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+				}
+			}
 			return data, nil
 		}
 
@@ -1706,6 +1731,13 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Track memory usage for S3 data
+		if s.memTracker != nil {
+			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+			}
+		}
 		// Store in cache
 		log.Printf("[CACHE] storing UID %d in cache (%s)", msg.UID, msg.ContentHash)
 		_ = s.server.cache.Put(msg.ContentHash, data)
@@ -1726,6 +1758,13 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 	if data == nil { // Should ideally not happen if GetLocalFile returns nil, nil for "not found"
 		return nil, fmt.Errorf("message UID %d (hash %s) not found on disk (GetLocalFile returned nil data, nil error)", msg.UID, msg.ContentHash)
+	}
+	// Track memory usage for disk data
+	if s.memTracker != nil {
+		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+		}
 	}
 	return data, nil
 }

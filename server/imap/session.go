@@ -49,6 +49,9 @@ type IMAPSession struct {
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	useMasterDB           bool // Pin session to master DB after a write to ensure consistency
+
+	// Memory tracking
+	memTracker *server.SessionMemoryTracker
 }
 
 func (s *IMAPSession) Context() context.Context {
@@ -201,6 +204,15 @@ func (s *IMAPSession) Close() error {
 
 	// Observe connection duration
 	metrics.ConnectionDuration.WithLabelValues("imap").Observe(time.Since(s.startTime).Seconds())
+
+	// Log and record peak memory usage
+	if s.memTracker != nil {
+		peak := s.memTracker.Peak()
+		metrics.SessionMemoryPeakBytes.WithLabelValues("imap").Observe(float64(peak))
+		if peak > 0 {
+			s.Log("session memory - peak: %s", server.FormatBytes(peak))
+		}
+	}
 
 	totalCount := s.server.totalConnections.Add(-1)
 	var authCount int64 = 0

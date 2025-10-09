@@ -262,6 +262,15 @@ db_sync_interval = "30s"          # How often to sync batched auth attempts to t
 max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
 db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
 
+# --- SEARCH RATE LIMITING ---
+# Per-user search rate limiting to prevent DoS attacks via excessive search queries
+search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
+search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
+
+# --- SESSION MEMORY LIMITING ---
+# Per-session memory limit to prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
+session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
+
 
 # LMTP SERVER EXAMPLE
 # =============================================================================
@@ -307,6 +316,10 @@ proxy_protocol_timeout = "5s"
 # Same configuration available as shown in IMAP example above
 # [server.auth_rate_limit]
 # enabled = false
+
+# --- SESSION MEMORY LIMITING ---
+# Per-session memory limit to prevent memory exhaustion attacks (POP3 RETR/TOP commands)
+session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -421,7 +434,7 @@ hash_usernames = true
 # HTTP ADMIN API SERVER EXAMPLE
 # =============================================================================
 # REST API server for administrative operations (accounts, health, connections, etc.)
-# Base URL: /api/v1/admin/*
+# Base URL: /admin/*
 
 [[server]]
 type = "http_admin_api"
@@ -441,7 +454,7 @@ proxy_protocol_timeout = "5s"
 # =============================================================================
 # REST API server for user mailbox access via HTTP (alternative to IMAP/POP3)
 # Provides stateless JWT-based authentication for web and mobile clients
-# Base URL: /api/v1/user/*
+# Base URL: /user/*
 
 [[server]]
 type = "http_user_api"

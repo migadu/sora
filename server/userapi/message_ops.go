@@ -27,7 +27,7 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract message ID from path: /user/v1/messages/{id}
+	// Extract message ID from path: /user/messages/{id}
 	messageIDStr := extractLastPathSegment(r.URL.Path)
 	messageID, err := strconv.ParseInt(messageIDStr, 10, 64)
 	if err != nil {
@@ -100,7 +100,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract message ID from path: /user/v1/messages/{id}
+	// Extract message ID from path: /user/messages/{id}
 	messageIDStr := extractLastPathSegment(r.URL.Path)
 	messageID, err := strconv.ParseInt(messageIDStr, 10, 64)
 	if err != nil {

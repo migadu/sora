@@ -445,7 +445,7 @@ func TestCreateAccountRequestValidation(t *testing.T) {
 				}
 			}
 
-			req := httptest.NewRequest("POST", "/api/v1/accounts", bytes.NewBuffer(body))
+			req := httptest.NewRequest("POST", "/admin/accounts", bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
@@ -512,7 +512,7 @@ func TestUpdateAccountRequestValidation(t *testing.T) {
 				}
 			}
 
-			req := httptest.NewRequest("PUT", "/api/v1/accounts/test@example.com", bytes.NewBuffer(body))
+			req := httptest.NewRequest("PUT", "/admin/accounts/test@example.com", bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
@@ -590,7 +590,7 @@ func TestAddCredentialRequestValidation(t *testing.T) {
 				}
 			}
 
-			req := httptest.NewRequest("POST", "/api/v1/accounts/primary@example.com/credentials", bytes.NewBuffer(body))
+			req := httptest.NewRequest("POST", "/admin/accounts/primary@example.com/credentials", bytes.NewBuffer(body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer test-api-key")
 

@@ -24,14 +24,19 @@ func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailbo
 
 	start := time.Now()
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT mc.text_body 
+		SELECT mc.text_body
 		FROM messages m
 		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
 		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
 	`, uid, mailboxID).Scan(&textBody)
 
-	// Record the duration
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
 	metrics.DBQueryDuration.WithLabelValues("fetch_message_body", "read").Observe(time.Since(start).Seconds())
+	metrics.DBQueriesTotal.WithLabelValues("fetch_message_body", status, "read").Inc()
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -29,8 +29,8 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract mailbox name from path: /user/v1/mailboxes/{name}/messages
-	mailboxName := extractPathParam(r.URL.Path, "/user/v1/mailboxes/", "/messages")
+	// Extract mailbox name from path: /user/mailboxes/{name}/messages
+	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/messages")
 	mailboxName, err = url.QueryUnescape(mailboxName)
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
@@ -112,8 +112,8 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract mailbox name from path: /user/v1/mailboxes/{name}/search
-	mailboxName := extractPathParam(r.URL.Path, "/user/v1/mailboxes/", "/search")
+	// Extract mailbox name from path: /user/mailboxes/{name}/search
+	mailboxName := extractPathParam(r.URL.Path, "/user/mailboxes/", "/search")
 	mailboxName, err = url.QueryUnescape(mailboxName)
 	if err != nil || mailboxName == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")

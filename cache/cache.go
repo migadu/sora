@@ -82,6 +82,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/migadu/sora/pkg/metrics"
 	_ "modernc.org/sqlite"
 )
 
@@ -189,21 +190,27 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			atomic.AddInt64(&c.cacheMisses, 1)
+			metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
+		} else {
+			metrics.CacheOperationsTotal.WithLabelValues("get", "error").Inc()
 		}
 		return nil, err
 	}
 	atomic.AddInt64(&c.cacheHits, 1)
+	metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
 	return data, nil
 }
 
 func (c *Cache) Put(contentHash string, data []byte) error {
 	if int64(len(data)) > c.maxObjectSize {
+		metrics.CacheOperationsTotal.WithLabelValues("put", "rejected").Inc()
 		return fmt.Errorf("data size %d exceeds object limit %d", len(data), c.maxObjectSize)
 	}
 
 	path := c.GetPathForContentHash(contentHash)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
+		metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
@@ -211,15 +218,18 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	// This also helps prevent corruption if the write is interrupted.
 	tempFile, err := os.CreateTemp(dir, "put-*.tmp")
 	if err != nil {
+		metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to create temporary cache file: %w", err)
 	}
 	defer os.Remove(tempFile.Name()) // Ensure temp file is cleaned up on return
 
 	if _, err := tempFile.Write(data); err != nil {
 		tempFile.Close() // Attempt to close, but prioritize write error
+		metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to write to temporary cache file: %w", err)
 	}
 	if err := tempFile.Close(); err != nil {
+		metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to close temporary cache file: %w", err)
 	}
 
@@ -227,6 +237,7 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	if err := os.Rename(tempFile.Name(), path); err != nil {
 		// If rename fails because the file exists, it means another process cached it. This is not an error.
 		if !os.IsExist(err) {
+			metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 			return fmt.Errorf("failed to move temporary file to final cache location %s: %w", path, err)
 		}
 		log.Printf("[CACHE] file %s appeared during rename, assuming concurrent cache success", path)
@@ -239,9 +250,11 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	if err := c.trackFile(path); err != nil {
 		// The file exists, but we failed to track it. The next purge/sync cycle might fix it.
 		// We don't remove the file here because it might be a valid cache entry from a concurrent Put.
+		metrics.CacheOperationsTotal.WithLabelValues("put", "error").Inc()
 		return fmt.Errorf("failed to track cache file %s: %w", path, err)
 	}
 	log.Printf("[CACHE] cached %s", path)
+	metrics.CacheOperationsTotal.WithLabelValues("put", "success").Inc()
 	return nil
 }
 
@@ -939,6 +952,10 @@ func (c *Cache) GetStats() (*CacheStats, error) {
 	if err := row.Scan(&objectCount, &totalSize); err != nil {
 		return nil, fmt.Errorf("failed to query cache statistics: %w", err)
 	}
+
+	// Update Prometheus metrics
+	metrics.CacheObjectsTotal.Set(float64(objectCount))
+	metrics.CacheSizeBytes.Set(float64(totalSize))
 
 	return &CacheStats{
 		ObjectCount: objectCount,

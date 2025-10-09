@@ -134,8 +134,8 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract mailbox name from path: /user/v1/mailboxes/{name}
-	name := extractPathParam(r.URL.Path, "/user/v1/mailboxes/", "")
+	// Extract mailbox name from path: /user/mailboxes/{name}
+	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "")
 	name, err = url.QueryUnescape(name)
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
@@ -175,8 +175,8 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Extract mailbox name from path: /user/v1/mailboxes/{name}/subscribe
-	name := extractPathParam(r.URL.Path, "/user/v1/mailboxes/", "/subscribe")
+	// Extract mailbox name from path: /user/mailboxes/{name}/subscribe
+	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/subscribe")
 	name, err = url.QueryUnescape(name)
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
@@ -211,8 +211,8 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Extract mailbox name from path: /user/v1/mailboxes/{name}/unsubscribe
-	name := extractPathParam(r.URL.Path, "/user/v1/mailboxes/", "/unsubscribe")
+	// Extract mailbox name from path: /user/mailboxes/{name}/unsubscribe
+	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/unsubscribe")
 	name, err = url.QueryUnescape(name)
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
