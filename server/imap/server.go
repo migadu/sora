@@ -240,6 +240,7 @@ type IMAPServer struct {
 	masterSASLPassword []byte
 	appendLimit        int64
 	ftsRetention       time.Duration
+	version            string
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -291,6 +292,8 @@ type IMAPServerOptions struct {
 	FTSRetention       time.Duration
 	// Client capability filtering
 	CapabilityFilters []config.ClientCapabilityFilter
+	// Version information
+	Version string
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -350,6 +353,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		cache:              cache,
 		appendLimit:        options.AppendLimit,
 		ftsRetention:       options.FTSRetention,
+		version:            options.Version,
 		authLimiter:        authLimiter,
 		proxyReader:        proxyReader,
 		enableWarmup:       options.EnableWarmup,

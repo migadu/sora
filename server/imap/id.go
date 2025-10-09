@@ -38,10 +38,14 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	}
 
 	// Build server response with basic server information
+	version := s.server.version
+	if version == "" {
+		version = "dev"
+	}
 	serverID := &imap.IDData{
 		Name:       "Sora",
-		Version:    "1.0.0", // TODO Get right version
-		Vendor:     "Migadu",
+		Version:    version,
+		Vendor:     "Migadu-Mail GmbH",
 		SupportURL: "https://migadu.com",
 	}
 
