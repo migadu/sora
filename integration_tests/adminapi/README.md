@@ -1,6 +1,10 @@
-# HTTP API Integration Tests
+# HTTP Admin API Integration Tests
 
-This directory contains comprehensive integration tests for the Sora HTTP API server.
+This directory contains comprehensive integration tests for the Sora HTTP Admin API server (`http_admin_api` server type).
+
+**Base Path:** `/admin/v1/*`
+
+**Authentication:** API key (Bearer token)
 
 ## Test Coverage
 
@@ -48,6 +52,13 @@ This directory contains comprehensive integration tests for the Sora HTTP API se
 - ✅ API feature discovery
 - ✅ Endpoint enumeration
 
+### **Message Restoration**
+- ✅ List deleted messages
+- ✅ Filter by mailbox
+- ✅ Restore by message IDs
+- ✅ Restore by mailbox
+- ✅ Pagination support
+
 ### **Error Scenarios**
 - ✅ Authentication failures (missing/invalid API key)
 - ✅ Resource not found errors
@@ -77,6 +88,7 @@ This directory contains comprehensive integration tests for the Sora HTTP API se
 9. **TestErrorScenarios** - Error handling and validation
 10. **TestCredentialManagementEdgeCases** - Advanced credential scenarios
 11. **TestAccountLifecycle** - Complete account workflow
+12. **TestMessageRestoration** - Deleted message restoration
 
 ### **Key Features**
 

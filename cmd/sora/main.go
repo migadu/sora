@@ -19,8 +19,8 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
-	"github.com/migadu/sora/server/httpapi"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/imapproxy"
 	"github.com/migadu/sora/server/lmtp"
@@ -31,6 +31,7 @@ import (
 	"github.com/migadu/sora/server/pop3proxy"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
+	mailapi "github.com/migadu/sora/server/userapi"
 	"github.com/migadu/sora/storage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -423,8 +424,10 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			go startDynamicManageSieveProxyServer(ctx, deps, server, errChan)
 		case "lmtp_proxy":
 			go startDynamicLMTPProxyServer(ctx, deps, server, errChan)
-		case "http_api":
-			go startDynamicHTTPAPIServer(ctx, deps, server, errChan)
+		case "http_admin_api":
+			go startDynamicHTTPAdminAPIServer(ctx, deps, server, errChan)
+		case "http_user_api":
+			go startDynamicHTTPUserAPIServer(ctx, deps, server, errChan)
 		default:
 			logger.Infof("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
 		}
@@ -896,23 +899,66 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	server.Start()
 }
 
-func startDynamicHTTPAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
 	if serverConfig.APIKey == "" {
-		logger.Infof("WARNING: HTTP API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
+		logger.Infof("WARNING: HTTP Admin API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
 		return
 	}
 
-	options := httpapi.ServerOptions{
-		Name:         serverConfig.Name,
-		Addr:         serverConfig.Addr,
-		APIKey:       serverConfig.APIKey,
-		AllowedHosts: serverConfig.AllowedHosts,
-		Cache:        deps.cacheInstance,
-		TLS:          serverConfig.TLS,
-		TLSCertFile:  serverConfig.TLSCertFile,
-		TLSKeyFile:   serverConfig.TLSKeyFile,
-		TLSVerify:    serverConfig.TLSVerify,
+	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+
+	options := adminapi.ServerOptions{
+		Name:          serverConfig.Name,
+		Addr:          serverConfig.Addr,
+		APIKey:        serverConfig.APIKey,
+		AllowedHosts:  serverConfig.AllowedHosts,
+		Cache:         deps.cacheInstance,
+		Uploader:      deps.uploadWorker,
+		Storage:       deps.storage,
+		ExternalRelay: serverConfig.ExternalRelay,
+		TLS:           serverConfig.TLS,
+		TLSCertFile:   serverConfig.TLSCertFile,
+		TLSKeyFile:    serverConfig.TLSKeyFile,
+		TLSVerify:     serverConfig.TLSVerify,
+		Hostname:      deps.hostname,
+		FTSRetention:  ftsRetention,
 	}
 
-	httpapi.Start(ctx, deps.resilientDB, options, errChan)
+	adminapi.Start(ctx, deps.resilientDB, options, errChan)
+}
+
+func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	if serverConfig.JWTSecret == "" {
+		logger.Infof("WARNING: HTTP User API server '%s' enabled but no JWT secret configured, skipping", serverConfig.Name)
+		return
+	}
+
+	// Parse token duration
+	tokenDuration := 24 * time.Hour // Default
+	if serverConfig.TokenDuration != "" {
+		if dur, err := time.ParseDuration(serverConfig.TokenDuration); err == nil {
+			tokenDuration = dur
+		} else {
+			logger.Infof("WARNING: Invalid token_duration '%s' for HTTP User API server '%s', using default 24h", serverConfig.TokenDuration, serverConfig.Name)
+		}
+	}
+
+	// Use mailapi package (need to add import)
+	options := mailapi.ServerOptions{
+		Name:           serverConfig.Name,
+		Addr:           serverConfig.Addr,
+		JWTSecret:      serverConfig.JWTSecret,
+		TokenDuration:  tokenDuration,
+		TokenIssuer:    serverConfig.TokenIssuer,
+		AllowedOrigins: serverConfig.AllowedOrigins,
+		AllowedHosts:   serverConfig.AllowedHosts,
+		Storage:        deps.storage,
+		Cache:          deps.cacheInstance,
+		TLS:            serverConfig.TLS,
+		TLSCertFile:    serverConfig.TLSCertFile,
+		TLSKeyFile:     serverConfig.TLSKeyFile,
+		TLSVerify:      serverConfig.TLSVerify,
+	}
+
+	mailapi.Start(ctx, deps.resilientDB, options, errChan)
 }

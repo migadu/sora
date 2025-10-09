@@ -4,8 +4,8 @@ info:
   description: HTTP API for managing and monitoring the Sora mail server.
   version: v1
 servers:
-  - url: /api/v1
-    description: API version 1
+  - url: /admin/v1
+    description: Admin API version 1
 
 # Security scheme definition
 components:
@@ -576,6 +576,70 @@ components:
         message:
           type: string
           example: "Successfully restored 5 messages"
+
+    DeliverMailRequest:
+      type: object
+      description: "Request to deliver mail via HTTP. Supports multiple input formats."
+      properties:
+        recipients:
+          type: array
+          items:
+            type: string
+            format: email
+          example: ["user1@example.com", "user2@example.com"]
+          description: "Recipient email addresses (required if not in message headers)"
+        message:
+          type: string
+          example: |
+            From: sender@example.com
+            To: recipient@example.com
+            Subject: Test Message
+
+            This is the message body.
+          description: "RFC822 formatted message"
+        from:
+          type: string
+          format: email
+          example: "sender@example.com"
+          description: "Sender address (optional, extracted from message if not provided)"
+        subject:
+          type: string
+          example: "Test Message"
+          description: "Message subject (optional, for logging/tracking)"
+
+    RecipientStatus:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          example: "user@example.com"
+        accepted:
+          type: boolean
+          example: true
+        error:
+          type: string
+          example: "Recipient not found"
+
+    DeliverMailResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+          description: "Overall delivery success (true if all recipients accepted)"
+        recipients:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecipientStatus'
+        message_id:
+          type: string
+          example: "<12345.67890@sora-http-delivery>"
+          description: "Message-ID assigned or extracted from message"
+        error:
+          type: string
+          example: "Partial delivery failure"
+          description: "Error message if delivery failed"
 
 # Global security requirement
 security:
@@ -1759,3 +1823,128 @@ paths:
                       type: array
                       items:
                         type: string
+
+  /mail/deliver:
+    post:
+      tags:
+        - Mail Delivery
+      summary: Deliver mail via HTTP
+      description: |
+        Deliver an RFC822 formatted email message to one or more recipients via HTTP POST.
+
+        This endpoint provides an alternative to LMTP for programmatic mail delivery.
+
+        **Supported Content-Types:**
+        - `application/json` - JSON request with recipients and message
+        - `message/rfc822` - Raw RFC822 message (recipients in query params or X-Recipients header)
+        - `multipart/form-data` - Form submission with message field
+        - `text/plain` - Plain text RFC822 message
+
+        **Authentication:** Requires API key in Authorization header.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeliverMailRequest'
+            examples:
+              simple:
+                summary: Simple JSON delivery
+                value:
+                  recipients: ["user@example.com"]
+                  message: |
+                    From: sender@example.com
+                    To: user@example.com
+                    Subject: Test Message
+
+                    This is a test message delivered via HTTP.
+              multiple_recipients:
+                summary: Multiple recipients
+                value:
+                  recipients: ["user1@example.com", "user2@example.com"]
+                  from: "sender@example.com"
+                  subject: "Notification"
+                  message: |
+                    From: sender@example.com
+                    Subject: Notification
+
+                    This message goes to multiple recipients.
+          message/rfc822:
+            schema:
+              type: string
+              format: binary
+            example: |
+              From: sender@example.com
+              To: recipient@example.com
+              Subject: Test
+
+              Message body
+      parameters:
+        - name: recipients
+          in: query
+          schema:
+            type: string
+          description: "Comma-separated recipient emails (for non-JSON requests)"
+          example: "user1@example.com,user2@example.com"
+      responses:
+        '200':
+          description: Mail delivered successfully to all recipients
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliverMailResponse'
+              examples:
+                success:
+                  summary: Successful delivery
+                  value:
+                    success: true
+                    recipients:
+                      - email: "user@example.com"
+                        accepted: true
+                    message_id: "<12345.67890@sora-http-delivery>"
+        '207':
+          description: Multi-Status - Partial delivery success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliverMailResponse'
+              examples:
+                partial:
+                  summary: Partial delivery
+                  value:
+                    success: false
+                    recipients:
+                      - email: "user1@example.com"
+                        accepted: true
+                      - email: "user2@example.com"
+                        accepted: false
+                        error: "Recipient not found"
+                    message_id: "<12345.67890@sora-http-delivery>"
+                    error: "Partial delivery failure"
+        '400':
+          description: Bad request - invalid message format or missing recipients
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_message:
+                  summary: Invalid RFC822 message
+                  value:
+                    error: "Invalid RFC822 message: malformed header"
+                no_recipients:
+                  summary: No recipients specified
+                  value:
+                    error: "At least one recipient is required"
+        '401':
+          description: Unauthorized - invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

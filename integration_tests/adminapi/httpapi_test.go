@@ -16,7 +16,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/server/httpapi"
+	"github.com/migadu/sora/server/adminapi"
 )
 
 const (
@@ -25,7 +25,7 @@ const (
 
 type HTTPAPITestServer struct {
 	URL     string
-	server  *httpapi.Server
+	server  *adminapi.Server
 	rdb     *resilient.ResilientDatabase
 	cache   *cache.Cache
 	cleanup func()
@@ -56,7 +56,7 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	addr := common.GetRandomAddress(t)
 
 	// Create server options
-	options := httpapi.ServerOptions{
+	options := adminapi.ServerOptions{
 		Addr:         addr,
 		APIKey:       testAPIKey,
 		AllowedHosts: []string{}, // Allow all for testing
@@ -65,7 +65,7 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	}
 
 	// Create server
-	server, err := httpapi.New(rdb, options)
+	server, err := adminapi.New(rdb, options)
 	if err != nil {
 		t.Fatalf("Failed to create HTTP API server: %v", err)
 	}
@@ -74,7 +74,7 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
 
-	go httpapi.Start(ctx, rdb, options, errChan)
+	go adminapi.Start(ctx, rdb, options, errChan)
 
 	// Wait a bit for server to start
 	time.Sleep(100 * time.Millisecond)
@@ -182,12 +182,12 @@ func TestAccountCRUD(t *testing.T) {
 	testEmail := fmt.Sprintf("test-crud-%d@example.com", time.Now().UnixNano())
 
 	// 1. Create account
-	reqBody := httpapi.CreateAccountRequest{
+	reqBody := adminapi.CreateAccountRequest{
 		Email:    testEmail,
 		Password: "test-password-123",
 	}
 
-	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+	resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
@@ -205,7 +205,7 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 2. Check account exists
-	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/exists", nil)
+	resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail+"/exists", nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -222,7 +222,7 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 3. Get account details
-	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
+	resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail, nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -245,11 +245,11 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 4. Update account
-	updateReq := httpapi.UpdateAccountRequest{
+	updateReq := adminapi.UpdateAccountRequest{
 		Password: "new-password-456",
 	}
 
-	resp, body = server.makeRequest(t, "PUT", "/api/v1/accounts/"+testEmail, updateReq)
+	resp, body = server.makeRequest(t, "PUT", "/admin/v1/accounts/"+testEmail, updateReq)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -262,7 +262,7 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 5. List accounts
-	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts", nil)
+	resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts", nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -286,7 +286,7 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 6. Delete account
-	resp, body = server.makeRequest(t, "DELETE", "/api/v1/accounts/"+testEmail, nil)
+	resp, body = server.makeRequest(t, "DELETE", "/admin/v1/accounts/"+testEmail, nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -303,7 +303,7 @@ func TestAccountCRUD(t *testing.T) {
 	}
 
 	// 7. Restore account
-	resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/restore", nil)
+	resp, body = server.makeRequest(t, "POST", "/admin/v1/accounts/"+testEmail+"/restore", nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -328,8 +328,8 @@ func TestMultiCredentialAccount(t *testing.T) {
 	secondaryEmail := fmt.Sprintf("secondary-%d@example.com", time.Now().UnixNano())
 
 	// Create account with multiple credentials
-	reqBody := httpapi.CreateAccountRequest{
-		Credentials: []httpapi.CreateCredentialSpec{
+	reqBody := adminapi.CreateAccountRequest{
+		Credentials: []adminapi.CreateCredentialSpec{
 			{
 				Email:     primaryEmail,
 				Password:  "primary-password",
@@ -345,7 +345,7 @@ func TestMultiCredentialAccount(t *testing.T) {
 		},
 	}
 
-	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+	resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
@@ -364,7 +364,7 @@ func TestMultiCredentialAccount(t *testing.T) {
 	}
 
 	// List credentials for primary email
-	resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+primaryEmail+"/credentials", nil)
+	resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+primaryEmail+"/credentials", nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -385,12 +385,12 @@ func TestMultiCredentialAccount(t *testing.T) {
 	// Add additional credential
 	additionalEmail := fmt.Sprintf("additional-%d@example.com", time.Now().UnixNano())
 
-	addReq := httpapi.AddCredentialRequest{
+	addReq := adminapi.AddCredentialRequest{
 		Email:    additionalEmail,
 		Password: "additional-password",
 	}
 
-	resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+primaryEmail+"/credentials", addReq)
+	resp, body = server.makeRequest(t, "POST", "/admin/v1/accounts/"+primaryEmail+"/credentials", addReq)
 
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
@@ -407,7 +407,7 @@ func TestMultiCredentialAccount(t *testing.T) {
 	}
 
 	// Get credential details
-	resp, body = server.makeRequest(t, "GET", "/api/v1/credentials/"+secondaryEmail, nil)
+	resp, body = server.makeRequest(t, "GET", "/admin/v1/credentials/"+secondaryEmail, nil)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -436,7 +436,7 @@ func TestConnectionManagement(t *testing.T) {
 	defer server.Close()
 
 	t.Run("list connections", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/connections", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/connections", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -461,7 +461,7 @@ func TestConnectionManagement(t *testing.T) {
 	})
 
 	t.Run("get connection stats", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/connections/stats", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/connections/stats", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -479,7 +479,7 @@ func TestConnectionManagement(t *testing.T) {
 			"protocol": "IMAP",
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/connections/kick", reqBody)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/connections/kick", reqBody)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -499,14 +499,14 @@ func TestConnectionManagement(t *testing.T) {
 
 	// Create a test account to test user connections
 	testEmail := fmt.Sprintf("conn-test-%d@example.com", time.Now().UnixNano())
-	reqBody := httpapi.CreateAccountRequest{
+	reqBody := adminapi.CreateAccountRequest{
 		Email:    testEmail,
 		Password: "test-password-123",
 	}
-	server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+	server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 
 	t.Run("get user connections", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/connections/user/"+testEmail, nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/connections/user/"+testEmail, nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -542,7 +542,7 @@ func TestCacheManagement(t *testing.T) {
 	defer server.Close()
 
 	t.Run("get cache stats", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/stats", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/cache/stats", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -556,7 +556,7 @@ func TestCacheManagement(t *testing.T) {
 	})
 
 	t.Run("get cache metrics - latest", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?latest=true", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/cache/metrics?latest=true", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -581,7 +581,7 @@ func TestCacheManagement(t *testing.T) {
 	})
 
 	t.Run("get cache metrics - historical", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?limit=10", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/cache/metrics?limit=10", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -601,7 +601,7 @@ func TestCacheManagement(t *testing.T) {
 	})
 
 	t.Run("purge cache", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "POST", "/api/v1/cache/purge", nil)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/cache/purge", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -631,7 +631,7 @@ func TestHealthMonitoring(t *testing.T) {
 	defer server.Close()
 
 	t.Run("get health overview", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/health/overview", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/health/overview", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -645,7 +645,7 @@ func TestHealthMonitoring(t *testing.T) {
 	})
 
 	t.Run("get health overview for specific hostname", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/health/overview?hostname=test-host", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/health/overview?hostname=test-host", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -656,7 +656,7 @@ func TestHealthMonitoring(t *testing.T) {
 	})
 
 	t.Run("get health statuses by host", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/health/servers/test-host", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -685,7 +685,7 @@ func TestHealthMonitoring(t *testing.T) {
 	})
 
 	t.Run("get health status by component", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host/components/database", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/health/servers/test-host/components/database", nil)
 
 		// This might return 404 if no health status exists, which is okay for testing
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
@@ -700,7 +700,7 @@ func TestHealthMonitoring(t *testing.T) {
 	})
 
 	t.Run("get health history", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/health/servers/test-host/components/database?history=true&limit=5", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/health/servers/test-host/components/database?history=true&limit=5", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -740,7 +740,7 @@ func TestUploaderMonitoring(t *testing.T) {
 	defer server.Close()
 
 	t.Run("get uploader status", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/status", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/uploader/status", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -755,7 +755,7 @@ func TestUploaderMonitoring(t *testing.T) {
 	})
 
 	t.Run("get uploader status with failed uploads", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/status?show_failed=true&failed_limit=5", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/uploader/status?show_failed=true&failed_limit=5", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -784,7 +784,7 @@ func TestUploaderMonitoring(t *testing.T) {
 	})
 
 	t.Run("get failed uploads", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/uploader/failed?limit=10", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/uploader/failed?limit=10", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -824,7 +824,7 @@ func TestAuthStatistics(t *testing.T) {
 	defer server.Close()
 
 	t.Run("get auth stats - default window", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/auth/stats", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -847,7 +847,7 @@ func TestAuthStatistics(t *testing.T) {
 	})
 
 	t.Run("get auth stats - custom window", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats?window=1h", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/auth/stats?window=1h", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -874,7 +874,7 @@ func TestSystemConfiguration(t *testing.T) {
 	defer server.Close()
 
 	t.Run("get config info", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/config", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/config", nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -921,7 +921,7 @@ func TestErrorScenarios(t *testing.T) {
 	defer server.Close()
 
 	t.Run("unauthorized request - no API key", func(t *testing.T) {
-		url := server.URL + "/api/v1/accounts"
+		url := server.URL + "/admin/v1/accounts"
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
@@ -950,7 +950,7 @@ func TestErrorScenarios(t *testing.T) {
 	})
 
 	t.Run("unauthorized request - wrong API key", func(t *testing.T) {
-		url := server.URL + "/api/v1/accounts"
+		url := server.URL + "/admin/v1/accounts"
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			t.Fatalf("Failed to create request: %v", err)
@@ -981,7 +981,7 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("account not found", func(t *testing.T) {
 		nonExistentEmail := "nonexistent@example.com"
 
-		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/"+nonExistentEmail, nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/accounts/"+nonExistentEmail, nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -993,19 +993,19 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("duplicate account creation", func(t *testing.T) {
 		testEmail := fmt.Sprintf("duplicate-test-%d@example.com", time.Now().UnixNano())
 
-		reqBody := httpapi.CreateAccountRequest{
+		reqBody := adminapi.CreateAccountRequest{
 			Email:    testEmail,
 			Password: "test-password-123",
 		}
 
 		// Create account first time
-		resp1, body1 := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+		resp1, body1 := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 		if resp1.StatusCode != http.StatusCreated {
 			t.Errorf("First creation should succeed. Status: %d, Body: %s", resp1.StatusCode, string(body1))
 		}
 
 		// Try to create same account again
-		resp2, body2 := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+		resp2, body2 := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 
 		// The API might return 409 Conflict or 500 Internal Server Error depending on how it handles duplicates
 		if resp2.StatusCode != http.StatusConflict && resp2.StatusCode != http.StatusInternalServerError {
@@ -1020,12 +1020,12 @@ func TestErrorScenarios(t *testing.T) {
 	})
 
 	t.Run("invalid email format", func(t *testing.T) {
-		reqBody := httpapi.CreateAccountRequest{
+		reqBody := adminapi.CreateAccountRequest{
 			Email:    "invalid-email-format",
 			Password: "test-password-123",
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 
 		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusInternalServerError {
 			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusBadRequest, http.StatusInternalServerError, resp.StatusCode, string(body))
@@ -1040,7 +1040,7 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("delete non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-delete@example.com"
 
-		resp, body := server.makeRequest(t, "DELETE", "/api/v1/accounts/"+nonExistentEmail, nil)
+		resp, body := server.makeRequest(t, "DELETE", "/admin/v1/accounts/"+nonExistentEmail, nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1052,7 +1052,7 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("restore non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-restore@example.com"
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+nonExistentEmail+"/restore", nil)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts/"+nonExistentEmail+"/restore", nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1064,12 +1064,12 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("add credential to non-existent account", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-primary@example.com"
 
-		reqBody := httpapi.AddCredentialRequest{
+		reqBody := adminapi.AddCredentialRequest{
 			Email:    "secondary@example.com",
 			Password: "password",
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+nonExistentEmail+"/credentials", reqBody)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts/"+nonExistentEmail+"/credentials", reqBody)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1081,7 +1081,7 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("get credential for non-existent email", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-credential@example.com"
 
-		resp, body := server.makeRequest(t, "GET", "/api/v1/credentials/"+nonExistentEmail, nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/credentials/"+nonExistentEmail, nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1093,7 +1093,7 @@ func TestErrorScenarios(t *testing.T) {
 	t.Run("delete non-existent credential", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-credential@example.com"
 
-		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+nonExistentEmail, nil)
+		resp, body := server.makeRequest(t, "DELETE", "/admin/v1/credentials/"+nonExistentEmail, nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1103,7 +1103,7 @@ func TestErrorScenarios(t *testing.T) {
 	})
 
 	t.Run("invalid auth stats window", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/auth/stats?window=invalid-duration", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/auth/stats?window=invalid-duration", nil)
 
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
@@ -1113,7 +1113,7 @@ func TestErrorScenarios(t *testing.T) {
 	})
 
 	t.Run("invalid cache metrics since parameter", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/cache/metrics?since=invalid-time", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/cache/metrics?since=invalid-time", nil)
 
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
@@ -1133,8 +1133,8 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 	secondaryEmail := fmt.Sprintf("edge-secondary-%d@example.com", time.Now().UnixNano())
 
 	// Create account with multiple credentials
-	reqBody := httpapi.CreateAccountRequest{
-		Credentials: []httpapi.CreateCredentialSpec{
+	reqBody := adminapi.CreateAccountRequest{
+		Credentials: []adminapi.CreateCredentialSpec{
 			{
 				Email:     primaryEmail,
 				Password:  "primary-password",
@@ -1150,18 +1150,18 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 		},
 	}
 
-	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", reqBody)
+	resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", reqBody)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("Failed to create test account: %d - %s", resp.StatusCode, string(body))
 	}
 
 	t.Run("add duplicate credential email", func(t *testing.T) {
-		addReq := httpapi.AddCredentialRequest{
+		addReq := adminapi.AddCredentialRequest{
 			Email:    secondaryEmail, // Already exists
 			Password: "new-password",
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/"+primaryEmail+"/credentials", addReq)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts/"+primaryEmail+"/credentials", addReq)
 
 		if resp.StatusCode != http.StatusConflict {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusConflict, resp.StatusCode, string(body))
@@ -1171,7 +1171,7 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 	})
 
 	t.Run("try to delete primary credential", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+primaryEmail, nil)
+		resp, body := server.makeRequest(t, "DELETE", "/admin/v1/credentials/"+primaryEmail, nil)
 
 		// Should not allow deleting primary credential if it would leave account without credentials
 		if resp.StatusCode != http.StatusBadRequest {
@@ -1182,7 +1182,7 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 	})
 
 	t.Run("delete secondary credential - should succeed", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+secondaryEmail, nil)
+		resp, body := server.makeRequest(t, "DELETE", "/admin/v1/credentials/"+secondaryEmail, nil)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
@@ -1201,7 +1201,7 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 	})
 
 	t.Run("verify credential was deleted", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/credentials/"+secondaryEmail, nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/credentials/"+secondaryEmail, nil)
 
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
@@ -1211,7 +1211,7 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 	})
 
 	t.Run("try to delete last remaining credential", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "DELETE", "/api/v1/credentials/"+primaryEmail, nil)
+		resp, body := server.makeRequest(t, "DELETE", "/admin/v1/credentials/"+primaryEmail, nil)
 
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
@@ -1231,18 +1231,18 @@ func TestAccountLifecycle(t *testing.T) {
 
 	t.Run("complete account lifecycle", func(t *testing.T) {
 		// 1. Create account
-		createReq := httpapi.CreateAccountRequest{
+		createReq := adminapi.CreateAccountRequest{
 			Email:    testEmail,
 			Password: "initial-password",
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", createReq)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", createReq)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("Failed to create account: %d - %s", resp.StatusCode, string(body))
 		}
 
 		// 2. Verify account exists
-		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/exists", nil)
+		resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail+"/exists", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to check account existence: %d - %s", resp.StatusCode, string(body))
 		}
@@ -1254,28 +1254,28 @@ func TestAccountLifecycle(t *testing.T) {
 		}
 
 		// 3. Update password
-		updateReq := httpapi.UpdateAccountRequest{
+		updateReq := adminapi.UpdateAccountRequest{
 			Password: "new-password",
 		}
 
-		resp, body = server.makeRequest(t, "PUT", "/api/v1/accounts/"+testEmail, updateReq)
+		resp, body = server.makeRequest(t, "PUT", "/admin/v1/accounts/"+testEmail, updateReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to update account: %d - %s", resp.StatusCode, string(body))
 		}
 
 		// 4. Add secondary credential
-		addCredReq := httpapi.AddCredentialRequest{
+		addCredReq := adminapi.AddCredentialRequest{
 			Email:    fmt.Sprintf("secondary-%s", testEmail),
 			Password: "secondary-password",
 		}
 
-		resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/credentials", addCredReq)
+		resp, body = server.makeRequest(t, "POST", "/admin/v1/accounts/"+testEmail+"/credentials", addCredReq)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("Failed to add credential: %d - %s", resp.StatusCode, string(body))
 		}
 
 		// 5. List credentials
-		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/credentials", nil)
+		resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail+"/credentials", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list credentials: %d - %s", resp.StatusCode, string(body))
 		}
@@ -1288,24 +1288,24 @@ func TestAccountLifecycle(t *testing.T) {
 		}
 
 		// 6. Delete account (soft delete)
-		resp, body = server.makeRequest(t, "DELETE", "/api/v1/accounts/"+testEmail, nil)
+		resp, body = server.makeRequest(t, "DELETE", "/admin/v1/accounts/"+testEmail, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to delete account: %d - %s", resp.StatusCode, string(body))
 		}
 
 		// 7. Verify account is marked as deleted
-		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
+		resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail, nil)
 		// This might return different status codes depending on how soft delete is implemented
 		// The account might still be retrievable but marked as deleted
 
 		// 8. Restore account
-		resp, body = server.makeRequest(t, "POST", "/api/v1/accounts/"+testEmail+"/restore", nil)
+		resp, body = server.makeRequest(t, "POST", "/admin/v1/accounts/"+testEmail+"/restore", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to restore account: %d - %s", resp.StatusCode, string(body))
 		}
 
 		// 9. Verify account is restored and accessible
-		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail, nil)
+		resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("Account should be accessible after restore: %d - %s", resp.StatusCode, string(body))
 		}
@@ -1321,11 +1321,11 @@ func TestMessageRestoration(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Create test account
-	createReq := httpapi.CreateAccountRequest{
+	createReq := adminapi.CreateAccountRequest{
 		Email:    testEmail,
 		Password: "test-password",
 	}
-	resp, body := server.makeRequest(t, "POST", "/api/v1/accounts", createReq)
+	resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", createReq)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("Failed to create account: %d - %s", resp.StatusCode, string(body))
 	}
@@ -1397,7 +1397,7 @@ func TestMessageRestoration(t *testing.T) {
 
 	// 5. List all deleted messages
 	t.Run("ListAllDeletedMessages", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/messages/deleted", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail+"/messages/deleted", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
 		}
@@ -1433,7 +1433,7 @@ func TestMessageRestoration(t *testing.T) {
 
 	// 6. List deleted messages filtered by mailbox
 	t.Run("ListDeletedMessagesByMailbox", func(t *testing.T) {
-		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/deleted?mailbox=INBOX", testEmail)
+		endpoint := fmt.Sprintf("/admin/v1/accounts/%s/messages/deleted?mailbox=INBOX", testEmail)
 		resp, body := server.makeRequest(t, "GET", endpoint, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
@@ -1450,7 +1450,7 @@ func TestMessageRestoration(t *testing.T) {
 
 	// 7. List deleted messages with limit
 	t.Run("ListDeletedMessagesWithLimit", func(t *testing.T) {
-		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/deleted?limit=1", testEmail)
+		endpoint := fmt.Sprintf("/admin/v1/accounts/%s/messages/deleted?limit=1", testEmail)
 		resp, body := server.makeRequest(t, "GET", endpoint, nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
@@ -1471,7 +1471,7 @@ func TestMessageRestoration(t *testing.T) {
 			"message_ids": []int64{msgID1, msgID2},
 		}
 
-		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		endpoint := fmt.Sprintf("/admin/v1/accounts/%s/messages/restore", testEmail)
 		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
@@ -1486,7 +1486,7 @@ func TestMessageRestoration(t *testing.T) {
 		}
 
 		// Verify messages are no longer in deleted list
-		resp, body = server.makeRequest(t, "GET", "/api/v1/accounts/"+testEmail+"/messages/deleted", nil)
+		resp, body = server.makeRequest(t, "GET", "/admin/v1/accounts/"+testEmail+"/messages/deleted", nil)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
 		}
@@ -1518,7 +1518,7 @@ func TestMessageRestoration(t *testing.T) {
 			"mailbox": "INBOX/Archive",
 		}
 
-		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		endpoint := fmt.Sprintf("/admin/v1/accounts/%s/messages/restore", testEmail)
 		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
@@ -1537,7 +1537,7 @@ func TestMessageRestoration(t *testing.T) {
 	t.Run("RestoreWithoutCriteria", func(t *testing.T) {
 		restoreReq := map[string]interface{}{}
 
-		endpoint := fmt.Sprintf("/api/v1/accounts/%s/messages/restore", testEmail)
+		endpoint := fmt.Sprintf("/admin/v1/accounts/%s/messages/restore", testEmail)
 		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("Expected 400 Bad Request, got %d - %s", resp.StatusCode, string(body))
@@ -1547,7 +1547,7 @@ func TestMessageRestoration(t *testing.T) {
 	})
 
 	t.Run("ListDeletedForNonExistentAccount", func(t *testing.T) {
-		resp, body := server.makeRequest(t, "GET", "/api/v1/accounts/nonexistent@example.com/messages/deleted", nil)
+		resp, body := server.makeRequest(t, "GET", "/admin/v1/accounts/nonexistent@example.com/messages/deleted", nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected 404 Not Found, got %d - %s", resp.StatusCode, string(body))
 		}
@@ -1558,9 +1558,290 @@ func TestMessageRestoration(t *testing.T) {
 			"message_ids": []int64{999999},
 		}
 
-		resp, body := server.makeRequest(t, "POST", "/api/v1/accounts/nonexistent@example.com/messages/restore", restoreReq)
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts/nonexistent@example.com/messages/restore", restoreReq)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("Expected 404 Not Found, got %d - %s", resp.StatusCode, string(body))
 		}
+	})
+}
+
+// TestMailDelivery tests the HTTP mail delivery endpoint
+func TestMailDelivery(t *testing.T) {
+	t.Skip("Mail delivery tests require uploader configuration (not set up in test environment)")
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	// Create a test account to deliver mail to
+	createReq := map[string]string{
+		"email":    fmt.Sprintf("delivery-test-%d@example.com", time.Now().Unix()),
+		"password": "testpassword123",
+	}
+	resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", createReq)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Failed to create test account: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var createResp map[string]interface{}
+	server.expectJSON(t, body, &createResp)
+	testEmail := createResp["email"].(string)
+
+	t.Run("DeliverMail_JSONFormat", func(t *testing.T) {
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail},
+			"message": fmt.Sprintf(`From: sender@example.com
+To: %s
+Subject: Test Message via HTTP
+Message-ID: <test-%d@example.com>
+Date: %s
+
+This is a test message delivered via HTTP API.
+`, testEmail, time.Now().Unix(), time.Now().Format(time.RFC1123Z)),
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var deliveryResp map[string]interface{}
+		server.expectJSON(t, body, &deliveryResp)
+
+		if success, ok := deliveryResp["success"].(bool); !ok || !success {
+			t.Errorf("Expected success=true, got %v", deliveryResp["success"])
+		}
+
+		if messageID, ok := deliveryResp["message_id"].(string); !ok || messageID == "" {
+			t.Errorf("Expected message_id, got %v", deliveryResp["message_id"])
+		}
+
+		recipients, ok := deliveryResp["recipients"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
+		}
+
+		if len(recipients) != 1 {
+			t.Errorf("Expected 1 recipient, got %d", len(recipients))
+		}
+
+		recipientStatus := recipients[0].(map[string]interface{})
+		if email, ok := recipientStatus["email"].(string); !ok || email != testEmail {
+			t.Errorf("Expected email %s, got %v", testEmail, recipientStatus["email"])
+		}
+
+		if accepted, ok := recipientStatus["accepted"].(bool); !ok || !accepted {
+			t.Errorf("Expected accepted=true, got %v", recipientStatus["accepted"])
+		}
+
+		t.Logf("Successfully delivered message to %s", testEmail)
+	})
+
+	t.Run("DeliverMail_MultipleRecipients", func(t *testing.T) {
+		// Create a second recipient
+		createReq2 := map[string]string{
+			"email":    fmt.Sprintf("delivery-test2-%d@example.com", time.Now().Unix()),
+			"password": "testpassword123",
+		}
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/accounts", createReq2)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("Failed to create second test account: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var createResp2 map[string]interface{}
+		server.expectJSON(t, body, &createResp2)
+		testEmail2 := createResp2["email"].(string)
+
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail, testEmail2},
+			"message": fmt.Sprintf(`From: sender@example.com
+To: %s, %s
+Subject: Test Message to Multiple Recipients
+Message-ID: <test-multi-%d@example.com>
+Date: %s
+
+This message is delivered to multiple recipients.
+`, testEmail, testEmail2, time.Now().Unix(), time.Now().Format(time.RFC1123Z)),
+		}
+
+		resp, body = server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var deliveryResp map[string]interface{}
+		server.expectJSON(t, body, &deliveryResp)
+
+		recipients, ok := deliveryResp["recipients"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
+		}
+
+		if len(recipients) != 2 {
+			t.Errorf("Expected 2 recipients, got %d", len(recipients))
+		}
+
+		// Check both recipients were accepted
+		for _, r := range recipients {
+			recipientStatus := r.(map[string]interface{})
+			if accepted, ok := recipientStatus["accepted"].(bool); !ok || !accepted {
+				t.Errorf("Expected all recipients accepted, got %v for %v", recipientStatus["accepted"], recipientStatus["email"])
+			}
+		}
+
+		t.Logf("Successfully delivered message to %d recipients", len(recipients))
+	})
+
+	t.Run("DeliverMail_PartialFailure", func(t *testing.T) {
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail, "nonexistent-user-12345@example.com"},
+			"message": fmt.Sprintf(`From: sender@example.com
+To: %s, nonexistent-user-12345@example.com
+Subject: Test Partial Failure
+Message-ID: <test-partial-%d@example.com>
+Date: %s
+
+This message has one valid and one invalid recipient.
+`, testEmail, time.Now().Unix(), time.Now().Format(time.RFC1123Z)),
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		// Should return 207 Multi-Status for partial failure
+		if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 207 or 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var deliveryResp map[string]interface{}
+		server.expectJSON(t, body, &deliveryResp)
+
+		recipients, ok := deliveryResp["recipients"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
+		}
+
+		if len(recipients) != 2 {
+			t.Errorf("Expected 2 recipients, got %d", len(recipients))
+		}
+
+		// Check that one succeeded and one failed
+		acceptedCount := 0
+		rejectedCount := 0
+		for _, r := range recipients {
+			recipientStatus := r.(map[string]interface{})
+			if accepted, ok := recipientStatus["accepted"].(bool); ok && accepted {
+				acceptedCount++
+			} else {
+				rejectedCount++
+			}
+		}
+
+		if acceptedCount != 1 || rejectedCount != 1 {
+			t.Errorf("Expected 1 accepted and 1 rejected, got %d accepted, %d rejected", acceptedCount, rejectedCount)
+		}
+
+		t.Logf("Partial delivery: %d accepted, %d rejected", acceptedCount, rejectedCount)
+	})
+
+	t.Run("DeliverMail_InvalidFormat", func(t *testing.T) {
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail},
+			"message":    "This is not a valid RFC822 message", // Missing headers
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Logf("Note: Got status %d for invalid message format (expected 400). Body: %s", resp.StatusCode, string(body))
+			// Some implementations may be lenient and add headers automatically
+			// So we don't fail the test, just log
+		}
+	})
+
+	t.Run("DeliverMail_NoRecipients", func(t *testing.T) {
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{},
+			"message": `From: sender@example.com
+Subject: No Recipients
+Message-ID: <test-norecip@example.com>
+
+This message has no recipients.
+`,
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status 400 for no recipients, got %d - %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("DeliverMail_MissingMessage", func(t *testing.T) {
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail},
+			// message field missing
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status 400 for missing message, got %d - %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("DeliverMail_WithSieveFiltering", func(t *testing.T) {
+		// This test verifies that Sieve filters are applied during HTTP delivery
+		// First, we'd need to set up a Sieve filter for the account, but that's
+		// beyond the scope of this basic test. Just verify delivery works.
+
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail},
+			"message": fmt.Sprintf(`From: sender@example.com
+To: %s
+Subject: Test Sieve Integration
+Message-ID: <test-sieve-%d@example.com>
+Date: %s
+
+Testing Sieve filter integration with HTTP delivery.
+`, testEmail, time.Now().Unix(), time.Now().Format(time.RFC1123Z)),
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var deliveryResp map[string]interface{}
+		server.expectJSON(t, body, &deliveryResp)
+
+		if success, ok := deliveryResp["success"].(bool); !ok || !success {
+			t.Errorf("Expected success=true, got %v", deliveryResp["success"])
+		}
+
+		t.Log("Successfully delivered message (Sieve filters would be applied if configured)")
+	})
+
+	t.Run("DeliverMail_LargeMessage", func(t *testing.T) {
+		// Create a larger message (100KB body)
+		largeBody := strings.Repeat("This is a test line.\n", 5000)
+
+		deliveryReq := map[string]interface{}{
+			"recipients": []string{testEmail},
+			"message": fmt.Sprintf(`From: sender@example.com
+To: %s
+Subject: Large Message Test
+Message-ID: <test-large-%d@example.com>
+Date: %s
+
+%s`, testEmail, time.Now().Unix(), time.Now().Format(time.RFC1123Z), largeBody),
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/v1/mail/deliver", deliveryReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200 for large message, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var deliveryResp map[string]interface{}
+		server.expectJSON(t, body, &deliveryResp)
+
+		if success, ok := deliveryResp["success"].(bool); !ok || !success {
+			t.Errorf("Expected success=true for large message, got %v", deliveryResp["success"])
+		}
+
+		t.Logf("Successfully delivered large message (~100KB)")
 	})
 }

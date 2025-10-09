@@ -827,7 +827,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 		return false
 	}
 
-	err = s.server.rdb.DeleteScriptWithRetry(s.ctx, script.ID, userID)
+	err = s.server.rdb.DeleteScriptByIDWithRetry(s.ctx, script.ID, userID)
 	if err != nil {
 		s.sendResponse("NO Internal server error\r\n")
 		return false

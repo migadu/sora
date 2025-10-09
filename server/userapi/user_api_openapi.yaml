@@ -1,0 +1,828 @@
+openapi: 3.0.3
+info:
+  title: Sora Mail User API
+  description: |
+    REST API for user mailbox access via HTTP, providing a modern alternative to IMAP/POP3 protocols.
+    Features stateless JWT-based authentication for web and mobile clients.
+  version: 1.0.0
+  contact:
+    name: Sora Mail Support
+    url: https://github.com/migadu/sora
+
+servers:
+  - url: /user/v1
+    description: User API version 1
+
+tags:
+  - name: Authentication
+    description: JWT authentication and token management
+  - name: Mailboxes
+    description: Mailbox management operations
+  - name: Messages
+    description: Message retrieval and management
+  - name: Filters
+    description: Sieve filter management
+
+paths:
+  /auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: Authenticate user
+      description: Authenticate with email and password to receive a JWT token
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: user@example.com
+                password:
+                  type: string
+                  format: password
+                  example: secret123
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: JWT access token
+                  expires_at:
+                    type: string
+                    format: date-time
+                    description: Token expiration timestamp
+                  account_id:
+                    type: integer
+                    format: int64
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /auth/refresh:
+    post:
+      tags:
+        - Authentication
+      summary: Refresh JWT token
+      description: Exchange an existing valid token for a new one
+      operationId: refreshToken
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: New JWT access token
+                  expires_at:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /mailboxes:
+    get:
+      tags:
+        - Mailboxes
+      summary: List all mailboxes
+      description: Retrieve all mailboxes for the authenticated user with message counts
+      operationId: listMailboxes
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: subscribed
+          in: query
+          description: Filter to only subscribed mailboxes
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of mailboxes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mailboxes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Mailbox'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags:
+        - Mailboxes
+      summary: Create new mailbox
+      description: Create a new mailbox for the authenticated user
+      operationId: createMailbox
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  example: Archive/2024
+      responses:
+        '201':
+          description: Mailbox created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  mailbox:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Mailbox already exists
+
+  /mailboxes/{name}:
+    delete:
+      tags:
+        - Mailboxes
+      summary: Delete mailbox
+      description: Delete a mailbox (INBOX cannot be deleted)
+      operationId: deleteMailbox
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MailboxName'
+      responses:
+        '200':
+          description: Mailbox deleted successfully
+        '400':
+          description: Cannot delete INBOX
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /mailboxes/{name}/subscribe:
+    post:
+      tags:
+        - Mailboxes
+      summary: Subscribe to mailbox
+      description: Mark a mailbox as subscribed
+      operationId: subscribeMailbox
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MailboxName'
+      responses:
+        '200':
+          description: Subscribed successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /mailboxes/{name}/unsubscribe:
+    post:
+      tags:
+        - Mailboxes
+      summary: Unsubscribe from mailbox
+      description: Mark a mailbox as unsubscribed
+      operationId: unsubscribeMailbox
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MailboxName'
+      responses:
+        '200':
+          description: Unsubscribed successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /mailboxes/{name}/messages:
+    get:
+      tags:
+        - Messages
+      summary: List messages in mailbox
+      description: Retrieve messages from a specific mailbox with pagination
+      operationId: listMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MailboxName'
+        - name: limit
+          in: query
+          description: Maximum number of messages to return
+          schema:
+            type: integer
+            default: 50
+            maximum: 1000
+        - name: offset
+          in: query
+          description: Number of messages to skip
+          schema:
+            type: integer
+            default: 0
+        - name: unseen
+          in: query
+          description: Return only unseen messages
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: List of messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MessageListItem'
+                  total:
+                    type: integer
+                  offset:
+                    type: integer
+                  limit:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /mailboxes/{name}/search:
+    get:
+      tags:
+        - Messages
+      summary: Search messages in mailbox
+      description: Full-text search across messages in a mailbox
+      operationId: searchMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MailboxName'
+        - name: q
+          in: query
+          description: Search query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          description: Filter by sender email
+          schema:
+            type: string
+        - name: subject
+          in: query
+          description: Filter by subject
+          schema:
+            type: string
+        - name: unseen
+          in: query
+          description: Only unseen messages
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MessageListItem'
+                  total:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /messages/{id}:
+    get:
+      tags:
+        - Messages
+      summary: Get message details
+      description: Retrieve full message details in JSON format
+      operationId: getMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: Message details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags:
+        - Messages
+      summary: Update message flags
+      description: Add or remove flags from a message
+      operationId: updateMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                add_flags:
+                  type: array
+                  items:
+                    type: string
+                    enum: [Seen, Answered, Flagged, Deleted, Draft]
+                  example: ["Seen", "Flagged"]
+                remove_flags:
+                  type: array
+                  items:
+                    type: string
+                    enum: [Seen, Answered, Flagged, Deleted, Draft]
+                  example: ["Draft"]
+      responses:
+        '200':
+          description: Flags updated successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags:
+        - Messages
+      summary: Delete message
+      description: Mark message as deleted and expunge
+      operationId: deleteMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: Message deleted successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /messages/{id}/body:
+    get:
+      tags:
+        - Messages
+      summary: Get message body
+      description: Retrieve message body in text or HTML format
+      operationId: getMessageBody
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+        - name: format
+          in: query
+          description: Preferred format
+          schema:
+            type: string
+            enum: [text, html]
+            default: html
+      responses:
+        '200':
+          description: Message body
+          content:
+            text/plain:
+              schema:
+                type: string
+            text/html:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /messages/{id}/raw:
+    get:
+      tags:
+        - Messages
+      summary: Get raw message
+      description: Retrieve message in RFC822 format
+      operationId: getMessageRaw
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: Raw RFC822 message
+          content:
+            message/rfc822:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /filters:
+    get:
+      tags:
+        - Filters
+      summary: List Sieve filters
+      description: Retrieve all Sieve filter scripts for the user
+      operationId: listFilters
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of filters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  filters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Filter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /filters/{name}:
+    get:
+      tags:
+        - Filters
+      summary: Get filter script
+      description: Retrieve a specific Sieve filter script
+      operationId: getFilter
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterName'
+      responses:
+        '200':
+          description: Filter script content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Filter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags:
+        - Filters
+      summary: Create or update filter
+      description: Create a new Sieve filter or update an existing one
+      operationId: putFilter
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  description: Sieve script content
+                  example: |
+                    require ["fileinto"];
+                    if header :contains "Subject" "[SPAM]" {
+                      fileinto "Junk";
+                    }
+      responses:
+        '200':
+          description: Filter updated successfully
+        '201':
+          description: Filter created successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      tags:
+        - Filters
+      summary: Delete filter
+      description: Delete a Sieve filter script
+      operationId: deleteFilter
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterName'
+      responses:
+        '200':
+          description: Filter deleted successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /filters/{name}/activate:
+    post:
+      tags:
+        - Filters
+      summary: Activate filter
+      description: Set a filter script as the active script
+      operationId: activateFilter
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterName'
+      responses:
+        '200':
+          description: Filter activated successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /filters/capabilities:
+    get:
+      tags:
+        - Filters
+      summary: Get Sieve capabilities
+      description: Retrieve supported Sieve extensions and capabilities
+      operationId: getCapabilities
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sieve capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  extensions:
+                    type: array
+                    items:
+                      type: string
+                    example: ["fileinto", "vacation", "regex", "envelope"]
+                  max_script_size:
+                    type: integer
+                    description: Maximum script size in bytes
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token obtained from /user/v1/auth/login
+
+  parameters:
+    MailboxName:
+      name: name
+      in: path
+      required: true
+      description: Mailbox name (URL encoded)
+      schema:
+        type: string
+      example: INBOX
+
+    MessageId:
+      name: id
+      in: path
+      required: true
+      description: Message ID
+      schema:
+        type: integer
+        format: int64
+
+    FilterName:
+      name: name
+      in: path
+      required: true
+      description: Filter script name
+      schema:
+        type: string
+      example: spam-filter
+
+  schemas:
+    Mailbox:
+      type: object
+      properties:
+        name:
+          type: string
+          example: INBOX
+        path:
+          type: string
+          example: INBOX
+        subscribed:
+          type: boolean
+        total_messages:
+          type: integer
+        unseen_messages:
+          type: integer
+        uidvalidity:
+          type: integer
+          format: int64
+        uidnext:
+          type: integer
+          format: int64
+
+    MessageListItem:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        uid:
+          type: integer
+          format: int64
+        mailbox:
+          type: string
+        subject:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        date:
+          type: string
+          format: date-time
+        size:
+          type: integer
+        flags:
+          type: array
+          items:
+            type: string
+        has_attachments:
+          type: boolean
+
+    Message:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        uid:
+          type: integer
+          format: int64
+        mailbox:
+          type: string
+        subject:
+          type: string
+        from:
+          type: object
+          properties:
+            name:
+              type: string
+            email:
+              type: string
+        to:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              email:
+                type: string
+        cc:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              email:
+                type: string
+        date:
+          type: string
+          format: date-time
+        size:
+          type: integer
+        flags:
+          type: array
+          items:
+            type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        body_text:
+          type: string
+        body_html:
+          type: string
+        attachments:
+          type: array
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+              content_type:
+                type: string
+              size:
+                type: integer
+              part_number:
+                type: string
+
+    Filter:
+      type: object
+      properties:
+        name:
+          type: string
+        content:
+          type: string
+        active:
+          type: boolean
+        size:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Bad request - invalid input
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+
+    Unauthorized:
+      description: Unauthorized - invalid or missing JWT token
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Invalid or expired token
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Resource not found

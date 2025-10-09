@@ -857,6 +857,12 @@ type ServerConfig struct {
 	APIKey       string   `toml:"api_key,omitempty"`
 	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
 
+	// Mail HTTP API specific (stateless JWT-based authentication)
+	JWTSecret      string   `toml:"jwt_secret,omitempty"`      // Secret key for signing JWT tokens
+	TokenDuration  string   `toml:"token_duration,omitempty"`  // Token validity duration (e.g., "24h", "7d")
+	TokenIssuer    string   `toml:"token_issuer,omitempty"`    // JWT issuer field
+	AllowedOrigins []string `toml:"allowed_origins,omitempty"` // CORS allowed origins for web clients
+
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
 	EnableUserMetrics    bool   `toml:"enable_user_metrics,omitempty"`
@@ -1596,7 +1602,7 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server address is required")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_api"}
+	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api"}
 	isValidType := false
 	for _, validType := range validTypes {
 		if s.Type == validType {

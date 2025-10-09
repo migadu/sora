@@ -72,6 +72,38 @@ func (rd *ResilientDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context
 	return result.(int64), nil
 }
 
+// GetCredentialForAuthWithRetry retrieves credentials for authentication with retry logic
+func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     2 * time.Second,
+		Multiplier:      1.5,
+		Jitter:          true,
+		MaxRetries:      2,
+	}
+
+	type credResult struct {
+		ID   int64
+		Hash string
+	}
+
+	op := func(ctx context.Context) (interface{}, error) {
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
+		if dbErr != nil {
+			return nil, dbErr
+		}
+		return credResult{ID: id, Hash: hash}, nil
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
+	if err != nil {
+		return 0, "", err
+	}
+
+	cred := result.(credResult)
+	return cred.ID, cred.Hash, nil
+}
+
 // AuthenticateWithRetry handles the full authentication flow with resilience.
 // It fetches credentials, verifies the password, and triggers a rehash if necessary.
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {

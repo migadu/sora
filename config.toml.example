@@ -167,7 +167,7 @@ trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/1
 #
 # Server Types:
 # - imap: IMAP4rev1 server for email access
-# - lmtp: Local Mail Transfer Protocol for mail delivery  
+# - lmtp: Local Mail Transfer Protocol for mail delivery
 # - pop3: POP3 server for email download
 # - managesieve: ManageSieve server for SIEVE script management
 # - imap_proxy: IMAP proxy server for load balancing
@@ -175,7 +175,7 @@ trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/1
 # - managesieve_proxy: ManageSieve proxy server for load balancing
 # - lmtp_proxy: LMTP proxy server for load balancing
 # - metrics: Prometheus metrics HTTP endpoint
-# - http_api: REST API server for administrative operations
+# - http_admin_api: REST API server for administrative operations
 #
 # IMPORTANT: You must configure at least one server for Sora to start.
 
@@ -406,12 +406,13 @@ max_tracked_users = 1000
 hash_usernames = true
 
 
-# HTTP API SERVER EXAMPLE
+# HTTP ADMIN API SERVER EXAMPLE
 # =============================================================================
-# REST API server for administrative operations
+# REST API server for administrative operations (accounts, health, connections, etc.)
+# Base URL: /api/v1/admin/*
 
 [[server]]
-type = "http_api"
+type = "http_admin_api"
 name = "admin-api"
 addr = ":8080"
 api_key = "your-secret-api-key-here"  # REQUIRED for API access.
@@ -422,6 +423,28 @@ tls_key_file = ""
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
+
+
+# HTTP USER API SERVER EXAMPLE
+# =============================================================================
+# REST API server for user mailbox access via HTTP (alternative to IMAP/POP3)
+# Provides stateless JWT-based authentication for web and mobile clients
+# Base URL: /api/v1/user/*
+
+[[server]]
+type = "http_user_api"
+name = "user-api"
+addr = ":8081"
+jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Secret key for signing JWT tokens. KEEP SECRET!
+token_duration = "24h"        # JWT token validity duration (e.g., "24h", "7d", "12h").
+token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validation).
+allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
+allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.
+tls = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = false
+
 
 # CONNECTION TRACKING CONFIGURATION
 # =============================================================================

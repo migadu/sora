@@ -180,8 +180,9 @@ main() {
                 echo "  --help, -h         Show this help message"
                 echo ""
                 echo "Available scopes:"
-                echo "  Core: imap, lmtp, pop3, managesieve, httpapi, config"
-                echo "  Admin: sora-admin (importer/exporter tests)"
+                echo "  Core Protocols: imap, lmtp, pop3, managesieve, config"
+                echo "  HTTP APIs: adminapi, userapi"
+                echo "  Admin Tools: sora-admin (importer/exporter tests)"
                 echo "  Proxy: imapproxy, lmtpproxy, pop3proxy, managesieveproxy"
                 echo "  Limits: connection_limits, lmtp_connection_limits, pop3_connection_limits,"
                 echo "          managesieve_connection_limits, proxy_connection_limits"
@@ -189,8 +190,9 @@ main() {
                 echo "Examples:"
                 echo "  $0                          # Run all integration tests"
                 echo "  $0 --scope imap             # Run only IMAP tests"
+                echo "  $0 --scope adminapi         # Run only Admin API tests"
+                echo "  $0 --scope userapi          # Run only User API tests"
                 echo "  $0 --scope sora-admin       # Run only importer/exporter tests"
-                echo "  $0 --scope httpapi          # Run only HTTP API tests"
                 echo "  $0 --scope connection_limits     # Run only connection limit tests"
                 echo "  $0 --verbose                # Run with verbose output"
                 exit 0
@@ -210,7 +212,7 @@ main() {
             "imapproxy" "lmtpproxy" "pop3proxy" "managesieveproxy"
             "connection_limits" "lmtp_connection_limits" "pop3_connection_limits"
             "managesieve_connection_limits" "proxy_connection_limits"
-            "httpapi" "config"
+            "adminapi" "userapi" "config"
             "sora-admin"
         )
     fi

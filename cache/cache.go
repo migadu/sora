@@ -137,9 +137,22 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 		return nil, fmt.Errorf("failed to open cache index DB: %w", err)
 	}
 
+	// Set busy timeout before enabling WAL to handle concurrent access
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		log.Printf("[CACHE] WARNING: failed to set busy_timeout: %v", err)
+	}
+
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
 		// Log the warning, but allow to proceed as WAL is an optimization.
 		log.Printf("[CACHE] WARNING: failed to set PRAGMA journal_mode = WAL: %v", err)
+	}
+
+	// Verify WAL mode was actually set
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode;`).Scan(&journalMode); err != nil {
+		log.Printf("[CACHE] WARNING: failed to verify journal mode: %v", err)
+	} else {
+		log.Printf("[CACHE] SQLite journal mode: %s", journalMode)
 	}
 
 	schema := `
