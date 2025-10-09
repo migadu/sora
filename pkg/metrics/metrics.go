@@ -228,3 +228,31 @@ var (
 		},
 	)
 )
+
+// Health status metrics
+var (
+	ComponentHealthStatus = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_component_health_status",
+			Help: "Health status of components (0=unreachable, 1=unhealthy, 2=degraded, 3=healthy)",
+		},
+		[]string{"component", "hostname"},
+	)
+
+	ComponentHealthChecks = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_component_health_checks_total",
+			Help: "Total number of health checks performed",
+		},
+		[]string{"component", "hostname", "status"},
+	)
+
+	ComponentHealthCheckDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_component_health_check_duration_seconds",
+			Help:    "Duration of health checks in seconds",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0},
+		},
+		[]string{"component", "hostname"},
+	)
+)

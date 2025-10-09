@@ -263,6 +263,11 @@ func (s *Server) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
+// GetConnectionManager returns the connection manager for health checks
+func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
+	return s.connManager
+}
+
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
 	log.Printf("* ManageSieve Proxy [%s] stopping...", s.name)

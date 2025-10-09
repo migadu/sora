@@ -341,6 +341,11 @@ func (s *POP3ProxyServer) SetConnectionTracker(tracker *proxy.ConnectionTracker)
 	s.connTracker = tracker
 }
 
+// GetConnectionManager returns the connection manager for health checks
+func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
+	return s.connManager
+}
+
 func (s *POP3ProxyServer) Stop() error {
 	log.Printf("* POP3 Proxy [%s] stopping...", s.name)
 	if s.cancel != nil {

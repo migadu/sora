@@ -142,6 +142,28 @@ func (hi *HealthIntegration) RegisterCustomCheck(check *HealthCheck) {
 	hi.monitor.RegisterCheck(check)
 }
 
+// PrelookupHealthChecker interface for prelookup clients that support health checks
+type PrelookupHealthChecker interface {
+	HealthCheck(ctx context.Context) error
+}
+
+// RegisterPrelookupCheck registers a health check for the prelookup database
+func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHealthChecker, serverName string) {
+	checkName := "prelookup_database"
+	if serverName != "" {
+		checkName = fmt.Sprintf("prelookup_database_%s", serverName)
+	}
+
+	prelookupCheck := &HealthCheck{
+		Name:     checkName,
+		Interval: 30 * time.Second,
+		Timeout:  10 * time.Second,
+		Critical: false, // Not critical since prelookup has fallback mode
+		Check:    prelookupClient.HealthCheck,
+	}
+	hi.monitor.RegisterCheck(prelookupCheck)
+}
+
 func (hi *HealthIntegration) storeHealthStatus(componentName string, status ComponentStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

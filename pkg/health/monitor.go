@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/pkg/circuitbreaker"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 type ComponentStatus string
@@ -129,8 +130,15 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	ctx, cancel := context.WithTimeout(hm.ctx, check.Timeout)
 	defer cancel()
 
+	// Time the health check
+	startTime := time.Now()
+
 	// Perform the actual check first (no lock needed)
 	err := check.Check(ctx)
+
+	// Record duration metric
+	duration := time.Since(startTime).Seconds()
+	metrics.ComponentHealthCheckDuration.WithLabelValues(check.Name, "").Observe(duration)
 
 	// Now update the check state with proper locking
 	check.mu.Lock()
@@ -163,6 +171,23 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 
 	currentStatus := check.Status
 	check.mu.Unlock()
+
+	// Record health check metrics
+	metrics.ComponentHealthChecks.WithLabelValues(check.Name, "", string(currentStatus)).Inc()
+
+	// Update health status gauge (0=unreachable, 1=unhealthy, 2=degraded, 3=healthy)
+	var statusValue float64
+	switch currentStatus {
+	case StatusHealthy:
+		statusValue = 3
+	case StatusDegraded:
+		statusValue = 2
+	case StatusUnhealthy:
+		statusValue = 1
+	case StatusUnreachable:
+		statusValue = 0
+	}
+	metrics.ComponentHealthStatus.WithLabelValues(check.Name, "").Set(statusValue)
 
 	if previousStatus != currentStatus || isFirstCheck {
 		if isFirstCheck {

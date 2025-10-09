@@ -84,6 +84,11 @@ func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, pa
 	return cm.routingLookup.AuthenticateAndRoute(ctx, email, password)
 }
 
+// GetRoutingLookup returns the routing lookup client (may be nil)
+func (cm *ConnectionManager) GetRoutingLookup() UserRoutingLookup {
+	return cm.routingLookup
+}
+
 // Connect attempts to connect to a remote server with round-robin and failover
 // Deprecated: Use ConnectWithContext instead to properly propagate context cancellation
 func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, error) {

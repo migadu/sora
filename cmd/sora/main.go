@@ -45,13 +45,14 @@ var (
 
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
-	storage       *storage.S3Storage
-	resilientDB   *resilient.ResilientDatabase
-	uploadWorker  *uploader.UploadWorker
-	cacheInstance *cache.Cache
-	cleanupWorker *cleaner.CleanupWorker
-	hostname      string
-	config        config.Config
+	storage           *storage.S3Storage
+	resilientDB       *resilient.ResilientDatabase
+	uploadWorker      *uploader.UploadWorker
+	cacheInstance     *cache.Cache
+	cleanupWorker     *cleaner.CleanupWorker
+	healthIntegration *health.HealthIntegration
+	hostname          string
+	config            config.Config
 }
 
 func main() {
@@ -264,13 +265,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize health monitoring
 	logger.Infof("Initializing health monitoring...")
-	healthIntegration := health.NewHealthIntegration(deps.resilientDB)
+	deps.healthIntegration = health.NewHealthIntegration(deps.resilientDB)
 
 	if storageServicesNeeded {
 		logger.Info("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
 
 		// Register S3 health check
-		healthIntegration.RegisterS3Check(deps.storage)
+		deps.healthIntegration.RegisterS3Check(deps.storage)
 
 		// Initialize the local cache using configuration defaulting methods
 		cacheSizeBytes := cfg.LocalCache.GetCapacityWithDefault()
@@ -290,7 +291,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		deps.cacheInstance.StartPurgeLoop(ctx)
 
 		// Register cache health check
-		healthIntegration.RegisterCustomCheck(&health.HealthCheck{
+		deps.healthIntegration.RegisterCustomCheck(&health.HealthCheck{
 			Name:     "cache",
 			Interval: 30 * time.Second,
 			Timeout:  5 * time.Second,
@@ -308,7 +309,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		})
 
 		// Register database failover health check
-		healthIntegration.RegisterCustomCheck(&health.HealthCheck{
+		deps.healthIntegration.RegisterCustomCheck(&health.HealthCheck{
 			Name:     "database_failover",
 			Interval: 45 * time.Second,
 			Timeout:  5 * time.Second,
@@ -384,7 +385,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	// Start health monitoring
-	healthIntegration.Start(ctx)
+	deps.healthIntegration.Start(ctx)
 	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
 
 	return deps, nil
@@ -714,6 +715,16 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
+	// Register prelookup health check if prelookup is enabled
+	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
+			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
+				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
+				logger.Infof("Registered prelookup health check for IMAP proxy %s", serverConfig.Name)
+			}
+		}
+	}
+
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
@@ -775,6 +786,16 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
+	// Register prelookup health check if prelookup is enabled
+	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
+			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
+				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
+				logger.Infof("Registered prelookup health check for POP3 proxy %s", serverConfig.Name)
+			}
+		}
+	}
+
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
@@ -833,6 +854,16 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		return
 	}
 
+	// Register prelookup health check if prelookup is enabled
+	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
+			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
+				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
+				logger.Infof("Registered prelookup health check for ManageSieve proxy %s", serverConfig.Name)
+			}
+		}
+	}
+
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
 		defer tracker.Stop()
@@ -884,6 +915,16 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)
 		return
+	}
+
+	// Register prelookup health check if prelookup is enabled
+	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
+			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
+				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
+				logger.Infof("Registered prelookup health check for LMTP proxy %s", serverConfig.Name)
+			}
+		}
 	}
 
 	// Start connection tracker if enabled.

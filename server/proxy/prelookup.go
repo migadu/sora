@@ -745,6 +745,14 @@ func (c *PreLookupClient) Close() error {
 	return nil
 }
 
+// HealthCheck performs a health check on the prelookup database
+func (c *PreLookupClient) HealthCheck(ctx context.Context) error {
+	if c.pool == nil {
+		return fmt.Errorf("prelookup database pool is nil")
+	}
+	return c.pool.Ping(ctx)
+}
+
 // isRetryableError checks if an error is transient and the operation can be retried.
 func isRetryableError(err error) bool {
 	if err == nil {
