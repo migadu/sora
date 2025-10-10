@@ -274,7 +274,7 @@ func containsInvalidChars(s string) bool {
 }
 
 // handleGetCapabilities returns the Sieve capabilities supported by the server
-func (s *Server) handleGetCapabilities(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetCapabilities(w http.ResponseWriter, _ *http.Request) {
 	// Return the Sieve capabilities
 	// These are the extensions supported by the server
 	capabilities := map[string]interface{}{

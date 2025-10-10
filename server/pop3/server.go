@@ -52,26 +52,30 @@ type POP3Server struct {
 	// Memory limiting
 	sessionMemoryLimit int64
 
-	// Command timeout
-	commandTimeout time.Duration
+	// Command timeout and throughput enforcement
+	commandTimeout         time.Duration
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 }
 
 type POP3ServerOptions struct {
-	Debug                bool
-	TLS                  bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	TLSVerify            bool
-	MasterSASLUsername   string
-	MasterSASLPassword   string
-	MaxConnections       int
-	MaxConnectionsPerIP  int
-	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
-	TrustedNetworks      []string // Global trusted networks for parameter forwarding
-	AuthRateLimit        serverPkg.AuthRateLimiterConfig
-	SessionMemoryLimit   int64         // Memory limit per session in bytes
-	CommandTimeout       time.Duration // Maximum time for a single command to execute
+	Debug                  bool
+	TLS                    bool
+	TLSCertFile            string
+	TLSKeyFile             string
+	TLSVerify              bool
+	MasterSASLUsername     string
+	MasterSASLPassword     string
+	MaxConnections         int
+	MaxConnectionsPerIP    int
+	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
+	TrustedNetworks        []string // Global trusted networks for parameter forwarding
+	AuthRateLimit          serverPkg.AuthRateLimiterConfig
+	SessionMemoryLimit     int64         // Memory limit per session in bytes
+	CommandTimeout         time.Duration // Maximum idle time before disconnection
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
 }
 
 func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -106,22 +110,24 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	server := &POP3Server{
-		hostname:           hostname,
-		name:               name,
-		addr:               popAddr,
-		rdb:                rdb,
-		s3:                 resilientS3,
-		appCtx:             serverCtx,
-		cancel:             serverCancel,
-		uploader:           uploadWorker,
-		cache:              cache,
-		masterSASLUsername: []byte(options.MasterSASLUsername),
-		masterSASLPassword: []byte(options.MasterSASLPassword),
-		proxyReader:        proxyReader,
-		authLimiter:        authLimiter,
-		trustedNetworks:    options.TrustedNetworks,
-		sessionMemoryLimit: options.SessionMemoryLimit,
-		commandTimeout:     options.CommandTimeout,
+		hostname:               hostname,
+		name:                   name,
+		addr:                   popAddr,
+		rdb:                    rdb,
+		s3:                     resilientS3,
+		appCtx:                 serverCtx,
+		cancel:                 serverCancel,
+		uploader:               uploadWorker,
+		cache:                  cache,
+		masterSASLUsername:     []byte(options.MasterSASLUsername),
+		masterSASLPassword:     []byte(options.MasterSASLPassword),
+		proxyReader:            proxyReader,
+		authLimiter:            authLimiter,
+		trustedNetworks:        options.TrustedNetworks,
+		sessionMemoryLimit:     options.SessionMemoryLimit,
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -207,6 +213,19 @@ func (s *POP3Server) Start(errChan chan error) {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
+	}
+
+	// Wrap listener with timeout enforcement if configured
+	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		listener = &timeoutListener{
+			Listener:          listener,
+			timeout:           s.commandTimeout,
+			absoluteTimeout:   s.absoluteSessionTimeout,
+			minBytesPerMinute: s.minBytesPerMinute,
+			protocol:          "pop3",
+		}
+		log.Printf("* POP3 [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation

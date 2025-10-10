@@ -99,6 +99,24 @@ Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
 *   `auth_rate_limit`: Contains settings to enable and configure brute-force authentication protection.
 *   `proxy_protocol`: Contains settings to enable PROXY protocol, which is essential for seeing real client IPs when Sora is behind a load balancer. **Only enable this if you are behind a trusted proxy.**
 
+#### Command Timeout and DoS Protection
+
+All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks:
+
+*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`). This protects against clients that connect but never send commands.
+*   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"30m"`). This ensures connections don't stay open indefinitely.
+*   `min_bytes_per_minute`: Minimum data throughput required (default: `1024` bytes/min). This protects against slowloris attacks where clients send data extremely slowly to tie up connections. Set to `0` to use the default; set to `-1` to disable throughput checking.
+
+Example:
+```toml
+[servers.imap]
+start = true
+addr = ":143"
+command_timeout = "5m"              # Close after 5 minutes of inactivity
+absolute_session_timeout = "30m"    # Maximum session duration
+min_bytes_per_minute = 1024         # Require at least 1KB/min throughput
+```
+
 ### `[servers.*_proxy]`
 
 Sora can also act as a proxy to load balance connections to other Sora backend servers.
@@ -108,6 +126,27 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 *   `remote_addrs`: A list of backend Sora server addresses.
 *   `enable_affinity`: Enables sticky sessions, ensuring a user is consistently routed to the same backend server.
 *   `prelookup`: An advanced feature for database-driven user routing. When enabled, the proxy queries a database to determine which backend server a user should be routed to. This is powerful for sharded or geo-distributed architectures.
+
+#### Proxy Timeout Protection
+
+Proxy servers also support the same multi-layered timeout protection as direct protocol servers:
+
+*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`).
+*   `absolute_session_timeout`: Maximum total session duration (default: `"30m"`).
+*   `min_bytes_per_minute`: Minimum throughput to prevent slowloris attacks (default: `1024` bytes/min).
+
+**Important:** When configuring timeout values for proxies, ensure the proxy's `command_timeout` is **longer** than any backend timeout values (including `proxy_protocol_timeout` if PROXY protocol is enabled on backends). This prevents the proxy from timing out while waiting for backend responses.
+
+Example:
+```toml
+[servers.imap_proxy]
+start = true
+addr = ":1143"
+remote_addrs = ["backend1:143", "backend2:143"]
+command_timeout = "10m"             # Longer than backend timeouts
+absolute_session_timeout = "30m"
+min_bytes_per_minute = 1024
+```
 
 ### `[servers.metrics]` and `[servers.http_api]`
 

@@ -15,6 +15,14 @@ import (
 	"github.com/migadu/sora/db"
 )
 
+// contextKey is a custom type for context keys to avoid collisions
+type contextKey string
+
+const (
+	contextKeyEmail     contextKey = "email"
+	contextKeyAccountID contextKey = "accountID"
+)
+
 // JWTClaims represents the JWT token claims
 type JWTClaims struct {
 	Email     string `json:"email"`
@@ -207,8 +215,8 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Add claims to request context
-		ctx := context.WithValue(r.Context(), "email", claims.Email)
-		ctx = context.WithValue(ctx, "accountID", claims.AccountID)
+		ctx := context.WithValue(r.Context(), contextKeyEmail, claims.Email)
+		ctx = context.WithValue(ctx, contextKeyAccountID, claims.AccountID)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -216,18 +224,9 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 
 // getAccountIDFromContext retrieves the account ID from the request context
 func getAccountIDFromContext(ctx context.Context) (int64, error) {
-	accountID, ok := ctx.Value("accountID").(int64)
+	accountID, ok := ctx.Value(contextKeyAccountID).(int64)
 	if !ok {
 		return 0, fmt.Errorf("account ID not found in context")
 	}
 	return accountID, nil
-}
-
-// getEmailFromContext retrieves the email from the request context
-func getEmailFromContext(ctx context.Context) (string, error) {
-	email, ok := ctx.Value("email").(string)
-	if !ok {
-		return "", fmt.Errorf("email not found in context")
-	}
-	return email, nil
 }

@@ -17,29 +17,32 @@ import (
 
 // Server represents a ManageSieve proxy server.
 type Server struct {
-	listener           net.Listener
-	rdb                *resilient.ResilientDatabase
-	name               string // Server name for logging
-	addr               string
-	hostname           string
-	masterSASLUsername []byte
-	masterSASLPassword []byte
-	tls                bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	connManager        *proxy.ConnectionManager
-	connTracker        *proxy.ConnectionTracker
-	wg                 sync.WaitGroup
-	ctx                context.Context
-	cancel             context.CancelFunc
-	enableAffinity     bool
-	affinityValidity   time.Duration
-	affinityStickiness float64
-	authLimiter        server.AuthLimiter
-	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig    *proxy.PreLookupConfig
-	sessionTimeout     time.Duration
+	listener               net.Listener
+	rdb                    *resilient.ResilientDatabase
+	name                   string // Server name for logging
+	addr                   string
+	hostname               string
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	tls                    bool
+	tlsCertFile            string
+	tlsKeyFile             string
+	tlsVerify              bool
+	connManager            *proxy.ConnectionManager
+	connTracker            *proxy.ConnectionTracker
+	wg                     sync.WaitGroup
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	enableAffinity         bool
+	affinityValidity       time.Duration
+	affinityStickiness     float64
+	authLimiter            server.AuthLimiter
+	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	prelookupConfig        *proxy.PreLookupConfig
+	sessionTimeout         time.Duration
+	commandTimeout         time.Duration // Idle timeout
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -62,6 +65,9 @@ type ServerOptions struct {
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
 	SessionTimeout         time.Duration
+	CommandTimeout         time.Duration // Idle timeout
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration
+	MinBytesPerMinute      int64         // Minimum throughput
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
@@ -133,27 +139,30 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	return &Server{
-		rdb:                rdb,
-		name:               opts.Name,
-		addr:               opts.Addr,
-		hostname:           hostname,
-		masterSASLUsername: []byte(opts.MasterSASLUsername),
-		masterSASLPassword: []byte(opts.MasterSASLPassword),
-		tls:                opts.TLS,
-		tlsCertFile:        opts.TLSCertFile,
-		tlsKeyFile:         opts.TLSKeyFile,
-		tlsVerify:          opts.TLSVerify,
-		connManager:        connManager,
-		ctx:                ctx,
-		cancel:             cancel,
-		enableAffinity:     opts.EnableAffinity,
-		affinityValidity:   opts.AffinityValidity,
-		affinityStickiness: stickiness,
-		authLimiter:        authLimiter,
-		trustedProxies:     opts.TrustedProxies,
-		prelookupConfig:    opts.PreLookup,
-		sessionTimeout:     opts.SessionTimeout,
-		limiter:            limiter,
+		rdb:                    rdb,
+		name:                   opts.Name,
+		addr:                   opts.Addr,
+		hostname:               hostname,
+		masterSASLUsername:     []byte(opts.MasterSASLUsername),
+		masterSASLPassword:     []byte(opts.MasterSASLPassword),
+		tls:                    opts.TLS,
+		tlsCertFile:            opts.TLSCertFile,
+		tlsKeyFile:             opts.TLSKeyFile,
+		tlsVerify:              opts.TLSVerify,
+		connManager:            connManager,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		enableAffinity:         opts.EnableAffinity,
+		affinityValidity:       opts.AffinityValidity,
+		affinityStickiness:     stickiness,
+		authLimiter:            authLimiter,
+		trustedProxies:         opts.TrustedProxies,
+		prelookupConfig:        opts.PreLookup,
+		sessionTimeout:         opts.SessionTimeout,
+		commandTimeout:         opts.CommandTimeout,
+		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
+		minBytesPerMinute:      opts.MinBytesPerMinute,
+		limiter:                limiter,
 	}, nil
 }
 
@@ -198,6 +207,19 @@ func (s *Server) Start() error {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
 		log.Printf("* ManageSieve proxy [%s] listening on %s", s.name, s.addr)
+	}
+
+	// Wrap listener with timeout protection
+	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		s.listener = &timeoutListener{
+			Listener:          s.listener,
+			timeout:           s.commandTimeout,
+			absoluteTimeout:   s.absoluteSessionTimeout,
+			minBytesPerMinute: s.minBytesPerMinute,
+			protocol:          "managesieve_proxy",
+		}
+		log.Printf("* ManageSieve proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Start connection limiter cleanup if enabled

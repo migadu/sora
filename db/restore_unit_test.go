@@ -42,7 +42,6 @@ func TestDeletedMessage_StructFields(t *testing.T) {
 // TestDeletedMessage_NilMailboxID tests that MailboxID can be nil
 func TestDeletedMessage_NilMailboxID(t *testing.T) {
 	msg := DeletedMessage{
-		ID:          1,
 		MailboxID:   nil, // Mailbox was deleted
 		MailboxPath: "INBOX",
 	}
@@ -305,7 +304,6 @@ func TestRestoreMessagesParams_MessageIDsValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			params := RestoreMessagesParams{
-				Email:      "test@example.com",
 				MessageIDs: tt.messageIDs,
 			}
 
@@ -411,35 +409,25 @@ func TestDeletedMessage_Comparison(t *testing.T) {
 	mailboxID2 := int64(2)
 
 	msg1 := DeletedMessage{
-		ID:          1,
-		UID:         100,
 		ExpungedAt:  now,
 		MailboxPath: "INBOX",
 		MailboxID:   &mailboxID1,
 	}
 
 	msg2 := DeletedMessage{
-		ID:          2,
-		UID:         200,
 		ExpungedAt:  now.Add(time.Hour),
 		MailboxPath: "INBOX",
 		MailboxID:   &mailboxID1,
 	}
 
 	msg3 := DeletedMessage{
-		ID:          3,
-		UID:         300,
 		ExpungedAt:  now,
 		MailboxPath: "Sent",
 		MailboxID:   &mailboxID2,
 	}
 
 	msg4 := DeletedMessage{
-		ID:          4,
-		UID:         400,
-		ExpungedAt:  now,
-		MailboxPath: "INBOX",
-		MailboxID:   nil, // Deleted mailbox
+		MailboxID: nil, // Deleted mailbox
 	}
 
 	// Test sorting by expunged time
@@ -477,7 +465,6 @@ func TestRestoreMessagesParams_PriorityOfFilters(t *testing.T) {
 
 	// When MessageIDs are provided, other filters are ignored
 	params := RestoreMessagesParams{
-		Email:       "user@example.com",
 		MessageIDs:  []int64{1, 2, 3},
 		MailboxPath: stringPtr("INBOX"), // Should be ignored
 		Since:       timePtr(now),       // Should be ignored
@@ -532,7 +519,6 @@ func TestDeletedMessage_SizeValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			msg := DeletedMessage{
-				ID:   1,
 				Size: tt.size,
 			}
 

@@ -150,3 +150,64 @@ max_connections_per_ip = 10     # Per IP address
 ```
 
 These limits prevent connection exhaustion attacks and ensure fair resource allocation across users.
+
+### Command Timeout and Slowloris Protection
+
+All protocol servers (IMAP, POP3, ManageSieve, LMTP) and their proxy variants implement multi-layered timeout protection to defend against various denial-of-service attacks:
+
+#### Three-Layer Timeout Protection
+
+1. **Idle Timeout** (`command_timeout`): Closes connections that have no activity for the specified duration
+   - Default: `"5m"` (5 minutes)
+   - Protects against: Clients that connect but never send commands
+   - Triggered when: No read or write operations occur within the timeout period
+
+2. **Absolute Session Timeout** (`absolute_session_timeout`): Enforces maximum total connection duration
+   - Default: `"30m"` (30 minutes)
+   - Protects against: Connections that stay open indefinitely by sending minimal activity
+   - Triggered when: Total session duration exceeds the limit, regardless of activity
+
+3. **Minimum Throughput Enforcement** (`min_bytes_per_minute`): Closes connections transferring data too slowly
+   - Default: `1024` bytes/minute (1 KB/min)
+   - Protects against: Slowloris attacks where attackers send data byte-by-byte to tie up connections
+   - Triggered when: Average data transfer rate falls below the threshold over a 1-minute window
+
+#### Configuration Example
+
+```toml
+[servers.imap]
+start = true
+addr = ":143"
+command_timeout = "5m"              # Close after 5 minutes of inactivity
+absolute_session_timeout = "30m"    # Maximum 30-minute sessions
+min_bytes_per_minute = 1024         # Require at least 1KB/min throughput
+
+[servers.imap_proxy]
+start = true
+addr = ":1143"
+remote_addrs = ["backend1:143", "backend2:143"]
+command_timeout = "10m"             # Longer than backend timeouts
+absolute_session_timeout = "30m"
+min_bytes_per_minute = 1024
+```
+
+#### Important Considerations
+
+- **Set to `0`**: Uses default values (5m idle, 30m session, 1024 bytes/min)
+- **Set to `-1`**: Disables that specific protection (not recommended for production)
+- **Proxy timeout coordination**: When using proxies with backends that have PROXY protocol enabled, ensure the proxy's `command_timeout` is **longer** than the backend's `proxy_protocol_timeout` (typically 5s) to prevent the proxy from timing out while waiting for backend PROXY protocol negotiation
+
+#### Monitoring
+
+All timeout events are logged with detailed information and exported as Prometheus metrics:
+
+```
+command_timeouts_total{protocol="imap", reason="idle"}
+command_timeouts_total{protocol="imap", reason="session_max"}
+command_timeouts_total{protocol="imap", reason="slow_throughput"}
+```
+
+Monitor these metrics to:
+- Detect potential attack patterns (sudden spikes in timeouts)
+- Tune timeout values for your workload
+- Identify misbehaving clients

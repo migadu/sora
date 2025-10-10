@@ -271,6 +271,15 @@ search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., 
 # Per-session memory limit to prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
 session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
 
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+# Multi-layered timeout protection against various DoS attacks:
+# 1. Idle timeout: Closes connections with no activity
+# 2. Absolute session timeout: Maximum total session duration regardless of activity
+# 3. Throughput enforcement: Closes connections transferring data too slowly
+command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
+absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
+min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+
 
 # LMTP SERVER EXAMPLE
 # =============================================================================
@@ -325,9 +334,14 @@ proxy_protocol_timeout = "5s"
 # Per-session memory limit to prevent memory exhaustion attacks (POP3 RETR/TOP commands)
 session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
 
-# --- COMMAND TIMEOUT ---
-# Maximum time allowed for a single POP3 command to execute (protects against Slowloris-style attacks)
-command_timeout = "2m"            # Default: 2 minutes (e.g., "30s", "5m"). Fast commands like STAT/LIST complete quickly.
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+# Multi-layered timeout protection against various DoS attacks:
+# 1. Idle timeout: Closes connections with no activity
+# 2. Absolute session timeout: Maximum total session duration regardless of activity
+# 3. Throughput enforcement: Closes connections transferring data too slowly
+command_timeout = "2m"             # Maximum idle time (default: 2 minutes, e.g., "30s", "5m").
+absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
+min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -358,9 +372,14 @@ proxy_protocol_timeout = "5s"
 # [server.auth_rate_limit]
 # enabled = false
 
-# --- COMMAND TIMEOUT ---
-# Maximum time allowed for a single ManageSieve command to execute (protects against Slowloris-style attacks)
-command_timeout = "3m"            # Default: 3 minutes (e.g., "30s", "5m"). PUTSCRIPT/GETSCRIPT may transfer larger scripts.
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+# Multi-layered timeout protection against various DoS attacks:
+# 1. Idle timeout: Closes connections with no activity
+# 2. Absolute session timeout: Maximum total session duration regardless of activity
+# 3. Throughput enforcement: Closes connections transferring data too slowly
+command_timeout = "3m"             # Maximum idle time (default: 3 minutes, e.g., "30s", "5m").
+absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
+min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
 
 
 # IMAP PROXY EXAMPLE
@@ -395,6 +414,15 @@ session_timeout = "30m"
 enable_affinity = true
 affinity_validity = "24h"
 affinity_stickiness = 0.9     # Probability (0.0-1.0) of sticking to the preferred server.
+
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+# Multi-layered timeout protection against various DoS attacks:
+# 1. Idle timeout: Closes connections with no activity
+# 2. Absolute session timeout: Maximum total session duration regardless of activity
+# 3. Throughput enforcement: Closes connections transferring data too slowly
+command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
+absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
+min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above

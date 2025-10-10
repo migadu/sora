@@ -503,6 +503,20 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
+	// Parse command timeout
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("IMAP [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		commandTimeout = 5 * time.Minute
+	}
+
+	// Parse absolute session timeout
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("IMAP [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:                        serverConfig.Debug,
@@ -524,6 +538,9 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			SearchRateLimitPerMin:        serverConfig.SearchRateLimitPerMin,
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SessionMemoryLimit:           sessionMemoryLimit,
+			CommandTimeout:               commandTimeout,
+			AbsoluteSessionTimeout:       absoluteSessionTimeout,
+			MinBytesPerMinute:            serverConfig.MinBytesPerMinute,
 			EnableWarmup:                 deps.config.LocalCache.EnableWarmup,
 			WarmupMessageCount:           deps.config.LocalCache.WarmupMessageCount,
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
@@ -618,22 +635,31 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		commandTimeout = 2 * time.Minute
 	}
 
+	// Parse absolute session timeout
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("POP3 [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
-		Debug:                serverConfig.Debug,
-		TLS:                  serverConfig.TLS,
-		TLSCertFile:          serverConfig.TLSCertFile,
-		TLSKeyFile:           serverConfig.TLSKeyFile,
-		TLSVerify:            serverConfig.TLSVerify,
-		MasterSASLUsername:   serverConfig.MasterSASLUsername,
-		MasterSASLPassword:   serverConfig.MasterSASLPassword,
-		MaxConnections:       serverConfig.MaxConnections,
-		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
-		ProxyProtocol:        serverConfig.ProxyProtocol,
-		ProxyProtocolTimeout: proxyProtocolTimeout,
-		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
-		AuthRateLimit:        authRateLimit,
-		SessionMemoryLimit:   sessionMemoryLimit,
-		CommandTimeout:       commandTimeout,
+		Debug:                  serverConfig.Debug,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSVerify:              serverConfig.TLSVerify,
+		MasterSASLUsername:     serverConfig.MasterSASLUsername,
+		MasterSASLPassword:     serverConfig.MasterSASLPassword,
+		MaxConnections:         serverConfig.MaxConnections,
+		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
+		ProxyProtocol:          serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:   proxyProtocolTimeout,
+		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		AuthRateLimit:          authRateLimit,
+		SessionMemoryLimit:     sessionMemoryLimit,
+		CommandTimeout:         commandTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
+		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
 	})
 
 	if err != nil {
@@ -667,25 +693,34 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		commandTimeout = 3 * time.Minute
 	}
 
+	// Parse absolute session timeout
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("ManageSieve [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
-		InsecureAuth:         serverConfig.InsecureAuth,
-		TLSVerify:            serverConfig.TLSVerify,
-		TLS:                  serverConfig.TLS,
-		TLSCertFile:          serverConfig.TLSCertFile,
-		TLSKeyFile:           serverConfig.TLSKeyFile,
-		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
-		Debug:                serverConfig.Debug,
-		MaxScriptSize:        maxSize,
-		SupportedExtensions:  serverConfig.SupportedExtensions,
-		MasterSASLUsername:   serverConfig.MasterSASLUsername,
-		MasterSASLPassword:   serverConfig.MasterSASLPassword,
-		MaxConnections:       serverConfig.MaxConnections,
-		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
-		ProxyProtocol:        serverConfig.ProxyProtocol,
-		ProxyProtocolTimeout: proxyProtocolTimeout,
-		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
-		AuthRateLimit:        authRateLimit,
-		CommandTimeout:       commandTimeout,
+		InsecureAuth:           serverConfig.InsecureAuth,
+		TLSVerify:              serverConfig.TLSVerify,
+		TLS:                    serverConfig.TLS,
+		TLSCertFile:            serverConfig.TLSCertFile,
+		TLSKeyFile:             serverConfig.TLSKeyFile,
+		TLSUseStartTLS:         serverConfig.TLSUseStartTLS,
+		Debug:                  serverConfig.Debug,
+		MaxScriptSize:          maxSize,
+		SupportedExtensions:    serverConfig.SupportedExtensions,
+		MasterSASLUsername:     serverConfig.MasterSASLUsername,
+		MasterSASLPassword:     serverConfig.MasterSASLPassword,
+		MaxConnections:         serverConfig.MaxConnections,
+		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
+		ProxyProtocol:          serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:   proxyProtocolTimeout,
+		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		AuthRateLimit:          authRateLimit,
+		CommandTimeout:         commandTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
+		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
 	})
 
 	if err != nil {
@@ -743,6 +778,19 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
+	// Parse timeout configurations
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("IMAP proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		commandTimeout = 5 * time.Minute
+	}
+
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("IMAP proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	server, err := imapproxy.New(ctx, deps.resilientDB, deps.hostname, imapproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
@@ -760,12 +808,19 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseIDCommand:     serverConfig.RemoteUseIDCommand,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
+		CommandTimeout:         commandTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
+		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AffinityStickiness:     serverConfig.AffinityStickiness,
 		AffinityValidity:       affinityValidity,
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+		MaxConnections:         serverConfig.MaxConnections,
+		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
+		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create IMAP proxy server: %w", err)
@@ -814,6 +869,19 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
+	// Parse timeout configurations
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("POP3 proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		commandTimeout = 5 * time.Minute
+	}
+
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("POP3 proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
 		Name:                   serverConfig.Name,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
@@ -830,6 +898,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
+		CommandTimeout:         commandTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
+		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
 		Debug:                  serverConfig.Debug,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AffinityStickiness:     serverConfig.AffinityStickiness,
@@ -837,6 +908,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+		MaxConnections:         serverConfig.MaxConnections,
+		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
+		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -883,6 +957,19 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		return
 	}
 
+	// Parse timeout configurations
+	commandTimeout, err := serverConfig.GetCommandTimeout()
+	if err != nil {
+		logger.Infof("ManageSieve proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		commandTimeout = 5 * time.Minute
+	}
+
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Infof("ManageSieve proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		absoluteSessionTimeout = 30 * time.Minute
+	}
+
 	server, err := managesieveproxy.New(ctx, deps.resilientDB, deps.hostname, managesieveproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
@@ -899,12 +986,18 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
+		CommandTimeout:         commandTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
+		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AffinityStickiness:     serverConfig.AffinityStickiness,
 		AffinityValidity:       affinityValidity,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
+		MaxConnections:         serverConfig.MaxConnections,
+		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
+		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)

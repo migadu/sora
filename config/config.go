@@ -599,22 +599,25 @@ func (c *LMTPProxyServerConfig) GetRemotePort() (int, error) {
 
 // IMAPServerConfig holds IMAP server configuration.
 type IMAPServerConfig struct {
-	Start                 bool                  `toml:"start"`
-	Addr                  string                `toml:"addr"`
-	AppendLimit           string                `toml:"append_limit"`
-	MaxConnections        int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP   int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterUsername        string                `toml:"master_username"`
-	MasterPassword        string                `toml:"master_password"`
-	MasterSASLUsername    string                `toml:"master_sasl_username"`
-	MasterSASLPassword    string                `toml:"master_sasl_password"`
-	TLS                   bool                  `toml:"tls"`
-	TLSCertFile           string                `toml:"tls_cert_file"`
-	TLSKeyFile            string                `toml:"tls_key_file"`
-	TLSVerify             bool                  `toml:"tls_verify"`
-	AuthRateLimit         AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
-	SearchRateLimitPerMin int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
+	Start                  bool                  `toml:"start"`
+	Addr                   string                `toml:"addr"`
+	AppendLimit            string                `toml:"append_limit"`
+	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterUsername         string                `toml:"master_username"`
+	MasterPassword         string                `toml:"master_password"`
+	MasterSASLUsername     string                `toml:"master_sasl_username"`
+	MasterSASLPassword     string                `toml:"master_sasl_password"`
+	TLS                    bool                  `toml:"tls"`
+	TLSCertFile            string                `toml:"tls_cert_file"`
+	TLSKeyFile             string                `toml:"tls_key_file"`
+	TLSVerify              bool                  `toml:"tls_verify"`
+	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
+	SearchRateLimitPerMin  int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow  string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
+	CommandTimeout         string                `toml:"command_timeout"`           // Maximum idle time before disconnection (e.g., "5m", default: 5 minutes)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"`  // Maximum total session duration (e.g., "30m", default: 30 minutes)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
 }
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
@@ -623,6 +626,22 @@ func (i *IMAPServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 		return time.Minute, nil // Default: 1 minute
 	}
 	return helpers.ParseDuration(i.SearchRateLimitWindow)
+}
+
+// GetCommandTimeout parses the command timeout duration for IMAP
+func (i *IMAPServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if i.CommandTimeout == "" {
+		return 5 * time.Minute, nil // Default: 5 minutes for IMAP commands
+	}
+	return helpers.ParseDuration(i.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for IMAP
+func (i *IMAPServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if i.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes for IMAP sessions
+	}
+	return helpers.ParseDuration(i.AbsoluteSessionTimeout)
 }
 
 // LMTPServerConfig holds LMTP server configuration.
@@ -641,18 +660,20 @@ type LMTPServerConfig struct {
 
 // POP3ServerConfig holds POP3 server configuration.
 type POP3ServerConfig struct {
-	Start               bool                  `toml:"start"`
-	Addr                string                `toml:"addr"`
-	MaxConnections      int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername  string                `toml:"master_sasl_username"`
-	MasterSASLPassword  string                `toml:"master_sasl_password"`
-	TLS                 bool                  `toml:"tls"`
-	TLSCertFile         string                `toml:"tls_cert_file"`
-	TLSKeyFile          string                `toml:"tls_key_file"`
-	TLSVerify           bool                  `toml:"tls_verify"`
-	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	CommandTimeout      string                `toml:"command_timeout"` // Maximum time for a single command to execute (default: 2m)
+	Start                  bool                  `toml:"start"`
+	Addr                   string                `toml:"addr"`
+	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername     string                `toml:"master_sasl_username"`
+	MasterSASLPassword     string                `toml:"master_sasl_password"`
+	TLS                    bool                  `toml:"tls"`
+	TLSCertFile            string                `toml:"tls_cert_file"`
+	TLSKeyFile             string                `toml:"tls_key_file"`
+	TLSVerify              bool                  `toml:"tls_verify"`
+	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 2m)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
 }
 
 // GetCommandTimeout parses the command timeout duration for POP3
@@ -663,24 +684,34 @@ func (c *POP3ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(c.CommandTimeout)
 }
 
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for POP3
+func (c *POP3ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if c.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes for POP3 sessions
+	}
+	return helpers.ParseDuration(c.AbsoluteSessionTimeout)
+}
+
 // ManageSieveServerConfig holds ManageSieve server configuration.
 type ManageSieveServerConfig struct {
-	Start               bool                  `toml:"start"`
-	Addr                string                `toml:"addr"`
-	MaxConnections      int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MaxScriptSize       string                `toml:"max_script_size"`
-	SupportedExtensions []string              `toml:"supported_extensions"` // List of supported Sieve extensions
-	InsecureAuth        bool                  `toml:"insecure_auth"`
-	MasterSASLUsername  string                `toml:"master_sasl_username"`
-	MasterSASLPassword  string                `toml:"master_sasl_password"`
-	TLS                 bool                  `toml:"tls"`
-	TLSUseStartTLS      bool                  `toml:"tls_use_starttls"`
-	TLSCertFile         string                `toml:"tls_cert_file"`
-	TLSKeyFile          string                `toml:"tls_key_file"`
-	TLSVerify           bool                  `toml:"tls_verify"`
-	AuthRateLimit       AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	CommandTimeout      string                `toml:"command_timeout"` // Maximum time for a single command to execute (default: 3m)
+	Start                  bool                  `toml:"start"`
+	Addr                   string                `toml:"addr"`
+	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MaxScriptSize          string                `toml:"max_script_size"`
+	SupportedExtensions    []string              `toml:"supported_extensions"` // List of supported Sieve extensions
+	InsecureAuth           bool                  `toml:"insecure_auth"`
+	MasterSASLUsername     string                `toml:"master_sasl_username"`
+	MasterSASLPassword     string                `toml:"master_sasl_password"`
+	TLS                    bool                  `toml:"tls"`
+	TLSUseStartTLS         bool                  `toml:"tls_use_starttls"`
+	TLSCertFile            string                `toml:"tls_cert_file"`
+	TLSKeyFile             string                `toml:"tls_key_file"`
+	TLSVerify              bool                  `toml:"tls_verify"`
+	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 3m)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
 }
 
 // GetCommandTimeout parses the command timeout duration for ManageSieve
@@ -689,6 +720,14 @@ func (c *ManageSieveServerConfig) GetCommandTimeout() (time.Duration, error) {
 		return 3 * time.Minute, nil // Default: 3 minutes for ManageSieve commands
 	}
 	return helpers.ParseDuration(c.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for ManageSieve
+func (c *ManageSieveServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if c.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes for ManageSieve sessions
+	}
+	return helpers.ParseDuration(c.AbsoluteSessionTimeout)
 }
 
 // IMAPProxyServerConfig holds IMAP proxy server configuration.
@@ -710,7 +749,10 @@ type IMAPProxyServerConfig struct {
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseIDCommand     bool                  `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
+	SessionTimeout         string                `toml:"session_timeout"`          // Maximum session duration
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -737,7 +779,10 @@ type POP3ProxyServerConfig struct {
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
+	SessionTimeout         string                `toml:"session_timeout"`          // Maximum session duration
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -763,9 +808,12 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	SessionTimeout         string                `toml:"session_timeout"` // Maximum session duration
-	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
+	SessionTimeout         string                `toml:"session_timeout"`          // Maximum session duration
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
+	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
+	PreLookup              *PreLookupConfig      `toml:"prelookup"`                // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -900,11 +948,13 @@ type ServerConfig struct {
 	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
 
 	// Auth rate limiting (embedded)
-	AuthRateLimit         *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
-	SearchRateLimitPerMin int                    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow string                 `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
-	SessionMemoryLimit    string                 `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
-	CommandTimeout        string                 `toml:"command_timeout,omitempty"`           // Per-command execution timeout (default: protocol-specific)
+	AuthRateLimit          *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+	SearchRateLimitPerMin  int                    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow  string                 `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
+	SessionMemoryLimit     string                 `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
+	CommandTimeout         string                 `toml:"command_timeout,omitempty"`           // Maximum idle time before disconnection (default: protocol-specific)
+	AbsoluteSessionTimeout string                 `toml:"absolute_session_timeout,omitempty"`  // Maximum total session duration (default: 30m)
+	MinBytesPerMinute      int64                  `toml:"min_bytes_per_minute,omitempty"`      // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
 
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
@@ -1342,6 +1392,54 @@ func (c *LMTPProxyServerConfig) GetSessionTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(c.SessionTimeout)
 }
 
+// GetCommandTimeout parses the command timeout duration for IMAP proxy
+func (c *IMAPProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if c.CommandTimeout == "" {
+		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+	}
+	return helpers.ParseDuration(c.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for IMAP proxy
+func (c *IMAPProxyServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if c.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes maximum session duration
+	}
+	return helpers.ParseDuration(c.AbsoluteSessionTimeout)
+}
+
+// GetCommandTimeout parses the command timeout duration for POP3 proxy
+func (c *POP3ProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if c.CommandTimeout == "" {
+		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+	}
+	return helpers.ParseDuration(c.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for POP3 proxy
+func (c *POP3ProxyServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if c.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes maximum session duration
+	}
+	return helpers.ParseDuration(c.AbsoluteSessionTimeout)
+}
+
+// GetCommandTimeout parses the command timeout duration for ManageSieve proxy
+func (c *ManageSieveProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
+	if c.CommandTimeout == "" {
+		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+	}
+	return helpers.ParseDuration(c.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration for ManageSieve proxy
+func (c *ManageSieveProxyServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if c.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes maximum session duration
+	}
+	return helpers.ParseDuration(c.AbsoluteSessionTimeout)
+}
+
 // Helper methods for ServerConfig
 func (s *ServerConfig) GetAppendLimit() (int64, error) {
 	if s.AppendLimit == "" {
@@ -1436,6 +1534,14 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 		}
 	}
 	return helpers.ParseDuration(s.CommandTimeout)
+}
+
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 30 minutes for all protocols)
+func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	if s.AbsoluteSessionTimeout == "" {
+		return 30 * time.Minute, nil // Default: 30 minutes for all protocols
+	}
+	return helpers.ParseDuration(s.AbsoluteSessionTimeout)
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

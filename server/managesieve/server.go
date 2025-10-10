@@ -47,29 +47,33 @@ type ManageSieveServer struct {
 	// Authentication rate limiting
 	authLimiter server.AuthLimiter
 
-	// Command timeout
-	commandTimeout time.Duration
+	// Command timeout and throughput enforcement
+	commandTimeout         time.Duration
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth         bool
-	Debug                bool
-	TLS                  bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	TLSVerify            bool
-	TLSUseStartTLS       bool
-	MaxScriptSize        int64
-	SupportedExtensions  []string // List of supported Sieve extensions
-	MasterSASLUsername   string
-	MasterSASLPassword   string
-	MaxConnections       int
-	MaxConnectionsPerIP  int
-	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
-	TrustedNetworks      []string // Global trusted networks for parameter forwarding
-	AuthRateLimit        server.AuthRateLimiterConfig
-	CommandTimeout       time.Duration // Maximum time for a single command to execute
+	InsecureAuth           bool
+	Debug                  bool
+	TLS                    bool
+	TLSCertFile            string
+	TLSKeyFile             string
+	TLSVerify              bool
+	TLSUseStartTLS         bool
+	MaxScriptSize          int64
+	SupportedExtensions    []string // List of supported Sieve extensions
+	MasterSASLUsername     string
+	MasterSASLPassword     string
+	MaxConnections         int
+	MaxConnectionsPerIP    int
+	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
+	TrustedNetworks        []string // Global trusted networks for parameter forwarding
+	AuthRateLimit          server.AuthRateLimiterConfig
+	CommandTimeout         time.Duration // Maximum idle time before disconnection
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
 }
 
 func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -100,21 +104,23 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	serverInstance := &ManageSieveServer{
-		hostname:            hostname,
-		name:                name,
-		addr:                addr,
-		rdb:                 rdb,
-		appCtx:              serverCtx,
-		cancel:              serverCancel,
-		useStartTLS:         options.TLSUseStartTLS,
-		insecureAuth:        options.InsecureAuth,
-		maxScriptSize:       options.MaxScriptSize,
-		supportedExtensions: options.SupportedExtensions,
-		masterSASLUsername:  []byte(options.MasterSASLUsername),
-		masterSASLPassword:  []byte(options.MasterSASLPassword),
-		proxyReader:         proxyReader,
-		authLimiter:         authLimiter,
-		commandTimeout:      options.CommandTimeout,
+		hostname:               hostname,
+		name:                   name,
+		addr:                   addr,
+		rdb:                    rdb,
+		appCtx:                 serverCtx,
+		cancel:                 serverCancel,
+		useStartTLS:            options.TLSUseStartTLS,
+		insecureAuth:           options.InsecureAuth,
+		maxScriptSize:          options.MaxScriptSize,
+		supportedExtensions:    options.SupportedExtensions,
+		masterSASLUsername:     []byte(options.MasterSASLUsername),
+		masterSASLPassword:     []byte(options.MasterSASLPassword),
+		proxyReader:            proxyReader,
+		authLimiter:            authLimiter,
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
 	}
 
 	// No default extensions - only use what's explicitly configured
@@ -200,6 +206,19 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
+	}
+
+	// Wrap listener with timeout enforcement if configured
+	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		listener = &timeoutListener{
+			Listener:          listener,
+			timeout:           s.commandTimeout,
+			absoluteTimeout:   s.absoluteSessionTimeout,
+			minBytesPerMinute: s.minBytesPerMinute,
+			protocol:          "managesieve",
+		}
+		log.Printf("* ManageSieve [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation

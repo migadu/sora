@@ -20,26 +20,29 @@ import (
 )
 
 type POP3ProxyServer struct {
-	name               string // Server name for logging
-	addr               string
-	hostname           string
-	rdb                *resilient.ResilientDatabase
-	appCtx             context.Context
-	cancel             context.CancelFunc
-	tlsConfig          *tls.Config
-	masterSASLUsername string
-	masterSASLPassword string
-	connManager        *proxy.ConnectionManager
-	connTracker        *proxy.ConnectionTracker
-	wg                 sync.WaitGroup
-	enableAffinity     bool
-	affinityValidity   time.Duration
-	affinityStickiness float64
-	authLimiter        server.AuthLimiter
-	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig    *proxy.PreLookupConfig
-	sessionTimeout     time.Duration
-	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
+	name                   string // Server name for logging
+	addr                   string
+	hostname               string
+	rdb                    *resilient.ResilientDatabase
+	appCtx                 context.Context
+	cancel                 context.CancelFunc
+	tlsConfig              *tls.Config
+	masterSASLUsername     string
+	masterSASLPassword     string
+	connManager            *proxy.ConnectionManager
+	connTracker            *proxy.ConnectionTracker
+	wg                     sync.WaitGroup
+	enableAffinity         bool
+	affinityValidity       time.Duration
+	affinityStickiness     float64
+	authLimiter            server.AuthLimiter
+	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	prelookupConfig        *proxy.PreLookupConfig
+	sessionTimeout         time.Duration
+	commandTimeout         time.Duration // Idle timeout
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput
+	remoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -109,6 +112,9 @@ type POP3ProxyServerOptions struct {
 	MasterSASLPassword     string
 	ConnectTimeout         time.Duration
 	SessionTimeout         time.Duration
+	CommandTimeout         time.Duration // Idle timeout
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration
+	MinBytesPerMinute      int64         // Minimum throughput
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
@@ -195,25 +201,28 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	server := &POP3ProxyServer{
-		name:               options.Name,
-		hostname:           hostname,
-		addr:               addr,
-		rdb:                rdb,
-		appCtx:             serverCtx,
-		cancel:             serverCancel,
-		masterSASLUsername: options.MasterSASLUsername,
-		masterSASLPassword: options.MasterSASLPassword,
-		connManager:        connManager,
-		enableAffinity:     options.EnableAffinity,
-		affinityValidity:   options.AffinityValidity,
-		affinityStickiness: stickiness,
-		authLimiter:        authLimiter,
-		trustedProxies:     options.TrustedProxies,
-		prelookupConfig:    options.PreLookup,
-		sessionTimeout:     options.SessionTimeout,
-		remoteUseXCLIENT:   options.RemoteUseXCLIENT,
-		limiter:            limiter,
-		debugWriter:        debugWriter,
+		name:                   options.Name,
+		hostname:               hostname,
+		addr:                   addr,
+		rdb:                    rdb,
+		appCtx:                 serverCtx,
+		cancel:                 serverCancel,
+		masterSASLUsername:     options.MasterSASLUsername,
+		masterSASLPassword:     options.MasterSASLPassword,
+		connManager:            connManager,
+		enableAffinity:         options.EnableAffinity,
+		affinityValidity:       options.AffinityValidity,
+		affinityStickiness:     stickiness,
+		authLimiter:            authLimiter,
+		trustedProxies:         options.TrustedProxies,
+		prelookupConfig:        options.PreLookup,
+		sessionTimeout:         options.SessionTimeout,
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
+		remoteUseXCLIENT:       options.RemoteUseXCLIENT,
+		limiter:                limiter,
+		debugWriter:            debugWriter,
 	}
 
 	// Setup TLS if enabled and certificate and key files are provided
@@ -266,6 +275,19 @@ func (s *POP3ProxyServer) Start() error {
 		log.Printf("* POP3 proxy [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
+
+	// Wrap listener with timeout protection
+	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		listener = &timeoutListener{
+			Listener:          listener,
+			timeout:           s.commandTimeout,
+			absoluteTimeout:   s.absoluteSessionTimeout,
+			minBytesPerMinute: s.minBytesPerMinute,
+			protocol:          "pop3_proxy",
+		}
+		log.Printf("* POP3 proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+	}
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {

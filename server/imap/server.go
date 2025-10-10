@@ -276,6 +276,11 @@ type IMAPServer struct {
 
 	// Client capability filtering
 	capFilters []ClientCapabilityFilter
+
+	// Command timeout and throughput enforcement
+	commandTimeout         time.Duration
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 }
 
 type IMAPServerOptions struct {
@@ -314,6 +319,10 @@ type IMAPServerOptions struct {
 	MetadataMaxEntriesPerMailbox int
 	MetadataMaxEntriesPerServer  int
 	MetadataMaxTotalSize         int
+	// Command timeout and throughput enforcement
+	CommandTimeout         time.Duration // Maximum idle time before disconnection
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -411,10 +420,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapNamespace:     struct{}{},
 			imap.CapMetadata:      struct{}{},
 		},
-		masterUsername:     options.MasterUsername,
-		masterPassword:     options.MasterPassword,
-		masterSASLUsername: options.MasterSASLUsername,
-		masterSASLPassword: options.MasterSASLPassword,
+		masterUsername:         options.MasterUsername,
+		masterPassword:         options.MasterPassword,
+		masterSASLUsername:     options.MasterSASLUsername,
+		masterSASLPassword:     options.MasterSASLPassword,
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
 	}
 
 	// Pre-compile regex patterns for capability filters for performance and correctness
@@ -531,6 +543,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Start connection limiter cleanup
 	s.limiter.StartCleanup(appCtx)
+
+	// Initialize command timeout metrics
+	if s.commandTimeout > 0 {
+		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
+	}
 
 	return s, nil
 }
@@ -678,7 +695,21 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		name:     s.name,
 	}
 
-	err = s.server.Serve(limitedListener)
+	// Wrap listener with command timeout enforcement if configured
+	var finalListener net.Listener = limitedListener
+	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		finalListener = &timeoutListener{
+			Listener:          limitedListener,
+			timeout:           s.commandTimeout,
+			absoluteTimeout:   s.absoluteSessionTimeout,
+			minBytesPerMinute: s.minBytesPerMinute,
+			protocol:          "imap",
+		}
+		log.Printf("* IMAP [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+	}
+
+	err = s.server.Serve(finalListener)
 
 	// Check if this was a graceful shutdown
 	if s.appCtx.Err() != nil {
