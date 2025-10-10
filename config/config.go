@@ -801,10 +801,12 @@ type ManageSieveProxyServerConfig struct {
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
 	MasterSASLPassword     string                `toml:"master_sasl_password"`
 	TLS                    bool                  `toml:"tls"`
+	TLSUseStartTLS         bool                  `toml:"tls_use_starttls"` // Use STARTTLS on listening port
 	TLSCertFile            string                `toml:"tls_cert_file"`
 	TLSKeyFile             string                `toml:"tls_key_file"`
 	TLSVerify              bool                  `toml:"tls_verify"`
 	RemoteTLS              bool                  `toml:"remote_tls"`
+	RemoteTLSUseStartTLS   bool                  `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
@@ -828,10 +830,12 @@ type LMTPProxyServerConfig struct {
 	MaxConnections         int              `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int              `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	TLS                    bool             `toml:"tls"`
+	TLSUseStartTLS         bool             `toml:"tls_use_starttls"` // Use STARTTLS on listening port
 	TLSCertFile            string           `toml:"tls_cert_file"`
 	TLSKeyFile             string           `toml:"tls_key_file"`
 	TLSVerify              bool             `toml:"tls_verify"`
 	RemoteTLS              bool             `toml:"remote_tls"`
+	RemoteTLSUseStartTLS   bool             `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool             `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool             `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseXCLIENT       bool             `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
@@ -919,6 +923,7 @@ type ServerConfig struct {
 	RemoteAddrs            []string    `toml:"remote_addrs,omitempty"`
 	RemotePort             interface{} `toml:"remote_port,omitempty"` // Default port for backends if not in address
 	RemoteTLS              bool        `toml:"remote_tls,omitempty"`
+	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool        `toml:"remote_tls_verify,omitempty"`
 	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol,omitempty"`
 	RemoteUseIDCommand     bool        `toml:"remote_use_id_command,omitempty"`

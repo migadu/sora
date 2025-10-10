@@ -21,6 +21,7 @@ type ConnectionManager struct {
 	remoteAddrs            []string
 	remotePort             int // Default port for backends if not in address
 	remoteTLS              bool
+	remoteTLSUseStartTLS   bool // Use STARTTLS for backend connections (only relevant if remoteTLS is true)
 	remoteTLSVerify        bool
 	remoteUseProxyProtocol bool
 	connectTimeout         time.Duration
@@ -44,6 +45,11 @@ func NewConnectionManager(remoteAddrs []string, remotePort int, remoteTLS bool, 
 
 // NewConnectionManagerWithRouting creates a new connection manager with optional user routing
 func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs, remotePort, remoteTLS, false, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, routingLookup)
+}
+
+// NewConnectionManagerWithRoutingAndStartTLS creates a new connection manager with optional user routing and StartTLS support
+func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
@@ -67,6 +73,7 @@ func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remot
 		remoteAddrs:            normalizedAddrs,
 		remotePort:             remotePort,
 		remoteTLS:              remoteTLS,
+		remoteTLSUseStartTLS:   remoteTLSUseStartTLS,
 		remoteTLSVerify:        remoteTLSVerify,
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
 		connectTimeout:         connectTimeout,
@@ -87,6 +94,28 @@ func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, pa
 // GetRoutingLookup returns the routing lookup client (may be nil)
 func (cm *ConnectionManager) GetRoutingLookup() UserRoutingLookup {
 	return cm.routingLookup
+}
+
+// GetTLSConfig returns the TLS configuration for remote connections
+// Used for StartTLS negotiation at the protocol layer
+func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
+	if !cm.remoteTLS {
+		return nil
+	}
+	return &tls.Config{
+		InsecureSkipVerify: !cm.remoteTLSVerify,
+		// Explicitly set empty certificates to prevent automatic client certificate presentation
+		Certificates: []tls.Certificate{},
+		// Disable client certificate authentication
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return nil, nil
+		},
+	}
+}
+
+// IsRemoteStartTLS returns whether remote connections should use StartTLS
+func (cm *ConnectionManager) IsRemoteStartTLS() bool {
+	return cm.remoteTLS && cm.remoteTLSUseStartTLS
 }
 
 // Connect attempts to connect to a remote server with round-robin and failover
@@ -262,7 +291,9 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 
 	var conn net.Conn
 	var err error
-	if cm.remoteTLS {
+	// Only use implicit TLS if remoteTLS is enabled AND StartTLS is not being used
+	// When StartTLS is enabled, the protocol layer will handle the TLS upgrade
+	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: !cm.remoteTLSVerify,
 			// Explicitly set empty certificates to prevent automatic client certificate presentation
@@ -274,6 +305,7 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 		}
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
+		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
 		conn, err = dialer.DialContext(ctx, "tcp", resolvedAddr)
 	}
 

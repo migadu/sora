@@ -403,10 +403,11 @@ tls_key_file = ""
 tls_verify = true
 
 # --- BACKEND TLS CONFIGURATION ---
-remote_tls = false
-remote_tls_verify = true
-remote_use_proxy_protocol = true
-remote_use_id_command = false
+remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
+remote_tls_verify = true              # Verify backend server TLS certificates
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_id_command = false         # Send IMAP ID command to backends
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -453,6 +454,121 @@ remote_tls_verify = true
 # remote_port = 143
 remote_use_proxy_protocol = true
 remote_use_id_command = false
+
+
+# POP3 PROXY EXAMPLE
+# =============================================================================
+# Proxy POP3 connections across multiple backend servers with load balancing
+
+[[server]]
+type = "pop3_proxy"
+name = "pop3-proxy-1"
+addr = ":1110"                # Proxy listen address. Must be different from backend POP3 port.
+remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
+max_connections = 1000
+max_connections_per_ip = 20
+master_sasl_username = "proxyuser"
+master_sasl_password = "proxypass"
+
+# --- PROXY TLS CONFIGURATION ---
+tls = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+
+# --- BACKEND TLS CONFIGURATION ---
+remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
+remote_tls_verify = true              # Verify backend server TLS certificates
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+
+# --- PROXY BEHAVIOR CONFIGURATION ---
+connect_timeout = "30s"
+session_timeout = "10m"
+enable_affinity = true
+affinity_validity = "24h"
+affinity_stickiness = 0.9
+
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+command_timeout = "5m"
+absolute_session_timeout = "30m"
+min_bytes_per_minute = 1024
+
+
+# MANAGESIEVE PROXY EXAMPLE
+# =============================================================================
+# Proxy ManageSieve connections across multiple backend servers
+
+[[server]]
+type = "managesieve_proxy"
+name = "managesieve-proxy-1"
+addr = ":14190"               # Proxy listen address. Must be different from backend ManageSieve port.
+remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
+max_connections = 500
+max_connections_per_ip = 10
+master_sasl_username = "proxyuser"
+master_sasl_password = "proxypass"
+
+# --- PROXY TLS CONFIGURATION ---
+tls = false
+tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+
+# --- BACKEND TLS CONFIGURATION ---
+remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
+remote_tls_verify = true              # Verify backend server TLS certificates
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+
+# --- PROXY BEHAVIOR CONFIGURATION ---
+connect_timeout = "30s"
+session_timeout = "15m"
+enable_affinity = true
+affinity_validity = "24h"
+affinity_stickiness = 0.9
+
+# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+command_timeout = "5m"
+absolute_session_timeout = "30m"
+min_bytes_per_minute = 1024
+
+
+# LMTP PROXY EXAMPLE
+# =============================================================================
+# Proxy LMTP connections across multiple backend servers for load balancing
+
+[[server]]
+type = "lmtp_proxy"
+name = "lmtp-proxy-1"
+addr = ":124"                 # Proxy listen address. Must be different from backend LMTP port.
+remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
+max_connections = 1000
+max_connections_per_ip = 0    # Typically no per-IP limits for LMTP (trusted sources)
+
+# --- PROXY TLS CONFIGURATION ---
+tls = false
+tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
+tls_cert_file = ""
+tls_key_file = ""
+tls_verify = true
+
+# --- BACKEND TLS CONFIGURATION ---
+remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
+remote_tls_verify = true              # Verify backend server TLS certificates
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+
+# --- PROXY BEHAVIOR CONFIGURATION ---
+connect_timeout = "30s"
+session_timeout = "5m"
+max_message_size = "50mb"
+enable_affinity = true
+affinity_validity = "24h"
+affinity_stickiness = 0.9
 
 
 # METRICS SERVER EXAMPLE

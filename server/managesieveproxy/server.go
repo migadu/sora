@@ -25,6 +25,7 @@ type Server struct {
 	masterSASLUsername     []byte
 	masterSASLPassword     []byte
 	tls                    bool
+	tlsUseStartTLS         bool
 	tlsCertFile            string
 	tlsKeyFile             string
 	tlsVerify              bool
@@ -57,10 +58,12 @@ type ServerOptions struct {
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	TLS                    bool
+	TLSUseStartTLS         bool // Use STARTTLS on listening port
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSVerify              bool
 	RemoteTLS              bool
+	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
@@ -108,7 +111,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		return nil, err // InitializePrelookup handles fallback logic and returns error only when fatal
 	}
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()
@@ -146,6 +149,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		masterSASLUsername:     []byte(opts.MasterSASLUsername),
 		masterSASLPassword:     []byte(opts.MasterSASLPassword),
 		tls:                    opts.TLS,
+		tlsUseStartTLS:         opts.TLSUseStartTLS,
 		tlsCertFile:            opts.TLSCertFile,
 		tlsKeyFile:             opts.TLSKeyFile,
 		tlsVerify:              opts.TLSVerify,
@@ -170,7 +174,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 func (s *Server) Start() error {
 	var err error
 
-	if s.tls {
+	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
+	if s.tls && !s.tlsUseStartTLS {
 		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
 		if err != nil {
 			s.cancel()
@@ -200,13 +205,17 @@ func (s *Server) Start() error {
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* ManageSieve proxy [%s] listening with TLS on %s", s.name, s.addr)
+		log.Printf("* ManageSieve proxy [%s] listening with implicit TLS on %s", s.name, s.addr)
 	} else {
 		s.listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("* ManageSieve proxy [%s] listening on %s", s.name, s.addr)
+		if s.tlsUseStartTLS {
+			log.Printf("* ManageSieve proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
+		} else {
+			log.Printf("* ManageSieve proxy [%s] listening on %s", s.name, s.addr)
+		}
 	}
 
 	// Wrap listener with timeout protection
