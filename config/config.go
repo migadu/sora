@@ -416,6 +416,7 @@ type PreLookupConfig struct {
 	AuthMethod             string      `toml:"auth_method"`               // "bcrypt", "plain", etc.
 	Query                  string      `toml:"query"`                     // Main query (auto-detects mode based on columns returned)
 	RemoteTLS              bool        `toml:"remote_tls"`                // Use TLS for backend connections from prelookup
+	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (requires remote_tls = true) - Only supported for LMTP and ManageSieve proxies
 	RemoteTLSVerify        *bool       `toml:"remote_tls_verify"`         // Verify backend TLS certificate
 	RemotePort             interface{} `toml:"remote_port"`               // Default port for routed backends if not in address
 	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections from prelookup

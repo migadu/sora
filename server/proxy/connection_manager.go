@@ -372,6 +372,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Default to the connection manager's global settings.
 	useProxyProtocol := cm.remoteUseProxyProtocol
 	remoteTLS := cm.remoteTLS
+	remoteTLSUseStartTLS := cm.remoteTLSUseStartTLS
 	remoteTLSVerify := cm.remoteTLSVerify
 
 	// If routingInfo is provided and this connection is for that specific server,
@@ -379,10 +380,11 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	if routingInfo != nil && routingInfo.ServerAddress == addr {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
 		remoteTLS = routingInfo.RemoteTLS
+		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
 		remoteTLSVerify = routingInfo.RemoteTLSVerify
-		log.Printf("[ConnectionManager] Using prelookup settings for %s: remoteTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSVerify, useProxyProtocol)
+		log.Printf("[ConnectionManager] Using prelookup settings for %s: remoteTLS=%t, remoteTLSUseStartTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, useProxyProtocol)
 	} else {
-		log.Printf("[ConnectionManager] Using global settings for %s: remoteTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSVerify, useProxyProtocol)
+		log.Printf("[ConnectionManager] Using global settings for %s: remoteTLS=%t, remoteTLSUseStartTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, useProxyProtocol)
 	}
 
 	// If we have client IP information and PROXY protocol is enabled, send PROXY protocol header
@@ -400,8 +402,9 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			clientIP, clientPort, serverIP, serverPort)
 	}
 
-	// Now establish TLS if required
-	if remoteTLS {
+	// Now establish TLS if required (only for implicit TLS, not StartTLS)
+	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
+	if remoteTLS && !remoteTLSUseStartTLS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: !remoteTLSVerify,
 			// Explicitly set empty certificates to prevent automatic client certificate presentation

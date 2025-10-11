@@ -30,6 +30,7 @@ type UserRoutingInfo struct {
 	AccountID              int64
 	IsPrelookupAccount     bool
 	RemoteTLS              bool
+	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	RemoteUseIDCommand     bool // Use IMAP ID command for forwarding (IMAP only)
@@ -68,6 +69,7 @@ type PreLookupClient struct {
 	cacheMutex             sync.RWMutex
 	fallbackMode           bool
 	remoteTLS              bool
+	remoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	remoteTLSVerify        bool
 	remotePort             int
 	remoteUseProxyProtocol bool
@@ -182,7 +184,12 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	if config.RemoteTLSVerify != nil {
 		remoteTLSVerify = *config.RemoteTLSVerify
 	}
-	log.Printf("[PreLookup] TLS configuration: RemoteTLS=%t, RemoteTLSVerify=%t (config.RemoteTLSVerify=%v)", config.RemoteTLS, remoteTLSVerify, config.RemoteTLSVerify)
+	log.Printf("[PreLookup] TLS configuration: RemoteTLS=%t, RemoteTLSUseStartTLS=%t, RemoteTLSVerify=%t (config.RemoteTLSVerify=%v)", config.RemoteTLS, config.RemoteTLSUseStartTLS, remoteTLSVerify, config.RemoteTLSVerify)
+
+	// Log warning if StartTLS is configured (it's only supported for LMTP and ManageSieve proxies)
+	if config.RemoteTLSUseStartTLS {
+		log.Printf("[PreLookup] WARNING: remote_tls_use_starttls is enabled. This setting only affects LMTP and ManageSieve proxies. IMAP and POP3 proxies use implicit TLS and will ignore this setting.")
+	}
 
 	// Get remote port for prelookup results
 	remotePort, err := config.GetRemotePort()
@@ -272,6 +279,7 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		cache:                  make(map[string]*cacheEntry),
 		fallbackMode:           config.FallbackDefault,
 		remoteTLS:              config.RemoteTLS,
+		remoteTLSUseStartTLS:   config.RemoteTLSUseStartTLS,
 		remoteTLSVerify:        remoteTLSVerify,
 		remotePort:             remotePort,
 		remoteUseProxyProtocol: config.RemoteUseProxyProtocol,
@@ -403,6 +411,7 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedAddr,
 		RemoteTLS:              c.remoteTLS,
+		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,
 		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
 		RemoteUseIDCommand:     c.remoteUseIDCommand,
@@ -496,6 +505,7 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 					ServerAddress:          normalizedAddr,
 					IsPrelookupAccount:     true,
 					RemoteTLS:              c.remoteTLS,
+					RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 					RemoteTLSVerify:        c.remoteTLSVerify,
 					RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
 					RemoteUseIDCommand:     c.remoteUseIDCommand,
@@ -687,6 +697,7 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		AccountID:              accountID,
 		IsPrelookupAccount:     true,
 		RemoteTLS:              c.remoteTLS,
+		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,
 		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
 		RemoteUseIDCommand:     c.remoteUseIDCommand,

@@ -449,8 +449,11 @@ cache_size = 10000
 auth_method = "bcrypt"
 query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
 fallback_to_default = true
-remote_tls = false
-remote_tls_verify = true
+remote_tls = false                      # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false         # Use STARTTLS for backend connections (requires remote_tls = true)
+                                        # NOTE: Only supported for LMTP and ManageSieve proxies.
+                                        #       IMAP and POP3 proxies use implicit TLS and ignore this setting.
+remote_tls_verify = true                # Verify backend TLS certificates
 # remote_port = 143
 remote_use_proxy_protocol = true
 remote_use_id_command = false
