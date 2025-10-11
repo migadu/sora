@@ -448,7 +448,8 @@ cache_ttl = "10m"
 cache_size = 10000
 auth_method = "bcrypt"
 query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1 AND active = true"
-fallback_to_default = true
+fallback_to_default = true              # If prelookup initialization fails (e.g., database error), continue without prelookup
+                                        # using default round-robin routing. If false, proxy fails to start on prelookup errors.
 remote_tls = false                      # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false         # Use STARTTLS for backend connections (requires remote_tls = true)
                                         # NOTE: Only supported for LMTP and ManageSieve proxies.

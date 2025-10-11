@@ -519,6 +519,12 @@ func (s *Session) authenticateToBackend() error {
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Auth string format: authorize-id=%s, authenticate-id=%s",
+			s.server.name, s.username, string(s.server.masterSASLUsername))
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Sending AUTHENTICATE command with base64: %s", s.server.name, encoded)
+	}
+
 	// ManageSieve requires quoted strings for command arguments
 	_, err := backendWriter.WriteString(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", encoded))
 	if err != nil {
@@ -530,6 +536,10 @@ func (s *Session) authenticateToBackend() error {
 	response, err := backendReader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("failed to read auth response: %w", err)
+	}
+
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Backend auth response: %s", s.server.name, strings.TrimSpace(response))
 	}
 
 	if !strings.HasPrefix(response, "OK") {
