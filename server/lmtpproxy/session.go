@@ -120,6 +120,14 @@ func (s *Session) handleConnection() {
 			if command == "EHLO" || command == "LHLO" {
 				// Send extended response
 				s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))
+
+				// Advertise STARTTLS if configured and not already using TLS
+				if s.server.tls && s.server.tlsUseStartTLS {
+					if _, ok := s.clientConn.(*tls.Conn); !ok {
+						s.sendResponse("250-STARTTLS")
+					}
+				}
+
 				s.sendResponse("250-PIPELINING")
 				if s.server.maxMessageSize > 0 {
 					s.sendResponse(fmt.Sprintf("250-SIZE %d", s.server.maxMessageSize))
@@ -188,6 +196,57 @@ func (s *Session) handleConnection() {
 				log.Printf("LMTP Proxy [%s] Cannot start proxy for recipient %s: no backend connection", s.server.name, s.to)
 			}
 			return
+
+		case "STARTTLS":
+			// Check if STARTTLS is enabled
+			if !s.server.tls || !s.server.tlsUseStartTLS {
+				s.sendResponse("502 5.5.1 STARTTLS not available")
+				continue
+			}
+
+			// Check if already using TLS
+			if _, ok := s.clientConn.(*tls.Conn); ok {
+				s.sendResponse("454 4.3.0 TLS not available: Already using TLS")
+				continue
+			}
+
+			// Send OK response
+			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
+				log.Printf("LMTP Proxy [%s] Failed to send STARTTLS response: %v", s.server.name, err)
+				return
+			}
+
+			// Load TLS config
+			cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
+			if err != nil {
+				log.Printf("LMTP Proxy [%s] Failed to load TLS certificate: %v", s.server.name, err)
+				return
+			}
+
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				ClientAuth:   tls.NoClientCert,
+			}
+			if s.server.tlsVerify {
+				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			}
+
+			// Upgrade connection to TLS
+			tlsConn := tls.Server(s.clientConn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("LMTP Proxy [%s] TLS handshake failed: %v", s.server.name, err)
+				return
+			}
+
+			// Update session with TLS connection
+			s.clientConn = tlsConn
+			s.clientReader = bufio.NewReader(tlsConn)
+			s.clientWriter = bufio.NewWriter(tlsConn)
+
+			log.Printf("LMTP Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+
+			// Client must send EHLO/LHLO again after STARTTLS (RFC 3207)
+			// Continue to next iteration to wait for new EHLO/LHLO
 
 		case "RSET":
 			s.sender = ""

@@ -200,6 +200,61 @@ func (s *Session) handleConnection() {
 			// We already sent capabilities in the greeting
 			s.sendResponse(`OK "CAPABILITY completed"`)
 
+		case "STARTTLS":
+			// Check if STARTTLS is enabled
+			if !s.server.tls || !s.server.tlsUseStartTLS {
+				if s.handleAuthError(`NO "STARTTLS not available"`) {
+					return
+				}
+				continue
+			}
+
+			// Check if already using TLS
+			if _, ok := s.clientConn.(*tls.Conn); ok {
+				if s.handleAuthError(`NO "Already using TLS"`) {
+					return
+				}
+				continue
+			}
+
+			// Send OK response
+			if err := s.sendResponse(`OK "Begin TLS negotiation now"`); err != nil {
+				log.Printf("ManageSieve Proxy [%s] Failed to send STARTTLS response: %v", s.server.name, err)
+				return
+			}
+
+			// Load TLS config
+			cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
+			if err != nil {
+				log.Printf("ManageSieve Proxy [%s] Failed to load TLS certificate: %v", s.server.name, err)
+				return
+			}
+
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				ClientAuth:   tls.NoClientCert,
+			}
+			if s.server.tlsVerify {
+				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			}
+
+			// Upgrade connection to TLS
+			tlsConn := tls.Server(s.clientConn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("ManageSieve Proxy [%s] TLS handshake failed: %v", s.server.name, err)
+				return
+			}
+
+			// Update session with TLS connection
+			s.clientConn = tlsConn
+			s.clientReader = bufio.NewReader(tlsConn)
+			s.clientWriter = bufio.NewWriter(tlsConn)
+
+			log.Printf("ManageSieve Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+
+			// Re-send greeting with updated capabilities (now with SASL mechanisms available)
+			s.sendGreeting()
+
 		default:
 			if s.handleAuthError(`NO "Command not supported before authentication"`) {
 				return
@@ -349,7 +404,20 @@ func (s *Session) authenticateUser(username, password string) error {
 func (s *Session) sendGreeting() {
 	// Send a minimal set of capabilities for the proxy
 	s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n")
-	s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n")
+
+	// Check if we're on a TLS connection
+	_, isSecure := s.clientConn.(*tls.Conn)
+
+	// Advertise STARTTLS if configured and not already using TLS
+	if s.server.tls && s.server.tlsUseStartTLS && !isSecure {
+		// Before STARTTLS: Don't advertise SASL mechanisms (RFC 5804 security requirement)
+		s.clientWriter.WriteString(`"SASL" ""` + "\r\n")
+		s.clientWriter.WriteString(`"STARTTLS"` + "\r\n")
+	} else {
+		// After STARTTLS or on implicit TLS: Advertise available SASL mechanisms
+		s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n")
+	}
+
 	s.clientWriter.WriteString(`"VERSION" "1.0"` + "\r\n")
 	s.clientWriter.WriteString(`OK "ManageSieve proxy ready"` + "\r\n")
 	s.clientWriter.Flush()
