@@ -65,7 +65,10 @@ func (s *Session) handleConnection() {
 	log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
 
 	// Send initial greeting with capabilities
-	s.sendGreeting()
+	if err := s.sendGreeting(); err != nil {
+		log.Printf("ManageSieve Proxy [%s] Failed to send greeting to %s: %v", s.server.name, clientAddr, err)
+		return
+	}
 
 	// Handle authentication phase
 	authenticated := false
@@ -253,7 +256,10 @@ func (s *Session) handleConnection() {
 			log.Printf("ManageSieve Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
 
 			// Re-send greeting with updated capabilities (now with SASL mechanisms available)
-			s.sendGreeting()
+			if err := s.sendGreeting(); err != nil {
+				log.Printf("ManageSieve Proxy [%s] Failed to send greeting after STARTTLS: %v", s.server.name, err)
+				return
+			}
 
 		default:
 			if s.handleAuthError(`NO "Command not supported before authentication"`) {
@@ -401,9 +407,11 @@ func (s *Session) authenticateUser(username, password string) error {
 }
 
 // sendGreeting sends the initial ManageSieve greeting with capabilities.
-func (s *Session) sendGreeting() {
+func (s *Session) sendGreeting() error {
 	// Send a minimal set of capabilities for the proxy
-	s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n")
+	if _, err := s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n"); err != nil {
+		return err
+	}
 
 	// Check if we're on a TLS connection
 	_, isSecure := s.clientConn.(*tls.Conn)
@@ -411,16 +419,26 @@ func (s *Session) sendGreeting() {
 	// Advertise STARTTLS if configured and not already using TLS
 	if s.server.tls && s.server.tlsUseStartTLS && !isSecure {
 		// Before STARTTLS: Don't advertise SASL mechanisms (RFC 5804 security requirement)
-		s.clientWriter.WriteString(`"SASL" ""` + "\r\n")
-		s.clientWriter.WriteString(`"STARTTLS"` + "\r\n")
+		if _, err := s.clientWriter.WriteString(`"SASL" ""` + "\r\n"); err != nil {
+			return err
+		}
+		if _, err := s.clientWriter.WriteString(`"STARTTLS"` + "\r\n"); err != nil {
+			return err
+		}
 	} else {
 		// After STARTTLS or on implicit TLS: Advertise available SASL mechanisms
-		s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n")
+		if _, err := s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n"); err != nil {
+			return err
+		}
 	}
 
-	s.clientWriter.WriteString(`"VERSION" "1.0"` + "\r\n")
-	s.clientWriter.WriteString(`OK "ManageSieve proxy ready"` + "\r\n")
-	s.clientWriter.Flush()
+	if _, err := s.clientWriter.WriteString(`"VERSION" "1.0"` + "\r\n"); err != nil {
+		return err
+	}
+	if _, err := s.clientWriter.WriteString(`OK "ManageSieve proxy ready"` + "\r\n"); err != nil {
+		return err
+	}
+	return s.clientWriter.Flush()
 }
 
 // connectToBackendAndAuth connects to backend and authenticates.
