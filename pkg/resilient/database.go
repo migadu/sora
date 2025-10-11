@@ -120,6 +120,7 @@ type RuntimeFailoverManager struct {
 	currentReadIdx  atomic.Int64
 	config          *config.DatabaseConfig
 	healthCheckStop chan struct{}
+	healthCheckWg   sync.WaitGroup // Wait for background goroutines to finish
 	mu              sync.RWMutex
 }
 
@@ -524,6 +525,11 @@ func (rd *ResilientDatabase) Close() {
 	// Stop the health checker
 	close(rd.failoverManager.healthCheckStop)
 
+	// Wait for all background goroutines to finish
+	log.Printf("[RESILIENT-FAILOVER] Waiting for background goroutines to finish...")
+	rd.failoverManager.healthCheckWg.Wait()
+	log.Printf("[RESILIENT-FAILOVER] All background goroutines finished")
+
 	// Close all managed pools
 	for _, pool := range rd.failoverManager.writePools {
 		pool.database.Close()
@@ -825,6 +831,9 @@ func (rd *ResilientDatabase) startRuntimeHealthChecking(ctx context.Context) {
 		return
 	}
 
+	rd.failoverManager.healthCheckWg.Add(1)
+	defer rd.failoverManager.healthCheckWg.Done()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -833,10 +842,10 @@ func (rd *ResilientDatabase) startRuntimeHealthChecking(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking")
+			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking (context done)")
 			return
 		case <-rd.failoverManager.healthCheckStop:
-			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking")
+			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking (close signal)")
 			return
 		case <-ticker.C:
 			rd.performHealthChecks(ctx)
@@ -891,13 +900,19 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 // StartPoolMetrics starts a goroutine that periodically collects connection pool metrics
 // from all managed database pools (both read and write) and exposes them via Prometheus
 func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
+	rd.failoverManager.healthCheckWg.Add(1)
 	go func() {
+		defer rd.failoverManager.healthCheckWg.Done()
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("[RESILIENT-FAILOVER] Stopped pool metrics collection")
+				return
+			case <-rd.failoverManager.healthCheckStop:
+				log.Printf("[RESILIENT-FAILOVER] Stopped pool metrics collection (close signal)")
 				return
 			case <-ticker.C:
 				rd.collectAggregatedPoolStats()
@@ -960,7 +975,9 @@ func (rd *ResilientDatabase) collectAggregatedPoolStats() {
 // StartPoolHealthMonitoring starts background monitoring of connection pool health
 // for all managed database pools with enhanced metrics collection
 func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
+	rd.failoverManager.healthCheckWg.Add(1)
 	go func() {
+		defer rd.failoverManager.healthCheckWg.Done()
 		ticker := time.NewTicker(30 * time.Second) // Align with existing health check interval
 		defer ticker.Stop()
 
@@ -970,6 +987,9 @@ func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				log.Printf("[RESILIENT-FAILOVER] Stopping aggregated pool health monitoring")
+				return
+			case <-rd.failoverManager.healthCheckStop:
+				log.Printf("[RESILIENT-FAILOVER] Stopping aggregated pool health monitoring (close signal)")
 				return
 			case <-ticker.C:
 				rd.monitorAggregatedPoolHealth()

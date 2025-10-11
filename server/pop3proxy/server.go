@@ -387,5 +387,15 @@ func (s *POP3ProxyServer) Stop() error {
 		log.Printf("POP3 Proxy [%s] Server stop timeout", s.name)
 	}
 
+	// Close prelookup client if it exists
+	if s.connManager != nil {
+		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
+			log.Printf("* POP3 Proxy [%s] closing prelookup client...", s.name)
+			if err := routingLookup.Close(); err != nil {
+				log.Printf("* POP3 Proxy [%s] error closing prelookup client: %v", s.name, err)
+			}
+		}
+	}
+
 	return nil
 }

@@ -978,10 +978,12 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		TLS:                    serverConfig.TLS,
+		TLSUseStartTLS:         serverConfig.TLSUseStartTLS,
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
 		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSUseStartTLS:   serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		ConnectTimeout:         connectTimeout,
@@ -998,6 +1000,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
@@ -1046,10 +1049,12 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteAddrs:            serverConfig.RemoteAddrs,
 		RemotePort:             remotePort,
 		TLS:                    serverConfig.TLS,
+		TLSUseStartTLS:         serverConfig.TLSUseStartTLS,
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
 		RemoteTLS:              serverConfig.RemoteTLS,
+		RemoteTLSUseStartTLS:   serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
@@ -1061,6 +1066,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,
+		MaxConnections:         serverConfig.MaxConnections,
+		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create LMTP proxy server: %w", err)

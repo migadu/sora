@@ -76,6 +76,7 @@ type PreLookupClient struct {
 	remoteUseIDCommand     bool
 	remoteUseXCLIENT       bool
 	stopJanitor            chan struct{}
+	janitorWg              sync.WaitGroup // Wait for janitor to finish
 	breaker                *circuitbreaker.CircuitBreaker
 }
 
@@ -719,7 +720,9 @@ func (c *PreLookupClient) startCacheJanitor() {
 		interval = time.Minute // Minimum cleanup interval
 	}
 
+	c.janitorWg.Add(1)
 	go func() {
+		defer c.janitorWg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -727,6 +730,7 @@ func (c *PreLookupClient) startCacheJanitor() {
 			case <-ticker.C:
 				c.cleanupCache()
 			case <-c.stopJanitor:
+				log.Printf("[PreLookup] Cache janitor stopped")
 				return
 			}
 		}
@@ -750,6 +754,10 @@ func (c *PreLookupClient) Close() error {
 	if c.pool != nil {
 		if c.stopJanitor != nil {
 			close(c.stopJanitor)
+			// Wait for janitor to finish before closing the pool
+			log.Printf("[PreLookup] Waiting for cache janitor to finish...")
+			c.janitorWg.Wait()
+			log.Printf("[PreLookup] Cache janitor finished")
 		}
 		c.pool.Close()
 	}

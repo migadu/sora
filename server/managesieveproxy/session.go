@@ -64,6 +64,11 @@ func (s *Session) handleConnection() {
 	clientAddr := s.clientConn.RemoteAddr().String()
 	log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
 
+	// Debug: Log connection type
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Connection type: %T", s.server.name, s.clientConn)
+	}
+
 	// Send initial greeting with capabilities
 	if err := s.sendGreeting(); err != nil {
 		log.Printf("ManageSieve Proxy [%s] Failed to send greeting to %s: %v", s.server.name, clientAddr, err)
@@ -410,7 +415,7 @@ func (s *Session) authenticateUser(username, password string) error {
 func (s *Session) sendGreeting() error {
 	// Send a minimal set of capabilities for the proxy
 	if _, err := s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n"); err != nil {
-		return err
+		return fmt.Errorf("failed to write IMPLEMENTATION: %w", err)
 	}
 
 	// Check if we're on a TLS connection
@@ -420,25 +425,31 @@ func (s *Session) sendGreeting() error {
 	if s.server.tls && s.server.tlsUseStartTLS && !isSecure {
 		// Before STARTTLS: Don't advertise SASL mechanisms (RFC 5804 security requirement)
 		if _, err := s.clientWriter.WriteString(`"SASL" ""` + "\r\n"); err != nil {
-			return err
+			return fmt.Errorf("failed to write SASL: %w", err)
 		}
 		if _, err := s.clientWriter.WriteString(`"STARTTLS"` + "\r\n"); err != nil {
-			return err
+			return fmt.Errorf("failed to write STARTTLS: %w", err)
 		}
 	} else {
 		// After STARTTLS or on implicit TLS: Advertise available SASL mechanisms
 		if _, err := s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n"); err != nil {
-			return err
+			return fmt.Errorf("failed to write SASL: %w", err)
 		}
 	}
 
 	if _, err := s.clientWriter.WriteString(`"VERSION" "1.0"` + "\r\n"); err != nil {
-		return err
+		return fmt.Errorf("failed to write VERSION: %w", err)
 	}
+
 	if _, err := s.clientWriter.WriteString(`OK "ManageSieve proxy ready"` + "\r\n"); err != nil {
-		return err
+		return fmt.Errorf("failed to write OK: %w", err)
 	}
-	return s.clientWriter.Flush()
+
+	if err := s.clientWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush: %w", err)
+	}
+
+	return nil
 }
 
 // connectToBackendAndAuth connects to backend and authenticates.

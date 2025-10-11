@@ -329,5 +329,15 @@ func (s *Server) Stop() error {
 		log.Printf("ManageSieve Proxy [%s] Server stop timeout", s.name)
 	}
 
+	// Close prelookup client if it exists
+	if s.connManager != nil {
+		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
+			log.Printf("* ManageSieve Proxy [%s] closing prelookup client...", s.name)
+			if err := routingLookup.Close(); err != nil {
+				log.Printf("* ManageSieve Proxy [%s] error closing prelookup client: %v", s.name, err)
+			}
+		}
+	}
+
 	return nil
 }
