@@ -1006,6 +1006,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		Debug:                  serverConfig.Debug,
+		SupportedExtensions:    serverConfig.SupportedExtensions,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)

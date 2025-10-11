@@ -100,6 +100,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		}
 	}
 
+	// Validate SIEVE extensions
+	if err := ValidateExtensions(options.SupportedExtensions); err != nil {
+		serverCancel()
+		return nil, fmt.Errorf("invalid ManageSieve configuration: %w", err)
+	}
+
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 

@@ -917,7 +917,7 @@ type ServerConfig struct {
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
-	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions (additional to builtins)
 	InsecureAuth        bool     `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific

@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -255,8 +256,11 @@ func (s *Session) handleConnection() {
 			s.sendResponse(`OK "NOOP completed"`)
 
 		case "CAPABILITY":
-			// We already sent capabilities in the greeting
-			s.sendResponse(`OK "CAPABILITY completed"`)
+			// Re-send capabilities as per RFC 5804
+			if err := s.sendCapabilities(); err != nil {
+				log.Printf("ManageSieve Proxy [%s] Error sending capabilities: %v", s.server.name, err)
+				return
+			}
 
 		case "STARTTLS":
 			// Check if STARTTLS is enabled
@@ -466,9 +470,21 @@ func (s *Session) authenticateUser(username, password string) error {
 
 // sendGreeting sends the initial ManageSieve greeting with capabilities.
 func (s *Session) sendGreeting() error {
+	return s.sendCapabilities()
+}
+
+// sendCapabilities sends ManageSieve capabilities.
+func (s *Session) sendCapabilities() error {
 	// Send a minimal set of capabilities for the proxy
 	if _, err := s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n"); err != nil {
 		return fmt.Errorf("failed to write IMPLEMENTATION: %w", err)
+	}
+
+	// Build SIEVE capabilities: builtin + configured extensions (from managesieve package)
+	capabilities := managesieve.GetSieveCapabilities(s.server.supportedExtensions)
+	capabilitiesStr := strings.Join(capabilities, " ")
+	if _, err := s.clientWriter.WriteString(fmt.Sprintf(`"SIEVE" "%s"`, capabilitiesStr) + "\r\n"); err != nil {
+		return fmt.Errorf("failed to write SIEVE: %w", err)
 	}
 
 	// Check if we're on a TLS connection

@@ -12,6 +12,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -50,6 +51,9 @@ type Server struct {
 
 	// Debug logging
 	debug bool
+
+	// SIEVE extensions (additional to builtin)
+	supportedExtensions []string
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
@@ -88,6 +92,9 @@ type ServerOptions struct {
 
 	// Debug logging
 	Debug bool // Enable debug logging
+
+	// SIEVE extensions
+	SupportedExtensions []string // Additional SIEVE extensions beyond builtins (e.g., ["vacation", "regex"])
 }
 
 // New creates a new ManageSieve proxy server.
@@ -138,6 +145,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		stickiness = 1.0
 	}
 
+	// Validate SIEVE extensions
+	if err := managesieve.ValidateExtensions(opts.SupportedExtensions); err != nil {
+		cancel()
+		return nil, fmt.Errorf("invalid ManageSieve proxy configuration: %w", err)
+	}
+
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
 
@@ -174,6 +187,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		minBytesPerMinute:      opts.MinBytesPerMinute,
 		limiter:                limiter,
 		debug:                  opts.Debug,
+		supportedExtensions:    opts.SupportedExtensions,
 	}, nil
 }
 

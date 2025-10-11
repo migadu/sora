@@ -54,13 +54,9 @@ func (s *ManageSieveSession) sendCapabilities() {
 
 	s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
 
-	// Build capabilities string from configured extensions
-	extensionsStr := ""
-	if len(s.server.supportedExtensions) > 0 {
-		extensionsStr = strings.Join(s.server.supportedExtensions, " ")
-	} else {
-		extensionsStr = "fileinto vacation" // fallback
-	}
+	// Build capabilities: builtin + configured extensions
+	capabilities := GetSieveCapabilities(s.server.supportedExtensions)
+	extensionsStr := strings.Join(capabilities, " ")
 	s.sendRawLine(fmt.Sprintf("\"SIEVE\" \"%s\"", extensionsStr))
 
 	if s.server.tlsConfig != nil && s.server.useStartTLS && !s.isTLS {
