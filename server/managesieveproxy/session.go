@@ -266,6 +266,9 @@ func (s *Session) handleConnection() {
 				return
 			}
 
+			// Continue to next command after STARTTLS
+			continue
+
 		default:
 			if s.handleAuthError(`NO "Command not supported before authentication"`) {
 				return
