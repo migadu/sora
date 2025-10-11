@@ -118,6 +118,13 @@ func (s *Session) handleConnection() {
 		log.Printf("ManageSieve Proxy [%s] Client %s: %s", s.server.name, clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 		switch command {
 		case "AUTHENTICATE":
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: len(args)=%d", s.server.name, len(args))
+				for i, arg := range args {
+					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: args[%d]=%q", s.server.name, i, arg)
+				}
+			}
+
 			if len(args) < 1 || strings.ToUpper(server.UnquoteString(args[0])) != "PLAIN" {
 				if s.handleAuthError(`NO "AUTHENTICATE PLAIN is the only supported mechanism"`) {
 					return
@@ -129,8 +136,14 @@ func (s *Session) handleConnection() {
 			var saslLine string
 			if len(args) >= 2 {
 				// Initial response provided
+				if s.server.debug {
+					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: using initial response from args[1]", s.server.name)
+				}
 				saslLine = server.UnquoteString(args[1])
 			} else {
+				if s.server.debug {
+					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: sending continuation, waiting for response", s.server.name)
+				}
 				// Send continuation and wait for response
 				s.sendContinuation()
 
