@@ -498,6 +498,9 @@ command_timeout = "5m"
 absolute_session_timeout = "30m"
 min_bytes_per_minute = 1024
 
+# --- DEBUG LOGGING ---
+debug = false                         # Enable debug logging (logs backend greetings/responses)
+
 
 # MANAGESIEVE PROXY EXAMPLE
 # =============================================================================
@@ -538,6 +541,9 @@ command_timeout = "5m"
 absolute_session_timeout = "30m"
 min_bytes_per_minute = 1024
 
+# --- DEBUG LOGGING ---
+debug = false                         # Enable debug logging (logs backend greetings/responses)
+
 
 # LMTP PROXY EXAMPLE
 # =============================================================================
@@ -572,6 +578,9 @@ max_message_size = "50mb"
 enable_affinity = true
 affinity_validity = "24h"
 affinity_stickiness = 0.9
+
+# --- DEBUG LOGGING ---
+debug = false                         # Enable debug logging (logs backend greetings/responses)
 
 
 # METRICS SERVER EXAMPLE

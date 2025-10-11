@@ -3,6 +3,7 @@ package managesieveproxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -280,17 +281,26 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	// Try prelookup authentication/routing first if configured
-	log.Printf("ManageSieve Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Attempting authentication for user %s via prelookup", s.server.name, username)
+	}
 	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 	if err != nil {
-		log.Printf("ManageSieve Proxy [%s] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", s.server.name, username, err)
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup authentication for '%s' failed with error: %v. Falling back to main DB.", s.server.name, username, err)
+		}
 		// Fallthrough to main DB auth
 	} else {
 		switch authResult {
 		case proxy.AuthSuccess:
 			// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
 			log.Printf("ManageSieve Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup routing: server=%s, TLS=%t, StartTLS=%t, TLSVerify=%t, ProxyProtocol=%t",
+					s.server.name, routingInfo.ServerAddress, routingInfo.RemoteTLS, routingInfo.RemoteTLSUseStartTLS,
+					routingInfo.RemoteTLSVerify, routingInfo.RemoteUseProxyProtocol)
+			}
 			s.accountID = routingInfo.AccountID
 			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 			s.routingInfo = routingInfo
@@ -309,12 +319,16 @@ func (s *Session) authenticateUser(username, password string) error {
 
 		case proxy.AuthUserNotFound:
 			// User not in prelookup DB. Fallthrough to main DB auth.
-			log.Printf("ManageSieve Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] [DEBUG] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+			}
 		}
 	}
 
 	// Fallback/default: Authenticate against the main database.
-	log.Printf("ManageSieve Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] [DEBUG] Authenticating user %s via main database", s.server.name, username)
+	}
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
@@ -409,6 +423,7 @@ func (s *Session) connectToBackendAndAuth() error {
 
 	// Read backend greeting and capabilities
 	backendReader := bufio.NewReader(s.backendConn)
+	backendWriter := bufio.NewWriter(s.backendConn)
 	for {
 		line, err := backendReader.ReadString('\n')
 		if err != nil {
@@ -421,6 +436,74 @@ func (s *Session) connectToBackendAndAuth() error {
 		if strings.HasPrefix(strings.TrimSpace(line), "OK") {
 			break
 		}
+	}
+
+	// Check if we need to negotiate StartTLS with the backend
+	// This happens when prelookup (or global config) specifies remote_tls_use_starttls
+	shouldUseStartTLS := false
+	var tlsConfig *tls.Config
+
+	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
+		// Prelookup routing specified StartTLS
+		shouldUseStartTLS = true
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
+		}
+		log.Printf("ManageSieve Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",
+			s.server.name, s.routingInfo.RemoteTLSVerify)
+	} else if s.server.connManager.IsRemoteStartTLS() {
+		// Global proxy config specified StartTLS
+		shouldUseStartTLS = true
+		tlsConfig = s.server.connManager.GetTLSConfig()
+		log.Printf("ManageSieve Proxy [%s] Using global StartTLS settings for backend", s.server.name)
+	}
+
+	if shouldUseStartTLS && tlsConfig != nil {
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] [DEBUG] Negotiating StartTLS with backend %s (InsecureSkipVerify=%t)",
+				s.server.name, actualAddr, tlsConfig.InsecureSkipVerify)
+		} else {
+			log.Printf("ManageSieve Proxy [%s] Negotiating StartTLS with backend %s", s.server.name, actualAddr)
+		}
+
+		// Send STARTTLS command
+		_, err := backendWriter.WriteString("STARTTLS\r\n")
+		if err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("failed to send STARTTLS command: %w", err)
+		}
+		backendWriter.Flush()
+
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] [DEBUG] Sent STARTTLS command to backend", s.server.name)
+		}
+
+		// Read STARTTLS response
+		response, err := backendReader.ReadString('\n')
+		if err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("failed to read STARTTLS response: %w", err)
+		}
+
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] [DEBUG] Backend STARTTLS response: %s", s.server.name, strings.TrimSpace(response))
+		}
+
+		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+			s.backendConn.Close()
+			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
+		}
+
+		// Upgrade connection to TLS
+		tlsConn := tls.Client(s.backendConn, tlsConfig)
+		err = tlsConn.Handshake()
+		if err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("TLS handshake with backend failed: %w", err)
+		}
+
+		log.Printf("ManageSieve Proxy [%s] StartTLS negotiation successful with backend %s", s.server.name, actualAddr)
+		s.backendConn = tlsConn
 	}
 
 	// Now authenticate to backend
@@ -436,7 +519,8 @@ func (s *Session) authenticateToBackend() error {
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
-	_, err := backendWriter.WriteString(fmt.Sprintf("AUTHENTICATE PLAIN %s\r\n", encoded))
+	// ManageSieve requires quoted strings for command arguments
+	_, err := backendWriter.WriteString(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", encoded))
 	if err != nil {
 		return fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
 	}

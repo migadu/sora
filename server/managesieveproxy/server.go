@@ -47,6 +47,9 @@ type Server struct {
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
+
+	// Debug logging
+	debug bool
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
@@ -82,6 +85,9 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
+
+	// Debug logging
+	Debug bool // Enable debug logging
 }
 
 // New creates a new ManageSieve proxy server.
@@ -167,6 +173,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
 		minBytesPerMinute:      opts.MinBytesPerMinute,
 		limiter:                limiter,
+		debug:                  opts.Debug,
 	}, nil
 }
 

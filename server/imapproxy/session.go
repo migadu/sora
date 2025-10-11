@@ -474,7 +474,9 @@ func (s *Session) connectToBackend() error {
 		log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, s.serverAddr, err)
 	}
 
-	log.Printf("IMAP Proxy [%s] Backend greeting from %s: %s", s.server.name, s.serverAddr, strings.TrimRight(greeting, "\r\n"))
+	if s.server.debugWriter != nil {
+		log.Printf("IMAP Proxy [%s] Backend greeting from %s: %s", s.server.name, s.serverAddr, strings.TrimRight(greeting, "\r\n"))
+	}
 
 	return nil
 }
