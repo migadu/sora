@@ -135,11 +135,48 @@ func (s *Session) handleConnection() {
 			// Check if initial response is included
 			var saslLine string
 			if len(args) >= 2 {
-				// Initial response provided
+				// Initial response provided (either quoted string or literal)
 				if s.server.debug {
 					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: using initial response from args[1]", s.server.name)
 				}
-				saslLine = server.UnquoteString(args[1])
+				arg1 := args[1]
+
+				// Check if it's a literal string {number+} or {number}
+				if strings.HasPrefix(arg1, "{") && strings.HasSuffix(arg1, "}") || strings.HasSuffix(arg1, "+}") {
+					// Literal string - need to read the specified number of bytes
+					var literalSize int
+					literalStr := strings.TrimPrefix(arg1, "{")
+					literalStr = strings.TrimSuffix(literalStr, "}")
+					literalStr = strings.TrimSuffix(literalStr, "+")
+
+					_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
+					if err != nil || literalSize < 0 || literalSize > 8192 {
+						if s.handleAuthError(`NO "Invalid literal size"`) {
+							return
+						}
+						continue
+					}
+
+					if s.server.debug {
+						log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: reading literal of %d bytes", s.server.name, literalSize)
+					}
+
+					// Read the literal data
+					literalData := make([]byte, literalSize)
+					_, err = io.ReadFull(s.clientReader, literalData)
+					if err != nil {
+						log.Printf("ManageSieve Proxy [%s] Error reading literal data: %v", s.server.name, err)
+						return
+					}
+
+					// Read the trailing CRLF after literal
+					s.clientReader.ReadString('\n')
+
+					saslLine = string(literalData)
+				} else {
+					// Quoted string
+					saslLine = server.UnquoteString(arg1)
+				}
 			} else {
 				if s.server.debug {
 					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: sending continuation, waiting for response", s.server.name)

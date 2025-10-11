@@ -538,21 +538,40 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
 		// It will fail only if an exclusive lock is held (e.g., by the migration tool).
+		// Retry with backoff to handle restarts where the old instance is still shutting down.
 		var lockAcquired bool
-		err = lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock_shared($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
-		if err != nil {
-			lockConn.Release()
-			db.Close()
-			return nil, fmt.Errorf("failed to attempt advisory lock: %w", err)
+		maxRetries := 10
+		retryDelay := 500 * time.Millisecond
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d)...", attempt+1, maxRetries)
+				time.Sleep(retryDelay)
+				retryDelay *= 2 // Exponential backoff
+				if retryDelay > 5*time.Second {
+					retryDelay = 5 * time.Second
+				}
+			}
+
+			err = lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock_shared($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
+			if err != nil {
+				lockConn.Release()
+				db.Close()
+				return nil, fmt.Errorf("failed to attempt advisory lock: %w", err)
+			}
+
+			if lockAcquired {
+				log.Printf("[DB] Acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
+				db.lockConn = lockConn // Store the *pgxpool.Conn
+				break
+			}
 		}
+
 		if !lockAcquired {
 			lockConn.Release()
 			db.Close()
-			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d). A migration may be in progress", consts.SoraAdvisoryLockID)
+			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d) after %d attempts. A migration may be in progress or another instance is shutting down", consts.SoraAdvisoryLockID, maxRetries)
 		}
-
-		log.Printf("[DB] Acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
-		db.lockConn = lockConn // Store the *pgxpool.Conn
 	}
 	return db, nil
 }

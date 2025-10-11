@@ -962,8 +962,42 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// Check if initial response is provided
 	var authData string
 	if len(parts) > 2 {
-		// Initial response provided - remove quotes and decode from base64
-		authData = server.UnquoteString(parts[2])
+		// Initial response provided (either quoted string or literal)
+		arg2 := parts[2]
+
+		// Check if it's a literal string {number+} or {number}
+		if strings.HasPrefix(arg2, "{") && (strings.HasSuffix(arg2, "}") || strings.HasSuffix(arg2, "+}")) {
+			// Literal string - need to read the specified number of bytes
+			var literalSize int
+			literalStr := strings.TrimPrefix(arg2, "{")
+			literalStr = strings.TrimSuffix(literalStr, "}")
+			literalStr = strings.TrimSuffix(literalStr, "+")
+
+			_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
+			if err != nil || literalSize < 0 || literalSize > 8192 {
+				s.sendResponse("NO Invalid literal size\r\n")
+				return false
+			}
+
+			s.Log("Reading AUTHENTICATE literal of %d bytes", literalSize)
+
+			// Read the literal data
+			literalData := make([]byte, literalSize)
+			_, err = io.ReadFull(s.reader, literalData)
+			if err != nil {
+				s.Log("error reading literal data: %v", err)
+				s.sendResponse("NO Authentication failed\r\n")
+				return false
+			}
+
+			// Read the trailing CRLF after literal
+			s.reader.ReadString('\n')
+
+			authData = string(literalData)
+		} else {
+			// Quoted string - remove quotes and decode from base64
+			authData = server.UnquoteString(arg2)
+		}
 	} else {
 		// No initial response, send continuation
 		s.sendResponse("\"\"\r\n")

@@ -134,6 +134,11 @@ func main() {
 	select {
 	case <-ctx.Done():
 		errorHandler.Shutdown(ctx)
+		// Give servers time to shut down gracefully before releasing resources
+		// This ensures background goroutines finish and advisory locks are released
+		logger.Infof("Waiting for all servers to stop gracefully...")
+		time.Sleep(5 * time.Second)
+		logger.Infof("Shutdown grace period complete, releasing database resources...")
 	case err := <-errChan:
 		errorHandler.FatalError("server operation", err)
 		os.Exit(errorHandler.WaitForExit())
