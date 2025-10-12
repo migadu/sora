@@ -289,14 +289,14 @@ func (c *Cache) Delete(contentHash string) error {
 	if err := os.Remove(path); err != nil {
 		// If the file doesn't exist, we can consider the delete successful for the cache's state.
 		if !errors.Is(err, os.ErrNotExist) {
-			log.Printf("[CACHE] failed to remove cache file %s: %v\n", path, err)
+			log.Printf("[CACHE] failed to remove cache file %s: %v", path, err)
 			return fmt.Errorf("failed to remove cache file %s: %w", path, err)
 		}
 	}
 	// Always try to remove from index, even if file was already gone.
 	if _, err := c.db.Exec(`DELETE FROM cache_index WHERE path = ?`, path); err != nil {
 		// Log the error, as this means the index might be out of sync.
-		log.Printf("[CACHE] failed to remove index entry for path %s: %v\n", path, err)
+		log.Printf("[CACHE] failed to remove index entry for path %s: %v", path, err)
 		return fmt.Errorf("failed to remove index entry for path %s: %w", path, err)
 	}
 
@@ -325,7 +325,7 @@ func (c *Cache) MoveIn(path string, contentHash string) error {
 
 	// File does not exist, so proceed with moving it.
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-		log.Printf("[CACHE] failed to create target directory %s: %v\n", filepath.Dir(target), err)
+		log.Printf("[CACHE] failed to create target directory %s: %v", filepath.Dir(target), err)
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
@@ -335,18 +335,18 @@ func (c *Cache) MoveIn(path string, contentHash string) error {
 		// It's likely a cross-device error.
 		if isCrossDeviceError(err) {
 			// Cross-device link error (common on Unix), fall back to copy+delete.
-			log.Printf("[CACHE] cross-device link detected, falling back to copy+delete for %s to %s\n", path, target)
+			log.Printf("[CACHE] cross-device link detected, falling back to copy+delete for %s to %s", path, target)
 			if err := copyFile(path, target); err != nil {
-				log.Printf("[CACHE] failed to copy file %s to %s: %v\n", path, target, err)
+				log.Printf("[CACHE] failed to copy file %s to %s: %v", path, target, err)
 				return fmt.Errorf("failed to copy file into cache: %w", err)
 			}
 			if err := os.Remove(path); err != nil {
-				log.Printf("[CACHE] failed to remove source file %s after copy: %v\n", path, err)
+				log.Printf("[CACHE] failed to remove source file %s after copy: %v", path, err)
 				// File was copied successfully, so continue with tracking.
 			}
 		} else {
 			// Another type of error occurred.
-			log.Printf("[CACHE] failed to move file %s to %s: %v\n", path, target, err)
+			log.Printf("[CACHE] failed to move file %s to %s: %v", path, target, err)
 			return fmt.Errorf("failed to move file into cache: %w", err)
 		}
 	}
@@ -476,13 +476,13 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 func (c *Cache) runPurgeCycle(ctx context.Context) {
 	log.Println("[CACHE] running cache purge cycle")
 	if err := c.PurgeIfNeeded(ctx); err != nil {
-		log.Printf("[CACHE] WARNING: cache purge failed: %v\n", err)
+		log.Printf("[CACHE] WARNING: cache purge failed: %v", err)
 	}
 	if err := c.RemoveStaleDBEntries(ctx); err != nil {
-		log.Printf("[CACHE] stale file cleanup error: %v\n", err)
+		log.Printf("[CACHE] stale file cleanup error: %v", err)
 	}
 	if err := c.PurgeOrphanedContentHashes(ctx); err != nil {
-		log.Printf("[CACHE] orphan cleanup error: %v\n", err)
+		log.Printf("[CACHE] orphan cleanup error: %v", err)
 	}
 }
 
@@ -706,7 +706,7 @@ func (c *Cache) PurgeOrphanedContentHashes(ctx context.Context) error {
 	}
 
 	if purged > 0 {
-		log.Printf("[CACHE] removed %d orphaned entries\n", purged)
+		log.Printf("[CACHE] removed %d orphaned entries", purged)
 	}
 
 	return nil
@@ -752,7 +752,7 @@ func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, path
 				removeEmptyParents(path, dataDir)
 			}
 		} else {
-			log.Printf("[CACHE] error removing cached file %s: %v\n", path, err)
+			log.Printf("[CACHE] error removing cached file %s: %v", path, err)
 		}
 	}
 
@@ -763,7 +763,7 @@ func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, path
 	// Batch delete from the SQLite index inside a transaction.
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("[CACHE] error beginning transaction: %v\n", err)
+		log.Printf("[CACHE] error beginning transaction: %v", err)
 		return 0
 	}
 	defer tx.Rollback() // Rollback if not committed
@@ -778,12 +778,12 @@ func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, path
 
 	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
-		log.Printf("[CACHE] error batch deleting from index: %v\n", err)
+		log.Printf("[CACHE] error batch deleting from index: %v", err)
 		return 0
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("[CACHE] error committing transaction: %v\n", err)
+		log.Printf("[CACHE] error committing transaction: %v", err)
 		return 0
 	}
 
@@ -804,7 +804,7 @@ func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
-			log.Printf("[CACHE] error scanning path during stale check: %v\n", err)
+			log.Printf("[CACHE] error scanning path during stale check: %v", err)
 			continue
 		}
 		allPaths = append(allPaths, path)
@@ -851,7 +851,7 @@ func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
 	}
 
 	rowsAffected, _ := result.RowsAffected()
-	log.Printf("[CACHE] removed %d stale entries from index\n", rowsAffected)
+	log.Printf("[CACHE] removed %d stale entries from index", rowsAffected)
 	return nil
 }
 
@@ -859,7 +859,7 @@ func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
 func (c *Cache) GetPathForContentHash(contentHash string) string {
 	// Require a minimum length for the hash to be splittable as intended.
 	if len(contentHash) < 4 { // Adjusted minimum length
-		log.Printf("[CACHE] received short contentHash '%s', using directly in data_dir path construction\n", contentHash)
+		log.Printf("[CACHE] received short contentHash '%s', using directly in data_dir path construction", contentHash)
 		return filepath.Join(c.basePath, DataDir, contentHash) // Or return an error
 	}
 	return filepath.Join(c.basePath, DataDir, contentHash[:2], contentHash[2:4], contentHash[4:])

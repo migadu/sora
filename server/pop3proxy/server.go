@@ -265,14 +265,14 @@ func (s *POP3ProxyServer) Start() error {
 			s.cancel()
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
-		log.Printf("* POP3 proxy [%s] listening with TLS on %s", s.name, s.addr)
+		log.Printf("POP3 proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("* POP3 proxy [%s] listening on %s", s.name, s.addr)
+		log.Printf("POP3 proxy [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 
@@ -285,7 +285,7 @@ func (s *POP3ProxyServer) Start() error {
 			minBytesPerMinute: s.minBytesPerMinute,
 			protocol:          "pop3_proxy",
 		}
-		log.Printf("* POP3 proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+		log.Printf("POP3 proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
 			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
@@ -333,7 +333,7 @@ func (s *POP3ProxyServer) Start() error {
 		}
 
 		session.RemoteIP = conn.RemoteAddr().String()
-		log.Printf("* POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
+		log.Printf("POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
 
 		// Track proxy connection
 		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()
@@ -369,7 +369,7 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 func (s *POP3ProxyServer) Stop() error {
-	log.Printf("* POP3 Proxy [%s] stopping...", s.name)
+	log.Printf("POP3 Proxy [%s] stopping...", s.name)
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -382,7 +382,7 @@ func (s *POP3ProxyServer) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("* POP3 Proxy [%s] server stopped gracefully", s.name)
+		log.Printf("POP3 Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
 		log.Printf("POP3 Proxy [%s] Server stop timeout", s.name)
 	}
@@ -390,9 +390,9 @@ func (s *POP3ProxyServer) Stop() error {
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("* POP3 Proxy [%s] closing prelookup client...", s.name)
+			log.Printf("POP3 Proxy [%s] closing prelookup client...", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("* POP3 Proxy [%s] error closing prelookup client: %v", s.name, err)
+				log.Printf("POP3 Proxy [%s] error closing prelookup client: %v", s.name, err)
 			}
 		}
 	}

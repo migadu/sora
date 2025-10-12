@@ -20,6 +20,7 @@ import (
 // Server represents an LMTP proxy server.
 type Server struct {
 	listener           net.Listener
+	listenerMu         sync.RWMutex
 	rdb                *resilient.ResilientDatabase
 	name               string // Server name for logging
 	addr               string
@@ -223,20 +224,24 @@ func (s *Server) Start() error {
 			log.Printf("Client TLS certificate verification is DISABLED for LMTP proxy [%s] (tls_verify=false)", s.name)
 		}
 
+		s.listenerMu.Lock()
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
+		s.listenerMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* LMTP proxy [%s] listening with implicit TLS on %s", s.name, s.addr)
+		log.Printf("LMTP proxy [%s] listening with implicit TLS on %s", s.name, s.addr)
 	} else {
+		s.listenerMu.Lock()
 		s.listener, err = net.Listen("tcp", s.addr)
+		s.listenerMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
 		if s.tlsUseStartTLS {
-			log.Printf("* LMTP proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
+			log.Printf("LMTP proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
 		} else {
-			log.Printf("* LMTP proxy [%s] listening on %s", s.name, s.addr)
+			log.Printf("LMTP proxy [%s] listening on %s", s.name, s.addr)
 		}
 	}
 
@@ -350,12 +355,16 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the LMTP proxy server.
 func (s *Server) Stop() error {
-	log.Printf("* LMTP Proxy [%s] stopping...", s.name)
+	log.Printf("LMTP Proxy [%s] stopping...", s.name)
 
 	s.cancel()
 
-	if s.listener != nil {
-		s.listener.Close()
+	s.listenerMu.RLock()
+	listener := s.listener
+	s.listenerMu.RUnlock()
+
+	if listener != nil {
+		listener.Close()
 	}
 
 	done := make(chan struct{})
@@ -366,7 +375,7 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("* LMTP Proxy [%s] server stopped gracefully", s.name)
+		log.Printf("LMTP Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
 		log.Printf("LMTP Proxy [%s] Server stop timeout", s.name)
 	}
@@ -374,9 +383,9 @@ func (s *Server) Stop() error {
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("* LMTP Proxy [%s] closing prelookup client...", s.name)
+			log.Printf("LMTP Proxy [%s] closing prelookup client...", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("* LMTP Proxy [%s] error closing prelookup client: %v", s.name, err)
+				log.Printf("LMTP Proxy [%s] error closing prelookup client: %v", s.name, err)
 			}
 		}
 	}

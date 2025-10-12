@@ -491,11 +491,17 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		return nil, fmt.Errorf("write database configuration is required")
 	}
 
+	// Determine the pool type for logging (allows resilient layer to override for read pools)
+	poolType := "write"
+	if dbConfig.PoolTypeOverride != "" {
+		poolType = dbConfig.PoolTypeOverride
+	}
+
 	// Create write failover manager and pool
-	writeFailover := NewFailoverManager(dbConfig.Write, "write")
-	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.LogQueries, "write", writeFailover)
+	writeFailover := NewFailoverManager(dbConfig.Write, poolType)
+	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.LogQueries, poolType, writeFailover)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create write pool: %v", err)
+		return nil, fmt.Errorf("failed to create %s pool: %v", poolType, err)
 	}
 
 	// Create read pool and failover manager
@@ -505,8 +511,11 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		readFailover = NewFailoverManager(dbConfig.Read, "read")
 		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.LogQueries, "read", readFailover)
 		if err != nil {
-			writePool.Close() // Clean up write pool on error
-			return nil, fmt.Errorf("failed to create read pool: %v", err)
+			// If all read replicas are down, fall back to write pool instead of failing startup
+			log.Printf("[DB] WARNING: Failed to create read pool (all read replicas unreachable): %v", err)
+			log.Printf("[DB] Falling back to write pool for read operations")
+			readPool = writePool
+			readFailover = writeFailover // Share the same failover manager
 		}
 	} else {
 		// If no read config specified, use write pool for reads
@@ -625,7 +634,9 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 			sslMode = "require"
 		}
 
-		connString := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
+		// Add connect_timeout to fail fast on unreachable hosts (5 seconds)
+		// This prevents long waits when a database host is down
+		connString := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&connect_timeout=5",
 			endpoint.User, endpoint.Password, actualHost, endpoint.Name, sslMode)
 
 		config, err := pgxpool.ParseConfig(connString)
@@ -666,6 +677,16 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 			}
 			config.MaxConnIdleTime = idleTime
 		}
+
+		// Configure health check period to detect dead connections quickly
+		// This runs a background goroutine that checks idle connections periodically
+		config.HealthCheckPeriod = 15 * time.Second
+
+		// Note: We don't use BeforeAcquire for connection validation because:
+		// 1. It adds latency to every query (blocking acquire)
+		// 2. HealthCheckPeriod already proactively removes dead connections
+		// 3. Query-level timeouts in the resilient layer handle connection failures
+		// 4. Dead connections will be detected on first query and removed from pool
 
 		dbPool, err := pgxpool.NewWithConfig(ctx, config)
 		if err != nil {

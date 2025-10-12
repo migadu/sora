@@ -12,7 +12,7 @@ type CustomTracer struct{}
 
 // TraceQueryStart is called at the beginning of Query, QueryRow, and Exec calls.
 func (ct *CustomTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	log.Printf("[DB] SQL: %s\n-- args: %v\n", data.SQL, data.Args)
+	log.Printf("[DB] SQL: %s\n-- args: %v", data.SQL, data.Args)
 	return ctx
 }
 

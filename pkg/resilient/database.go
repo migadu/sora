@@ -86,7 +86,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -98,6 +97,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
@@ -112,10 +112,20 @@ type DatabasePool struct {
 	failCount   atomic.Int64
 }
 
+// FailedReplica tracks a read replica that failed to connect at startup
+type FailedReplica struct {
+	host           string
+	endpointConfig *config.DatabaseEndpointConfig
+	lastAttempt    time.Time
+	attemptCount   int
+	mu             sync.Mutex
+}
+
 // RuntimeFailoverManager manages multiple database pools and handles failover
 type RuntimeFailoverManager struct {
 	writePools      []*DatabasePool
 	readPools       []*DatabasePool
+	failedReplicas  []*FailedReplica // Read replicas that failed at startup
 	currentWriteIdx atomic.Int64
 	currentReadIdx  atomic.Int64
 	config          *config.DatabaseConfig
@@ -157,7 +167,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 		return counts.Requests >= 8 && failureRatio >= 0.6
 	}
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("[RESILIENT-FAILOVER] Database query circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
@@ -169,7 +179,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 		return counts.Requests >= 5 && failureRatio >= 0.5
 	}
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("[RESILIENT-FAILOVER] Database write circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
 
 	// Create failover manager
@@ -214,20 +224,20 @@ func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType
 	case timeoutWrite:
 		timeout, err = rd.config.GetWriteTimeout()
 		if err != nil {
-			log.Printf("WARN: Invalid global write_timeout, using default 10s: %v", err)
+			logger.Warn("Invalid global write_timeout, using default 10s", "error", err)
 			timeout = 15 * time.Second
 		}
 	case timeoutSearch:
 		timeout, err = rd.config.GetSearchTimeout()
 		if err != nil {
-			log.Printf("WARN: Invalid global search_timeout, using default: %v", err)
+			logger.Warn("Invalid global search_timeout, using default", "error", err)
 			timeout = 60 * time.Second
 		}
 	case timeoutAuth:
 		// Auth operations should be fast - use write timeout as base, but shorter
 		timeout, err = rd.config.GetWriteTimeout()
 		if err != nil {
-			log.Printf("WARN: Invalid global write_timeout for auth, using default 10s: %v", err)
+			logger.Warn("Invalid global write_timeout for auth, using default 10s", "error", err)
 			timeout = 10 * time.Second
 		} else if timeout > 10*time.Second {
 			// Cap auth timeout to be reasonably fast
@@ -237,14 +247,14 @@ func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType
 		// Admin operations can be longer (imports, user creation)
 		timeout, err = rd.config.GetSearchTimeout() // Use search timeout as base
 		if err != nil {
-			log.Printf("WARN: Invalid global search_timeout for admin, using default 45s: %v", err)
+			logger.Warn("Invalid global search_timeout for admin, using default 45s", "error", err)
 			timeout = 45 * time.Second
 		}
 		timeout = time.Duration(float64(timeout) * 0.75) // Admin ops get 75% of search timeout
 	default: // timeoutRead
 		timeout, err = rd.config.GetQueryTimeout()
 		if err != nil {
-			log.Printf("WARN: Invalid global query_timeout, using default: %v", err)
+			logger.Warn("Invalid global query_timeout, using default", "error", err)
 			timeout = 30 * time.Second
 		}
 
@@ -257,7 +267,7 @@ func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType
 		if endpointConfig != nil {
 			endpointTimeout, endpointErr := endpointConfig.GetQueryTimeout()
 			if endpointErr != nil {
-				log.Printf("WARN: Invalid endpoint query_timeout, using global/default: %v", endpointErr)
+				logger.Warn("Invalid endpoint query_timeout, using global/default", "error", endpointErr)
 			} else if endpointTimeout > 0 {
 				timeout = endpointTimeout // Override with endpoint-specific timeout
 			}
@@ -350,7 +360,7 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 				// and handle the error outside
 				return cbErr
 			}
-			log.Printf("Retrying query due to retryable error: %v", cbErr)
+			logger.Debug("Retrying query due to retryable error", "error", cbErr)
 			return cbErr // It's retryable, so return the error to signal a retry.
 		}
 
@@ -449,7 +459,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 			if !rd.isRetryableError(cbErr) {
 				return retry.Stop(cbErr)
 			}
-			log.Printf("Retrying BeginTx due to retryable error: %v", cbErr)
+			logger.Debug("Retrying BeginTx due to retryable error", "error", cbErr)
 			return cbErr
 		}
 
@@ -526,9 +536,9 @@ func (rd *ResilientDatabase) Close() {
 	close(rd.failoverManager.healthCheckStop)
 
 	// Wait for all background goroutines to finish
-	log.Printf("[RESILIENT-FAILOVER] Waiting for background goroutines to finish...")
+	logger.Info("Waiting for background goroutines to finish", "component", "RESILIENT-FAILOVER")
 	rd.failoverManager.healthCheckWg.Wait()
-	log.Printf("[RESILIENT-FAILOVER] All background goroutines finished")
+	logger.Info("All background goroutines finished", "component", "RESILIENT-FAILOVER")
 
 	// Close all managed pools
 	for _, pool := range rd.failoverManager.writePools {
@@ -604,6 +614,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	manager := &RuntimeFailoverManager{
 		writePools:      make([]*DatabasePool, 0),
 		readPools:       make([]*DatabasePool, 0),
+		failedReplicas:  make([]*FailedReplica, 0),
 		config:          config,
 		healthCheckStop: make(chan struct{}),
 	}
@@ -615,7 +626,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 			isFirstPool := (i == 0)
 			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write", runMigrations && isFirstPool, isFirstPool)
 			if err != nil {
-				log.Printf("[RESILIENT-FAILOVER] Failed to create write pool for host %s: %v", host, err)
+				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
 				continue
 			}
 
@@ -636,11 +647,22 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 
 	// Create database pools for all read hosts
 	if config.Read != nil && len(config.Read.Hosts) > 0 {
-		for i, host := range config.Read.Hosts {
+		logger.Info("Attempting to connect to read replicas", "component", "RESILIENT-FAILOVER", "count", len(config.Read.Hosts))
+		successCount := 0
+		for _, host := range config.Read.Hosts {
 			// Never run migrations or acquire lock for read pools.
 			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", false, false)
 			if err != nil {
-				log.Printf("[RESILIENT-FAILOVER] Failed to create read pool for host %s: %v", host, err)
+				logger.Warn("Failed to connect to read replica, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
+
+				// Track this failed replica for reconnection attempts
+				failedReplica := &FailedReplica{
+					host:           host,
+					endpointConfig: config.Read,
+					lastAttempt:    time.Now(),
+					attemptCount:   1,
+				}
+				manager.failedReplicas = append(manager.failedReplicas, failedReplica)
 				continue
 			}
 
@@ -651,17 +673,28 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 			dbPool.isHealthy.Store(true) // Start as healthy
 
 			manager.readPools = append(manager.readPools, dbPool)
+			successCount++
 
-			// First pool becomes the current one
-			if i == 0 {
-				manager.currentReadIdx.Store(0)
+			// First successful pool becomes the current one
+			if successCount == 1 {
+				manager.currentReadIdx.Store(int64(len(manager.readPools) - 1))
 			}
+		}
+		if successCount > 0 {
+			logger.Info("Successfully connected to read replicas", "component", "RESILIENT-FAILOVER", "success_count", successCount, "total", len(config.Read.Hosts))
+		}
+		if len(manager.failedReplicas) > 0 {
+			logger.Info("Read replicas failed at startup, will attempt reconnection", "component", "RESILIENT-FAILOVER", "failed_count", len(manager.failedReplicas))
 		}
 	}
 
 	// Fallback: if no read pools, use write pools for reads
 	if len(manager.readPools) == 0 && len(manager.writePools) > 0 {
-		log.Printf("[RESILIENT-FAILOVER] No read pools configured, using write pools for read operations")
+		if config.Read != nil && len(config.Read.Hosts) > 0 {
+			logger.Warn("All read replicas unreachable at startup, falling back to write pools, will automatically reconnect when they recover", "component", "RESILIENT-FAILOVER")
+		} else {
+			logger.Info("No read pools configured, using write pools for read operations", "component", "RESILIENT-FAILOVER")
+		}
 		manager.readPools = manager.writePools
 		manager.currentReadIdx.Store(manager.currentWriteIdx.Load())
 	}
@@ -670,14 +703,15 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		return nil, fmt.Errorf("no healthy database pools available")
 	}
 
-	log.Printf("[RESILIENT-FAILOVER] Created runtime failover manager with %d write pools and %d read pools",
-		len(manager.writePools), len(manager.readPools))
+	logger.Info("Created runtime failover manager", "component", "RESILIENT-FAILOVER", "write_pools", len(manager.writePools), "read_pools", len(manager.readPools))
 	return manager, nil
 }
 
 // createDatabasePool creates a single database connection pool
 func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool, acquireLock bool) (*db.Database, error) {
 	// Create a temporary config for this single host
+	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
+	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
 	tempConfig := &config.DatabaseConfig{
 		LogQueries: logQueries,
 		Write: &config.DatabaseEndpointConfig{
@@ -692,6 +726,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 			MaxConnLifetime: endpointConfig.MaxConnLifetime,
 			MaxConnIdleTime: endpointConfig.MaxConnIdleTime,
 		},
+		PoolTypeOverride: poolType, // Pass the actual pool type for logging
 	}
 
 	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations, acquireLock)
@@ -807,10 +842,10 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 			// Found a healthy pool, switch to it.
 			if isWrite {
 				rd.failoverManager.currentWriteIdx.Store(int64(nextIdx))
-				log.Printf("[RESILIENT-FAILOVER] Switched write operations from unhealthy pool %s to healthy pool %s", pools[currentIdx].host, pools[nextIdx].host)
+				logger.Info("Switched write operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			} else {
 				rd.failoverManager.currentReadIdx.Store(int64(nextIdx))
-				log.Printf("[RESILIENT-FAILOVER] Switched read operations from unhealthy pool %s to healthy pool %s", pools[currentIdx].host, pools[nextIdx].host)
+				logger.Info("Switched read operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			}
 			return pools[nextIdx].database
 		}
@@ -821,7 +856,7 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 	if isWrite {
 		opType = "write"
 	}
-	log.Printf("[RESILIENT-FAILOVER] WARNING: No healthy %s database pools available. Continuing to use unhealthy pool %s as a last resort.", opType, pools[currentIdx].host)
+	logger.Warn("No healthy database pools available, continuing with unhealthy pool as last resort", "component", "RESILIENT-FAILOVER", "type", opType, "pool", pools[currentIdx].host)
 	return pools[currentIdx].database
 }
 
@@ -837,15 +872,15 @@ func (rd *ResilientDatabase) startRuntimeHealthChecking(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	log.Printf("[RESILIENT-FAILOVER] Started background health checking")
+	logger.Info("Started background health checking", "component", "RESILIENT-FAILOVER")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking (context done)")
+			logger.Info("Stopped background health checking (context done)", "component", "RESILIENT-FAILOVER")
 			return
 		case <-rd.failoverManager.healthCheckStop:
-			log.Printf("[RESILIENT-FAILOVER] Stopped background health checking (close signal)")
+			logger.Info("Stopped background health checking (close signal)", "component", "RESILIENT-FAILOVER")
 			return
 		case <-ticker.C:
 			rd.performHealthChecks(ctx)
@@ -874,6 +909,9 @@ func (rd *ResilientDatabase) performHealthChecks(ctx context.Context) {
 			}(pool)
 		}
 	}
+
+	// Attempt to reconnect to failed read replicas
+	rd.attemptReconnectFailedReplicas(ctx)
 }
 
 // checkPoolHealth checks the health of a single pool
@@ -881,19 +919,108 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 	healthCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	err := pool.database.WritePool.Ping(healthCtx)
+	// Use the appropriate pool for health checking
+	// For read pools that are distinct from write pools, check the read pool specifically
+	// Otherwise, check the write pool (which handles both read and write operations)
+	var err error
+	if poolType == "read" && rd.failoverManager.readPoolsAreDistinct() {
+		err = pool.database.ReadPool.Ping(healthCtx)
+	} else {
+		err = pool.database.WritePool.Ping(healthCtx)
+	}
+
 	wasHealthy := pool.isHealthy.Load()
 	isHealthyNow := (err == nil)
 
 	if wasHealthy != isHealthyNow {
 		pool.isHealthy.Store(isHealthyNow)
 		if isHealthyNow {
-			log.Printf("[RESILIENT-FAILOVER] %s database pool recovered: %s", poolType, pool.host)
+			logger.Info("Database pool recovered", "component", "RESILIENT-FAILOVER", "type", poolType, "host", pool.host)
 		} else {
-			log.Printf("[RESILIENT-FAILOVER] %s database pool failed health check: %s (error: %v)", poolType, pool.host, err)
+			logger.Warn("Database pool failed health check", "component", "RESILIENT-FAILOVER", "type", poolType, "host", pool.host, "error", err)
 			pool.lastFailure.Store(time.Now().Unix())
 			pool.failCount.Add(1)
 		}
+	}
+}
+
+// attemptReconnectFailedReplicas tries to reconnect to read replicas that failed at startup
+func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context) {
+	rd.failoverManager.mu.Lock()
+	defer rd.failoverManager.mu.Unlock()
+
+	if len(rd.failoverManager.failedReplicas) == 0 {
+		return
+	}
+
+	// Process failed replicas (iterate backwards so we can remove items)
+	for i := len(rd.failoverManager.failedReplicas) - 1; i >= 0; i-- {
+		replica := rd.failoverManager.failedReplicas[i]
+
+		replica.mu.Lock()
+		timeSinceLastAttempt := time.Since(replica.lastAttempt)
+		attemptCount := replica.attemptCount
+		replica.mu.Unlock()
+
+		// Use exponential backoff: 30s, 1m, 2m, 5m, 10m, then every 10m
+		var backoffDuration time.Duration
+		switch {
+		case attemptCount <= 1:
+			backoffDuration = 30 * time.Second
+		case attemptCount == 2:
+			backoffDuration = 1 * time.Minute
+		case attemptCount == 3:
+			backoffDuration = 2 * time.Minute
+		case attemptCount == 4:
+			backoffDuration = 5 * time.Minute
+		default:
+			backoffDuration = 10 * time.Minute
+		}
+
+		if timeSinceLastAttempt < backoffDuration {
+			continue // Not time to retry yet
+		}
+
+		// Attempt reconnection
+		logger.Info("Attempting to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "attempt", attemptCount+1)
+
+		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.LogQueries, "read", false, false)
+
+		replica.mu.Lock()
+		replica.lastAttempt = time.Now()
+		replica.attemptCount++
+		replica.mu.Unlock()
+
+		if err != nil {
+			logger.Debug("Failed to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "error", err)
+			continue
+		}
+
+		// Success! Add the pool and remove from failed list
+		logger.Info("Successfully reconnected to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host)
+
+		dbPool := &DatabasePool{
+			database: pool,
+			host:     replica.host,
+		}
+		dbPool.isHealthy.Store(true)
+
+		// If we were using write pools as fallback, switch to the new read pool
+		wasUsingWritePoolsForReads := !rd.failoverManager.readPoolsAreDistinct()
+
+		rd.failoverManager.readPools = append(rd.failoverManager.readPools, dbPool)
+
+		// If this is the first read pool (was using write pools before), set it as current
+		if wasUsingWritePoolsForReads {
+			rd.failoverManager.currentReadIdx.Store(int64(len(rd.failoverManager.readPools) - 1))
+			logger.Info("Switching from write pools to dedicated read replica for read operations", "component", "RESILIENT-FAILOVER")
+		}
+
+		// Remove from failed replicas list
+		rd.failoverManager.failedReplicas = append(
+			rd.failoverManager.failedReplicas[:i],
+			rd.failoverManager.failedReplicas[i+1:]...,
+		)
 	}
 }
 
@@ -909,10 +1036,10 @@ func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Printf("[RESILIENT-FAILOVER] Stopped pool metrics collection")
+				logger.Info("Stopped pool metrics collection", "component", "RESILIENT-FAILOVER")
 				return
 			case <-rd.failoverManager.healthCheckStop:
-				log.Printf("[RESILIENT-FAILOVER] Stopped pool metrics collection (close signal)")
+				logger.Info("Stopped pool metrics collection (close signal)", "component", "RESILIENT-FAILOVER")
 				return
 			case <-ticker.C:
 				rd.collectAggregatedPoolStats()
@@ -981,15 +1108,15 @@ func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 		ticker := time.NewTicker(30 * time.Second) // Align with existing health check interval
 		defer ticker.Stop()
 
-		log.Printf("[RESILIENT-FAILOVER] Starting aggregated pool health monitoring every 30s")
+		logger.Info("Starting aggregated pool health monitoring every 30s", "component", "RESILIENT-FAILOVER")
 
 		for {
 			select {
 			case <-ctx.Done():
-				log.Printf("[RESILIENT-FAILOVER] Stopping aggregated pool health monitoring")
+				logger.Info("Stopping aggregated pool health monitoring", "component", "RESILIENT-FAILOVER")
 				return
 			case <-rd.failoverManager.healthCheckStop:
-				log.Printf("[RESILIENT-FAILOVER] Stopping aggregated pool health monitoring (close signal)")
+				logger.Info("Stopping aggregated pool health monitoring (close signal)", "component", "RESILIENT-FAILOVER")
 				return
 			case <-ticker.C:
 				rd.monitorAggregatedPoolHealth()
@@ -1046,7 +1173,7 @@ func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType st
 				utilization := float64(stats.AcquiredConns()) / float64(stats.MaxConns())
 				if utilization > 0.95 {
 					exhaustionCount++
-					log.Printf("[RESILIENT-FAILOVER] WARNING: %s pool %s near exhaustion (%.1f%% utilization)",
+					logger.Warn("Database pool near exhaustion", "component", "RESILIENT-FAILOVER", "type",
 						poolType, pool.host, utilization*100)
 				}
 			}
@@ -1066,6 +1193,5 @@ func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType st
 		metrics.DBPoolExhaustion.WithLabelValues(poolType).Add(float64(exhaustionCount))
 	}
 
-	log.Printf("[RESILIENT-FAILOVER] %s pools health: %d total conns, %d idle, %d in-use across %d pools",
-		poolType, totalConns, idleConns, acquiredConns, len(pools))
+	logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", poolType, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", len(pools))
 }

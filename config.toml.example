@@ -13,11 +13,11 @@
 
 # LOGGING CONFIGURATION
 # =============================================================================
-# Structured logging configuration using zap logger for better observability.
+# Structured logging configuration using Go's standard slog library.
 
 [logging]
 output = "stderr"         # Log destination: "stderr", "stdout", "syslog", or "/path/to/file.log"
-format = "console"        # Log format: "json" for structured JSON logs, "console" for human-readable output
+format = "console"        # Log format: "json" for structured JSON logs, "console" for human-readable text
 level = "info"            # Log level: "debug", "info", "warn", "error"
 
 

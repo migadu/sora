@@ -475,7 +475,7 @@ func (s *Session) connectToBackend() error {
 	}
 
 	if s.server.debugWriter != nil {
-		log.Printf("IMAP Proxy [%s] Backend greeting from %s: %s", s.server.name, s.serverAddr, strings.TrimRight(greeting, "\r\n"))
+		log.Printf("IMAP Proxy [%s] Backend greeting from %s: %s", s.server.name, s.serverAddr, strings.TrimRight(greeting, "\r"))
 	}
 
 	return nil

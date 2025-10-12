@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +44,28 @@ var (
 	date    = "unknown"
 )
 
+// serverManager tracks running servers for coordinated shutdown
+type serverManager struct {
+	wg sync.WaitGroup
+	mu sync.Mutex
+}
+
+func (sm *serverManager) Add() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.wg.Add(1)
+}
+
+func (sm *serverManager) Done() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.wg.Done()
+}
+
+func (sm *serverManager) Wait() {
+	sm.wg.Wait()
+}
+
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
 	storage           *storage.S3Storage
@@ -51,8 +74,10 @@ type serverDependencies struct {
 	cacheInstance     *cache.Cache
 	cleanupWorker     *cleaner.CleanupWorker
 	healthIntegration *health.HealthIntegration
+	metricsCollector  *metrics.Collector
 	hostname          string
 	config            config.Config
+	serverManager     *serverManager
 }
 
 func main() {
@@ -134,10 +159,27 @@ func main() {
 	select {
 	case <-ctx.Done():
 		errorHandler.Shutdown(ctx)
-		// Give servers time to shut down gracefully before releasing resources
-		// This ensures background goroutines finish and advisory locks are released
+		// Wait for all servers to finish shutting down gracefully before releasing resources
 		logger.Infof("Waiting for all servers to stop gracefully...")
-		time.Sleep(5 * time.Second)
+
+		// Wait for server functions to return (listeners closed, Serve() calls returned)
+		done := make(chan struct{})
+		go func() {
+			deps.serverManager.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			logger.Infof("All server listeners closed")
+		case <-time.After(10 * time.Second):
+			logger.Warn("Server shutdown timeout reached after 10 seconds")
+		}
+
+		// Give additional time for connection goroutines to finish and release database resources
+		// This ensures advisory locks are released and no goroutines are accessing the database
+		logger.Infof("Waiting for active connections to finish...")
+		time.Sleep(3 * time.Second)
 		logger.Infof("Shutdown grace period complete, releasing database resources...")
 	case err := <-errChan:
 		errorHandler.FatalError("server operation", err)
@@ -219,8 +261,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	deps := &serverDependencies{
-		hostname: hostname,
-		config:   cfg,
+		hostname:      hostname,
+		config:        cfg,
+		serverManager: &serverManager{}, // Initialize server manager for coordinated shutdown
 	}
 
 	// Initialize S3 storage if needed
@@ -375,6 +418,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
 		deps.cleanupWorker.Start(ctx)
+		defer deps.cleanupWorker.Stop() // Ensure cleanup worker stops cleanly on shutdown
 
 		// Initialize and start the upload worker
 		retryInterval := cfg.Uploader.GetRetryIntervalWithDefault()
@@ -385,17 +429,20 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		deps.uploadWorker.Start(ctx)
+		defer deps.uploadWorker.Stop() // Ensure upload worker stops cleanly on shutdown
 	} else {
 		logger.Info("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
 	}
 
 	// Start health monitoring
 	deps.healthIntegration.Start(ctx)
+	defer deps.healthIntegration.Stop() // Ensure health monitoring stops cleanly on shutdown
 	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
 
 	// Start metrics collector for database statistics
-	metricsCollector := metrics.NewCollector(deps.resilientDB, 60*time.Second)
-	go metricsCollector.Start(ctx)
+	deps.metricsCollector = metrics.NewCollector(deps.resilientDB, 60*time.Second)
+	go deps.metricsCollector.Start(ctx)
+	defer deps.metricsCollector.Stop() // Ensure metrics collector stops cleanly on shutdown
 
 	return deps, nil
 }
@@ -428,7 +475,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				server.MaxTrackedUsers,
 				server.HashUsernames,
 			)
-			go startDynamicMetricsServer(ctx, server, errChan)
+			go startDynamicMetricsServer(ctx, deps, server, errChan)
 		case "imap_proxy":
 			go startDynamicIMAPProxyServer(ctx, deps, server, errChan)
 		case "pop3_proxy":
@@ -469,7 +516,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 		terminationPollInterval = 30 * time.Second
 	}
 
-	logger.Infof("* %s Proxy [%s] Starting connection tracker.", protocol, serverName)
+	logger.Infof("%s Proxy [%s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
 		rdb,
@@ -487,6 +534,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 
 // Dynamic server functions
 func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	appendLimit := serverConfig.GetAppendLimitWithDefault()
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 
@@ -578,6 +628,9 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
@@ -612,7 +665,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down LMTP server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down LMTP server %s...", serverConfig.Name)
 		if err := lmtpServer.Close(); err != nil {
 			logger.Infof("Error closing LMTP server: %v", err)
 		}
@@ -622,6 +675,9 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
@@ -677,7 +733,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down POP3 server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down POP3 server %s...", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -685,6 +741,9 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	maxSize := serverConfig.GetMaxScriptSizeWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
@@ -738,14 +797,16 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down ManageSieve server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down ManageSieve server %s...", serverConfig.Name)
 		s.Close()
 	}()
 
 	s.Start(errChan)
 }
 
-func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerConfig, errChan chan error) {
+func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
 
 	mux := http.NewServeMux()
 	mux.Handle(serverConfig.Path, promhttp.Handler())
@@ -757,7 +818,7 @@ func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerCo
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down metrics server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down metrics server %s...", serverConfig.Name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
@@ -771,6 +832,9 @@ func startDynamicMetricsServer(ctx context.Context, serverConfig config.ServerCo
 }
 
 func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
@@ -852,7 +916,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down IMAP proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down IMAP proxy server %s...", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -862,6 +926,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
@@ -942,7 +1009,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down POP3 proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down POP3 proxy server %s...", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -950,6 +1017,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
@@ -1033,7 +1103,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down ManageSieve proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down ManageSieve proxy server %s...", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1041,6 +1111,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 }
 
 func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
@@ -1100,7 +1173,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down LMTP proxy server %s...\n", serverConfig.Name)
+		logger.Infof("Shutting down LMTP proxy server %s...", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1108,6 +1181,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	if serverConfig.APIKey == "" {
 		logger.Infof("WARNING: HTTP Admin API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
 		return
@@ -1136,6 +1212,9 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
 	if serverConfig.JWTSecret == "" {
 		logger.Infof("WARNING: HTTP User API server '%s' enabled but no JWT secret configured, skipping", serverConfig.Name)
 		return

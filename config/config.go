@@ -136,12 +136,13 @@ type DatabaseEndpointConfig struct {
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
 type DatabaseConfig struct {
-	LogQueries    bool                    `toml:"log_queries"`    // Global setting for query logging
-	QueryTimeout  string                  `toml:"query_timeout"`  // Default timeout for all database queries (default: "30s")
-	SearchTimeout string                  `toml:"search_timeout"` // Specific timeout for complex search queries (default: "60s")
-	WriteTimeout  string                  `toml:"write_timeout"`  // Timeout for write operations (default: "10s")
-	Write         *DatabaseEndpointConfig `toml:"write"`          // Write database configuration
-	Read          *DatabaseEndpointConfig `toml:"read"`           // Read database configuration (can have multiple hosts for load balancing)
+	LogQueries       bool                    `toml:"log_queries"`    // Global setting for query logging
+	QueryTimeout     string                  `toml:"query_timeout"`  // Default timeout for all database queries (default: "30s")
+	SearchTimeout    string                  `toml:"search_timeout"` // Specific timeout for complex search queries (default: "60s")
+	WriteTimeout     string                  `toml:"write_timeout"`  // Timeout for write operations (default: "10s")
+	Write            *DatabaseEndpointConfig `toml:"write"`          // Write database configuration
+	Read             *DatabaseEndpointConfig `toml:"read"`           // Read database configuration (can have multiple hosts for load balancing)
+	PoolTypeOverride string                  `toml:"-"`              // Internal: Override pool type in logs (not in config file)
 }
 
 // GetMaxConnLifetime parses the max connection lifetime duration for an endpoint

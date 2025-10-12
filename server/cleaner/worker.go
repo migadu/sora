@@ -69,6 +69,7 @@ type CleanupWorker struct {
 	ftsRetention          time.Duration
 	authAttemptsRetention time.Duration
 	healthStatusRetention time.Duration
+	stopCh                chan struct{}
 }
 
 // New creates a new CleanupWorker.
@@ -86,6 +87,7 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 		ftsRetention:          ftsRetention,
 		authAttemptsRetention: authAttemptsRetention,
 		healthStatusRetention: healthStatusRetention,
+		stopCh:                make(chan struct{}),
 	}
 }
 
@@ -115,7 +117,10 @@ func (w *CleanupWorker) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Println("[CLEANUP] worker stopped")
+				log.Println("[CLEANUP] worker stopped due to context cancellation")
+				return
+			case <-w.stopCh:
+				log.Println("[CLEANUP] worker stopped due to stop signal")
 				return
 			case <-ticker.C:
 				log.Println("[CLEANUP] running S3 cleanup")
@@ -125,6 +130,11 @@ func (w *CleanupWorker) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// Stop signals the cleanup worker to stop
+func (w *CleanupWorker) Stop() {
+	close(w.stopCh)
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {

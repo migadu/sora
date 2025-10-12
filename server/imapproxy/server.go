@@ -22,6 +22,7 @@ import (
 // Server represents an IMAP proxy server.
 type Server struct {
 	listener               net.Listener
+	listenerMu             sync.RWMutex
 	rdb                    *resilient.ResilientDatabase
 	name                   string // Server name for logging
 	addr                   string
@@ -272,21 +273,26 @@ func (s *Server) Start() error {
 			log.Printf("Client TLS certificate verification is DISABLED for IMAP proxy [%s] (tls_verify=false)", s.name)
 		}
 
+		s.listenerMu.Lock()
 		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
+		s.listenerMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("* IMAP proxy [%s] listening with TLS on %s", s.name, s.addr)
+		log.Printf("IMAP proxy [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
+		s.listenerMu.Lock()
 		s.listener, err = net.Listen("tcp", s.addr)
+		s.listenerMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("* IMAP proxy [%s] listening on %s", s.name, s.addr)
+		log.Printf("IMAP proxy [%s] listening on %s", s.name, s.addr)
 	}
 
 	// Wrap listener with timeout protection
 	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
+		s.listenerMu.Lock()
 		s.listener = &timeoutListener{
 			Listener:          s.listener,
 			timeout:           s.commandTimeout,
@@ -294,7 +300,8 @@ func (s *Server) Start() error {
 			minBytesPerMinute: s.minBytesPerMinute,
 			protocol:          "imap_proxy",
 		}
-		log.Printf("* IMAP proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+		s.listenerMu.Unlock()
+		log.Printf("IMAP proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
 			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
@@ -368,12 +375,16 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the IMAP proxy server.
 func (s *Server) Stop() error {
-	log.Printf("* IMAP Proxy [%s] stopping...", s.name)
+	log.Printf("IMAP Proxy [%s] stopping...", s.name)
 
 	s.cancel()
 
-	if s.listener != nil {
-		s.listener.Close()
+	s.listenerMu.RLock()
+	listener := s.listener
+	s.listenerMu.RUnlock()
+
+	if listener != nil {
+		listener.Close()
 	}
 
 	done := make(chan struct{})
@@ -384,7 +395,7 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("* IMAP Proxy [%s] server stopped gracefully", s.name)
+		log.Printf("IMAP Proxy [%s] server stopped gracefully", s.name)
 	case <-time.After(30 * time.Second):
 		log.Printf("IMAP Proxy [%s] Server stop timeout", s.name)
 	}
@@ -392,9 +403,9 @@ func (s *Server) Stop() error {
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("* IMAP Proxy [%s] closing prelookup client...", s.name)
+			log.Printf("IMAP Proxy [%s] closing prelookup client...", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("* IMAP Proxy [%s] error closing prelookup client: %v", s.name, err)
+				log.Printf("IMAP Proxy [%s] error closing prelookup client: %v", s.name, err)
 			}
 		}
 	}

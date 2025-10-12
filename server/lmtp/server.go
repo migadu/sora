@@ -460,14 +460,14 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* LMTP [%s] listening with implicit TLS on %s", b.name, b.server.Addr)
+		log.Printf("LMTP [%s] listening with implicit TLS on %s", b.name, b.server.Addr)
 	} else {
 		listener, err = net.Listen("tcp", b.server.Addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* LMTP [%s] listening on %s", b.name, b.server.Addr)
+		log.Printf("LMTP [%s] listening on %s", b.name, b.server.Addr)
 	}
 	defer listener.Close()
 
@@ -489,13 +489,13 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	if err := b.server.Serve(limitedListener); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		if b.appCtx.Err() != nil {
-			log.Printf("* LMTP [%s] server stopped gracefully", b.name)
+			log.Printf("LMTP [%s] server stopped gracefully", b.name)
 		} else {
 			errChan <- fmt.Errorf("LMTP server error: %w", err)
 		}
 	} else {
 		// Server closed without error (shouldn't normally happen, but handle gracefully)
-		log.Printf("* LMTP [%s] server stopped gracefully", b.name)
+		log.Printf("LMTP [%s] server stopped gracefully", b.name)
 	}
 }
 

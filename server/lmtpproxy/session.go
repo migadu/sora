@@ -446,7 +446,7 @@ func (s *Session) connectToBackend() error {
 	}
 
 	if s.server.debugWriter != nil {
-		log.Printf("LMTP Proxy [%s] Backend greeting: %s", s.server.name, strings.TrimRight(greeting, "\r\n"))
+		log.Printf("LMTP Proxy [%s] Backend greeting: %s", s.server.name, strings.TrimRight(greeting, "\r"))
 	}
 
 	// Send LHLO to backend
@@ -467,7 +467,7 @@ func (s *Session) connectToBackend() error {
 		}
 
 		if s.server.debugWriter != nil {
-			log.Printf("LMTP Proxy [%s] Backend LHLO response: %s", s.server.name, strings.TrimRight(response, "\r\n"))
+			log.Printf("LMTP Proxy [%s] Backend LHLO response: %s", s.server.name, strings.TrimRight(response, "\r"))
 		}
 
 		// Check if this is the last line (no hyphen after status code)
@@ -567,7 +567,7 @@ func (s *Session) connectToBackend() error {
 			}
 
 			if s.server.debugWriter != nil {
-				log.Printf("LMTP Proxy [%s] Backend LHLO response after STARTTLS: %s", s.server.name, strings.TrimRight(response, "\r\n"))
+				log.Printf("LMTP Proxy [%s] Backend LHLO response after STARTTLS: %s", s.server.name, strings.TrimRight(response, "\r"))
 			}
 
 			// Check if this is the last line

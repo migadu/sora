@@ -57,6 +57,7 @@ type UploadWorker struct {
 	retryInterval time.Duration
 	instanceID    string
 	notifyCh      chan struct{}
+	stopCh        chan struct{}
 	errCh         chan<- error
 }
 
@@ -83,6 +84,7 @@ func New(ctx context.Context, path string, batchSize int, concurrency int, maxAt
 		retryInterval: retryInterval,
 		instanceID:    instanceID,
 		notifyCh:      notifyCh,
+		stopCh:        make(chan struct{}),
 	}, nil
 }
 
@@ -96,7 +98,10 @@ func (w *UploadWorker) Start(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Println("[UPLOADER] worker stopped")
+				log.Println("[UPLOADER] worker stopped due to context cancellation")
+				return
+			case <-w.stopCh:
+				log.Println("[UPLOADER] worker stopped due to stop signal")
 				return
 			case <-ticker.C:
 				log.Println("[UPLOADER] timer tick")
@@ -113,6 +118,11 @@ func (w *UploadWorker) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// Stop signals the upload worker to stop
+func (w *UploadWorker) Stop() {
+	close(w.stopCh)
 }
 
 func (w *UploadWorker) NotifyUploadQueued() {

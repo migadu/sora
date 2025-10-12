@@ -667,13 +667,13 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 
 		// Wrap with JA4 TLS listener for fingerprinting
 		listener = serverPkg.NewJA4TLSListener(tcpListener, s.tlsConfig)
-		log.Printf("* IMAP [%s] listening with TLS (JA4 fingerprinting enabled) on %s", s.name, imapAddr)
+		log.Printf("IMAP [%s] listening with TLS (JA4 fingerprinting enabled) on %s", s.name, imapAddr)
 	} else {
 		listener, err = net.Listen("tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("* IMAP [%s] listening on %s", s.name, imapAddr)
+		log.Printf("IMAP [%s] listening on %s", s.name, imapAddr)
 	}
 	defer listener.Close()
 	defer func() {
@@ -705,7 +705,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 			minBytesPerMinute: s.minBytesPerMinute,
 			protocol:          "imap",
 		}
-		log.Printf("* IMAP [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+		log.Printf("IMAP [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
 			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
@@ -713,7 +713,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 
 	// Check if this was a graceful shutdown
 	if s.appCtx.Err() != nil {
-		log.Printf("* IMAP [%s] server stopped gracefully", s.name)
+		log.Printf("IMAP [%s] server stopped gracefully", s.name)
 		return nil
 	}
 

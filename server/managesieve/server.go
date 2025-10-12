@@ -195,14 +195,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
+		log.Printf("ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* ManageSieve [%s] listening on %s", s.name, s.addr)
+		log.Printf("ManageSieve [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 
@@ -223,14 +223,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			minBytesPerMinute: s.minBytesPerMinute,
 			protocol:          "managesieve",
 		}
-		log.Printf("* ManageSieve [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+		log.Printf("ManageSieve [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
 			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("* ManageSieve [%s] stopping", s.name)
+		log.Printf("ManageSieve [%s] stopping", s.name)
 		listener.Close()
 	}()
 
@@ -246,7 +246,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
-				log.Printf("* ManageSieve [%s] server stopped gracefully", s.name)
+				log.Printf("ManageSieve [%s] server stopped gracefully", s.name)
 				return
 			default:
 				// For other errors, this might be a fatal server error
@@ -326,7 +326,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			remoteInfo = session.RemoteIP
 		}
 		// Log connection with connection counters
-		log.Printf("* ManageSieve [%s] new connection from %s (connections: total=%d, authenticated=%d)",
+		log.Printf("ManageSieve [%s] new connection from %s (connections: total=%d, authenticated=%d)",
 			s.name, remoteInfo, totalCount, authCount)
 
 		go session.handleConnection()

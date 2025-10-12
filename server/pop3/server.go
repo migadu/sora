@@ -195,7 +195,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
 			return
 		}
-		log.Printf("* POP3 [%s] listening with TLS on %s", s.name, s.addr)
+		log.Printf("POP3 [%s] listening with TLS on %s", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
@@ -203,7 +203,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("* POP3 [%s] listening on %s", s.name, s.addr)
+		log.Printf("POP3 [%s] listening on %s", s.name, s.addr)
 	}
 	defer listener.Close()
 
@@ -224,14 +224,14 @@ func (s *POP3Server) Start(errChan chan error) {
 			minBytesPerMinute: s.minBytesPerMinute,
 			protocol:          "pop3",
 		}
-		log.Printf("* POP3 [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
+		log.Printf("POP3 [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
 			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("* POP3 [%s] stopping", s.name)
+		log.Printf("POP3 [%s] stopping", s.name)
 		listener.Close()
 	}()
 
@@ -247,7 +247,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
-				log.Printf("* POP3 [%s] server stopped gracefully", s.name)
+				log.Printf("POP3 [%s] server stopped gracefully", s.name)
 				return
 			default:
 				// For other errors, this might be a fatal server error
@@ -322,7 +322,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		} else {
 			remoteInfo = session.RemoteIP
 		}
-		log.Printf("* POP3 [%s] new connection from %s (connections: total=%d, authenticated=%d)",
+		log.Printf("POP3 [%s] new connection from %s (connections: total=%d, authenticated=%d)",
 			s.name, remoteInfo, totalCount, authCount)
 
 		go session.handleConnection()

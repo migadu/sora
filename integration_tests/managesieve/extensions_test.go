@@ -17,21 +17,31 @@ import (
 func TestManageSieveConfigurableExtensions(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Test 1: Default extensions
+	// Builtin extensions that are always present
+	builtinExtensions := []string{
+		"fileinto", "reject", "envelope", "encoded-character", "subaddress",
+		"comparator-i;ascii-numeric", "relational", "imap4flags", "copy",
+		"include", "variables", "body", "enotify", "environment", "mailbox",
+		"date", "index", "ihave", "duplicate", "mime", "foreverypart", "extracttext",
+	}
+
+	// Test 1: Default extensions (no additional configured, just builtins)
 	t.Run("DefaultExtensions", func(t *testing.T) {
-		testExtensions(t, nil, []string{"fileinto", "vacation"})
+		testExtensions(t, nil, builtinExtensions)
 	})
 
-	// Test 2: Custom extensions
+	// Test 2: Custom additional extensions (vacation added to builtins)
 	t.Run("CustomExtensions", func(t *testing.T) {
-		customExtensions := []string{"fileinto", "vacation", "envelope", "variables", "relational"}
-		testExtensions(t, customExtensions, customExtensions)
+		additionalExtensions := []string{"vacation"}
+		expectedExtensions := append(builtinExtensions, additionalExtensions...)
+		testExtensions(t, additionalExtensions, expectedExtensions)
 	})
 
-	// Test 3: Minimal extensions
-	t.Run("MinimalExtensions", func(t *testing.T) {
-		minimalExtensions := []string{"fileinto"}
-		testExtensions(t, minimalExtensions, minimalExtensions)
+	// Test 3: Multiple additional extensions
+	t.Run("MultipleAdditionalExtensions", func(t *testing.T) {
+		additionalExtensions := []string{"vacation", "regex"}
+		expectedExtensions := append(builtinExtensions, additionalExtensions...)
+		testExtensions(t, additionalExtensions, expectedExtensions)
 	})
 }
 

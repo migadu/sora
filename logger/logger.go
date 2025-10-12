@@ -1,6 +1,6 @@
 // Package logger provides structured logging for the Sora email server.
 //
-// This package wraps zap (https://github.com/uber-go/zap) for high-performance
+// This package wraps Go's standard library slog for high-performance
 // structured logging with support for multiple outputs:
 //   - Console (stdout/stderr)
 //   - File (with automatic rotation)
@@ -27,20 +27,20 @@
 // Use the package-level functions for logging:
 //
 //	logger.Info("Server started successfully")
-//	logger.Infof("Listening on %s", addr)
+//	logger.InfoContext(ctx, "Listening on address", "addr", addr)
 //	logger.Warn("High memory usage detected")
-//	logger.Error("Failed to connect to database", err)
+//	logger.Error("Failed to connect to database", "error", err)
 //	logger.Fatal("Critical error, shutting down")
 //
 // # Structured Logging
 //
-// For structured fields, use the With* functions:
+// Use key-value pairs for structured fields:
 //
-//	logger.With(
+//	logger.Info("Mailbox access",
 //		"user_id", 123,
 //		"mailbox", "INBOX",
 //		"message_count", 42,
-//	).Info("Mailbox access")
+//	)
 //
 // # Log Levels
 //
@@ -49,13 +49,12 @@
 //   - info: General informational messages
 //   - warn: Warning messages for potential issues
 //   - error: Error messages for failures
-//   - fatal: Critical errors that cause shutdown
 //
 // # Output Formats
 //
 // Two formats are supported:
 //   - json: Machine-readable structured JSON
-//   - console: Human-readable colored output
+//   - console: Human-readable text output
 //
 // # Syslog Integration
 //
@@ -70,28 +69,102 @@
 //
 // # Performance
 //
-// The logger uses zap's high-performance structured logging with minimal
-// allocations. It can handle millions of logs per second.
+// The logger uses Go's standard slog for high-performance structured logging
+// with minimal allocations.
 package logger
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"log/syslog"
 	"os"
 	"runtime"
-
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 
 	"github.com/migadu/sora/config"
 )
 
 var (
 	// Global logger instance
-	globalLogger *zap.Logger
-	// Sugar logger for easier usage
-	globalSugar *zap.SugaredLogger
+	globalLogger *slog.Logger
 )
+
+// syslogHandler wraps syslog.Writer to implement slog.Handler
+type syslogHandler struct {
+	writer *syslog.Writer
+	level  slog.Level
+	attrs  []slog.Attr
+	groups []string
+}
+
+func newSyslogHandler(w *syslog.Writer, level slog.Level) *syslogHandler {
+	return &syslogHandler{
+		writer: w,
+		level:  level,
+		attrs:  []slog.Attr{},
+		groups: []string{},
+	}
+}
+
+func (h *syslogHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level
+}
+
+func (h *syslogHandler) Handle(_ context.Context, r slog.Record) error {
+	msg := r.Message
+
+	// Add attributes
+	if len(h.attrs) > 0 || r.NumAttrs() > 0 {
+		attrs := make([]any, 0, len(h.attrs)*2+r.NumAttrs()*2)
+		for _, a := range h.attrs {
+			attrs = append(attrs, a.Key, a.Value.Any())
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			attrs = append(attrs, a.Key, a.Value.Any())
+			return true
+		})
+		if len(attrs) > 0 {
+			msg = fmt.Sprintf("%s %v", msg, attrs)
+		}
+	}
+
+	switch r.Level {
+	case slog.LevelDebug:
+		return h.writer.Debug(msg)
+	case slog.LevelInfo:
+		return h.writer.Info(msg)
+	case slog.LevelWarn:
+		return h.writer.Warning(msg)
+	case slog.LevelError:
+		return h.writer.Err(msg)
+	default:
+		return h.writer.Info(msg)
+	}
+}
+
+func (h *syslogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	newAttrs := make([]slog.Attr, len(h.attrs)+len(attrs))
+	copy(newAttrs, h.attrs)
+	copy(newAttrs[len(h.attrs):], attrs)
+	return &syslogHandler{
+		writer: h.writer,
+		level:  h.level,
+		attrs:  newAttrs,
+		groups: h.groups,
+	}
+}
+
+func (h *syslogHandler) WithGroup(name string) slog.Handler {
+	newGroups := make([]string, len(h.groups)+1)
+	copy(newGroups, h.groups)
+	newGroups[len(h.groups)] = name
+	return &syslogHandler{
+		writer: h.writer,
+		level:  h.level,
+		attrs:  h.attrs,
+		groups: newGroups,
+	}
+}
 
 // Initialize sets up the global logger based on configuration
 func Initialize(cfg config.LoggingConfig) (*os.File, error) {
@@ -116,36 +189,31 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 	}
 
 	// Parse log level
-	zapLevel := parseLogLevel(level)
+	slogLevel := parseLogLevel(level)
 
-	// Create encoder config
-	var encoderConfig zapcore.EncoderConfig
-	if format == "json" {
-		encoderConfig = zap.NewProductionEncoderConfig()
-	} else {
-		encoderConfig = zap.NewDevelopmentEncoderConfig()
-		encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-		encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	// Create handler options
+	handlerOpts := &slog.HandlerOptions{
+		Level:     slogLevel,
+		AddSource: false, // Disabled because wrapper functions report incorrect source locations
 	}
 
-	// Create encoder
-	var encoder zapcore.Encoder
-	if format == "json" {
-		encoder = zapcore.NewJSONEncoder(encoderConfig)
-	} else {
-		encoder = zapcore.NewConsoleEncoder(encoderConfig)
-	}
+	var handler slog.Handler
 
-	// Create write syncer based on output
-	var writeSyncer zapcore.WriteSyncer
-	var err error
-
+	// Create handler based on output
 	switch output {
 	case "stdout":
-		writeSyncer = zapcore.AddSync(os.Stdout)
+		if format == "json" {
+			handler = slog.NewJSONHandler(os.Stdout, handlerOpts)
+		} else {
+			handler = slog.NewTextHandler(os.Stdout, handlerOpts)
+		}
 
 	case "stderr":
-		writeSyncer = zapcore.AddSync(os.Stderr)
+		if format == "json" {
+			handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
+		} else {
+			handler = slog.NewTextHandler(os.Stderr, handlerOpts)
+		}
 
 	case "syslog":
 		if runtime.GOOS != "windows" {
@@ -153,138 +221,166 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 			if sysErr != nil {
 				// Fall back to stderr if syslog fails
 				fmt.Fprintf(os.Stderr, "WARNING: failed to connect to syslog: %v. Falling back to stderr.\n", sysErr)
-				writeSyncer = zapcore.AddSync(os.Stderr)
+				if format == "json" {
+					handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
+				} else {
+					handler = slog.NewTextHandler(os.Stderr, handlerOpts)
+				}
 			} else {
-				writeSyncer = zapcore.AddSync(syslogWriter)
+				handler = newSyslogHandler(syslogWriter, slogLevel)
 			}
 		} else {
 			fmt.Fprintf(os.Stderr, "WARNING: syslog is not supported on Windows. Falling back to stderr.\n")
-			writeSyncer = zapcore.AddSync(os.Stderr)
+			if format == "json" {
+				handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
+			} else {
+				handler = slog.NewTextHandler(os.Stderr, handlerOpts)
+			}
 		}
 
 	default:
 		// Assume it's a file path
+		var err error
 		logFile, err = os.OpenFile(output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to open log file '%s': %v. Falling back to stderr.\n", output, err)
-			writeSyncer = zapcore.AddSync(os.Stderr)
+			if format == "json" {
+				handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
+			} else {
+				handler = slog.NewTextHandler(os.Stderr, handlerOpts)
+			}
 			logFile = nil
 		} else {
-			writeSyncer = zapcore.AddSync(logFile)
+			if format == "json" {
+				handler = slog.NewJSONHandler(logFile, handlerOpts)
+			} else {
+				handler = slog.NewTextHandler(logFile, handlerOpts)
+			}
 			// Redirect stdout and stderr to log file
 			os.Stdout = logFile
 			os.Stderr = logFile
 		}
 	}
 
-	// Create core
-	core := zapcore.NewCore(encoder, writeSyncer, zapLevel)
-
-	// Create logger
-	globalLogger = zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
-	globalSugar = globalLogger.Sugar()
+	// Create and set global logger
+	globalLogger = slog.New(handler)
+	slog.SetDefault(globalLogger)
 
 	return logFile, nil
 }
 
-// parseLogLevel converts string log level to zapcore.Level
-func parseLogLevel(level string) zapcore.Level {
+// parseLogLevel converts string log level to slog.Level
+func parseLogLevel(level string) slog.Level {
 	switch level {
 	case "debug":
-		return zapcore.DebugLevel
+		return slog.LevelDebug
 	case "info":
-		return zapcore.InfoLevel
+		return slog.LevelInfo
 	case "warn", "warning":
-		return zapcore.WarnLevel
+		return slog.LevelWarn
 	case "error":
-		return zapcore.ErrorLevel
+		return slog.LevelError
 	default:
-		return zapcore.InfoLevel
+		return slog.LevelInfo
 	}
 }
 
 // Get returns the global logger instance
-func Get() *zap.Logger {
+func Get() *slog.Logger {
 	if globalLogger == nil {
-		// Return a no-op logger if not initialized
-		return zap.NewNop()
+		return slog.Default()
 	}
 	return globalLogger
 }
 
-// Sugar returns the global sugared logger instance
-func Sugar() *zap.SugaredLogger {
-	if globalSugar == nil {
-		// Return a no-op logger if not initialized
-		return zap.NewNop().Sugar()
-	}
-	return globalSugar
+// Info logs an info message with optional key-value pairs
+func Info(msg string, args ...any) {
+	Get().Info(msg, args...)
 }
 
-// Sync flushes any buffered log entries
-func Sync() error {
-	if globalLogger != nil {
-		return globalLogger.Sync()
-	}
-	return nil
+// InfoContext logs an info message with context and optional key-value pairs
+func InfoContext(ctx context.Context, msg string, args ...any) {
+	Get().InfoContext(ctx, msg, args...)
 }
 
-// Info logs an info message
-func Info(msg string, fields ...zap.Field) {
-	Get().Info(msg, fields...)
+// Debug logs a debug message with optional key-value pairs
+func Debug(msg string, args ...any) {
+	Get().Debug(msg, args...)
 }
 
-// Debug logs a debug message
-func Debug(msg string, fields ...zap.Field) {
-	Get().Debug(msg, fields...)
+// DebugContext logs a debug message with context and optional key-value pairs
+func DebugContext(ctx context.Context, msg string, args ...any) {
+	Get().DebugContext(ctx, msg, args...)
 }
 
-// Warn logs a warning message
-func Warn(msg string, fields ...zap.Field) {
-	Get().Warn(msg, fields...)
+// Warn logs a warning message with optional key-value pairs
+func Warn(msg string, args ...any) {
+	Get().Warn(msg, args...)
 }
 
-// Error logs an error message
-func Error(msg string, fields ...zap.Field) {
-	Get().Error(msg, fields...)
+// WarnContext logs a warning message with context and optional key-value pairs
+func WarnContext(ctx context.Context, msg string, args ...any) {
+	Get().WarnContext(ctx, msg, args...)
+}
+
+// Error logs an error message with optional key-value pairs
+func Error(msg string, args ...any) {
+	Get().Error(msg, args...)
+}
+
+// ErrorContext logs an error message with context and optional key-value pairs
+func ErrorContext(ctx context.Context, msg string, args ...any) {
+	Get().ErrorContext(ctx, msg, args...)
 }
 
 // Fatal logs a fatal message and exits
-func Fatal(msg string, fields ...zap.Field) {
-	Get().Fatal(msg, fields...)
+func Fatal(msg string, args ...any) {
+	Get().Error(msg, args...)
+	os.Exit(1)
 }
 
-// Infof logs an info message with formatting
-func Infof(template string, args ...interface{}) {
-	Sugar().Infof(template, args...)
+// With returns a logger with the given attributes
+func With(args ...any) *slog.Logger {
+	return Get().With(args...)
 }
 
-// Debugf logs a debug message with formatting
-func Debugf(template string, args ...interface{}) {
-	Sugar().Debugf(template, args...)
+// Printf provides compatibility with standard log.Printf (logs at Info level)
+func Printf(format string, args ...any) {
+	Get().Info(fmt.Sprintf(format, args...))
 }
 
-// Warnf logs a warning message with formatting
-func Warnf(template string, args ...interface{}) {
-	Sugar().Warnf(template, args...)
+// Println provides compatibility with standard log.Println (logs at Info level)
+func Println(args ...any) {
+	Get().Info(fmt.Sprint(args...))
 }
 
-// Errorf logs an error message with formatting
-func Errorf(template string, args ...interface{}) {
-	Sugar().Errorf(template, args...)
+// Infof logs an info message with formatting (compatibility)
+func Infof(format string, args ...any) {
+	Get().Info(fmt.Sprintf(format, args...))
 }
 
-// Fatalf logs a fatal message with formatting and exits
-func Fatalf(template string, args ...interface{}) {
-	Sugar().Fatalf(template, args...)
+// Debugf logs a debug message with formatting (compatibility)
+func Debugf(format string, args ...any) {
+	Get().Debug(fmt.Sprintf(format, args...))
 }
 
-// Printf provides compatibility with standard log.Printf
-func Printf(template string, args ...interface{}) {
-	Sugar().Infof(template, args...)
+// Warnf logs a warning message with formatting (compatibility)
+func Warnf(format string, args ...any) {
+	Get().Warn(fmt.Sprintf(format, args...))
 }
 
-// Println provides compatibility with standard log.Println
-func Println(args ...interface{}) {
-	Sugar().Info(args...)
+// Errorf logs an error message with formatting (compatibility)
+func Errorf(format string, args ...any) {
+	Get().Error(fmt.Sprintf(format, args...))
+}
+
+// Fatalf logs a fatal message with formatting and exits (compatibility)
+func Fatalf(format string, args ...any) {
+	Get().Error(fmt.Sprintf(format, args...))
+	os.Exit(1)
+}
+
+// Sync flushes any buffered log entries (no-op for slog, kept for compatibility)
+func Sync() error {
+	return nil
 }
