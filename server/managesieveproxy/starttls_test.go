@@ -45,23 +45,8 @@ func TestManageSieveProxyServerOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := ServerOptions{
-				Name:                 "test-managesieve-proxy",
-				Addr:                 ":4190",
-				RemoteAddrs:          []string{"backend1.example.com:4190"},
-				RemotePort:           4190,
-				TLS:                  true,
 				TLSUseStartTLS:       tt.tlsUseStartTLS,
-				TLSCertFile:          "/path/to/cert.pem",
-				TLSKeyFile:           "/path/to/key.pem",
-				TLSVerify:            false,
-				RemoteTLS:            true,
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
-				RemoteTLSVerify:      true,
-				ConnectTimeout:       10 * time.Second,
-				SessionTimeout:       30 * time.Minute,
-				CommandTimeout:       5 * time.Minute,
-				MasterSASLUsername:   "proxyuser",
-				MasterSASLPassword:   "proxypass",
 				AuthRateLimit: server.AuthRateLimiterConfig{
 					Enabled: false,
 				},

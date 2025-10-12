@@ -168,7 +168,7 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 # --- TRUSTED NETWORKS ---
 # Networks trusted for proxy parameter forwarding (XCLIENT, ID commands, etc.)
 # These networks can forward client information through proxy protocols
-trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128"]
 
 
 # DYNAMIC SERVER CONFIGURATION
@@ -541,6 +541,14 @@ affinity_stickiness = 0.9
 command_timeout = "5m"
 absolute_session_timeout = "30m"
 min_bytes_per_minute = 1024
+
+# --- SIEVE EXTENSIONS ---
+# Builtin extensions are always advertised: fileinto, reject, envelope, encoded-character,
+# subaddress, comparator-i;ascii-numeric, relational, imap4flags, copy, include, variables,
+# body, enotify, environment, mailbox, date, index, ihave, duplicate, mime, foreverypart, extracttext
+#
+# Add additional extensions here (e.g., vacation, regex, spamtest, virustest)
+supported_extensions = ["vacation", "regex"]
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)

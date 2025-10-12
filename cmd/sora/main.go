@@ -407,6 +407,9 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 
 	// Start all configured servers dynamically
 	for _, server := range allServers {
+		// Warn about unused config options
+		server.WarnUnusedConfigOptions(logger.Infof)
+
 		switch server.Type {
 		case "imap":
 			go startDynamicIMAPServer(ctx, deps, server, errChan)

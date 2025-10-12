@@ -1821,6 +1821,123 @@ func (s *ServerConfig) Validate() error {
 	return nil
 }
 
+// WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
+func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...interface{})) {
+	// Check proxy-only options on non-proxy servers
+	if !strings.HasSuffix(s.Type, "_proxy") {
+		if len(s.RemoteAddrs) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'remote_addrs' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLSUseStartTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteTLSVerify {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_verify' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteUseProxyProtocol {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_proxy_protocol' configured, but this only applies to proxy servers", s.Name, s.Type)
+		}
+	}
+
+	switch s.Type {
+	case "imap":
+		// IMAP server
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.RemoteUseIDCommand {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
+		}
+
+	case "lmtp":
+		// LMTP server
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.RemoteUseXCLIENT {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+		}
+
+	case "pop3":
+		// POP3 server
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+
+	case "managesieve":
+		// ManageSieve server - no proxy-specific warnings needed (handled above)
+
+	case "imap_proxy":
+		// IMAP proxy
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+		}
+		if s.MaxScriptSize != "" {
+			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.RemoteUseXCLIENT {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+		}
+
+	case "pop3_proxy":
+		// POP3 proxy
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+		}
+		if s.MaxScriptSize != "" {
+			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.RemoteUseIDCommand {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteUseXCLIENT {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+		}
+
+	case "lmtp_proxy":
+		// LMTP proxy
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers/proxies", s.Name, s.Type)
+		}
+		if s.MaxScriptSize != "" {
+			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.RemoteUseIDCommand {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
+		}
+
+	case "managesieve_proxy":
+		// ManageSieve proxy
+		if s.AppendLimit != "" {
+			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		}
+		if s.RemoteUseIDCommand {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
+		}
+		if s.RemoteUseXCLIENT {
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+		}
+
+	case "metrics", "http_admin_api", "http_user_api":
+		// HTTP servers - warn about protocol-specific options
+		if len(s.SupportedExtensions) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.MaxScriptSize != "" {
+			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
+		}
+		if s.AppendLimit != "" {
+			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		}
+		if s.TLSUseStartTLS {
+			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
+		}
+	}
+}
+
 // GetAllServers returns all configured servers from the dynamic configuration
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
