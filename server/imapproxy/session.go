@@ -147,7 +147,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			s.username = username
+			// Only set username if it wasn't already set by prelookup (which may have extracted actual email from token)
+			if s.username == "" {
+				s.username = username
+			}
 			s.postAuthenticationSetup(tag)
 			authenticated = true
 
@@ -215,7 +218,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			s.username = authnID
+			// Only set username if it wasn't already set by prelookup (which may have extracted actual email from token)
+			if s.username == "" {
+				s.username = authnID
+			}
 			s.postAuthenticationSetup(tag)
 			authenticated = true
 
@@ -318,12 +324,9 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	address, err := server.NewAddress(username)
-	if err != nil {
-		return fmt.Errorf("invalid address format: %w", err)
-	}
-
 	// Try prelookup authentication/routing first if configured
+	// Skip strict address validation if prelookup is enabled, as it may support master tokens
+	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
 		log.Printf("IMAP Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
@@ -339,10 +342,19 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
+				// Use the actual email (without token) for backend impersonation
+				if routingInfo.ActualEmail != "" {
+					s.username = routingInfo.ActualEmail
+				} else {
+					s.username = username // Fallback to original
+				}
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
-				metrics.TrackDomainConnection("imap_proxy", address.Domain())
-				metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+				// For metrics, use username as-is (may contain token, but that's ok for tracking)
+				if addr, err := server.NewAddress(username); err == nil {
+					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
+					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
+				}
 				return nil // Authentication complete
 
 			case proxy.AuthFailed:
@@ -359,7 +371,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 	}
 
-	// Fallback to main DB
+	// Fallback to main DB - validate address format for normal email
+	address, err := server.NewAddress(username)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %w", err)
+	}
+
 	log.Printf("IMAP Proxy [%s] Authenticating user %s via main database", s.server.name, username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {

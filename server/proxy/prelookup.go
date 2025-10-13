@@ -30,6 +30,7 @@ type UserRoutingInfo struct {
 	ResolvedAddress        string // Optional resolved address from prelookup query (overrides ServerAddress if present)
 	AccountID              int64
 	IsPrelookupAccount     bool
+	ActualEmail            string // Actual email address (without master token if present)
 	RemoteTLS              bool
 	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool
@@ -826,6 +827,7 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		ResolvedAddress:        normalizedResolved,
 		AccountID:              accountID,
 		IsPrelookupAccount:     true,
+		ActualEmail:            actualEmail, // Set the actual email without token
 		RemoteTLS:              c.remoteTLS,
 		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,

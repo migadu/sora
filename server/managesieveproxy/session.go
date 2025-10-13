@@ -398,12 +398,9 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	address, err := server.NewAddress(username)
-	if err != nil {
-		return fmt.Errorf("invalid address format: %w", err)
-	}
-
 	// Try prelookup authentication/routing first if configured
+	// Skip strict address validation if prelookup is enabled, as it may support master tokens
+	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.debug {
 		log.Printf("ManageSieve Proxy [%s] [DEBUG] Attempting authentication for user %s via prelookup", s.server.name, username)
 	}
@@ -427,10 +424,19 @@ func (s *Session) authenticateUser(username, password string) error {
 			s.accountID = routingInfo.AccountID
 			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 			s.routingInfo = routingInfo
+			// Use the actual email (without token) for backend impersonation
+			if routingInfo.ActualEmail != "" {
+				s.username = routingInfo.ActualEmail
+			} else {
+				s.username = username // Fallback to original
+			}
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
-			metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
-			metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
+			// For metrics, use username as-is (may contain token, but that's ok for tracking)
+			if addr, err := server.NewAddress(username); err == nil {
+				metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
+				metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
+			}
 			return nil // Authentication complete
 
 		case proxy.AuthFailed:
@@ -446,6 +452,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				log.Printf("ManageSieve Proxy [%s] [DEBUG] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
 			}
 		}
+	}
+
+	// Fallback to main DB - validate address format for normal email
+	address, err := server.NewAddress(username)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %w", err)
 	}
 
 	// Fallback/default: Authenticate against the main database.

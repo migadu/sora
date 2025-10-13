@@ -318,12 +318,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		return err
 	}
 
-	address, err := server.NewAddress(username)
-	if err != nil {
-		return fmt.Errorf("invalid address format: %w", err)
-	}
-
 	// Try prelookup authentication/routing first if configured
+	// Skip strict address validation if prelookup is enabled, as it may support master tokens
+	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
 		log.Printf("POP3 Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
@@ -339,12 +336,20 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
-				s.username = address.FullAddress()
+				// Use the actual email (without token) for backend impersonation
+				if routingInfo.ActualEmail != "" {
+					s.username = routingInfo.ActualEmail
+				} else {
+					s.username = username // Fallback to original
+				}
 				s.authenticated = true
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
-				metrics.TrackDomainConnection("pop3_proxy", address.Domain())
-				metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
+				// For metrics, use username as-is (may contain token, but that's ok for tracking)
+				if addr, err := server.NewAddress(username); err == nil {
+					metrics.TrackDomainConnection("pop3_proxy", addr.Domain())
+					metrics.TrackUserActivity("pop3_proxy", addr.FullAddress(), "connection", 1)
+				}
 
 				// Connect to backend
 				if err := s.connectToBackend(); err != nil {
@@ -366,7 +371,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		}
 	}
 
-	// Fallback to main DB
+	// Fallback to main DB - validate address format for normal email
+	address, err := server.NewAddress(username)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %w", err)
+	}
+
 	log.Printf("POP3 Proxy [%s] Authenticating user %s via main database", s.server.name, username)
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {

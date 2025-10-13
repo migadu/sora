@@ -494,11 +494,36 @@ max_conn_idle_time = "30m"
 cache_ttl = "10m"             # How long to cache routing results (reduces database queries)
 cache_size = 10000            # Maximum number of cached entries
 auth_method = "bcrypt"        # Only used if query returns password_hash column. Supports: "bcrypt", "ssha512"
+
 # Example queries (use named columns - order doesn't matter):
-# query = "SELECT server_address FROM user_routing WHERE email = $1"  # Routing only
-# query = "SELECT server_address, resolved_address FROM user_routing WHERE email = $1"  # With resolution
-# query = "SELECT password_hash, server_address FROM user_routing WHERE email = $1"  # With auth
-query = "SELECT account_id, password_hash, server_address, resolved_address FROM user_routing WHERE email = $1 AND active = true"
+# Simple query:
+# query = "SELECT server_address FROM user_routing WHERE email = $1"
+
+# With master token support (multiline for readability):
+query = """
+  SELECT
+    account_id,
+    password_hash,
+    server_address,
+    resolved_address
+  FROM user_routing
+  WHERE email = $1
+    AND active = true
+"""
+
+# Advanced example with master token logic in database:
+# query = """
+#   SELECT
+#     CASE
+#       WHEN $1 LIKE '%@%@%' THEN master_token_hash
+#       ELSE user_password_hash
+#     END as password_hash,
+#     server_address,
+#     resolved_address
+#   FROM user_routing
+#   WHERE email = regexp_replace($1, '@[^@]+$', '')
+#     AND active = true
+# """
 fallback_to_default = true    # If prelookup initialization fails (e.g., database unreachable), continue without prelookup
                               # using default round-robin routing. If false, proxy fails to start on prelookup errors.
                               # NOTE: This only applies to initialization failures, not per-user lookup failures.
