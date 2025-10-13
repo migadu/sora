@@ -423,6 +423,8 @@ type PreLookupConfig struct {
 	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections from prelookup
 	RemoteUseIDCommand     bool        `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding from prelookup (IMAP only)
 	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding from prelookup (POP3/LMTP)
+	AllowMasterToken       bool        `toml:"allow_master_token"`        // Enable master token authentication (bypass password check with token)
+	MasterTokenSeparator   string      `toml:"master_token_separator"`    // Separator for master token in password field (default: "@")
 }
 
 // GetCacheTTL returns the configured cache TTL duration

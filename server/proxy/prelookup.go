@@ -76,6 +76,8 @@ type PreLookupClient struct {
 	remoteUseProxyProtocol bool
 	remoteUseIDCommand     bool
 	remoteUseXCLIENT       bool
+	allowMasterToken       bool   // Enable master token authentication
+	masterTokenSeparator   string // Separator for extracting master token from password
 	stopJanitor            chan struct{}
 	janitorWg              sync.WaitGroup // Wait for janitor to finish
 	breaker                *circuitbreaker.CircuitBreaker
@@ -274,6 +276,12 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		return counts.Requests >= 5 && failureRatio >= 0.6
 	}
 
+	// Set default master token separator if enabled but not specified
+	masterTokenSeparator := config.MasterTokenSeparator
+	if config.AllowMasterToken && masterTokenSeparator == "" {
+		masterTokenSeparator = "@"
+	}
+
 	client := &PreLookupClient{
 		pool:                   pool,
 		query:                  query,
@@ -287,6 +295,8 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 		remoteUseProxyProtocol: config.RemoteUseProxyProtocol,
 		remoteUseIDCommand:     config.RemoteUseIDCommand,
 		remoteUseXCLIENT:       config.RemoteUseXCLIENT,
+		allowMasterToken:       config.AllowMasterToken,
+		masterTokenSeparator:   masterTokenSeparator,
 		stopJanitor:            make(chan struct{}),
 		breaker:                circuitbreaker.NewCircuitBreaker(breakerSettings),
 	}
@@ -294,6 +304,9 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	// Log the configuration for debugging
 	log.Printf("[PreLookup] Initialized with auto-detect mode, unified auth (supports SSHA512, SHA512, bcrypt, BLF-CRYPT), cache_ttl=%v", cacheTTL)
 	log.Printf("[PreLookup] Query: %s", query)
+	if client.allowMasterToken {
+		log.Printf("[PreLookup] Master token authentication enabled with separator: %q", client.masterTokenSeparator)
+	}
 
 	client.startCacheJanitor()
 	return client, nil
@@ -608,6 +621,54 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 	return routingInfo, authResult, nil
 }
 
+// splitEmailAndToken splits an email that may contain a master token
+// Returns: (actualEmail, extractedToken, hasMasterToken)
+// Example: "user@domain.com@MASTERTOKEN" with separator "@" -> ("user@domain.com", "MASTERTOKEN", true)
+// IMPORTANT: The token must not contain the separator itself. We use the LAST occurrence
+// to split, and the extracted token must not contain any more separators.
+// Special handling for @ separator: requires at least 3 parts (user@domain@token) to avoid
+// splitting normal email addresses.
+func (c *PreLookupClient) splitEmailAndToken(email string) (string, string, bool) {
+	if !c.allowMasterToken || c.masterTokenSeparator == "" {
+		return email, "", false
+	}
+
+	// Special case for @ separator: need at least 3 parts (user, domain, token)
+	// to distinguish from normal email address user@domain
+	if c.masterTokenSeparator == "@" {
+		parts := strings.Count(email, "@")
+		if parts < 2 {
+			// Not enough @ symbols for email@TOKEN pattern
+			return email, "", false
+		}
+	}
+
+	// Find the last occurrence of the separator
+	idx := strings.LastIndex(email, c.masterTokenSeparator)
+	if idx == -1 {
+		// No separator found, treat as regular email
+		return email, "", false
+	}
+
+	// Split at the last separator
+	actualEmail := email[:idx]
+	token := email[idx+len(c.masterTokenSeparator):]
+
+	// If token is empty, treat as regular email
+	if token == "" {
+		return email, "", false
+	}
+
+	// IMPORTANT: Token must not contain the separator
+	// This prevents attacks like "user@domain@token@anotherseparator"
+	if strings.Contains(token, c.masterTokenSeparator) {
+		log.Printf("[PreLookup] Master token contains separator %q, rejecting", c.masterTokenSeparator)
+		return email, "", false
+	}
+
+	return actualEmail, token, true
+}
+
 // verifyPassword verifies a password against a hash using the same auth mechanisms as the main server
 func (c *PreLookupClient) verifyPassword(password, hash string) bool {
 	err := db.VerifyPassword(hash, password)
@@ -721,9 +782,28 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		}
 	}
 
-	// Verify password
-	if !c.verifyPassword(password, passwordHash) {
-		log.Printf("[PreLookup] Authentication failed for user: %s", email)
+	// Check for master token authentication
+	// If master token is enabled and present in email, extract it
+	actualEmail, masterToken, hasMasterToken := c.splitEmailAndToken(email)
+
+	// The database query should have been called with the ORIGINAL email (possibly including @TOKEN)
+	// and should return the appropriate password_hash (either user's or master's)
+	// We verify the password/token against the returned hash
+	var credentialToVerify string
+	if hasMasterToken {
+		credentialToVerify = masterToken
+		log.Printf("[PreLookup] Attempting master token authentication for user '%s' (actual: '%s')", email, actualEmail)
+	} else {
+		credentialToVerify = password
+	}
+
+	// Verify password/token against the hash returned by the database
+	if !c.verifyPassword(credentialToVerify, passwordHash) {
+		if hasMasterToken {
+			log.Printf("[PreLookup] Master token authentication failed for user '%s'", email)
+		} else {
+			log.Printf("[PreLookup] Authentication failed for user: %s", email)
+		}
 		return map[string]interface{}{
 			"mode":   "auth_and_route",
 			"info":   nil,
@@ -731,7 +811,11 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		}, nil
 	}
 
-	log.Printf("[PreLookup] Authentication successful for user '%s'", email)
+	if hasMasterToken {
+		log.Printf("[PreLookup] Master token authentication successful for user '%s' (actual: '%s')", email, actualEmail)
+	} else {
+		log.Printf("[PreLookup] Authentication successful for user '%s'", email)
+	}
 	normalizedAddr := c.normalizeServerAddress(serverAddress)
 	normalizedResolved := ""
 	if resolvedAddress != "" {
