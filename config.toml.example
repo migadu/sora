@@ -548,26 +548,47 @@ remote_use_id_command = false
 # 4. Database query logic determines which hash to return based on presence of token
 # 5. System verifies extracted token against returned password_hash (NOT the password!)
 #
-# Example database query (you control the logic):
+# Optional columns that query can return:
+# - password_hash (required): Hash to verify against
+# - account_id (required): Account ID for the user
+# - server_address (required): Backend server IP/hostname
+# - resolved_address (optional): Alternative server address (overrides server_address if present)
+# - actual_email (optional): Resolved email address for impersonation (useful for ALIAS resolution)
+#     * If provided, overrides the email extracted from token splitting
+#     * Use case: alias@domain.com@TOKEN -> resolves to realuser@domain.com
+#
+# Example database query with alias resolution:
 #   SELECT
 #     CASE
-#       WHEN $1 LIKE '%@%@%' THEN master_token_hash  -- Email has token separator
-#       ELSE user_password_hash                      -- Normal email
+#       WHEN master_access_enabled AND split_part($1, '@', 3) IS NOT NULL
+#       THEN master_access_hashed_password
+#       ELSE hashed_password
 #     END as password_hash,
-#     server_address,
-#     resolved_address
-#   FROM user_routing
-#   WHERE email = regexp_replace($1, '@[^@]+$', '')  -- Strip @TOKEN part to get actual email
-#     AND active = true
+#     id as account_id,
+#     dovecot_ip as server_address,
+#     address as actual_email  -- Resolved email (e.g., alias -> real mailbox)
+#   FROM mailbox_address_ip_view
+#   WHERE (
+#     master_access_enabled = true
+#     AND address = split_part($1, '@', 1) || '@' || split_part($1, '@', 2)
+#     AND master_access_token = split_part($1, '@', 3)
+#   ) OR (
+#     address = $1  -- Normal login
+#   )
+#   LIMIT 1
 #
-# OR simpler: pass actual email, store master_token_hash in table:
+# Simpler example without alias resolution:
 #   SELECT
-#     COALESCE(master_token_hash, user_password_hash) as password_hash,
+#     CASE
+#       WHEN $1 LIKE '%@%@%' THEN master_token_hash
+#       ELSE user_password_hash
+#     END as password_hash,
+#     account_id,
 #     server_address
 #   FROM user_routing
-#   WHERE email = regexp_replace($1, '@[^@]+$', '')  -- Strip @TOKEN if present
+#   WHERE email = regexp_replace($1, '@[^@]+$', '')  -- Strip @TOKEN to get base email
 #
-# Use case: Administrative access, support tools, migration scripts
+# Use case: Administrative access, support tools, migration scripts, alias resolution
 #
 # IMPORTANT SECURITY NOTES:
 # - Token is in the EMAIL field, not the password field!

@@ -27,10 +27,9 @@ type PreLookupConfig = config.PreLookupConfig
 // UserRoutingInfo represents routing information for a user
 type UserRoutingInfo struct {
 	ServerAddress          string
-	ResolvedAddress        string // Optional resolved address from prelookup query (overrides ServerAddress if present)
 	AccountID              int64
 	IsPrelookupAccount     bool
-	ActualEmail            string // Actual email address (without master token if present)
+	ActualEmail            string // Actual email address (without master token if present) - used for backend impersonation
 	RemoteTLS              bool
 	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool
@@ -332,7 +331,6 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	c.cacheMutex.RUnlock()
 
 	var serverAddress string
-	var resolvedAddress string
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     3 * time.Second,
@@ -434,10 +432,8 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 		if result != nil {
 			addrMap := result.(map[string]string)
 			serverAddress = addrMap["server"]
-			resolvedAddress = addrMap["resolved"]
 		} else {
 			serverAddress = ""
-			resolvedAddress = ""
 		}
 		return nil // Success
 	}, config)
@@ -447,15 +443,10 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 		return nil, fmt.Errorf("database query failed: %w", err)
 	}
 
-	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s', resolved_address='%s'", email, serverAddress, resolvedAddress)
+	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
 	normalizedAddr := c.normalizeServerAddress(serverAddress)
-	normalizedResolved := ""
-	if resolvedAddress != "" {
-		normalizedResolved = c.normalizeServerAddress(resolvedAddress)
-	}
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedAddr,
-		ResolvedAddress:        normalizedResolved,
 		RemoteTLS:              c.remoteTLS,
 		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,
@@ -706,7 +697,7 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 
 	// Extract named columns
 	var accountID int64 = -1 // Default for 2-column mode
-	var passwordHash, serverAddress, resolvedAddress string
+	var passwordHash, serverAddress string
 
 	// Try to find account_id column
 	if idx, ok := colMap["account_id"]; ok {
@@ -769,23 +760,26 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
 	}
 
-	// Try to find resolved_address column (optional)
-	resolvedIdx := -1
-	for _, name := range []string{"resolved_address", "resolved"} {
-		if idx, ok := colMap[name]; ok {
-			resolvedIdx = idx
-			break
-		}
-	}
-	if resolvedIdx != -1 && values[resolvedIdx] != nil {
-		if addr, ok := values[resolvedIdx].(string); ok && strings.TrimSpace(addr) != "" {
-			resolvedAddress = addr
+	// Try to find actual_email column (optional) - allows database to override email resolution
+	// This is useful for alias resolution: alias@domain@TOKEN -> realuser@domain
+	actualEmailFromDB := ""
+	if idx, ok := colMap["actual_email"]; ok {
+		if idx != -1 && values[idx] != nil {
+			if email, ok := values[idx].(string); ok && strings.TrimSpace(email) != "" {
+				actualEmailFromDB = strings.TrimSpace(email)
+			}
 		}
 	}
 
 	// Check for master token authentication
 	// If master token is enabled and present in email, extract it
 	actualEmail, masterToken, hasMasterToken := c.splitEmailAndToken(email)
+
+	// If database provided an actual_email, use it (for alias resolution)
+	if actualEmailFromDB != "" {
+		actualEmail = actualEmailFromDB
+		log.Printf("[PreLookup] Database provided actual email: '%s' (from input: '%s')", actualEmail, email)
+	}
 
 	// The database query should have been called with the ORIGINAL email (possibly including @TOKEN)
 	// and should return the appropriate password_hash (either user's or master's)
@@ -818,13 +812,8 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		log.Printf("[PreLookup] Authentication successful for user '%s'", email)
 	}
 	normalizedAddr := c.normalizeServerAddress(serverAddress)
-	normalizedResolved := ""
-	if resolvedAddress != "" {
-		normalizedResolved = c.normalizeServerAddress(resolvedAddress)
-	}
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedAddr,
-		ResolvedAddress:        normalizedResolved,
 		AccountID:              accountID,
 		IsPrelookupAccount:     true,
 		ActualEmail:            actualEmail, // Set the actual email without token
