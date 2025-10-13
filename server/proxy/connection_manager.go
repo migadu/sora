@@ -649,10 +649,16 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
-		result.PreferredAddr = result.RoutingInfo.ServerAddress
+		// Use resolved address if available, otherwise use server address
+		if result.RoutingInfo.ResolvedAddress != "" {
+			result.PreferredAddr = result.RoutingInfo.ResolvedAddress
+			log.Printf("[%s] Using routing lookup for %s: resolved_address=%s (server_address=%s)", params.ProxyName, params.Username, result.PreferredAddr, result.RoutingInfo.ServerAddress)
+		} else {
+			result.PreferredAddr = result.RoutingInfo.ServerAddress
+			log.Printf("[%s] Using routing lookup for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+		}
 		result.RoutingMethod = "prelookup"
 		result.IsPrelookupRoute = true
-		log.Printf("[%s] Using routing lookup for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
 	}
 
 	// 2. If no routing info from prelookup, try affinity

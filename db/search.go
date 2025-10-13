@@ -392,8 +392,9 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
+		// Default to DESC so newest messages are returned first when hitting LIMIT
 		if orderByClause == "" {
-			orderByClause = "ORDER BY m.uid"
+			orderByClause = "ORDER BY m.uid DESC"
 		}
 
 		// Fast path: Simple query without joining message_contents.
@@ -419,8 +420,9 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For CTE queries, ensure ORDER BY uses no prefix
+		// Default to DESC so newest messages are returned first when hitting LIMIT
 		if orderByClause == "" {
-			orderByClause = "ORDER BY uid"
+			orderByClause = "ORDER BY uid DESC"
 		}
 
 		// Complex path: Use CTE when sequence numbers or FTS are needed
@@ -481,7 +483,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 }
 
 func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]Message, error) {
-	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "ORDER BY uid") // Default sort
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "") // Empty string triggers default sort
 	if err != nil {
 		return nil, fmt.Errorf("GetMessagesWithCriteria: %w", err)
 	}

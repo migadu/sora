@@ -27,6 +27,7 @@ type PreLookupConfig = config.PreLookupConfig
 // UserRoutingInfo represents routing information for a user
 type UserRoutingInfo struct {
 	ServerAddress          string
+	ResolvedAddress        string // Optional resolved address from prelookup query (overrides ServerAddress if present)
 	AccountID              int64
 	IsPrelookupAccount     bool
 	RemoteTLS              bool
@@ -317,6 +318,7 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 	c.cacheMutex.RUnlock()
 
 	var serverAddress string
+	var resolvedAddress string
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     3 * time.Second,
@@ -341,44 +343,65 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 				return nil, retry.Stop(pgx.ErrNoRows)
 			}
 
-			// Get field descriptions to determine the number of columns
+			// Get field descriptions to build column name map
 			fieldDescs := rows.FieldDescriptions()
 			numCols := len(fieldDescs)
 
-			if numCols == 1 {
-				// Single column: server_address only (routing-only mode)
-				var addr string
-				err := rows.Scan(&addr)
-				if err != nil {
-					return nil, err
-				}
-				return addr, nil
-			} else if numCols >= 2 {
-				// Multiple columns: assume it includes password_hash (auth+route mode)
-				// For routing-only lookup, we just need the server address (assume it's the last column)
-				values := make([]interface{}, numCols)
-				valuePtrs := make([]interface{}, numCols)
-				for i := range values {
-					valuePtrs[i] = &values[i]
-				}
-
-				err := rows.Scan(valuePtrs...)
-				if err != nil {
-					return nil, err
-				}
-
-				// Return the last column as server address for routing purposes
-				if values[numCols-1] != nil {
-					addr, ok := values[numCols-1].(string)
-					if !ok {
-						return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
-					}
-					return addr, nil
-				}
-				return "", nil
+			// Build column name to index map
+			colMap := make(map[string]int)
+			for i, fd := range fieldDescs {
+				colMap[strings.ToLower(string(fd.Name))] = i
 			}
 
-			return nil, fmt.Errorf("unexpected number of columns: %d", numCols)
+			// Scan all values
+			values := make([]interface{}, numCols)
+			valuePtrs := make([]interface{}, numCols)
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+			if err := rows.Scan(valuePtrs...); err != nil {
+				return nil, err
+			}
+
+			// Extract named columns
+			result := map[string]string{"server": "", "resolved": ""}
+
+			// Try common column names for server address
+			serverIdx := -1
+			for _, name := range []string{"server_address", "server", "address"} {
+				if idx, ok := colMap[name]; ok {
+					serverIdx = idx
+					break
+				}
+			}
+
+			// If no named server column found, use last column as fallback
+			if serverIdx == -1 {
+				serverIdx = numCols - 1
+			}
+
+			if values[serverIdx] != nil {
+				if addr, ok := values[serverIdx].(string); ok {
+					result["server"] = addr
+				}
+			}
+
+			// Try to find resolved_address column
+			resolvedIdx := -1
+			for _, name := range []string{"resolved_address", "resolved"} {
+				if idx, ok := colMap[name]; ok {
+					resolvedIdx = idx
+					break
+				}
+			}
+
+			if resolvedIdx != -1 && values[resolvedIdx] != nil {
+				if addr, ok := values[resolvedIdx].(string); ok && strings.TrimSpace(addr) != "" {
+					result["resolved"] = addr
+				}
+			}
+
+			return result, nil
 		})
 
 		if cbErr != nil {
@@ -395,9 +418,12 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 		}
 
 		if result != nil {
-			serverAddress = result.(string)
+			addrMap := result.(map[string]string)
+			serverAddress = addrMap["server"]
+			resolvedAddress = addrMap["resolved"]
 		} else {
 			serverAddress = ""
+			resolvedAddress = ""
 		}
 		return nil // Success
 	}, config)
@@ -407,10 +433,15 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 		return nil, fmt.Errorf("database query failed: %w", err)
 	}
 
-	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s'", email, serverAddress)
+	log.Printf("[PreLookup] Routing result for user '%s': server_address='%s', resolved_address='%s'", email, serverAddress, resolvedAddress)
 	normalizedAddr := c.normalizeServerAddress(serverAddress)
+	normalizedResolved := ""
+	if resolvedAddress != "" {
+		normalizedResolved = c.normalizeServerAddress(resolvedAddress)
+	}
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedAddr,
+		ResolvedAddress:        normalizedResolved,
 		RemoteTLS:              c.remoteTLS,
 		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
 		RemoteTLSVerify:        c.remoteTLSVerify,
@@ -592,6 +623,12 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 	fieldDescs := rows.FieldDescriptions()
 	numCols := len(fieldDescs)
 
+	// Build column name to index map
+	colMap := make(map[string]int)
+	for i, fd := range fieldDescs {
+		colMap[strings.ToLower(string(fd.Name))] = i
+	}
+
 	values := make([]interface{}, numCols)
 	valuePtrs := make([]interface{}, numCols)
 	for i := range values {
@@ -605,79 +642,82 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 
 	log.Printf("[PreLookup] Auto-detected auth+route mode for user '%s' (%d columns)", email, numCols)
 
-	// Extract values - assume common patterns:
-	// 2 cols: password_hash, server_address
-	// 3+ cols: account_id, password_hash, server_address (last is server)
-	var accountID int64
-	var passwordHash, serverAddress string
+	// Extract named columns
+	var accountID int64 = -1 // Default for 2-column mode
+	var passwordHash, serverAddress, resolvedAddress string
+
+	// Try to find account_id column
+	if idx, ok := colMap["account_id"]; ok {
+		if values[idx] != nil {
+			if id, ok := values[idx].(int64); ok && id > 0 {
+				accountID = id
+			} else {
+				log.Printf("[PreLookup] Authentication failed for user '%s': account_id is invalid in prelookup result", email)
+				return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+			}
+		}
+	}
+
+	// Try to find password_hash column (required)
+	passwordIdx := -1
+	for _, name := range []string{"password_hash", "password"} {
+		if idx, ok := colMap[name]; ok {
+			passwordIdx = idx
+			break
+		}
+	}
+	if passwordIdx == -1 {
+		return nil, fmt.Errorf("prelookup query: password_hash column not found")
+	}
+	if values[passwordIdx] == nil {
+		log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is NULL in prelookup result", email)
+		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	}
 	var ok bool
+	passwordHash, ok = values[passwordIdx].(string)
+	if !ok {
+		return nil, fmt.Errorf("prelookup query: expected password_hash to be a string, but got %T", values[passwordIdx])
+	}
+	if strings.TrimSpace(passwordHash) == "" {
+		log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
+		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	}
 
-	if numCols == 2 {
-		if values[0] == nil {
-			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is NULL in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	// Try to find server_address column (required)
+	serverIdx := -1
+	for _, name := range []string{"server_address", "server", "address"} {
+		if idx, ok := colMap[name]; ok {
+			serverIdx = idx
+			break
 		}
-		passwordHash, ok = values[0].(string)
-		if !ok {
-			return nil, fmt.Errorf("prelookup query: expected column 1 (password_hash) to be a string, but got %T", values[0])
-		}
-		if strings.TrimSpace(passwordHash) == "" {
-			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
+	}
+	if serverIdx == -1 {
+		return nil, fmt.Errorf("prelookup query: server_address column not found")
+	}
+	if values[serverIdx] == nil {
+		log.Printf("[PreLookup] Authentication failed for user '%s': server_address is NULL in prelookup result", email)
+		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	}
+	serverAddress, ok = values[serverIdx].(string)
+	if !ok {
+		return nil, fmt.Errorf("prelookup query: expected server_address to be a string, but got %T", values[serverIdx])
+	}
+	if strings.TrimSpace(serverAddress) == "" {
+		log.Printf("[PreLookup] Authentication failed for user '%s': server_address is empty in prelookup result", email)
+		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	}
 
-		if values[1] == nil {
-			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is NULL in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	// Try to find resolved_address column (optional)
+	resolvedIdx := -1
+	for _, name := range []string{"resolved_address", "resolved"} {
+		if idx, ok := colMap[name]; ok {
+			resolvedIdx = idx
+			break
 		}
-		serverAddress, ok = values[1].(string)
-		if !ok {
-			return nil, fmt.Errorf("prelookup query: expected column 2 (server_address) to be a string, but got %T", values[1])
-		}
-		if strings.TrimSpace(serverAddress) == "" {
-			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is empty in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-		// For 2-column mode, use a placeholder account ID since it's not provided
-		accountID = -1 // Use -1 to distinguish from default 0
-	} else { // 3+ columns
-		if values[0] == nil {
-			log.Printf("[PreLookup] Authentication failed for user '%s': account_id is NULL in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-		accountID, ok = values[0].(int64)
-		if !ok {
-			return nil, fmt.Errorf("prelookup query: expected column 1 (account_id) to be an int64, but got %T", values[0])
-		}
-		if accountID <= 0 {
-			log.Printf("[PreLookup] Authentication failed for user '%s': account_id is invalid (%d) in prelookup result", email, accountID)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-
-		if values[1] == nil {
-			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is NULL in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-		passwordHash, ok = values[1].(string)
-		if !ok {
-			return nil, fmt.Errorf("prelookup query: expected column 2 (password_hash) to be a string, but got %T", values[1])
-		}
-		if strings.TrimSpace(passwordHash) == "" {
-			log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-
-		if values[numCols-1] == nil {
-			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is NULL in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
-		}
-		serverAddress, ok = values[numCols-1].(string)
-		if !ok {
-			return nil, fmt.Errorf("prelookup query: expected last column (server_address) to be a string, but got %T", values[numCols-1])
-		}
-		if strings.TrimSpace(serverAddress) == "" {
-			log.Printf("[PreLookup] Authentication failed for user '%s': server_address is empty in prelookup result", email)
-			return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
+	}
+	if resolvedIdx != -1 && values[resolvedIdx] != nil {
+		if addr, ok := values[resolvedIdx].(string); ok && strings.TrimSpace(addr) != "" {
+			resolvedAddress = addr
 		}
 	}
 
@@ -693,8 +733,13 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 
 	log.Printf("[PreLookup] Authentication successful for user '%s'", email)
 	normalizedAddr := c.normalizeServerAddress(serverAddress)
+	normalizedResolved := ""
+	if resolvedAddress != "" {
+		normalizedResolved = c.normalizeServerAddress(resolvedAddress)
+	}
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedAddr,
+		ResolvedAddress:        normalizedResolved,
 		AccountID:              accountID,
 		IsPrelookupAccount:     true,
 		RemoteTLS:              c.remoteTLS,
