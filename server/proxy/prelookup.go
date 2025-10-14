@@ -177,7 +177,6 @@ func NewPreLookupClient(ctx context.Context, config *PreLookupConfig) (*PreLooku
 	}
 
 	// Use a single query that can handle both routing-only and auth+route modes.
-	// The system will auto-detect the mode based on the number of columns returned.
 	query := config.Query
 	if query == "" {
 		return nil, errors.New("prelookup query is not configured")
@@ -341,7 +340,6 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		result, cbErr := c.breaker.Execute(func() (interface{}, error) {
-			// Try to execute query and auto-detect the format based on columns
 			rows, err := c.pool.Query(ctx, c.query, email)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, sql.ErrNoRows) {
@@ -481,7 +479,6 @@ func (c *PreLookupClient) LookupUserRoute(ctx context.Context, email string) (*U
 }
 
 // AuthenticateAndRoute performs both authentication and routing lookup
-// Auto-detects mode based on query results: 1 column = routing only, 2+ columns = auth+route
 func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
 	// Check cache first - but never cache passwords for security
 	c.cacheMutex.RLock()
@@ -524,19 +521,19 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 				return nil, retry.Stop(pgx.ErrNoRows)
 			}
 
-			// Auto-detect mode based on number of columns
 			fieldDescs := rows.FieldDescriptions()
 			numCols := len(fieldDescs)
 
+			// Special case: single unnamed column is treated as server_address (routing-only mode)
+			// This is for backward compatibility with simple queries like "SELECT server FROM ..."
 			if numCols == 1 {
-				// Single column: routing-only mode - just server address
 				var serverAddr string
 				err := rows.Scan(&serverAddr)
 				if err != nil {
 					return nil, err
 				}
 
-				log.Printf("[PreLookup] Auto-detected routing-only mode for user '%s'", email)
+				log.Printf("[PreLookup] Routing-only mode for user '%s' (single column)", email)
 				normalizedAddr := c.normalizeServerAddress(serverAddr)
 				info := &UserRoutingInfo{
 					ServerAddress:          normalizedAddr,
@@ -553,12 +550,11 @@ func (c *PreLookupClient) AuthenticateAndRoute(ctx context.Context, email, passw
 					"info":   info,
 					"result": AuthSuccess,
 				}, nil
-
-			} else if numCols >= 2 {
-				return c._handleAuthAndRoute(rows, email, password)
 			}
 
-			return nil, fmt.Errorf("unexpected number of columns: %d", numCols)
+			// For 2+ columns, use named column detection
+			// The actual mode (routing vs auth+route) is determined by which named columns are present
+			return c._handleAuthAndRoute(rows, email, password)
 		})
 
 		if cbErr != nil {
@@ -693,7 +689,7 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 		return nil, err
 	}
 
-	log.Printf("[PreLookup] Auto-detected auth+route mode for user '%s' (%d columns)", email, numCols)
+	log.Printf("[PreLookup] Processing auth+route mode for user '%s'", email)
 
 	// Extract named columns
 	var accountID int64 = -1 // Default for 2-column mode
@@ -731,7 +727,8 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 	if !ok {
 		return nil, fmt.Errorf("prelookup query: expected password_hash to be a string, but got %T", values[passwordIdx])
 	}
-	if strings.TrimSpace(passwordHash) == "" {
+	passwordHash = strings.TrimSpace(passwordHash)
+	if passwordHash == "" {
 		log.Printf("[PreLookup] Authentication failed for user '%s': password_hash is empty in prelookup result", email)
 		return map[string]interface{}{"mode": "auth_and_route", "info": nil, "result": AuthFailed}, nil
 	}
@@ -785,11 +782,19 @@ func (c *PreLookupClient) _handleAuthAndRoute(rows pgx.Rows, email, password str
 	// and should return the appropriate password_hash (either user's or master's)
 	// We verify the password/token against the returned hash
 	var credentialToVerify string
+	var hashPrefix string
+	if len(passwordHash) > 30 {
+		hashPrefix = passwordHash[:30] + "..."
+	} else {
+		hashPrefix = passwordHash
+	}
+
 	if hasMasterToken {
 		credentialToVerify = masterToken
-		log.Printf("[PreLookup] Attempting master token authentication for user '%s' (actual: '%s')", email, actualEmail)
+		log.Printf("[PreLookup] Attempting master token authentication for user '%s' (actual: '%s', token length: %d, hash: %s)", email, actualEmail, len(masterToken), hashPrefix)
 	} else {
 		credentialToVerify = password
+		log.Printf("[PreLookup] Attempting password authentication for user '%s' (password length: %d, hash: %s)", email, len(password), hashPrefix)
 	}
 
 	// Verify password/token against the hash returned by the database

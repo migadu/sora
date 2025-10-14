@@ -436,43 +436,38 @@ min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris att
 # The prelookup query uses NAMED COLUMNS for maximum flexibility. Column order doesn't matter!
 # The system recognizes these column names (case-insensitive):
 #
-# REQUIRED COLUMNS (at least one):
-# - server_address, server, address: Backend server address
+# REQUIRED COLUMNS:
+# - server_address: Backend server IP/hostname to connect to
 #
 # OPTIONAL COLUMNS:
-# - resolved_address, resolved: Resolved backend address (overrides server_address if present and non-empty)
-# - password_hash, password: Password hash for authentication (enables auth mode)
+# - password_hash: Password hash for authentication (enables auth mode)
 # - account_id: Account ID for tracking/metrics
+# - actual_email: Resolved email address for backend impersonation (useful for alias resolution)
 #
 # Examples (column order is flexible - use any order you prefer):
 #
 # 1. ROUTING-ONLY MODE:
 #    SELECT server_address FROM user_routing WHERE email = $1
 #
-# 2. ROUTING WITH ADDRESS RESOLUTION:
-#    SELECT server_address, resolved_address FROM user_routing WHERE email = $1
-#    -- Column order doesn't matter:
-#    SELECT resolved_address, server_address FROM user_routing WHERE email = $1
-#
-# 3. AUTH+ROUTE MODE:
+# 2. AUTH+ROUTE MODE:
 #    SELECT password_hash, server_address FROM user_routing WHERE email = $1
 #    -- Any order works:
 #    SELECT server_address, password_hash FROM user_routing WHERE email = $1
 #
-# 4. AUTH+ROUTE WITH ID:
+# 3. AUTH+ROUTE WITH ID:
 #    SELECT account_id, password_hash, server_address FROM user_routing WHERE email = $1
 #    -- Mix and match as needed:
 #    SELECT password_hash, account_id, server_address FROM user_routing WHERE email = $1
 #
-# 5. FULL MODE (all columns):
-#    SELECT account_id, password_hash, server_address, resolved_address FROM user_routing WHERE email = $1
+# 4. FULL MODE WITH ALIAS RESOLUTION:
+#    SELECT account_id, password_hash, server_address, actual_email FROM user_routing WHERE email = $1
 #    -- Order is completely flexible:
-#    SELECT server_address, resolved_address, account_id, password_hash FROM user_routing WHERE email = $1
+#    SELECT server_address, actual_email, account_id, password_hash FROM user_routing WHERE email = $1
 #
 # BEHAVIOR:
 # - Column names are case-insensitive
-# - NULL or empty resolved_address → falls back to server_address
 # - password_hash present → authentication required at proxy level
+# - actual_email (if provided) → overrides automatic email extraction for backend impersonation
 # - If user not found (no rows) → falls back to default routing (if fallback_to_default=true)
 # - If user found but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
@@ -505,7 +500,7 @@ query = """
     account_id,
     password_hash,
     server_address,
-    resolved_address
+    actual_email
   FROM user_routing
   WHERE email = $1
     AND active = true
@@ -519,7 +514,7 @@ query = """
 #       ELSE user_password_hash
 #     END as password_hash,
 #     server_address,
-#     resolved_address
+#     actual_email
 #   FROM user_routing
 #   WHERE email = regexp_replace($1, '@[^@]+$', '')
 #     AND active = true
@@ -551,9 +546,8 @@ remote_use_id_command = false
 # Optional columns that query can return:
 # - password_hash (required): Hash to verify against
 # - account_id (required): Account ID for the user
-# - server_address (required): Backend server IP/hostname
-# - resolved_address (optional): Alternative server address (overrides server_address if present)
-# - actual_email (optional): Resolved email address for impersonation (useful for ALIAS resolution)
+# - server_address (required): Backend server IP/hostname to connect to
+# - actual_email (optional): Resolved email address for backend impersonation (useful for ALIAS resolution)
 #     * If provided, overrides the email extracted from token splitting
 #     * Use case: alias@domain.com@TOKEN -> resolves to realuser@domain.com
 #
