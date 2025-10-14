@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
@@ -37,7 +38,7 @@ type POP3ProxyServer struct {
 	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig        *proxy.PreLookupConfig
+	prelookupConfig        *config.PreLookupConfig
 	sessionTimeout         time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
@@ -119,7 +120,7 @@ type POP3ProxyServerOptions struct {
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	AuthRateLimit          server.AuthRateLimiterConfig
-	PreLookup              *proxy.PreLookupConfig
+	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 
@@ -135,13 +136,13 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// Ensure PreLookup config has a default value to avoid nil panics.
 	if options.PreLookup == nil {
-		options.PreLookup = &proxy.PreLookupConfig{}
+		options.PreLookup = &config.PreLookupConfig{}
 	}
 
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if options.PreLookup != nil && options.PreLookup.Enabled {
-		prelookupClient, err := proxy.NewPreLookupClient(serverCtx, options.PreLookup)
+		prelookupClient, err := proxy.InitializePrelookup(options.PreLookup)
 		if err != nil {
 			log.Printf("[POP3 Proxy %s] Failed to initialize prelookup client: %v", options.Name, err)
 			if !options.PreLookup.FallbackDefault {
@@ -151,7 +152,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			log.Printf("[POP3 Proxy %s] Continuing without prelookup due to fallback_to_default=true", options.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[POP3 Proxy %s] Prelookup database client initialized successfully", options.Name)
+			log.Printf("[POP3 Proxy %s] Prelookup client initialized successfully", options.Name)
 		}
 	}
 

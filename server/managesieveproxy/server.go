@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -41,7 +42,7 @@ type Server struct {
 	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig        *proxy.PreLookupConfig
+	prelookupConfig        *config.PreLookupConfig
 	sessionTimeout         time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
@@ -83,7 +84,7 @@ type ServerOptions struct {
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	AuthRateLimit          server.AuthRateLimiterConfig
-	PreLookup              *proxy.PreLookupConfig
+	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 
 	// Connection limiting
@@ -115,14 +116,18 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Ensure PreLookup config has a default value to avoid nil panics.
 	if opts.PreLookup == nil {
-		opts.PreLookup = &proxy.PreLookupConfig{}
+		opts.PreLookup = &config.PreLookupConfig{}
 	}
 
 	// Initialize prelookup client if configured
-	routingLookup, err := proxy.InitializePrelookup(ctx, opts.PreLookup, "ManageSieve")
+	routingLookup, err := proxy.InitializePrelookup(opts.PreLookup)
 	if err != nil {
-		cancel()
-		return nil, err // InitializePrelookup handles fallback logic and returns error only when fatal
+		log.Printf("[ManageSieve Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
+		if opts.PreLookup != nil && !opts.PreLookup.FallbackDefault {
+			cancel()
+			return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+		}
+		log.Printf("[ManageSieve Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)

@@ -430,172 +430,144 @@ min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris att
 # [server.auth_rate_limit]
 # enabled = false
 
-# --- DATABASE-DRIVEN USER ROUTING (PRELOOKUP) ---
-# Advanced feature for routing users to specific backend servers based on database queries.
+# --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
+# Advanced feature for routing users to specific backend servers via HTTP API.
 #
-# The prelookup query uses NAMED COLUMNS for maximum flexibility. Column order doesn't matter!
-# The system recognizes these column names (case-insensitive):
+# The prelookup service is called via HTTP GET with the email parameter.
+# Request URL: GET {url}?email=user@domain.com
 #
-# REQUIRED COLUMNS:
-# - server_address: Backend server IP/hostname to connect to
+# The HTTP endpoint should return a JSON response with the following fields:
 #
-# OPTIONAL COLUMNS:
-# - password_hash: Password hash for authentication (enables auth mode)
-# - account_id: Account ID for tracking/metrics
-# - actual_email: Resolved email address for backend impersonation (useful for alias resolution)
+# REQUIRED FIELDS:
+# - address: Email address for backend impersonation (string)
+# - password_hash: Password hash to verify authentication (string)
+# - server: Backend server address - can be IP/hostname:port OR just IP/hostname (string)
+#   * If port is included: "192.168.1.10:143" or "backend.example.com:993"
+#   * If port is omitted: "192.168.1.10" or "backend.example.com"
+#     → Port from remote_port config will be appended (default: 143)
+# - account_id: Account ID for tracking/metrics (integer, must be > 0)
 #
-# Examples (column order is flexible - use any order you prefer):
+# Example JSON Response (with port):
+# {
+#   "address": "user@domain.com",
+#   "password_hash": "$2a$12$abcdef...",
+#   "server": "backend1.example.com:143",
+#   "account_id": 12345
+# }
 #
-# 1. ROUTING-ONLY MODE:
-#    SELECT server_address FROM user_routing WHERE email = $1
-#
-# 2. AUTH+ROUTE MODE:
-#    SELECT password_hash, server_address FROM user_routing WHERE email = $1
-#    -- Any order works:
-#    SELECT server_address, password_hash FROM user_routing WHERE email = $1
-#
-# 3. AUTH+ROUTE WITH ID:
-#    SELECT account_id, password_hash, server_address FROM user_routing WHERE email = $1
-#    -- Mix and match as needed:
-#    SELECT password_hash, account_id, server_address FROM user_routing WHERE email = $1
-#
-# 4. FULL MODE WITH ALIAS RESOLUTION:
-#    SELECT account_id, password_hash, server_address, actual_email FROM user_routing WHERE email = $1
-#    -- Order is completely flexible:
-#    SELECT server_address, actual_email, account_id, password_hash FROM user_routing WHERE email = $1
+# Example JSON Response (without port - uses remote_port):
+# {
+#   "address": "user@domain.com",
+#   "password_hash": "$2a$12$abcdef...",
+#   "server": "192.168.1.10",
+#   "account_id": 12345
+# }
 #
 # BEHAVIOR:
-# - Column names are case-insensitive
-# - password_hash present → authentication required at proxy level
-# - actual_email (if provided) → overrides automatic email extraction for backend impersonation
-# - If user not found (no rows) → falls back to default routing (if fallback_to_default=true)
-# - If user found but auth fails → connection REJECTED (no fallback)
+# - HTTP GET request is made for each authentication attempt
+# - Circuit breaker protects against service failures (60% failure rate triggers open state)
+# - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
+# - If HTTP endpoint returns 404 or 5xx → falls back to default routing (if fallback_to_default=true)
+# - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
-# - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...)
-# - Results cached for cache_ttl duration to reduce database load
+# - Timeout for HTTP requests is configurable (default: 5s)
+#
+# ALIAS RESOLUTION:
+# The "address" field in the response is used for backend impersonation. This enables alias resolution:
+# - Request: user logs in with "alias@domain.com"
+# - Response: {"address": "realuser@domain.com", ...}
+# - Proxy connects to backend and authenticates as "realuser@domain.com"
 #
 [server.prelookup]
-enabled = false               # Enable/disable database-driven user routing.
-hosts = ["localhost"]
-port = 5432
-user = "postgres"
-password = ""
-name = "routing_db"
-tls = false
-max_conns = 10
-min_conns = 2
-max_conn_lifetime = "1h"
-max_conn_idle_time = "30m"
-cache_ttl = "10m"             # How long to cache routing results (reduces database queries)
-cache_size = 10000            # Maximum number of cached entries
-auth_method = "bcrypt"        # Only used if query returns password_hash column. Supports: "bcrypt", "ssha512"
+enabled = false                       # Enable/disable HTTP-based user routing.
+url = "http://localhost:8080/lookup"  # HTTP endpoint URL for prelookup service (required if enabled)
+timeout = "5s"                        # HTTP request timeout (default: 5s)
 
-# Example queries (use named columns - order doesn't matter):
-# Simple query:
-# query = "SELECT server_address FROM user_routing WHERE email = $1"
+fallback_to_default = true            # If prelookup initialization fails (e.g., endpoint unreachable), continue without prelookup
+                                      # using default round-robin routing. If false, proxy fails to start on prelookup errors.
+                                      # NOTE: This only applies to initialization failures, not per-user lookup failures.
+remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
+remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
+                                      # NOTE: Only supported for LMTP and ManageSieve proxies.
+                                      #       IMAP and POP3 proxies use implicit TLS and ignore this setting.
+remote_tls_verify = true              # Verify backend TLS certificates
+# remote_port = 143                   # Default port to append if server address doesn't include port (default: 143)
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
 
-# With master token support (multiline for readability):
-query = """
-  SELECT
-    account_id,
-    password_hash,
-    server_address,
-    actual_email
-  FROM user_routing
-  WHERE email = $1
-    AND active = true
-"""
+  # --- PRELOOKUP CACHING ---
+  # In-memory caching of HTTP prelookup results for improved performance.
+  # Significantly reduces HTTP requests by caching authentication results.
+  #
+  # CACHE BEHAVIOR:
+  # - Positive results (successful auth): Cached with longer TTL
+  # - Negative results (failed auth, user not found): Cached with shorter TTL
+  # - Cache key: Combination of email and password hash
+  # - Thread-safe with read/write locks
+  # - Background cleanup of expired entries
+  # - LRU-style eviction when max size exceeded
+  #
+  # BENEFITS:
+  # - Reduced latency: Sub-millisecond cache lookups vs HTTP roundtrip
+  # - Reduced load: Fewer requests to prelookup HTTP endpoint
+  # - DDoS protection: Negative caching prevents repeated failed auth attempts
+  # - Configurable: Separate TTLs for positive/negative results
+  #
+  # EXAMPLE SCENARIOS:
+  # - User authenticates successfully → cached for 5 minutes
+  # - Same user authenticates again within 5 minutes → instant cache hit
+  # - Attacker tries wrong password → cached as failed for 1 minute
+  # - Attacker retries same wrong password → instant rejection from cache
+  #
+  # [server.prelookup.cache]
+  # enabled = false                 # Enable in-memory caching of prelookup results (default: false)
+  # positive_ttl = "5m"             # TTL for successful authentication (default: 5m)
+                                    # How long to cache valid credentials
+                                    # Longer TTL = fewer HTTP requests, but password changes take longer to take effect
+  # negative_ttl = "1m"             # TTL for failed auth or user not found (default: 1m)
+                                    # Shorter TTL avoids caching temporary issues (e.g., typos, transient failures)
+                                    # Provides DDoS protection while allowing quick recovery
+  # max_size = 10000                # Maximum number of cached entries (default: 10000)
+                                    # When exceeded, oldest entries (by expiration time) are evicted
+                                    # Memory usage: ~1-2 KB per entry, so 10000 entries ≈ 10-20 MB
+  # cleanup_interval = "1m"         # How often to scan and remove expired entries (default: 1m)
+                                    # More frequent = lower memory usage, slightly higher CPU
+                                    # Less frequent = higher memory usage, lower CPU
 
-# Advanced example with master token logic in database:
-# query = """
-#   SELECT
-#     CASE
-#       WHEN $1 LIKE '%@%@%' THEN master_token_hash
-#       ELSE user_password_hash
-#     END as password_hash,
-#     server_address,
-#     actual_email
-#   FROM user_routing
-#   WHERE email = regexp_replace($1, '@[^@]+$', '')
-#     AND active = true
-# """
-fallback_to_default = true    # If prelookup initialization fails (e.g., database unreachable), continue without prelookup
-                              # using default round-robin routing. If false, proxy fails to start on prelookup errors.
-                              # NOTE: This only applies to initialization failures, not per-user lookup failures.
-remote_tls = false                      # Enable TLS for backend connections (implicit TLS or StartTLS)
-remote_tls_use_starttls = false         # Use STARTTLS for backend connections (requires remote_tls = true)
-                                        # NOTE: Only supported for LMTP and ManageSieve proxies.
-                                        #       IMAP and POP3 proxies use implicit TLS and ignore this setting.
-remote_tls_verify = true                # Verify backend TLS certificates
-# remote_port = 143
-remote_use_proxy_protocol = true
-remote_use_id_command = false
-
-# --- MASTER TOKEN AUTHENTICATION ---
-# Allow master user to authenticate as any user using a token appended to the EMAIL address.
-# Syntax: Login with email="user@domain.com@MASTERTOKEN" and password="anything"
-# The system extracts the token from the EMAIL, and the DATABASE returns the appropriate password_hash.
+# --- MASTER TOKEN / ALIAS RESOLUTION ---
+# The HTTP endpoint can implement master token authentication or alias resolution.
+# The proxy simply passes the full email address to the endpoint and verifies the returned password hash.
 #
-# How it works:
-# 1. User logs in: email="user@domain.com@MASTERTOKEN", password="anything"
-# 2. System extracts: actualEmail="user@domain.com", token="MASTERTOKEN"
-# 3. System passes ORIGINAL email to database: $1 = "user@domain.com@MASTERTOKEN"
-# 4. Database query logic determines which hash to return based on presence of token
-# 5. System verifies extracted token against returned password_hash (NOT the password!)
+# Example: Master Token Authentication
+# - Client logs in with: email="user@domain.com@MASTERTOKEN", password="anything"
+# - HTTP GET request: /lookup?email=user@domain.com@MASTERTOKEN
+# - HTTP endpoint splits the email, validates the token, and returns:
+#   {
+#     "address": "user@domain.com",
+#     "password_hash": "<hash of MASTERTOKEN>",
+#     "server": "backend1:143",
+#     "account_id": 123
+#   }
+# - Proxy verifies "anything" against the returned hash
+# - Proxy connects to backend as "user@domain.com" (from "address" field)
 #
-# Optional columns that query can return:
-# - password_hash (required): Hash to verify against
-# - account_id (required): Account ID for the user
-# - server_address (required): Backend server IP/hostname to connect to
-# - actual_email (optional): Resolved email address for backend impersonation (useful for ALIAS resolution)
-#     * If provided, overrides the email extracted from token splitting
-#     * Use case: alias@domain.com@TOKEN -> resolves to realuser@domain.com
+# Example: Alias Resolution
+# - Client logs in with: email="alias@domain.com", password="userpass"
+# - HTTP GET request: /lookup?email=alias@domain.com
+# - HTTP endpoint resolves alias and returns:
+#   {
+#     "address": "realuser@domain.com",
+#     "password_hash": "<hash of userpass>",
+#     "server": "backend1:143",
+#     "account_id": 456
+#   }
+# - Proxy verifies "userpass" against the returned hash
+# - Proxy connects to backend as "realuser@domain.com" (from "address" field)
 #
-# Example database query with alias resolution:
-#   SELECT
-#     CASE
-#       WHEN master_access_enabled AND split_part($1, '@', 3) IS NOT NULL
-#       THEN master_access_hashed_password
-#       ELSE hashed_password
-#     END as password_hash,
-#     id as account_id,
-#     dovecot_ip as server_address,
-#     address as actual_email  -- Resolved email (e.g., alias -> real mailbox)
-#   FROM mailbox_address_ip_view
-#   WHERE (
-#     master_access_enabled = true
-#     AND address = split_part($1, '@', 1) || '@' || split_part($1, '@', 2)
-#     AND master_access_token = split_part($1, '@', 3)
-#   ) OR (
-#     address = $1  -- Normal login
-#   )
-#   LIMIT 1
+# The "address" field in the HTTP response determines which user the proxy authenticates as on the backend.
+# All logic for token splitting, validation, alias resolution, etc. is handled by your HTTP endpoint.
 #
-# Simpler example without alias resolution:
-#   SELECT
-#     CASE
-#       WHEN $1 LIKE '%@%@%' THEN master_token_hash
-#       ELSE user_password_hash
-#     END as password_hash,
-#     account_id,
-#     server_address
-#   FROM user_routing
-#   WHERE email = regexp_replace($1, '@[^@]+$', '')  -- Strip @TOKEN to get base email
-#
-# Use case: Administrative access, support tools, migration scripts, alias resolution
-#
-# IMPORTANT SECURITY NOTES:
-# - Token is in the EMAIL field, not the password field!
-# - The master token itself CANNOT contain the separator character
-# - Token validation is strict: tokens with embedded separators are rejected
-# - Master token hash should be strong (bcrypt $2a$12$ or SSHA512)
-# - Database controls which hash is returned based on your business logic
-# - This bypasses normal password authentication - use with extreme caution!
-# - All master token attempts are logged for audit
-#
-allow_master_token = false              # Enable master token authentication (default: false)
-master_token_separator = "@"            # Character(s) used to split email from token (default: "@")
-                                        # The token is extracted from: email = user@domain.com + separator + token
+# See test_prelookup_server.go for a working example implementation.
 
 
 # POP3 PROXY EXAMPLE

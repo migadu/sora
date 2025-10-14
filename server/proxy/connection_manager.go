@@ -88,7 +88,7 @@ func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, pa
 	if cm.routingLookup == nil {
 		return nil, AuthUserNotFound, fmt.Errorf("no routing lookup configured")
 	}
-	return cm.routingLookup.AuthenticateAndRoute(ctx, email, password)
+	return cm.routingLookup.LookupUserRoute(ctx, email, password)
 }
 
 // GetRoutingLookup returns the routing lookup client (may be nil)
@@ -599,11 +599,19 @@ func (cm *ConnectionManager) HasRouting() bool {
 }
 
 // LookupUserRoute performs a user routing lookup if configured.
+// Note: This is routing-only lookup, so password is empty.
 func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) (*UserRoutingInfo, error) {
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
 	}
-	return cm.routingLookup.LookupUserRoute(ctx, email)
+	info, authResult, err := cm.routingLookup.LookupUserRoute(ctx, email, "")
+	if err != nil {
+		return nil, err
+	}
+	if authResult == AuthUserNotFound {
+		return nil, nil
+	}
+	return info, nil
 }
 
 // RouteParams holds all parameters needed to determine a backend route.

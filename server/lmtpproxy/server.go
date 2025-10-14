@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -39,7 +40,7 @@ type Server struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig    *proxy.PreLookupConfig
+	prelookupConfig    *config.PreLookupConfig
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 	sessionTimeout     time.Duration
 	maxMessageSize     int64
@@ -74,7 +75,7 @@ type ServerOptions struct {
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
-	PreLookup              *proxy.PreLookupConfig
+	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 	MaxMessageSize         int64
@@ -103,13 +104,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Ensure PreLookup config has a default value to avoid nil panics.
 	if opts.PreLookup == nil {
-		opts.PreLookup = &proxy.PreLookupConfig{}
+		opts.PreLookup = &config.PreLookupConfig{}
 	}
 
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.NewPreLookupClient(ctx, opts.PreLookup)
+		prelookupClient, err := proxy.InitializePrelookup(opts.PreLookup)
 		if err != nil {
 			log.Printf("[LMTP Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
 			if !opts.PreLookup.FallbackDefault {
@@ -119,7 +120,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			log.Printf("[LMTP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[LMTP Proxy %s] Prelookup database client initialized successfully", opts.Name)
+			log.Printf("[LMTP Proxy %s] Prelookup client initialized successfully", opts.Name)
 		}
 	}
 

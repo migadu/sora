@@ -4,8 +4,12 @@ package imapproxy_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +22,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestIMAPProxyMasterToken tests master token authentication through prelookup
+// TestIMAPProxyMasterToken tests master token authentication through HTTP prelookup
 func TestIMAPProxyMasterToken(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -26,12 +30,13 @@ func TestIMAPProxyMasterToken(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Set up prelookup test data in database
-	setupMasterTokenTestData(t, backendServer.ResilientDB, account.Email, account.Password, backendServer.Address)
+	// Set up HTTP prelookup server
+	prelookupServer := setupHTTPPrelookupServer(t, account.Email, account.Password, backendServer.Address)
+	defer prelookupServer.Close()
 
-	// Set up IMAP proxy with prelookup and master token enabled
+	// Set up IMAP proxy with HTTP prelookup and master token enabled
 	proxyAddress := common.GetRandomAddress(t)
-	proxyServer := setupIMAPProxyWithMasterToken(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address})
+	proxyServer := setupIMAPProxyWithHTTPPrelookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
 	defer func() {
 		if srv, ok := proxyServer.Server.(*imapproxy.Server); ok {
 			srv.Stop()
@@ -138,12 +143,13 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Set up prelookup test data
-	setupMasterTokenTestData(t, backendServer.ResilientDB, account.Email, account.Password, backendServer.Address)
+	// Set up HTTP prelookup server
+	prelookupServer := setupHTTPPrelookupServer(t, account.Email, account.Password, backendServer.Address)
+	defer prelookupServer.Close()
 
 	// Set up IMAP proxy
 	proxyAddress := common.GetRandomAddress(t)
-	proxyServer := setupIMAPProxyWithMasterToken(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address})
+	proxyServer := setupIMAPProxyWithHTTPPrelookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
 	defer func() {
 		if srv, ok := proxyServer.Server.(*imapproxy.Server); ok {
 			srv.Stop()
@@ -167,20 +173,9 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	}
 	defer c.Logout()
 
-	// Note: We need to create test data for this token too
-	tokenHash, err := bcrypt.GenerateFromPassword([]byte(masterToken), bcrypt.DefaultCost)
-	if err != nil {
-		t.Fatalf("Failed to hash token: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err = backendServer.ResilientDB.ExecWithRetry(ctx, `
-		UPDATE user_routing_test_master
-		SET master_token_hash = $1
-		WHERE email = $2
-	`, string(tokenHash), account.Email)
-	if err != nil {
-		t.Fatalf("Failed to update token: %v", err)
+	// Update the prelookup server to accept this specific token
+	if httpServer, ok := prelookupServer.Config.Handler.(*httpPrelookupHandler); ok {
+		httpServer.updateMasterToken(masterToken)
 	}
 
 	err = c.Login(emailWithToken, masterToken).Wait()
@@ -190,35 +185,77 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	t.Logf("✓ Email with multiple @ symbols (%d) accepted successfully", atCount)
 }
 
-// setupMasterTokenTestData creates test data for master token authentication
-func setupMasterTokenTestData(t *testing.T, rdb *resilient.ResilientDatabase, userEmail, userPassword, backendAddr string) {
+// httpPrelookupHandler handles HTTP prelookup requests for testing
+type httpPrelookupHandler struct {
+	mu               sync.RWMutex
+	userEmail        string
+	userPassword     string
+	masterToken      string
+	backendAddr      string
+	userPasswordHash string
+	masterTokenHash  string
+}
+
+func (h *httpPrelookupHandler) updateMasterToken(newToken string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.masterToken = newToken
+	hash, _ := bcrypt.GenerateFromPassword([]byte(newToken), bcrypt.DefaultCost)
+	h.masterTokenHash = string(hash)
+}
+
+func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	email := r.URL.Query().Get("email")
+	if email == "" {
+		http.Error(w, `{"error": "email parameter required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Check if this is master token authentication (email@domain@TOKEN)
+	parts := strings.Split(email, "@")
+	var actualEmail string
+	var hashToReturn string
+
+	if len(parts) >= 3 {
+		// Master token format: user@domain@TOKEN
+		actualEmail = parts[0] + "@" + parts[1]
+		token := parts[2]
+
+		// Verify token matches
+		if actualEmail == h.userEmail && token == h.masterToken {
+			hashToReturn = h.masterTokenHash
+		} else {
+			http.Error(w, `{"error": "invalid master token"}`, http.StatusForbidden)
+			return
+		}
+	} else {
+		// Normal authentication
+		actualEmail = email
+		if actualEmail == h.userEmail {
+			hashToReturn = h.userPasswordHash
+		} else {
+			http.Error(w, `{"error": "user not found"}`, http.StatusNotFound)
+			return
+		}
+	}
+
+	response := map[string]interface{}{
+		"address":       actualEmail,
+		"password_hash": hashToReturn,
+		"server":        h.backendAddr,
+		"account_id":    1,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// setupHTTPPrelookupServer creates an HTTP test server for prelookup
+func setupHTTPPrelookupServer(t *testing.T, userEmail, userPassword, backendAddr string) *httptest.Server {
 	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Drop and recreate prelookup test table to ensure clean state
-	dropTable := `DROP TABLE IF EXISTS user_routing_test_master;`
-	if _, err := rdb.ExecWithRetry(ctx, dropTable); err != nil {
-		t.Fatalf("Failed to drop prelookup test table: %v", err)
-	}
-
-	// Create prelookup test table with all required columns
-	schema := `
-	CREATE TABLE user_routing_test_master (
-		email TEXT PRIMARY KEY,
-		password_hash TEXT NOT NULL,
-		master_token_hash TEXT,
-		server_address TEXT NOT NULL,
-		resolved_address TEXT,
-		account_id BIGINT NOT NULL,
-		master_access_enabled BOOLEAN DEFAULT false,
-		remote_use_proxy_protocol BOOLEAN DEFAULT true
-	);
-	`
-	if _, err := rdb.ExecWithRetry(ctx, schema); err != nil {
-		t.Fatalf("Failed to create prelookup test table: %v", err)
-	}
 
 	// Hash user password
 	userHash, err := bcrypt.GenerateFromPassword([]byte(userPassword), bcrypt.DefaultCost)
@@ -233,73 +270,42 @@ func setupMasterTokenTestData(t *testing.T, rdb *resilient.ResilientDatabase, us
 		t.Fatalf("Failed to hash master token: %v", err)
 	}
 
-	// Insert test user with master token support
-	// Note: remote_use_proxy_protocol=true to match the backend server setup
-	_, err = rdb.ExecWithRetry(ctx, `
-		INSERT INTO user_routing_test_master (email, password_hash, master_token_hash, server_address, resolved_address, account_id, master_access_enabled, remote_use_proxy_protocol)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (email) DO UPDATE SET
-			password_hash = EXCLUDED.password_hash,
-			master_token_hash = EXCLUDED.master_token_hash,
-			server_address = EXCLUDED.server_address,
-			resolved_address = EXCLUDED.resolved_address,
-			master_access_enabled = EXCLUDED.master_access_enabled,
-			remote_use_proxy_protocol = EXCLUDED.remote_use_proxy_protocol
-	`, userEmail, string(userHash), string(masterHash), backendAddr, backendAddr, 1, true, true)
-	if err != nil {
-		t.Fatalf("Failed to insert test user: %v", err)
+	handler := &httpPrelookupHandler{
+		userEmail:        userEmail,
+		userPassword:     userPassword,
+		masterToken:      masterToken,
+		backendAddr:      backendAddr,
+		userPasswordHash: string(userHash),
+		masterTokenHash:  string(masterHash),
 	}
 
-	t.Logf("Created master token test data for %s", userEmail)
+	server := httptest.NewServer(handler)
+	t.Logf("Created HTTP prelookup server at %s for %s", server.URL, userEmail)
+	return server
 }
 
-// setupIMAPProxyWithMasterToken creates IMAP proxy with prelookup and master token support
-func setupIMAPProxyWithMasterToken(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string) *common.TestServer {
+// setupIMAPProxyWithHTTPPrelookup creates IMAP proxy with HTTP prelookup and master token support
+func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-master-token"
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
-	// Build prelookup query with master token logic
-	prelookupQuery := `
-SELECT
-  CASE
-    WHEN master_access_enabled AND
-         (SELECT count(*) FROM regexp_matches($1, '@', 'g')) >= 2
-    THEN master_token_hash
-    ELSE password_hash
-  END AS password_hash,
-  server_address AS server_address,
-  resolved_address AS resolved_address,
-  account_id AS account_id,
-  remote_use_proxy_protocol AS remote_use_proxy_protocol
-FROM user_routing_test_master
-WHERE email = (
-  CASE
-    WHEN (SELECT count(*) FROM regexp_matches($1, '@', 'g')) >= 2
-    THEN regexp_replace($1, '@[^@]+$', '')
-    ELSE $1
-  END
-)
-`
-
-	// Configure prelookup with master token support
+	// Configure HTTP prelookup with caching
+	// Note: Master token logic is now handled by the HTTP endpoint, not the client
 	prelookupConfig := &config.PreLookupConfig{
-		Enabled:                true,
-		Hosts:                  []string{"localhost"},
-		Port:                   "5432",
-		User:                   "postgres",
-		Name:                   "sora_mail_db",
-		TLS:                    false,
-		MaxConns:               10,
-		MinConns:               2,
-		MaxConnLifetime:        "30m",
-		MaxConnIdleTime:        "5m",
-		CacheTTL:               "5m",
-		Query:                  prelookupQuery,
-		AllowMasterToken:       true,
-		MasterTokenSeparator:   "@",
+		Enabled: true,
+		URL:     prelookupURL + "/lookup",
+		Timeout: "5s",
+		// Enable caching for testing
+		Cache: &config.PreLookupCacheConfig{
+			Enabled:         true,
+			PositiveTTL:     "10s",
+			NegativeTTL:     "5s",
+			MaxSize:         100,
+			CleanupInterval: "30s",
+		},
 		RemoteUseProxyProtocol: true, // Match the backend server configuration
 	}
 
@@ -331,7 +337,7 @@ WHERE email = (
 	// Create proxy server
 	proxyServer, err := imapproxy.New(context.Background(), rdb, hostname, opts)
 	if err != nil {
-		t.Fatalf("Failed to create IMAP proxy with master token: %v", err)
+		t.Fatalf("Failed to create IMAP proxy with HTTP prelookup: %v", err)
 	}
 
 	// Start proxy in background

@@ -153,12 +153,12 @@ type PrelookupWithCircuitBreaker interface {
 	GetCircuitBreaker() *circuitbreaker.CircuitBreaker
 }
 
-// RegisterPrelookupCheck registers a health check for the prelookup database
+// RegisterPrelookupCheck registers a health check for the prelookup HTTP endpoint
 // If the client has a circuit breaker, it will also register a circuit breaker check
 func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHealthChecker, serverName string) {
-	checkName := "prelookup_database"
+	checkName := "prelookup_http"
 	if serverName != "" {
-		checkName = fmt.Sprintf("prelookup_database_%s", serverName)
+		checkName = fmt.Sprintf("prelookup_http_%s", serverName)
 	}
 
 	prelookupCheck := &HealthCheck{
@@ -173,9 +173,9 @@ func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHea
 	// If the client has a circuit breaker, register it too
 	if clientWithBreaker, ok := prelookupClient.(PrelookupWithCircuitBreaker); ok {
 		if breaker := clientWithBreaker.GetCircuitBreaker(); breaker != nil {
-			cbName := "prelookup_circuit_breaker"
+			cbName := "prelookup_http_circuit_breaker"
 			if serverName != "" {
-				cbName = fmt.Sprintf("prelookup_circuit_breaker_%s", serverName)
+				cbName = fmt.Sprintf("prelookup_http_circuit_breaker_%s", serverName)
 			}
 			hi.RegisterCircuitBreakerCheck(cbName, breaker)
 		}

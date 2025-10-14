@@ -398,57 +398,65 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	}
 }
 
-// PreLookupConfig holds configuration for database-driven user routing
+// PreLookupConfig holds configuration for HTTP-based user routing
+// PreLookupCacheConfig holds caching configuration for prelookup
+type PreLookupCacheConfig struct {
+	Enabled         bool   `toml:"enabled"`          // Enable in-memory caching of lookup results
+	PositiveTTL     string `toml:"positive_ttl"`     // TTL for successful lookups (default: "5m")
+	NegativeTTL     string `toml:"negative_ttl"`     // TTL for failed lookups (default: "1m")
+	MaxSize         int    `toml:"max_size"`         // Maximum number of cached entries (default: 10000)
+	CleanupInterval string `toml:"cleanup_interval"` // How often to clean expired entries (default: "1m")
+}
+
 type PreLookupConfig struct {
-	Enabled                bool        `toml:"enabled"`
-	Hosts                  []string    `toml:"hosts"`
-	Port                   interface{} `toml:"port"` // Database port (default: "5432"), can be string or integer
-	User                   string      `toml:"user"`
-	Password               string      `toml:"password"`
-	Name                   string      `toml:"name"`
-	TLS                    bool        `toml:"tls"`
-	MaxConns               int         `toml:"max_conns"`
-	MinConns               int         `toml:"min_conns"`
-	MaxConnLifetime        string      `toml:"max_conn_lifetime"`
-	MaxConnIdleTime        string      `toml:"max_conn_idle_time"`
-	CacheTTL               string      `toml:"cache_ttl"`
-	CacheSize              int         `toml:"cache_size"`
-	FallbackDefault        bool        `toml:"fallback_to_default"`
-	AuthMethod             string      `toml:"auth_method"`               // "bcrypt", "plain", etc.
-	Query                  string      `toml:"query"`                     // Main query (auto-detects mode based on columns returned)
-	RemoteTLS              bool        `toml:"remote_tls"`                // Use TLS for backend connections from prelookup
-	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (requires remote_tls = true) - Only supported for LMTP and ManageSieve proxies
+	Enabled bool   `toml:"enabled"`
+	URL     string `toml:"url"`     // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
+	Timeout string `toml:"timeout"` // HTTP request timeout (default: "5s")
+
+	// Backend connection settings
+	FallbackDefault        bool        `toml:"fallback_to_default"`       // Fallback to default routing if lookup fails
+	RemoteTLS              bool        `toml:"remote_tls"`                // Use TLS for backend connections
+	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
 	RemoteTLSVerify        *bool       `toml:"remote_tls_verify"`         // Verify backend TLS certificate
 	RemotePort             interface{} `toml:"remote_port"`               // Default port for routed backends if not in address
-	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections from prelookup
-	RemoteUseIDCommand     bool        `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding from prelookup (IMAP only)
-	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding from prelookup (POP3/LMTP)
-	AllowMasterToken       bool        `toml:"allow_master_token"`        // Enable master token authentication (bypass password check with token)
-	MasterTokenSeparator   string      `toml:"master_token_separator"`    // Separator for master token in password field (default: "@")
+	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseIDCommand     bool        `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
+	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
+
+	// Cache configuration
+	Cache *PreLookupCacheConfig `toml:"cache"` // Caching configuration
 }
 
-// GetCacheTTL returns the configured cache TTL duration
-func (c *PreLookupConfig) GetCacheTTL() (time.Duration, error) {
-	if c.CacheTTL == "" {
-		return 10 * time.Minute, nil
+// GetTimeout returns the configured HTTP timeout duration
+func (c *PreLookupConfig) GetTimeout() (time.Duration, error) {
+	if c.Timeout == "" {
+		return 5 * time.Second, nil
 	}
-	return helpers.ParseDuration(c.CacheTTL)
+	return helpers.ParseDuration(c.Timeout)
 }
 
-// GetMaxConnLifetime returns the configured max connection lifetime
-func (c *PreLookupConfig) GetMaxConnLifetime() (time.Duration, error) {
-	if c.MaxConnLifetime == "" {
-		return time.Hour, nil
+// GetPositiveTTL returns the positive cache TTL duration
+func (c *PreLookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
+	if c.PositiveTTL == "" {
+		return 5 * time.Minute, nil
 	}
-	return helpers.ParseDuration(c.MaxConnLifetime)
+	return helpers.ParseDuration(c.PositiveTTL)
 }
 
-// GetMaxConnIdleTime returns the configured max connection idle time
-func (c *PreLookupConfig) GetMaxConnIdleTime() (time.Duration, error) {
-	if c.MaxConnIdleTime == "" {
-		return 30 * time.Minute, nil
+// GetNegativeTTL returns the negative cache TTL duration
+func (c *PreLookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
+	if c.NegativeTTL == "" {
+		return 1 * time.Minute, nil
 	}
-	return helpers.ParseDuration(c.MaxConnIdleTime)
+	return helpers.ParseDuration(c.NegativeTTL)
+}
+
+// GetCleanupInterval returns the cache cleanup interval
+func (c *PreLookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
+	if c.CleanupInterval == "" {
+		return 1 * time.Minute, nil
+	}
+	return helpers.ParseDuration(c.CleanupInterval)
 }
 
 // GetRemotePort parses the remote port and returns it as an int.
