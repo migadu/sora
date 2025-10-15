@@ -54,7 +54,6 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  creds,
 		Secure: useSSL,
-		Region: cfg.Region,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
