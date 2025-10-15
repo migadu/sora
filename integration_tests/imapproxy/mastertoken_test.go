@@ -296,7 +296,7 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 	// Note: Master token logic is now handled by the HTTP endpoint, not the client
 	prelookupConfig := &config.PreLookupConfig{
 		Enabled:   true,
-		URL:       prelookupURL + "/lookup",
+		URL:       prelookupURL + "/lookup?email=$email", // Use $email placeholder for interpolation
 		Timeout:   "5s",
 		AuthToken: "test-secret-token", // Bearer token for authentication
 		// Enable caching for testing

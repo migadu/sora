@@ -103,10 +103,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 
 	// Execute HTTP request through circuit breaker
 	result, err := c.breaker.Execute(func() (interface{}, error) {
-		// Build request URL
-		requestURL := fmt.Sprintf("%s?email=%s", c.baseURL, url.QueryEscape(email))
+		// Build request URL by interpolating $email placeholder
+		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(email))
 
-		log.Printf("[HTTP-PreLookup] Requesting lookup for user '%s' from %s", email, c.baseURL)
+		log.Printf("[HTTP-PreLookup] Requesting lookup for user '%s' from %s", email, requestURL)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)

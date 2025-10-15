@@ -630,8 +630,12 @@ min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris att
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
 #
-# The prelookup service is called via HTTP GET with the email parameter.
-# Request URL: GET {url}?email=user@domain.com
+# The prelookup service is called via HTTP GET with email interpolation.
+# The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+#
+# Example URLs:
+#   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
+#   "http://localhost:8080/user/$email/info"    → GET /user/user@domain.com/info
 #
 # The HTTP endpoint should return a JSON response with the following fields:
 #
@@ -676,12 +680,17 @@ min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris att
 # - Proxy connects to backend and authenticates as "realuser@domain.com"
 #
 [server.prelookup]
-enabled = false                       # Enable/disable HTTP-based user routing.
-url = "http://localhost:8080/lookup"  # HTTP endpoint URL for prelookup service (required if enabled)
-timeout = "5s"                        # HTTP request timeout (default: 5s)
-# auth_token = "your-secret-token"    # Bearer token for HTTP authentication (optional)
-                                      # If set, sends "Authorization: Bearer <token>" header with requests
-                                      # Use this to secure your prelookup endpoint
+enabled = false                             # Enable/disable HTTP-based user routing.
+url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $email placeholder (required if enabled)
+                                            # The $email placeholder is replaced with the URL-encoded email address
+                                            # Examples:
+                                            #   "http://localhost:8080/lookup?email=$email" → query parameter
+                                            #   "http://localhost:8080/user/$email/lookup" → path parameter
+                                            #   "http://localhost:8080/api/v1/auth?user=$email&format=json" → custom format
+timeout = "5s"                              # HTTP request timeout (default: 5s)
+# auth_token = "your-secret-token"          # Bearer token for HTTP authentication (optional)
+                                            # If set, sends "Authorization: Bearer <token>" header with requests
+                                            # Use this to secure your prelookup endpoint
 
 fallback_to_default = true            # If prelookup initialization fails (e.g., endpoint unreachable), continue without prelookup
                                       # using default round-robin routing. If false, proxy fails to start on prelookup errors.
