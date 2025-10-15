@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 type GracefulError struct {
@@ -88,8 +90,8 @@ func (eh *ErrorHandler) WaitForExitWithTimeout(timeout time.Duration) (int, bool
 func (eh *ErrorHandler) Shutdown(ctx context.Context) {
 	select {
 	case <-ctx.Done():
-		eh.logger.Println("Graceful shutdown initiated")
+		logger.Info("Graceful shutdown initiated")
 	default:
-		eh.logger.Println("Unexpected shutdown")
+		logger.Warn("Unexpected shutdown")
 	}
 }
