@@ -158,6 +158,18 @@ func main() {
 	if deps.clusterManager != nil {
 		defer deps.clusterManager.Shutdown()
 	}
+	if deps.healthIntegration != nil {
+		defer deps.healthIntegration.Stop()
+	}
+	if deps.metricsCollector != nil {
+		defer deps.metricsCollector.Stop()
+	}
+	if deps.cleanupWorker != nil {
+		defer deps.cleanupWorker.Stop()
+	}
+	if deps.uploadWorker != nil {
+		defer deps.uploadWorker.Stop()
+	}
 
 	// Start all configured servers
 	errChan := startServers(ctx, deps)
@@ -425,7 +437,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
 		deps.cleanupWorker.Start(ctx)
-		defer deps.cleanupWorker.Stop() // Ensure cleanup worker stops cleanly on shutdown
 
 		// Initialize and start the upload worker
 		retryInterval := cfg.Uploader.GetRetryIntervalWithDefault()
@@ -436,7 +447,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		deps.uploadWorker.Start(ctx)
-		defer deps.uploadWorker.Stop() // Ensure upload worker stops cleanly on shutdown
 	} else {
 		logger.Info("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
 	}
@@ -468,13 +478,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Start health monitoring
 	deps.healthIntegration.Start(ctx)
-	defer deps.healthIntegration.Stop() // Ensure health monitoring stops cleanly on shutdown
 	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
 
 	// Start metrics collector for database statistics
 	deps.metricsCollector = metrics.NewCollector(deps.resilientDB, 60*time.Second)
 	go deps.metricsCollector.Start(ctx)
-	defer deps.metricsCollector.Stop() // Ensure metrics collector stops cleanly on shutdown
 
 	return deps, nil
 }
