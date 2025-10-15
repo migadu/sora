@@ -249,6 +249,9 @@ type ClusterConfig struct {
 type TLSLetsEncryptS3Config struct {
 	Bucket          string `toml:"bucket"`            // S3 bucket for certificate storage
 	Region          string `toml:"region"`            // AWS region (optional)
+	Endpoint        string `toml:"endpoint"`          // S3-compatible storage endpoint (default: "s3.amazonaws.com")
+	DisableTLS      bool   `toml:"disable_tls"`       // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Debug           bool   `toml:"debug"`             // Enable detailed S3 request/response tracing
 	AccessKeyID     string `toml:"access_key_id"`     // AWS credentials (optional, uses default chain)
 	SecretAccessKey string `toml:"secret_access_key"` // AWS credentials (optional)
 }

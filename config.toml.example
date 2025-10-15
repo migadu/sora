@@ -143,6 +143,9 @@ storage_provider = "s3"                         # Certificate storage backend (c
 [tls.letsencrypt.s3]
 bucket = "sora-tls-certificates"                # S3 bucket name for certificate storage (bucket must exist before starting Sora)
 region = "us-east-1"                            # AWS region where the bucket is located (REQUIRED)
+endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint (default: "s3.amazonaws.com" for AWS, or "minio.example.com:9000" for MinIO)
+disable_tls = false                             # Disable TLS for S3 endpoint (useful for local MinIO setups)
+debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
 # access_key_id = ""                            # AWS access key ID (optional - uses default AWS credential chain if omitted: env vars, ~/.aws/credentials, IAM role)
 # secret_access_key = ""                        # AWS secret access key (optional - uses default AWS credential chain if omitted)
 

@@ -3,19 +3,17 @@
 package tlsmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"golang.org/x/crypto/acme/autocert"
@@ -24,41 +22,48 @@ import (
 // S3Cache implements autocert.Cache using S3 for certificate storage.
 // This allows certificates to be shared across multiple instances of the application.
 type S3Cache struct {
-	client *s3.Client
+	client *minio.Client
 	bucket string
 	prefix string // Key prefix for certificate storage (default: "autocert/")
 }
 
-// NewS3Cache creates a new S3-backed autocert cache.
+// NewS3Cache creates a new S3-backed autocert cache using MinIO client.
 func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 	ctx := context.Background()
 
-	var awsCfg aws.Config
-	var err error
+	// Determine endpoint - use config value or default to AWS
+	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "s3.amazonaws.com"
+	}
 
-	// Configure AWS SDK
+	// Determine if TLS should be used
+	useSSL := !cfg.DisableTLS
+
+	// Configure credentials
+	var creds *credentials.Credentials
 	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
-		// Use explicit credentials
-		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithRegion(cfg.Region),
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				cfg.AccessKeyID,
-				cfg.SecretAccessKey,
-				"",
-			)),
-		)
+		// Use static credentials
+		creds = credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, "")
 	} else {
-		// Use default credential chain (environment, IAM role, etc.)
-		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithRegion(cfg.Region),
-		)
+		// Use IAM credentials chain (environment vars, EC2 IAM role, etc.)
+		creds = credentials.NewIAM("")
 	}
 
+	// Initialize MinIO client
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  creds,
+		Secure: useSSL,
+		Region: cfg.Region,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	// Enable debug logging if requested
+	if cfg.Debug {
+		client.TraceOn(os.Stdout)
+	}
 
 	cache := &S3Cache{
 		client: client,
@@ -71,102 +76,118 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 		return nil, fmt.Errorf("failed to verify S3 bucket access: %w", err)
 	}
 
-	logger.Infof("S3 autocert cache initialized with bucket: %s", cfg.Bucket)
-
+	logger.Infof("S3 autocert cache initialized with bucket: %s (endpoint: %s, tls: %v, debug: %v)",
+		cfg.Bucket, endpoint, useSSL, cfg.Debug)
 	return cache, nil
 }
 
-// verifyBucketAccess checks if the bucket is accessible
+// verifyBucketAccess checks if the S3 bucket exists and is accessible.
 func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
-	_, err := c.client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(c.bucket),
-	})
+	exists, err := c.client.BucketExists(ctx, c.bucket)
 	if err != nil {
-		return fmt.Errorf("bucket %s is not accessible: %w", c.bucket, err)
+		return fmt.Errorf("failed to check bucket existence: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("bucket %s does not exist", c.bucket)
 	}
 	return nil
 }
 
-// keyName generates the S3 key name for a given certificate key name.
-// It creates a sanitized path-safe key with a hash-based subdirectory for distribution.
-func (c *S3Cache) keyName(name string) string {
-	// Sanitize the name to be S3-safe (remove any path separators)
-	safeName := strings.ReplaceAll(name, "/", "_")
-	safeName = strings.ReplaceAll(safeName, "\\", "_")
+// Get retrieves a certificate data from S3.
+func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
+	s3Key := c.prefix + hashKey(key)
 
-	// Create a hash of the name for distribution across S3 partitions
-	// This improves S3 performance for high-throughput scenarios
-	hash := sha256.Sum256([]byte(name))
-	hashPrefix := hex.EncodeToString(hash[:2]) // Use first 2 bytes for 65k partitions
+	logger.Debugf("[S3-Cache] Getting certificate for key: %s (S3 key: %s)", key, s3Key)
 
-	return fmt.Sprintf("%s%s/%s", c.prefix, hashPrefix, safeName)
-}
-
-// Get retrieves a certificate from S3 storage.
-// Returns autocert.ErrCacheMiss if the certificate doesn't exist.
-func (c *S3Cache) Get(ctx context.Context, name string) ([]byte, error) {
-	key := c.keyName(name)
-
-	result, err := c.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(key),
-	})
-
+	// Get object from S3
+	obj, err := c.client.GetObject(ctx, c.bucket, s3Key, minio.GetObjectOptions{})
 	if err != nil {
-		// Check if it's a "not found" error
-		var noSuchKey *types.NoSuchKey
-		if errors.As(err, &noSuchKey) {
-			logger.Debugf("Certificate not found in S3: %s", name)
+		logger.Errorf("[S3-Cache] Failed to get object from S3: %v", err)
+		return nil, autocert.ErrCacheMiss
+	}
+	defer obj.Close()
+
+	// Check if object exists (404 means cache miss)
+	if _, err := obj.Stat(); err != nil {
+		// MinIO returns error on stat if object doesn't exist
+		if minio.ToErrorResponse(err).StatusCode == 404 {
+			logger.Debugf("[S3-Cache] Certificate not found in S3 (cache miss): %s", key)
 			return nil, autocert.ErrCacheMiss
 		}
-		return nil, fmt.Errorf("failed to get certificate from S3: %w", err)
+		logger.Errorf("[S3-Cache] Failed to stat object: %v", err)
+		return nil, fmt.Errorf("failed to stat object: %w", err)
 	}
-	defer result.Body.Close()
 
-	data, err := io.ReadAll(result.Body)
+	// Read object data
+	data, err := io.ReadAll(obj)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read certificate data from S3: %w", err)
+		logger.Errorf("[S3-Cache] Failed to read object data: %v", err)
+		return nil, fmt.Errorf("failed to read object: %w", err)
 	}
 
-	logger.Debugf("Retrieved certificate from S3: %s (%d bytes)", name, len(data))
+	logger.Debugf("[S3-Cache] Successfully retrieved certificate from S3: %s (%d bytes)", key, len(data))
 	return data, nil
 }
 
-// Put stores a certificate in S3 storage.
-func (c *S3Cache) Put(ctx context.Context, name string, data []byte) error {
-	key := c.keyName(name)
+// Put stores certificate data in S3.
+func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
+	s3Key := c.prefix + hashKey(key)
 
-	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:       aws.String(c.bucket),
-		Key:          aws.String(key),
-		Body:         strings.NewReader(string(data)),
-		ContentType:  aws.String("application/octet-stream"),
-		StorageClass: types.StorageClassStandard,
-		// Add server-side encryption
-		ServerSideEncryption: types.ServerSideEncryptionAes256,
-	})
+	logger.Debugf("[S3-Cache] Putting certificate for key: %s (S3 key: %s, %d bytes)", key, s3Key, len(data))
 
+	// Upload to S3
+	_, err := c.client.PutObject(
+		ctx,
+		c.bucket,
+		s3Key,
+		bytes.NewReader(data),
+		int64(len(data)),
+		minio.PutObjectOptions{
+			ContentType: "application/octet-stream",
+		},
+	)
 	if err != nil {
-		return fmt.Errorf("failed to put certificate to S3: %w", err)
+		logger.Errorf("[S3-Cache] Failed to upload certificate to S3: %v", err)
+		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
 
-	logger.Infof("Stored certificate in S3: %s (%d bytes)", name, len(data))
+	logger.Debugf("[S3-Cache] Successfully stored certificate in S3: %s", key)
 	return nil
 }
 
-// Delete removes a certificate from S3 storage.
-func (c *S3Cache) Delete(ctx context.Context, name string) error {
-	key := c.keyName(name)
+// Delete removes certificate data from S3.
+func (c *S3Cache) Delete(ctx context.Context, key string) error {
+	s3Key := c.prefix + hashKey(key)
 
-	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(key),
-	})
+	logger.Debugf("[S3-Cache] Deleting certificate for key: %s (S3 key: %s)", key, s3Key)
 
+	// Delete from S3
+	err := c.client.RemoveObject(ctx, c.bucket, s3Key, minio.RemoveObjectOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to delete certificate from S3: %w", err)
+		// Check if object doesn't exist (which is fine for Delete)
+		if minio.ToErrorResponse(err).StatusCode == 404 {
+			logger.Debugf("[S3-Cache] Certificate already deleted or doesn't exist: %s", key)
+			return nil
+		}
+		logger.Errorf("[S3-Cache] Failed to delete certificate from S3: %v", err)
+		return fmt.Errorf("failed to delete from S3: %w", err)
 	}
 
-	logger.Infof("Deleted certificate from S3: %s", name)
+	logger.Debugf("[S3-Cache] Successfully deleted certificate from S3: %s", key)
 	return nil
+}
+
+// hashKey creates a deterministic hash of the certificate key for S3 storage.
+// This prevents issues with special characters in certificate domain names.
+func hashKey(key string) string {
+	// Normalize the key
+	key = strings.ToLower(strings.TrimSpace(key))
+
+	// Hash the key for safe S3 storage
+	h := sha256.New()
+	h.Write([]byte(key))
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	// Return hash with a readable prefix for debugging
+	return fmt.Sprintf("cert-%s", hash)
 }
