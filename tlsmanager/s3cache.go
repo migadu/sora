@@ -12,10 +12,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"golang.org/x/crypto/acme/autocert"
 )
 
