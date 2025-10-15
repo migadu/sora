@@ -32,6 +32,7 @@ type Server struct {
 	tlsCertFile            string
 	tlsKeyFile             string
 	tlsVerify              bool
+	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
 	connManager            *proxy.ConnectionManager
 	connTracker            *proxy.ConnectionTracker
 	wg                     sync.WaitGroup
@@ -71,6 +72,7 @@ type ServerOptions struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSVerify              bool
+	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS              bool
 	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool
@@ -166,7 +168,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter = server.NewConnectionLimiterWithTrustedNets("SIEVE-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
 	}
 
-	return &Server{
+	s := &Server{
 		rdb:                    rdb,
 		name:                   opts.Name,
 		addr:                   opts.Addr,
@@ -194,7 +196,43 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter:                limiter,
 		debug:                  opts.Debug,
 		supportedExtensions:    opts.SupportedExtensions,
-	}, nil
+	}
+
+	// Setup TLS config: Three scenarios
+	// 1. Per-server TLS: cert files provided
+	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided
+	// 3. No implicit TLS (may use STARTTLS): opts.TLS=false or opts.TLSUseStartTLS=true
+	if opts.TLS && !opts.TLSUseStartTLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
+		// Scenario 1: Per-server TLS with explicit cert files
+		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+		clientAuth := tls.NoClientCert
+		if opts.TLSVerify {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
+
+		s.tlsConfig = &tls.Config{
+			Certificates:             []tls.Certificate{cert},
+			MinVersion:               tls.VersionTLS12,
+			ClientAuth:               clientAuth,
+			ServerName:               hostname,
+			PreferServerCipherSuites: true,
+		}
+		log.Printf("ManageSieve proxy [%s] using per-server TLS certificate", opts.Name)
+	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {
+		// Scenario 2: Global TLS manager
+		s.tlsConfig = opts.TLSConfig
+		log.Printf("ManageSieve proxy [%s] using global TLS manager", opts.Name)
+	} else if opts.TLS && !opts.TLSUseStartTLS {
+		// TLS enabled but no cert files and no global TLS config provided
+		cancel()
+		return nil, fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)
+	}
+
+	return s, nil
 }
 
 // Start starts the ManageSieve proxy server.
@@ -202,26 +240,7 @@ func (s *Server) Start() error {
 	var err error
 
 	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
-	if s.tls && !s.tlsUseStartTLS {
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
-		if err != nil {
-			s.cancel()
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
-		}
-
-		clientAuth := tls.NoClientCert
-		if s.tlsVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               s.hostname,
-			PreferServerCipherSuites: true,
-		}
-
+	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
 		if s.tlsVerify {
 			log.Printf("Client TLS certificate verification is REQUIRED for ManageSieve proxy [%s] (tls_verify=true)", s.name)
 		} else {
@@ -229,7 +248,7 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
+		s.listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
 		s.listenerMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)

@@ -115,9 +115,23 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 
 	m.memberlist = ml
 
-	// Join cluster if peers are specified
-	if len(cfg.Peers) > 0 {
-		n, err := ml.Join(cfg.Peers)
+	// Filter out self-references from peers list
+	// A node should never list itself in the peers array as this causes gossip issues
+	filteredPeers := make([]string, 0, len(cfg.Peers))
+	selfReferenceFound := false
+	for _, peer := range cfg.Peers {
+		if peer == nodeID {
+			selfReferenceFound = true
+			logger.Warnf("Cluster configuration WARNING: node_id '%s' found in peers list - ignoring self-reference", nodeID)
+			logger.Warnf("The peers list should only contain OTHER nodes in the cluster, not this node itself")
+		} else {
+			filteredPeers = append(filteredPeers, peer)
+		}
+	}
+
+	// Join cluster if peers are specified (after filtering)
+	if len(filteredPeers) > 0 {
+		n, err := ml.Join(filteredPeers)
 		if err != nil {
 			logger.Warn("Failed to join cluster peers: %v (will retry in background)", err)
 		} else {
@@ -128,8 +142,13 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Start leader election loop
 	go m.leaderElectionLoop()
 
-	logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, peers=%v",
-		nodeID, cfg.BindAddr, cfg.BindPort, cfg.Peers)
+	if selfReferenceFound {
+		logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, original_peers=%v, filtered_peers=%v",
+			nodeID, cfg.BindAddr, cfg.BindPort, cfg.Peers, filteredPeers)
+	} else {
+		logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, peers=%v",
+			nodeID, cfg.BindAddr, cfg.BindPort, filteredPeers)
+	}
 
 	return m, nil
 }

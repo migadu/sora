@@ -278,6 +278,9 @@ bind_addr = "0.0.0.0"                           # Gossip protocol bind address (
 bind_port = 7946                                # Gossip protocol port (default: 7946)
 node_id = ""                                    # Unique node ID (default: hostname)
 peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com", "node-2.example.com"])
+                                                # IMPORTANT: Do NOT include this node's own node_id in the peers list!
+                                                # Only list OTHER nodes in the cluster. Self-references will be filtered out
+                                                # automatically and a warning will be logged.
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key (REQUIRED for production)
                                                 # Generate with: openssl rand -base64 32
 

@@ -36,6 +36,7 @@ type Server struct {
 	tlsCertFile            string
 	tlsKeyFile             string
 	tlsVerify              bool
+	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	enableAffinity         bool
 	affinityValidity       time.Duration
 	affinityStickiness     float64
@@ -115,6 +116,7 @@ type ServerOptions struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSVerify              bool
+	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS              bool
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
@@ -226,6 +228,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		tlsCertFile:            opts.TLSCertFile,
 		tlsKeyFile:             opts.TLSKeyFile,
 		tlsVerify:              opts.TLSVerify,
+		tlsConfig:              opts.TLSConfig,
 		enableAffinity:         opts.EnableAffinity,
 		affinityValidity:       opts.AffinityValidity,
 		affinityStickiness:     stickiness,
@@ -248,7 +251,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 func (s *Server) Start() error {
 	var err error
 
-	if s.tls {
+	// Three TLS scenarios:
+	// 1. Per-server TLS: cert files provided
+	// 2. Global TLS: tls=true, no cert files, global TLS config provided
+	// 3. No TLS: tls=false
+	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		// Scenario 1: Per-server TLS with explicit cert files
 		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
 		if err != nil {
 			s.cancel()
@@ -280,8 +288,22 @@ func (s *Server) Start() error {
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("IMAP proxy [%s] listening with TLS on %s", s.name, s.addr)
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate)", s.name, s.addr)
+	} else if s.tls && s.tlsConfig != nil {
+		// Scenario 2: Global TLS manager
+		s.listenerMu.Lock()
+		s.listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
+		s.listenerMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("failed to start TLS listener: %w", err)
+		}
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager)", s.name, s.addr)
+	} else if s.tls {
+		// TLS enabled but no cert files and no global TLS config provided
+		s.cancel()
+		return fmt.Errorf("TLS enabled for IMAP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	} else {
+		// Scenario 3: No TLS
 		s.listenerMu.Lock()
 		s.listener, err = net.Listen("tcp", s.addr)
 		s.listenerMu.Unlock()

@@ -104,6 +104,7 @@ type POP3ProxyServerOptions struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSVerify              bool
+	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteAddrs            []string
 	RemotePort             int // Default port for backends if not in address
 	RemoteTLS              bool
@@ -226,8 +227,12 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debugWriter:            debugWriter,
 	}
 
-	// Setup TLS if enabled and certificate and key files are provided
+	// Setup TLS: Three scenarios
+	// 1. Per-server TLS: cert files provided
+	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided
+	// 3. No TLS: options.TLS=false
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+		// Scenario 1: Per-server TLS with explicit cert files
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			serverCancel()
@@ -251,6 +256,15 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		} else {
 			log.Printf("Client TLS certificate verification is DISABLED for POP3 proxy [%s] (tls_verify=false)", options.Name)
 		}
+		log.Printf("POP3 proxy [%s] using per-server TLS certificate", options.Name)
+	} else if options.TLS && options.TLSConfig != nil {
+		// Scenario 2: Global TLS manager
+		server.tlsConfig = options.TLSConfig
+		log.Printf("POP3 proxy [%s] using global TLS manager", options.Name)
+	} else if options.TLS {
+		// TLS enabled but no cert files and no global TLS config provided
+		serverCancel()
+		return nil, fmt.Errorf("TLS enabled for POP3 proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", options.Name)
 	}
 
 	return server, nil

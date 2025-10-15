@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
@@ -932,6 +933,12 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	server, err := imapproxy.New(ctx, deps.resilientDB, deps.hostname, imapproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
@@ -943,6 +950,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
+		TLSConfig:              tlsConfig,
 		RemoteTLS:              serverConfig.RemoteTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
@@ -1026,6 +1034,12 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
 		Name:                   serverConfig.Name,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
@@ -1036,6 +1050,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
+		TLSConfig:              tlsConfig,
 		RemoteTLS:              serverConfig.RemoteTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
@@ -1117,6 +1132,12 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	server, err := managesieveproxy.New(ctx, deps.resilientDB, deps.hostname, managesieveproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
@@ -1129,6 +1150,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
+		TLSConfig:              tlsConfig,
 		RemoteTLS:              serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:   serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
@@ -1194,6 +1216,12 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	server, err := lmtpproxy.New(ctx, deps.resilientDB, deps.hostname, lmtpproxy.ServerOptions{
 		Name:                   serverConfig.Name,
 		Addr:                   serverConfig.Addr,
@@ -1204,6 +1232,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSVerify:              serverConfig.TLSVerify,
+		TLSConfig:              tlsConfig,
 		RemoteTLS:              serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:   serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
