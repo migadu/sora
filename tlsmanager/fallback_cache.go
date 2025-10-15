@@ -27,10 +27,14 @@ type FallbackCache struct {
 
 // NewFallbackCache creates a cache that uses S3 as primary storage
 // with a local filesystem fallback for resilience.
-func NewFallbackCache(s3Cache autocert.Cache, fallbackDir string) (*FallbackCache, error) {
-	// Ensure fallback directory exists
+// If the fallback directory cannot be created, returns S3-only cache with a warning.
+func NewFallbackCache(s3Cache autocert.Cache, fallbackDir string) (autocert.Cache, error) {
+	// Try to ensure fallback directory exists
 	if err := os.MkdirAll(fallbackDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create fallback directory: %w", err)
+		logger.Warnf("Cannot create fallback directory %s: %v - fallback cache disabled, using S3-only", fallbackDir, err)
+		logger.Warnf("Certificates will only be stored in S3. If S3 becomes unavailable, certificate operations will fail.")
+		// Return S3-only cache instead of failing
+		return s3Cache, nil
 	}
 
 	// Create local directory cache as fallback

@@ -125,14 +125,17 @@ func (m *Manager) initLetsEncryptProvider() error {
 			fallbackDir = "/var/lib/sora/certs" // Default fallback directory
 		}
 
+		// NewFallbackCache will return S3-only cache if fallback dir cannot be created
+		// This prevents server crashes due to permission issues
 		fallbackCache, err := NewFallbackCache(s3cache, fallbackDir)
 		if err != nil {
 			return fmt.Errorf("failed to initialize fallback cache: %w", err)
 		}
 		cache = fallbackCache
-		logger.Infof("Certificate fallback cache enabled with directory: %s", fallbackDir)
+		// Note: Success message logged inside NewFallbackCache (or warning if fallback disabled)
 	} else {
 		logger.Infof("Certificate fallback cache disabled - using S3 only")
+		cache = s3cache
 	}
 
 	// Wrap cache with cluster-aware wrapper if cluster is enabled
