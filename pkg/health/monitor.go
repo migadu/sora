@@ -97,11 +97,14 @@ func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
 	ticker := time.NewTicker(check.Interval)
 	defer ticker.Stop()
 
+	log.Printf("[HEALTH] Started monitoring '%s' with interval %v", check.Name, check.Interval)
+
 	// Don't perform the first check immediately - wait for the first ticker interval
 	// to allow the application to fully initialize and avoid context cancellation issues
 	for {
 		select {
 		case <-hm.ctx.Done():
+			log.Printf("[HEALTH] Monitoring stopped for '%s' due to context cancellation", check.Name)
 			return
 		case <-ticker.C:
 			hm.performCheck(check)
