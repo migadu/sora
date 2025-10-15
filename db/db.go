@@ -199,11 +199,11 @@ func (db *Database) Close() {
 		var unlocked bool
 		err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
 		if err != nil {
-			log.Printf("[DB] WARN: Failed to explicitly release advisory lock: %v", err)
+			log.Printf("[DB] Failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
 		} else if unlocked {
 			log.Println("[DB] Released shared database advisory lock.")
 		} else {
-			log.Println("[DB] WARN: Advisory lock was not held at time of release.")
+			log.Println("[DB] Advisory lock was not held at time of release (likely auto-released on connection close).")
 		}
 		db.lockConn.Release()
 	}
