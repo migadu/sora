@@ -855,46 +855,22 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 					continue // Already cached
 				}
 
-				// Build S3 key and fetch from S3 with retry logic
+				// Build S3 key and fetch from S3 (best-effort, no retries during warmup)
 				s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
-				var data []byte
 
-				// Retry S3 operations up to 3 times with exponential backoff
-				maxRetries := 3
-				var fetchErr error
-				for attempt := 0; attempt < maxRetries; attempt++ {
-					if attempt > 0 {
-						// Exponential backoff: 100ms, 200ms, 400ms
-						backoffTime := time.Duration(100*(1<<uint(attempt-1))) * time.Millisecond
-						select {
-						case <-time.After(backoffTime):
-						case <-warmupCtx.Done():
-							log.Printf("IMAP [%s] warmup cancelled during retry backoff for user %d", s.name, userID)
-							return
-						}
-						log.Printf("IMAP [%s] warmup: retrying S3 fetch for %s (attempt %d/%d)", s.name, contentHash, attempt+1, maxRetries)
-					}
-
-					reader, err := s.s3.GetWithRetry(ctx, s3Key)
-					if err != nil {
-						fetchErr = err
-						continue
-					}
-
-					data, err = io.ReadAll(reader)
-					reader.Close()
-					if err != nil {
-						fetchErr = err
-						continue
-					}
-
-					// Success - break out of retry loop
-					fetchErr = nil
-					break
+				// Single attempt - warmup is best-effort
+				reader, fetchErr := s.s3.GetWithRetry(warmupCtx, s3Key)
+				if fetchErr != nil {
+					log.Printf("IMAP [%s] warmup: skipping %s, failed to fetch from S3: %v", s.name, contentHash, fetchErr)
+					skippedCount++
+					continue
 				}
 
-				if fetchErr != nil {
-					log.Printf("IMAP [%s] warmup: failed to fetch content %s from S3 after %d attempts: %v", s.name, contentHash, maxRetries, fetchErr)
+				data, err := io.ReadAll(reader)
+				reader.Close()
+				if err != nil {
+					log.Printf("IMAP [%s] warmup: skipping %s, failed to read from S3: %v", s.name, contentHash, err)
+					skippedCount++
 					continue
 				}
 

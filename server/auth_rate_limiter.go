@@ -86,6 +86,9 @@ type AuthRateLimiter struct {
 	lastDBError      time.Time
 	dbErrorThreshold time.Duration
 
+	// Cluster integration (optional)
+	clusterLimiter *ClusterRateLimiter
+
 	stopCleanup chan struct{}
 	stopSync    chan struct{}
 }
@@ -142,6 +145,14 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimit
 		config.DelayStartThreshold, config.MaxDelay)
 
 	return limiter
+}
+
+// SetClusterLimiter sets the cluster rate limiter for cluster-wide synchronization
+func (a *AuthRateLimiter) SetClusterLimiter(clusterLimiter *ClusterRateLimiter) {
+	if a == nil {
+		return
+	}
+	a.clusterLimiter = clusterLimiter
 }
 
 // CanAttemptAuth checks if authentication can be attempted with fast blocking
@@ -338,9 +349,10 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	}
 
 	if info.FailureCount >= a.config.FastBlockThreshold {
+		blockedUntil := failureTime.Add(a.config.FastBlockDuration)
 		a.blockMu.Lock()
 		a.blockedIPs[ip] = &BlockedIPInfo{
-			BlockedUntil: failureTime.Add(a.config.FastBlockDuration),
+			BlockedUntil: blockedUntil,
 			FailureCount: info.FailureCount,
 			FirstFailure: info.FirstFailure,
 			LastFailure:  failureTime,
@@ -348,10 +360,20 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 		}
 		a.blockMu.Unlock()
 		log.Printf("[%s-AUTH-LIMITER] FAST BLOCKED IP %s after %d failures (blocked until %v)",
-			a.protocol, ip, info.FailureCount, failureTime.Add(a.config.FastBlockDuration).Format("15:04:05"))
+			a.protocol, ip, info.FailureCount, blockedUntil.Format("15:04:05"))
+
+		// Broadcast to cluster
+		if a.clusterLimiter != nil {
+			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, a.protocol, info.FirstFailure)
+		}
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
 		log.Printf("[%s-AUTH-LIMITER] Progressive delay for IP %s: %v (failure %d)",
 			a.protocol, ip, info.LastDelay, info.FailureCount)
+
+		// Broadcast failure count to cluster for progressive delays
+		if a.clusterLimiter != nil {
+			a.clusterLimiter.BroadcastFailureCount(ip, info.FailureCount, info.LastDelay, info.FirstFailure)
+		}
 	}
 }
 

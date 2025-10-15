@@ -97,8 +97,8 @@ func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
 	ticker := time.NewTicker(check.Interval)
 	defer ticker.Stop()
 
-	hm.performCheck(check)
-
+	// Don't perform the first check immediately - wait for the first ticker interval
+	// to allow the application to fully initialize and avoid context cancellation issues
 	for {
 		select {
 		case <-hm.ctx.Done():

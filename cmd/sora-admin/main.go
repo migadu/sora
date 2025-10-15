@@ -2577,7 +2577,7 @@ Examples:
 	defer rdb.Close()
 
 	// Connect to S3
-	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug())
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -2788,7 +2788,7 @@ Examples:
 	defer rdb.Close()
 
 	// Connect to S3
-	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug())
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -4283,7 +4283,7 @@ func printPrettyConfig(cfg AdminConfig) {
 	fmt.Println()
 
 	fmt.Println("DATABASE CONFIGURATION:")
-	fmt.Printf("  Log Queries: %t\n", cfg.Database.LogQueries)
+	fmt.Printf("  Debug: %t\n", cfg.Database.GetDebug())
 
 	if cfg.Database.Write != nil {
 		fmt.Println("  Write Database:")
@@ -4320,7 +4320,7 @@ func printPrettyConfig(cfg AdminConfig) {
 	fmt.Printf("  Access Key: %s\n", cfg.S3.AccessKey)
 	fmt.Printf("  Secret Key: %s\n", cfg.S3.SecretKey)
 	fmt.Printf("  Bucket: %s\n", cfg.S3.Bucket)
-	fmt.Printf("  Trace: %t\n", cfg.S3.Trace)
+	fmt.Printf("  Trace: %t\n", cfg.S3.GetDebug())
 	fmt.Printf("  Encrypt: %t\n", cfg.S3.Encrypt)
 	fmt.Printf("  Encryption Key: %s\n", cfg.S3.EncryptionKey)
 
@@ -4381,7 +4381,7 @@ func handleImportS3(ctx context.Context) {
 	defer rdb.Close()
 
 	// Connect to S3
-	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+	s3, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug())
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}

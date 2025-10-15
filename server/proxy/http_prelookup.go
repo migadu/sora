@@ -19,6 +19,7 @@ import (
 type HTTPPreLookupClient struct {
 	baseURL                string
 	timeout                time.Duration
+	authToken              string // Bearer token for HTTP authentication
 	client                 *http.Client
 	breaker                *circuitbreaker.CircuitBreaker
 	cache                  *prelookupCache // In-memory cache for lookup results
@@ -43,6 +44,7 @@ type HTTPPreLookupResponse struct {
 func NewHTTPPreLookupClient(
 	baseURL string,
 	timeout time.Duration,
+	authToken string,
 	remotePort int,
 	remoteTLS bool,
 	remoteTLSUseStartTLS bool,
@@ -68,6 +70,7 @@ func NewHTTPPreLookupClient(
 	return &HTTPPreLookupClient{
 		baseURL:                baseURL,
 		timeout:                timeout,
+		authToken:              authToken,
 		client:                 &http.Client{Timeout: timeout},
 		breaker:                breaker,
 		cache:                  cache,
@@ -109,6 +112,11 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Add Bearer token authentication if configured
+		if c.authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.authToken)
 		}
 
 		resp, err := c.client.Do(req)

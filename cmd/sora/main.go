@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/errors"
@@ -34,6 +35,7 @@ import (
 	"github.com/migadu/sora/server/uploader"
 	mailapi "github.com/migadu/sora/server/userapi"
 	"github.com/migadu/sora/storage"
+	"github.com/migadu/sora/tlsmanager"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -75,6 +77,8 @@ type serverDependencies struct {
 	cleanupWorker     *cleaner.CleanupWorker
 	healthIntegration *health.HealthIntegration
 	metricsCollector  *metrics.Collector
+	clusterManager    *cluster.Manager
+	tlsManager        *tlsmanager.Manager
 	hostname          string
 	config            config.Config
 	serverManager     *serverManager
@@ -150,6 +154,9 @@ func main() {
 	}
 	if deps.cacheInstance != nil {
 		defer deps.cacheInstance.Close()
+	}
+	if deps.clusterManager != nil {
+		defer deps.clusterManager.Shutdown()
 	}
 
 	// Start all configured servers
@@ -282,7 +289,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 		logger.Infof("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
 		var err error
-		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.Trace)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug())
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())
@@ -434,6 +441,31 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		logger.Info("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
 	}
 
+	// Initialize cluster manager if enabled
+	if cfg.Cluster.Enabled {
+		logger.Infof("Initializing cluster manager")
+		deps.clusterManager, err = cluster.New(cfg.Cluster)
+		if err != nil {
+			errorHandler.FatalError("initialize cluster manager", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		logger.Infof("Cluster manager initialized: node_id=%s, members=%d, leader=%s",
+			deps.clusterManager.GetNodeID(),
+			deps.clusterManager.GetMemberCount(),
+			deps.clusterManager.GetLeaderID())
+	}
+
+	// Initialize TLS manager if TLS is enabled
+	if cfg.TLS.Enabled {
+		logger.Infof("Initializing TLS manager with provider: %s", cfg.TLS.Provider)
+		deps.tlsManager, err = tlsmanager.New(cfg.TLS, deps.clusterManager)
+		if err != nil {
+			errorHandler.FatalError("initialize TLS manager", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		logger.Infof("TLS manager initialized successfully")
+	}
+
 	// Start health monitoring
 	deps.healthIntegration.Start(ctx)
 	defer deps.healthIntegration.Stop() // Ensure health monitoring stops cleanly on shutdown
@@ -451,6 +483,35 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	errChan := make(chan error, 1)
 	allServers := deps.config.GetAllServers()
+
+	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
+	if deps.tlsManager != nil {
+		handler := deps.tlsManager.HTTPHandler()
+		if handler != nil {
+			go func() {
+				logger.Infof("Starting HTTP-01 challenge server on :80 for Let's Encrypt")
+				httpServer := &http.Server{
+					Addr:    ":80",
+					Handler: handler,
+				}
+
+				// Graceful shutdown handler
+				go func() {
+					<-ctx.Done()
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := httpServer.Shutdown(shutdownCtx); err != nil {
+						logger.Warn("HTTP-01 challenge server shutdown error: %v", err)
+					}
+				}()
+
+				if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+					logger.Error("HTTP-01 challenge server error", err)
+					errChan <- fmt.Errorf("HTTP-01 challenge server failed: %w", err)
+				}
+			}()
+		}
+	}
 
 	// Start all configured servers dynamically
 	for _, server := range allServers {
@@ -593,12 +654,12 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			ProxyProtocolTimeout:         proxyProtocolTimeout,
 			TrustedNetworks:              deps.config.Servers.TrustedNetworks,
 			AuthRateLimit:                authRateLimit,
-			SearchRateLimitPerMin:        serverConfig.SearchRateLimitPerMin,
+			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SessionMemoryLimit:           sessionMemoryLimit,
 			CommandTimeout:               commandTimeout,
 			AbsoluteSessionTimeout:       absoluteSessionTimeout,
-			MinBytesPerMinute:            serverConfig.MinBytesPerMinute,
+			MinBytesPerMinute:            serverConfig.GetMinBytesPerMinute(),
 			EnableWarmup:                 deps.config.LocalCache.EnableWarmup,
 			WarmupMessageCount:           deps.config.LocalCache.WarmupMessageCount,
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
@@ -723,7 +784,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		SessionMemoryLimit:     sessionMemoryLimit,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
-		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
+		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 	})
 
 	if err != nil {
@@ -787,7 +848,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		AuthRateLimit:          authRateLimit,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
-		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
+		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 	})
 
 	if err != nil {
@@ -882,7 +943,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		SessionTimeout:         sessionTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
-		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
+		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AffinityStickiness:     serverConfig.AffinityStickiness,
 		AffinityValidity:       affinityValidity,
@@ -975,7 +1036,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		SessionTimeout:         sessionTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
-		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
+		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		Debug:                  serverConfig.Debug,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AffinityStickiness:     serverConfig.AffinityStickiness,
@@ -1068,7 +1129,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		SessionTimeout:         sessionTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
-		MinBytesPerMinute:      serverConfig.MinBytesPerMinute,
+		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		EnableAffinity:         serverConfig.EnableAffinity,

@@ -136,7 +136,8 @@ type DatabaseEndpointConfig struct {
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
 type DatabaseConfig struct {
-	LogQueries       bool                    `toml:"log_queries"`    // Global setting for query logging
+	Debug            bool                    `toml:"debug"`          // Enable SQL query logging (replaces log_queries)
+	LogQueries       bool                    `toml:"log_queries"`    // DEPRECATED: Use debug instead
 	QueryTimeout     string                  `toml:"query_timeout"`  // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"` // Specific timeout for complex search queries (default: "60s")
 	WriteTimeout     string                  `toml:"write_timeout"`  // Timeout for write operations (default: "10s")
@@ -177,6 +178,12 @@ func (d *DatabaseConfig) GetQueryTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(d.QueryTimeout)
 }
 
+// GetDebug returns the debug flag with backward compatibility
+func (d *DatabaseConfig) GetDebug() bool {
+	// Check new field first, fall back to deprecated LogQueries
+	return d.Debug || d.LogQueries
+}
+
 // GetSearchTimeout parses the search timeout duration
 func (d *DatabaseConfig) GetSearchTimeout() (time.Duration, error) {
 	if d.SearchTimeout == "" {
@@ -200,9 +207,70 @@ type S3Config struct {
 	AccessKey     string `toml:"access_key"`
 	SecretKey     string `toml:"secret_key"`
 	Bucket        string `toml:"bucket"`
-	Trace         bool   `toml:"trace"`
+	Debug         bool   `toml:"debug"` // Enable detailed S3 request/response tracing (replaces trace)
+	Trace         bool   `toml:"trace"` // DEPRECATED: Use debug instead
 	Encrypt       bool   `toml:"encrypt"`
 	EncryptionKey string `toml:"encryption_key"`
+}
+
+// GetDebug returns the debug flag with backward compatibility
+func (s *S3Config) GetDebug() bool {
+	// Check new field first, fall back to deprecated Trace
+	return s.Debug || s.Trace
+}
+
+// ClusterRateLimitSyncConfig holds configuration for cluster-wide auth rate limiting
+type ClusterRateLimitSyncConfig struct {
+	Enabled           bool `toml:"enabled"`             // Enable cluster-wide rate limiting (default: true if cluster enabled)
+	SyncBlocks        bool `toml:"sync_blocks"`         // Sync IP blocks across cluster (default: true)
+	SyncFailureCounts bool `toml:"sync_failure_counts"` // Sync progressive delay failure counts (default: true)
+}
+
+// ClusterAffinityConfig holds configuration for cluster-wide server affinity
+type ClusterAffinityConfig struct {
+	Enabled         bool   `toml:"enabled"`          // Enable cluster-wide affinity (default: false)
+	TTL             string `toml:"ttl"`              // How long affinity persists (default: "24h")
+	CleanupInterval string `toml:"cleanup_interval"` // How often to clean up expired affinities (default: "1h")
+}
+
+// ClusterConfig holds cluster coordination configuration using gossip protocol
+type ClusterConfig struct {
+	Enabled       bool                       `toml:"enabled"`         // Enable cluster mode
+	BindAddr      string                     `toml:"bind_addr"`       // Gossip protocol bind address
+	BindPort      int                        `toml:"bind_port"`       // Gossip protocol port
+	NodeID        string                     `toml:"node_id"`         // Unique node ID (defaults to hostname)
+	Peers         []string                   `toml:"peers"`           // Initial seed nodes
+	SecretKey     string                     `toml:"secret_key"`      // Cluster encryption key (base64-encoded 32-byte key)
+	RateLimitSync ClusterRateLimitSyncConfig `toml:"rate_limit_sync"` // Auth rate limiting sync configuration
+	Affinity      ClusterAffinityConfig      `toml:"affinity"`        // Server affinity configuration
+}
+
+// TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
+type TLSLetsEncryptS3Config struct {
+	Bucket          string `toml:"bucket"`            // S3 bucket for certificate storage
+	Region          string `toml:"region"`            // AWS region (optional)
+	AccessKeyID     string `toml:"access_key_id"`     // AWS credentials (optional, uses default chain)
+	SecretAccessKey string `toml:"secret_access_key"` // AWS credentials (optional)
+}
+
+// TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
+type TLSLetsEncryptConfig struct {
+	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
+	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
+	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
+	RenewBefore     string                 `toml:"renew_before"`     // Renew certificates this duration before expiry (e.g., "720h" = 30 days). Default: 30 days
+	EnableFallback  bool                   `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true)
+	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
+}
+
+// TLSConfig holds TLS/SSL configuration
+type TLSConfig struct {
+	Enabled     bool                  `toml:"enabled"`     // Enable HTTPS/TLS
+	Provider    string                `toml:"provider"`    // TLS provider: "file" or "letsencrypt"
+	CertFile    string                `toml:"cert_file"`   // Certificate file (for provider="file")
+	KeyFile     string                `toml:"key_file"`    // Private key file (for provider="file")
+	LetsEncrypt *TLSLetsEncryptConfig `toml:"letsencrypt"` // Let's Encrypt configuration
 }
 
 // CleanupConfig holds cleaner worker configuration.
@@ -409,9 +477,10 @@ type PreLookupCacheConfig struct {
 }
 
 type PreLookupConfig struct {
-	Enabled bool   `toml:"enabled"`
-	URL     string `toml:"url"`     // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
-	Timeout string `toml:"timeout"` // HTTP request timeout (default: "5s")
+	Enabled   bool   `toml:"enabled"`
+	URL       string `toml:"url"`        // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
+	Timeout   string `toml:"timeout"`    // HTTP request timeout (default: "5s")
+	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
 	FallbackDefault        bool        `toml:"fallback_to_default"`       // Fallback to default routing if lookup fails
@@ -893,6 +962,20 @@ type HTTPAPIConfig struct {
 	TLSVerify    bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
 }
 
+// ServerLimitsConfig holds resource limits for a server
+type ServerLimitsConfig struct {
+	SearchRateLimitPerMin int    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
+	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
+}
+
+// ServerTimeoutsConfig holds timeout settings for a server
+type ServerTimeoutsConfig struct {
+	CommandTimeout         string `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
+	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 30m)
+	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+}
+
 // ServerConfig represents a single server instance
 type ServerConfig struct {
 	Type string `toml:"type"`
@@ -965,16 +1048,26 @@ type ServerConfig struct {
 	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
 
 	// Auth rate limiting (embedded)
-	AuthRateLimit          *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
-	SearchRateLimitPerMin  int                    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow  string                 `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
-	SessionMemoryLimit     string                 `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
-	CommandTimeout         string                 `toml:"command_timeout,omitempty"`           // Maximum idle time before disconnection (default: protocol-specific)
-	AbsoluteSessionTimeout string                 `toml:"absolute_session_timeout,omitempty"`  // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64                  `toml:"min_bytes_per_minute,omitempty"`      // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+
+	// Resource limits (embedded)
+	Limits *ServerLimitsConfig `toml:"limits,omitempty"`
+
+	// Session timeouts (embedded)
+	Timeouts *ServerTimeoutsConfig `toml:"timeouts,omitempty"`
 
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
+
+	// DEPRECATED: Backward compatibility fields (kept for migration)
+	// These fields are deprecated and will be removed in a future version.
+	// Use server.limits and server.timeouts sections instead.
+	SearchRateLimitPerMin  int    `toml:"search_rate_limit_per_min,omitempty"` // DEPRECATED: Use limits.search_rate_limit_per_min
+	SearchRateLimitWindow  string `toml:"search_rate_limit_window,omitempty"`  // DEPRECATED: Use limits.search_rate_limit_window
+	SessionMemoryLimit     string `toml:"session_memory_limit,omitempty"`      // DEPRECATED: Use limits.session_memory_limit
+	CommandTimeout         string `toml:"command_timeout,omitempty"`           // DEPRECATED: Use timeouts.command_timeout
+	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"`  // DEPRECATED: Use timeouts.absolute_session_timeout
+	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`      // DEPRECATED: Use timeouts.min_bytes_per_minute
 
 	// Client capability filtering (IMAP specific)
 	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`
@@ -1028,6 +1121,8 @@ type Config struct {
 	Logging    LoggingConfig    `toml:"logging"`
 	Database   DatabaseConfig   `toml:"database"`
 	S3         S3Config         `toml:"s3"`
+	TLS        TLSConfig        `toml:"tls"`
+	Cluster    ClusterConfig    `toml:"cluster"`
 	LocalCache LocalCacheConfig `toml:"local_cache"`
 	Cleanup    CleanupConfig    `toml:"cleanup"`
 	Servers    ServersConfig    `toml:"servers"`
@@ -1521,6 +1616,11 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
+	// Check new location first
+	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
+		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+	}
+	// Fall back to old location for backward compatibility
 	if s.SearchRateLimitWindow == "" {
 		return time.Minute, nil // Default: 1 minute
 	}
@@ -1529,6 +1629,11 @@ func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 
 // GetSessionMemoryLimit parses the session memory limit
 func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
+	// Check new location first
+	if s.Limits != nil && s.Limits.SessionMemoryLimit != "" {
+		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
+	}
+	// Fall back to old location for backward compatibility
 	if s.SessionMemoryLimit == "" {
 		return 100 * 1024 * 1024, nil // Default: 100MB
 	}
@@ -1537,6 +1642,11 @@ func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 
 // GetCommandTimeout parses the command timeout duration with protocol-specific defaults
 func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
+	// Check new location first
+	if s.Timeouts != nil && s.Timeouts.CommandTimeout != "" {
+		return helpers.ParseDuration(s.Timeouts.CommandTimeout)
+	}
+	// Fall back to old location for backward compatibility
 	if s.CommandTimeout == "" {
 		// Protocol-specific defaults
 		switch s.Type {
@@ -1555,10 +1665,38 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 
 // GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 30 minutes for all protocols)
 func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
+	// Check new location first
+	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
+		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
+	}
+	// Fall back to old location for backward compatibility
 	if s.AbsoluteSessionTimeout == "" {
 		return 30 * time.Minute, nil // Default: 30 minutes for all protocols
 	}
 	return helpers.ParseDuration(s.AbsoluteSessionTimeout)
+}
+
+// GetSearchRateLimitPerMin returns search rate limit per minute with backward compatibility
+func (s *ServerConfig) GetSearchRateLimitPerMin() int {
+	// Check new location first
+	if s.Limits != nil && s.Limits.SearchRateLimitPerMin > 0 {
+		return s.Limits.SearchRateLimitPerMin
+	}
+	// Fall back to old location for backward compatibility
+	return s.SearchRateLimitPerMin
+}
+
+// GetMinBytesPerMinute returns minimum bytes per minute with backward compatibility
+func (s *ServerConfig) GetMinBytesPerMinute() int64 {
+	// Check new location first
+	if s.Timeouts != nil && s.Timeouts.MinBytesPerMinute > 0 {
+		return s.Timeouts.MinBytesPerMinute
+	}
+	// Fall back to old location for backward compatibility
+	if s.MinBytesPerMinute > 0 {
+		return s.MinBytesPerMinute
+	}
+	return 1024 // Default: 1024 bytes/min
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

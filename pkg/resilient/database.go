@@ -624,7 +624,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		for i, host := range config.Write.Hosts {
 			// Only run migrations and acquire lock for the very first write pool.
 			isFirstPool := (i == 0)
-			pool, err := createDatabasePool(ctx, host, config.Write, config.LogQueries, "write", runMigrations && isFirstPool, isFirstPool)
+			pool, err := createDatabasePool(ctx, host, config.Write, config.GetDebug(), "write", runMigrations && isFirstPool, isFirstPool)
 			if err != nil {
 				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
 				continue
@@ -651,7 +651,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		successCount := 0
 		for _, host := range config.Read.Hosts {
 			// Never run migrations or acquire lock for read pools.
-			pool, err := createDatabasePool(ctx, host, config.Read, config.LogQueries, "read", false, false)
+			pool, err := createDatabasePool(ctx, host, config.Read, config.GetDebug(), "read", false, false)
 			if err != nil {
 				logger.Warn("Failed to connect to read replica, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
 
@@ -984,7 +984,7 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 		// Attempt reconnection
 		logger.Info("Attempting to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "attempt", attemptCount+1)
 
-		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.LogQueries, "read", false, false)
+		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.GetDebug(), "read", false, false)
 
 		replica.mu.Lock()
 		replica.lastAttempt = time.Now()

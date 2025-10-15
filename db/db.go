@@ -499,7 +499,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 	// Create write failover manager and pool
 	writeFailover := NewFailoverManager(dbConfig.Write, poolType)
-	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.LogQueries, poolType, writeFailover)
+	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), poolType, writeFailover)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s pool: %v", poolType, err)
 	}
@@ -509,7 +509,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	var readFailover *FailoverManager
 	if dbConfig.Read != nil {
 		readFailover = NewFailoverManager(dbConfig.Read, "read")
-		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.LogQueries, "read", readFailover)
+		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.GetDebug(), "read", readFailover)
 		if err != nil {
 			// If all read replicas are down, fall back to write pool instead of failing startup
 			log.Printf("[DB] WARNING: Failed to create read pool (all read replicas unreachable): %v", err)

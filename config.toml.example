@@ -27,7 +27,7 @@ level = "info"            # Log level: "debug", "info", "warn", "error"
 # Sora requires PostgreSQL with the pg_trgm extension for full-text search.
 
 [database]
-log_queries = false             # Enable SQL query logging. Useful for debugging, but impacts performance.
+debug = false                   # Enable SQL query logging. Useful for debugging, but impacts performance.
 query_timeout = "30s"           # Default timeout for all database queries (e.g., "30s", "1m").
 search_timeout = "1m"           # Specific timeout for complex search queries (e.g., "60s", "2m").
 write_timeout = "15s"           # Timeout for write operations (INSERT, UPDATE, DELETE).
@@ -88,12 +88,208 @@ disable_tls = false                     # Disable TLS for S3 endpoint. Useful fo
 access_key = "YOUR_S3_ACCESS_KEY_HERE"  # S3 access key ID for authentication.
 secret_key = "YOUR_S3_SECRET_KEY_HERE"  # S3 secret access key for authentication.
 bucket = "your-sora-mail-bucket"        # S3 bucket name for storing message bodies. Must be globally unique.
-trace = false                           # Enable detailed S3 request/response tracing. Impacts performance.
+debug = false                           # Enable detailed S3 request/response tracing. Impacts performance.
 
 # --- CLIENT-SIDE ENCRYPTION SETTINGS ---
 # Encrypt message bodies before uploading to S3 for additional security
 encrypt = false                                                                    # Enable client-side encryption. Messages are encrypted before S3 upload.
 encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" # 32-byte master encryption key (64 hex chars). CRITICAL: Store securely! Gen: openssl rand -hex 32
+
+
+# TLS/SSL CONFIGURATION
+# =============================================================================
+# Global TLS configuration for centralized certificate management.
+# Supports both file-based certificates and automatic Let's Encrypt certificates.
+#
+# IMPORTANT: This is a global TLS manager that provides certificates to all servers.
+# When enabled, servers with tls=true will use certificates from this manager.
+# Individual servers can still use their own tls_cert_file/tls_key_file if preferred.
+#
+# TWO PROVIDER OPTIONS:
+# 1. provider = "file"        - Use static certificate files (traditional approach)
+# 2. provider = "letsencrypt" - Automatic certificates from Let's Encrypt (recommended)
+
+[tls]
+enabled = false                                 # Enable global TLS management (default: false)
+provider = "file"                               # TLS provider: "file" or "letsencrypt" (default: "file")
+
+# --- OPTION 1: FILE-BASED CERTIFICATES (provider = "file") ---
+# Use this for static certificates (purchased SSL, self-signed, or existing certs)
+# Both cert_file and key_file are REQUIRED when provider = "file"
+cert_file = "/path/to/cert.pem"                 # Full path to PEM-encoded certificate file
+key_file = "/path/to/key.pem"                   # Full path to PEM-encoded private key file
+
+# EXAMPLE USAGE (File-based):
+# [tls]
+# enabled = true
+# provider = "file"
+# cert_file = "/etc/ssl/certs/mail.example.com.crt"
+# key_file = "/etc/ssl/private/mail.example.com.key"
+
+# --- OPTION 2: LET'S ENCRYPT AUTOMATIC CERTIFICATES (provider = "letsencrypt") ---
+# Use this for automatic, free TLS certificates with auto-renewal
+# REQUIREMENTS:
+# - Domains must have DNS A records pointing to this server's public IP
+# - Port 80 must be accessible from the internet (for HTTP-01 challenge validation)
+# - S3 bucket for certificate storage (allows sharing across multiple instances)
+# - AWS credentials or IAM role with S3 access
+[tls.letsencrypt]
+email = "admin@example.com"                     # REQUIRED: Email for Let's Encrypt account (used for expiration notices and account recovery)
+domains = ["mail.example.com"]                  # REQUIRED: List of domains for certificate (supports multiple: ["mail.example.com", "imap.example.com", "smtp.example.com"])
+storage_provider = "s3"                         # Certificate storage backend (currently only "s3" is supported)
+
+# S3 storage configuration for Let's Encrypt certificates
+# Certificates are stored in S3 to enable sharing across multiple Sora instances
+[tls.letsencrypt.s3]
+bucket = "sora-tls-certificates"                # S3 bucket name for certificate storage (bucket must exist before starting Sora)
+region = "us-east-1"                            # AWS region where the bucket is located (REQUIRED)
+# access_key_id = ""                            # AWS access key ID (optional - uses default AWS credential chain if omitted: env vars, ~/.aws/credentials, IAM role)
+# secret_access_key = ""                        # AWS secret access key (optional - uses default AWS credential chain if omitted)
+
+# OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)
+# renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (format: "Xh", "Xd" not supported, use hours)
+
+# OPTIONAL: Local filesystem fallback for S3 outages (enabled by default)
+# enable_fallback = true                        # Enable local filesystem fallback when S3 is unavailable (default: true)
+# fallback_dir = "/var/lib/sora/certs"          # Local directory to cache certificates when S3 is unavailable (default: "/var/lib/sora/certs")
+#
+# When to disable fallback (enable_fallback = false):
+# - You prefer hard failure when S3 is down (fail-fast approach)
+# - You don't want local disk dependencies
+# - You're running in a container with ephemeral storage
+# - You have strict compliance requirements about certificate storage locations
+
+# EXAMPLE USAGE (Let's Encrypt):
+# [tls]
+# enabled = true
+# provider = "letsencrypt"
+# # cert_file and key_file are not needed for Let's Encrypt
+#
+# [tls.letsencrypt]
+# email = "admin@example.com"
+# domains = ["mail.example.com", "imap.example.com"]
+# storage_provider = "s3"
+#
+# [tls.letsencrypt.s3]
+# bucket = "sora-tls-certificates"
+# region = "us-east-1"
+
+# SETUP STEPS FOR LET'S ENCRYPT:
+# 1. Create S3 bucket:
+#    aws s3 mb s3://sora-tls-certificates --region us-east-1
+# 2. Verify DNS A records:
+#    dig +short mail.example.com  # Should return your server's public IP
+# 3. Ensure port 80 is open:
+#    Sora will automatically start an HTTP-01 challenge server on port 80
+# 4. Set provider = "letsencrypt" and enabled = true
+# 5. Start Sora - certificates will be issued on first HTTPS request
+#
+# FEATURES:
+# - Automatic certificate issuance (30-60 seconds on first request)
+# - Automatic renewal (certificates renewed 30 days before expiration by default, configurable via renew_before)
+# - Hot reload (new certificates automatically loaded on next TLS handshake - no restart needed)
+# - Multi-instance support (multiple Sora instances share certificates via S3)
+# - Zero-downtime renewal (renewals happen in background during TLS handshakes)
+# - Server-side encryption (certificates encrypted at rest with AES256)
+# - File fallback (local filesystem cache when S3 is unavailable - automatic recovery)
+# - Cost: ~$0.001/month for S3 storage
+#
+# LIMITATIONS:
+# - Let's Encrypt rate limits: 50 certificates per domain per week
+# - Requires port 80 for HTTP-01 challenges (cannot be changed)
+# - Only supports HTTP-01 challenge (no DNS-01 for wildcard certificates yet)
+
+
+# CLUSTER CONFIGURATION
+# =============================================================================
+# Distributed coordination using gossip protocol (HashiCorp memberlist)
+# for leader election and cluster membership management.
+#
+# USE CASE: When running multiple Sora instances with Let's Encrypt TLS,
+# cluster mode ensures only ONE node requests certificates from Let's Encrypt
+# at a time, preventing rate limit issues and duplicate certificate requests.
+#
+# ARCHITECTURE:
+# - Uses gossip protocol for peer discovery and failure detection
+# - Leader election based on lexicographically smallest node ID (deterministic)
+# - Only the leader node can request new TLS certificates
+# - All nodes can read certificates from S3 (shared storage)
+# - Automatic failover when leader goes down
+
+[cluster]
+enabled = false                                 # Enable cluster mode (default: false)
+bind_addr = "0.0.0.0"                           # Gossip protocol bind address (default: "0.0.0.0")
+bind_port = 7946                                # Gossip protocol port (default: 7946)
+node_id = ""                                    # Unique node ID (default: hostname)
+peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com", "node-2.example.com"])
+secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key (REQUIRED for production)
+                                                # Generate with: openssl rand -base64 32
+
+# --- CLUSTER-WIDE AUTH RATE LIMITING ---
+# Synchronize authentication rate limiting across cluster nodes via gossip protocol.
+# When enabled, failed authentication attempts on one node immediately block the IP
+# on all other nodes, providing cluster-wide brute-force protection.
+[cluster.rate_limit_sync]
+enabled = true                                  # Enable cluster-wide rate limiting (default: true if cluster enabled)
+sync_blocks = true                              # Synchronize IP blocks across nodes (default: true)
+sync_failure_counts = true                      # Synchronize progressive delay failure counts (default: true)
+
+# --- CLUSTER-WIDE SERVER AFFINITY ---
+# Synchronize user-to-backend affinity (sticky sessions) across cluster nodes via gossip.
+# When enabled, users are consistently routed to the same backend server across all proxy nodes
+# for better cache locality and connection reuse. Affinity automatically updates when backends fail.
+# NOTE: Affinity is ONLY for non-prelookup users. Prelookup routes are always authoritative.
+[cluster.affinity]
+enabled = false                                 # Enable cluster-wide server affinity (default: false)
+ttl = "24h"                                     # How long affinity persists (default: "24h")
+cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
+
+# EXAMPLE USAGE (Multi-instance deployment):
+# [cluster]
+# enabled = true
+# bind_addr = "0.0.0.0"
+# bind_port = 7946
+# node_id = "sora-1"                            # Or leave empty to use hostname
+# peers = ["sora-2.example.com", "sora-3.example.com"]  # Only need 1-2 seed nodes, gossip discovers others
+# secret_key = "YOUR_BASE64_ENCODED_32_BYTE_SECRET_KEY_HERE"
+
+# SETUP STEPS:
+# 1. Generate cluster secret key:
+#    openssl rand -base64 32
+# 2. Configure same secret_key on all nodes (CRITICAL: must match across cluster)
+# 3. Set unique node_id for each node (or use default hostname)
+# 4. Specify 1-2 peer nodes for initial discovery
+# 5. Start all nodes - they will discover each other via gossip
+# 6. Verify cluster membership: check logs for "Cluster manager initialized"
+#
+# FEATURES:
+# - Automatic leader election (lexicographically smallest node ID)
+# - Peer discovery via gossip protocol (memberlist)
+# - Failure detection and automatic failover
+# - Encrypted communication (AES-256 when secret_key is set)
+# - Zero single point of failure
+#
+# INTEGRATION WITH TLS:
+# When cluster mode is enabled with Let's Encrypt:
+# - Only the cluster leader requests new certificates from Let's Encrypt
+# - Non-leader nodes read certificates from S3 (shared storage)
+# - Prevents Let's Encrypt rate limiting (50 certs/domain/week)
+# - Prevents duplicate certificate requests
+# - Automatic leadership handoff when leader fails
+#
+# PORTS:
+# - bind_port (7946): Gossip protocol communication (TCP + UDP)
+# - Ensure this port is accessible between all cluster nodes
+#
+# SECURITY:
+# - ALWAYS use secret_key in production for encrypted gossip communication
+# - Use firewall rules to restrict bind_port access to cluster nodes only
+# - Rotate secret_key periodically (requires cluster restart)
+#
+# MONITORING:
+# - Log messages show cluster membership changes
+# - Log messages show leader election results
+# - Example: "Cluster leader changed: node-1 -> node-2 (this node is leader: false)"
 
 
 # LOCAL CACHE CONFIGURATION
@@ -262,20 +458,21 @@ db_sync_interval = "30s"          # How often to sync batched auth attempts to t
 max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
 db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
 
-# --- SEARCH RATE LIMITING ---
-# Per-user search rate limiting to prevent DoS attacks via excessive search queries
+# --- RESOURCE LIMITS ---
+[server.limits]
+# Search rate limiting - prevent DoS attacks via excessive search queries
 search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
 search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
 
-# --- SESSION MEMORY LIMITING ---
-# Per-session memory limit to prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
+# Session memory limiting - prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
 session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
+# --- SESSION TIMEOUTS ---
 # Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
+# 1. Idle timeout (command_timeout): Closes connections with no activity
 # 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
+# 3. Throughput enforcement (min_bytes_per_minute): Closes connections transferring data too slowly
+[server.timeouts]
 command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
 absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
 min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
@@ -482,6 +679,9 @@ min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris att
 enabled = false                       # Enable/disable HTTP-based user routing.
 url = "http://localhost:8080/lookup"  # HTTP endpoint URL for prelookup service (required if enabled)
 timeout = "5s"                        # HTTP request timeout (default: 5s)
+# auth_token = "your-secret-token"    # Bearer token for HTTP authentication (optional)
+                                      # If set, sends "Authorization: Bearer <token>" header with requests
+                                      # Use this to secure your prelookup endpoint
 
 fallback_to_default = true            # If prelookup initialization fails (e.g., endpoint unreachable), continue without prelookup
                                       # using default round-robin routing. If false, proxy fails to start on prelookup errors.

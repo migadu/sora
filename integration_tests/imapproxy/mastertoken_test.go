@@ -292,12 +292,13 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
-	// Configure HTTP prelookup with caching
+	// Configure HTTP prelookup with caching and authentication
 	// Note: Master token logic is now handled by the HTTP endpoint, not the client
 	prelookupConfig := &config.PreLookupConfig{
-		Enabled: true,
-		URL:     prelookupURL + "/lookup",
-		Timeout: "5s",
+		Enabled:   true,
+		URL:       prelookupURL + "/lookup",
+		Timeout:   "5s",
+		AuthToken: "test-secret-token", // Bearer token for authentication
 		// Enable caching for testing
 		Cache: &config.PreLookupCacheConfig{
 			Enabled:         true,

@@ -13,8 +13,26 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 )
+
+// AffinityManager defines the interface for cluster-wide affinity management
+type AffinityManager interface {
+	GetBackend(username, protocol string) (string, bool)
+	SetBackend(username, backend, protocol string)
+	UpdateBackend(username, oldBackend, newBackend, protocol string)
+	DeleteBackend(username, protocol string)
+}
+
+// BackendHealth tracks detailed health information for a backend
+type BackendHealth struct {
+	FailureCount     int       // Total failure count
+	ConsecutiveFails int       // Consecutive failures (resets on success)
+	LastFailure      time.Time // Time of last failure
+	LastSuccess      time.Time // Time of last successful connection
+	IsHealthy        bool      // Current health status
+}
 
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
@@ -29,13 +47,20 @@ type ConnectionManager struct {
 	// Round-robin index
 	nextIndex atomic.Uint32
 
-	// Track healthy servers
+	// Track healthy servers (legacy simple health tracking)
 	healthyMu     sync.RWMutex
 	healthyStatus map[string]bool
 	lastCheck     map[string]time.Time
 
+	// Detailed backend health tracking
+	healthMu      sync.RWMutex
+	backendHealth map[string]*BackendHealth
+
 	// User routing lookup
 	routingLookup UserRoutingLookup
+
+	// Affinity manager (optional, for cluster-wide affinity)
+	affinityManager AffinityManager
 }
 
 // NewConnectionManager creates a new connection manager
@@ -62,11 +87,16 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 
 	healthyStatus := make(map[string]bool)
 	lastCheck := make(map[string]time.Time)
+	backendHealth := make(map[string]*BackendHealth)
 
 	// Initially mark all servers as healthy
 	for _, addr := range normalizedAddrs {
 		healthyStatus[addr] = true
 		lastCheck[addr] = time.Now()
+		backendHealth[addr] = &BackendHealth{
+			IsHealthy:   true,
+			LastSuccess: time.Now(),
+		}
 	}
 
 	return &ConnectionManager{
@@ -79,8 +109,108 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		connectTimeout:         connectTimeout,
 		healthyStatus:          healthyStatus,
 		lastCheck:              lastCheck,
+		backendHealth:          backendHealth,
 		routingLookup:          routingLookup,
 	}, nil
+}
+
+// SetAffinityManager sets the affinity manager for cluster-wide affinity
+func (cm *ConnectionManager) SetAffinityManager(am AffinityManager) {
+	cm.affinityManager = am
+}
+
+// GetAffinityManager returns the affinity manager (may be nil)
+func (cm *ConnectionManager) GetAffinityManager() AffinityManager {
+	return cm.affinityManager
+}
+
+// IsBackendHealthy checks if a backend is healthy based on detailed health tracking
+// Returns true if healthy, false if marked unhealthy
+// Auto-recovers backends after 1 minute of being marked unhealthy
+func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
+	cm.healthMu.RLock()
+	health, exists := cm.backendHealth[backend]
+	cm.healthMu.RUnlock()
+
+	if !exists {
+		// Backend not in our list, assume unhealthy
+		return false
+	}
+
+	// Check if backend should auto-recover (1 minute since last failure)
+	if !health.IsHealthy && time.Since(health.LastFailure) > 1*time.Minute {
+		cm.healthMu.Lock()
+		health.IsHealthy = true
+		health.ConsecutiveFails = 0 // Reset consecutive failures
+		cm.healthMu.Unlock()
+		logger.Infof("[ConnectionManager] Auto-recovered backend %s after 1 minute", backend)
+		return true
+	}
+
+	return health.IsHealthy
+}
+
+// RecordConnectionSuccess records a successful connection to a backend
+func (cm *ConnectionManager) RecordConnectionSuccess(backend string) {
+	cm.healthMu.Lock()
+	defer cm.healthMu.Unlock()
+
+	health, exists := cm.backendHealth[backend]
+	if !exists {
+		// Create health entry for new backend
+		health = &BackendHealth{
+			IsHealthy:   true,
+			LastSuccess: time.Now(),
+		}
+		cm.backendHealth[backend] = health
+		return
+	}
+
+	wasUnhealthy := !health.IsHealthy
+	health.LastSuccess = time.Now()
+	health.ConsecutiveFails = 0 // Reset consecutive failures on success
+	health.IsHealthy = true
+
+	if wasUnhealthy {
+		logger.Infof("[ConnectionManager] Backend %s recovered (consecutive failures reset)", backend)
+	}
+}
+
+// RecordConnectionFailure records a connection failure and marks backend unhealthy after 3 consecutive failures
+// Returns true if backend was just marked unhealthy (transition from healthy to unhealthy)
+func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
+	cm.healthMu.Lock()
+	defer cm.healthMu.Unlock()
+
+	health, exists := cm.backendHealth[backend]
+	if !exists {
+		// Create health entry for new backend
+		health = &BackendHealth{
+			IsHealthy:        false,
+			LastFailure:      time.Now(),
+			FailureCount:     1,
+			ConsecutiveFails: 1,
+		}
+		cm.backendHealth[backend] = health
+		logger.Warnf("[ConnectionManager] Backend %s marked unhealthy after first failure", backend)
+		return true
+	}
+
+	wasHealthy := health.IsHealthy
+	health.FailureCount++
+	health.ConsecutiveFails++
+	health.LastFailure = time.Now()
+
+	// Mark unhealthy after 3 consecutive failures
+	if health.ConsecutiveFails >= 3 {
+		health.IsHealthy = false
+		if wasHealthy {
+			logger.Warnf("[ConnectionManager] Backend %s marked unhealthy after %d consecutive failures", backend, health.ConsecutiveFails)
+			return true // Just became unhealthy
+		}
+	}
+
+	return false
 }
 
 // AuthenticateAndRoute delegates to the routing lookup if available
@@ -160,10 +290,15 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 
 		conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if err == nil {
+			// Record success in detailed health tracking
+			cm.RecordConnectionSuccess(addr)
 			return conn, addr, nil
 		}
 
-		// Mark as unhealthy if connection failed
+		// Record failure in detailed health tracking
+		cm.RecordConnectionFailure(addr)
+
+		// Mark as unhealthy if connection failed (legacy tracking)
 		cm.markUnhealthy(addr)
 		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
 	}
@@ -201,12 +336,16 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 	// Attempt to dial the preferred address.
 	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 	if err == nil {
-		// Success!
+		// Success! Record success in health tracking
+		if isInList {
+			cm.RecordConnectionSuccess(preferredAddr)
+		}
 		return conn, preferredAddr, nil, false // No fallback
 	}
 
 	// Connection failed. Mark it as unhealthy if it's in our managed list.
 	if isInList {
+		cm.RecordConnectionFailure(preferredAddr)
 		cm.markUnhealthy(preferredAddr)
 	}
 
@@ -618,11 +757,12 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 type RouteParams struct {
 	Ctx                context.Context
 	Username           string
+	Protocol           string // "imap", "pop3", "managesieve", "lmtp"
 	AccountID          int64
 	IsPrelookupAccount bool
 	RoutingInfo        *UserRoutingInfo
 	ConnManager        *ConnectionManager
-	RDB                *resilient.ResilientDatabase // For affinity lookup
+	RDB                *resilient.ResilientDatabase // For affinity lookup (legacy database-based affinity)
 	EnableAffinity     bool
 	AffinityValidity   time.Duration
 	AffinityStickiness float64
@@ -665,19 +805,38 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	// 2. If no routing info from prelookup, try affinity
-	if result.PreferredAddr == "" && params.EnableAffinity && !params.IsPrelookupAccount && params.AccountID > 0 {
-		affinityCtx, affinityCancel := context.WithTimeout(params.Ctx, 2*time.Second)
-		lastAddr, lastTime, affinityErr := params.RDB.GetLastServerAddressWithRetry(affinityCtx, params.AccountID)
-		affinityCancel()
-
-		if affinityErr != nil {
-			if !errors.Is(affinityErr, consts.ErrNoServerAffinity) {
-				log.Printf("[%s] Could not get preferred backend for %s: %v", params.ProxyName, params.Username, affinityErr)
+	if result.PreferredAddr == "" && params.EnableAffinity && !params.IsPrelookupAccount {
+		// Try cluster-wide affinity first (if available)
+		affinityMgr := params.ConnManager.GetAffinityManager()
+		if affinityMgr != nil && params.Protocol != "" {
+			// Use gossip-based affinity manager
+			if lastAddr, found := affinityMgr.GetBackend(params.Username, params.Protocol); found {
+				// Check if backend is healthy
+				if params.ConnManager.IsBackendHealthy(lastAddr) {
+					result.PreferredAddr = lastAddr
+					result.RoutingMethod = "affinity"
+					logger.Infof("[%s] Using cluster affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+				} else {
+					logger.Infof("[%s] Cluster affinity backend %s for %s is unhealthy, deleting affinity", params.ProxyName, lastAddr, params.Username)
+					// Delete unhealthy affinity
+					affinityMgr.DeleteBackend(params.Username, params.Protocol)
+				}
 			}
-		} else if lastAddr != "" && time.Since(lastTime) < params.AffinityValidity {
-			result.PreferredAddr = lastAddr
-			result.RoutingMethod = "affinity"
-			log.Printf("[%s] Using server affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+		} else if params.RDB != nil && params.AccountID > 0 {
+			// Fall back to legacy database-based affinity
+			affinityCtx, affinityCancel := context.WithTimeout(params.Ctx, 2*time.Second)
+			lastAddr, lastTime, affinityErr := params.RDB.GetLastServerAddressWithRetry(affinityCtx, params.AccountID)
+			affinityCancel()
+
+			if affinityErr != nil {
+				if !errors.Is(affinityErr, consts.ErrNoServerAffinity) {
+					log.Printf("[%s] Could not get preferred backend for %s: %v", params.ProxyName, params.Username, affinityErr)
+				}
+			} else if lastAddr != "" && time.Since(lastTime) < params.AffinityValidity {
+				result.PreferredAddr = lastAddr
+				result.RoutingMethod = "affinity"
+				log.Printf("[%s] Using database affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+			}
 		}
 	}
 
@@ -691,4 +850,32 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	return result, nil
+}
+
+// UpdateAffinityAfterConnection updates affinity after a successful connection
+// This should be called by proxies after establishing a backend connection
+func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, wasAffinityRoute bool) {
+	// Only update affinity for non-prelookup users
+	if params.IsPrelookupAccount {
+		return
+	}
+
+	affinityMgr := params.ConnManager.GetAffinityManager()
+	if affinityMgr == nil || params.Protocol == "" {
+		return
+	}
+
+	// Check current affinity
+	currentBackend, hasAffinity := affinityMgr.GetBackend(params.Username, params.Protocol)
+
+	if !hasAffinity {
+		// No affinity exists, set new affinity
+		affinityMgr.SetBackend(params.Username, connectedBackend, params.Protocol)
+		logger.Infof("[%s] Set new affinity for %s → %s", params.ProxyName, params.Username, connectedBackend)
+	} else if currentBackend != connectedBackend {
+		// Affinity changed (due to failover)
+		affinityMgr.UpdateBackend(params.Username, currentBackend, connectedBackend, params.Protocol)
+		logger.Infof("[%s] Updated affinity for %s: %s → %s", params.ProxyName, params.Username, currentBackend, connectedBackend)
+	}
+	// If affinity matches connected backend, no update needed (affinity is still valid)
 }

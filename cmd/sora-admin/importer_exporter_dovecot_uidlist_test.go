@@ -774,10 +774,10 @@ func createTestS3StorageFromConfig(t *testing.T) *storage.S3Storage {
 	}
 
 	// Create S3 storage using the loaded config
-	// storage.New(endpoint, accessKey, secretKey, bucket, useSSL, trace)
+	// storage.New(endpoint, accessKey, secretKey, bucket, useSSL, debug)
 	useSSL := !cfg.S3.DisableTLS
-	trace := cfg.S3.Trace
-	s3Storage, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, useSSL, trace)
+	debug := cfg.S3.GetDebug()
+	s3Storage, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, useSSL, debug)
 	if err != nil {
 		t.Skipf("Failed to create S3 storage from config: %v\n"+
 			"Ensure S3/MinIO is running and configured in config-test.toml\n"+

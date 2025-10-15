@@ -79,12 +79,14 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 		cache = newPrelookupCache(positiveTTL, negativeTTL, maxSize, cleanupInterval)
 	}
 
-	log.Printf("[Prelookup] Initializing HTTP prelookup: url=%s, timeout=%s, remote_port=%d, cache_enabled=%v",
-		cfg.URL, timeout, remotePort, cacheEnabled)
+	hasAuth := cfg.AuthToken != ""
+	log.Printf("[Prelookup] Initializing HTTP prelookup: url=%s, timeout=%s, remote_port=%d, cache_enabled=%v, auth_enabled=%v",
+		cfg.URL, timeout, remotePort, cacheEnabled, hasAuth)
 
 	client := NewHTTPPreLookupClient(
 		cfg.URL,
 		timeout,
+		cfg.AuthToken,
 		remotePort,
 		cfg.RemoteTLS,
 		cfg.RemoteTLSUseStartTLS,
