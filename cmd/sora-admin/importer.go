@@ -1293,8 +1293,19 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 	}
 
 	// --- Robust Import Flow ---
-	// Step 1: Insert the message in the database with UID preservation
-	// Debug logging for UID preservation
+	// Step 1: Upload content to S3 first (skip in test mode)
+	if !i.options.TestMode && i.s3 != nil {
+		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
+		s3Err := i.s3.Put(s3Key, bytes.NewReader(content), size)
+		if s3Err != nil {
+			// S3 upload failed. Don't insert into DB at all.
+			return fmt.Errorf("failed to upload to S3: %w", s3Err)
+		}
+	}
+
+	// Step 2: Insert the message in the database with uploaded=TRUE
+	// Since we do synchronous S3 upload, use InsertMessageFromImporterWithRetry
+	// which marks uploaded=TRUE immediately and does NOT add to pending_uploads queue
 	if preservedUID != nil {
 		logger.Infof("[IMPORTER] DEBUG: About to insert with preserved UID=%d", *preservedUID)
 	}
@@ -1302,8 +1313,7 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 		logger.Infof("[IMPORTER] DEBUG: About to insert with preserved UIDVALIDITY=%d", *preservedUIDValidity)
 	}
 
-	hostname, _ := os.Hostname()
-	msgID, uid, err := i.rdb.InsertMessageWithRetry(i.ctx,
+	msgID, uid, err := i.rdb.InsertMessageFromImporterWithRetry(i.ctx,
 		&db.InsertMessageOptions{
 			UserID:               user.UserID(),
 			MailboxID:            mailbox.ID,
@@ -1325,49 +1335,19 @@ func (i *Importer) importMessage(path, filename, hash string, size int64, mailbo
 			PreservedUID:         preservedUID,
 			PreservedUIDValidity: preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
-		},
-		db.PendingUpload{
-			InstanceID:  hostname,
-			ContentHash: hash,
-			Size:        size,
-			AccountID:   user.UserID(),
 		})
 
 	if err != nil {
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			// This can happen if another process imported the message between our check and insert (race condition).
-			// It's safe to skip, as no S3 orphan was created.
+			// The S3 object exists (uploaded above), but that's okay - S3 is content-addressed.
 			logger.Infof("%s Message already exists in DB (race condition?), skipping: %s", i.getProgressPrefix(), path)
 			atomic.AddInt64(&i.skippedMessages, 1)
 			return nil
 		}
-		return fmt.Errorf("failed to queue message in database: %w", err)
-	}
-
-	// Step 2: Upload content to S3 (skip in test mode)
-	if i.options.TestMode || i.s3 == nil {
-		// In test mode, skip S3 upload and mark as complete directly
-		err = i.rdb.CompleteS3UploadWithRetry(i.ctx, hash, user.UserID())
-		if err != nil {
-			return fmt.Errorf("test mode: failed to finalize message in DB: %w", err)
-		}
-	} else {
-		// Normal mode: upload to S3
-		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), hash)
-		s3Err := i.s3.Put(s3Key, bytes.NewReader(content), size)
-		if s3Err != nil {
-			// S3 upload failed. The message remains in the 'pending_uploads' queue.
-			// It can be retried by re-running the import. No S3 orphan was created.
-			return fmt.Errorf("failed to upload to S3. Message is queued in DB for retry on next run: %w", s3Err)
-		}
-
-		// Step 3: Finalize the upload in the database.
-		err = i.rdb.CompleteS3UploadWithRetry(i.ctx, hash, user.UserID())
-		if err != nil {
-			// The S3 object exists, but we failed to mark it as complete in the DB.
-			// The message remains in the 'pending_uploads' queue and can be retried.
-			return fmt.Errorf("S3 upload succeeded, but failed to finalize in DB. Message is queued for retry on next run: %w", err)
-		}
+		// Database insert failed after successful S3 upload.
+		// The S3 object will remain (orphaned), but can be cleaned up later.
+		return fmt.Errorf("failed to insert message in database: %w", err)
 	}
 
 	// Mark message as uploaded to S3 in SQLite cache

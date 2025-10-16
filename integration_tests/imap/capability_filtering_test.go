@@ -888,3 +888,297 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 		t.Logf("SUCCESS: Capability filtering working correctly after ID command")
 	}
 }
+
+// TestIMAP_ESEARCHFallback_WithCONDSTORE verifies that when ESEARCH is filtered,
+// CONDSTORE functionality still works properly. This test catches control flow bugs
+// where early returns might skip CONDSTORE processing.
+func TestIMAP_ESEARCHFallback_WithCONDSTORE(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Define a filter to disable ESEARCH but keep CONDSTORE
+	filters := []config.ClientCapabilityFilter{
+		{
+			ClientName:    "TestClientWithESEARCHDisabled",
+			ClientVersion: ".*",
+			DisableCaps:   []string{"ESEARCH"},
+			Reason:        "Test ESEARCH fallback with CONDSTORE",
+		},
+	}
+
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	// Login
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Identify as the test client to trigger capability filtering
+	if _, err := c.ID(&imap.IDData{Name: "TestClientWithESEARCHDisabled", Version: "1.0"}).Wait(); err != nil {
+		t.Fatalf("ID command failed: %v", err)
+	}
+
+	// Select INBOX with CONDSTORE enabled
+	selectData, err := c.Select("INBOX", &imap.SelectOptions{}).Wait()
+	if err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	initialModSeq := selectData.HighestModSeq
+	t.Logf("Initial HIGHESTMODSEQ: %d", initialModSeq)
+
+	// Append a test message
+	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
+		"To: %s\r\n"+
+		"Subject: CONDSTORE Test\r\n"+
+		"Date: %s\r\n"+
+		"\r\n"+
+		"Test CONDSTORE with ESEARCH fallback.\r\n",
+		account.Email, time.Now().Format(time.RFC1123))
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+	if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		t.Fatalf("Failed to close append: %v", err)
+	}
+	if _, err := appendCmd.Wait(); err != nil {
+		t.Fatalf("Failed to wait for append: %v", err)
+	}
+
+	// Perform SEARCH with ESEARCH options AND MODSEQ criteria
+	// This tests that CONDSTORE processing still happens even with ESEARCH fallback
+	modSeqValue := uint64(1)
+	searchData, err := c.Search(&imap.SearchCriteria{
+		ModSeq: &imap.SearchCriteriaModSeq{
+			ModSeq: modSeqValue,
+		},
+	}, &imap.SearchOptions{
+		ReturnCount: true,
+		ReturnMin:   true,
+		ReturnMax:   true,
+	}).Wait()
+
+	if err != nil {
+		t.Fatalf("Search with MODSEQ failed: %v", err)
+	}
+
+	// Verify fallback happened (Min/Max should be 0 for standard search)
+	if searchData.Min > 0 || searchData.Max > 0 {
+		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d), expected standard SEARCH fallback",
+			searchData.Min, searchData.Max)
+	}
+
+	// CRITICAL TEST: Verify CONDSTORE was processed (ModSeq should be set)
+	if searchData.ModSeq == 0 {
+		t.Errorf("FAILURE: ModSeq not set in search response - CONDSTORE processing was skipped!")
+		t.Errorf("This indicates a control flow bug where the function returns early before CONDSTORE processing")
+	} else {
+		t.Logf("SUCCESS: ModSeq=%d in search response - CONDSTORE processing happened correctly", searchData.ModSeq)
+	}
+
+	// Verify we got results
+	foundMessages := searchData.AllSeqNums()
+	t.Logf("Found %d messages with MODSEQ > %d", len(foundMessages), modSeqValue)
+}
+
+// TestIMAP_ESEARCHFallback_RepeatedSearches verifies that repeated searches
+// with ESEARCH options work correctly when ESEARCH is filtered. This catches
+// bugs where response handling might get into an inconsistent state.
+func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	filters := []config.ClientCapabilityFilter{
+		{
+			ClientName:    "TestClientRepeatedSearch",
+			ClientVersion: ".*",
+			DisableCaps:   []string{"ESEARCH"},
+			Reason:        "Test repeated search fallback",
+		},
+	}
+
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	if _, err := c.ID(&imap.IDData{Name: "TestClientRepeatedSearch", Version: "1.0"}).Wait(); err != nil {
+		t.Fatalf("ID command failed: %v", err)
+	}
+
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Append multiple test messages
+	for i := 1; i <= 5; i++ {
+		testMessage := fmt.Sprintf("From: test@example.com\r\n"+
+			"To: %s\r\n"+
+			"Subject: Test Message %d\r\n"+
+			"Date: %s\r\n"+
+			"\r\n"+
+			"Message body %d for repeated search test.\r\n",
+			account.Email, i, time.Now().Format(time.RFC1123), i)
+
+		appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+		if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+			t.Fatalf("Failed to write message %d: %v", i, err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("Failed to close append %d: %v", i, err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("Failed to wait for append %d: %v", i, err)
+		}
+	}
+
+	// Perform multiple searches in rapid succession with ESEARCH options
+	// This simulates the infinite loop scenario from the bug report
+	searchOptions := &imap.SearchOptions{
+		ReturnCount: true,
+		ReturnAll:   true,
+		ReturnMin:   true,
+		ReturnMax:   true,
+	}
+
+	for i := 1; i <= 10; i++ {
+		searchData, err := c.Search(&imap.SearchCriteria{
+			Text: []string{"Message"},
+		}, searchOptions).Wait()
+
+		if err != nil {
+			t.Fatalf("Search iteration %d failed: %v", i, err)
+		}
+
+		// Verify each search gets proper fallback response
+		if searchData.Min > 0 || searchData.Max > 0 {
+			t.Errorf("Search %d: Got ESEARCH response (Min=%d, Max=%d), expected standard fallback",
+				i, searchData.Min, searchData.Max)
+		}
+
+		foundMessages := searchData.AllSeqNums()
+		if len(foundMessages) == 0 {
+			t.Errorf("Search %d: Expected to find messages but got none", i)
+		}
+
+		t.Logf("Search iteration %d: Found %d messages (correct fallback)", i, len(foundMessages))
+	}
+
+	t.Logf("SUCCESS: All 10 repeated searches completed without hanging or errors")
+}
+
+// TestIMAP_ESEARCHFallback_EmptyResults verifies that ESEARCH fallback
+// works correctly when the search returns no results. This is an edge case
+// that might expose control flow bugs.
+func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	filters := []config.ClientCapabilityFilter{
+		{
+			ClientName:    "TestClientEmptySearch",
+			ClientVersion: ".*",
+			DisableCaps:   []string{"ESEARCH"},
+			Reason:        "Test empty search fallback",
+		},
+	}
+
+	server, account := setupIMAPServerWithCapabilityFilters(t, filters)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	if _, err := c.ID(&imap.IDData{Name: "TestClientEmptySearch", Version: "1.0"}).Wait(); err != nil {
+		t.Fatalf("ID command failed: %v", err)
+	}
+
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Search for something that doesn't exist with ESEARCH options
+	searchData, err := c.Search(&imap.SearchCriteria{
+		Text: []string{"ThisStringDoesNotExistInAnyMessage12345"},
+	}, &imap.SearchOptions{
+		ReturnCount: true,
+		ReturnMin:   true,
+		ReturnMax:   true,
+	}).Wait()
+
+	if err != nil {
+		t.Fatalf("Empty search failed: %v", err)
+	}
+
+	// Verify fallback happened
+	if searchData.Min > 0 || searchData.Max > 0 {
+		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d) for empty results",
+			searchData.Min, searchData.Max)
+	}
+
+	// Verify empty results
+	foundMessages := searchData.AllSeqNums()
+	if len(foundMessages) != 0 {
+		t.Errorf("Expected 0 messages but got %d", len(foundMessages))
+	}
+
+	t.Logf("SUCCESS: Empty search with ESEARCH fallback works correctly (0 results, Min=%d, Max=%d)",
+		searchData.Min, searchData.Max)
+
+	// Perform another search after empty result to ensure session is still healthy
+	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
+		"To: %s\r\n"+
+		"Subject: Test After Empty\r\n"+
+		"Date: %s\r\n"+
+		"\r\n"+
+		"Test message after empty search.\r\n",
+		account.Email, time.Now().Format(time.RFC1123))
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), nil)
+	if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		t.Fatalf("Failed to close append: %v", err)
+	}
+	if _, err := appendCmd.Wait(); err != nil {
+		t.Fatalf("Failed to wait for append: %v", err)
+	}
+
+	// Search again - should find the new message
+	searchData2, err := c.Search(&imap.SearchCriteria{
+		Text: []string{"After Empty"},
+	}, &imap.SearchOptions{ReturnAll: true}).Wait()
+
+	if err != nil {
+		t.Fatalf("Second search after empty failed: %v", err)
+	}
+
+	foundMessages2 := searchData2.AllSeqNums()
+	if len(foundMessages2) == 0 {
+		t.Errorf("Expected to find message after empty search but got none")
+	}
+
+	t.Logf("SUCCESS: Session remains healthy after empty search - found %d messages", len(foundMessages2))
+}

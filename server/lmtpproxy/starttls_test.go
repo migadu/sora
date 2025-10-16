@@ -43,21 +43,21 @@ func TestLMTPProxyServerOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := ServerOptions{
-				Name:                 "test-lmtp-proxy",
-				Addr:                 ":24",
-				RemoteAddrs:          []string{"backend1.example.com:24"},
-				RemotePort:           24,
-				TLS:                  true,
-				TLSUseStartTLS:       tt.tlsUseStartTLS,
-				TLSCertFile:          "/path/to/cert.pem",
-				TLSKeyFile:           "/path/to/key.pem",
-				TLSVerify:            false,
-				RemoteTLS:            true,
+				// Name:                 "test-lmtp-proxy",
+				// Addr:                 ":24",
+				// RemoteAddrs:          []string{"backend1.example.com:24"},
+				// RemotePort:           24,
+				// TLS:                  true,
+				TLSUseStartTLS: tt.tlsUseStartTLS,
+				// TLSCertFile:          "/path/to/cert.pem",
+				// TLSKeyFile:           "/path/to/key.pem",
+				// TLSVerify:            false,
+				// RemoteTLS:            true,
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
-				RemoteTLSVerify:      true,
-				ConnectTimeout:       10 * time.Second,
-				SessionTimeout:       5 * time.Minute,
-				MaxMessageSize:       52428800, // 50MB
+				// RemoteTLSVerify:      true,
+				// ConnectTimeout:       10 * time.Second,
+				// SessionTimeout:       5 * time.Minute,
+				// MaxMessageSize:       52428800, // 50MB
 			}
 
 			// Verify the options are stored correctly

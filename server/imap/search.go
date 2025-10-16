@@ -191,11 +191,12 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// To generate a standard `* SEARCH` response, we only populate the `All` field.
 	// The go-imap/v2 library will correctly generate an untagged `* SEARCH` response.
 	// If we populated `Count`, it would incorrectly generate an `* ESEARCH` response.
-	if options == nil {
-		s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
-	}
+	if options == nil || (options != nil && !s.GetCapabilities().Has(imap.CapESearch)) {
+		// This is either a standard SEARCH or ESEARCH with capability filtered
+		if options == nil {
+			s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
+		}
 
-	if len(messages) > 0 {
 		if len(messages) > 0 {
 			var uids imap.UIDSet
 			var seqNums imap.SeqSet
@@ -215,9 +216,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				searchData.All = seqNums
 			}
 		}
-		// If ESEARCH options were provided but the capability is disabled, we must return
-		// the standard search data. Otherwise, the server would send no response.
-		return searchData, nil
 	}
 
 	// CONDSTORE functionality - only process if capability is enabled
