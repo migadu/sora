@@ -71,6 +71,7 @@ func (m *Manager) initFileProvider() error {
 	m.tlsConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
 	}
 
 	logger.Infof("Loaded TLS certificate from files: cert=%s, key=%s", m.config.CertFile, m.config.KeyFile)
@@ -185,6 +186,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 	// Create TLS config with autocert
 	m.tlsConfig = m.autocertMgr.TLSConfig()
 	m.tlsConfig.MinVersion = tls.VersionTLS12
+	m.tlsConfig.NextProtos = []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"}
 
 	logger.Infof("Let's Encrypt autocert initialized for domains: %v", leCfg.Domains)
 	logger.Infof("Certificates will be stored in S3 bucket: %s", leCfg.S3.Bucket)

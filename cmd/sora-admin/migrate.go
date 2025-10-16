@@ -10,14 +10,12 @@ import (
 	"io/fs"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/golang-migrate/migrate/v4"
 	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db" // Import the db package to access MigrationsFS
 )
 
@@ -51,8 +49,8 @@ func handleMigrateCommand(ctx context.Context) {
 func printMigrateUsage() {
 	fmt.Printf(`Database Schema Migration Management
 
-This command should be run while the main 'sora' server is stopped to prevent
-schema conflicts. It uses a database lock to ensure safety.
+This command can be run safely while sora instances are running. The golang-migrate
+library uses its own internal advisory lock to ensure only one migration runs at a time.
 
 Usage:
   sora-admin migrate <subcommand> [options]
@@ -89,12 +87,6 @@ func handleMigrateUp(ctx context.Context) {
 	}
 	defer db.Close()
 
-	if err := acquireExclusiveLock(ctx, db); err != nil {
-		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
-	}
-	// Use a background context for deferred cleanup to ensure it runs even if the primary context is cancelled.
-	defer releaseExclusiveLock(context.Background(), db)
-
 	logger.Info("Applying UP migrations...")
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		logger.Fatalf("Failed to apply UP migrations: %v", err)
@@ -119,11 +111,6 @@ func handleMigrateDown(ctx context.Context) {
 		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
 	defer db.Close()
-
-	if err := acquireExclusiveLock(ctx, db); err != nil {
-		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
-	}
-	defer releaseExclusiveLock(context.Background(), db)
 
 	if *all {
 		version, dirty, err := m.Version()
@@ -196,11 +183,6 @@ func handleMigrateForce(ctx context.Context) {
 	}
 	defer db.Close()
 
-	if err := acquireExclusiveLock(ctx, db); err != nil {
-		logger.Fatalf("Failed to acquire exclusive lock: %v", err)
-	}
-	defer releaseExclusiveLock(context.Background(), db)
-
 	logger.Infof("Forcing database version to %d...", version)
 	if err := m.Force(version); err != nil {
 		logger.Fatalf("Failed to force version: %v", err)
@@ -268,41 +250,6 @@ func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrat
 
 	m.Log = &migrationLogger{}
 	return m, sqlDB, nil
-}
-
-func acquireExclusiveLock(ctx context.Context, db *sql.DB) error {
-	var lockAcquired bool
-	// Use a context with a short timeout to avoid waiting forever.
-	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	err := db.QueryRowContext(queryCtx, "SELECT pg_try_advisory_lock($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
-	if err != nil {
-		return fmt.Errorf("failed to query for advisory lock: %w", err)
-	}
-
-	if !lockAcquired {
-		return fmt.Errorf("could not acquire exclusive database lock. Is a sora server instance already running?")
-	}
-
-	logger.Info("Acquired exclusive database lock for migration.")
-	return nil
-}
-
-func releaseExclusiveLock(ctx context.Context, db *sql.DB) {
-	var unlocked bool
-	// Use a background context as the main context might be done.
-	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	err := db.QueryRowContext(queryCtx, "SELECT pg_advisory_unlock($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
-	if err != nil {
-		logger.Infof("WARN: failed to release advisory lock after migration: %v", err)
-	} else if unlocked {
-		logger.Info("Released exclusive database lock.")
-	} else {
-		logger.Infof("WARN: pg_advisory_unlock reported lock was not held at time of release.")
-	}
 }
 
 func showVersion(m *migrate.Migrate) {
