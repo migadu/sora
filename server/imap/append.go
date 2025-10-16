@@ -218,10 +218,19 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// Update session state if this message was appended to the currently selected mailbox
 	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailbox.ID {
-		// Atomically increment the count for the selected mailbox
-		newCount := s.currentNumMessages.Add(1)
+		// Query the actual message count from the database instead of incrementing,
+		// because the append operation may have deleted a conflicting draft (net change = 0)
+		actualCount, _, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(s.ctx, mailbox.ID)
+		if err != nil {
+			s.Log("[APPEND] Failed to get message count after append: %v", err)
+			// Fall back to incrementing, which may be incorrect but prevents complete failure
+			actualCount = int(s.currentNumMessages.Add(1))
+		} else {
+			s.currentNumMessages.Store(uint32(actualCount))
+		}
+
 		if s.mailboxTracker != nil {
-			s.mailboxTracker.QueueNumMessages(newCount)
+			s.mailboxTracker.QueueNumMessages(uint32(actualCount))
 		} else {
 			// This would indicate an inconsistent state if a mailbox is selected but has no tracker.
 			s.Log("[APPEND] Inconsistent state: selectedMailbox ID %d is set, but mailboxTracker is nil.", s.selectedMailbox.ID)
@@ -241,6 +250,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	success = true
+
+	s.Log("[APPEND] Successfully appended message to '%s': UID=%d, UIDValidity=%d", mboxName, messageUID, mailbox.UIDValidity)
+
 	return &imap.AppendData{
 		UID:         imap.UID(messageUID),
 		UIDValidity: mailbox.UIDValidity,

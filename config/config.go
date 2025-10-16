@@ -89,6 +89,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -2104,15 +2105,127 @@ func (c *Config) GetAllServers() []ServerConfig {
 }
 
 // LoadConfigFromFile loads configuration from a TOML file and trims whitespace from all string fields
+// This function is lenient with duplicate keys - it will log a warning and use the first occurrence
 func LoadConfigFromFile(configPath string, cfg *Config) error {
-	_, err := toml.DecodeFile(configPath, cfg)
+	// Read the file content first
+	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
+	}
+
+	// Try to decode - if it fails due to duplicate keys, we'll handle it gracefully
+	_, err = toml.Decode(string(content), cfg)
+	if err != nil {
+		// Check if this is a duplicate key error
+		if strings.Contains(err.Error(), "has already been defined") {
+			// Extract the duplicate key name from error message
+			errMsg := err.Error()
+			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, errMsg)
+			log.Printf("WARNING: Ignoring duplicate entries. Only the first occurrence of each key will be used.")
+			log.Printf("WARNING: Please fix your configuration file to remove duplicates.")
+
+			// Parse again with a lenient approach by removing duplicate keys
+			cleanedContent, parseErr := removeDuplicateKeysFromTOML(string(content))
+			if parseErr != nil {
+				// If we can't clean it, return a helpful error
+				return enhanceConfigError(err)
+			}
+
+			// Try decoding the cleaned content
+			_, err = toml.Decode(cleanedContent, cfg)
+			if err != nil {
+				return enhanceConfigError(err)
+			}
+		} else {
+			// For other errors, provide enhanced error messages
+			return enhanceConfigError(err)
+		}
 	}
 
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
 	return nil
+}
+
+// removeDuplicateKeysFromTOML removes duplicate keys from TOML content
+// This is a simple implementation that keeps the first occurrence of each key
+func removeDuplicateKeysFromTOML(content string) (string, error) {
+	lines := strings.Split(content, "\n")
+	seenKeys := make(map[string]int) // Maps key path to line number
+	var result []string
+	var currentSection string
+
+	for lineNum, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip empty lines and comments
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			result = append(result, line)
+			continue
+		}
+
+		// Track section changes
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			currentSection = trimmed
+			result = append(result, line)
+			continue
+		}
+
+		// Check if this is a key = value line
+		if strings.Contains(trimmed, "=") {
+			parts := strings.SplitN(trimmed, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				fullKey := currentSection + "." + key
+
+				// Check if we've seen this key before
+				if prevLine, exists := seenKeys[fullKey]; exists {
+					// Duplicate found - comment it out
+					log.Printf("WARNING: Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
+						fullKey, lineNum+1, prevLine+1)
+					result = append(result, "# DUPLICATE IGNORED: "+line)
+					continue
+				}
+
+				// Remember this key
+				seenKeys[fullKey] = lineNum
+			}
+		}
+
+		result = append(result, line)
+	}
+
+	return strings.Join(result, "\n"), nil
+}
+
+// enhanceConfigError provides more helpful error messages for common TOML parsing issues
+func enhanceConfigError(err error) error {
+	errMsg := err.Error()
+
+	// Check for duplicate key errors
+	if strings.Contains(errMsg, "has already been defined") {
+		// Extract the key name from the error message
+		// Format: "toml: line X (last key "key.name"): Key 'key.name' has already been defined."
+		return fmt.Errorf("%w\n\nHINT: You have a duplicate configuration key in your TOML file.\n"+
+			"Please check your configuration file and remove or comment out the duplicate entry.\n"+
+			"Common causes:\n"+
+			"  - Same key appears twice in the same section\n"+
+			"  - Copy-paste errors when creating multiple server configurations\n"+
+			"  - Uncommenting a setting that already exists elsewhere", err)
+	}
+
+	// Check for invalid TOML syntax
+	if strings.Contains(errMsg, "expected") || strings.Contains(errMsg, "invalid") {
+		return fmt.Errorf("%w\n\nHINT: There is a syntax error in your TOML configuration file.\n"+
+			"Please check:\n"+
+			"  - All strings are properly quoted\n"+
+			"  - All brackets and braces are balanced\n"+
+			"  - No special characters are unescaped\n"+
+			"  - Section headers use [section] or [[array]] format", err)
+	}
+
+	// Return original error if we don't have specific guidance
+	return err
 }
 
 // trimStringFields recursively trims whitespace from all string fields in a struct
