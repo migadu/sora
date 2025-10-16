@@ -101,6 +101,9 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		s.sessionCaps[cap] = struct{}{}
 	}
 
+	// Debug logging to track fingerprint
+	s.Log("[CAPS] applyCapabilityFilters called - ja4Fingerprint=%q, clientID=%v", s.ja4Fingerprint, s.clientID != nil)
+
 	// Apply capability filtering based on client identification and/or TLS fingerprint
 	disabledCaps := s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID, s.ja4Fingerprint)
 
