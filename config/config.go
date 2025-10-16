@@ -137,14 +137,15 @@ type DatabaseEndpointConfig struct {
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
 type DatabaseConfig struct {
-	Debug            bool                    `toml:"debug"`          // Enable SQL query logging (replaces log_queries)
-	LogQueries       bool                    `toml:"log_queries"`    // DEPRECATED: Use debug instead
-	QueryTimeout     string                  `toml:"query_timeout"`  // Default timeout for all database queries (default: "30s")
-	SearchTimeout    string                  `toml:"search_timeout"` // Specific timeout for complex search queries (default: "60s")
-	WriteTimeout     string                  `toml:"write_timeout"`  // Timeout for write operations (default: "10s")
-	Write            *DatabaseEndpointConfig `toml:"write"`          // Write database configuration
-	Read             *DatabaseEndpointConfig `toml:"read"`           // Read database configuration (can have multiple hosts for load balancing)
-	PoolTypeOverride string                  `toml:"-"`              // Internal: Override pool type in logs (not in config file)
+	Debug            bool                    `toml:"debug"`             // Enable SQL query logging (replaces log_queries)
+	LogQueries       bool                    `toml:"log_queries"`       // DEPRECATED: Use debug instead
+	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
+	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
+	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
+	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
+	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
+	Read             *DatabaseEndpointConfig `toml:"read"`              // Read database configuration (can have multiple hosts for load balancing)
+	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
 }
 
 // GetMaxConnLifetime parses the max connection lifetime duration for an endpoint
@@ -199,6 +200,14 @@ func (d *DatabaseConfig) GetWriteTimeout() (time.Duration, error) {
 		return 10 * time.Second, nil // Default 10 second timeout for write operations
 	}
 	return helpers.ParseDuration(d.WriteTimeout)
+}
+
+// GetMigrationTimeout parses the migration timeout duration
+func (d *DatabaseConfig) GetMigrationTimeout() (time.Duration, error) {
+	if d.MigrationTimeout == "" {
+		return 2 * time.Minute, nil // Default 2 minute timeout for auto-migrations
+	}
+	return helpers.ParseDuration(d.MigrationTimeout)
 }
 
 // S3Config holds S3 configuration.

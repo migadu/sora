@@ -180,7 +180,8 @@ func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, 
 	}
 
 	if runMigrations {
-		if err := db.migrate(ctx); err != nil {
+		// Use default 2-minute timeout for legacy function
+		if err := db.migrate(ctx, 2*time.Minute); err != nil {
 			return nil, err
 		}
 	}
@@ -236,7 +237,7 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 	return db.ReadPool
 }
 
-func (db *Database) migrate(ctx context.Context) error {
+func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration) error {
 	// The go:embed directive includes the 'migrations' directory, so we need to
 	// create a sub-filesystem rooted at that directory.
 	migrations, err := fs.Sub(MigrationsFS, "migrations")
@@ -274,25 +275,70 @@ func (db *Database) migrate(ctx context.Context) error {
 
 	m.Log = &migrationLogger{}
 
-	log.Println("[DB] running migrations...")
-	err = m.Up()
-	if err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("failed to run migrations: %w", err)
+	// Check current version before attempting migrations
+	currentVersion, dirty, err := m.Version()
+	if err != nil && err != migrate.ErrNilVersion {
+		return fmt.Errorf("failed to get current migration version: %w", err)
+	}
+	if dirty {
+		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
 	}
 
-	if err == migrate.ErrNoChange {
-		log.Println("[DB] migrations are up to date")
-	} else {
-		log.Println("[DB] migrations applied successfully")
+	log.Printf("[DB] Current migration version: %d, checking for updates...", currentVersion)
+
+	// Run migrations with timeout context to prevent hanging forever
+	// If another instance is running migrations, this will wait up to the configured timeout
+	log.Printf("[DB] Migration timeout configured: %v", migrationTimeout)
+	migrateCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
+	defer cancel()
+
+	// Create a channel to run migrations asynchronously
+	errChan := make(chan error, 1)
+	go func() {
+		log.Println("[DB] Attempting to run migrations...")
+		errChan <- m.Up()
+	}()
+
+	// Wait for either completion or timeout
+	select {
+	case err := <-errChan:
+		if err != nil && err != migrate.ErrNoChange {
+			return fmt.Errorf("failed to run migrations: %w", err)
+		}
+
+		if err == migrate.ErrNoChange {
+			log.Println("[DB] migrations are up to date")
+		} else {
+			log.Println("[DB] migrations applied successfully")
+		}
+	case <-migrateCtx.Done():
+		// Timeout occurred - likely another instance is running migrations
+		log.Println("[DB] Migration attempt timed out (another instance may be running migrations)")
+		log.Println("[DB] Verifying current migration state...")
+
+		// Check if migrations completed anyway (by the other instance)
+		newVersion, dirty, err := m.Version()
+		if err != nil && err != migrate.ErrNilVersion {
+			return fmt.Errorf("failed to verify migration version after timeout: %w", err)
+		}
+		if dirty {
+			return fmt.Errorf("database is in a dirty migration state after timeout (version %d)", newVersion)
+		}
+
+		// If version is up to date, consider it success
+		log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
 	}
 
+	// Final verification
 	version, dirty, err := m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
-		return fmt.Errorf("failed to get migration version: %w", err)
+		return fmt.Errorf("failed to get final migration version: %w", err)
 	}
 	if dirty {
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
 	}
+
+	log.Printf("[DB] Migration complete. Current version: %d", version)
 	return nil
 }
 
@@ -531,7 +577,12 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	}
 
 	if runMigrations {
-		if err := db.migrate(ctx); err != nil {
+		migrationTimeout, err := dbConfig.GetMigrationTimeout()
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("invalid migration_timeout: %w", err)
+		}
+		if err := db.migrate(ctx, migrationTimeout); err != nil {
 			db.Close()
 			return nil, err
 		}

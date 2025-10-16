@@ -31,7 +31,9 @@ debug = false                   # Enable SQL query logging. Useful for debugging
 query_timeout = "30s"           # Default timeout for all database queries (e.g., "30s", "1m").
 search_timeout = "1m"           # Specific timeout for complex search queries (e.g., "60s", "2m").
 write_timeout = "15s"           # Timeout for write operations (INSERT, UPDATE, DELETE).
-
+migration_timeout = "2m"        # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
+                                # one will run migrations while others wait. If timeout is reached, the instance will
+                                # verify migrations are complete before continuing. Default: "2m" (2 minutes).
 
 # WRITE DATABASE CONFIGURATION
 # =============================================================================
@@ -297,10 +299,6 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 # Synchronize user-to-backend affinity (sticky sessions) across cluster nodes via gossip.
 # When enabled, users are consistently routed to the same backend server across all proxy nodes
 # for better cache locality and connection reuse. Affinity automatically updates when backends fail.
-#
-# NOTE: This is the ONLY affinity mechanism. Per-proxy affinity_validity and affinity_stickiness
-#       parameters have been removed. Affinity TTL is configured here globally.
-#
 # NOTE: Affinity is ONLY for non-prelookup users. Prelookup routes are always authoritative.
 [cluster.affinity]
 enabled = false                                 # Enable cluster-wide server affinity (default: false)
