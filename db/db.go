@@ -60,6 +60,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -286,6 +287,41 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 	log.Printf("[DB] Current migration version: %d, checking for updates...", currentVersion)
 
+	// Check if we need to run migrations at all
+	// This prevents waiting for locks when migrations are already up-to-date
+	firstVersion, err := sourceDriver.First()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// No migrations exist, nothing to do
+			log.Println("[DB] No migration files found. Skipping migration check.")
+			return nil
+		}
+		return fmt.Errorf("failed to get first migration version: %w", err)
+	}
+
+	// Find the latest migration version by iterating through all migrations
+	latestVersion := firstVersion
+	currentSourceVersion := firstVersion
+	for {
+		next, err := sourceDriver.Next(currentSourceVersion)
+		if err != nil {
+			// Check if we've reached the end of migrations (no more files)
+			if errors.Is(err, fs.ErrNotExist) {
+				// Reached the end, latestVersion is the last one we saw
+				break
+			}
+			return fmt.Errorf("failed to iterate migration versions: %w", err)
+		}
+		latestVersion = next
+		currentSourceVersion = next
+	}
+
+	// If current version matches latest, skip migrations entirely
+	if currentVersion == latestVersion {
+		log.Printf("[DB] Migrations are up to date (version %d). Skipping migration check.", currentVersion)
+		return nil
+	}
+
 	// Run migrations with timeout context to prevent hanging forever
 	// If another instance is running migrations, this will wait up to the configured timeout
 	log.Printf("[DB] Migration timeout configured: %v", migrationTimeout)
@@ -310,17 +346,23 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 				log.Println("[DB] Migration lock acquisition failed (another instance is running migrations)")
 				log.Println("[DB] Verifying current migration state...")
 
-				// Check if migrations completed anyway (by the other instance)
-				newVersion, dirty, vErr := m.Version()
-				if vErr != nil && vErr != migrate.ErrNilVersion {
-					return fmt.Errorf("failed to verify migration version after lock timeout: %w", vErr)
+				// Query schema_migrations directly to avoid lock contention
+				var newVersion uint
+				var dirty bool
+				queryErr := sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &dirty)
+				if queryErr != nil && queryErr != sql.ErrNoRows {
+					return fmt.Errorf("failed to verify migration version after lock timeout: %w", queryErr)
 				}
 				if dirty {
 					return fmt.Errorf("database is in a dirty migration state after lock timeout (version %d)", newVersion)
 				}
 
-				// If version is up to date, consider it success
-				log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+				// Check if the version is now up-to-date (>= latest available migration)
+				if newVersion >= latestVersion {
+					log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+				} else {
+					return fmt.Errorf("lock acquisition failed and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
+				}
 			} else {
 				return fmt.Errorf("failed to run migrations: %w", err)
 			}
@@ -334,17 +376,23 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		log.Println("[DB] Migration attempt timed out (another instance may be running migrations)")
 		log.Println("[DB] Verifying current migration state...")
 
-		// Check if migrations completed anyway (by the other instance)
-		newVersion, dirty, err := m.Version()
-		if err != nil && err != migrate.ErrNilVersion {
-			return fmt.Errorf("failed to verify migration version after timeout: %w", err)
+		// Query schema_migrations directly to avoid lock contention
+		var newVersion uint
+		var dirty bool
+		queryErr := sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &dirty)
+		if queryErr != nil && queryErr != sql.ErrNoRows {
+			return fmt.Errorf("failed to verify migration version after timeout: %w", queryErr)
 		}
 		if dirty {
 			return fmt.Errorf("database is in a dirty migration state after timeout (version %d)", newVersion)
 		}
 
-		// If version is up to date, consider it success
-		log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+		// Check if the version is now up-to-date (>= latest available migration)
+		if newVersion >= latestVersion {
+			log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+		} else {
+			return fmt.Errorf("timeout waiting for migrations and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
+		}
 	}
 
 	// Final verification
