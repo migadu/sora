@@ -97,6 +97,9 @@ const DataDir = "data"
 const IndexDB = "cache_index.db"
 const PurgeBatchSize = 1000
 
+// ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size limit
+var ErrObjectTooLarge = errors.New("object exceeds cache size limit")
+
 type Cache struct {
 	basePath         string
 	capacity         int64
@@ -204,7 +207,7 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 func (c *Cache) Put(contentHash string, data []byte) error {
 	if int64(len(data)) > c.maxObjectSize {
 		metrics.CacheOperationsTotal.WithLabelValues("put", "rejected").Inc()
-		return fmt.Errorf("data size %d exceeds object limit %d", len(data), c.maxObjectSize)
+		return fmt.Errorf("%w: data size %d exceeds limit %d", ErrObjectTooLarge, len(data), c.maxObjectSize)
 	}
 
 	path := c.GetPathForContentHash(contentHash)

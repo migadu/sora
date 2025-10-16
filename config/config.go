@@ -838,8 +838,6 @@ type IMAPProxyServerConfig struct {
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
 	EnableAffinity         bool                  `toml:"enable_affinity"`
-	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string                `toml:"affinity_validity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
 }
@@ -868,8 +866,6 @@ type POP3ProxyServerConfig struct {
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
 	EnableAffinity         bool                  `toml:"enable_affinity"`
-	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string                `toml:"affinity_validity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
 }
@@ -1277,8 +1273,6 @@ func NewDefaultConfig() Config {
 				RemoteUseProxyProtocol: true,
 				RemoteUseIDCommand:     false,
 				EnableAffinity:         true,
-				AffinityStickiness:     0.9,
-				AffinityValidity:       "24h",
 			},
 			POP3Proxy: POP3ProxyServerConfig{
 				Start:                  false,
@@ -1293,8 +1287,6 @@ func NewDefaultConfig() Config {
 				RemoteUseProxyProtocol: true,
 				RemoteUseXCLIENT:       false,
 				EnableAffinity:         true,
-				AffinityStickiness:     0.9,
-				AffinityValidity:       "24h",
 				AuthRateLimit:          DefaultAuthRateLimiterConfig(),
 			},
 			ManageSieveProxy: ManageSieveProxyServerConfig{
@@ -1310,8 +1302,6 @@ func NewDefaultConfig() Config {
 				RemoteUseProxyProtocol: true,
 				AuthRateLimit:          DefaultAuthRateLimiterConfig(),
 				EnableAffinity:         true,
-				AffinityStickiness:     0.9,
-				AffinityValidity:       "24h",
 			},
 			LMTPProxy: LMTPProxyServerConfig{
 				Start:                  false,
@@ -1325,8 +1315,6 @@ func NewDefaultConfig() Config {
 				RemoteUseProxyProtocol: true,
 				RemoteUseXCLIENT:       false,
 				EnableAffinity:         true,
-				AffinityStickiness:     0.9,
-				AffinityValidity:       "24h",
 			},
 			ConnectionTracking: ConnectionTrackingConfig{
 				Enabled:                 true,
@@ -1403,28 +1391,12 @@ func (c *POP3ProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(c.ConnectTimeout)
 }
 
-// GetAffinityValidity parses the affinity validity duration for POP3 proxy
-func (c *POP3ProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
-}
-
 // GetConnectTimeout parses the connect timeout duration for ManageSieve proxy
 func (c *ManageSieveProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	if c.ConnectTimeout == "" {
 		return 30 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.ConnectTimeout)
-}
-
-// GetAffinityValidity parses the affinity validity duration for ManageSieve proxy
-func (c *ManageSieveProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
 }
 
 // GetUpdateInterval parses the update interval duration for connection tracking
@@ -1457,22 +1429,6 @@ func (c *LMTPProxyServerConfig) GetMaxMessageSize() (int64, error) {
 		return 52428800, nil // Default: 50MiB
 	}
 	return helpers.ParseSize(c.MaxMessageSize)
-}
-
-// GetAffinityValidity parses the affinity validity duration for LMTP proxy
-func (c *LMTPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
-}
-
-// GetAffinityValidity parses the affinity validity duration for IMAP proxy
-func (c *IMAPProxyServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if c.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(c.AffinityValidity)
 }
 
 // GetSessionTimeout parses the session timeout duration for IMAP proxy
@@ -1601,13 +1557,6 @@ func (s *ServerConfig) GetSessionTimeout() (time.Duration, error) {
 		}
 	}
 	return helpers.ParseDuration(s.SessionTimeout)
-}
-
-func (s *ServerConfig) GetAffinityValidity() (time.Duration, error) {
-	if s.AffinityValidity == "" {
-		return 24 * time.Hour, nil
-	}
-	return helpers.ParseDuration(s.AffinityValidity)
 }
 
 func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
@@ -1778,15 +1727,6 @@ func (s *ServerConfig) GetSessionTimeoutWithDefault() time.Duration {
 		}
 	}
 	return timeout
-}
-
-func (s *ServerConfig) GetAffinityValidityWithDefault() time.Duration {
-	validity, err := s.GetAffinityValidity()
-	if err != nil {
-		log.Printf("WARNING: Failed to parse affinity validity for server '%s': %v, using default (24h)", s.Name, err)
-		return 24 * time.Hour
-	}
-	return validity
 }
 
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {

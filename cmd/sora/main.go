@@ -906,7 +906,6 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
@@ -961,8 +960,6 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		EnableAffinity:         serverConfig.EnableAffinity,
-		AffinityStickiness:     serverConfig.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
@@ -1007,7 +1004,6 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
@@ -1062,8 +1058,6 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		Debug:                  serverConfig.Debug,
 		EnableAffinity:         serverConfig.EnableAffinity,
-		AffinityStickiness:     serverConfig.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
@@ -1105,7 +1099,6 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
@@ -1163,8 +1156,6 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		AuthRateLimit:          authRateLimit,
 		PreLookup:              serverConfig.PreLookup,
 		EnableAffinity:         serverConfig.EnableAffinity,
-		AffinityStickiness:     serverConfig.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
@@ -1206,7 +1197,6 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	affinityValidity := serverConfig.GetAffinityValidityWithDefault()
 	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
@@ -1241,8 +1231,6 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		ConnectTimeout:         connectTimeout,
 		SessionTimeout:         sessionTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
-		AffinityStickiness:     serverConfig.AffinityStickiness,
-		AffinityValidity:       affinityValidity,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,

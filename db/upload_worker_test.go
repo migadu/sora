@@ -38,7 +38,6 @@ func setupUploadWorkerTest(t *testing.T) *Database {
 		"messages",
 		"mailboxes",
 		"credentials",
-		"server_affinity",
 		"accounts",
 	}
 

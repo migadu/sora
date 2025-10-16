@@ -249,6 +249,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			ClientAuth:               clientAuth,
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
+			NextProtos:               []string{"pop3"},
 		}
 
 		if options.TLSVerify {

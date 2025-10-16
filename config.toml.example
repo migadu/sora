@@ -297,6 +297,10 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 # Synchronize user-to-backend affinity (sticky sessions) across cluster nodes via gossip.
 # When enabled, users are consistently routed to the same backend server across all proxy nodes
 # for better cache locality and connection reuse. Affinity automatically updates when backends fail.
+#
+# NOTE: This is the ONLY affinity mechanism. Per-proxy affinity_validity and affinity_stickiness
+#       parameters have been removed. Affinity TTL is configured here globally.
+#
 # NOTE: Affinity is ONLY for non-prelookup users. Prelookup routes are always authoritative.
 [cluster.affinity]
 enabled = false                                 # Enable cluster-wide server affinity (default: false)
@@ -673,9 +677,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
 session_timeout = "30m"
-enable_affinity = true
-affinity_validity = "24h"
-affinity_stickiness = 0.9     # Probability (0.0-1.0) of sticking to the preferred server.
+enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
 # Multi-layered timeout protection against various DoS attacks:
@@ -873,9 +875,7 @@ remote_use_xclient = false            # Send XCLIENT command to backends for for
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
 session_timeout = "10m"
-enable_affinity = true
-affinity_validity = "24h"
-affinity_stickiness = 0.9
+enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
 command_timeout = "5m"
@@ -916,9 +916,7 @@ remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
 session_timeout = "15m"
-enable_affinity = true
-affinity_validity = "24h"
-affinity_stickiness = 0.9
+enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
 command_timeout = "5m"
@@ -967,9 +965,7 @@ remote_use_xclient = false            # Send XCLIENT command to backends for for
 connect_timeout = "30s"
 session_timeout = "5m"
 max_message_size = "50mb"
-enable_affinity = true
-affinity_validity = "24h"
-affinity_stickiness = 0.9
+enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)

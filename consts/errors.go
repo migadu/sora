@@ -13,7 +13,6 @@ var (
 	ErrMalformedMessage     = errors.New("malformed message")
 	ErrMessageNotAvailable  = errors.New("message not available")
 	ErrEmptyMessageID       = errors.New("empty message ID")
-	ErrNoServerAffinity     = errors.New("no server affinity found")
 
 	ErrDBNotFound                = errors.New("not found")
 	ErrDBUniqueViolation         = errors.New("unique violation")

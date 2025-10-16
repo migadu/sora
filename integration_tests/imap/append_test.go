@@ -200,4 +200,105 @@ func TestIMAP_AppendOperation(t *testing.T) {
 		}
 		t.Logf("Fetched message with correct Unicode subject: %s", msgs[0].Envelope.Subject)
 	})
+
+	t.Run("Draft Replacement - Same Message-ID", func(t *testing.T) {
+		// This test verifies the fix for the Thunderbird draft replacement issue.
+		// When a client saves a draft multiple times with the same Message-ID,
+		// the server should delete the old draft and replace it with the new one,
+		// maintaining the correct message count.
+
+		// Select Drafts folder
+		mbox, err := c.Select("Drafts", nil).Wait()
+		if err != nil {
+			t.Fatalf("Select Drafts failed: %v", err)
+		}
+		initialMessages := mbox.NumMessages
+		t.Logf("Drafts folder initially has %d messages", initialMessages)
+
+		// Append first draft with a specific Message-ID
+		messageID := "<test-draft-123@example.com>"
+		draft1 := "Message-ID: " + messageID + "\r\n" +
+			"Subject: Draft Version 1\r\n" +
+			"\r\n" +
+			"This is the first version of the draft."
+
+		appendCmd1 := c.Append("Drafts", int64(len(draft1)), &imap.AppendOptions{
+			Flags: []imap.Flag{imap.FlagDraft},
+		})
+		if _, err := appendCmd1.Write([]byte(draft1)); err != nil {
+			t.Fatalf("First APPEND write failed: %v", err)
+		}
+		if err := appendCmd1.Close(); err != nil {
+			t.Fatalf("First APPEND close failed: %v", err)
+		}
+		appendData1, err := appendCmd1.Wait()
+		if err != nil {
+			t.Fatalf("First APPEND command failed: %v", err)
+		}
+		t.Logf("First draft appended with UID=%d", appendData1.UID)
+
+		// Verify message count increased by 1
+		mbox, err = c.Select("Drafts", nil).Wait()
+		if err != nil {
+			t.Fatalf("Reselect Drafts failed: %v", err)
+		}
+		if mbox.NumMessages != initialMessages+1 {
+			t.Errorf("After first append: expected %d messages, got %d", initialMessages+1, mbox.NumMessages)
+		}
+		t.Logf("After first append: Drafts has %d messages", mbox.NumMessages)
+
+		// Append second draft with the SAME Message-ID (simulating Thunderbird draft save)
+		draft2 := "Message-ID: " + messageID + "\r\n" +
+			"Subject: Draft Version 2\r\n" +
+			"\r\n" +
+			"This is the UPDATED version of the draft."
+
+		appendCmd2 := c.Append("Drafts", int64(len(draft2)), &imap.AppendOptions{
+			Flags: []imap.Flag{imap.FlagDraft},
+		})
+		if _, err := appendCmd2.Write([]byte(draft2)); err != nil {
+			t.Fatalf("Second APPEND write failed: %v", err)
+		}
+		if err := appendCmd2.Close(); err != nil {
+			t.Fatalf("Second APPEND close failed: %v", err)
+		}
+		appendData2, err := appendCmd2.Wait()
+		if err != nil {
+			t.Fatalf("Second APPEND command failed: %v", err)
+		}
+		t.Logf("Second draft appended with UID=%d (replacing UID=%d)", appendData2.UID, appendData1.UID)
+
+		// CRITICAL: Verify message count stayed the same (old draft replaced, not added)
+		mbox, err = c.Select("Drafts", nil).Wait()
+		if err != nil {
+			t.Fatalf("Reselect Drafts after replacement failed: %v", err)
+		}
+		expectedCount := initialMessages + 1 // Should still be +1, not +2
+		if mbox.NumMessages != expectedCount {
+			t.Errorf("After draft replacement: expected %d messages (same as after first append), got %d", expectedCount, mbox.NumMessages)
+		}
+		t.Logf("After second append: Drafts CORRECTLY has %d messages (old draft was replaced)", mbox.NumMessages)
+
+		// Verify the old draft is gone and new draft exists
+		fetchCmd := c.Fetch(imap.SeqSetNum(mbox.NumMessages), &imap.FetchOptions{
+			Envelope: true,
+			UID:      true,
+		})
+		msgs, err := fetchCmd.Collect()
+		if err != nil {
+			t.Fatalf("FETCH failed: %v", err)
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("Expected 1 message, got %d", len(msgs))
+		}
+
+		// Verify we got the NEW draft (subject should be "Draft Version 2")
+		if msgs[0].Envelope.Subject != "Draft Version 2" {
+			t.Errorf("Expected subject 'Draft Version 2', got '%s'", msgs[0].Envelope.Subject)
+		}
+		if msgs[0].UID != appendData2.UID {
+			t.Errorf("Expected UID %d, got %d", appendData2.UID, msgs[0].UID)
+		}
+		t.Logf("Verified: New draft (UID=%d, subject='%s') exists, old draft was replaced", msgs[0].UID, msgs[0].Envelope.Subject)
+	})
 }

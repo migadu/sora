@@ -516,6 +516,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			ClientAuth:               tls.NoClientCert,
 			ServerName:               hostname,
 			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
+			NextProtos:               []string{"imap"},
 		}
 
 		// This setting on the server listener is intended to control client certificate
@@ -877,7 +878,12 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				// Store in cache
 				err = s.cache.Put(contentHash, data)
 				if err != nil {
-					log.Printf("IMAP [%s] warmup: failed to cache content %s: %v", s.name, contentHash, err)
+					if errors.Is(err, cache.ErrObjectTooLarge) {
+						log.Printf("IMAP [%s] warmup: skipping %s, object too large for cache (%d bytes)", s.name, contentHash, len(data))
+						skippedCount++
+					} else {
+						log.Printf("IMAP [%s] warmup: failed to cache content %s: %v", s.name, contentHash, err)
+					}
 					continue
 				}
 

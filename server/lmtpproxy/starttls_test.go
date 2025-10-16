@@ -149,8 +149,8 @@ func TestLMTPProxyServerStartTLSConfiguration(t *testing.T) {
 				RemotePort:           24,
 				TLS:                  tt.tlsEnabled,
 				TLSUseStartTLS:       tt.tlsUseStartTLS,
-				TLSCertFile:          "/nonexistent/cert.pem", // Won't be loaded in this test
-				TLSKeyFile:           "/nonexistent/key.pem",
+				TLSCertFile:          "../../testdata/sora.crt",
+				TLSKeyFile:           "../../testdata/sora.key",
 				TLSVerify:            false,
 				RemoteTLS:            tt.remoteTLSEnabled,
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
@@ -305,6 +305,8 @@ func TestLMTPProxyTLSModeMatrix(t *testing.T) {
 			opts.Addr = ":124"
 			opts.RemoteAddrs = []string{"backend.example.com:24"}
 			opts.RemotePort = 24
+			opts.TLSCertFile = "../../testdata/sora.crt"
+			opts.TLSKeyFile = "../../testdata/sora.key"
 			opts.ConnectTimeout = 10 * time.Second
 			opts.SessionTimeout = 5 * time.Minute
 			opts.MaxMessageSize = 52428800 // 50MB

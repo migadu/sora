@@ -486,46 +486,6 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 	return err
 }
 
-// GetLastServerAddressWithRetry retrieves the last server address a user connected to, with retry logic.
-func (rd *ResilientDatabase) GetLastServerAddressWithRetry(ctx context.Context, accountID int64) (string, time.Time, error) {
-	config := retry.BackoffConfig{
-		InitialInterval: 250 * time.Millisecond,
-		MaxInterval:     2 * time.Second,
-		Multiplier:      1.5,
-		Jitter:          true,
-		MaxRetries:      3,
-	}
-
-	op := func(ctx context.Context) (interface{}, error) {
-		addr, t, err := rd.getOperationalDatabaseForOperation(false).GetLastServerAddress(ctx, accountID)
-		if err != nil {
-			return nil, err
-		}
-		return []interface{}{addr, t}, nil
-	}
-
-	result, err := rd.executeReadWithRetry(ctx, config, timeoutRead, op, consts.ErrNoServerAffinity)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-
-	resSlice := result.([]interface{})
-	return resSlice[0].(string), resSlice[1].(time.Time), nil
-}
-
-// UpdateLastServerAddressWithRetry updates the last server address a user connected to, with retry logic.
-func (rd *ResilientDatabase) UpdateLastServerAddressWithRetry(ctx context.Context, accountID int64, serverAddr string) error {
-	config := writeRetryConfig
-	config.MaxRetries = 3 // Can be slightly more aggressive for this simple update.
-
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).UpdateLastServerAddress(ctx, tx, accountID, serverAddr)
-	}
-
-	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
-	return err
-}
-
 func (rd *ResilientDatabase) Close() {
 	if rd.failoverManager == nil {
 		// This case is for when it's initialized without runtime failover.

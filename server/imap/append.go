@@ -219,7 +219,10 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Update session state if this message was appended to the currently selected mailbox
 	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailbox.ID {
 		// Query the actual message count from the database instead of incrementing,
-		// because the append operation may have deleted a conflicting draft (net change = 0)
+		// because the append operation may have deleted a conflicting draft (net change = 0).
+		// This fixes the Thunderbird draft replacement issue where clients repeatedly save
+		// drafts with the same Message-ID, causing the old draft to be deleted.
+		// See test: TestIMAP_AppendOperation/Draft_Replacement_-_Same_Message-ID
 		actualCount, _, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(s.ctx, mailbox.ID)
 		if err != nil {
 			s.Log("[APPEND] Failed to get message count after append: %v", err)

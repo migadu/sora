@@ -38,8 +38,6 @@ type Server struct {
 	tlsVerify              bool
 	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	enableAffinity         bool
-	affinityValidity       time.Duration
-	affinityStickiness     float64
 	sessionTimeout         time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
@@ -126,8 +124,6 @@ type ServerOptions struct {
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration
 	MinBytesPerMinute      int64         // Minimum throughput
 	EnableAffinity         bool
-	AffinityValidity       time.Duration
-	AffinityStickiness     float64
 	AuthRateLimit          server.AuthRateLimiterConfig
 	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
@@ -194,13 +190,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		log.Printf("[IMAP Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
 	}
 
-	// Validate affinity stickiness
-	stickiness := opts.AffinityStickiness
-	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid IMAP proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
-		stickiness = 1.0
-	}
-
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
 
@@ -230,8 +219,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		tlsVerify:              opts.TLSVerify,
 		tlsConfig:              opts.TLSConfig,
 		enableAffinity:         opts.EnableAffinity,
-		affinityValidity:       opts.AffinityValidity,
-		affinityStickiness:     stickiness,
 		sessionTimeout:         opts.SessionTimeout,
 		commandTimeout:         opts.CommandTimeout,
 		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
@@ -274,6 +261,7 @@ func (s *Server) Start() error {
 			ClientAuth:               clientAuth,
 			ServerName:               s.hostname,
 			PreferServerCipherSuites: true,
+			NextProtos:               []string{"imap"},
 		}
 
 		if s.tlsVerify {

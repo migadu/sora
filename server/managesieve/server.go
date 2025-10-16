@@ -163,6 +163,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			ClientAuth:               tls.NoClientCert,
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
+			NextProtos:               []string{"sieve"},
 		}
 
 		if !options.TLSVerify {

@@ -54,13 +54,10 @@ func testHealthyBackendAffinity(t *testing.T) {
 		Ctx:                context.Background(),
 		Username:           "user@example.com",
 		Protocol:           "imap",
-		AccountID:          123,
 		IsPrelookupAccount: false,
 		RoutingInfo:        nil,
 		ConnManager:        connMgr,
 		EnableAffinity:     true,
-		AffinityValidity:   1 * time.Hour,
-		AffinityStickiness: 1.0,
 		ProxyName:          "Test Proxy",
 	})
 
@@ -122,13 +119,10 @@ func testUnhealthyBackendFailover(t *testing.T) {
 		Ctx:                context.Background(),
 		Username:           "user@example.com",
 		Protocol:           "imap",
-		AccountID:          123,
 		IsPrelookupAccount: false,
 		RoutingInfo:        nil,
 		ConnManager:        connMgr,
 		EnableAffinity:     true,
-		AffinityValidity:   1 * time.Hour,
-		AffinityStickiness: 1.0,
 		ProxyName:          "Test Proxy",
 	})
 

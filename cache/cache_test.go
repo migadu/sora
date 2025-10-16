@@ -181,7 +181,8 @@ func TestPut_ObjectTooLarge(t *testing.T) {
 
 	err := c.Put(hash, data)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds object limit")
+	assert.ErrorIs(t, err, ErrObjectTooLarge)
+	assert.Contains(t, err.Error(), "exceeds limit")
 }
 
 func TestConcurrentPut(t *testing.T) {

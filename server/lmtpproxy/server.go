@@ -217,6 +217,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			ClientAuth:               clientAuth,
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
+			NextProtos:               []string{"lmtp"},
 		}
 		log.Printf("LMTP proxy [%s] using per-server TLS certificate", opts.Name)
 	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {

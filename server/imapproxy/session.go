@@ -404,14 +404,11 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                s.ctx,
 		Username:           s.username,
-		AccountID:          s.accountID,
+		Protocol:           "imap",
 		IsPrelookupAccount: s.isPrelookupAccount,
 		RoutingInfo:        s.routingInfo,
 		ConnManager:        s.server.connManager,
-		RDB:                s.server.rdb,
 		EnableAffinity:     s.server.enableAffinity,
-		AffinityValidity:   s.server.affinityValidity,
-		AffinityStickiness: s.server.affinityStickiness,
 		ProxyName:          "IMAP Proxy",
 	})
 	if err != nil {
@@ -461,13 +458,14 @@ func (s *Session) connectToBackend() error {
 
 	// Record successful connection for future affinity if enabled
 	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
-		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer updateCancel()
-		if err := s.server.rdb.UpdateLastServerAddressWithRetry(updateCtx, s.accountID, actualAddr); err != nil {
-			log.Printf("IMAP Proxy [%s] Failed to update server affinity for %s: %v", s.server.name, s.username, err)
-		} else {
-			log.Printf("IMAP Proxy [%s] Updated server affinity for %s to %s", s.server.name, s.username, actualAddr)
-		}
+		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
+			Username:           s.username,
+			Protocol:           "imap",
+			IsPrelookupAccount: s.isPrelookupAccount,
+			ConnManager:        s.server.connManager,
+			EnableAffinity:     s.server.enableAffinity,
+			ProxyName:          "IMAP Proxy",
+		}, actualAddr, routeResult.RoutingMethod == "affinity")
 	}
 
 	// Set a deadline for reading the greeting to prevent hanging

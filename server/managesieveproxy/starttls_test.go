@@ -141,8 +141,8 @@ func TestManageSieveProxyServerStartTLSConfiguration(t *testing.T) {
 				RemotePort:           4190,
 				TLS:                  tt.tlsEnabled,
 				TLSUseStartTLS:       tt.tlsUseStartTLS,
-				TLSCertFile:          "/nonexistent/cert.pem", // Won't be loaded in this test
-				TLSKeyFile:           "/nonexistent/key.pem",
+				TLSCertFile:          "../../testdata/sora.crt",
+				TLSKeyFile:           "../../testdata/sora.key",
 				TLSVerify:            false,
 				RemoteTLS:            tt.remoteTLSEnabled,
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
@@ -308,6 +308,8 @@ func TestManageSieveProxyTLSModeMatrix(t *testing.T) {
 			opts.MasterSASLUsername = "proxyuser"
 			opts.MasterSASLPassword = "proxypass"
 			opts.AuthRateLimit = server.AuthRateLimiterConfig{Enabled: false}
+			opts.TLSCertFile = "../../testdata/sora.crt"
+			opts.TLSKeyFile = "../../testdata/sora.key"
 
 			srv, err := New(ctx, nil, "test.example.com", opts)
 			if err != nil {

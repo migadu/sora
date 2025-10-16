@@ -3,18 +3,14 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 // AffinityManager defines the interface for cluster-wide affinity management
@@ -758,14 +754,10 @@ type RouteParams struct {
 	Ctx                context.Context
 	Username           string
 	Protocol           string // "imap", "pop3", "managesieve", "lmtp"
-	AccountID          int64
 	IsPrelookupAccount bool
 	RoutingInfo        *UserRoutingInfo
 	ConnManager        *ConnectionManager
-	RDB                *resilient.ResilientDatabase // For affinity lookup (legacy database-based affinity)
 	EnableAffinity     bool
-	AffinityValidity   time.Duration
-	AffinityStickiness float64
 	ProxyName          string // "IMAP Proxy", "POP3 Proxy", etc. for logging
 }
 
@@ -804,12 +796,11 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		result.IsPrelookupRoute = true
 	}
 
-	// 2. If no routing info from prelookup, try affinity
+	// 2. If no routing info from prelookup, try cluster-wide affinity
 	if result.PreferredAddr == "" && params.EnableAffinity && !params.IsPrelookupAccount {
-		// Try cluster-wide affinity first (if available)
 		affinityMgr := params.ConnManager.GetAffinityManager()
 		if affinityMgr != nil && params.Protocol != "" {
-			// Use gossip-based affinity manager
+			// Use gossip-based cluster affinity
 			if lastAddr, found := affinityMgr.GetBackend(params.Username, params.Protocol); found {
 				// Check if backend is healthy
 				if params.ConnManager.IsBackendHealthy(lastAddr) {
@@ -822,30 +813,6 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 					affinityMgr.DeleteBackend(params.Username, params.Protocol)
 				}
 			}
-		} else if params.RDB != nil && params.AccountID > 0 {
-			// Fall back to legacy database-based affinity
-			affinityCtx, affinityCancel := context.WithTimeout(params.Ctx, 2*time.Second)
-			lastAddr, lastTime, affinityErr := params.RDB.GetLastServerAddressWithRetry(affinityCtx, params.AccountID)
-			affinityCancel()
-
-			if affinityErr != nil {
-				if !errors.Is(affinityErr, consts.ErrNoServerAffinity) {
-					log.Printf("[%s] Could not get preferred backend for %s: %v", params.ProxyName, params.Username, affinityErr)
-				}
-			} else if lastAddr != "" && time.Since(lastTime) < params.AffinityValidity {
-				result.PreferredAddr = lastAddr
-				result.RoutingMethod = "affinity"
-				log.Printf("[%s] Using database affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
-			}
-		}
-	}
-
-	// 3. Apply stickiness to affinity address ONLY. Prelookup routes are absolute.
-	if result.PreferredAddr != "" && !result.IsPrelookupRoute && params.AffinityStickiness < 1.0 {
-		if rand.Float64() > params.AffinityStickiness {
-			log.Printf("[%s] Ignoring affinity for %s due to stickiness factor (%.2f), falling back to round-robin", params.ProxyName, params.Username, params.AffinityStickiness)
-			result.PreferredAddr = "" // This will cause the connection manager to use round-robin
-			result.RoutingMethod = "roundrobin"
 		}
 	}
 
