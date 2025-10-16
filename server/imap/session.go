@@ -102,7 +102,7 @@ func (s *IMAPSession) applyCapabilityFilters() {
 	}
 
 	// Debug logging to track fingerprint (use log.Printf to avoid dependency on session fields)
-	log.Printf("[JA4-DEBUG] applyCapabilityFilters called on session %p - ja4Fingerprint=%q, clientID=%v", s, s.ja4Fingerprint, s.clientID != nil)
+	s.Log("[JA4-DEBUG] applyCapabilityFilters called on session %p - ja4Fingerprint=%q, clientID=%v", s, s.ja4Fingerprint, s.clientID != nil)
 
 	// Apply capability filtering based on client identification and/or TLS fingerprint
 	disabledCaps := s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID, s.ja4Fingerprint)
