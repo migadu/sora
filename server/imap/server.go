@@ -628,9 +628,10 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		// during connection acceptance.
 		if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 			session.ja4Fingerprint = fingerprint
-			log.Printf("[JA4] Captured fingerprint during handshake: %s", session.ja4Fingerprint)
+			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s on session object %p (Id will be set later)", session.ja4Fingerprint, session)
 			// Apply filters to sessionCaps BEFORE greeting is sent
 			session.applyCapabilityFilters()
+			log.Printf("[JA4-DEBUG] After applyCapabilityFilters, ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 		} else {
 			// Fingerprint not yet available - store ja4Conn for lazy capture
 			// This should be rare since handshake typically completes during accept
