@@ -613,25 +613,28 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 
 	if ja4Conn != nil {
-		// ja4Conn embeds *tls.Conn, so we can call Handshake() directly
-		// Check if it has the Handshake method
+		// Try to perform TLS handshake explicitly if the method is available
+		// (Some connection types may have already completed the handshake)
 		if handshaker, ok := ja4Conn.(interface{ Handshake() error }); ok {
 			if err := handshaker.Handshake(); err != nil {
 				log.Printf("IMAP [%s] TLS handshake failed: %v", s.name, err)
 			} else {
-				log.Printf("IMAP [%s] TLS handshake completed, checking for JA4...", s.name)
-				// Now the JA4 should be available
-				if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
-					session.ja4Fingerprint = fingerprint
-					log.Printf("IMAP [%s] JA4 fingerprint captured: %q", s.name, session.ja4Fingerprint)
-					// Apply filters to sessionCaps
-					session.applyCapabilityFilters()
-				} else {
-					log.Printf("IMAP [%s] JA4 fingerprint still not available after handshake: err=%v", s.name, err)
-				}
+				log.Printf("IMAP [%s] TLS handshake completed via explicit call", s.name)
 			}
+		}
+
+		// Always try to capture the fingerprint immediately, regardless of whether
+		// we called Handshake() explicitly. The handshake may have already completed
+		// during connection acceptance.
+		if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
+			session.ja4Fingerprint = fingerprint
+			log.Printf("[JA4] Captured fingerprint during handshake: %s", session.ja4Fingerprint)
+			// Apply filters to sessionCaps BEFORE greeting is sent
+			session.applyCapabilityFilters()
 		} else {
-			// Store ja4Conn for later
+			// Fingerprint not yet available - store ja4Conn for lazy capture
+			// This should be rare since handshake typically completes during accept
+			log.Printf("IMAP [%s] JA4 fingerprint not yet available, will capture on first capability request: err=%v", s.name, err)
 			session.ja4Conn = ja4Conn
 		}
 	}

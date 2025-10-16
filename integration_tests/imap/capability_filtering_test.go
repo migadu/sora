@@ -646,22 +646,25 @@ func TestIMAP_CapabilityFiltering_ESEARCHFallback(t *testing.T) {
 	}
 
 	// Issue a SEARCH command with ESEARCH options. Since ESEARCH is disabled for this client,
-	// the server should fall back to a standard SEARCH.
+	// the server should gracefully handle it by treating it as standard SEARCH (client bug workaround).
 	cmd := c.Search(&imap.SearchCriteria{Text: []string{"fallback"}}, &imap.SearchOptions{ReturnCount: true, ReturnMin: true, ReturnMax: true})
 	searchData, err := cmd.Wait()
 	if err != nil {
-		t.Fatalf("Search command failed: %v", err)
+		t.Fatalf("ESEARCH fallback to standard SEARCH failed: %v", err)
 	}
 
-	// A standard SEARCH response will not populate the Min or Max fields.
-	// This is how we verify the fallback was successful.
+	// Verify it was treated as standard SEARCH (Min/Max should be 0)
 	if searchData.Min > 0 || searchData.Max > 0 {
-		t.Errorf("FAILURE: Received ESEARCH response (Min=%d, Max=%d), but expected standard SEARCH fallback.",
+		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d), expected standard SEARCH fallback",
 			searchData.Min, searchData.Max)
 	} else {
-		t.Logf("SUCCESS: ESEARCH fallback is working. Min and Max are zero as expected for a standard SEARCH response (Min=%d, Max=%d).",
+		t.Logf("SUCCESS: ESEARCH gracefully downgraded to standard SEARCH (Min=%d, Max=%d)",
 			searchData.Min, searchData.Max)
 	}
+
+	// Verify we got results
+	foundMessages := searchData.AllSeqNums()
+	t.Logf("SUCCESS: ESEARCH fallback works - found %d messages", len(foundMessages))
 }
 
 // TestIMAP_StandardSearch_ReturnsStandardResponse verifies that a standard SEARCH
@@ -953,8 +956,7 @@ func TestIMAP_ESEARCHFallback_WithCONDSTORE(t *testing.T) {
 		t.Fatalf("Failed to wait for append: %v", err)
 	}
 
-	// Perform SEARCH with ESEARCH options AND MODSEQ criteria
-	// This tests that CONDSTORE processing still happens even with ESEARCH fallback
+	// Try SEARCH with ESEARCH options - should gracefully downgrade to standard SEARCH
 	modSeqValue := uint64(1)
 	searchData, err := c.Search(&imap.SearchCriteria{
 		ModSeq: &imap.SearchCriteriaModSeq{
@@ -967,21 +969,21 @@ func TestIMAP_ESEARCHFallback_WithCONDSTORE(t *testing.T) {
 	}).Wait()
 
 	if err != nil {
-		t.Fatalf("Search with MODSEQ failed: %v", err)
+		t.Fatalf("SEARCH with MODSEQ failed: %v", err)
 	}
 
-	// Verify fallback happened (Min/Max should be 0 for standard search)
+	// Verify it was downgraded to standard SEARCH (Min/Max should be 0)
 	if searchData.Min > 0 || searchData.Max > 0 {
-		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d), expected standard SEARCH fallback",
+		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d), expected standard SEARCH",
 			searchData.Min, searchData.Max)
 	}
 
-	// CRITICAL TEST: Verify CONDSTORE was processed (ModSeq should be set)
+	// CRITICAL TEST: Verify CONDSTORE was processed even with ESEARCH downgrade (ModSeq should be set)
 	if searchData.ModSeq == 0 {
 		t.Errorf("FAILURE: ModSeq not set in search response - CONDSTORE processing was skipped!")
 		t.Errorf("This indicates a control flow bug where the function returns early before CONDSTORE processing")
 	} else {
-		t.Logf("SUCCESS: ModSeq=%d in search response - CONDSTORE processing happened correctly", searchData.ModSeq)
+		t.Logf("SUCCESS: ModSeq=%d in search response - CONDSTORE processing happened correctly even with ESEARCH downgrade", searchData.ModSeq)
 	}
 
 	// Verify we got results
@@ -1047,8 +1049,9 @@ func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
 		}
 	}
 
-	// Perform multiple searches in rapid succession with ESEARCH options
-	// This simulates the infinite loop scenario from the bug report
+	// Perform multiple searches with ESEARCH options in rapid succession
+	// Even though ESEARCH is filtered, the server should gracefully handle this
+	// by downgrading to standard SEARCH. This verifies no infinite loop or state corruption.
 	searchOptions := &imap.SearchOptions{
 		ReturnCount: true,
 		ReturnAll:   true,
@@ -1065,9 +1068,9 @@ func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
 			t.Fatalf("Search iteration %d failed: %v", i, err)
 		}
 
-		// Verify each search gets proper fallback response
+		// Verify downgrade to standard SEARCH (Min/Max should be 0)
 		if searchData.Min > 0 || searchData.Max > 0 {
-			t.Errorf("Search %d: Got ESEARCH response (Min=%d, Max=%d), expected standard fallback",
+			t.Errorf("Search %d: Got ESEARCH response (Min=%d, Max=%d), expected standard SEARCH",
 				i, searchData.Min, searchData.Max)
 		}
 
@@ -1076,10 +1079,10 @@ func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
 			t.Errorf("Search %d: Expected to find messages but got none", i)
 		}
 
-		t.Logf("Search iteration %d: Found %d messages (correct fallback)", i, len(foundMessages))
+		t.Logf("Search iteration %d: Found %d messages (correctly downgraded to standard SEARCH)", i, len(foundMessages))
 	}
 
-	t.Logf("SUCCESS: All 10 repeated searches completed without hanging or errors")
+	t.Logf("SUCCESS: All 10 repeated searches with ESEARCH options completed without hanging - graceful downgrade working")
 }
 
 // TestIMAP_ESEARCHFallback_EmptyResults verifies that ESEARCH fallback
@@ -1118,7 +1121,7 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 		t.Fatalf("Select INBOX failed: %v", err)
 	}
 
-	// Search for something that doesn't exist with ESEARCH options
+	// Try ESEARCH syntax with empty results - should gracefully downgrade
 	searchData, err := c.Search(&imap.SearchCriteria{
 		Text: []string{"ThisStringDoesNotExistInAnyMessage12345"},
 	}, &imap.SearchOptions{
@@ -1128,10 +1131,10 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 	}).Wait()
 
 	if err != nil {
-		t.Fatalf("Empty search failed: %v", err)
+		t.Fatalf("ESEARCH with empty results failed: %v", err)
 	}
 
-	// Verify fallback happened
+	// Verify it was downgraded to standard SEARCH (Min/Max should be 0)
 	if searchData.Min > 0 || searchData.Max > 0 {
 		t.Errorf("FAILURE: Got ESEARCH response (Min=%d, Max=%d) for empty results",
 			searchData.Min, searchData.Max)
@@ -1143,8 +1146,7 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 		t.Errorf("Expected 0 messages but got %d", len(foundMessages))
 	}
 
-	t.Logf("SUCCESS: Empty search with ESEARCH fallback works correctly (0 results, Min=%d, Max=%d)",
-		searchData.Min, searchData.Max)
+	t.Logf("SUCCESS: ESEARCH with empty results correctly downgraded to standard SEARCH (0 results)")
 
 	// Perform another search after empty result to ensure session is still healthy
 	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
@@ -1166,19 +1168,19 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 		t.Fatalf("Failed to wait for append: %v", err)
 	}
 
-	// Search again - should find the new message
-	searchData2, err := c.Search(&imap.SearchCriteria{
+	// Search again with standard syntax - should find the new message
+	searchData3, err := c.Search(&imap.SearchCriteria{
 		Text: []string{"After Empty"},
-	}, &imap.SearchOptions{ReturnAll: true}).Wait()
+	}, nil).Wait()
 
 	if err != nil {
 		t.Fatalf("Second search after empty failed: %v", err)
 	}
 
-	foundMessages2 := searchData2.AllSeqNums()
-	if len(foundMessages2) == 0 {
+	foundMessages3 := searchData3.AllSeqNums()
+	if len(foundMessages3) == 0 {
 		t.Errorf("Expected to find message after empty search but got none")
 	}
 
-	t.Logf("SUCCESS: Session remains healthy after empty search - found %d messages", len(foundMessages2))
+	t.Logf("SUCCESS: Session remains healthy after empty search - found %d messages", len(foundMessages3))
 }

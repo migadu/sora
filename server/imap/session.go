@@ -66,10 +66,12 @@ func (s *IMAPSession) Context() context.Context {
 func (s *IMAPSession) GetCapabilities() imap.CapSet {
 
 	// If we have a pending JA4 connection, try to capture fingerprint now
+	// This is a fallback path for when fingerprint wasn't available during NewSession
 	if s.ja4Conn != nil && s.ja4Fingerprint == "" {
 		if fingerprint, err := s.ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 			s.ja4Fingerprint = fingerprint
 			s.ja4Conn = nil
+			s.Log("[JA4] Captured fingerprint during lazy evaluation: %s", s.ja4Fingerprint)
 
 			// Re-initialize capabilities from server defaults
 			s.sessionCaps = make(imap.CapSet)

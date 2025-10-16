@@ -89,9 +89,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	searchData := &imap.SearchData{}
 
 	if options != nil {
-		// Check if session has ESEARCH capability - if not, ignore ESEARCH options
+		// Check if session has ESEARCH capability - if not, log warning and ignore RETURN options
+		// Some clients (like iOS Mail) may use RETURN syntax even when we don't advertise ESEARCH.
+		// We handle this gracefully by treating it as a standard SEARCH.
 		if !s.GetCapabilities().Has(imap.CapESearch) {
-			s.Log("[SEARCH] ESEARCH options ignored due to capability filtering, falling back to standard search")
+			s.Log("[SEARCH] WARNING: Client using ESEARCH RETURN syntax despite capability being filtered")
+			s.Log("[SEARCH] Ignoring RETURN options and treating as standard SEARCH (client bug workaround)")
+			// Set options to nil to trigger standard SEARCH handling below
+			options = nil
 		} else {
 			s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 				options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
@@ -181,21 +186,15 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					searchData.All = imap.SeqSet{}
 				}
 			}
-		} else { // ESEARCH capability is filtered out, fall back to standard search behavior
-			s.Log("[SEARCH] Using standard search fallback due to capability filtering.")
-			// Fall through to standard search response logic
 		}
 	}
 
-	// Standard SEARCH response logic (for both explicit standard SEARCH and ESEARCH fallback).
+	// Standard SEARCH response logic (when options == nil, i.e., no RETURN clause).
 	// To generate a standard `* SEARCH` response, we only populate the `All` field.
 	// The go-imap/v2 library will correctly generate an untagged `* SEARCH` response.
 	// If we populated `Count`, it would incorrectly generate an `* ESEARCH` response.
-	if options == nil || (options != nil && !s.GetCapabilities().Has(imap.CapESearch)) {
-		// This is either a standard SEARCH or ESEARCH with capability filtered
-		if options == nil {
-			s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
-		}
+	if options == nil {
+		s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
 
 		if len(messages) > 0 {
 			var uids imap.UIDSet
