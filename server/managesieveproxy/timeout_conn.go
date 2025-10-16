@@ -185,6 +185,11 @@ func (c *timeoutConn) Close() error {
 	return c.Conn.Close()
 }
 
+// Unwrap returns the underlying connection for connection unwrapping
+func (c *timeoutConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
 // timeoutListener wraps a net.Listener to apply timeout to accepted connections
 type timeoutListener struct {
 	net.Listener

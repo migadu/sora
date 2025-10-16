@@ -400,3 +400,8 @@ type proxyProtocolConn struct {
 func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
 }
+
+// Unwrap returns the underlying connection for connection unwrapping
+func (c *proxyProtocolConn) Unwrap() net.Conn {
+	return c.Conn
+}

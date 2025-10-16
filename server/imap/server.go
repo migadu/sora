@@ -168,6 +168,11 @@ func (c *connectionLimitingConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
 }
 
+// Unwrap returns the underlying connection for connection unwrapping
+func (c *connectionLimitingConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
 func (c *connectionLimitingConn) Close() error {
 	if c.releaseFunc != nil {
 		c.releaseFunc()
@@ -613,6 +618,8 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 
 	if ja4Conn != nil {
+		log.Printf("[JA4-DEBUG] ja4Conn found, type=%T, attempting to retrieve fingerprint", ja4Conn)
+
 		// Try to perform TLS handshake explicitly if the method is available
 		// (Some connection types may have already completed the handshake)
 		if handshaker, ok := ja4Conn.(interface{ Handshake() error }); ok {
@@ -626,18 +633,23 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		// Always try to capture the fingerprint immediately, regardless of whether
 		// we called Handshake() explicitly. The handshake may have already completed
 		// during connection acceptance.
-		if fingerprint, err := ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
+		fingerprint, err := ja4Conn.GetJA4Fingerprint()
+		log.Printf("[JA4-DEBUG] GetJA4Fingerprint returned: fingerprint=%q, err=%v", fingerprint, err)
+
+		if err == nil && fingerprint != "" {
 			session.ja4Fingerprint = fingerprint
-			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s on session object %p (Id will be set later)", session.ja4Fingerprint, session)
+			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 			// Apply filters to sessionCaps BEFORE greeting is sent
 			session.applyCapabilityFilters()
 			log.Printf("[JA4-DEBUG] After applyCapabilityFilters, ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 		} else {
 			// Fingerprint not yet available - store ja4Conn for lazy capture
 			// This should be rare since handshake typically completes during accept
-			log.Printf("IMAP [%s] JA4 fingerprint not yet available, will capture on first capability request: err=%v", s.name, err)
+			log.Printf("[JA4-DEBUG] Fingerprint not ready (fp=%q, err=%v), storing ja4Conn for lazy capture", fingerprint, err)
 			session.ja4Conn = ja4Conn
 		}
+	} else {
+		log.Printf("[JA4-DEBUG] ja4Conn is nil - no JA4 fingerprint capture available")
 	}
 
 	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -792,6 +804,11 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
+}
+
+// Unwrap returns the underlying connection for connection unwrapping
+func (c *proxyProtocolConn) Unwrap() net.Conn {
+	return c.Conn
 }
 
 // WarmupCache pre-fetches recent messages for a user to improve performance when they reconnect
