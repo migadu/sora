@@ -173,6 +173,16 @@ func (c *timeoutConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// ResetThroughputCounter resets the throughput measurement counters.
+// This should be called when entering IMAP IDLE or other states where
+// minimal traffic is expected and legitimate.
+func (c *timeoutConn) ResetThroughputCounter() {
+	c.mu.Lock()
+	c.lastThroughputCheck = time.Now()
+	c.bytesTransferred = 0
+	c.mu.Unlock()
+}
+
 // Close stops the idle checker and closes the connection
 func (c *timeoutConn) Close() error {
 	c.mu.Lock()

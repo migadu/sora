@@ -15,6 +15,14 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()
 
+	// Reset throughput counter when entering IDLE to avoid false positives
+	// for slowloris detection. IDLE is expected to have minimal traffic.
+	if netConn := s.conn.NetConn(); netConn != nil {
+		if tc, ok := netConn.(*timeoutConn); ok {
+			tc.ResetThroughputCounter()
+		}
+	}
+
 	for {
 		if stop, err := s.idleLoop(w, done); err != nil {
 			return err
