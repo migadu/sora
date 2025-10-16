@@ -596,6 +596,13 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		proxyInfo = limitingConn.GetProxyInfo()
 	}
 
+	// Check for JA4 fingerprint from PROXY v2 TLV (highest priority)
+	var proxyJA4Fingerprint string
+	if proxyInfo != nil && proxyInfo.JA4Fingerprint != "" {
+		proxyJA4Fingerprint = proxyInfo.JA4Fingerprint
+		log.Printf("IMAP [%s] Received JA4 fingerprint from PROXY v2 TLV: %s", s.name, proxyJA4Fingerprint)
+	}
+
 	// Extract JA4 fingerprint if this is a JA4-enabled TLS connection
 	// Need to unwrap connection layers to get to the underlying JA4 connection
 	var ja4Conn interface{ GetJA4Fingerprint() (string, error) }
@@ -617,7 +624,15 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		}
 	}
 
-	if ja4Conn != nil {
+	// Priority order for JA4 fingerprint: PROXY v2 TLV > Direct connection unwrapping > ID command
+	if proxyJA4Fingerprint != "" {
+		// Use JA4 from PROXY v2 TLV (highest priority)
+		session.ja4Fingerprint = proxyJA4Fingerprint
+		log.Printf("[JA4-DEBUG] Using JA4 from PROXY v2 TLV: %s on session object %p", session.ja4Fingerprint, session)
+		// Apply filters to sessionCaps BEFORE greeting is sent
+		session.applyCapabilityFilters()
+		log.Printf("[JA4-DEBUG] After applyCapabilityFilters (PROXY TLV), ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
+	} else if ja4Conn != nil {
 		log.Printf("[JA4-DEBUG] ja4Conn found, type=%T, attempting to retrieve fingerprint", ja4Conn)
 
 		// Try to perform TLS handshake explicitly if the method is available
@@ -638,10 +653,10 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 		if err == nil && fingerprint != "" {
 			session.ja4Fingerprint = fingerprint
-			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
+			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s (direct) on session object %p", session.ja4Fingerprint, session)
 			// Apply filters to sessionCaps BEFORE greeting is sent
 			session.applyCapabilityFilters()
-			log.Printf("[JA4-DEBUG] After applyCapabilityFilters, ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
+			log.Printf("[JA4-DEBUG] After applyCapabilityFilters (direct), ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 		} else {
 			// Fingerprint not yet available - store ja4Conn for lazy capture
 			// This should be rare since handshake typically completes during accept
@@ -649,7 +664,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 			session.ja4Conn = ja4Conn
 		}
 	} else {
-		log.Printf("[JA4-DEBUG] ja4Conn is nil - no JA4 fingerprint capture available")
+		log.Printf("[JA4-DEBUG] No JA4 fingerprint available from PROXY TLV or direct connection - may be available via ID command")
 	}
 
 	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)

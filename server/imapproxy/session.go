@@ -428,6 +428,18 @@ func (s *Session) connectToBackend() error {
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer connectCancel()
 
+	// Ensure routing info has client connection for JA4 fingerprint extraction
+	if s.routingInfo == nil {
+		// Create minimal routing info with client connection for JA4 extraction
+		// Copy server's settings to avoid overriding them with zero values later
+		s.routingInfo = &proxy.UserRoutingInfo{
+			ClientConn:         s.clientConn,
+			RemoteUseIDCommand: s.server.remoteUseIDCommand,
+		}
+	} else {
+		s.routingInfo.ClientConn = s.clientConn
+	}
+
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(

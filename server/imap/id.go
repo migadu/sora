@@ -138,9 +138,23 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 		}
 	}
 
-	s.Log("[ID] Processed forwarding parameters: client=%s:%d, proxy=%s, session=%s, ttl=%d",
+	// Extract JA4 fingerprint if forwarded from proxy
+	// This allows capability filtering to work even when client connects through a proxy
+	// Only use ID command fingerprint if we don't already have one from PROXY v2 TLV (higher priority)
+	if ja4Fingerprint, ok := forwardingParams.Variables["ja4-fingerprint"]; ok && ja4Fingerprint != "" {
+		if s.ja4Fingerprint == "" {
+			s.ja4Fingerprint = ja4Fingerprint
+			s.Log("[ID] Received JA4 fingerprint from proxy ID command: %s", ja4Fingerprint)
+			// Apply capability filters based on the forwarded fingerprint
+			s.applyCapabilityFilters()
+		} else {
+			s.Log("[ID] Ignoring JA4 from ID command (already have %s from PROXY TLV)", s.ja4Fingerprint)
+		}
+	}
+
+	s.Log("[ID] Processed forwarding parameters: client=%s:%d, proxy=%s, session=%s, ttl=%d, ja4=%s",
 		forwardingParams.OriginatingIP, forwardingParams.OriginatingPort, s.ProxyIP,
-		forwardingParams.SessionID, forwardingParams.ProxyTTL)
+		forwardingParams.SessionID, forwardingParams.ProxyTTL, s.ja4Fingerprint)
 }
 
 // addForwardingToIMAPID adds forwarding parameters to IMAP ID response

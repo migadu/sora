@@ -526,7 +526,20 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	if useProxyProtocol && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
 		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d",
 			clientIP, clientPort, serverIP, serverPort)
-		err = cm.writeProxyV2Header(conn, clientIP, clientPort, serverIP, serverPort)
+
+		// Extract JA4 fingerprint from routingInfo.ClientConn if available
+		var ja4Fingerprint string
+		if routingInfo != nil && routingInfo.ClientConn != nil {
+			if ja4Conn, ok := routingInfo.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
+				fingerprint, err := ja4Conn.GetJA4Fingerprint()
+				if err == nil && fingerprint != "" {
+					ja4Fingerprint = fingerprint
+					log.Printf("[ConnectionManager] Extracted JA4 fingerprint for PROXY v2 TLV: %s", fingerprint)
+				}
+			}
+		}
+
+		err = cm.writeProxyV2HeaderWithTLVs(conn, clientIP, clientPort, serverIP, serverPort, ja4Fingerprint)
 		if err != nil {
 			conn.Close()
 			log.Printf("[ConnectionManager] Failed to send PROXY protocol header to %s: %v", addr, err)
@@ -578,8 +591,17 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	return conn, nil
 }
 
-// writeProxyV2Header writes a PROXY protocol v2 header manually to avoid circular imports
-func (cm *ConnectionManager) writeProxyV2Header(conn net.Conn, clientIP string, clientPort int, serverIP string, serverPort int) error {
+// writeProxyV2HeaderWithTLVs writes a PROXY protocol v2 header with optional TLV extensions
+func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP string, clientPort int, serverIP string, serverPort int, ja4Fingerprint string) error {
+	// Build TLVs map if we have a JA4 fingerprint
+	var tlvs map[byte][]byte
+	if ja4Fingerprint != "" {
+		tlvs = map[byte][]byte{
+			0xE0: []byte(ja4Fingerprint), // TLVTypeJA4Fingerprint
+		}
+		log.Printf("[PROXY] Including JA4 fingerprint in PROXY v2 TLV: %s", ja4Fingerprint)
+	}
+
 	// PROXY v2 signature
 	header := make([]byte, 16)
 	copy(header[0:12], []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A})
@@ -631,16 +653,30 @@ func (cm *ConnectionManager) writeProxyV2Header(conn net.Conn, clientIP string, 
 		addressData[35] = byte(serverPort & 0xFF)
 	}
 
+	// Encode TLVs if present
+	var tlvData []byte
+	if len(tlvs) > 0 {
+		for tlvType, tlvValue := range tlvs {
+			tlvLen := len(tlvValue)
+			// TLV format: Type (1 byte) + Length (2 bytes, big endian) + Value
+			tlvData = append(tlvData, tlvType)
+			tlvData = append(tlvData, byte(tlvLen>>8))
+			tlvData = append(tlvData, byte(tlvLen&0xFF))
+			tlvData = append(tlvData, tlvValue...)
+		}
+	}
+
 	// Address family and protocol (byte 13)
 	header[13] = (addressFamily << 4) | transportProtocol
 
-	// Length (bytes 14-15, big endian)
-	dataLen := len(addressData)
+	// Length (bytes 14-15, big endian) - includes address data + TLV data
+	dataLen := len(addressData) + len(tlvData)
 	header[14] = byte(dataLen >> 8)
 	header[15] = byte(dataLen & 0xFF)
 
-	// Combine header and address data
+	// Combine header, address data, and TLV data
 	proxyHeader := append(header, addressData...)
+	proxyHeader = append(proxyHeader, tlvData...)
 
 	// Send the header
 	_, err := conn.Write(proxyHeader)
@@ -648,8 +684,13 @@ func (cm *ConnectionManager) writeProxyV2Header(conn net.Conn, clientIP string, 
 		return fmt.Errorf("failed to write PROXY v2 header: %w", err)
 	}
 
-	log.Printf("[PROXY] Sent PROXY v2 header to backend %s: client=%s:%d -> server=%s:%d",
-		conn.RemoteAddr(), clientIP, clientPort, serverIP, serverPort)
+	if ja4Fingerprint != "" {
+		log.Printf("[PROXY] Sent PROXY v2 header with JA4 TLV to backend %s: client=%s:%d -> server=%s:%d, ja4=%s",
+			conn.RemoteAddr(), clientIP, clientPort, serverIP, serverPort, ja4Fingerprint)
+	} else {
+		log.Printf("[PROXY] Sent PROXY v2 header to backend %s: client=%s:%d -> server=%s:%d",
+			conn.RemoteAddr(), clientIP, clientPort, serverIP, serverPort)
+	}
 
 	return nil
 }

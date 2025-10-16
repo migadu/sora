@@ -22,14 +22,21 @@ type ProxyProtocolConfig = config.ProxyProtocolConfig
 
 // ProxyProtocolInfo contains information extracted from PROXY protocol header
 type ProxyProtocolInfo struct {
-	Version  int    // 1 or 2
-	Command  string // PROXY or TCP4/TCP6
-	SrcIP    string // Real client IP
-	DstIP    string // Destination IP
-	SrcPort  int    // Real client port
-	DstPort  int    // Destination port
-	Protocol string // TCP4, TCP6, UDP4, UDP6
+	Version        int             // 1 or 2
+	Command        string          // PROXY or TCP4/TCP6
+	SrcIP          string          // Real client IP
+	DstIP          string          // Destination IP
+	SrcPort        int             // Real client port
+	DstPort        int             // Destination port
+	Protocol       string          // TCP4, TCP6, UDP4, UDP6
+	TLVs           map[byte][]byte // PROXY v2 TLV extensions (type -> value)
+	JA4Fingerprint string          // JA4 TLS fingerprint (extracted from TLV 0xE0)
 }
+
+const (
+	// Custom TLV types (0xE0-0xFF range is for private use per PROXY v2 spec)
+	TLVTypeJA4Fingerprint byte = 0xE0 // JA4 TLS fingerprint
+)
 
 // ProxyProtocolReader handles PROXY protocol parsing
 type ProxyProtocolReader struct {
@@ -389,15 +396,23 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			protocolStr = "UDP4"
 		}
 
-		// Skip any remaining data
+		// Parse TLVs from remaining data
 		remaining := length - 12
-		if remaining > 0 {
-			skipData := make([]byte, remaining)
-			_, err := reader.Read(skipData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to skip remaining data: %w", err)
-			}
+		tlvs, err := parseTLVs(reader, remaining)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse TLVs: %w", err)
 		}
+		return &ProxyProtocolInfo{
+			Version:        2,
+			Command:        "PROXY",
+			SrcIP:          srcIP,
+			DstIP:          dstIP,
+			SrcPort:        srcPort,
+			DstPort:        dstPort,
+			Protocol:       protocolStr,
+			TLVs:           tlvs,
+			JA4Fingerprint: extractJA4FromTLVs(tlvs),
+		}, nil
 
 	case 0x2: // AF_INET6 (IPv6)
 		if length < 36 {
@@ -424,15 +439,23 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			protocolStr = "UDP6"
 		}
 
-		// Skip any remaining data
+		// Parse TLVs from remaining data
 		remaining := length - 36
-		if remaining > 0 {
-			skipData := make([]byte, remaining)
-			_, err := reader.Read(skipData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to skip remaining data: %w", err)
-			}
+		tlvs, err := parseTLVs(reader, remaining)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse TLVs: %w", err)
 		}
+		return &ProxyProtocolInfo{
+			Version:        2,
+			Command:        "PROXY",
+			SrcIP:          srcIP,
+			DstIP:          dstIP,
+			SrcPort:        srcPort,
+			DstPort:        dstPort,
+			Protocol:       protocolStr,
+			TLVs:           tlvs,
+			JA4Fingerprint: extractJA4FromTLVs(tlvs),
+		}, nil
 
 	case 0x0: // AF_UNSPEC (UNKNOWN)
 		// Skip the data
@@ -452,16 +475,56 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	default:
 		return nil, fmt.Errorf("unsupported address family: %d", addressFamily)
 	}
+}
 
-	return &ProxyProtocolInfo{
-		Version:  2,
-		Command:  "PROXY",
-		SrcIP:    srcIP,
-		DstIP:    dstIP,
-		SrcPort:  srcPort,
-		DstPort:  dstPort,
-		Protocol: protocolStr,
-	}, nil
+// parseTLVs parses PROXY v2 TLV (Type-Length-Value) extensions
+func parseTLVs(reader *bufio.Reader, dataLen int) (map[byte][]byte, error) {
+	tlvs := make(map[byte][]byte)
+
+	if dataLen <= 0 {
+		return tlvs, nil
+	}
+
+	tlvData := make([]byte, dataLen)
+	n, err := reader.Read(tlvData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read TLV data: %w", err)
+	}
+	if n != dataLen {
+		return nil, fmt.Errorf("incomplete TLV data: expected %d bytes, got %d", dataLen, n)
+	}
+
+	// Parse TLVs
+	offset := 0
+	for offset < dataLen {
+		if offset+3 > dataLen {
+			// Not enough data for TLV header (type + 2-byte length)
+			break
+		}
+
+		tlvType := tlvData[offset]
+		tlvLen := (int(tlvData[offset+1]) << 8) | int(tlvData[offset+2])
+		offset += 3
+
+		if offset+tlvLen > dataLen {
+			return nil, fmt.Errorf("TLV length exceeds available data: type=0x%02x, len=%d, available=%d", tlvType, tlvLen, dataLen-offset)
+		}
+
+		tlvValue := make([]byte, tlvLen)
+		copy(tlvValue, tlvData[offset:offset+tlvLen])
+		tlvs[tlvType] = tlvValue
+		offset += tlvLen
+	}
+
+	return tlvs, nil
+}
+
+// extractJA4FromTLVs extracts the JA4 fingerprint from TLVs
+func extractJA4FromTLVs(tlvs map[byte][]byte) string {
+	if ja4Bytes, ok := tlvs[TLVTypeJA4Fingerprint]; ok {
+		return string(ja4Bytes)
+	}
+	return ""
 }
 
 // isTrustedConnection checks if connection is from trusted proxy
@@ -561,8 +624,8 @@ func GetConnectionIPs(conn net.Conn, proxyInfo *ProxyProtocolInfo) (clientIP, pr
 	return directIP, ""
 }
 
-// GenerateProxyV2Header generates a PROXY protocol v2 header
-func GenerateProxyV2Header(clientIP string, clientPort int, serverIP string, serverPort int, protocol string) ([]byte, error) {
+// GenerateProxyV2HeaderWithTLVs generates a PROXY protocol v2 header with optional TLV extensions
+func GenerateProxyV2HeaderWithTLVs(clientIP string, clientPort int, serverIP string, serverPort int, protocol string, tlvs map[byte][]byte) ([]byte, error) {
 	// PROXY v2 signature
 	header := make([]byte, 16)
 	copy(header[0:12], []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A})
@@ -617,18 +680,45 @@ func GenerateProxyV2Header(clientIP string, clientPort int, serverIP string, ser
 	// Address family and protocol (byte 13)
 	header[13] = (addressFamily << 4) | transportProtocol
 
-	// Length (bytes 14-15, big endian)
-	dataLen := len(addressData)
-	header[14] = byte(dataLen >> 8)
-	header[15] = byte(dataLen & 0xFF)
+	// Encode TLVs if provided
+	var tlvData []byte
+	if len(tlvs) > 0 {
+		for tlvType, tlvValue := range tlvs {
+			tlvLen := len(tlvValue)
+			// TLV format: 1 byte type + 2 bytes length (big endian) + value
+			tlvHeader := []byte{
+				tlvType,
+				byte(tlvLen >> 8),
+				byte(tlvLen & 0xFF),
+			}
+			tlvData = append(tlvData, tlvHeader...)
+			tlvData = append(tlvData, tlvValue...)
+		}
+	}
 
-	// Combine header and address data
+	// Total length = address data + TLV data
+	totalLen := len(addressData) + len(tlvData)
+	header[14] = byte(totalLen >> 8)
+	header[15] = byte(totalLen & 0xFF)
+
+	// Combine header + address data + TLV data
 	result := append(header, addressData...)
+	result = append(result, tlvData...)
 
-	log.Printf("[PROXY] Generated PROXY v2 header: client=%s:%d -> server=%s:%d (family=%d, len=%d)",
-		clientIP, clientPort, serverIP, serverPort, addressFamily, dataLen)
+	if len(tlvData) > 0 {
+		log.Printf("[PROXY] Generated PROXY v2 header with TLVs: client=%s:%d -> server=%s:%d (family=%d, addr_len=%d, tlv_len=%d)",
+			clientIP, clientPort, serverIP, serverPort, addressFamily, len(addressData), len(tlvData))
+	} else {
+		log.Printf("[PROXY] Generated PROXY v2 header: client=%s:%d -> server=%s:%d (family=%d, len=%d)",
+			clientIP, clientPort, serverIP, serverPort, addressFamily, len(addressData))
+	}
 
 	return result, nil
+}
+
+// GenerateProxyV2Header generates a PROXY protocol v2 header without TLVs (backward compatibility)
+func GenerateProxyV2Header(clientIP string, clientPort int, serverIP string, serverPort int, protocol string) ([]byte, error) {
+	return GenerateProxyV2HeaderWithTLVs(clientIP, clientPort, serverIP, serverPort, protocol, nil)
 }
 
 // WriteProxyV2Header writes a PROXY protocol v2 header to a connection

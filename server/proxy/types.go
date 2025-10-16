@@ -25,16 +25,17 @@ type UserRoutingLookup interface {
 
 // UserRoutingInfo contains backend routing information for a user
 type UserRoutingInfo struct {
-	ServerAddress          string // Backend server to connect to
-	AccountID              int64  // Account ID for tracking/metrics
-	IsPrelookupAccount     bool   // Whether this came from prelookup
-	ActualEmail            string // Actual email address for backend impersonation
-	RemoteTLS              bool   // Use TLS for backend connection
-	RemoteTLSUseStartTLS   bool   // Use STARTTLS (LMTP/ManageSieve only)
-	RemoteTLSVerify        bool   // Verify backend TLS certificate
-	RemoteUseProxyProtocol bool   // Use PROXY protocol for backend connection
-	RemoteUseIDCommand     bool   // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool   // Use XCLIENT command (POP3/LMTP)
+	ServerAddress          string   // Backend server to connect to
+	AccountID              int64    // Account ID for tracking/metrics
+	IsPrelookupAccount     bool     // Whether this came from prelookup
+	ActualEmail            string   // Actual email address for backend impersonation
+	RemoteTLS              bool     // Use TLS for backend connection
+	RemoteTLSUseStartTLS   bool     // Use STARTTLS (LMTP/ManageSieve only)
+	RemoteTLSVerify        bool     // Verify backend TLS certificate
+	RemoteUseProxyProtocol bool     // Use PROXY protocol for backend connection
+	RemoteUseIDCommand     bool     // Use IMAP ID command (IMAP only)
+	RemoteUseXCLIENT       bool     // Use XCLIENT command (POP3/LMTP)
+	ClientConn             net.Conn // Client connection (for extracting JA4 fingerprint)
 }
 
 // normalizeHostPort normalizes a host:port address, adding a default port if missing
