@@ -188,8 +188,6 @@ func setupIMAPProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		ConnectTimeout:         10 * time.Second,
 		SessionTimeout:         30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},
@@ -243,8 +241,6 @@ func setupIMAPProxyWithIDCommand(t *testing.T, rdb *resilient.ResilientDatabase,
 		ConnectTimeout:         10 * time.Second,
 		SessionTimeout:         30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},

@@ -326,8 +326,6 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 		ConnectTimeout:         10 * time.Second,
 		SessionTimeout:         30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		PreLookup:              prelookupConfig,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
