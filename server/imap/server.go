@@ -88,6 +88,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -278,6 +279,8 @@ type IMAPServer struct {
 	warmupMailboxes    []string
 	warmupAsync        bool
 	warmupTimeout      time.Duration
+	warmupInterval     time.Duration // Minimum time between warmups for same user
+	lastWarmupTimes    sync.Map      // map[int64]time.Time - tracks last warmup time per user
 
 	// Client capability filtering
 	capFilters []ClientCapabilityFilter
@@ -314,6 +317,7 @@ type IMAPServerOptions struct {
 	WarmupMailboxes    []string
 	WarmupAsync        bool
 	WarmupTimeout      string
+	WarmupInterval     string // Minimum time between warmups for same user (e.g., "1h", "30m")
 	FTSRetention       time.Duration
 	// Client capability filtering
 	CapabilityFilters []config.ClientCapabilityFilter
@@ -381,6 +385,16 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		}
 	}
 
+	// Parse warmup interval with default fallback
+	warmupInterval := 24 * time.Hour // Default: only warmup once per day per user
+	if options.WarmupInterval != "" {
+		if parsed, err := helpers.ParseDuration(options.WarmupInterval); err != nil {
+			log.Printf("IMAP [%s] WARNING: invalid warmup_interval '%s': %v. Using default of %v", name, options.WarmupInterval, err, warmupInterval)
+		} else {
+			warmupInterval = parsed
+		}
+	}
+
 	s := &IMAPServer{
 		hostname:                     hostname,
 		name:                         name,
@@ -406,6 +420,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		warmupMailboxes:              options.WarmupMailboxes,
 		warmupAsync:                  options.WarmupAsync,
 		warmupTimeout:                warmupTimeout,
+		warmupInterval:               warmupInterval,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:     struct{}{},
 			imap.CapLiteralPlus:   struct{}{},
@@ -876,13 +891,29 @@ func (c *proxyProtocolConn) Unwrap() net.Conn {
 
 // WarmupCache pre-fetches recent messages for a user to improve performance when they reconnect
 // This method fetches message content from S3 and stores it in the local cache
+// It only runs if enough time has passed since the last warmup for this user (controlled by warmupInterval)
 func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames []string, messageCount int, async bool) error {
 	if messageCount <= 0 || len(mailboxNames) == 0 || s.cache == nil {
 		return nil
 	}
 
-	log.Printf("IMAP [%s] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v)",
-		s.name, userID, messageCount, mailboxNames, async, s.warmupTimeout)
+	// Check if enough time has passed since last warmup for this user
+	now := time.Now()
+	if lastWarmupRaw, ok := s.lastWarmupTimes.Load(userID); ok {
+		lastWarmup := lastWarmupRaw.(time.Time)
+		timeSinceLastWarmup := now.Sub(lastWarmup)
+		if timeSinceLastWarmup < s.warmupInterval {
+			log.Printf("IMAP [%s] skipping cache warmup for user %d: last warmup was %v ago (minimum interval: %v)",
+				s.name, userID, timeSinceLastWarmup.Round(time.Second), s.warmupInterval)
+			return nil
+		}
+	}
+
+	// Update last warmup time immediately to prevent concurrent warmups
+	s.lastWarmupTimes.Store(userID, now)
+
+	log.Printf("IMAP [%s] starting cache warmup for user %d: %d messages from mailboxes %v (async=%t, timeout=%v, interval=%v)",
+		s.name, userID, messageCount, mailboxNames, async, s.warmupTimeout, s.warmupInterval)
 
 	warmupFunc := func() {
 		// Add timeout to prevent runaway warmup operations

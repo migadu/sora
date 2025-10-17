@@ -374,6 +374,7 @@ warmup_message_count = 50     # Number of recent messages to preload per mailbox
 warmup_mailboxes = ["INBOX"]  # Mailboxes to warm up. Most clients check INBOX first. e.g., ["INBOX", "Sent"].
 warmup_async = true           # true: warmup happens in background (fast login). false: blocks login.
 warmup_timeout = "5m"         # Maximum time allowed for a cache warmup operation.
+warmup_interval = "24h"       # Minimum time between warmups for the same user. Prevents warmup on every connection.
 
 
 # S3 UPLOADER CONFIGURATION

@@ -357,6 +357,7 @@ type LocalCacheConfig struct {
 	WarmupMailboxes    []string `toml:"warmup_mailboxes"`
 	WarmupAsync        bool     `toml:"warmup_async"`
 	WarmupTimeout      string   `toml:"warmup_timeout"`
+	WarmupInterval     string   `toml:"warmup_interval"`
 }
 
 // GetCapacity parses the cache capacity size
