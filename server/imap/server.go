@@ -317,6 +317,8 @@ type IMAPServerOptions struct {
 	FTSRetention       time.Duration
 	// Client capability filtering
 	CapabilityFilters []config.ClientCapabilityFilter
+	// Global capability disabling
+	DisabledCaps []string
 	// Version information
 	Version string
 	// Metadata limits (RFC 5464)
@@ -480,6 +482,19 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Store the valid filters
 	s.capFilters = validFilters
+
+	// Remove globally disabled capabilities from the server
+	if len(options.DisabledCaps) > 0 {
+		for _, capStr := range options.DisabledCaps {
+			cap := imap.Cap(capStr)
+			if _, exists := s.caps[cap]; exists {
+				delete(s.caps, cap)
+				log.Printf("IMAP [%s] Disabled capability: %s (global server setting)", name, capStr)
+			} else {
+				log.Printf("IMAP [%s] WARNING: Cannot disable capability %s - not found in default capabilities", name, capStr)
+			}
+		}
+	}
 
 	// Create connection limiter with trusted networks from server configuration
 	// For IMAP backend:

@@ -676,6 +676,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
 			FTSRetention:                 ftsRetention,
 			CapabilityFilters:            serverConfig.ClientFilters,
+			DisabledCaps:                 serverConfig.DisabledCaps,
 			Version:                      version,
 			MetadataMaxEntrySize:         deps.config.Metadata.MaxEntrySize,
 			MetadataMaxEntriesPerMailbox: deps.config.Metadata.MaxEntriesPerMailbox,

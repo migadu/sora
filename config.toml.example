@@ -488,6 +488,26 @@ tls_verify = false                        # Verify client certificates (mutual T
 proxy_protocol = false            # Enable PROXY protocol support (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
+# --- GLOBAL CAPABILITY CONFIGURATION ---
+# Disable specific IMAP capabilities for ALL clients connecting to this server.
+# Disabled capabilities are not announced in CAPABILITY responses and cannot be used.
+#
+# This is different from client_filters which apply based on client identity.
+# Use this when you want to disable capabilities for ALL clients on this server.
+#
+# Common capabilities that can be disabled:
+# - ESEARCH: Extended search (RFC 4731)
+# - CONDSTORE: Conditional STORE (RFC 7162)
+# - IDLE: Push notifications (RFC 2177)
+# - MOVE: Efficient message moving (RFC 6851)
+# - COMPRESS: DEFLATE compression (RFC 4978)
+# - SORT/ESORT: Server-side sorting
+#
+# disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
+#
+# NOTE: Do not disable core capabilities like IMAP4rev1, STARTTLS, or AUTH=PLAIN
+# as this will break basic IMAP functionality.
+
 # --- CLIENT CAPABILITY FILTERS ---
 # Disable specific IMAP capabilities for problematic clients based on their ID or TLS fingerprint
 # This helps work around client bugs while maintaining full functionality for well-behaved clients
