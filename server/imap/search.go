@@ -88,7 +88,11 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	searchData := &imap.SearchData{}
 
-	if options != nil {
+	// Check if this is actually an ESEARCH command (has RETURN options)
+	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set
+	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
+
+	if isESEARCH {
 		// Check if session has ESEARCH capability - if not, log warning and ignore RETURN options
 		// Some clients (like iOS Mail) may use RETURN syntax even when we don't advertise ESEARCH.
 		// We handle this gracefully by treating it as a standard SEARCH.
@@ -97,12 +101,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			s.Log("[SEARCH] Ignoring RETURN options and treating as standard SEARCH (client bug workaround)")
 			// Set options to nil to trigger standard SEARCH handling below
 			options = nil
+			isESEARCH = false
 		} else {
 			s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 				options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 		}
 
-		if s.GetCapabilities().Has(imap.CapESearch) && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount) {
+		// At this point, isESEARCH is true and capability is verified
+		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			// Set count for ESEARCH responses
 			searchData.Count = uint32(len(messages))
 			if len(messages) > 0 {
@@ -151,7 +157,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
 			// The go-imap library will include Count in ESEARCH responses when it's set
 
-		} else if s.GetCapabilities().Has(imap.CapESearch) {
+		} else {
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
@@ -189,11 +195,11 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
-	// Standard SEARCH response logic (when options == nil, i.e., no RETURN clause).
+	// Standard SEARCH response logic (when not using ESEARCH, i.e., no RETURN clause).
 	// To generate a standard `* SEARCH` response, we only populate the `All` field.
 	// The go-imap/v2 library will correctly generate an untagged `* SEARCH` response.
 	// If we populated `Count`, it would incorrectly generate an `* ESEARCH` response.
-	if options == nil {
+	if !isESEARCH {
 		s.Log("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
 
 		if len(messages) > 0 {
