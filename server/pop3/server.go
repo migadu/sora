@@ -187,24 +187,48 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 func (s *POP3Server) Start(errChan chan error) {
 	var listener net.Listener
-	var err error
+
+	// Configure SoraConn with timeout protection
+	connConfig := serverPkg.SoraConnConfig{
+		Protocol:             "pop3",
+		IdleTimeout:          s.commandTimeout,
+		AbsoluteTimeout:      s.absoluteSessionTimeout,
+		MinBytesPerMinute:    s.minBytesPerMinute,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+	}
 
 	if s.tlsConfig != nil {
-		listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			s.cancel()
-			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
+			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
 			return
 		}
-		log.Printf("POP3 [%s] listening with TLS on %s", s.name, s.addr)
+
+		// Use SoraTLSListener for TLS with timeout protection
+		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("POP3 [%s] listening with TLS on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("POP3 [%s] listening with TLS on %s", s.name, s.addr)
+		}
 	} else {
-		listener, err = net.Listen("tcp", s.addr)
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("POP3 [%s] listening on %s", s.name, s.addr)
+
+		// Use SoraListener for non-TLS with timeout protection
+		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("POP3 [%s] listening on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("POP3 [%s] listening on %s", s.name, s.addr)
+		}
 	}
 	defer listener.Close()
 
@@ -214,19 +238,6 @@ func (s *POP3Server) Start(errChan chan error) {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
-	}
-
-	// Wrap listener with timeout enforcement if configured
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		listener = &timeoutListener{
-			Listener:          listener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "pop3",
-		}
-		log.Printf("POP3 [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation

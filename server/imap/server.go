@@ -704,6 +704,15 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	var listener net.Listener
 	var err error
 
+	// Configure SoraConn
+	connConfig := serverPkg.SoraConnConfig{
+		Protocol:             "imap",
+		IdleTimeout:          s.commandTimeout,
+		AbsoluteTimeout:      s.absoluteSessionTimeout,
+		MinBytesPerMinute:    s.minBytesPerMinute,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+	}
+
 	if s.tlsConfig != nil {
 		// Create base TCP listener
 		tcpListener, err := net.Listen("tcp", imapAddr)
@@ -711,15 +720,29 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 			return fmt.Errorf("failed to create TCP listener: %w", err)
 		}
 
-		// Wrap with JA4 TLS listener for fingerprinting
-		listener = serverPkg.NewJA4TLSListener(tcpListener, s.tlsConfig)
-		log.Printf("IMAP [%s] listening with TLS (JA4 fingerprinting enabled) on %s", s.name, imapAddr)
+		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
+		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("IMAP [%s] listening with TLS on %s (JA4 enabled, timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, imapAddr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("IMAP [%s] listening with TLS on %s (JA4 enabled)", s.name, imapAddr)
+		}
 	} else {
-		listener, err = net.Listen("tcp", imapAddr)
+		// Create base TCP listener
+		tcpListener, err := net.Listen("tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("IMAP [%s] listening on %s", s.name, imapAddr)
+
+		// Use SoraListener for non-TLS with timeout protection
+		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("IMAP [%s] listening on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, imapAddr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("IMAP [%s] listening on %s", s.name, imapAddr)
+		}
 	}
 	defer listener.Close()
 	defer func() {
@@ -741,21 +764,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		name:     s.name,
 	}
 
-	// Wrap listener with command timeout enforcement if configured
-	var finalListener net.Listener = limitedListener
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		finalListener = &timeoutListener{
-			Listener:          limitedListener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "imap",
-		}
-		log.Printf("IMAP [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
-	}
-
-	err = s.server.Serve(finalListener)
+	err = s.server.Serve(limitedListener)
 
 	// Check if this was a graceful shutdown
 	if s.appCtx.Err() != nil {

@@ -235,14 +235,18 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 // Start starts the LMTP proxy server.
 func (s *Server) Start() error {
-	var err error
-
 	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
 	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
 		if s.tlsVerify {
 			log.Printf("Client TLS certificate verification is REQUIRED for LMTP proxy [%s] (tls_verify=true)", s.name)
 		} else {
 			log.Printf("Client TLS certificate verification is DISABLED for LMTP proxy [%s] (tls_verify=false)", s.name)
+		}
+
+		// Configure SoraConn (LMTP proxy doesn't have timeout protection currently)
+		connConfig := server.SoraConnConfig{
+			Protocol:             "lmtp_proxy",
+			EnableTimeoutChecker: false,
 		}
 
 		s.listenerMu.Lock()
@@ -252,17 +256,26 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		// Wrap with JA4 capture for TLS fingerprinting
-		s.listener = server.NewJA4TLSListener(tcpListener, s.tlsConfig)
+		// Use SoraTLSListener for TLS with JA4 capture
+		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
 		log.Printf("LMTP proxy [%s] listening with implicit TLS on %s (JA4 enabled)", s.name, s.addr)
 	} else {
+		// Configure SoraConn (LMTP proxy doesn't have timeout protection currently)
+		connConfig := server.SoraConnConfig{
+			Protocol:             "lmtp_proxy",
+			EnableTimeoutChecker: false,
+		}
+
 		s.listenerMu.Lock()
-		s.listener, err = net.Listen("tcp", s.addr)
-		s.listenerMu.Unlock()
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
+		// Use SoraListener for non-TLS
+		s.listener = server.NewSoraListener(tcpListener, connConfig)
+		s.listenerMu.Unlock()
 		if s.tlsUseStartTLS {
 			log.Printf("LMTP proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
 		} else {

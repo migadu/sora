@@ -236,8 +236,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 // Start starts the IMAP proxy server.
 func (s *Server) Start() error {
-	var err error
-
 	// Three TLS scenarios:
 	// 1. Per-server TLS: cert files provided
 	// 2. Global TLS: tls=true, no cert files, global TLS config provided
@@ -277,10 +275,17 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		// Wrap with JA4 capture for TLS fingerprinting
-		s.listener = server.NewJA4TLSListener(tcpListener, tlsConfig)
+		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
+		connConfig := server.SoraConnConfig{
+			Protocol:             "imap_proxy",
+			IdleTimeout:          s.commandTimeout,
+			AbsoluteTimeout:      s.absoluteSessionTimeout,
+			MinBytesPerMinute:    s.minBytesPerMinute,
+			EnableTimeoutChecker: true,
+		}
+		s.listener = server.NewSoraTLSListener(tcpListener, tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate, JA4 enabled)", s.name, s.addr)
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate, SoraConn enabled)", s.name, s.addr)
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.listenerMu.Lock()
@@ -290,10 +295,17 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		// Wrap with JA4 capture for TLS fingerprinting
-		s.listener = server.NewJA4TLSListener(tcpListener, s.tlsConfig)
+		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
+		connConfig := server.SoraConnConfig{
+			Protocol:             "imap_proxy",
+			IdleTimeout:          s.commandTimeout,
+			AbsoluteTimeout:      s.absoluteSessionTimeout,
+			MinBytesPerMinute:    s.minBytesPerMinute,
+			EnableTimeoutChecker: true,
+		}
+		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager, JA4 enabled)", s.name, s.addr)
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager, SoraConn enabled)", s.name, s.addr)
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
 		s.cancel()
@@ -301,27 +313,22 @@ func (s *Server) Start() error {
 	} else {
 		// Scenario 3: No TLS
 		s.listenerMu.Lock()
-		s.listener, err = net.Listen("tcp", s.addr)
-		s.listenerMu.Unlock()
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		log.Printf("IMAP proxy [%s] listening on %s", s.name, s.addr)
-	}
-
-	// Wrap listener with timeout protection
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		s.listenerMu.Lock()
-		s.listener = &timeoutListener{
-			Listener:          s.listener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "imap_proxy",
+		// Wrap with SoraListener for timeout protection (no TLS/JA4)
+		connConfig := server.SoraConnConfig{
+			Protocol:             "imap_proxy",
+			IdleTimeout:          s.commandTimeout,
+			AbsoluteTimeout:      s.absoluteSessionTimeout,
+			MinBytesPerMinute:    s.minBytesPerMinute,
+			EnableTimeoutChecker: true,
 		}
+		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		log.Printf("IMAP proxy [%s] listening on %s (SoraConn enabled)", s.name, s.addr)
 	}
 
 	// Start connection limiter cleanup if enabled

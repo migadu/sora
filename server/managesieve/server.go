@@ -13,7 +13,7 @@ import (
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/server"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 )
 
@@ -39,13 +39,13 @@ type ManageSieveServer struct {
 	authenticatedConnections atomic.Int64
 
 	// Connection limiting
-	limiter *server.ConnectionLimiter
+	limiter *serverPkg.ConnectionLimiter
 
 	// PROXY protocol support
-	proxyReader *server.ProxyProtocolReader
+	proxyReader *serverPkg.ProxyProtocolReader
 
 	// Authentication rate limiting
-	authLimiter server.AuthLimiter
+	authLimiter serverPkg.AuthLimiter
 
 	// Command timeout and throughput enforcement
 	commandTimeout         time.Duration
@@ -70,7 +70,7 @@ type ManageSieveServerOptions struct {
 	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
-	AuthRateLimit          server.AuthRateLimiterConfig
+	AuthRateLimit          serverPkg.AuthRateLimiterConfig
 	CommandTimeout         time.Duration // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
@@ -80,10 +80,10 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
 	// Initialize PROXY protocol reader if enabled
-	var proxyReader *server.ProxyProtocolReader
+	var proxyReader *serverPkg.ProxyProtocolReader
 	if options.ProxyProtocol {
 		// Create ProxyProtocolConfig from simplified settings
-		proxyConfig := server.ProxyProtocolConfig{
+		proxyConfig := serverPkg.ProxyProtocolConfig{
 			Enabled:        true,
 			Mode:           "required",
 			TrustedProxies: options.TrustedNetworks,
@@ -93,7 +93,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		// Proxy protocol is always required when enabled
 
 		var err error
-		proxyReader, err = server.NewProxyProtocolReader("ManageSieve", proxyConfig)
+		proxyReader, err = serverPkg.NewProxyProtocolReader("ManageSieve", proxyConfig)
 		if err != nil {
 			serverCancel()
 			return nil, fmt.Errorf("failed to initialize PROXY protocol reader: %w", err)
@@ -107,7 +107,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
 	serverInstance := &ManageSieveServer{
 		hostname:               hostname,
@@ -148,7 +148,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		limiterMaxPerIP = options.MaxConnectionsPerIP
 	}
 
-	serverInstance.limiter = server.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
 	// Set up TLS config if TLS is enabled and certificates are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
@@ -185,25 +185,47 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 func (s *ManageSieveServer) Start(errChan chan error) {
 	var listener net.Listener
-	var err error
+
+	// Configure SoraConn with timeout protection
+	connConfig := serverPkg.SoraConnConfig{
+		Protocol:             "managesieve",
+		IdleTimeout:          s.commandTimeout,
+		AbsoluteTimeout:      s.absoluteSessionTimeout,
+		MinBytesPerMinute:    s.minBytesPerMinute,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+	}
 
 	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if isImplicitTLS {
-		// Implicit TLS - use TLS listener
-		listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
+		// Implicit TLS - use SoraTLSListener
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
-			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
+			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
 			return
 		}
-		log.Printf("ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
+
+		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("ManageSieve [%s] listening with implicit TLS on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
+		}
 	} else {
-		listener, err = net.Listen("tcp", s.addr)
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
-		log.Printf("ManageSieve [%s] listening on %s", s.name, s.addr)
+
+		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		if connConfig.EnableTimeoutChecker {
+			log.Printf("ManageSieve [%s] listening on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
+				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		} else {
+			log.Printf("ManageSieve [%s] listening on %s", s.name, s.addr)
+		}
 	}
 	defer listener.Close()
 
@@ -213,19 +235,6 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
-	}
-
-	// Wrap listener with timeout enforcement if configured
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		listener = &timeoutListener{
-			Listener:          listener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "managesieve",
-		}
-		log.Printf("ManageSieve [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
 	}
 
 	// Use a goroutine to monitor application context cancellation
@@ -257,7 +266,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
-		var proxyInfoForLimiting *server.ProxyProtocolInfo
+		var proxyInfoForLimiting *serverPkg.ProxyProtocolInfo
 		var realClientIP string
 		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
 			proxyInfoForLimiting = proxyConn.GetProxyInfo()
@@ -298,7 +307,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		// Extract real client IP and proxy IP from PROXY protocol if available
 		// Need to unwrap connection layers to get to proxyProtocolConn
-		var proxyInfo *server.ProxyProtocolInfo
+		var proxyInfo *serverPkg.ProxyProtocolInfo
 		currentConn := conn
 		for currentConn != nil {
 			if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
@@ -313,7 +322,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			}
 		}
 
-		clientIP, proxyIP := server.GetConnectionIPs(conn, proxyInfo)
+		clientIP, proxyIP := serverPkg.GetConnectionIPs(conn, proxyInfo)
 		session.RemoteIP = clientIP
 		session.ProxyIP = proxyIP
 		session.Protocol = "ManageSieve"
@@ -328,7 +337,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 
 		// Initialize the mutex helper
-		session.mutexHelper = server.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
+		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
 
 		// Build connection info for logging
 		var remoteInfo string
@@ -366,7 +375,7 @@ var errProxyProtocol = errors.New("PROXY protocol error")
 // proxyProtocolListener wraps a listener to handle PROXY protocol
 type proxyProtocolListener struct {
 	net.Listener
-	proxyReader *server.ProxyProtocolReader
+	proxyReader *serverPkg.ProxyProtocolReader
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
@@ -387,9 +396,9 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		}
 
 		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
-		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., server.ErrNoProxyHeader)
+		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
 		// and to not consume bytes from the connection if no header is found.
-		if l.proxyReader.IsOptionalMode() && errors.Is(err, server.ErrNoProxyHeader) {
+		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic ManageSieve
 			log.Printf("ManageSieve No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
@@ -407,9 +416,9 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 // proxyProtocolConn wraps a connection with PROXY protocol information
 type proxyProtocolConn struct {
 	net.Conn
-	proxyInfo *server.ProxyProtocolInfo
+	proxyInfo *serverPkg.ProxyProtocolInfo
 }
 
-func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
+func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
 }

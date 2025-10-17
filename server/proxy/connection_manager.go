@@ -530,6 +530,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		// Extract JA4 fingerprint from routingInfo.ClientConn if available
 		var ja4Fingerprint string
 		if routingInfo != nil && routingInfo.ClientConn != nil {
+			// With SoraConn, no unwrapping needed - direct access
 			if ja4Conn, ok := routingInfo.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
 				fingerprint, err := ja4Conn.GetJA4Fingerprint()
 				if err == nil && fingerprint != "" {

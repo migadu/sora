@@ -37,8 +37,12 @@ func TestJA4TLSWithRealCertificates(t *testing.T) {
 	// Channel to communicate JA4 fingerprint from server to test
 	ja4Channel := make(chan string, 1)
 
-	// Wrap listener with JA4 capture
-	ja4Listener := NewJA4TLSListener(listener, serverTLSConfig)
+	// Wrap listener with SoraTLSListener for JA4 capture
+	connConfig := SoraConnConfig{
+		Protocol:             "test",
+		EnableTimeoutChecker: false,
+	}
+	ja4Listener := NewSoraTLSListener(listener, serverTLSConfig, connConfig)
 
 	// Start server
 	go func() {
@@ -142,7 +146,11 @@ func TestJA4ProxyV2WithRealTLS(t *testing.T) {
 	defer listener.Close()
 
 	addr := listener.Addr().String()
-	ja4Listener := NewJA4TLSListener(listener, serverTLSConfig)
+	connConfig := SoraConnConfig{
+		Protocol:             "test",
+		EnableTimeoutChecker: false,
+	}
+	ja4Listener := NewSoraTLSListener(listener, serverTLSConfig, connConfig)
 
 	// Channels for results
 	ja4Chan := make(chan string, 1)
@@ -286,7 +294,11 @@ func TestJA4ConsistencyAcrossConnections(t *testing.T) {
 		}
 
 		addr := listener.Addr().String()
-		ja4Listener := NewJA4TLSListener(listener, serverTLSConfig)
+		connConfig := SoraConnConfig{
+			Protocol:             "test",
+			EnableTimeoutChecker: false,
+		}
+		ja4Listener := NewSoraTLSListener(listener, serverTLSConfig, connConfig)
 
 		ja4Chan := make(chan string, 1)
 

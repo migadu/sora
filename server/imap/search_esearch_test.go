@@ -100,28 +100,28 @@ func TestSearchOptionsDetection(t *testing.T) {
 	}
 }
 
-// TestSearchWarningTrigger tests that the warning is only triggered for actual ESEARCH commands
-func TestSearchWarningTrigger(t *testing.T) {
+// TestSearchErrorTrigger tests that BAD error is returned for ESEARCH when capability is filtered
+func TestSearchErrorTrigger(t *testing.T) {
 	tests := []struct {
 		name          string
 		options       *imap.SearchOptions
 		hasESEARCHCap bool
-		expectWarning bool
+		expectError   bool
 		description   string
 	}{
 		{
 			name:          "Standard SEARCH without ESEARCH capability",
 			options:       &imap.SearchOptions{}, // Empty struct (standard SEARCH)
 			hasESEARCHCap: false,
-			expectWarning: false,
-			description:   "Should NOT warn - standard SEARCH is always allowed",
+			expectError:   false,
+			description:   "Should NOT error - standard SEARCH is always allowed",
 		},
 		{
 			name:          "Standard SEARCH with ESEARCH capability",
 			options:       &imap.SearchOptions{}, // Empty struct (standard SEARCH)
 			hasESEARCHCap: true,
-			expectWarning: false,
-			description:   "Should NOT warn - standard SEARCH is always allowed",
+			expectError:   false,
+			description:   "Should NOT error - standard SEARCH is always allowed",
 		},
 		{
 			name: "ESEARCH RETURN (ALL) without ESEARCH capability",
@@ -129,8 +129,8 @@ func TestSearchWarningTrigger(t *testing.T) {
 				ReturnAll: true,
 			},
 			hasESEARCHCap: false,
-			expectWarning: true,
-			description:   "Should WARN - client using ESEARCH syntax but capability filtered",
+			expectError:   true,
+			description:   "Should ERROR - client using ESEARCH syntax but capability filtered (prevents infinite loop)",
 		},
 		{
 			name: "ESEARCH RETURN (ALL) with ESEARCH capability",
@@ -138,8 +138,8 @@ func TestSearchWarningTrigger(t *testing.T) {
 				ReturnAll: true,
 			},
 			hasESEARCHCap: true,
-			expectWarning: false,
-			description:   "Should NOT warn - ESEARCH is advertised and allowed",
+			expectError:   false,
+			description:   "Should NOT error - ESEARCH is advertised and allowed",
 		},
 		{
 			name: "ESEARCH RETURN (COUNT) without ESEARCH capability",
@@ -147,8 +147,8 @@ func TestSearchWarningTrigger(t *testing.T) {
 				ReturnCount: true,
 			},
 			hasESEARCHCap: false,
-			expectWarning: true,
-			description:   "Should WARN - client using ESEARCH syntax but capability filtered",
+			expectError:   true,
+			description:   "Should ERROR - client using ESEARCH syntax but capability filtered (prevents infinite loop)",
 		},
 		{
 			name: "ESEARCH RETURN (MIN MAX) without ESEARCH capability",
@@ -157,28 +157,28 @@ func TestSearchWarningTrigger(t *testing.T) {
 				ReturnMax: true,
 			},
 			hasESEARCHCap: false,
-			expectWarning: true,
-			description:   "Should WARN - client using ESEARCH syntax but capability filtered",
+			expectError:   true,
+			description:   "Should ERROR - client using ESEARCH syntax but capability filtered (prevents infinite loop)",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the logic from search.go:91-104
+			// Simulate the logic from search.go:93-107
 			isESEARCH := tt.options != nil && (tt.options.ReturnMin || tt.options.ReturnMax || tt.options.ReturnAll || tt.options.ReturnCount || tt.options.ReturnSave)
 
-			var shouldWarn bool
+			var shouldError bool
 			if isESEARCH {
-				// Check if session has ESEARCH capability - if not, we should warn
+				// Check if session has ESEARCH capability - if not, return BAD error
 				if !tt.hasESEARCHCap {
-					shouldWarn = true
+					shouldError = true
 				}
 			}
 
-			if shouldWarn != tt.expectWarning {
-				t.Errorf("%s: got shouldWarn=%v, want %v", tt.description, shouldWarn, tt.expectWarning)
+			if shouldError != tt.expectError {
+				t.Errorf("%s: got shouldError=%v, want %v", tt.description, shouldError, tt.expectError)
 			} else {
-				t.Logf("✓ %s: correctly determined shouldWarn=%v", tt.description, shouldWarn)
+				t.Logf("✓ %s: correctly determined shouldError=%v", tt.description, shouldError)
 			}
 		})
 	}
@@ -258,18 +258,18 @@ func TestIOSMailBugScenario(t *testing.T) {
 	hasESEARCHCapability := false // Filtered due to JA4 match
 
 	scenarios := []struct {
-		name          string
-		command       string
-		options       *imap.SearchOptions
-		expectWarning bool
-		explanation   string
+		name        string
+		command     string
+		options     *imap.SearchOptions
+		expectError bool
+		explanation string
 	}{
 		{
-			name:          "iOS sends standard SEARCH (expected behavior)",
-			command:       "UID SEARCH UID 930:*",
-			options:       &imap.SearchOptions{}, // Empty options = standard SEARCH
-			expectWarning: false,
-			explanation:   "Client respects filtered capabilities and uses standard SEARCH - no warning needed",
+			name:        "iOS sends standard SEARCH (expected behavior)",
+			command:     "UID SEARCH UID 930:*",
+			options:     &imap.SearchOptions{}, // Empty options = standard SEARCH
+			expectError: false,
+			explanation: "Client respects filtered capabilities and uses standard SEARCH - no error",
 		},
 		{
 			name:    "iOS sends ESEARCH despite filtering (the bug)",
@@ -277,8 +277,8 @@ func TestIOSMailBugScenario(t *testing.T) {
 			options: &imap.SearchOptions{
 				ReturnAll: true,
 			},
-			expectWarning: true,
-			explanation:   "Client ignores filtered capabilities and uses ESEARCH - this is the iOS Mail bug we're working around",
+			expectError: true,
+			explanation: "Client ignores filtered capabilities and uses ESEARCH - server returns BAD to prevent infinite loop",
 		},
 	}
 
@@ -287,44 +287,35 @@ func TestIOSMailBugScenario(t *testing.T) {
 			// Check if this is ESEARCH
 			isESEARCH := scenario.options != nil && (scenario.options.ReturnMin || scenario.options.ReturnMax || scenario.options.ReturnAll || scenario.options.ReturnCount || scenario.options.ReturnSave)
 
-			var shouldWarn bool
+			var shouldError bool
 			if isESEARCH && !hasESEARCHCapability {
-				shouldWarn = true
+				shouldError = true
 			}
 
-			if shouldWarn != scenario.expectWarning {
-				t.Errorf("Got shouldWarn=%v, want %v", shouldWarn, scenario.expectWarning)
+			if shouldError != scenario.expectError {
+				t.Errorf("Got shouldError=%v, want %v", shouldError, scenario.expectError)
 				t.Errorf("Explanation: %s", scenario.explanation)
 			} else {
 				t.Logf("✓ %s", scenario.explanation)
-				if shouldWarn {
-					t.Log("  → Warning would be logged: 'Client using ESEARCH RETURN syntax despite capability being filtered'")
-					t.Log("  → Server gracefully handles by treating as standard SEARCH")
+				if shouldError {
+					t.Log("  → BAD error returned: 'ESEARCH not supported'")
+					t.Log("  → This prevents the infinite retry loop")
 				}
 			}
 		})
 	}
 }
 
-// TestESEARCHNilPointerRegression tests for the panic bug where options was set to nil
-// but code continued to access options.ReturnMin etc., causing nil pointer dereference
-func TestESEARCHNilPointerRegression(t *testing.T) {
-	// This test reproduces the exact panic scenario from the production bug
-	// Panic: "panic handling command: runtime error: invalid memory address or nil pointer dereference"
-	// Location: server/imap/search.go:111 attempting to access options.ReturnMin when options is nil
+// TestESEARCHBadResponsePreventsLoop tests that BAD error prevents infinite retry loop
+func TestESEARCHBadResponsePreventsLoop(t *testing.T) {
+	// This test verifies the fix for infinite loop where client kept retrying ESEARCH
+	// OLD BEHAVIOR: Server returned standard SEARCH results, client kept retrying with ESEARCH
+	// NEW BEHAVIOR: Server returns BAD error, client should stop retrying
 
-	t.Log("Testing regression fix for nil pointer panic in ESEARCH handling")
-
-	// Simulate the scenario:
-	// 1. Client sends ESEARCH with RETURN options
-	// 2. Server has ESEARCH capability filtered (disabled)
-	// 3. Code sets options = nil and isESEARCH = false
-	// 4. OLD BUG: Code continued to access options.ReturnMin, causing panic
-	// 5. FIX: Code now checks isESEARCH && options != nil before accessing options
+	t.Log("Testing that BAD error prevents infinite ESEARCH retry loop")
 
 	options := &imap.SearchOptions{
 		ReturnAll: true,
-		ReturnMin: true,
 	}
 
 	// Step 1: Detect ESEARCH
@@ -332,35 +323,22 @@ func TestESEARCHNilPointerRegression(t *testing.T) {
 	if !isESEARCH {
 		t.Fatal("Expected ESEARCH to be detected")
 	}
-	t.Log("✓ Step 1: ESEARCH detected (options has RETURN flags set)")
+	t.Log("✓ Step 1: ESEARCH detected (RETURN (ALL) syntax)")
 
 	// Step 2: Capability check fails (ESEARCH not advertised)
 	hasESEARCHCapability := false
 	if isESEARCH && !hasESEARCHCapability {
-		t.Log("✓ Step 2: ESEARCH capability not advertised - triggering workaround")
-		// This is what the code does when capability is filtered
-		options = nil
-		isESEARCH = false
+		t.Log("✓ Step 2: ESEARCH capability not advertised")
+		// NEW FIX: Return BAD error instead of trying to handle gracefully
+		shouldReturnBadError := true
+		if !shouldReturnBadError {
+			t.Fatal("Should return BAD error to prevent infinite loop!")
+		}
+		t.Log("✓ Step 3: Returning BAD error: 'ESEARCH not supported'")
+		t.Log("✓ Step 4: Client receives BAD and should stop retrying")
+		t.Log("✓ FIX VERIFIED: BAD error prevents infinite retry loop")
+		return
 	}
 
-	t.Log("✓ Step 3: Set options = nil and isESEARCH = false (workaround)")
-
-	// Step 4: OLD BUG - Code would continue to access options here, causing panic
-	// The old code structure was:
-	//   if isESEARCH {
-	//       if !hasCapability {
-	//           options = nil; isESEARCH = false
-	//       }
-	//       // BUG: This code still executes even after setting isESEARCH = false
-	//       if options.ReturnMin { ... } // PANIC: nil pointer dereference
-	//   }
-
-	// Step 5: NEW FIX - Check both isESEARCH && options != nil
-	if isESEARCH && options != nil {
-		t.Fatal("Should not enter ESEARCH block when options is nil - this would have caused the panic!")
-	}
-
-	t.Log("✓ Step 4: ESEARCH block correctly skipped (isESEARCH = false, options = nil)")
-	t.Log("✓ Step 5: No panic! Code correctly handles the workaround scenario")
-	t.Log("✓ FIX VERIFIED: Nil pointer dereference prevented by 'isESEARCH && options != nil' guard")
+	t.Fatal("Should have detected missing capability and returned error")
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
+	serverPkg "github.com/migadu/sora/server"
 )
 
 var idlePollInterval = 15 * time.Second
@@ -18,7 +19,7 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	// Reset throughput counter when entering IDLE to avoid false positives
 	// for slowloris detection. IDLE is expected to have minimal traffic.
 	if netConn := s.conn.NetConn(); netConn != nil {
-		if tc, ok := netConn.(*timeoutConn); ok {
+		if tc, ok := netConn.(*serverPkg.SoraConn); ok {
 			tc.ResetThroughputCounter()
 		}
 	}

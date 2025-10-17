@@ -273,7 +273,15 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 func (s *POP3ProxyServer) Start() error {
 	var listener net.Listener
-	var err error
+
+	// Configure SoraConn with timeout protection
+	connConfig := server.SoraConnConfig{
+		Protocol:             "pop3_proxy",
+		IdleTimeout:          s.commandTimeout,
+		AbsoluteTimeout:      s.absoluteSessionTimeout,
+		MinBytesPerMinute:    s.minBytesPerMinute,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+	}
 
 	if s.tlsConfig != nil {
 		// Create base TCP listener
@@ -282,31 +290,23 @@ func (s *POP3ProxyServer) Start() error {
 			s.cancel()
 			return fmt.Errorf("failed to create TCP listener: %w", err)
 		}
-		// Wrap with JA4 capture for TLS fingerprinting
-		listener = server.NewJA4TLSListener(tcpListener, s.tlsConfig)
-		log.Printf("POP3 proxy [%s] listening with TLS on %s (JA4 enabled)", s.name, s.addr)
+		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
+		listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		log.Printf("POP3 proxy [%s] listening with TLS on %s (JA4 enabled, timeout protection: %v)",
+			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	} else {
-		listener, err = net.Listen("tcp", s.addr)
+		// Create base TCP listener
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
-		log.Printf("POP3 proxy [%s] listening on %s", s.name, s.addr)
+		// Use SoraListener for non-TLS with timeout protection
+		listener = server.NewSoraListener(tcpListener, connConfig)
+		log.Printf("POP3 proxy [%s] listening on %s (timeout protection: %v)",
+			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	}
 	defer listener.Close()
-
-	// Wrap listener with timeout protection
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		listener = &timeoutListener{
-			Listener:          listener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "pop3_proxy",
-		}
-		log.Printf("POP3 proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
-	}
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {

@@ -238,14 +238,21 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 // Start starts the ManageSieve proxy server.
 func (s *Server) Start() error {
-	var err error
-
 	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
 	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
 		if s.tlsVerify {
 			log.Printf("Client TLS certificate verification is REQUIRED for ManageSieve proxy [%s] (tls_verify=true)", s.name)
 		} else {
 			log.Printf("Client TLS certificate verification is DISABLED for ManageSieve proxy [%s] (tls_verify=false)", s.name)
+		}
+
+		// Configure SoraConn with timeout protection
+		connConfig := server.SoraConnConfig{
+			Protocol:             "managesieve_proxy",
+			IdleTimeout:          s.commandTimeout,
+			AbsoluteTimeout:      s.absoluteSessionTimeout,
+			MinBytesPerMinute:    s.minBytesPerMinute,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
 		}
 
 		s.listenerMu.Lock()
@@ -255,37 +262,37 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		// Wrap with JA4 capture for TLS fingerprinting
-		s.listener = server.NewJA4TLSListener(tcpListener, s.tlsConfig)
+		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
+		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("ManageSieve proxy [%s] listening with implicit TLS on %s (JA4 enabled)", s.name, s.addr)
+		log.Printf("ManageSieve proxy [%s] listening with implicit TLS on %s (JA4 enabled, timeout protection: %v)",
+			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	} else {
+		// Configure SoraConn with timeout protection
+		connConfig := server.SoraConnConfig{
+			Protocol:             "managesieve_proxy",
+			IdleTimeout:          s.commandTimeout,
+			AbsoluteTimeout:      s.absoluteSessionTimeout,
+			MinBytesPerMinute:    s.minBytesPerMinute,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		}
+
 		s.listenerMu.Lock()
-		s.listener, err = net.Listen("tcp", s.addr)
-		s.listenerMu.Unlock()
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		if s.tlsUseStartTLS {
-			log.Printf("ManageSieve proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
-		} else {
-			log.Printf("ManageSieve proxy [%s] listening on %s", s.name, s.addr)
-		}
-	}
-
-	// Wrap listener with timeout protection
-	if s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0 {
-		s.listenerMu.Lock()
-		s.listener = &timeoutListener{
-			Listener:          s.listener,
-			timeout:           s.commandTimeout,
-			absoluteTimeout:   s.absoluteSessionTimeout,
-			minBytesPerMinute: s.minBytesPerMinute,
-			protocol:          "managesieve_proxy",
-		}
+		// Use SoraListener for non-TLS with timeout protection
+		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("ManageSieve proxy [%s] timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min",
-			s.name, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+		if s.tlsUseStartTLS {
+			log.Printf("ManageSieve proxy [%s] listening on %s (STARTTLS enabled, timeout protection: %v)",
+				s.name, s.addr, connConfig.EnableTimeoutChecker)
+		} else {
+			log.Printf("ManageSieve proxy [%s] listening on %s (timeout protection: %v)",
+				s.name, s.addr, connConfig.EnableTimeoutChecker)
+		}
 	}
 
 	// Start connection limiter cleanup if enabled

@@ -92,17 +92,12 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
 
-	if isESEARCH {
-		// Check if session has ESEARCH capability - if not, log warning and ignore RETURN options
-		// Some clients (like iOS Mail) may use RETURN syntax even when we don't advertise ESEARCH.
-		// We handle this gracefully by treating it as a standard SEARCH.
-		if !s.GetCapabilities().Has(imap.CapESearch) {
-			s.Log("[SEARCH] WARNING: Client using ESEARCH RETURN syntax despite capability being filtered")
-			s.Log("[SEARCH] Ignoring RETURN options and treating as standard SEARCH (client bug workaround)")
-			// Set options to nil to trigger standard SEARCH handling below
-			options = nil
-			isESEARCH = false
-		}
+	// If client uses ESEARCH syntax but ESEARCH capability is filtered, fall back to standard SEARCH
+	// This provides graceful compatibility when capability filtering is applied
+	if isESEARCH && !s.GetCapabilities().Has(imap.CapESearch) {
+		s.Log("[SEARCH] Client using ESEARCH RETURN syntax but ESEARCH capability is filtered - falling back to standard SEARCH")
+		isESEARCH = false // Force standard SEARCH response format
+		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_fallback", "capability_filter").Inc()
 	}
 
 	if isESEARCH && options != nil {

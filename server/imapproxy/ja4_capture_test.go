@@ -12,16 +12,16 @@ func TestIMAPProxyUsesJA4Listener(t *testing.T) {
 	// This test verifies the code pattern is correct
 	// The actual JA4 capture is tested in server/ja4_tls_realtest_test.go with real TLS connections
 
-	t.Log("✓ IMAP proxy server.go lines 274-294 wrap TLS listeners with server.NewJA4TLSListener()")
+	t.Log("✓ IMAP proxy server.go uses server.NewSoraTLSListener() for TLS connections")
 	t.Log("✓ This ensures JA4 fingerprints are captured from direct client TLS connections")
 	t.Log("✓ Captured JA4 is then forwarded to backends via PROXY v2 TLV (type 0xE0)")
-	t.Log("✓ See id_forwarding.go:41-47 for JA4 extraction and forwarding")
+	t.Log("✓ See id_forwarding.go for JA4 extraction and forwarding")
 
-	// Verify the NewJA4TLSListener function exists and is accessible
+	// Verify the NewSoraTLSListener function exists and is accessible
 	// This ensures the import is correct and the function is available
-	_ = server.NewJA4TLSListener
+	_ = server.NewSoraTLSListener
 
-	t.Log("✓ server.NewJA4TLSListener is available and imported correctly")
+	t.Log("✓ server.NewSoraTLSListener is available and imported correctly")
 }
 
 // TestIMAPProxyJA4ForwardingCode verifies the JA4 forwarding logic exists

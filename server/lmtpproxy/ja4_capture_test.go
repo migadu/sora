@@ -12,14 +12,14 @@ func TestLMTPProxyUsesJA4Listener(t *testing.T) {
 	// This test verifies the code pattern is correct
 	// The actual JA4 capture is tested in server/ja4_tls_realtest_test.go with real TLS connections
 
-	t.Log("✓ LMTP proxy server.go lines 249-257 wrap TLS listeners with server.NewJA4TLSListener()")
+	t.Log("✓ LMTP proxy server.go lines 249-257 uses server.NewSoraTLSListener() for TLS connections")
 	t.Log("✓ This ensures JA4 fingerprints are captured from direct client TLS connections")
 	t.Log("✓ Captured JA4 is forwarded to backends via PROXY v2 TLV (type 0xE0)")
 
-	// Verify the NewJA4TLSListener function exists and is accessible
-	_ = server.NewJA4TLSListener
+	// Verify the NewSoraTLSListener function exists and is accessible
+	_ = server.NewSoraTLSListener
 
-	t.Log("✓ server.NewJA4TLSListener is available and imported correctly")
+	t.Log("✓ server.NewSoraTLSListener is available and imported correctly")
 }
 
 // TestLMTPProxyJA4ForwardingCode verifies the JA4 forwarding logic exists
