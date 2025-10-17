@@ -416,12 +416,26 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
+	// Need to unwrap connection layers to get to proxyProtocolConn
 	netConn := c.Conn()
 	var proxyInfo *server.ProxyProtocolInfo
-	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
-		proxyInfo = proxyConn.GetProxyInfo()
-	} else if limitingConn, ok := netConn.(*connectionLimitingConn); ok {
-		proxyInfo = limitingConn.GetProxyInfo()
+	currentConn := netConn
+	for currentConn != nil {
+		if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
+			proxyInfo = proxyConn.GetProxyInfo()
+			break
+		} else if limitingConn, ok := currentConn.(*connectionLimitingConn); ok {
+			if limitingInfo := limitingConn.GetProxyInfo(); limitingInfo != nil {
+				proxyInfo = limitingInfo
+				break
+			}
+		}
+		// Try to unwrap the connection
+		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+			currentConn = wrapper.Unwrap()
+		} else {
+			break
+		}
 	}
 
 	clientIP, proxyIP := server.GetConnectionIPs(netConn, proxyInfo)

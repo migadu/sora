@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"net"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -59,15 +60,24 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 
 // isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
 func (s *IMAPSession) isFromTrustedProxy() bool {
-	conn := s.conn.NetConn()
-
 	// Use the server's limiter trusted networks for ID command forwarding
 	// This ensures consistency with connection limiting behavior
 	if s.server.limiter == nil {
 		return false
 	}
 
-	// Extract IP from connection
+	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
+	// The ProxyIP contains the actual IP of the proxy server that sent the PROXY header
+	if s.ProxyIP != "" {
+		// Create a fake net.Addr with the proxy IP for trusted network checking
+		proxyAddr := &net.TCPAddr{
+			IP: net.ParseIP(s.ProxyIP),
+		}
+		return s.server.limiter.IsTrustedConnection(proxyAddr)
+	}
+
+	// Fall back to checking the direct connection's remote address (no PROXY protocol)
+	conn := s.conn.NetConn()
 	remoteAddr := conn.RemoteAddr()
 	return s.server.limiter.IsTrustedConnection(remoteAddr)
 }

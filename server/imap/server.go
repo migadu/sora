@@ -588,12 +588,26 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
+	// Need to unwrap connection layers to get to proxyProtocolConn
 	netConn := conn.NetConn()
 	var proxyInfo *serverPkg.ProxyProtocolInfo
-	if proxyConn, ok := netConn.(*proxyProtocolConn); ok {
-		proxyInfo = proxyConn.GetProxyInfo()
-	} else if limitingConn, ok := netConn.(*connectionLimitingConn); ok {
-		proxyInfo = limitingConn.GetProxyInfo()
+	currentConn := netConn
+	for currentConn != nil {
+		if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
+			proxyInfo = proxyConn.GetProxyInfo()
+			break
+		} else if limitingConn, ok := currentConn.(*connectionLimitingConn); ok {
+			if limitingInfo := limitingConn.GetProxyInfo(); limitingInfo != nil {
+				proxyInfo = limitingInfo
+				break
+			}
+		}
+		// Try to unwrap the connection
+		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+			currentConn = wrapper.Unwrap()
+		} else {
+			break
+		}
 	}
 
 	// Check for JA4 fingerprint from PROXY v2 TLV (highest priority)
@@ -606,7 +620,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Extract JA4 fingerprint if this is a JA4-enabled TLS connection
 	// Need to unwrap connection layers to get to the underlying JA4 connection
 	var ja4Conn interface{ GetJA4Fingerprint() (string, error) }
-	currentConn := netConn
+	currentConn = netConn
 	for currentConn != nil {
 		if jc, ok := currentConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
 			ja4Conn = jc

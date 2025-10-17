@@ -1080,8 +1080,8 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	if !impersonating {
 		// For regular ManageSieve, we don't support proxy authentication
 		if authzID != "" && authzID != authnID {
-			s.Log("proxy authentication not supported: authz='%s', authn='%s'", authzID, authnID)
-			s.sendResponse("NO Proxy authentication not supported\r\n")
+			s.Log("proxy authentication requires master credentials: authz='%s', authn='%s'", authzID, authnID)
+			s.sendResponse("NO Proxy authentication requires master_sasl_username and master_sasl_password to be configured\r\n")
 			return false
 		}
 

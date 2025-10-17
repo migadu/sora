@@ -227,8 +227,9 @@ func (s *POP3ProxySession) handleConnection() {
 			password := authParts[2]
 
 			// For proxy, we expect authzID to be empty or same as authnID
+			// Authorization identity is handled by master SASL on the backend
 			if authzID != "" && authzID != authnID {
-				if s.handleAuthError(writer, "-ERR Proxy authentication not supported\r\n") {
+				if s.handleAuthError(writer, "-ERR Authorization identity not supported on proxy (configure master SASL on backend)\r\n") {
 					return
 				}
 				continue

@@ -1315,8 +1315,8 @@ func (s *POP3Session) handleConnection() {
 			if !impersonating {
 				// For regular POP3, we don't support proxy authentication
 				if authzID != "" && authzID != authnID {
-					s.Log("proxy authentication not supported: authz='%s', authn='%s'", authzID, authnID)
-					if s.handleClientError(writer, "-ERR [AUTH] Proxy authentication not supported\r\n") {
+					s.Log("proxy authentication requires master credentials: authz='%s', authn='%s'", authzID, authnID)
+					if s.handleClientError(writer, "-ERR [AUTH] Proxy authentication requires master_sasl_username and master_sasl_password to be configured\r\n") {
 						return
 					}
 					continue

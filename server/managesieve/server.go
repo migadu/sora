@@ -297,9 +297,20 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available
+		// Need to unwrap connection layers to get to proxyProtocolConn
 		var proxyInfo *server.ProxyProtocolInfo
-		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
-			proxyInfo = proxyConn.GetProxyInfo()
+		currentConn := conn
+		for currentConn != nil {
+			if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
+				proxyInfo = proxyConn.GetProxyInfo()
+				break
+			}
+			// Try to unwrap the connection
+			if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+				currentConn = wrapper.Unwrap()
+			} else {
+				break
+			}
 		}
 
 		clientIP, proxyIP := server.GetConnectionIPs(conn, proxyInfo)

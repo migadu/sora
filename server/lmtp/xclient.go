@@ -95,7 +95,8 @@ func (s *LMTPSession) isFromTrustedProxy() bool {
 		}
 	}
 
-	return server.IsTrustedForwarding(netConn, trustedProxies)
+	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
+	return server.IsTrustedForwardingWithProxy(netConn, s.ProxyIP, trustedProxies)
 }
 
 // ParseRCPTForward processes XRCPTFORWARD parameters from RCPT TO command

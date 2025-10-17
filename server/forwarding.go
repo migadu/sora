@@ -434,3 +434,31 @@ func IsTrustedForwarding(conn net.Conn, trustedProxies []string) bool {
 
 	return false
 }
+
+// IsTrustedForwardingWithProxy checks if the connection is from a trusted proxy
+// When PROXY protocol is used, it checks the proxy IP instead of the client IP
+func IsTrustedForwardingWithProxy(conn net.Conn, proxyIP string, trustedProxies []string) bool {
+	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
+	// The proxyIP contains the actual IP of the proxy server that sent the PROXY header
+	if proxyIP != "" {
+		ip := net.ParseIP(proxyIP)
+		if ip == nil {
+			return false
+		}
+
+		// Check against trusted proxy networks
+		for _, cidr := range trustedProxies {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				continue
+			}
+			if network.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Fall back to checking the direct connection's remote address (no PROXY protocol)
+	return IsTrustedForwarding(conn, trustedProxies)
+}

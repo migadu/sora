@@ -2,6 +2,7 @@ package pop3
 
 import (
 	"bufio"
+	"net"
 
 	"github.com/migadu/sora/server"
 )
@@ -70,7 +71,17 @@ func (s *POP3Session) isFromTrustedProxy() bool {
 		return false
 	}
 
-	// Extract connection address
+	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
+	// The ProxyIP contains the actual IP of the proxy server that sent the PROXY header
+	if s.ProxyIP != "" {
+		// Create a fake net.Addr with the proxy IP for trusted network checking
+		proxyAddr := &net.TCPAddr{
+			IP: net.ParseIP(s.ProxyIP),
+		}
+		return s.server.limiter.IsTrustedConnection(proxyAddr)
+	}
+
+	// Fall back to checking the direct connection's remote address (no PROXY protocol)
 	conn := *s.conn
 	remoteAddr := conn.RemoteAddr()
 	return s.server.limiter.IsTrustedConnection(remoteAddr)
