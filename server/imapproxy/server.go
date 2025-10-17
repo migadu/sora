@@ -271,21 +271,27 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		s.listener, err = tls.Listen("tcp", s.addr, tlsConfig)
-		s.listenerMu.Unlock()
+		baseTLSListener, err := tls.Listen("tcp", s.addr, tlsConfig)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate)", s.name, s.addr)
+		// Wrap with JA4 capture for TLS fingerprinting
+		s.listener = server.NewJA4TLSListener(baseTLSListener, tlsConfig)
+		s.listenerMu.Unlock()
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate, JA4 enabled)", s.name, s.addr)
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.listenerMu.Lock()
-		s.listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
-		s.listenerMu.Unlock()
+		baseTLSListener, err := tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager)", s.name, s.addr)
+		// Wrap with JA4 capture for TLS fingerprinting
+		s.listener = server.NewJA4TLSListener(baseTLSListener, s.tlsConfig)
+		s.listenerMu.Unlock()
+		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager, JA4 enabled)", s.name, s.addr)
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
 		s.cancel()

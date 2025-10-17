@@ -246,12 +246,15 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		s.listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
-		s.listenerMu.Unlock()
+		baseTLSListener, err := tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
+			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
-		log.Printf("LMTP proxy [%s] listening with implicit TLS on %s", s.name, s.addr)
+		// Wrap with JA4 capture for TLS fingerprinting
+		s.listener = server.NewJA4TLSListener(baseTLSListener, s.tlsConfig)
+		s.listenerMu.Unlock()
+		log.Printf("LMTP proxy [%s] listening with implicit TLS on %s (JA4 enabled)", s.name, s.addr)
 	} else {
 		s.listenerMu.Lock()
 		s.listener, err = net.Listen("tcp", s.addr)

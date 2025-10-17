@@ -276,12 +276,14 @@ func (s *POP3ProxyServer) Start() error {
 	var err error
 
 	if s.tlsConfig != nil {
-		listener, err = tls.Listen("tcp", s.addr, s.tlsConfig)
+		baseTLSListener, err := tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
 			s.cancel()
 			return fmt.Errorf("failed to create TLS listener: %w", err)
 		}
-		log.Printf("POP3 proxy [%s] listening with TLS on %s", s.name, s.addr)
+		// Wrap with JA4 capture for TLS fingerprinting
+		listener = server.NewJA4TLSListener(baseTLSListener, s.tlsConfig)
+		log.Printf("POP3 proxy [%s] listening with TLS on %s (JA4 enabled)", s.name, s.addr)
 	} else {
 		listener, err = net.Listen("tcp", s.addr)
 		if err != nil {
