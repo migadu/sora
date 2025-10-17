@@ -36,6 +36,7 @@ type UserRoutingInfo struct {
 	RemoteUseIDCommand     bool     // Use IMAP ID command (IMAP only)
 	RemoteUseXCLIENT       bool     // Use XCLIENT command (POP3/LMTP)
 	ClientConn             net.Conn // Client connection (for extracting JA4 fingerprint)
+	ProxySessionID         string   // Proxy session ID for end-to-end tracing
 }
 
 // normalizeHostPort normalizes a host:port address, adding a default port if missing

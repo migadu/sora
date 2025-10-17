@@ -700,7 +700,13 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 
 	authCount := s.authenticatedConnections.Load()
-	session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
+	// Log proxy session ID if present for end-to-end tracing
+	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+		log.Printf("IMAP [%s] Received proxy session ID from PROXY v2 TLV: %s", s.name, proxyInfo.ProxySessionID)
+		session.Log("connected (connections: total=%d, authenticated=%d) proxy_session=%s", totalCount, authCount, proxyInfo.ProxySessionID)
+	} else {
+		session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
+	}
 	return session, greeting, nil
 }
 

@@ -527,20 +527,28 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d",
 			clientIP, clientPort, serverIP, serverPort)
 
-		// Extract JA4 fingerprint from routingInfo.ClientConn if available
-		var ja4Fingerprint string
-		if routingInfo != nil && routingInfo.ClientConn != nil {
-			// With SoraConn, no unwrapping needed - direct access
-			if ja4Conn, ok := routingInfo.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
-				fingerprint, err := ja4Conn.GetJA4Fingerprint()
-				if err == nil && fingerprint != "" {
-					ja4Fingerprint = fingerprint
-					log.Printf("[ConnectionManager] Extracted JA4 fingerprint for PROXY v2 TLV: %s", fingerprint)
+		// Extract JA4 fingerprint and session ID from routingInfo if available
+		var ja4Fingerprint, proxySessionID string
+		if routingInfo != nil {
+			// Extract JA4 fingerprint from client connection
+			if routingInfo.ClientConn != nil {
+				// With SoraConn, no unwrapping needed - direct access
+				if ja4Conn, ok := routingInfo.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
+					fingerprint, err := ja4Conn.GetJA4Fingerprint()
+					if err == nil && fingerprint != "" {
+						ja4Fingerprint = fingerprint
+						log.Printf("[ConnectionManager] Extracted JA4 fingerprint for PROXY v2 TLV: %s", fingerprint)
+					}
 				}
+			}
+			// Extract proxy session ID for end-to-end tracing
+			if routingInfo.ProxySessionID != "" {
+				proxySessionID = routingInfo.ProxySessionID
+				log.Printf("[ConnectionManager] Including proxy session ID in PROXY v2 TLV: %s", proxySessionID)
 			}
 		}
 
-		err = cm.writeProxyV2HeaderWithTLVs(conn, clientIP, clientPort, serverIP, serverPort, ja4Fingerprint)
+		err = cm.writeProxyV2HeaderWithTLVs(conn, clientIP, clientPort, serverIP, serverPort, ja4Fingerprint, proxySessionID)
 		if err != nil {
 			conn.Close()
 			log.Printf("[ConnectionManager] Failed to send PROXY protocol header to %s: %v", addr, err)
@@ -593,14 +601,19 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 }
 
 // writeProxyV2HeaderWithTLVs writes a PROXY protocol v2 header with optional TLV extensions
-func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP string, clientPort int, serverIP string, serverPort int, ja4Fingerprint string) error {
-	// Build TLVs map if we have a JA4 fingerprint
+func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP string, clientPort int, serverIP string, serverPort int, ja4Fingerprint, proxySessionID string) error {
+	// Build TLVs map if we have a JA4 fingerprint or session ID
 	var tlvs map[byte][]byte
-	if ja4Fingerprint != "" {
-		tlvs = map[byte][]byte{
-			0xE0: []byte(ja4Fingerprint), // TLVTypeJA4Fingerprint
+	if ja4Fingerprint != "" || proxySessionID != "" {
+		tlvs = make(map[byte][]byte)
+		if ja4Fingerprint != "" {
+			tlvs[0xE0] = []byte(ja4Fingerprint) // TLVTypeJA4Fingerprint
+			log.Printf("[PROXY] Including JA4 fingerprint in PROXY v2 TLV: %s", ja4Fingerprint)
 		}
-		log.Printf("[PROXY] Including JA4 fingerprint in PROXY v2 TLV: %s", ja4Fingerprint)
+		if proxySessionID != "" {
+			tlvs[0xE1] = []byte(proxySessionID) // TLVTypeProxySessionID
+			log.Printf("[PROXY] Including proxy session ID in PROXY v2 TLV: %s", proxySessionID)
+		}
 	}
 
 	// PROXY v2 signature

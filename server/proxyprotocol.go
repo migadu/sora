@@ -31,11 +31,13 @@ type ProxyProtocolInfo struct {
 	Protocol       string          // TCP4, TCP6, UDP4, UDP6
 	TLVs           map[byte][]byte // PROXY v2 TLV extensions (type -> value)
 	JA4Fingerprint string          // JA4 TLS fingerprint (extracted from TLV 0xE0)
+	ProxySessionID string          // Proxy session ID (extracted from TLV 0xE1) - for end-to-end tracing
 }
 
 const (
 	// Custom TLV types (0xE0-0xFF range is for private use per PROXY v2 spec)
 	TLVTypeJA4Fingerprint byte = 0xE0 // JA4 TLS fingerprint
+	TLVTypeProxySessionID byte = 0xE1 // Proxy session ID for end-to-end tracing
 )
 
 // ProxyProtocolReader handles PROXY protocol parsing
@@ -412,6 +414,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			Protocol:       protocolStr,
 			TLVs:           tlvs,
 			JA4Fingerprint: extractJA4FromTLVs(tlvs),
+			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
 
 	case 0x2: // AF_INET6 (IPv6)
@@ -455,6 +458,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			Protocol:       protocolStr,
 			TLVs:           tlvs,
 			JA4Fingerprint: extractJA4FromTLVs(tlvs),
+			ProxySessionID: extractProxySessionIDFromTLVs(tlvs),
 		}, nil
 
 	case 0x0: // AF_UNSPEC (UNKNOWN)
@@ -523,6 +527,14 @@ func parseTLVs(reader *bufio.Reader, dataLen int) (map[byte][]byte, error) {
 func extractJA4FromTLVs(tlvs map[byte][]byte) string {
 	if ja4Bytes, ok := tlvs[TLVTypeJA4Fingerprint]; ok {
 		return string(ja4Bytes)
+	}
+	return ""
+}
+
+// extractProxySessionIDFromTLVs extracts the proxy session ID from TLVs
+func extractProxySessionIDFromTLVs(tlvs map[byte][]byte) string {
+	if sessionIDBytes, ok := tlvs[TLVTypeProxySessionID]; ok {
+		return string(sessionIDBytes)
 	}
 	return ""
 }

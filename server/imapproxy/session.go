@@ -37,6 +37,7 @@ type Session struct {
 	isPrelookupAccount bool
 	routingInfo        *proxy.UserRoutingInfo
 	serverAddr         string
+	sessionID          string // Proxy session ID for end-to-end tracing
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -428,6 +429,11 @@ func (s *Session) connectToBackend() error {
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer connectCancel()
 
+	// Generate session ID if not already generated
+	if s.sessionID == "" {
+		s.sessionID = s.generateSessionID()
+	}
+
 	// Ensure routing info has client connection for JA4 fingerprint extraction
 	if s.routingInfo == nil {
 		// Create minimal routing info with client connection for JA4 extraction
@@ -435,9 +441,11 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo = &proxy.UserRoutingInfo{
 			ClientConn:         s.clientConn,
 			RemoteUseIDCommand: s.server.remoteUseIDCommand,
+			ProxySessionID:     s.sessionID, // Include session ID for end-to-end tracing
 		}
 	} else {
 		s.routingInfo.ClientConn = s.clientConn
+		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
