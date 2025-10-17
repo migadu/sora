@@ -9,13 +9,13 @@ import (
 // TestJA4ProxyV2EndToEnd tests the complete flow: proxy extracts JA4 → sends via PROXY v2 TLV → backend extracts it
 func TestJA4ProxyV2EndToEnd(t *testing.T) {
 	tests := []struct {
-		name        string
-		ja4         string
-		clientIP    string
-		clientPort  int
-		serverIP    string
-		serverPort  int
-		expectJA4   bool
+		name       string
+		ja4        string
+		clientIP   string
+		clientPort int
+		serverIP   string
+		serverPort int
+		expectJA4  bool
 	}{
 		{
 			name:       "IPv4 with JA4 fingerprint",
