@@ -249,13 +249,14 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		baseTLSListener, err := tls.Listen("tcp", s.addr, s.tlsConfig)
+		// Create base TCP listener
+		tcpListener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TLS listener: %w", err)
+			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
 		// Wrap with JA4 capture for TLS fingerprinting
-		s.listener = server.NewJA4TLSListener(baseTLSListener, s.tlsConfig)
+		s.listener = server.NewJA4TLSListener(tcpListener, s.tlsConfig)
 		s.listenerMu.Unlock()
 		log.Printf("ManageSieve proxy [%s] listening with implicit TLS on %s (JA4 enabled)", s.name, s.addr)
 	} else {
