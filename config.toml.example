@@ -489,21 +489,47 @@ proxy_protocol = false            # Enable PROXY protocol support (HAProxy, ngin
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- CLIENT CAPABILITY FILTERS ---
-# Disable specific IMAP capabilities for problematic clients based on their ID
+# Disable specific IMAP capabilities for problematic clients based on their ID or TLS fingerprint
 # This helps work around client bugs while maintaining full functionality for well-behaved clients
-# Note: CAPABILITY response still shows all capabilities, but command handlers respect filtering
+# Note: Filtered capabilities are removed from CAPABILITY responses and command handlers reject their use
 
+# Match by client name (from IMAP ID command)
 # [[server.client_filters]]
 # client_name = "com\\.apple\\.email\\.maild"  # iOS Apple Mail (regex pattern)
 # client_version = ".*"                        # Any version
 # disable_caps = ["CONDSTORE"]                 # Capabilities to disable
 # reason = "iOS Apple Mail has CONDSTORE implementation issues"
 
+# Match by client name and version
 # [[server.client_filters]]
 # client_name = "Microsoft Outlook"            # Outlook for Windows/Mac
 # client_version = "16\\..*"                   # Only version 16.x
 # disable_caps = ["IDLE", "CONDSTORE"]         # Multiple capabilities
 # reason = "Outlook 16.x has connection issues with IDLE and CONDSTORE"
+
+# Match by JA4 TLS fingerprint (requires TLS or PROXY protocol with JA4 TLV)
+# Useful for filtering before client sends ID command, or when client doesn't send ID
+# [[server.client_filters]]
+# ja4_fingerprints = ["^t13d1516h2_8daaf6152771_.*"]  # Single JA4 pattern (as array)
+# disable_caps = ["ESEARCH", "IDLE"]
+# reason = "Client with this TLS fingerprint has issues"
+
+# Match by multiple JA4 fingerprints (one client may have different fingerprints)
+# [[server.client_filters]]
+# client_name = "com\\.apple\\.email\\.maild"
+# client_version = ".*"
+# ja4_fingerprints = [
+#   "^t13d411100_6be44479b708_.*",  # iOS with one network config
+#   "^t13d2014ip_a09f3c656075_.*",  # iOS with IPv6
+#   "^t13i201200_a09f3c656075_.*",  # iOS with different cipher preference
+# ]
+# disable_caps = ["ESEARCH", "CONDSTORE", "IDLE"]
+# reason = "iOS Apple Mail has implementation issues (multiple fingerprints)"
+
+# Matching logic:
+# - If ja4_fingerprints specified: matches if ANY pattern matches (OR)
+# - If client_name/version specified: matches if BOTH name AND version match (AND)
+# - Between ja4_fingerprints and client_name/version: matches if EITHER criteria is met (OR)
 
 # --- AUTHENTICATION RATE LIMITING ---
 [server.auth_rate_limit]

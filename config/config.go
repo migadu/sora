@@ -101,11 +101,11 @@ import (
 
 // ClientCapabilityFilter defines capability filtering rules for specific clients
 type ClientCapabilityFilter struct {
-	ClientName     string   `toml:"client_name"`     // Client name pattern (regex)
-	ClientVersion  string   `toml:"client_version"`  // Client version pattern (regex)
-	JA4Fingerprint string   `toml:"ja4_fingerprint"` // JA4 TLS fingerprint pattern (regex). Format: "t13d1516h2_8daaf6152771_e5627efa2ab1"
-	DisableCaps    []string `toml:"disable_caps"`    // List of capabilities to disable
-	Reason         string   `toml:"reason"`          // Human-readable reason for the filter
+	ClientName      string   `toml:"client_name"`      // Client name pattern (regex)
+	ClientVersion   string   `toml:"client_version"`   // Client version pattern (regex)
+	JA4Fingerprints []string `toml:"ja4_fingerprints"` // JA4 TLS fingerprint patterns (regex). Can be a single string or array. Useful when a client has multiple fingerprints across versions/platforms. Format: "t13d1516h2_8daaf6152771_e5627efa2ab1"
+	DisableCaps     []string `toml:"disable_caps"`     // List of capabilities to disable
+	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
 }
 
 // DatabaseEndpointConfig holds configuration for a single database endpoint

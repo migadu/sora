@@ -109,9 +109,9 @@ const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
 // ClientCapabilityFilter extends the config.ClientCapabilityFilter with compiled regex patterns
 type ClientCapabilityFilter struct {
 	config.ClientCapabilityFilter
-	clientNameRegexp     *regexp.Regexp
-	clientVersionRegexp  *regexp.Regexp
-	ja4FingerprintRegexp *regexp.Regexp
+	clientNameRegexp      *regexp.Regexp
+	clientVersionRegexp   *regexp.Regexp
+	ja4FingerprintRegexps []*regexp.Regexp // Multiple JA4 patterns - matches if ANY pattern matches
 }
 
 // connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
@@ -458,13 +458,17 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 				filter.clientVersionRegexp = re
 			}
 		}
-		if filter.JA4Fingerprint != "" && isValid {
-			re, err := regexp.Compile(filter.JA4Fingerprint)
-			if err != nil {
-				log.Printf("IMAP [%s] WARNING: invalid ja4_fingerprint regex pattern '%s' in capability filter, skipping filter: %v", name, filter.JA4Fingerprint, err)
-				isValid = false
-			} else {
-				filter.ja4FingerprintRegexp = re
+		// Compile all JA4 fingerprint patterns
+		if len(filter.JA4Fingerprints) > 0 && isValid {
+			filter.ja4FingerprintRegexps = make([]*regexp.Regexp, 0, len(filter.JA4Fingerprints))
+			for _, pattern := range filter.JA4Fingerprints {
+				re, err := regexp.Compile(pattern)
+				if err != nil {
+					log.Printf("IMAP [%s] WARNING: invalid ja4_fingerprints regex pattern '%s' in capability filter, skipping filter: %v", name, pattern, err)
+					isValid = false
+					break
+				}
+				filter.ja4FingerprintRegexps = append(filter.ja4FingerprintRegexps, re)
 			}
 		}
 
@@ -982,8 +986,10 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 	log.Printf("IMAP [%s] Checking %d capability filters (clientName=%q, clientVersion=%q, tlsFingerprint=%q)",
 		s.name, len(s.capFilters), clientName, clientVersion, tlsFingerprint)
 	for i, filter := range s.capFilters {
-		log.Printf("IMAP [%s] Filter %d: ClientName=%q, ClientVersion=%q, JA4Fingerprint=%q, DisableCaps=%v",
-			s.name, i, filter.ClientName, filter.ClientVersion, filter.JA4Fingerprint, filter.DisableCaps)
+		// Display JA4 patterns
+		ja4Display := strings.Join(filter.JA4Fingerprints, ", ")
+		log.Printf("IMAP [%s] Filter %d: ClientName=%q, ClientVersion=%q, JA4Fingerprints=%q, DisableCaps=%v",
+			s.name, i, filter.ClientName, filter.ClientVersion, ja4Display, filter.DisableCaps)
 		if s.clientMatches(clientName, clientVersion, tlsFingerprint, filter) {
 			log.Printf("IMAP [%s] Applying capability filter: %s (clientName=%s, clientVersion=%s, tlsFingerprint=%s)",
 				s.name, filter.Reason, clientName, clientVersion, tlsFingerprint)
@@ -1005,14 +1011,16 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 
 // clientMatches checks if a client matches the filter criteria
 // A filter matches if ANY of the following are true:
-// 1. JA4 fingerprint matches (if specified in filter)
+// 1. JA4 fingerprint matches (if specified in filter) - matches if ANY pattern matches
 // 2. Client name/version match (if specified in filter)
 func (s *IMAPServer) clientMatches(clientName, clientVersion, tlsFingerprint string, filter ClientCapabilityFilter) bool {
-	// Check if JA4 fingerprint matches (if filter specifies one)
-	if filter.ja4FingerprintRegexp != nil {
-		if tlsFingerprint != "" && filter.ja4FingerprintRegexp.MatchString(tlsFingerprint) {
-			// JA4 match is sufficient - return true immediately
-			return true
+	// Check if JA4 fingerprint matches any of the patterns (if filter specifies them)
+	if len(filter.ja4FingerprintRegexps) > 0 && tlsFingerprint != "" {
+		for _, ja4Regexp := range filter.ja4FingerprintRegexps {
+			if ja4Regexp.MatchString(tlsFingerprint) {
+				// JA4 match is sufficient - return true immediately
+				return true
+			}
 		}
 	}
 
