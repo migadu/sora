@@ -174,7 +174,13 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		log.Printf("[HTTP-PreLookup] DEBUG: Parsed response for user '%s': address=%s, server=%s, password_hash_length=%d",
 			email, lookupResp.Address, lookupResp.Server, len(lookupResp.PasswordHash))
 
-		// Validate required fields - invalid 200 response is a server bug
+		// If server is null/empty, treat as user not found (404)
+		if strings.TrimSpace(lookupResp.Server) == "" {
+			log.Printf("[HTTP-PreLookup] Server is null/empty for user '%s' - treating as user not found", email)
+			return map[string]interface{}{"result": AuthUserNotFound}, nil
+		}
+
+		// Validate other required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': address is empty", email)
 			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
@@ -182,10 +188,6 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': password_hash is empty", email)
 			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
-		}
-		if strings.TrimSpace(lookupResp.Server) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server is empty", email)
-			return nil, fmt.Errorf("%w: server is empty in response", ErrPrelookupInvalidResponse)
 		}
 
 		// Derive account_id from the address field

@@ -129,12 +129,12 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
-					// server is missing
+					// server is missing - should be treated as 404
 				})
 			},
-			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with missing server should return ErrPrelookupInvalidResponse",
+			expectAuthResult: AuthUserNotFound,
+			expectErrorType:  nil,
+			description:      "200 with missing server should be treated as user not found (404)",
 		},
 		{
 			name: "200_ValidResponse",
