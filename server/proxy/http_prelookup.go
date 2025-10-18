@@ -38,7 +38,7 @@ type HTTPPreLookupClient struct {
 type HTTPPreLookupResponse struct {
 	Address      string `json:"address"`         // Email address for the user (required - used to derive account_id)
 	PasswordHash string `json:"hashed_password"` // Password hash to verify against (required)
-	Server       string `json:"server_ip"`       // Backend server IP/hostname:port (required)
+	Server       string `json:"server"`          // Backend server IP/hostname:port (required)
 	AccountID    int64  // Derived from Address, not part of JSON response
 }
 
@@ -170,7 +170,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		}
 
 		// Log parsed response
-		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server_ip=%s, address=%s, hashed_password_length=%d",
+		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, hashed_password_length=%d",
 			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
 
 		// Validate required fields - invalid 200 response is a server bug
@@ -183,8 +183,8 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: hashed_password is empty in response", ErrPrelookupInvalidResponse)
 		}
 		if strings.TrimSpace(lookupResp.Server) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server_ip is empty", email)
-			return nil, fmt.Errorf("%w: server_ip is empty in response", ErrPrelookupInvalidResponse)
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server is empty", email)
+			return nil, fmt.Errorf("%w: server is empty in response", ErrPrelookupInvalidResponse)
 		}
 
 		// Derive account_id from the address field

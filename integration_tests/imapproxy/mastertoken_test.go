@@ -245,7 +245,7 @@ func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	response := map[string]interface{}{
 		"address":         actualEmail,
 		"hashed_password": hashToReturn,
-		"server_ip":       h.backendAddr,
+		"server":          h.backendAddr,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
