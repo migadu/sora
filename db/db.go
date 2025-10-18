@@ -664,18 +664,24 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
 		// It will fail only if an exclusive lock is held (e.g., by the migration tool).
-		// Retry with backoff to handle restarts where the old instance is still shutting down.
+		// For shared locks, we use faster retries since they don't conflict with each other.
 		var lockAcquired bool
-		maxRetries := 10
-		retryDelay := 500 * time.Millisecond
+		maxRetries := 30                     // More attempts
+		retryDelay := 100 * time.Millisecond // Start with shorter delay
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			if attempt > 0 {
-				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d)...", attempt+1, maxRetries)
-				time.Sleep(retryDelay)
-				retryDelay *= 2 // Exponential backoff
-				if retryDelay > 5*time.Second {
-					retryDelay = 5 * time.Second
+				// Add jitter to prevent thundering herd when multiple instances restart simultaneously
+				jitter := time.Duration(attempt*10) * time.Millisecond
+				actualDelay := retryDelay + jitter
+
+				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d) after %v...", attempt+1, maxRetries, actualDelay)
+				time.Sleep(actualDelay)
+
+				// Slower exponential backoff for shared locks (1.5x instead of 2x)
+				retryDelay = time.Duration(float64(retryDelay) * 1.5)
+				if retryDelay > 2*time.Second {
+					retryDelay = 2 * time.Second // Lower cap since shared locks don't conflict
 				}
 			}
 

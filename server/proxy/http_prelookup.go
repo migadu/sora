@@ -135,8 +135,9 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
 		}
 
-		// Log the response for debugging
-		log.Printf("[HTTP-PreLookup] Response for user '%s': status=%d, body=%s", email, resp.StatusCode, string(bodyBytes))
+		// Log the raw response for debugging
+		log.Printf("[HTTP-PreLookup] DEBUG: Raw response for user '%s': HTTP %d", email, resp.StatusCode)
+		log.Printf("[HTTP-PreLookup] DEBUG: Response body: %s", string(bodyBytes))
 
 		// Check status code
 		if resp.StatusCode == http.StatusNotFound {
@@ -169,9 +170,9 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
-		// Log parsed response
-		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, password_hash_length=%d",
-			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
+		// Log parsed response (DEBUG)
+		log.Printf("[HTTP-PreLookup] DEBUG: Parsed response for user '%s': address=%s, server=%s, password_hash_length=%d",
+			email, lookupResp.Address, lookupResp.Server, len(lookupResp.PasswordHash))
 
 		// Validate required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {

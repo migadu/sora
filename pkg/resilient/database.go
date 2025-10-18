@@ -605,19 +605,38 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		}
 	}
 
-	// Create database pools for all read hosts
+	// Create database pools for all read hosts (in parallel for faster startup)
 	if config.Read != nil && len(config.Read.Hosts) > 0 {
 		logger.Info("Attempting to connect to read replicas", "component", "RESILIENT-FAILOVER", "count", len(config.Read.Hosts))
-		successCount := 0
+
+		// Use channels to collect results from parallel connection attempts
+		type poolResult struct {
+			host string
+			pool *db.Database
+			err  error
+		}
+		resultChan := make(chan poolResult, len(config.Read.Hosts))
+
+		// Attempt all connections in parallel to minimize startup time
 		for _, host := range config.Read.Hosts {
-			// Never run migrations or acquire lock for read pools.
-			pool, err := createDatabasePool(ctx, host, config.Read, config.GetDebug(), "read", false, false)
-			if err != nil {
-				logger.Warn("Failed to connect to read replica, will retry periodically", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
+			go func(h string) {
+				// Never run migrations or acquire lock for read pools.
+				pool, err := createDatabasePool(ctx, h, config.Read, config.GetDebug(), "read", false, false)
+				resultChan <- poolResult{host: h, pool: pool, err: err}
+			}(host)
+		}
+
+		// Collect results
+		successCount := 0
+		for i := 0; i < len(config.Read.Hosts); i++ {
+			result := <-resultChan
+
+			if result.err != nil {
+				logger.Warn("Failed to connect to read replica, will retry periodically", "component", "RESILIENT-FAILOVER", "host", result.host, "error", result.err)
 
 				// Track this failed replica for reconnection attempts
 				failedReplica := &FailedReplica{
-					host:           host,
+					host:           result.host,
 					endpointConfig: config.Read,
 					lastAttempt:    time.Now(),
 					attemptCount:   1,
@@ -627,8 +646,8 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 			}
 
 			dbPool := &DatabasePool{
-				database: pool,
-				host:     host,
+				database: result.pool,
+				host:     result.host,
 			}
 			dbPool.isHealthy.Store(true) // Start as healthy
 
@@ -640,6 +659,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 				manager.currentReadIdx.Store(int64(len(manager.readPools) - 1))
 			}
 		}
+
 		if successCount > 0 {
 			logger.Info("Successfully connected to read replicas", "component", "RESILIENT-FAILOVER", "success_count", successCount, "total", len(config.Read.Hosts))
 		}
