@@ -183,10 +183,22 @@ func (m *Manager) initLetsEncryptProvider() error {
 		},
 	}
 
-	// Create TLS config with autocert
-	m.tlsConfig = m.autocertMgr.TLSConfig()
-	m.tlsConfig.MinVersion = tls.VersionTLS12
-	m.tlsConfig.NextProtos = []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"}
+	// Create TLS config with autocert and logging wrapper
+	baseTLSConfig := m.autocertMgr.TLSConfig()
+	m.tlsConfig = &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI)", hello.ServerName)
+			cert, err := baseTLSConfig.GetCertificate(hello)
+			if err != nil {
+				logger.Errorf("[TLS] Failed to get certificate for %s: %v", hello.ServerName, err)
+				return nil, err
+			}
+			logger.Debugf("[TLS] Certificate provided for: %s", hello.ServerName)
+			return cert, nil
+		},
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+	}
 
 	logger.Infof("Let's Encrypt autocert initialized for domains: %v", leCfg.Domains)
 	logger.Infof("Certificates will be stored in S3 bucket: %s", leCfg.S3.Bucket)

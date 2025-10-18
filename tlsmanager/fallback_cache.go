@@ -89,17 +89,38 @@ func (fc *FallbackCache) markS3Available() {
 	fc.s3Available = true
 }
 
-// Get retrieves a certificate, trying S3 first, then falling back to local cache
+// Get retrieves a certificate, trying local cache first (fast), then S3 (slow)
+// This ensures TLS handshakes are fast when certificates are already cached locally.
 func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
-	// Try S3 first if available
+	logger.Debugf("[FallbackCache] Get certificate: %s (checking local cache first)", name)
+
+	// STEP 1: Try local cache first (FAST - no network call)
+	data, err := fc.fallback.Get(ctx, name)
+	if err == nil {
+		logger.Debugf("[FallbackCache] Certificate found in local cache: %s", name)
+		return data, nil
+	}
+
+	// Not in local cache or error reading
+	if err != autocert.ErrCacheMiss {
+		logger.Warnf("[FallbackCache] Error reading local cache for %s: %v (will try S3)", name, err)
+	} else {
+		logger.Debugf("[FallbackCache] Certificate not in local cache: %s (checking S3)", name)
+	}
+
+	// STEP 2: Try S3 (SLOW - network call)
 	if fc.isS3Available() {
+		logger.Debugf("[FallbackCache] Fetching certificate from S3: %s", name)
 		data, err := fc.primary.Get(ctx, name)
 		if err == nil {
+			logger.Infof("[FallbackCache] Certificate found in S3: %s (syncing to local cache)", name)
 			fc.markS3Available()
-			// Also store in fallback cache for future resilience
+			// Store in local cache for future fast access
 			go func() {
 				if putErr := fc.fallback.Put(context.Background(), name, data); putErr != nil {
-					logger.Debugf("Failed to sync certificate to fallback cache: %v", putErr)
+					logger.Warnf("[FallbackCache] Failed to sync certificate to local cache: %v", putErr)
+				} else {
+					logger.Debugf("[FallbackCache] Certificate synced to local cache: %s", name)
 				}
 			}()
 			return data, nil
@@ -107,23 +128,19 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 
 		// If it's just a cache miss, don't mark S3 as unavailable
 		if err == autocert.ErrCacheMiss {
+			logger.Debugf("[FallbackCache] Certificate not found in S3: %s (cache miss)", name)
 			return nil, autocert.ErrCacheMiss
 		}
 
-		// S3 error - mark as unavailable and fall back
-		logger.Warnf("S3 Get failed for %s: %v - trying fallback cache", name, err)
+		// S3 error - mark as unavailable
+		logger.Warnf("[FallbackCache] S3 Get failed for %s: %v (S3 unavailable)", name, err)
 		fc.markS3Unavailable()
-	}
-
-	// Try fallback cache
-	logger.Debugf("Using fallback cache for Get: %s", name)
-	data, err := fc.fallback.Get(ctx, name)
-	if err != nil {
 		return nil, err
 	}
 
-	logger.Infof("Certificate retrieved from fallback cache: %s", name)
-	return data, nil
+	// S3 not available and not in local cache
+	logger.Debugf("[FallbackCache] Certificate not found (S3 unavailable, not in local cache): %s", name)
+	return nil, autocert.ErrCacheMiss
 }
 
 // Put stores a certificate, trying S3 first, then falling back to local cache

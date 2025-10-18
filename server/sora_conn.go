@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bufio"
 	"crypto/tls"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -21,6 +24,9 @@ import (
 // with a single, unified implementation.
 type SoraConn struct {
 	net.Conn // Underlying connection (TLS or plain TCP)
+
+	// Buffered reader (created if TLS detection is used)
+	reader *bufio.Reader
 
 	// Timeout protection
 	idleTimeout         time.Duration // Maximum idle time (e.g., 5 minutes)
@@ -177,7 +183,15 @@ func (c *SoraConn) timeoutChecker() {
 
 // Read implements net.Conn.Read with activity tracking
 func (c *SoraConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
+	var n int
+	var err error
+
+	// If we have a buffered reader (from TLS detection), use it
+	if c.reader != nil {
+		n, err = c.reader.Read(b)
+	} else {
+		n, err = c.Conn.Read(b)
+	}
 
 	if n > 0 {
 		c.mu.Lock()
@@ -273,6 +287,95 @@ func (c *SoraConn) GetProtocol() string {
 // Unwrap returns the underlying connection (for compatibility with unwrapping patterns)
 func (c *SoraConn) Unwrap() net.Conn {
 	return c.Conn
+}
+
+// ErrTLSOnPlainPort is returned when TLS traffic is detected on a plain-text port
+var ErrTLSOnPlainPort = errors.New("TLS connection attempted on plain-text port")
+
+// DetectAndRejectTLS checks if the connection is attempting to use TLS on a plain-text port.
+// It peeks at the first 3 bytes to detect the TLS handshake signature (0x16 0x03 0x01/0x02/0x03).
+// If TLS is detected, it writes a rejection message and returns ErrTLSOnPlainPort.
+// This should be called early in protocol handlers for plain-text ports, before sending greetings.
+//
+// After calling this method, subsequent Read() calls will use a buffered reader to ensure
+// peeked bytes are not lost.
+func (c *SoraConn) DetectAndRejectTLS() error {
+	// Create a buffered reader for peeking (if not already created)
+	if c.reader == nil {
+		c.reader = bufio.NewReader(c.Conn)
+	}
+
+	// Set a very short deadline just for peeking to avoid blocking on slow clients
+	// TLS handshakes send the Client Hello immediately, so 100ms is generous
+	originalDeadline := time.Now().Add(100 * time.Millisecond)
+	if err := c.Conn.SetReadDeadline(originalDeadline); err != nil {
+		// If we can't set deadline, skip detection (better to proceed than fail)
+		log.Printf("[%s] TLS detection: cannot set read deadline: %v", c.protocol, err)
+		c.Conn.SetReadDeadline(time.Time{}) // Clear deadline
+		return nil
+	}
+
+	// Peek at first 3 bytes (does not consume them from the buffer)
+	peekBuf, err := c.reader.Peek(3)
+
+	// Clear the deadline immediately
+	c.Conn.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		// Timeout or other error during peek
+		if err == io.EOF {
+			// Connection closed before any data - not our concern
+			return err
+		}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Timeout means no immediate data - not a TLS handshake
+			// (TLS clients send Client Hello immediately upon connect)
+			return nil
+		}
+		// Check for "buffer full" error - might indicate partial read
+		if err == bufio.ErrBufferFull {
+			// This shouldn't happen with 3 bytes, but proceed anyway
+			log.Printf("[%s] TLS detection: buffer full during peek", c.protocol)
+			return nil
+		}
+		// Other errors will be caught by protocol handler
+		return nil
+	}
+
+	if len(peekBuf) < 3 {
+		// Not enough bytes available - cannot definitively detect TLS
+		// This might happen if connection is very slow
+		return nil
+	}
+
+	// Check for TLS handshake signature
+	// TLS records start with: 0x16 (handshake) followed by version (0x03 0x01/0x02/0x03)
+	// SSLv3: 0x16 0x03 0x00
+	// TLS 1.0: 0x16 0x03 0x01
+	// TLS 1.1: 0x16 0x03 0x02
+	// TLS 1.2: 0x16 0x03 0x03
+	// TLS 1.3: 0x16 0x03 0x03 (legacy version field)
+	if peekBuf[0] == 0x16 && peekBuf[1] == 0x03 {
+		// This is very likely a TLS Client Hello
+		remoteAddr := c.Conn.RemoteAddr().String()
+		log.Printf("[%s-SECURITY] remote=%s TLS handshake detected on plain-text port - rejecting connection", c.protocol, remoteAddr)
+
+		// Write a helpful error message
+		// Note: The client's TLS stack won't display this, but it helps with debugging
+		c.Conn.Write([]byte("ERROR: TLS connection attempted on plain-text port. Use STARTTLS or connect to the TLS port.\r\n"))
+
+		// Record metric
+		metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "tls_on_plain_port").Inc()
+
+		// Close the connection
+		c.Close()
+
+		return ErrTLSOnPlainPort
+	}
+
+	// Not TLS - normal plain-text connection
+	// The peeked bytes remain in the buffer for subsequent reads
+	return nil
 }
 
 // SoraListener wraps a net.Listener to create SoraConn instances
