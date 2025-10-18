@@ -187,6 +187,18 @@ func (m *Manager) initLetsEncryptProvider() error {
 	baseTLSConfig := m.autocertMgr.TLSConfig()
 	m.tlsConfig = &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			// Reject requests with no server name (missing SNI)
+			if hello.ServerName == "" {
+				logger.Debugf("[TLS] Rejected certificate request: missing server name (SNI)")
+				return nil, fmt.Errorf("missing server name")
+			}
+
+			// Check if the server name matches our configured domains using the HostPolicy
+			if err := m.autocertMgr.HostPolicy(nil, hello.ServerName); err != nil {
+				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s", hello.ServerName)
+				return nil, err
+			}
+
 			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI)", hello.ServerName)
 			cert, err := baseTLSConfig.GetCertificate(hello)
 			if err != nil {
