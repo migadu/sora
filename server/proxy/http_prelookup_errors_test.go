@@ -14,11 +14,11 @@ import (
 // the correct error types for different failure scenarios
 func TestHTTPPrelookupErrorTypes(t *testing.T) {
 	tests := []struct {
-		name           string
-		handler        http.HandlerFunc
+		name             string
+		handler          http.HandlerFunc
 		expectAuthResult AuthResult
 		expectErrorType  error // ErrPrelookupTransient, ErrPrelookupInvalidResponse, or nil
-		description    string
+		description      string
 	}{
 		{
 			name: "404_UserNotFound",
@@ -200,7 +200,7 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 	// Create prelookup client pointing to non-existent server
 	client := NewHTTPPreLookupClient(
 		"http://localhost:9999/lookup?email=$email", // Port that's not listening
-		100*time.Millisecond, // Short timeout
+		100*time.Millisecond,                        // Short timeout
 		"test-token",
 		143,
 		false, // remoteTLS
