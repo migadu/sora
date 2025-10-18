@@ -246,7 +246,6 @@ func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		"address":         actualEmail,
 		"hashed_password": hashToReturn,
 		"server_ip":       h.backendAddr,
-		"account_id":      1,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

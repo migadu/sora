@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,11 +36,10 @@ type HTTPPreLookupClient struct {
 
 // HTTPPreLookupResponse represents the JSON response from the HTTP prelookup endpoint
 type HTTPPreLookupResponse struct {
-	Address        string `json:"address"`         // Email address for backend impersonation (optional)
-	PasswordHash   string `json:"password_hash"`   // Password hash to verify against (preferred)
-	HashedPassword string `json:"hashed_password"` // Legacy password hash field (fallback)
-	Server         string `json:"server"`          // Backend server IP/hostname:port (required)
-	AccountID      int64  `json:"account_id"`      // Account ID for tracking (required)
+	Address      string `json:"address"`         // Email address for the user (required - used to derive account_id)
+	PasswordHash string `json:"hashed_password"` // Password hash to verify against (required)
+	Server       string `json:"server_ip"`       // Backend server IP/hostname:port (required)
+	AccountID    int64  // Derived from Address, not part of JSON response
 }
 
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
@@ -173,6 +174,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
 
 		// Validate required fields - invalid 200 response is a server bug
+		if strings.TrimSpace(lookupResp.Address) == "" {
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': address is empty", email)
+			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
+		}
 		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': hashed_password is empty", email)
 			return nil, fmt.Errorf("%w: hashed_password is empty in response", ErrPrelookupInvalidResponse)
@@ -181,10 +186,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server_ip is empty", email)
 			return nil, fmt.Errorf("%w: server_ip is empty in response", ErrPrelookupInvalidResponse)
 		}
-		if lookupResp.AccountID <= 0 {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': account_id=%d (must be > 0)", email, lookupResp.AccountID)
-			return nil, fmt.Errorf("%w: account_id is missing or invalid in response (must be > 0)", ErrPrelookupInvalidResponse)
-		}
+
+		// Derive account_id from the address field
+		lookupResp.AccountID = deriveAccountIDFromEmail(lookupResp.Address)
+		log.Printf("[HTTP-PreLookup] Derived account_id from address '%s': %d", lookupResp.Address, lookupResp.AccountID)
 
 		return lookupResp, nil
 	})
@@ -217,11 +222,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		return nil, AuthFailed, fmt.Errorf("unexpected result type from circuit breaker")
 	}
 
-	// Use address from response if provided, otherwise use input email
-	actualEmail := email
-	if strings.TrimSpace(lookupResp.Address) != "" {
-		actualEmail = strings.TrimSpace(lookupResp.Address)
-		log.Printf("[HTTP-PreLookup] Using address from response: '%s' (from input: '%s')", actualEmail, email)
+	// Use the address from response (required field, already validated)
+	actualEmail := strings.TrimSpace(lookupResp.Address)
+	if actualEmail != email {
+		log.Printf("[HTTP-PreLookup] Using address from response: '%s' (differs from query: '%s')", actualEmail, email)
 	}
 
 	// Log authentication attempt
@@ -298,6 +302,30 @@ func (c *HTTPPreLookupClient) normalizeServerAddress(addr string) string {
 		defaultPort = 143 // Default IMAP port
 	}
 	return fmt.Sprintf("%s:%d", addr, defaultPort)
+}
+
+// deriveAccountIDFromEmail creates a stable, unique int64 ID from an email address
+// This allows connection tracking even when the prelookup endpoint doesn't provide an account_id
+func deriveAccountIDFromEmail(email string) int64 {
+	// Normalize the email (lowercase, trim spaces)
+	normalized := strings.ToLower(strings.TrimSpace(email))
+
+	// Hash the email using SHA256
+	hash := sha256.Sum256([]byte(normalized))
+
+	// Take the first 8 bytes and convert to int64
+	// Use absolute value to ensure positive ID
+	id := int64(binary.BigEndian.Uint64(hash[:8]))
+	if id < 0 {
+		id = -id
+	}
+
+	// Ensure it's never 0 (0 means "no account ID" in the code)
+	if id == 0 {
+		id = 1
+	}
+
+	return id
 }
 
 // HealthCheck performs a health check on the HTTP prelookup endpoint
