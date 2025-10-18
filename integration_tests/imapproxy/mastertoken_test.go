@@ -243,10 +243,10 @@ func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	response := map[string]interface{}{
-		"address":       actualEmail,
-		"password_hash": hashToReturn,
-		"server":        h.backendAddr,
-		"account_id":    1,
+		"address":         actualEmail,
+		"hashed_password": hashToReturn,
+		"server_ip":       h.backendAddr,
+		"account_id":      1,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

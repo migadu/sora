@@ -168,27 +168,18 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
-		// Normalize password hash field: support both password_hash (preferred) and hashed_password (legacy)
-		passwordHash := strings.TrimSpace(lookupResp.PasswordHash)
-		if passwordHash == "" {
-			passwordHash = strings.TrimSpace(lookupResp.HashedPassword)
-		}
-
 		// Log parsed response
-		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, password_hash_length=%d, hashed_password_length=%d",
-			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash), len(lookupResp.HashedPassword))
+		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server_ip=%s, address=%s, hashed_password_length=%d",
+			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
 
 		// Validate required fields - invalid 200 response is a server bug
-		if passwordHash == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': both password_hash and hashed_password are empty", email)
-			return nil, fmt.Errorf("%w: password_hash and hashed_password are both empty in response", ErrPrelookupInvalidResponse)
+		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': hashed_password is empty", email)
+			return nil, fmt.Errorf("%w: hashed_password is empty in response", ErrPrelookupInvalidResponse)
 		}
-
-		// Update the response struct with the normalized hash
-		lookupResp.PasswordHash = passwordHash
 		if strings.TrimSpace(lookupResp.Server) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server is empty", email)
-			return nil, fmt.Errorf("%w: server is empty in response", ErrPrelookupInvalidResponse)
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server_ip is empty", email)
+			return nil, fmt.Errorf("%w: server_ip is empty in response", ErrPrelookupInvalidResponse)
 		}
 		if lookupResp.AccountID <= 0 {
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': account_id=%d (must be > 0)", email, lookupResp.AccountID)

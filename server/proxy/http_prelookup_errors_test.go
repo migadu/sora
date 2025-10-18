@@ -67,59 +67,59 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			description:      "200 with invalid JSON should return ErrPrelookupInvalidResponse",
 		},
 		{
-			name: "200_MissingPasswordHash",
+			name: "200_MissingHashedPassword",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"address":    "user@example.com",
-					"server":     "backend:143",
+					"server_ip":  "backend:143",
 					"account_id": 123,
-					// password_hash is missing
+					// hashed_password is missing
 				})
 			},
 			expectAuthResult: AuthFailed,
 			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with missing password_hash should return ErrPrelookupInvalidResponse",
+			description:      "200 with missing hashed_password should return ErrPrelookupInvalidResponse",
 		},
 		{
-			name: "200_EmptyPasswordHash",
+			name: "200_EmptyHashedPassword",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":       "user@example.com",
-					"password_hash": "",
-					"server":        "backend:143",
-					"account_id":    123,
+					"address":         "user@example.com",
+					"hashed_password": "",
+					"server_ip":       "backend:143",
+					"account_id":      123,
 				})
 			},
 			expectAuthResult: AuthFailed,
 			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with empty password_hash should return ErrPrelookupInvalidResponse",
+			description:      "200 with empty hashed_password should return ErrPrelookupInvalidResponse",
 		},
 		{
-			name: "200_MissingServer",
+			name: "200_MissingServerIP",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":       "user@example.com",
-					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
-					"account_id":    123,
-					// server is missing
+					"address":         "user@example.com",
+					"hashed_password": "$2a$10$abcdefghijklmnopqrstuvwxyz",
+					"account_id":      123,
+					// server_ip is missing
 				})
 			},
 			expectAuthResult: AuthFailed,
 			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with missing server should return ErrPrelookupInvalidResponse",
+			description:      "200 with missing server_ip should return ErrPrelookupInvalidResponse",
 		},
 		{
 			name: "200_InvalidAccountID",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":       "user@example.com",
-					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
-					"server":        "backend:143",
-					"account_id":    0, // Invalid account ID
+					"address":         "user@example.com",
+					"hashed_password": "$2a$10$abcdefghijklmnopqrstuvwxyz",
+					"server_ip":       "backend:143",
+					"account_id":      0, // Invalid account ID
 				})
 			},
 			expectAuthResult: AuthFailed,
@@ -131,46 +131,15 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":       "user@example.com",
-					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash of "password"
-					"server":        "backend:143",
-					"account_id":    123,
+					"address":         "user@example.com",
+					"hashed_password": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash of "password"
+					"server_ip":       "backend:143",
+					"account_id":      123,
 				})
 			},
 			expectAuthResult: AuthFailed, // Will fail password check in this test
 			expectErrorType:  nil,
 			description:      "200 with valid response structure should parse successfully",
-		},
-		{
-			name: "200_LegacyHashedPassword",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":         "user@example.com",
-					"hashed_password": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash
-					"server":          "backend:143",
-					"account_id":      123,
-				})
-			},
-			expectAuthResult: AuthFailed, // Will fail password check in this test
-			expectErrorType:  nil,
-			description:      "200 with legacy hashed_password field should work as fallback",
-		},
-		{
-			name: "200_BothHashFields",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"address":         "user@example.com",
-					"password_hash":   "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // Preferred
-					"hashed_password": "$2a$10$differenthash",                                         // Should be ignored
-					"server":          "backend:143",
-					"account_id":      123,
-				})
-			},
-			expectAuthResult: AuthFailed, // Will fail password check in this test
-			expectErrorType:  nil,
-			description:      "200 with both hash fields should prefer password_hash",
 		},
 	}
 
