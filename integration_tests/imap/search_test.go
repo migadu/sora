@@ -162,3 +162,146 @@ func TestIMAP_SearchOperations(t *testing.T) {
 
 	t.Log("Search operations test completed successfully")
 }
+
+// TestIMAP_ESearchEmptyResult tests ESEARCH with empty results
+//
+// This test verifies that empty ESEARCH responses are formatted correctly:
+// "* ESEARCH (TAG "X") UID" without the "ALL" keyword when there are no results.
+//
+// This was previously broken in upstream go-imap but is now fixed in our fork.
+func TestIMAP_ESearchEmptyResult(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Select INBOX
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Add a single test message so we have something in the mailbox
+	testMessage := "From: sender@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Test Message\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
+		"\r\n" +
+		"Test body\r\n"
+
+	appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+		Flags: []imap.Flag{imap.FlagSeen},
+		Time:  time.Now(),
+	})
+	_, err = appendCmd.Write([]byte(testMessage))
+	if err != nil {
+		t.Fatalf("APPEND write failed: %v", err)
+	}
+	err = appendCmd.Close()
+	if err != nil {
+		t.Fatalf("APPEND close failed: %v", err)
+	}
+	_, err = appendCmd.Wait()
+	if err != nil {
+		t.Fatalf("APPEND failed: %v", err)
+	}
+
+	// Test 1: UID SEARCH with RETURN (ALL) for non-existent UID
+	// This should return empty results: "* ESEARCH (TAG "X") UID" without "ALL"
+	searchResults, err := c.UIDSearch(&imap.SearchCriteria{
+		UID: []imap.UIDSet{imap.UIDSetNum(99999)}, // Non-existent UID
+	}, &imap.SearchOptions{
+		ReturnAll: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("UID SEARCH RETURN (ALL) failed: %v", err)
+	}
+
+	uids := searchResults.AllUIDs()
+	if len(uids) != 0 {
+		t.Errorf("Expected 0 UIDs in empty search result, got %d: %v", len(uids), uids)
+	}
+	t.Logf("UID SEARCH RETURN (ALL) for non-existent UID correctly returned empty result")
+
+	// Test 2: UID SEARCH with RETURN (MIN MAX ALL) for non-existent UID
+	searchResults, err = c.UIDSearch(&imap.SearchCriteria{
+		UID: []imap.UIDSet{imap.UIDSetNum(99999)},
+	}, &imap.SearchOptions{
+		ReturnMin: true,
+		ReturnMax: true,
+		ReturnAll: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("UID SEARCH RETURN (MIN MAX ALL) failed: %v", err)
+	}
+
+	uids = searchResults.AllUIDs()
+	if len(uids) != 0 {
+		t.Errorf("Expected 0 UIDs in empty search result, got %d: %v", len(uids), uids)
+	}
+	if searchResults.Min != 0 {
+		t.Errorf("Expected Min=0 for empty result, got %d", searchResults.Min)
+	}
+	if searchResults.Max != 0 {
+		t.Errorf("Expected Max=0 for empty result, got %d", searchResults.Max)
+	}
+	t.Logf("UID SEARCH RETURN (MIN MAX ALL) for non-existent UID correctly returned empty result")
+
+	// Test 3: Regular SEARCH (non-UID) with RETURN (ALL) for non-existent sequence
+	searchResults, err = c.Search(&imap.SearchCriteria{
+		SeqNum: []imap.SeqSet{imap.SeqSetNum(99999)}, // Non-existent sequence number
+	}, &imap.SearchOptions{
+		ReturnAll: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("SEARCH RETURN (ALL) failed: %v", err)
+	}
+
+	seqNums := searchResults.AllSeqNums()
+	if len(seqNums) != 0 {
+		t.Errorf("Expected 0 sequence numbers in empty search result, got %d: %v", len(seqNums), seqNums)
+	}
+	t.Logf("SEARCH RETURN (ALL) for non-existent sequence correctly returned empty result")
+
+	// Test 4: Standard SEARCH (no RETURN clause) - should work fine
+	// Standard SEARCH doesn't use ESEARCH format so no encoder bug
+	searchResults, err = c.UIDSearch(&imap.SearchCriteria{
+		UID: []imap.UIDSet{imap.UIDSetNum(99999)},
+	}, nil).Wait()
+	if err != nil {
+		t.Fatalf("UID SEARCH (standard) failed: %v", err)
+	}
+
+	uids = searchResults.AllUIDs()
+	if len(uids) != 0 {
+		t.Errorf("Expected 0 UIDs in empty search result, got %d: %v", len(uids), uids)
+	}
+	t.Logf("UID SEARCH (standard) for non-existent UID correctly returned empty result")
+
+	// Test 5: Search by non-existent flag with RETURN (ALL)
+	searchResults, err = c.UIDSearch(&imap.SearchCriteria{
+		Flag: []imap.Flag{imap.FlagFlagged}, // Our message doesn't have this flag
+	}, &imap.SearchOptions{
+		ReturnAll: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("UID SEARCH by non-existent flag failed: %v", err)
+	}
+
+	uids = searchResults.AllUIDs()
+	if len(uids) != 0 {
+		t.Errorf("Expected 0 UIDs when searching for non-existent flag, got %d: %v", len(uids), uids)
+	}
+	t.Logf("UID SEARCH by non-existent flag correctly returned empty result")
+
+	t.Log("ESEARCH empty result test completed successfully")
+}

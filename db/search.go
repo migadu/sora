@@ -323,6 +323,11 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 		return "", nil, fmt.Errorf("unsupported NumSet type: %T", numSet)
 	}
 
+	// If no conditions were generated (empty set), return a condition that matches nothing
+	if len(conditions) == 0 {
+		return "1=0", args, nil
+	}
+
 	finalCondition := strings.Join(conditions, " OR ")
 	if len(conditions) > 1 {
 		finalCondition = "(" + finalCondition + ")"

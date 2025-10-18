@@ -92,12 +92,16 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
 
-	// If client uses ESEARCH syntax but ESEARCH capability is filtered, fall back to standard SEARCH
-	// This provides graceful compatibility when capability filtering is applied
+	// If client uses ESEARCH syntax but ESEARCH capability is filtered, return error
+	// RFC 5530 defines CLIENTBUG for when client violates server's advertised capabilities
 	if isESEARCH && !s.GetCapabilities().Has(imap.CapESearch) {
-		s.Log("[SEARCH] Client using ESEARCH RETURN syntax but ESEARCH capability is filtered - falling back to standard SEARCH")
-		isESEARCH = false // Force standard SEARCH response format
-		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_fallback", "capability_filter").Inc()
+		s.Log("[SEARCH] Client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
+		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeClientBug,
+			Text: "ESEARCH is not supported for this client",
+		}
 	}
 
 	if isESEARCH && options != nil {
@@ -108,20 +112,22 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
 			// Set count for ESEARCH responses
 			searchData.Count = uint32(len(messages))
+
+			// Always initialize All as empty set for ESEARCH to work around go-imap encoder bug
+			// The encoder checks if All is nil/empty AFTER writing "ALL", causing parse errors
+			var uids imap.UIDSet
+			var seqNums imap.SeqSet
+
 			if len(messages) > 0 {
+				// Set fields for ESEARCH responses when we have results
 				if options.ReturnMin {
 					searchData.Min = uint32(messages[0].UID)
 				}
 				if options.ReturnMax {
 					searchData.Max = uint32(messages[len(messages)-1].UID)
 				}
-			}
 
-			// Include ALL for ESEARCH responses when there are results
-			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
-			if len(messages) > 0 {
-				var uids imap.UIDSet
-				var seqNums imap.SeqSet
+				// Populate ALL with actual results
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
 					// Use our snapshot of sessionTracker which is thread-safe
@@ -133,22 +139,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 						seqNums.AddNum(msg.Seq)
 					}
 				}
-				if numKind == imapserver.NumKindUID {
-					searchData.All = uids
-				} else {
-					searchData.All = seqNums
-				}
-			} else {
-				// When client explicitly requests ALL, we must provide empty sets
-				if options.ReturnAll {
-					if numKind == imapserver.NumKindUID {
-						searchData.All = imap.UIDSet{}
-					} else {
-						searchData.All = imap.SeqSet{}
-					}
-				}
 			}
-			// When empty, go-imap will output "ESEARCH (TAG ...) UID" without ALL
+
+			// Always set All (even if empty) to ensure go-imap encoder works correctly
+			if numKind == imapserver.NumKindUID {
+				searchData.All = uids
+			} else {
+				searchData.All = seqNums
+			}
 
 			// RFC 4731: For ESEARCH, COUNT should be included unless explicitly excluded
 			// The Count field is always set (line 59), but we need to ensure it's included in the response
@@ -163,7 +161,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			searchData.Count = uint32(len(messages))
 
 			// Include ALL for ESEARCH responses when there are results
-			// Note: go-imap has issues encoding empty sets, so we only set All when non-empty
+			// Note: When empty, we don't set All at all (not even empty sets)
+			// This ensures go-imap outputs "ESEARCH (TAG ...) UID" without the "ALL" keyword
 			if len(messages) > 0 {
 				var uids imap.UIDSet
 				var seqNums imap.SeqSet
@@ -180,13 +179,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 					searchData.All = uids
 				} else {
 					searchData.All = seqNums
-				}
-			} else {
-				// For default ESEARCH behavior, we should provide ALL even when empty
-				if numKind == imapserver.NumKindUID {
-					searchData.All = imap.UIDSet{}
-				} else {
-					searchData.All = imap.SeqSet{}
 				}
 			}
 		}

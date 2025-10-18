@@ -107,6 +107,12 @@ func TestNewFallbackCache_Success(t *testing.T) {
 	if string(data) != string(testData) {
 		t.Errorf("Got wrong data: expected %q, got %q", testData, data)
 	}
+
+	// Clean up test data to ensure directory is empty for t.TempDir() cleanup
+	err = cache.Delete(ctx, "test-cert")
+	if err != nil {
+		t.Logf("Failed to delete test cert (non-critical): %v", err)
+	}
 }
 
 // TestFallbackCache_S3Failure verifies fallback behavior when S3 fails
