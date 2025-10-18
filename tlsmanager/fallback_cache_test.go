@@ -113,6 +113,12 @@ func TestNewFallbackCache_Success(t *testing.T) {
 	if err != nil {
 		t.Logf("Failed to delete test cert (non-critical): %v", err)
 	}
+
+	// Also clean up fallback directory explicitly to avoid cleanup warnings
+	// DirCache may create subdirectories that need to be removed
+	if err := os.RemoveAll(fallbackDir); err != nil {
+		t.Logf("Failed to clean up fallback directory (non-critical): %v", err)
+	}
 }
 
 // TestFallbackCache_S3Failure verifies fallback behavior when S3 fails

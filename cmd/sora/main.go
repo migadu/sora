@@ -80,6 +80,7 @@ type serverDependencies struct {
 	metricsCollector  *metrics.Collector
 	clusterManager    *cluster.Manager
 	tlsManager        *tlsmanager.Manager
+	affinityManager   *serverPkg.AffinityManager
 	hostname          string
 	config            config.Config
 	serverManager     *serverManager
@@ -464,6 +465,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			deps.clusterManager.GetNodeID(),
 			deps.clusterManager.GetMemberCount(),
 			deps.clusterManager.GetLeaderID())
+
+		// Initialize affinity manager for cluster-wide user-to-backend affinity
+		// Default TTL: 1 hour, Cleanup interval: 10 minutes
+		deps.affinityManager = serverPkg.NewAffinityManager(deps.clusterManager, true, 1*time.Hour, 10*time.Minute)
+		logger.Infof("Affinity manager initialized for cluster-wide user routing")
 	}
 
 	// Initialize TLS manager if TLS is enabled
@@ -974,8 +980,14 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
-	// Register prelookup health check if prelookup is enabled
+	// Set affinity manager on connection manager if cluster is enabled
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if deps.affinityManager != nil {
+			connMgr.SetAffinityManager(deps.affinityManager)
+			logger.Infof("IMAP Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+		}
+
+		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
@@ -1071,8 +1083,14 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
-	// Register prelookup health check if prelookup is enabled
+	// Set affinity manager on connection manager if cluster is enabled
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if deps.affinityManager != nil {
+			connMgr.SetAffinityManager(deps.affinityManager)
+			logger.Infof("POP3 Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+		}
+
+		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
@@ -1169,8 +1187,14 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		return
 	}
 
-	// Register prelookup health check if prelookup is enabled
+	// Set affinity manager on connection manager if cluster is enabled
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if deps.affinityManager != nil {
+			connMgr.SetAffinityManager(deps.affinityManager)
+			logger.Infof("ManageSieve Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+		}
+
+		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
@@ -1243,8 +1267,14 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
-	// Register prelookup health check if prelookup is enabled
+	// Set affinity manager on connection manager if cluster is enabled
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if deps.affinityManager != nil {
+			connMgr.SetAffinityManager(deps.affinityManager)
+			logger.Infof("LMTP Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+		}
+
+		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
