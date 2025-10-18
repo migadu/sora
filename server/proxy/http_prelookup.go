@@ -34,10 +34,11 @@ type HTTPPreLookupClient struct {
 
 // HTTPPreLookupResponse represents the JSON response from the HTTP prelookup endpoint
 type HTTPPreLookupResponse struct {
-	Address      string `json:"address"`       // Email address for backend impersonation (optional)
-	PasswordHash string `json:"password_hash"` // Password hash to verify against (required)
-	Server       string `json:"server"`        // Backend server IP/hostname:port (required)
-	AccountID    int64  `json:"account_id"`    // Account ID for tracking (required)
+	Address        string `json:"address"`         // Email address for backend impersonation (optional)
+	PasswordHash   string `json:"password_hash"`   // Password hash to verify against (preferred)
+	HashedPassword string `json:"hashed_password"` // Legacy password hash field (fallback)
+	Server         string `json:"server"`          // Backend server IP/hostname:port (required)
+	AccountID      int64  `json:"account_id"`      // Account ID for tracking (required)
 }
 
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
@@ -167,15 +168,24 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
+		// Normalize password hash field: support both password_hash (preferred) and hashed_password (legacy)
+		passwordHash := strings.TrimSpace(lookupResp.PasswordHash)
+		if passwordHash == "" {
+			passwordHash = strings.TrimSpace(lookupResp.HashedPassword)
+		}
+
 		// Log parsed response
-		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, password_hash_length=%d",
-			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
+		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, password_hash_length=%d, hashed_password_length=%d",
+			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash), len(lookupResp.HashedPassword))
 
 		// Validate required fields - invalid 200 response is a server bug
-		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': password_hash is empty", email)
-			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
+		if passwordHash == "" {
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': both password_hash and hashed_password are empty", email)
+			return nil, fmt.Errorf("%w: password_hash and hashed_password are both empty in response", ErrPrelookupInvalidResponse)
 		}
+
+		// Update the response struct with the normalized hash
+		lookupResp.PasswordHash = passwordHash
 		if strings.TrimSpace(lookupResp.Server) == "" {
 			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server is empty", email)
 			return nil, fmt.Errorf("%w: server is empty in response", ErrPrelookupInvalidResponse)

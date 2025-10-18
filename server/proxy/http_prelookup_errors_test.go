@@ -141,6 +141,37 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			expectErrorType:  nil,
 			description:      "200 with valid response structure should parse successfully",
 		},
+		{
+			name: "200_LegacyHashedPassword",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"address":         "user@example.com",
+					"hashed_password": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash
+					"server":          "backend:143",
+					"account_id":      123,
+				})
+			},
+			expectAuthResult: AuthFailed, // Will fail password check in this test
+			expectErrorType:  nil,
+			description:      "200 with legacy hashed_password field should work as fallback",
+		},
+		{
+			name: "200_BothHashFields",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"address":         "user@example.com",
+					"password_hash":   "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // Preferred
+					"hashed_password": "$2a$10$differenthash",                                         // Should be ignored
+					"server":          "backend:143",
+					"account_id":      123,
+				})
+			},
+			expectAuthResult: AuthFailed, // Will fail password check in this test
+			expectErrorType:  nil,
+			description:      "200 with both hash fields should prefer password_hash",
+		},
 	}
 
 	for _, tt := range tests {
