@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"strconv"
@@ -15,6 +16,17 @@ const (
 	AuthUserNotFound AuthResult = iota // User doesn't exist in prelookup - fallback allowed
 	AuthSuccess                        // User found and authenticated - proceed with routing
 	AuthFailed                         // User found but auth failed - reject, no fallback
+)
+
+// Prelookup error types for distinguishing failure modes
+var (
+	// ErrPrelookupTransient represents a transient error (network issue, 5xx, circuit breaker open)
+	// Fallback behavior is controlled by fallback_to_default config
+	ErrPrelookupTransient = errors.New("prelookup transient error")
+
+	// ErrPrelookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)
+	// This is a server bug - should fail hard, no fallback
+	ErrPrelookupInvalidResponse = errors.New("prelookup invalid response")
 )
 
 // UserRoutingLookup interface for routing lookups

@@ -121,9 +121,20 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
+			// Network error - this is transient
+			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrPrelookupTransient, err)
 		}
 		defer resp.Body.Close()
+
+		// Read response body first so we can log it
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			log.Printf("[HTTP-PreLookup] Failed to read response body for user '%s': %v", email, readErr)
+			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
+		}
+
+		// Log the response for debugging
+		log.Printf("[HTTP-PreLookup] Response for user '%s': status=%d, body=%s", email, resp.StatusCode, string(bodyBytes))
 
 		// Check status code
 		if resp.StatusCode == http.StatusNotFound {
@@ -131,27 +142,47 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return map[string]interface{}{"result": AuthUserNotFound}, nil
 		}
 
+		// 4xx errors (except 404) mean user lookup failed - allow fallback
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			log.Printf("[HTTP-PreLookup] Client error %d for user '%s': %s - treating as user not found", resp.StatusCode, email, string(bodyBytes))
+			return map[string]interface{}{"result": AuthUserNotFound}, nil
+		}
+
+		// 5xx errors are transient - fallback controlled by config
+		if resp.StatusCode >= 500 {
+			log.Printf("[HTTP-PreLookup] Server error %d for user '%s': %s", resp.StatusCode, email, string(bodyBytes))
+			return nil, fmt.Errorf("%w: server error %d", ErrPrelookupTransient, resp.StatusCode)
+		}
+
+		// Non-200 2xx responses - treat as transient
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			log.Printf("[HTTP-PreLookup] Unexpected status %d for user '%s': %s", resp.StatusCode, email, string(body))
-			return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			log.Printf("[HTTP-PreLookup] Unexpected status %d for user '%s': %s", resp.StatusCode, email, string(bodyBytes))
+			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrPrelookupTransient, resp.StatusCode)
 		}
 
-		// Parse JSON response
+		// Parse JSON response - if this fails on a 200 response, it's a server bug
 		var lookupResp HTTPPreLookupResponse
-		if err := json.NewDecoder(resp.Body).Decode(&lookupResp); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+		if err := json.Unmarshal(bodyBytes, &lookupResp); err != nil {
+			log.Printf("[HTTP-PreLookup] Failed to parse JSON for user '%s': %v, body: %s", email, err, string(bodyBytes))
+			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
-		// Validate required fields
+		// Log parsed response
+		log.Printf("[HTTP-PreLookup] Parsed response for user '%s': account_id=%d, server=%s, address=%s, password_hash_length=%d",
+			email, lookupResp.AccountID, lookupResp.Server, lookupResp.Address, len(lookupResp.PasswordHash))
+
+		// Validate required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
-			return nil, fmt.Errorf("password_hash is empty in response")
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': password_hash is empty", email)
+			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
 		}
 		if strings.TrimSpace(lookupResp.Server) == "" {
-			return nil, fmt.Errorf("server is empty in response")
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': server is empty", email)
+			return nil, fmt.Errorf("%w: server is empty in response", ErrPrelookupInvalidResponse)
 		}
 		if lookupResp.AccountID <= 0 {
-			return nil, fmt.Errorf("account_id is missing or invalid in response (must be > 0)")
+			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': account_id=%d (must be > 0)", email, lookupResp.AccountID)
+			return nil, fmt.Errorf("%w: account_id is missing or invalid in response (must be > 0)", ErrPrelookupInvalidResponse)
 		}
 
 		return lookupResp, nil
@@ -161,8 +192,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
 			log.Printf("[HTTP-PreLookup] Circuit breaker is open for %s", c.baseURL)
-			return nil, AuthFailed, fmt.Errorf("circuit breaker open: too many failures")
+			// Circuit breaker open is a transient error - wrap it
+			return nil, AuthFailed, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
 		}
+		// Return error as-is (already wrapped with ErrPrelookupTransient or ErrPrelookupInvalidResponse)
 		return nil, AuthFailed, err
 	}
 

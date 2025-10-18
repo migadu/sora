@@ -327,8 +327,31 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 		if err != nil {
-			log.Printf("POP3 Proxy [%s] Prelookup authentication for '%s' failed with an error: %v. Falling back to main DB.", s.server.name, username, err)
-			// Fallthrough to main DB auth
+			// Categorize the error type to determine fallback behavior
+			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
+				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
+				log.Printf("POP3 Proxy [%s] Prelookup returned invalid response for '%s': %v. This is a server bug - rejecting authentication.", s.server.name, username, err)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+				return fmt.Errorf("prelookup server error: invalid response")
+			}
+
+			if errors.Is(err, proxy.ErrPrelookupTransient) {
+				// Transient error (network, 5xx, circuit breaker) - check fallback config
+				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
+					log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+					// Fallthrough to main DB auth
+				} else {
+					log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+					return fmt.Errorf("prelookup service unavailable")
+				}
+			} else {
+				// Unknown error type - log and fallthrough
+				log.Printf("POP3 Proxy [%s] Prelookup unknown error for '%s': %v. Attempting fallback to main DB.", s.server.name, username, err)
+				// Fallthrough to main DB auth
+			}
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:

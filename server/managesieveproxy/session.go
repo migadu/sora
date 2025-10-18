@@ -407,10 +407,35 @@ func (s *Session) authenticateUser(username, password string) error {
 	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 	if err != nil {
-		if s.server.debug {
-			log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup authentication for '%s' failed with error: %v. Falling back to main DB.", s.server.name, username, err)
+		// Categorize the error type to determine fallback behavior
+		if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
+			// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
+			log.Printf("ManageSieve Proxy [%s] Prelookup returned invalid response for '%s': %v. This is a server bug - rejecting authentication.", s.server.name, username, err)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			return fmt.Errorf("prelookup server error: invalid response")
 		}
-		// Fallthrough to main DB auth
+
+		if errors.Is(err, proxy.ErrPrelookupTransient) {
+			// Transient error (network, 5xx, circuit breaker) - check fallback config
+			if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
+				if s.server.debug {
+					log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+				}
+				// Fallthrough to main DB auth
+			} else {
+				log.Printf("ManageSieve Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				return fmt.Errorf("prelookup service unavailable")
+			}
+		} else {
+			// Unknown error type - log and fallthrough
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup unknown error for '%s': %v. Attempting fallback to main DB.", s.server.name, username, err)
+			}
+			// Fallthrough to main DB auth
+		}
 	} else {
 		switch authResult {
 		case proxy.AuthSuccess:
