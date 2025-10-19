@@ -445,7 +445,6 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapID:            struct{}{},
 			imap.CapNamespace:     struct{}{},
 			imap.CapMetadata:      struct{}{},
-			imap.Cap("ACL"):       struct{}{}, // RFC 4314 - Access Control List
 		},
 		masterUsername:         options.MasterUsername,
 		masterPassword:         options.MasterPassword,
@@ -539,6 +538,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
 		s.caps[appendLimitCapName] = struct{}{}
 		s.caps.Has(imap.CapAppendLimit)
+	}
+
+	// Enable ACL capability only if shared mailboxes are enabled
+	if s.config != nil && s.config.SharedMailboxes.Enabled {
+		s.caps[imap.CapACL] = struct{}{} // RFC 4314 - Access Control List
 	}
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided

@@ -109,10 +109,13 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 
 // timeoutChecker runs in background and enforces timeout protections
 func (c *SoraConn) timeoutChecker() {
-	// Check frequency: every 1 minute for throughput, or more frequently for idle timeout
+	// Check frequency: every 1 minute for throughput, or more frequently for idle/absolute timeout
 	checkInterval := 1 * time.Minute
 	if c.idleTimeout > 0 && c.idleTimeout/4 < checkInterval {
 		checkInterval = c.idleTimeout / 4
+	}
+	if c.absoluteTimeout > 0 && c.absoluteTimeout/4 < checkInterval {
+		checkInterval = c.absoluteTimeout / 4
 	}
 
 	ticker := time.NewTicker(checkInterval)
@@ -140,7 +143,7 @@ func (c *SoraConn) timeoutChecker() {
 				log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=session_max duration=%v: Connection closed - exceeded maximum session duration (%v)",
 					c.protocol, remoteAddr, username, sessionDuration.Round(time.Second), c.absoluteTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
-				c.Conn.Close()
+				c.Close()
 				return
 			}
 
@@ -154,7 +157,7 @@ func (c *SoraConn) timeoutChecker() {
 					log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=slow_throughput bytes_per_min=%.0f required=%d: Connection closed - throughput too slow",
 						c.protocol, remoteAddr, username, bytesPerMinute, c.minBytesPerMinute)
 					metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
-					c.Conn.Close()
+					c.Close()
 					return
 				}
 
@@ -171,7 +174,7 @@ func (c *SoraConn) timeoutChecker() {
 				log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=idle idle_time=%v max_idle=%v: Connection closed - no activity",
 					c.protocol, remoteAddr, username, idleTime.Round(time.Second), c.idleTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
-				c.Conn.Close()
+				c.Close()
 				return
 			}
 

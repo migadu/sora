@@ -197,10 +197,37 @@ func TestSoraConnUnwrap(t *testing.T) {
 
 // TestSoraConnActivityTracking tests that read/write updates activity timestamps
 func TestSoraConnActivityTracking(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
-	clientConn, serverConn := net.Pipe()
+	// Create a TCP listener for real connection
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Accept in background
+	acceptDone := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Logf("Accept error: %v", err)
+			close(acceptDone)
+			return
+		}
+		acceptDone <- conn
+	}()
+
+	// Connect client
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
 	defer clientConn.Close()
-	defer serverConn.Close()
+
+	// Get server connection
+	serverConn := <-acceptDone
+	if serverConn == nil {
+		t.Fatal("Server failed to accept connection")
+	}
 
 	config := SoraConnConfig{
 		Protocol:             "test",
@@ -211,18 +238,23 @@ func TestSoraConnActivityTracking(t *testing.T) {
 	defer soraConn.Close()
 
 	// Record initial activity time
+	soraConn.mu.RLock()
 	initialActivity := soraConn.lastActivity
+	soraConn.mu.RUnlock()
 
 	// Wait a bit
 	time.Sleep(50 * time.Millisecond)
 
-	// Perform a write
+	// Perform a write and read to ensure activity is tracked
 	go func() {
 		soraConn.Write([]byte("test"))
 	}()
 
 	buf := make([]byte, 100)
-	clientConn.Read(buf)
+	_, err = clientConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Client read failed: %v", err)
+	}
 
 	// Check that activity was updated
 	soraConn.mu.RLock()
@@ -238,9 +270,37 @@ func TestSoraConnActivityTracking(t *testing.T) {
 
 // TestSoraConnIdleTimeout tests idle timeout enforcement
 func TestSoraConnIdleTimeout(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
-	clientConn, serverConn := net.Pipe()
+	// Create a TCP listener for real connection
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Accept in background
+	acceptDone := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Logf("Accept error: %v", err)
+			close(acceptDone)
+			return
+		}
+		acceptDone <- conn
+	}()
+
+	// Connect client
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
 	defer clientConn.Close()
+
+	// Get server connection
+	serverConn := <-acceptDone
+	if serverConn == nil {
+		t.Fatal("Server failed to accept connection")
+	}
 
 	config := SoraConnConfig{
 		Protocol:             "test",
@@ -255,11 +315,11 @@ func TestSoraConnIdleTimeout(t *testing.T) {
 	// Don't perform any I/O - connection should timeout
 
 	// Wait for timeout to trigger (timeout + grace period)
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Try to read - should fail because connection was closed
 	buf := make([]byte, 100)
-	_, err := soraConn.Read(buf)
+	_, err = soraConn.Read(buf)
 	if err == nil {
 		t.Error("Expected error after idle timeout, got nil")
 	}
@@ -269,9 +329,37 @@ func TestSoraConnIdleTimeout(t *testing.T) {
 
 // TestSoraConnAbsoluteTimeout tests absolute session timeout
 func TestSoraConnAbsoluteTimeout(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
-	clientConn, serverConn := net.Pipe()
+	// Create a TCP listener for real connection
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Accept in background
+	acceptDone := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Logf("Accept error: %v", err)
+			close(acceptDone)
+			return
+		}
+		acceptDone <- conn
+	}()
+
+	// Connect client
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
 	defer clientConn.Close()
+
+	// Get server connection
+	serverConn := <-acceptDone
+	if serverConn == nil {
+		t.Fatal("Server failed to accept connection")
+	}
 
 	config := SoraConnConfig{
 		Protocol:             "test",
@@ -311,7 +399,7 @@ func TestSoraConnAbsoluteTimeout(t *testing.T) {
 	}()
 
 	// Wait for absolute timeout
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(400 * time.Millisecond)
 
 	// Connection should be closed
 	soraConn.closeMutex.Lock()
@@ -327,10 +415,37 @@ func TestSoraConnAbsoluteTimeout(t *testing.T) {
 
 // TestSoraConnConcurrentAccess tests thread-safety
 func TestSoraConnConcurrentAccess(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
-	clientConn, serverConn := net.Pipe()
+	// Create a TCP listener for real connection
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	// Accept in background
+	acceptDone := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Logf("Accept error: %v", err)
+			close(acceptDone)
+			return
+		}
+		acceptDone <- conn
+	}()
+
+	// Connect client
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
 	defer clientConn.Close()
-	defer serverConn.Close()
+
+	// Get server connection
+	serverConn := <-acceptDone
+	if serverConn == nil {
+		t.Fatal("Server failed to accept connection")
+	}
 
 	config := SoraConnConfig{
 		Protocol:             "test",
@@ -367,10 +482,21 @@ func TestSoraConnConcurrentAccess(t *testing.T) {
 		done <- true
 	}()
 
+	// Background goroutine to drain client reads
 	go func() {
-		buf := make([]byte, 1)
+		buf := make([]byte, 1024)
+		for {
+			_, err := clientConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
 		for i := 0; i < 100; i++ {
 			clientConn.Write([]byte("x"))
+			buf := make([]byte, 1)
 			soraConn.Read(buf)
 		}
 		done <- true
@@ -386,7 +512,6 @@ func TestSoraConnConcurrentAccess(t *testing.T) {
 
 // TestSoraListener tests the SoraListener wrapper
 func TestSoraListener(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
 	// Create a TCP listener
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -400,10 +525,17 @@ func TestSoraListener(t *testing.T) {
 	}
 	soraListener := NewSoraListener(listener, config)
 
-	// Connect a client
+	// Connect a client in background
 	addr := listener.Addr().String()
+	clientDone := make(chan net.Conn, 1)
 	go func() {
-		net.Dial("tcp", addr)
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Logf("Client connection failed: %v", err)
+			close(clientDone)
+			return
+		}
+		clientDone <- conn
 	}()
 
 	// Accept connection
@@ -412,6 +544,12 @@ func TestSoraListener(t *testing.T) {
 		t.Fatalf("Accept failed: %v", err)
 	}
 	defer conn.Close()
+
+	// Get client connection
+	clientConn := <-clientDone
+	if clientConn != nil {
+		defer clientConn.Close()
+	}
 
 	// Verify it's a SoraConn
 	soraConn, ok := conn.(*SoraConn)
@@ -428,7 +566,6 @@ func TestSoraListener(t *testing.T) {
 
 // TestSoraTLSListenerWithRealCerts tests TLS+JA4 capture with real certificates
 func TestSoraTLSListenerWithRealCerts(t *testing.T) {
-	t.Skip("Test has timing/synchronization issues with net.Pipe - SoraConn functionality is tested in integration tests")
 	// Load test certificates
 	cert, err := tls.LoadX509KeyPair("../testdata/sora.crt", "../testdata/sora.key")
 	if err != nil {
