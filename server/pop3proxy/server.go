@@ -3,6 +3,7 @@ package pop3proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -325,6 +326,14 @@ func (s *POP3ProxyServer) Start() error {
 			// If context is cancelled, listener.Close() was called, so this is a graceful shutdown.
 			if s.appCtx.Err() != nil {
 				return nil
+			}
+			// Check if this is a TLS handshake error (connection-specific, not fatal)
+			var tlsRecordHeaderErr tls.RecordHeaderError
+			if errors.As(err, &tlsRecordHeaderErr) ||
+				strings.Contains(err.Error(), "tls:") ||
+				strings.Contains(err.Error(), "missing server name") {
+				log.Printf("[POP3 Proxy %s] TLS handshake error: %v", s.name, err)
+				continue // Continue accepting other connections
 			}
 			// Otherwise, it's an unexpected error.
 			return fmt.Errorf("failed to accept connection: %w", err)

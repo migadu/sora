@@ -123,6 +123,8 @@ func main() {
 		handleACLCommand(ctx)
 	case "credentials":
 		handleCredentialsCommand(ctx)
+	case "mailbox":
+		handleMailboxCommand(ctx)
 	case "cache":
 		handleCacheCommand(ctx)
 	case "stats":
@@ -306,6 +308,7 @@ Commands:
   accounts      Manage user accounts
   acl           Manage mailbox ACL (Access Control Lists)
   credentials   Manage account credentials
+  mailbox       Manage mailboxes (create, delete, rename, subscribe)
   cache         Cache management operations
   stats         System statistics and analytics
   connections   Connection management

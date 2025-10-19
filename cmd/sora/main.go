@@ -688,6 +688,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			MetadataMaxEntriesPerMailbox: deps.config.Metadata.MaxEntriesPerMailbox,
 			MetadataMaxEntriesPerServer:  deps.config.Metadata.MaxEntriesPerServer,
 			MetadataMaxTotalSize:         deps.config.Metadata.MaxTotalSize,
+			Config:                       &deps.config,
 		})
 	if err != nil {
 		errChan <- err
