@@ -1127,18 +1127,28 @@ type MetadataConfig struct {
 	MaxTotalSize int `toml:"max_total_size"`
 }
 
+// SharedMailboxesConfig holds shared mailbox configuration
+type SharedMailboxesConfig struct {
+	Enabled               bool   `toml:"enabled"`                 // Enable shared mailbox functionality
+	NamespacePrefix       string `toml:"namespace_prefix"`        // IMAP namespace prefix (e.g., "Shared/" or "#shared/")
+	AllowUserCreate       bool   `toml:"allow_user_create"`       // Allow regular users to create shared mailboxes
+	DefaultRights         string `toml:"default_rights"`          // Default ACL rights for shared mailbox creators
+	AllowAnyoneIdentifier bool   `toml:"allow_anyone_identifier"` // Enable RFC 4314 "anyone" identifier for domain-wide sharing
+}
+
 // Config holds all configuration for the application.
 type Config struct {
-	Logging    LoggingConfig    `toml:"logging"`
-	Database   DatabaseConfig   `toml:"database"`
-	S3         S3Config         `toml:"s3"`
-	TLS        TLSConfig        `toml:"tls"`
-	Cluster    ClusterConfig    `toml:"cluster"`
-	LocalCache LocalCacheConfig `toml:"local_cache"`
-	Cleanup    CleanupConfig    `toml:"cleanup"`
-	Servers    ServersConfig    `toml:"servers"`
-	Uploader   UploaderConfig   `toml:"uploader"`
-	Metadata   MetadataConfig   `toml:"metadata"`
+	Logging         LoggingConfig         `toml:"logging"`
+	Database        DatabaseConfig        `toml:"database"`
+	S3              S3Config              `toml:"s3"`
+	TLS             TLSConfig             `toml:"tls"`
+	Cluster         ClusterConfig         `toml:"cluster"`
+	LocalCache      LocalCacheConfig      `toml:"local_cache"`
+	Cleanup         CleanupConfig         `toml:"cleanup"`
+	Servers         ServersConfig         `toml:"servers"`
+	Uploader        UploaderConfig        `toml:"uploader"`
+	Metadata        MetadataConfig        `toml:"metadata"`
+	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
@@ -1217,6 +1227,12 @@ func NewDefaultConfig() Config {
 			MaxEntriesPerMailbox: 100,     // 100 entries per mailbox
 			MaxEntriesPerServer:  50,      // 50 server-level entries per account
 			MaxTotalSize:         1048576, // 1MB total per account
+		},
+		SharedMailboxes: SharedMailboxesConfig{
+			Enabled:         false,         // Disabled by default
+			NamespacePrefix: "Shared/",     // Default prefix
+			AllowUserCreate: false,         // Admin-only by default
+			DefaultRights:   "lrswipkxtea", // Full rights for creators
 		},
 		Servers: ServersConfig{
 			TrustedNetworks: []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"},

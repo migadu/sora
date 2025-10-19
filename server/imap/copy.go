@@ -50,6 +50,20 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to fetch destination mailbox '%s': %v", mboxName, err)
 	}
 
+	// Check ACL permissions - requires 'i' (insert) right on destination mailbox
+	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, userID, 'i')
+	if err != nil {
+		return nil, s.internalError("failed to check insert permission on destination: %v", err)
+	}
+	if !hasInsertRight {
+		s.Log("[COPY] user does not have insert permission on destination mailbox '%s'", mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to copy messages to this mailbox",
+		}
+	}
+
 	// Get the messages to determine their UIDs
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {

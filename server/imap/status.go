@@ -31,6 +31,20 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		return nil, s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
+	// Check ACL permissions - requires 'r' (read) right
+	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, userID, 'r')
+	if err != nil {
+		return nil, s.internalError("failed to check read permission: %v", err)
+	}
+	if !hasReadRight {
+		s.Log("[STATUS] user does not have read permission on mailbox '%s'", mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to get status of this mailbox",
+		}
+	}
+
 	summary, err := s.server.rdb.GetMailboxSummaryWithRetry(s.ctx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get mailbox summary for '%s': %v", mboxName, err)

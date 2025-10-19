@@ -39,6 +39,17 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 			}
 			return nil, fmt.Errorf("failed to get mailbox: %w", err)
 		}
+
+		// Check ACL permissions - requires 'r' (read) right for mailbox metadata
+		hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'r')
+		if err != nil {
+			return nil, fmt.Errorf("failed to check read permission: %w", err)
+		}
+		if !hasReadRight {
+			s.Log("[GETMETADATA] user does not have read permission on mailbox '%s'", mailbox)
+			return nil, fmt.Errorf("you do not have permission to get metadata for this mailbox")
+		}
+
 		mailboxID = &dbMailbox.ID
 		mailboxName = dbMailbox.Name
 	}
@@ -91,6 +102,39 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 			return fmt.Errorf("failed to get mailbox: %w", err)
 		}
+
+		// Check ACL permissions
+		// For /shared entries, requires 'w' (write) right
+		// For /private entries, requires 'l' (lookup) right (implicit - user can access mailbox)
+		needsWrite := false
+		for entryName := range entries {
+			if strings.HasPrefix(entryName, "/shared/") {
+				needsWrite = true
+				break
+			}
+		}
+
+		if needsWrite {
+			hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'w')
+			if err != nil {
+				return fmt.Errorf("failed to check write permission: %w", err)
+			}
+			if !hasWriteRight {
+				s.Log("[SETMETADATA] user does not have write permission on mailbox '%s'", mailbox)
+				return fmt.Errorf("you do not have permission to set shared metadata for this mailbox")
+			}
+		} else {
+			// For /private entries, just verify user has lookup permission (already verified by GetMailboxByName)
+			hasLookupRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'l')
+			if err != nil {
+				return fmt.Errorf("failed to check lookup permission: %w", err)
+			}
+			if !hasLookupRight {
+				s.Log("[SETMETADATA] user does not have lookup permission on mailbox '%s'", mailbox)
+				return fmt.Errorf("you do not have permission to set metadata for this mailbox")
+			}
+		}
+
 		mailboxID = &dbMailbox.ID
 	}
 

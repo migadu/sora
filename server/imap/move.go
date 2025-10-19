@@ -51,6 +51,38 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
+	// Check ACL permissions on destination - requires 'i' (insert) right
+	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, s.UserID(), 'i')
+	if err != nil {
+		return s.internalError("failed to check insert permission on destination: %v", err)
+	}
+	if !hasInsertRight {
+		s.Log("[MOVE] user does not have insert permission on destination mailbox '%s'", dest)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to move messages to this mailbox",
+		}
+	}
+
+	// Check ACL permissions on source - requires 't' (delete-msg) and 'e' (expunge) rights
+	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 't')
+	if err != nil {
+		return s.internalError("failed to check delete permission on source: %v", err)
+	}
+	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 'e')
+	if err != nil {
+		return s.internalError("failed to check expunge permission on source: %v", err)
+	}
+	if !hasDeleteRight || !hasExpungeRight {
+		s.Log("[MOVE] user does not have delete/expunge permission on source mailbox")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to delete messages from the source mailbox",
+		}
+	}
+
 	// Check if the context is still valid before proceeding
 	if s.ctx.Err() != nil {
 		s.Log("[MOVE] request aborted before message retrieval, aborting operation")

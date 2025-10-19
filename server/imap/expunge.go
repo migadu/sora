@@ -25,7 +25,22 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 	mailboxID := s.selectedMailbox.ID
 	sessionTrackerSnapshot := s.sessionTracker
+	userID := s.UserID()
 	release()
+
+	// Check ACL permissions - requires 'e' (expunge) right
+	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailboxID, userID, 'e')
+	if err != nil {
+		return s.internalError("failed to check expunge permission: %v", err)
+	}
+	if !hasExpungeRight {
+		s.Log("[EXPUNGE] user does not have expunge permission")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to expunge messages from this mailbox",
+		}
+	}
 
 	// Middle phase: Get messages to expunge (outside lock)
 	messages, err := s.server.rdb.GetMessagesByFlagWithRetry(s.ctx, mailboxID, imap.FlagDeleted)

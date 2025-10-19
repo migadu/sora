@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -19,8 +20,14 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	userID := s.UserID()
 	release()
 
+	// Add config to context for shared mailbox detection
+	ctx := s.ctx
+	if s.server.config != nil {
+		ctx = context.WithValue(ctx, "config", s.server.config)
+	}
+
 	// Check if mailbox already exists
-	_, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, name)
+	_, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, name)
 	if err == nil {
 		s.Log("[CREATE] mailbox '%s' already exists", name)
 		return &imap.Error{
@@ -53,15 +60,31 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 				var parentMailbox *db.DBMailbox
 
 				// Check if parent mailbox exists. If not, create it.
-				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, parentPathWithoutDelim)
+				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, parentPathWithoutDelim)
 				if err == consts.ErrMailboxNotFound {
+					// If parent doesn't exist and we have a grandparent, check 'k' right on grandparent
+					if currentParentID != nil {
+						hasCreateRight, checkErr := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *currentParentID, userID, 'k')
+						if checkErr != nil {
+							return s.internalError("failed to check create permission on parent: %v", checkErr)
+						}
+						if !hasCreateRight {
+							s.Log("[CREATE] user does not have create permission on parent mailbox")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeNoPerm,
+								Text: "You do not have permission to create child mailboxes under this parent",
+							}
+						}
+					}
+
 					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithoutDelim)
-					err = s.server.rdb.CreateMailboxWithRetry(s.ctx, userID, parentPathWithoutDelim, currentParentID)
+					err = s.server.rdb.CreateMailboxWithRetry(ctx, userID, parentPathWithoutDelim, currentParentID)
 					if err != nil {
 						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
 
-					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, parentPathWithoutDelim)
+					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, parentPathWithoutDelim)
 					if err != nil {
 						return s.internalError("failed to fetch auto-created parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
@@ -78,8 +101,24 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
+	// Check ACL permission on final parent - requires 'k' (create) right for creating child mailbox
+	if parentMailboxID != nil {
+		hasCreateRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *parentMailboxID, userID, 'k')
+		if err != nil {
+			return s.internalError("failed to check create permission: %v", err)
+		}
+		if !hasCreateRight {
+			s.Log("[CREATE] user does not have create permission on parent mailbox")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNoPerm,
+				Text: "You do not have permission to create child mailboxes under this parent",
+			}
+		}
+	}
+
 	// Final phase: actual creation - no locks needed as it's a DB operation
-	err = s.server.rdb.CreateMailboxWithRetry(s.ctx, userID, name, parentMailboxID)
+	err = s.server.rdb.CreateMailboxWithRetry(ctx, userID, name, parentMailboxID)
 	if err != nil {
 		return s.internalError("failed to create mailbox '%s': %v", name, err)
 	}

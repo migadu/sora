@@ -6,14 +6,25 @@ import (
 )
 
 func (s *IMAPSession) Namespace() (*imap.NamespaceData, error) {
-	return &imap.NamespaceData{
+	data := &imap.NamespaceData{
 		Personal: []imap.NamespaceDescriptor{
 			{
 				Prefix: "",
 				Delim:  consts.MailboxDelimiter,
 			},
 		},
-		Other:  nil,
-		Shared: nil,
-	}, nil
+		Other: nil,
+	}
+
+	// Add shared namespace if feature is enabled
+	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
+		data.Shared = []imap.NamespaceDescriptor{
+			{
+				Prefix: s.server.config.SharedMailboxes.NamespacePrefix,
+				Delim:  consts.MailboxDelimiter,
+			},
+		}
+	}
+
+	return data, nil
 }

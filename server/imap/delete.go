@@ -44,6 +44,20 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		return s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
+	// Check ACL permissions - requires 'x' (delete) right
+	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, userID, 'x')
+	if err != nil {
+		return s.internalError("failed to check delete permission: %v", err)
+	}
+	if !hasDeleteRight {
+		s.Log("[DELETE] user does not have delete permission on mailbox '%s'", mboxName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to delete this mailbox",
+		}
+	}
+
 	// RFC 3501 Section 6.3.4: It is an error to delete a mailbox that has
 	// inferior hierarchical names.
 	if mailbox.HasChildren {
@@ -55,7 +69,8 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Final phase: actual deletion - no locks needed as it's a DB operation
-	err = s.server.rdb.DeleteMailboxWithRetry(s.ctx, mailbox.ID, userID)
+	// Use mailbox.AccountID (the owner) not userID (the requester) for shared mailbox support
+	err = s.server.rdb.DeleteMailboxWithRetry(s.ctx, mailbox.ID, mailbox.AccountID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}

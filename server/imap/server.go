@@ -247,6 +247,7 @@ type IMAPServer struct {
 	appendLimit        int64
 	ftsRetention       time.Duration
 	version            string
+	config             *config.Config // Full config reference for shared mailboxes
 
 	// Metadata limits (RFC 5464)
 	metadataMaxEntrySize         int
@@ -334,6 +335,8 @@ type IMAPServerOptions struct {
 	CommandTimeout         time.Duration // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
+	// Full config for shared mailboxes and other features
+	Config *config.Config
 }
 
 func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options IMAPServerOptions) (*IMAPServer, error) {
@@ -407,6 +410,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		appendLimit:                  options.AppendLimit,
 		ftsRetention:                 options.FTSRetention,
 		version:                      options.Version,
+		config:                       options.Config,
 		metadataMaxEntrySize:         options.MetadataMaxEntrySize,
 		metadataMaxEntriesPerMailbox: options.MetadataMaxEntriesPerMailbox,
 		metadataMaxEntriesPerServer:  options.MetadataMaxEntriesPerServer,
@@ -441,6 +445,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapID:            struct{}{},
 			imap.CapNamespace:     struct{}{},
 			imap.CapMetadata:      struct{}{},
+			imap.Cap("ACL"):       struct{}{}, // RFC 4314 - Access Control List
 		},
 		masterUsername:         options.MasterUsername,
 		masterPassword:         options.MasterPassword,

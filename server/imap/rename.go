@@ -41,6 +41,20 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		return s.internalError("failed to fetch mailbox '%s': %v", existingName, err)
 	}
 
+	// Check ACL permissions - requires 'x' (delete) right on the mailbox being renamed
+	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, oldMailbox.ID, userID, 'x')
+	if err != nil {
+		return s.internalError("failed to check delete permission: %v", err)
+	}
+	if !hasDeleteRight {
+		s.Log("[RENAME] user does not have delete permission on mailbox '%s'", existingName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to rename this mailbox",
+		}
+	}
+
 	_, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, newName)
 	if err == nil {
 		s.Log("[RENAME] mailbox '%s' already exists", newName)

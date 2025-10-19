@@ -55,6 +55,23 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
 	}
 
+	// Check ACL permissions - requires 'i' (insert) right
+	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, s.UserID(), 'i')
+	if err != nil {
+		s.classifyAndTrackError("APPEND", err, nil)
+		return nil, s.internalError("failed to check insert permission: %v", err)
+	}
+	if !hasInsertRight {
+		s.Log("[APPEND] user does not have insert permission on mailbox '%s'", mboxName)
+		imapErr := &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to append messages to this mailbox",
+		}
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		return nil, imapErr
+	}
+
 	// Read the entire message into a buffer
 	var buf bytes.Buffer
 	if _, err = io.Copy(&buf, r); err != nil {

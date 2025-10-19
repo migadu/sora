@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
@@ -18,6 +19,7 @@ import (
 // DBMailbox represents the database structure of a mailbox
 type DBMailbox struct {
 	ID          int64
+	AccountID   int64  // The owner of the mailbox (important for shared mailboxes)
 	Name        string // User-visible, delimiter-separated mailbox name (e.g., "INBOX/Sent")
 	UIDValidity uint32
 	Subscribed  bool
@@ -41,12 +43,30 @@ func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, su
 }
 
 func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed bool) ([]*DBMailbox, error) {
+	// Modified query to include both personal mailboxes and shared mailboxes with ACL access
 	query := `
-		SELECT
-			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at,
+		SELECT DISTINCT
+			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
 			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LENGTH(child.path) = LENGTH(m.path) + 16 AND child.path LIKE m.path || '%') AS has_children
 		FROM mailboxes m
-		WHERE m.account_id = $1
+		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1
+		WHERE
+			-- Personal mailboxes (owned by user, not shared)
+			(m.account_id = $1 AND NOT COALESCE(m.is_shared, FALSE))
+			OR
+			-- Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
+			(COALESCE(m.is_shared, FALSE) = TRUE AND acl.account_id IS NOT NULL AND position('l' IN acl.rights) > 0)
+			OR
+			-- Shared mailboxes with "anyone" access (same domain, must have 'l' right)
+			(COALESCE(m.is_shared, FALSE) = TRUE
+			 AND EXISTS (
+			   SELECT 1 FROM mailbox_acls a2
+			   INNER JOIN credentials c ON c.account_id = $1 AND c.primary_identity = TRUE
+			   WHERE a2.mailbox_id = m.id
+			     AND a2.identifier = 'anyone'
+			     AND position('l' IN a2.rights) > 0
+			     AND m.owner_domain = SPLIT_PART(c.address, '@', 2)
+			 ))
 	`
 
 	if subscribed {
@@ -69,7 +89,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
@@ -92,11 +112,11 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 
 	// First, fetch the core mailbox details.
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at
+		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
 		FROM mailboxes
 		WHERE id = $1 AND account_id = $2
 	`, mailboxID, userID).Scan(
-		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt,
+		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
 	)
 
 	if err != nil {
@@ -124,10 +144,34 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name string) (*DBMailbox, error) {
 	var mailbox DBMailbox
 	var uidValidityInt64 int64
+	var accountID int64
+
+	// First try to find owned mailbox, then check for shared mailbox with ACL access
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at
-		FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2
-	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt)
+		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+		FROM mailboxes m
+		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1
+		WHERE LOWER(m.name) = $2
+		  AND (
+		    -- Owned mailbox (shared or non-shared, owner always has access)
+		    (m.account_id = $1)
+		    OR
+		    -- Shared mailbox with ACL access (has 'l' right)
+		    (COALESCE(m.is_shared, FALSE) = TRUE AND acl.account_id IS NOT NULL AND position('l' IN acl.rights) > 0)
+		    OR
+		    -- Shared mailbox with "anyone" access (same domain, has 'l' right)
+		    (COALESCE(m.is_shared, FALSE) = TRUE
+		     AND EXISTS (
+		       SELECT 1 FROM mailbox_acls a2
+		       INNER JOIN credentials c ON c.account_id = $1 AND c.primary_identity = TRUE
+		       WHERE a2.mailbox_id = m.id
+		         AND a2.identifier = 'anyone'
+		         AND position('l' IN a2.rights) > 0
+		         AND m.owner_domain = SPLIT_PART(c.address, '@', 2)
+		     ))
+		  )
+		LIMIT 1
+	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -138,11 +182,13 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 	}
 
 	mailbox.UIDValidity = uint32(uidValidityInt64)
+	mailbox.AccountID = accountID
 
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
+	// For shared mailboxes, check all children (not just user's children)
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
-	`, userID, mailbox.Path).Scan(&mailbox.HasChildren)
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE LENGTH(path) = LENGTH($1) + 16 AND path LIKE $1 || '%')
+	`, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		log.Printf("[DB] failed to check for children of mailbox '%s': %v", name, err)
 		return nil, consts.ErrInternalError
@@ -162,6 +208,34 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
 	uidValidity := uint32(time.Now().UnixNano())
 
+	// Check if this is a shared mailbox based on name prefix
+	// Extract config from context if available
+	isShared := false
+	var ownerDomain *string
+	sharedPrefix := "Shared/" // Default prefix
+
+	// Try to get config from context
+	if cfg, ok := ctx.Value("config").(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
+		sharedPrefix = cfg.SharedMailboxes.NamespacePrefix
+		// Check if name starts with prefix, or is the prefix itself (without trailing slash)
+		prefixWithoutSlash := strings.TrimSuffix(sharedPrefix, "/")
+		if strings.HasPrefix(name, sharedPrefix) || name == prefixWithoutSlash {
+			isShared = true
+
+			// Extract domain from user's primary credential
+			var domain string
+			err := tx.QueryRow(ctx, `
+				SELECT SPLIT_PART(address, '@', 2)
+				FROM credentials
+				WHERE account_id = $1 AND primary_identity = TRUE
+			`, userID).Scan(&domain)
+			if err != nil {
+				return fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
+			}
+			ownerDomain = &domain
+		}
+	}
+
 	// Determine the parent path if parentID is provided
 	var parentPath string
 	if parentID != nil {
@@ -178,13 +252,13 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		}
 	}
 
-	// Insert the mailbox
+	// Insert the mailbox with shared mailbox fields
 	var mailboxID int64
 	err := tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
-		VALUES ($1, $2, $3, $4, '')
+		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain)
+		VALUES ($1, $2, $3, $4, '', $5, $6)
 		RETURNING id
-	`, userID, name, int64(uidValidity), false).Scan(&mailboxID)
+	`, userID, name, int64(uidValidity), false, isShared, ownerDomain).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -212,6 +286,50 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 
 	if err != nil {
 		return fmt.Errorf("failed to update mailbox path: %w", err)
+	}
+
+	// If shared mailbox, grant creator full rights (or configured default rights)
+	// Also inherit ACLs from parent mailbox if one exists (RFC 4314)
+	if isShared {
+		// If there's a parent mailbox, inherit its ACLs
+		if parentID != nil {
+			// Copy all ACL entries from parent to child
+			_, err = tx.Exec(ctx, `
+				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+				SELECT $1, account_id, identifier, rights, now(), now()
+				FROM mailbox_acls
+				WHERE mailbox_id = $2
+			`, mailboxID, *parentID)
+			if err != nil {
+				return fmt.Errorf("failed to inherit parent ACLs: %w", err)
+			}
+			log.Printf("[DB] Created shared mailbox '%s' (ID: %d) with inherited ACLs from parent (ID: %d)", name, mailboxID, *parentID)
+		} else {
+			// No parent, grant creator full rights (or configured default rights)
+			defaultRights := "lrswipkxtea" // Full rights by default
+			if cfg, ok := ctx.Value("config").(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
+				defaultRights = cfg.SharedMailboxes.DefaultRights
+			}
+
+			// Get creator's email for identifier
+			var creatorEmail string
+			err = tx.QueryRow(ctx, `
+				SELECT address FROM credentials
+				WHERE account_id = $1 AND primary_identity = TRUE
+			`, userID).Scan(&creatorEmail)
+			if err != nil {
+				return fmt.Errorf("failed to get creator email: %w", err)
+			}
+
+			_, err = tx.Exec(ctx, `
+				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, now(), now())
+			`, mailboxID, userID, creatorEmail, defaultRights)
+			if err != nil {
+				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
+			}
+			log.Printf("[DB] Created shared mailbox '%s' (ID: %d) for user %d with domain %s", name, mailboxID, userID, *ownerDomain)
+		}
 	}
 
 	return nil
@@ -299,13 +417,31 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 
 // DeleteMailbox deletes a mailbox for a specific user by id
 func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64) error {
+	// Check if user has delete permission (ACL 'x' right) for shared mailboxes
+	// For personal mailboxes, ownership is sufficient
 	var mboxPath string
-	err := tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxPath)
+	var isShared bool
+	err := tx.QueryRow(ctx, `
+		SELECT path, COALESCE(is_shared, FALSE)
+		FROM mailboxes
+		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
+	`, mailboxID, userID).Scan(&mboxPath, &isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
-		return fmt.Errorf("failed to fetch mailbox path for deletion: %w", err)
+		return fmt.Errorf("failed to fetch mailbox for deletion: %w", err)
+	}
+
+	// If it's a shared mailbox, check ACL permissions
+	if isShared {
+		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, userID, ACLRightDelete)
+		if err != nil {
+			return fmt.Errorf("failed to check delete permission: %w", err)
+		}
+		if !hasDeleteRight {
+			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+		}
 	}
 
 	// Find all mailboxes that will be deleted (the target and its children)
@@ -527,9 +663,35 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return consts.ErrMailboxInvalidName
 	}
 
+	// Check if user has admin permission (ACL 'a' right) for shared mailboxes
+	// For personal mailboxes, ownership is sufficient
+	var isShared bool
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(is_shared, FALSE)
+		FROM mailboxes
+		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
+	`, mailboxID, userID).Scan(&isShared)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return consts.ErrMailboxNotFound
+		}
+		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+
+	// If it's a shared mailbox, check ACL permissions
+	if isShared {
+		hasAdminRight, err := db.CheckMailboxPermission(ctx, mailboxID, userID, ACLRightAdmin)
+		if err != nil {
+			return fmt.Errorf("failed to check admin permission: %w", err)
+		}
+		if !hasAdminRight {
+			return fmt.Errorf("permission denied: user does not have admin right on shared mailbox")
+		}
+	}
+
 	// Check if the new name already exists within the same transaction to prevent race conditions.
 	var existingID int64
-	err := tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists

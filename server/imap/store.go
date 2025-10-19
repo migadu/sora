@@ -40,6 +40,64 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	release()
 
+	// Check ACL permissions based on which flags are being modified
+	// Need 'w' (write) for general flags, 's' (seen) for \Seen, 't' (delete-msg) for \Deleted
+	var needsWrite, needsSeen, needsDelete bool
+	for _, flag := range flags.Flags {
+		switch flag {
+		case imap.FlagSeen:
+			needsSeen = true
+		case imap.FlagDeleted:
+			needsDelete = true
+		default:
+			needsWrite = true
+		}
+	}
+
+	// Check required permissions
+	if needsWrite {
+		hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 'w')
+		if err != nil {
+			return s.internalError("failed to check write permission: %v", err)
+		}
+		if !hasWriteRight {
+			s.Log("[STORE] user does not have write permission")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNoPerm,
+				Text: "You do not have permission to modify flags on this mailbox",
+			}
+		}
+	}
+	if needsSeen {
+		hasSeenRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 's')
+		if err != nil {
+			return s.internalError("failed to check seen permission: %v", err)
+		}
+		if !hasSeenRight {
+			s.Log("[STORE] user does not have seen permission")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNoPerm,
+				Text: "You do not have permission to modify \\Seen flag on this mailbox",
+			}
+		}
+	}
+	if needsDelete {
+		hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 't')
+		if err != nil {
+			return s.internalError("failed to check delete permission: %v", err)
+		}
+		if !hasDeleteRight {
+			s.Log("[STORE] user does not have delete permission")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNoPerm,
+				Text: "You do not have permission to modify \\Deleted flag on this mailbox",
+			}
+		}
+	}
+
 	// Perform database operations outside of lock
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {

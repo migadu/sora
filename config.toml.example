@@ -416,6 +416,26 @@ max_entries_per_server = 50    # Maximum number of server-level metadata entries
 max_total_size = 1048576       # Maximum total metadata size per account (1MB). Overall quota protection.
 
 
+# SHARED MAILBOXES CONFIGURATION
+# =============================================================================
+# Enable shared mailboxes for collaboration between users on the same domain.
+# Uses IMAP namespace extension (RFC 2342) for proper client support.
+# Implements Access Control Lists (RFC 4314) for fine-grained permissions.
+
+[shared_mailboxes]
+enabled = false                  # Enable shared mailbox functionality (default: false)
+namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/")
+allow_user_create = false        # Allow regular users to create shared mailboxes (false = admin-only)
+default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
+                                # Rights: l=lookup, r=read, s=seen, w=write, i=insert, p=post, k=create, x=delete, t=delete-msg, e=expunge, a=admin
+
+# IMPORTANT NOTES:
+# - Shared mailboxes are restricted to users within the same domain for security
+# - Creators automatically receive the default_rights on mailboxes they create
+# - Additional users must be granted access via IMAP ACL commands or admin API
+# - The NAMESPACE command will advertise the shared namespace when enabled
+
+
 # GLOBAL SERVERS CONFIGURATION
 # =============================================================================
 # Global settings that apply to all protocol servers.

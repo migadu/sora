@@ -52,6 +52,21 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to fetch mailbox '%s' for user %d: %v", mboxName, s.UserID(), err)
 	}
 
+	// Check ACL permissions for shared mailboxes (requires 'r' read right)
+	// The has_mailbox_right function returns TRUE for owners, so this works for both personal and shared mailboxes
+	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, userID, 'r')
+	if err != nil {
+		return nil, s.internalError("failed to check read permission for mailbox '%s': %v", mboxName, err)
+	}
+	if !hasReadRight {
+		s.Log("[SELECT] user %d does not have read permission on mailbox '%s'", userID, mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to select this mailbox",
+		}
+	}
+
 	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)

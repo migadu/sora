@@ -87,6 +87,11 @@ func CreateTestAccount(t *testing.T, rdb *resilient.ResilientDatabase) TestAccou
 	return TestAccount{Email: email, Password: password}
 }
 
+// GetTimestamp returns current Unix nano timestamp for unique identifiers
+func GetTimestamp() int64 {
+	return time.Now().UnixNano()
+}
+
 func GetRandomAddress(t *testing.T) string {
 	t.Helper()
 
@@ -133,6 +138,17 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		t.Fatalf("Failed to create upload worker: %v", err)
 	}
 
+	// Create test config with shared mailboxes enabled
+	testConfig := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:               true,
+			NamespacePrefix:       "Shared/",
+			AllowUserCreate:       true,
+			DefaultRights:         "lrswipkxtea",
+			AllowAnyoneIdentifier: true,
+		},
+	}
+
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -142,7 +158,9 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		rdb,
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
-		imap.IMAPServerOptions{},
+		imap.IMAPServerOptions{
+			Config: testConfig,
+		},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
