@@ -32,11 +32,12 @@ var (
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database   config.DatabaseConfig   `toml:"database"`
-	S3         config.S3Config         `toml:"s3"`
-	LocalCache config.LocalCacheConfig `toml:"local_cache"`
-	Uploader   config.UploaderConfig   `toml:"uploader"`
-	Cleanup    config.CleanupConfig    `toml:"cleanup"`
+	Database        config.DatabaseConfig        `toml:"database"`
+	S3              config.S3Config              `toml:"s3"`
+	LocalCache      config.LocalCacheConfig      `toml:"local_cache"`
+	Uploader        config.UploaderConfig        `toml:"uploader"`
+	Cleanup         config.CleanupConfig         `toml:"cleanup"`
+	SharedMailboxes config.SharedMailboxesConfig `toml:"shared_mailboxes"`
 }
 
 func newDefaultAdminConfig() AdminConfig {
@@ -4336,17 +4337,17 @@ func handleConfigDump(ctx context.Context) {
 	var maskSecrets bool
 
 	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
-	flagSet.StringVar(&configFile, "config", "config.toml", "Path to configuration file")
+	flagSet.StringVar(&configFile, "config", "", "Path to configuration file (required)")
 	flagSet.StringVar(&format, "format", "toml", "Output format: toml, json, or pretty")
 	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
 	flagSet.Usage = func() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
 Usage:
-  sora-admin config dump [options]
+  sora-admin config dump --config PATH [options]
 
 Options:
-  --config PATH        Path to configuration file (default: config.toml)
+  --config PATH        Path to configuration file (required)
   --format FORMAT      Output format: toml, json, or pretty (default: toml)
   --mask-secrets       Mask sensitive values like passwords (default: true)
 
@@ -4359,8 +4360,14 @@ Examples:
 
 	flagSet.Parse(os.Args[3:])
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
+	if configFile == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		flagSet.Usage()
+		os.Exit(1)
+	}
+
+	// Load full configuration
+	cfg := config.NewDefaultConfig()
 	if _, err := toml.DecodeFile(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
@@ -4376,6 +4383,13 @@ Examples:
 		cfg.S3.AccessKey = "***MASKED***"
 		cfg.S3.SecretKey = "***MASKED***"
 		cfg.S3.EncryptionKey = "***MASKED***"
+		cfg.TLS.CertFile = "***MASKED***"
+		cfg.TLS.KeyFile = "***MASKED***"
+		if cfg.TLS.LetsEncrypt != nil {
+			cfg.TLS.LetsEncrypt.S3.AccessKeyID = "***MASKED***"
+			cfg.TLS.LetsEncrypt.S3.SecretAccessKey = "***MASKED***"
+		}
+		cfg.Cluster.SecretKey = "***MASKED***"
 	}
 
 	// Output in requested format
@@ -4398,11 +4412,20 @@ Examples:
 	}
 }
 
-func printPrettyConfig(cfg AdminConfig) {
-	fmt.Println("=== SORA ADMIN CONFIGURATION ===")
+func printPrettyConfig(cfg config.Config) {
+	fmt.Println("=== SORA CONFIGURATION ===")
+	fmt.Println()
+
+	fmt.Println("LOGGING:")
+	fmt.Printf("  Output: %s\n", cfg.Logging.Output)
+	fmt.Printf("  Format: %s\n", cfg.Logging.Format)
+	fmt.Printf("  Level: %s\n", cfg.Logging.Level)
 	fmt.Println()
 
 	fmt.Println("DATABASE CONFIGURATION:")
+	fmt.Printf("  Query Timeout: %s\n", cfg.Database.QueryTimeout)
+	fmt.Printf("  Search Timeout: %s\n", cfg.Database.SearchTimeout)
+	fmt.Printf("  Write Timeout: %s\n", cfg.Database.WriteTimeout)
 	fmt.Printf("  Debug: %t\n", cfg.Database.GetDebug())
 
 	if cfg.Database.Write != nil {
@@ -4445,12 +4468,63 @@ func printPrettyConfig(cfg AdminConfig) {
 	fmt.Printf("  Encryption Key: %s\n", cfg.S3.EncryptionKey)
 
 	fmt.Println()
+	fmt.Println("LOCAL CACHE CONFIGURATION:")
+	fmt.Printf("  Path: %s\n", cfg.LocalCache.Path)
+	fmt.Printf("  Capacity: %s\n", cfg.LocalCache.Capacity)
+	fmt.Printf("  Max Object Size: %s\n", cfg.LocalCache.MaxObjectSize)
+
+	fmt.Println()
 	fmt.Println("UPLOADER CONFIGURATION:")
 	fmt.Printf("  Path: %s\n", cfg.Uploader.Path)
 	fmt.Printf("  Batch Size: %d\n", cfg.Uploader.BatchSize)
 	fmt.Printf("  Concurrency: %d\n", cfg.Uploader.Concurrency)
 	fmt.Printf("  Max Attempts: %d\n", cfg.Uploader.MaxAttempts)
 	fmt.Printf("  Retry Interval: %s\n", cfg.Uploader.RetryInterval)
+
+	fmt.Println()
+	fmt.Println("CLEANUP CONFIGURATION:")
+	fmt.Printf("  Grace Period: %s\n", cfg.Cleanup.GracePeriod)
+	fmt.Printf("  Wake Interval: %s\n", cfg.Cleanup.WakeInterval)
+	fmt.Printf("  FTS Retention: %s\n", cfg.Cleanup.FTSRetention)
+
+	fmt.Println()
+	fmt.Println("TLS CONFIGURATION:")
+	fmt.Printf("  Enabled: %t\n", cfg.TLS.Enabled)
+	fmt.Printf("  Provider: %s\n", cfg.TLS.Provider)
+	fmt.Printf("  Cert File: %s\n", cfg.TLS.CertFile)
+	fmt.Printf("  Key File: %s\n", cfg.TLS.KeyFile)
+	if cfg.TLS.LetsEncrypt != nil {
+		fmt.Printf("  LetsEncrypt Enabled: %t\n", len(cfg.TLS.LetsEncrypt.Domains) > 0)
+		fmt.Printf("  LetsEncrypt Domains: %v\n", cfg.TLS.LetsEncrypt.Domains)
+	}
+
+	fmt.Println()
+	fmt.Println("CLUSTER CONFIGURATION:")
+	fmt.Printf("  Enabled: %t\n", cfg.Cluster.Enabled)
+	fmt.Printf("  Node ID: %s\n", cfg.Cluster.NodeID)
+	fmt.Printf("  Bind Addr: %s\n", cfg.Cluster.BindAddr)
+	fmt.Printf("  Bind Port: %d\n", cfg.Cluster.BindPort)
+
+	fmt.Println()
+	fmt.Println("SERVERS:")
+	if cfg.Servers.IMAP.Start {
+		fmt.Printf("  IMAP: %s\n", cfg.Servers.IMAP.Addr)
+	}
+	if cfg.Servers.LMTP.Start {
+		fmt.Printf("  LMTP: %s\n", cfg.Servers.LMTP.Addr)
+	}
+	if cfg.Servers.POP3.Start {
+		fmt.Printf("  POP3: %s\n", cfg.Servers.POP3.Addr)
+	}
+	if cfg.Servers.ManageSieve.Start {
+		fmt.Printf("  ManageSieve: %s\n", cfg.Servers.ManageSieve.Addr)
+	}
+	if cfg.Servers.HTTPAPI.Start {
+		fmt.Printf("  HTTP API: %s\n", cfg.Servers.HTTPAPI.Addr)
+	}
+
+	fmt.Println()
+	fmt.Println("Note: Use --format json or --format toml for complete configuration details")
 }
 
 func truncateString(s string, maxLen int) string {

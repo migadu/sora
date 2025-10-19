@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/aclservice"
 )
@@ -96,11 +97,17 @@ func handleACLGrant(ctx context.Context) {
 	}
 	defer rdb.Close()
 
+	// Create full config for context (needed for shared mailbox detection)
+	fullConfig := &config.Config{
+		SharedMailboxes: cfg.SharedMailboxes,
+	}
+	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)
 
-	// Grant ACL
-	err = aclSvc.Grant(ctx, *email, *mailbox, targetIdentifier, *rights)
+	// Grant ACL (use context with config)
+	err = aclSvc.Grant(ctxWithConfig, *email, *mailbox, targetIdentifier, *rights)
 	if err != nil {
 		fmt.Printf("Failed to grant ACL: %v\n", err)
 		os.Exit(1)
@@ -164,11 +171,17 @@ func handleACLRevoke(ctx context.Context) {
 	}
 	defer rdb.Close()
 
+	// Create full config for context (needed for shared mailbox detection)
+	fullConfig := &config.Config{
+		SharedMailboxes: cfg.SharedMailboxes,
+	}
+	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)
 
-	// Revoke ACL
-	err = aclSvc.Revoke(ctx, *email, *mailbox, targetIdentifier)
+	// Revoke ACL (use context with config)
+	err = aclSvc.Revoke(ctxWithConfig, *email, *mailbox, targetIdentifier)
 	if err != nil {
 		fmt.Printf("Failed to revoke ACL: %v\n", err)
 		os.Exit(1)
@@ -219,11 +232,17 @@ func handleACLList(ctx context.Context) {
 	}
 	defer rdb.Close()
 
+	// Create full config for context (needed for shared mailbox detection)
+	fullConfig := &config.Config{
+		SharedMailboxes: cfg.SharedMailboxes,
+	}
+	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)
 
-	// List ACLs
-	acls, err := aclSvc.List(ctx, *email, *mailbox)
+	// List ACLs (use context with config)
+	acls, err := aclSvc.List(ctxWithConfig, *email, *mailbox)
 	if err != nil {
 		fmt.Printf("Failed to list ACLs: %v\n", err)
 		os.Exit(1)
