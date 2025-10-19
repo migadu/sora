@@ -108,7 +108,8 @@ func TestACL_GETACL(t *testing.T) {
 		t.Fatalf("User1 login failed: %v", err)
 	}
 
-	sharedMailbox := "Shared/TestACL"
+	// Use unique mailbox name to avoid conflicts with previous test runs
+	sharedMailbox := fmt.Sprintf("Shared/TestACL-%d", common.GetTimestamp())
 	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
 		t.Fatalf("Failed to create shared mailbox: %v", err)
 	}

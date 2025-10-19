@@ -51,8 +51,8 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 		FROM mailboxes m
 		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1
 		WHERE
-			-- Personal mailboxes (owned by user, not shared)
-			(m.account_id = $1 AND NOT COALESCE(m.is_shared, FALSE))
+			-- All mailboxes owned by user (including shared mailboxes they created)
+			m.account_id = $1
 			OR
 			-- Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
 			(COALESCE(m.is_shared, FALSE) = TRUE AND acl.account_id IS NOT NULL AND position('l' IN acl.rights) > 0)
