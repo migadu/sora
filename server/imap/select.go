@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -16,6 +17,20 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	if s.ctx.Err() != nil {
 		s.Log("[SELECT] request aborted before selecting mailbox '%s'", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
+	}
+
+	// Prevent selecting the shared namespace root
+	// The namespace root (e.g., "Shared") should only be a container, not a selectable mailbox
+	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
+		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
+		if mboxName == sharedPrefix {
+			s.Log("[SELECT] cannot select shared namespace root '%s'", mboxName)
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "The shared namespace root cannot be selected. Select mailboxes under it instead",
+			}
+		}
 	}
 
 	// Phase 1: Read session state with read lock

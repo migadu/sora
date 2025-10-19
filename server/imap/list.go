@@ -156,6 +156,12 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 
+	// Add \noselect for shared namespace root (e.g., "Shared" for prefix "Shared/")
+	// This prevents clients from trying to SELECT the namespace prefix itself
+	if mbox.Name == "Shared" && mbox.HasChildren {
+		attributes = append(attributes, imap.MailboxAttrNoSelect)
+	}
+
 	if serverCaps.Has(imap.CapChildren) {
 		if mbox.HasChildren {
 			attributes = append(attributes, imap.MailboxAttrHasChildren)

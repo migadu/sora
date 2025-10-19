@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/emersion/go-imap/v2"
 	imapClient "github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/assert"
@@ -178,4 +179,97 @@ func TestSharedMailbox_UserWithoutACLCannotList(t *testing.T) {
 
 	// Cleanup
 	c1.Delete(sharedMailbox).Wait()
+}
+
+// TestSharedMailbox_OwnerCanSelect tests that the owner can SELECT their own shared mailbox
+// This is a regression test for the bug where owners couldn't SELECT shared mailboxes
+func TestSharedMailbox_OwnerCanSelect(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Connect as owner
+	c, err := imapClient.DialInsecure(server.Address, nil)
+	require.NoError(t, err, "Failed to connect to IMAP")
+	defer c.Logout()
+
+	err = c.Login(owner.Email, owner.Password).Wait()
+	require.NoError(t, err, "Login failed")
+
+	// Create shared mailbox
+	sharedMailbox := fmt.Sprintf("Shared/TestSELECT-%d", common.GetTimestamp())
+	err = c.Create(sharedMailbox, nil).Wait()
+	require.NoError(t, err, "Failed to create shared mailbox")
+
+	// SELECT the shared mailbox - this should work for the owner
+	selectData, err := c.Select(sharedMailbox, nil).Wait()
+	require.NoError(t, err, "Owner should be able to SELECT their own shared mailbox")
+	assert.NotNil(t, selectData, "SELECT should return mailbox data")
+
+	t.Logf("✓ Owner can SELECT their shared mailbox")
+
+	// Cleanup
+	c.Delete(sharedMailbox).Wait()
+}
+
+// TestSharedNamespaceRoot tests that the "Shared" root folder has \Noselect attribute
+// This prevents clients from trying to SELECT "Shared" itself
+func TestSharedNamespaceRoot(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	// Connect as owner
+	c, err := imapClient.DialInsecure(server.Address, nil)
+	require.NoError(t, err, "Failed to connect to IMAP")
+	defer c.Logout()
+
+	err = c.Login(owner.Email, owner.Password).Wait()
+	require.NoError(t, err, "Login failed")
+
+	// Create a shared mailbox to ensure "Shared" parent exists
+	sharedMailbox := fmt.Sprintf("Shared/TestRoot-%d", common.GetTimestamp())
+	err = c.Create(sharedMailbox, nil).Wait()
+	require.NoError(t, err, "Failed to create shared mailbox")
+
+	// LIST to get mailbox attributes
+	mailboxes, err := c.List("", "Shared", nil).Collect()
+	require.NoError(t, err, "LIST Shared failed")
+
+	// Find the "Shared" mailbox
+	var sharedRoot *imap.ListData
+	for i := range mailboxes {
+		if mailboxes[i].Mailbox == "Shared" {
+			sharedRoot = mailboxes[i]
+			break
+		}
+	}
+
+	require.NotNil(t, sharedRoot, "Shared namespace root should exist in LIST")
+
+	// Verify it has \Noselect attribute
+	hasNoselect := false
+	hasChildren := false
+	for _, attr := range sharedRoot.Attrs {
+		if attr == imap.MailboxAttrNoSelect {
+			hasNoselect = true
+		}
+		if attr == imap.MailboxAttrHasChildren {
+			hasChildren = true
+		}
+	}
+
+	assert.True(t, hasNoselect, "Shared namespace root should have \\Noselect attribute")
+	assert.True(t, hasChildren, "Shared namespace root should have \\HasChildren attribute")
+
+	// Try to SELECT it - should fail
+	_, err = c.Select("Shared", nil).Wait()
+	assert.Error(t, err, "SELECT on Shared namespace root should fail")
+
+	t.Logf("✓ Shared namespace root correctly has \\Noselect attribute")
+
+	// Cleanup
+	c.Delete(sharedMailbox).Wait()
 }

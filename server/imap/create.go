@@ -26,6 +26,20 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		ctx = context.WithValue(ctx, "config", s.server.config)
 	}
 
+	// Prevent creating the shared namespace root explicitly
+	// Users should create "Shared/Something", not just "Shared"
+	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
+		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
+		if name == sharedPrefix {
+			s.Log("[CREATE] cannot create shared namespace root '%s' explicitly", name)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
+			}
+		}
+	}
+
 	// Check if mailbox already exists
 	_, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, name)
 	if err == nil {
