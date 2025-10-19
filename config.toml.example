@@ -158,16 +158,6 @@ email = "admin@example.com"                     # REQUIRED: Email for Let's Encr
 domains = ["mail.example.com"]                  # REQUIRED: List of domains for certificate (supports multiple: ["mail.example.com", "imap.example.com", "smtp.example.com"])
 storage_provider = "s3"                         # Certificate storage backend (currently only "s3" is supported)
 
-# S3 storage configuration for Let's Encrypt certificates
-# Certificates are stored in S3 to enable sharing across multiple Sora instances
-[tls.letsencrypt.s3]
-bucket = "sora-tls-certificates"                # S3 bucket name for certificate storage (bucket must exist before starting Sora)
-endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint (default: "s3.amazonaws.com" for AWS, or "minio.example.com:9000" for MinIO)
-disable_tls = false                             # Disable TLS for S3 endpoint (useful for local MinIO setups)
-debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
-# access_key_id = ""                            # AWS/S3 access key ID (optional - uses IAM credentials chain if omitted)
-# secret_access_key = ""                        # AWS/S3 secret access key (optional - uses IAM credentials chain if omitted)
-
 # OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)
 # renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (format: "Xh", "Xd" not supported, use hours)
 
@@ -177,6 +167,16 @@ debug = false                                   # Enable detailed S3 request/res
 #
 # IMPORTANT: If the fallback directory cannot be created (e.g., permission denied),
 # Sora will automatically disable fallback and use S3-only mode with a warning.
+
+# S3 storage configuration for Let's Encrypt certificates
+# Certificates are stored in S3 to enable sharing across multiple Sora instances
+[tls.letsencrypt.s3]
+bucket = "sora-tls-certificates"                # S3 bucket name for certificate storage (bucket must exist before starting Sora)
+endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint (default: "s3.amazonaws.com" for AWS, or "minio.example.com:9000" for MinIO)
+disable_tls = false                             # Disable TLS for S3 endpoint (useful for local MinIO setups)
+debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
+# access_key_id = ""                            # AWS/S3 access key ID (optional - uses IAM credentials chain if omitted)
+# secret_access_key = ""                        # AWS/S3 secret access key (optional - uses IAM credentials chain if omitted)
 # This prevents server crashes due to filesystem permission issues.
 #
 # When to disable fallback (enable_fallback = false):
