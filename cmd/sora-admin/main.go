@@ -118,6 +118,8 @@ func main() {
 	switch command {
 	case "accounts":
 		handleAccountsCommand(ctx)
+	case "acl":
+		handleACLCommand(ctx)
 	case "credentials":
 		handleCredentialsCommand(ctx)
 	case "cache":
@@ -301,6 +303,7 @@ Usage:
 
 Commands:
   accounts      Manage user accounts
+  acl           Manage mailbox ACL (Access Control Lists)
   credentials   Manage account credentials
   cache         Cache management operations
   stats         System statistics and analytics
@@ -457,7 +460,7 @@ func handleCreateAccount(ctx context.Context) {
 	// Parse accounts create specific flags
 	fs := flag.NewFlagSet("accounts create", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the new account (required unless --credentials is provided)")
 	password := fs.String("password", "", "Password for the new account (required unless --password-hash or --credentials is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
@@ -476,7 +479,7 @@ Options:
   --password-hash string Pre-computed password hash (alternative to --password)
   --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
   --credentials string   JSON string containing multiple credentials (alternative to single email/password)
-  --config string        Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   # Create account with single credential
@@ -497,6 +500,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *credentials == "" && *email == "" {
 		fmt.Printf("Error: either --email or --credentials is required\n\n")
@@ -573,7 +581,7 @@ func handleAddCredential(ctx context.Context) {
 	// Parse add-credential specific flags
 	fs := flag.NewFlagSet("credentials add", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	primaryIdentity := fs.String("primary", "", "Primary identity of the account to add credential to (required)")
 	email := fs.String("email", "", "New email address to add as credential (required)")
 	password := fs.String("password", "", "Password for the new credential (required unless --password-hash is provided)")
@@ -596,7 +604,7 @@ Options:
   --password-hash string Pre-computed password hash (alternative to --password)
   --make-primary         Make this the new primary identity for the account
   --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
-  --config string        Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
@@ -610,6 +618,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *primaryIdentity == "" {
 		fmt.Printf("Error: --primary is required\n\n")
@@ -761,7 +774,7 @@ func handleListConnections(ctx context.Context) {
 	// Parse connections list specific flags
 	fs := flag.NewFlagSet("connections list", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	userEmail := fs.String("user", "", "Filter connections by user email")
 	protocol := fs.String("protocol", "", "Filter connections by protocol (IMAP, POP3, LMTP)")
 	instanceID := fs.String("instance", "", "Filter connections by instance ID")
@@ -776,7 +789,7 @@ Options:
   --user string         Filter connections by user email
   --protocol string     Filter connections by protocol (IMAP, POP3, LMTP)  
   --instance string     Filter connections by instance ID
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command shows:
   - Active connections with client and server addresses
@@ -797,6 +810,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -910,7 +929,7 @@ func handleKickConnections(ctx context.Context) {
 	// Parse kick-connections specific flags
 	fs := flag.NewFlagSet("connections kick", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	userEmail := fs.String("user", "", "Kick all connections for specific user email")
 	protocol := fs.String("protocol", "", "Kick connections using specific protocol (IMAP, POP3, ManageSieve)")
 	server := fs.String("server", "", "Kick connections to specific server")
@@ -933,7 +952,7 @@ Options:
   --client string       Kick connection from specific client address
   --all                 Kick all active connections
   --confirm             Confirm kick without interactive prompt
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command marks connections for termination. The proxy servers check for
 termination marks every 30 seconds and will close marked connections.
@@ -953,6 +972,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate that at least one filter is specified
 	if *userEmail == "" && *protocol == "" && *server == "" && *clientAddr == "" && !*all {
 		fmt.Printf("Error: At least one filtering option must be specified\n\n")
@@ -1140,7 +1165,7 @@ func handleUpdateAccount(ctx context.Context) {
 	// Parse update-account specific flags
 	fs := flag.NewFlagSet("accounts update", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the account to update (required)")
 	password := fs.String("password", "", "New password for the account (optional if --password-hash or --make-primary is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
@@ -1161,7 +1186,7 @@ Options:
   --password-hash string Pre-computed password hash (alternative to --password)
   --make-primary         Make this credential the primary identity for the account
   --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
-  --config string        Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin accounts update --email user@example.com --password newpassword
@@ -1177,6 +1202,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -1244,7 +1274,7 @@ func handleDeleteAccount(ctx context.Context) {
 	// Parse delete-account specific flags
 	fs := flag.NewFlagSet("accounts delete", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the account to delete (required)")
 	confirm := fs.Bool("confirm", false, "Confirm account deletion (required)")
 
@@ -1263,7 +1293,7 @@ Usage:
 Options:
   --email string      Email address for the account to delete (required)
   --confirm           Confirm account soft-deletion (required for safety)
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin accounts delete --email user@example.com --confirm
@@ -1275,6 +1305,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -1356,7 +1391,7 @@ func handleListCredentials(ctx context.Context) {
 	// Parse list-credentials specific flags
 	fs := flag.NewFlagSet("credentials list", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address associated with the account (required)")
 
 	// Database connection flags (overrides from config file)
@@ -1369,7 +1404,7 @@ Usage:
 
 Options:
   --email string       Email address associated with the account (required)
-  --config string      Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin list-credentials --email user@example.com
@@ -1382,6 +1417,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -1446,7 +1486,7 @@ func handleDeleteCredential(ctx context.Context) {
 	// Parse delete-credential specific flags
 	fs := flag.NewFlagSet("credentials delete", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the credential to delete (required)")
 
 	fs.Usage = func() {
@@ -1465,7 +1505,7 @@ Usage:
 
 Options:
   --email string      Email address of the credential to delete (required)
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin delete-credential --email alias@example.com
@@ -1477,6 +1517,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -1527,7 +1572,7 @@ func handleListAccounts(ctx context.Context) {
 	// Parse list-accounts specific flags
 	fs := flag.NewFlagSet("accounts list", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 
 	fs.Usage = func() {
 		fmt.Printf(`List all accounts in the system
@@ -1543,7 +1588,7 @@ Usage:
   sora-admin list-accounts [options]
 
 Options:
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin list-accounts
@@ -1556,6 +1601,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -1628,7 +1679,7 @@ func handleRestoreAccount(ctx context.Context) {
 	// Parse accounts restore specific flags
 	fs := flag.NewFlagSet("accounts restore", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the account to restore (required)")
 
 	fs.Usage = func() {
@@ -1643,7 +1694,7 @@ Usage:
 
 Options:
   --email string      Email address for the account to restore (required)
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin accounts restore --email user@example.com
@@ -1655,6 +1706,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -1688,7 +1744,7 @@ func handleShowAccount(ctx context.Context) {
 	// Parse show-account specific flags
 	fs := flag.NewFlagSet("accounts show", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the account to show")
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
 
 	fs.Usage = func() {
@@ -1705,7 +1761,7 @@ Usage:
 
 Options:
   --email string      Email address of the account to show (required)
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
   --json             Output in JSON format instead of human-readable format
 
 Examples:
@@ -1720,6 +1776,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.Usage()
@@ -1824,7 +1886,7 @@ func handleShowCredential(ctx context.Context) {
 	// Parse show-credential specific flags
 	fs := flag.NewFlagSet("credentials show", flag.ExitOnError)
 	email := fs.String("email", "", "Email address (credential) to show details for")
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
 
 	fs.Usage = func() {
@@ -1842,7 +1904,7 @@ Usage:
 
 Options:
   --email string      Email address (credential) to show details for (required)
-  --config string     Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
   --json             Output in JSON format instead of human-readable format
 
 Examples:
@@ -1857,6 +1919,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.Usage()
@@ -1993,7 +2061,7 @@ func handleListDeletedMessages(ctx context.Context) {
 	// Parse list-deleted-messages specific flags
 	fs := flag.NewFlagSet("messages list-deleted", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Filter by mailbox path (optional)")
 	since := fs.String("since", "", "Show messages deleted since this date (YYYY-MM-DD or RFC3339)")
@@ -2020,7 +2088,7 @@ Optional Filters:
   --limit int           Maximum number of messages to show (default: 100)
 
 Other Options:
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   sora-admin messages list-deleted --email user@example.com
@@ -2035,6 +2103,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required flags
 	if *email == "" {
 		fmt.Println("ERROR: --email is required")
@@ -2084,7 +2158,7 @@ func handleRestoreMessages(ctx context.Context) {
 	// Parse restore-messages specific flags
 	fs := flag.NewFlagSet("messages restore", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Restore all deleted messages from this mailbox")
 	ids := fs.String("ids", "", "Comma-separated list of message IDs to restore")
@@ -2118,7 +2192,7 @@ Filter Options (choose one or combine):
 
 Other Options:
   --confirm             Skip confirmation prompt
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 Examples:
   # Restore specific messages by ID
@@ -2137,6 +2211,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required flags
 	if *email == "" {
 		fmt.Println("ERROR: --email is required")
@@ -2435,7 +2515,7 @@ func handleImportMaildir(ctx context.Context) {
 	// Parse import specific flags
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the account to import mail to (required)")
 	maildirPath := fs.String("maildir-path", "", "Path to the maildir to import (required)")
 	jobs := fs.Int("jobs", 4, "Number of parallel import jobs")
@@ -2474,7 +2554,7 @@ Options:
   --mailbox-filter string Comma-separated list of mailboxes to import (e.g. INBOX,Sent,Archive*)
   --start-date string     Import only messages after this date (YYYY-MM-DD)
   --end-date string       Import only messages before this date (YYYY-MM-DD)
-  --config string         Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
 not to a parent directory containing multiple maildirs.
@@ -2512,6 +2592,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -2661,7 +2746,7 @@ func handleExportMaildir(ctx context.Context) {
 	// Parse export specific flags
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address for the account to export mail from (required)")
 	maildirPath := fs.String("maildir-path", "", "Path where the maildir will be created/updated (required)")
 	jobs := fs.Int("jobs", 4, "Number of parallel export jobs")
@@ -2694,7 +2779,7 @@ Options:
   --mailbox-filter string Comma-separated list of mailboxes to export (e.g. INBOX,Sent,Archive*)
   --start-date string     Export only messages after this date (YYYY-MM-DD)
   --end-date string       Export only messages before this date (YYYY-MM-DD)
-  --config string         Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 The exporter creates a SQLite database (sora-export.db) in the maildir path to track
 exported messages and avoid duplicates. If exporting to an existing maildir, messages
@@ -2723,6 +2808,11 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required arguments
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
@@ -2828,7 +2918,7 @@ func handleCacheStats(ctx context.Context) {
 	// Parse cache-stats specific flags
 	fs := flag.NewFlagSet("cache stats", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Show local cache size and object count
@@ -2837,7 +2927,7 @@ Usage:
   sora-admin cache-stats [options]
 
 Options:
-  --config string      Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command shows:
   - Cache directory path
@@ -2856,6 +2946,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -2880,7 +2976,7 @@ func handleCachePurge(ctx context.Context) {
 	// Parse cache-purge specific flags
 	fs := flag.NewFlagSet("cache purge", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	confirm := fs.Bool("confirm", false, "Confirm cache purge without interactive prompt")
 
 	fs.Usage = func() {
@@ -2890,7 +2986,7 @@ Usage:
   sora-admin cache-purge [options]
 
 Options:
-  --config string      Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
   --confirm            Confirm cache purge without interactive prompt
 
 This command removes all cached objects from the local cache directory
@@ -2908,6 +3004,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -3025,7 +3127,7 @@ func handleUploaderStatus(ctx context.Context) {
 	// Parse uploader status specific flags
 	fs := flag.NewFlagSet("uploader status", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	showFailed := fs.Bool("show-failed", true, "Show failed uploads details")
 	failedLimit := fs.Int("failed-limit", 10, "Maximum number of failed uploads to show")
 
@@ -3036,7 +3138,7 @@ Usage:
   sora-admin uploader status [options]
 
 Options:
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
   --show-failed         Show failed uploads details (default: true)
   --failed-limit int    Maximum number of failed uploads to show (default: 10)
 
@@ -3059,6 +3161,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -3178,7 +3286,7 @@ func handleConnectionStats(ctx context.Context) {
 	// Parse connection-stats specific flags
 	fs := flag.NewFlagSet("stats connection", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	userEmail := fs.String("user", "", "Show connections for specific user email")
 	server := fs.String("server", "", "Show connections for specific server")
 	cleanupStale := fs.Bool("cleanup-stale", false, "Remove stale connections (no activity for 30 minutes)")
@@ -3199,7 +3307,7 @@ Options:
   --cleanup-stale       Remove stale connections (no activity for specified minutes)
   --stale-minutes int   Minutes of inactivity to consider connection stale (default: 30)
   --detail              Show detailed connection list (default: true)
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command shows:
   - Total number of active connections
@@ -3223,6 +3331,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
@@ -3383,7 +3497,7 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 func handleAuthStats(ctx context.Context) {
 	// Parse auth-stats specific flags
 	fs := flag.NewFlagSet("stats auth", flag.ExitOnError)
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	windowDuration := fs.String("window", "15m", "Time window for statistics (e.g., '15m', '1h', '24h')")
 	showBlocked := fs.Bool("blocked", true, "Show currently blocked IPs and usernames")
 	showStats := fs.Bool("stats", true, "Show overall authentication statistics")
@@ -3403,7 +3517,7 @@ Options:
   --stats                       Show overall authentication statistics (default: true)
   --max-attempts-ip int         Max attempts per IP for blocking threshold (default: 10)
   --max-attempts-username int   Max attempts per username for blocking threshold (default: 5)
-  --config string              Path to TOML configuration file (default: "config.toml")
+  --config string              Path to TOML configuration file (required)
 
 
 Examples:
@@ -3548,7 +3662,7 @@ func handleHealthStatus(ctx context.Context) {
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
 
 	// Configuration
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Show system health status and component monitoring
@@ -3563,7 +3677,7 @@ Options:
   --history             Show health status history
   --since string        Time window for history, e.g. 1h, 24h, 7d (default: 1h)
   --json                Output in JSON format
-  --config string       Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command shows:
   - Overall system health status
@@ -3959,7 +4073,7 @@ func handleCacheMetrics(ctx context.Context) {
 	// Parse cache-metrics specific flags
 	fs := flag.NewFlagSet("cache metrics", flag.ExitOnError)
 
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	instanceID := fs.String("instance", "", "Show metrics for specific instance ID")
 	since := fs.String("since", "24h", "Time window for historical metrics (e.g., 1h, 24h, 7d)")
 	showHistory := fs.Bool("history", false, "Show historical metrics instead of just latest")
@@ -3978,7 +4092,7 @@ Options:
   --history            Show historical metrics instead of just latest
   --limit int          Maximum number of historical records to show (default: 50)
   --json               Output in JSON format
-  --config string      Path to TOML configuration file (default: config.toml)
+  --config string        Path to TOML configuration file (required)
 
 This command shows:
   - Cache hit/miss ratios for each instance
@@ -3999,6 +4113,12 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Parse since duration
 	sinceDuration, err := helpers.ParseDuration(*since)
 	if err != nil {
@@ -4362,6 +4482,12 @@ func handleImportS3(ctx context.Context) {
 		logger.Fatalf("Failed to parse flags: %v", err)
 	}
 
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 	// Validate required flags
 	if *email == "" {
 		logger.Fatal("--email is required (e.g., 'user@example.com')")

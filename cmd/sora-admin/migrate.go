@@ -74,12 +74,18 @@ Use 'sora-admin migrate <subcommand> --help' for detailed help.
 
 func handleMigrateUp(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate up", flag.ExitOnError)
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate up [--config config.toml]")
+		fmt.Println("Usage: sora-admin migrate up --config config.toml")
 		fmt.Println("Applies all pending upwards migrations.")
 	}
 	fs.Parse(os.Args[3:])
+
+	if *configPath == "" {
+		fmt.Println("Error: --config is required")
+		fs.PrintDefaults()
+		os.Exit(1)
+	}
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
@@ -97,14 +103,20 @@ func handleMigrateUp(ctx context.Context) {
 
 func handleMigrateDown(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate down", flag.ExitOnError)
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	limit := fs.Int("limit", 1, "Number of migrations to revert")
 	all := fs.Bool("all", false, "Revert all migrations")
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate down [--config config.toml] [--limit N | --all]")
+		fmt.Println("Usage: sora-admin migrate down --config config.toml [--limit N | --all]")
 		fmt.Println("Reverts migrations. Defaults to reverting one migration.")
 	}
 	fs.Parse(os.Args[3:])
+
+	if *configPath == "" {
+		fmt.Println("Error: --config is required")
+		fs.PrintDefaults()
+		os.Exit(1)
+	}
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
@@ -142,12 +154,18 @@ func handleMigrateDown(ctx context.Context) {
 
 func handleMigrateVersion(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate version", flag.ExitOnError)
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate version [--config config.toml]")
+		fmt.Println("Usage: sora-admin migrate version --config config.toml")
 		fmt.Println("Shows the current migration version and dirty state.")
 	}
 	fs.Parse(os.Args[3:])
+
+	if *configPath == "" {
+		fmt.Println("Error: --config is required")
+		fs.PrintDefaults()
+		os.Exit(1)
+	}
 
 	m, db, err := getMigrateInstance(ctx, *configPath)
 	if err != nil {
@@ -160,12 +178,18 @@ func handleMigrateVersion(ctx context.Context) {
 
 func handleMigrateForce(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate force", flag.ExitOnError)
-	configPath := fs.String("config", "config.toml", "Path to TOML configuration file")
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate force [--config config.toml] <version>")
+		fmt.Println("Usage: sora-admin migrate force --config config.toml <version>")
 		fmt.Println("Forcibly sets the database migration version. USE WITH CAUTION.")
 	}
 	fs.Parse(os.Args[3:])
+
+	if *configPath == "" {
+		fmt.Println("Error: --config is required")
+		fs.PrintDefaults()
+		os.Exit(1)
+	}
 
 	if fs.NArg() != 1 {
 		fs.Usage()

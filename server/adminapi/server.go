@@ -195,6 +195,11 @@ func (s *Server) setupRoutes() http.Handler {
 	// Mail delivery route
 	mux.HandleFunc("/admin/mail/deliver", routeHandler("POST", s.handleDeliverMail))
 
+	// ACL management routes
+	mux.HandleFunc("/admin/mailboxes/acl/grant", routeHandler("POST", s.handleACLGrant))
+	mux.HandleFunc("/admin/mailboxes/acl/revoke", routeHandler("POST", s.handleACLRevoke))
+	mux.HandleFunc("/admin/mailboxes/acl", routeHandler("GET", s.handleACLList))
+
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)
 	handler = s.allowedHostsMiddleware(handler)

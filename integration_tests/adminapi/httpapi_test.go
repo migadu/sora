@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/adminapi"
@@ -1839,5 +1840,255 @@ Date: %s
 		}
 
 		t.Logf("Successfully delivered large message (~100KB)")
+	})
+}
+
+// TestACLManagement tests the ACL management endpoints
+func TestACLManagement(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	// Create test accounts
+	owner := common.CreateTestAccount(t, server.rdb)
+	user2 := common.CreateTestAccount(t, server.rdb)
+	user3 := common.CreateTestAccount(t, server.rdb)
+
+	// Create a shared mailbox via database
+	ctx := context.Background()
+
+	// Add config to context to enable shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx = context.WithValue(ctx, "config", cfg)
+
+	ownerID, _ := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+	mailboxName := "Shared/TestACL"
+
+	err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailboxName, nil)
+	if err != nil {
+		t.Fatalf("Failed to create shared mailbox: %v", err)
+	}
+
+	t.Run("GrantACL_Success", func(t *testing.T) {
+		grantReq := map[string]interface{}{
+			"owner":      owner.Email,
+			"mailbox":    mailboxName,
+			"identifier": user2.Email,
+			"rights":     "lrs",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant", grantReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var grantResp map[string]interface{}
+		server.expectJSON(t, body, &grantResp)
+
+		if status, ok := grantResp["status"].(string); !ok || status != "success" {
+			t.Errorf("Expected status='success', got %v", grantResp["status"])
+		}
+
+		if rights, ok := grantResp["rights"].(string); !ok || rights != "lrs" {
+			t.Errorf("Expected rights='lrs', got %v", grantResp["rights"])
+		}
+
+		t.Logf("Successfully granted ACL rights: %v", grantResp)
+	})
+
+	t.Run("GrantACL_AnyoneIdentifier", func(t *testing.T) {
+		grantReq := map[string]interface{}{
+			"owner":      owner.Email,
+			"mailbox":    mailboxName,
+			"identifier": "anyone",
+			"rights":     "lr",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant", grantReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var grantResp map[string]interface{}
+		server.expectJSON(t, body, &grantResp)
+
+		if identifier, ok := grantResp["identifier"].(string); !ok || identifier != "anyone" {
+			t.Errorf("Expected identifier='anyone', got %v", grantResp["identifier"])
+		}
+
+		t.Logf("Successfully granted 'anyone' ACL rights: %v", grantResp)
+	})
+
+	t.Run("ListACL_Success", func(t *testing.T) {
+		url := fmt.Sprintf("/admin/mailboxes/acl?owner=%s&mailbox=%s", owner.Email, mailboxName)
+		resp, body := server.makeRequest(t, "GET", url, nil)
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var listResp map[string]interface{}
+		server.expectJSON(t, body, &listResp)
+
+		if mbox, ok := listResp["mailbox"].(string); !ok || mbox != mailboxName {
+			t.Errorf("Expected mailbox='%s', got %v", mailboxName, listResp["mailbox"])
+		}
+
+		acls, ok := listResp["acls"].([]interface{})
+		if !ok {
+			t.Fatalf("Expected acls array, got %T", listResp["acls"])
+		}
+
+		if len(acls) < 2 {
+			t.Errorf("Expected at least 2 ACL entries (owner + user2), got %d", len(acls))
+		}
+
+		// Verify user2 has 'lrs' rights
+		foundUser2 := false
+		foundAnyone := false
+		for _, acl := range acls {
+			aclMap := acl.(map[string]interface{})
+			identifier := aclMap["identifier"].(string)
+			rights := aclMap["rights"].(string)
+
+			if identifier == user2.Email && rights == "lrs" {
+				foundUser2 = true
+			}
+			if identifier == "anyone" && rights == "lr" {
+				foundAnyone = true
+			}
+		}
+
+		if !foundUser2 {
+			t.Error("Did not find user2 with 'lrs' rights in ACL list")
+		}
+		if !foundAnyone {
+			t.Error("Did not find 'anyone' with 'lr' rights in ACL list")
+		}
+
+		t.Logf("Successfully listed ACL entries: %d entries", len(acls))
+	})
+
+	t.Run("RevokeACL_Success", func(t *testing.T) {
+		revokeReq := map[string]interface{}{
+			"owner":      owner.Email,
+			"mailbox":    mailboxName,
+			"identifier": user2.Email,
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/revoke", revokeReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var revokeResp map[string]interface{}
+		server.expectJSON(t, body, &revokeResp)
+
+		if status, ok := revokeResp["status"].(string); !ok || status != "success" {
+			t.Errorf("Expected status='success', got %v", revokeResp["status"])
+		}
+
+		// Verify user2 no longer has access
+		url := fmt.Sprintf("/admin/mailboxes/acl?owner=%s&mailbox=%s", owner.Email, mailboxName)
+		resp, body = server.makeRequest(t, "GET", url, nil)
+
+		var listResp map[string]interface{}
+		server.expectJSON(t, body, &listResp)
+
+		acls := listResp["acls"].([]interface{})
+		for _, acl := range acls {
+			aclMap := acl.(map[string]interface{})
+			if identifier := aclMap["identifier"].(string); identifier == user2.Email {
+				t.Errorf("User2 still has ACL entry after revocation: %v", aclMap)
+			}
+		}
+
+		t.Log("Successfully revoked ACL rights")
+	})
+
+	t.Run("GrantACL_InvalidRights", func(t *testing.T) {
+		grantReq := map[string]interface{}{
+			"owner":      owner.Email,
+			"mailbox":    mailboxName,
+			"identifier": user3.Email,
+			"rights":     "xyz", // Invalid rights
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant", grantReq)
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("Expected error for invalid rights, got status 200 - %s", string(body))
+		}
+
+		var errResp map[string]interface{}
+		server.expectJSON(t, body, &errResp)
+
+		if _, ok := errResp["error"]; !ok {
+			t.Error("Expected error message in response")
+		}
+
+		t.Logf("Correctly rejected invalid rights: %v", errResp)
+	})
+
+	t.Run("GrantACL_MissingOwner", func(t *testing.T) {
+		grantReq := map[string]interface{}{
+			"mailbox":    mailboxName,
+			"identifier": user3.Email,
+			"rights":     "lrs",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant", grantReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400 for missing owner, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var errResp map[string]interface{}
+		server.expectJSON(t, body, &errResp)
+
+		if _, ok := errResp["error"]; !ok {
+			t.Error("Expected error message in response")
+		}
+
+		t.Log("Correctly rejected request with missing owner")
+	})
+
+	t.Run("ListACL_MissingParameters", func(t *testing.T) {
+		// Missing mailbox parameter
+		url := fmt.Sprintf("/admin/mailboxes/acl?owner=%s", owner.Email)
+		resp, body := server.makeRequest(t, "GET", url, nil)
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400 for missing mailbox, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var errResp map[string]interface{}
+		server.expectJSON(t, body, &errResp)
+
+		if _, ok := errResp["error"]; !ok {
+			t.Error("Expected error message in response")
+		}
+
+		t.Log("Correctly rejected request with missing mailbox parameter")
+	})
+
+	t.Run("RevokeACL_NonexistentUser", func(t *testing.T) {
+		revokeReq := map[string]interface{}{
+			"owner":      owner.Email,
+			"mailbox":    mailboxName,
+			"identifier": "nonexistent@example.com",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/revoke", revokeReq)
+		// This should succeed (idempotent) even if the user doesn't have access
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("Expected status 200 or 500, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		t.Log("Revoke operation completed (idempotent behavior)")
 	})
 }

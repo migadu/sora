@@ -451,6 +451,12 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 	// Perform TLS handshake
 	tlsConn := tls.Server(tcpConn, tlsConfig)
 
+	// Force TLS handshake to complete (this triggers JA4 capture via GetConfigForClient)
+	if err := tlsConn.Handshake(); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
 	// Replace the underlying connection in SoraConn with the TLS connection
 	soraConn.Conn = tlsConn
 

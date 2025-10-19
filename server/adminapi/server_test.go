@@ -612,3 +612,317 @@ func TestAddCredentialRequestValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestACLGrantRequestValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestBody    interface{}
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "invalid JSON",
+			requestBody:    "invalid-json",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "Invalid request body",
+		},
+		{
+			name: "missing owner",
+			requestBody: map[string]interface{}{
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+				"rights":     "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner is required",
+		},
+		{
+			name: "missing mailbox",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"identifier": "user@example.com",
+				"rights":     "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox is required",
+		},
+		{
+			name: "missing identifier",
+			requestBody: map[string]interface{}{
+				"owner":   "owner@example.com",
+				"mailbox": "Shared/Sales",
+				"rights":  "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "identifier is required",
+		},
+		{
+			name: "missing rights",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "rights is required",
+		},
+		{
+			name: "empty owner",
+			requestBody: map[string]interface{}{
+				"owner":      "",
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+				"rights":     "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner is required",
+		},
+		{
+			name: "empty mailbox",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "",
+				"identifier": "user@example.com",
+				"rights":     "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox is required",
+		},
+		{
+			name: "empty identifier",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "Shared/Sales",
+				"identifier": "",
+				"rights":     "lrs",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "identifier is required",
+		},
+		{
+			name: "empty rights",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+				"rights":     "",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "rights is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			var err error
+
+			if str, ok := tt.requestBody.(string); ok {
+				body = []byte(str)
+			} else {
+				body, err = json.Marshal(tt.requestBody)
+				if err != nil {
+					t.Fatalf("Failed to marshal request body: %v", err)
+				}
+			}
+
+			req := httptest.NewRequest("POST", "/admin/mailboxes/acl/grant", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer test-api-key")
+
+			server := &Server{
+				apiKey: "test-api-key",
+			}
+
+			rr := httptest.NewRecorder()
+			server.handleACLGrant(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("handleACLGrant() status = %v, want %v", rr.Code, tt.expectedStatus)
+			}
+
+			if !strings.Contains(rr.Body.String(), tt.expectedError) {
+				t.Errorf("handleACLGrant() body = %v, want to contain %v", rr.Body.String(), tt.expectedError)
+			}
+		})
+	}
+}
+
+func TestACLRevokeRequestValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestBody    interface{}
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "invalid JSON",
+			requestBody:    "invalid-json",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "Invalid request body",
+		},
+		{
+			name: "missing owner",
+			requestBody: map[string]interface{}{
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner is required",
+		},
+		{
+			name: "missing mailbox",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"identifier": "user@example.com",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox is required",
+		},
+		{
+			name: "missing identifier",
+			requestBody: map[string]interface{}{
+				"owner":   "owner@example.com",
+				"mailbox": "Shared/Sales",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "identifier is required",
+		},
+		{
+			name: "empty owner",
+			requestBody: map[string]interface{}{
+				"owner":      "",
+				"mailbox":    "Shared/Sales",
+				"identifier": "user@example.com",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner is required",
+		},
+		{
+			name: "empty mailbox",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "",
+				"identifier": "user@example.com",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox is required",
+		},
+		{
+			name: "empty identifier",
+			requestBody: map[string]interface{}{
+				"owner":      "owner@example.com",
+				"mailbox":    "Shared/Sales",
+				"identifier": "",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "identifier is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			var err error
+
+			if str, ok := tt.requestBody.(string); ok {
+				body = []byte(str)
+			} else {
+				body, err = json.Marshal(tt.requestBody)
+				if err != nil {
+					t.Fatalf("Failed to marshal request body: %v", err)
+				}
+			}
+
+			req := httptest.NewRequest("POST", "/admin/mailboxes/acl/revoke", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer test-api-key")
+
+			server := &Server{
+				apiKey: "test-api-key",
+			}
+
+			rr := httptest.NewRecorder()
+			server.handleACLRevoke(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("handleACLRevoke() status = %v, want %v", rr.Code, tt.expectedStatus)
+			}
+
+			if !strings.Contains(rr.Body.String(), tt.expectedError) {
+				t.Errorf("handleACLRevoke() body = %v, want to contain %v", rr.Body.String(), tt.expectedError)
+			}
+		})
+	}
+}
+
+func TestACLListRequestValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		queryParams    map[string]string
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "missing owner parameter",
+			queryParams:    map[string]string{"mailbox": "Shared/Sales"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner parameter is required",
+		},
+		{
+			name:           "missing mailbox parameter",
+			queryParams:    map[string]string{"owner": "owner@example.com"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox parameter is required",
+		},
+		{
+			name:           "both parameters missing",
+			queryParams:    map[string]string{},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner parameter is required",
+		},
+		{
+			name:           "empty owner parameter",
+			queryParams:    map[string]string{"owner": "", "mailbox": "Shared/Sales"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "owner parameter is required",
+		},
+		{
+			name:           "empty mailbox parameter",
+			queryParams:    map[string]string{"owner": "owner@example.com", "mailbox": ""},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "mailbox parameter is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := "/admin/mailboxes/acl"
+			if len(tt.queryParams) > 0 {
+				url += "?"
+				for key, value := range tt.queryParams {
+					url += key + "=" + value + "&"
+				}
+				url = url[:len(url)-1] // Remove trailing &
+			}
+
+			req := httptest.NewRequest("GET", url, nil)
+			req.Header.Set("Authorization", "Bearer test-api-key")
+
+			server := &Server{
+				apiKey: "test-api-key",
+			}
+
+			rr := httptest.NewRecorder()
+			server.handleACLList(rr, req)
+
+			if rr.Code != tt.expectedStatus {
+				t.Errorf("handleACLList() status = %v, want %v", rr.Code, tt.expectedStatus)
+			}
+
+			if !strings.Contains(rr.Body.String(), tt.expectedError) {
+				t.Errorf("handleACLList() body = %v, want to contain %v", rr.Body.String(), tt.expectedError)
+			}
+		})
+	}
+}

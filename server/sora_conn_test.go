@@ -594,17 +594,17 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 
 	// Accept in background
 	acceptDone := make(chan net.Conn)
+	acceptErr := make(chan error, 1)
 	go func() {
 		conn, err := soraListener.Accept()
 		if err != nil {
-			t.Logf("Accept error: %v", err)
-			close(acceptDone)
+			acceptErr <- err
 			return
 		}
 		acceptDone <- conn
 	}()
 
-	// Give server time to start
+	// Give server time to start accepting
 	time.Sleep(50 * time.Millisecond)
 
 	// Connect client with TLS
@@ -619,11 +619,16 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	// Write some data to complete handshake
-	clientConn.Write([]byte("test\r\n"))
-
-	// Get server connection
-	serverConn := <-acceptDone
+	// Get server connection (should complete now that TLS handshake happened)
+	var serverConn net.Conn
+	select {
+	case serverConn = <-acceptDone:
+		// Success
+	case err := <-acceptErr:
+		t.Fatalf("Accept failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Accept timed out")
+	}
 	if serverConn == nil {
 		t.Fatal("Server failed to accept connection")
 	}
@@ -635,14 +640,7 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 		t.Fatalf("Expected *SoraConn, got %T", serverConn)
 	}
 
-	// Read the data to ensure handshake completed
-	buf := make([]byte, 100)
-	soraConn.Read(buf)
-
-	// Give time for JA4 callback to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Check JA4 was captured
+	// Check JA4 was captured (handshake is already complete due to Accept())
 	ja4, err := soraConn.GetJA4Fingerprint()
 	if err != nil {
 		t.Fatalf("GetJA4Fingerprint failed: %v", err)

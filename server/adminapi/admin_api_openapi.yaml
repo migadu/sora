@@ -641,6 +641,91 @@ components:
           example: "Partial delivery failure"
           description: "Error message if delivery failed"
 
+    ACLGrantRequest:
+      type: object
+      properties:
+        owner:
+          type: string
+          format: email
+          description: "Email address of the mailbox owner"
+          example: "owner@example.com"
+        mailbox:
+          type: string
+          description: "Mailbox name (e.g., 'Shared/Sales')"
+          example: "Shared/Sales"
+        identifier:
+          type: string
+          description: "Email address or 'anyone' for domain-wide access"
+          example: "user@example.com"
+        rights:
+          type: string
+          description: "ACL rights string (combination of: lrswipkxtea)"
+          example: "lrs"
+          pattern: '^[lrswipkxtea]+$'
+      required:
+        - owner
+        - mailbox
+        - identifier
+        - rights
+
+    ACLRevokeRequest:
+      type: object
+      properties:
+        owner:
+          type: string
+          format: email
+          description: "Email address of the mailbox owner"
+          example: "owner@example.com"
+        mailbox:
+          type: string
+          description: "Mailbox name (e.g., 'Shared/Sales')"
+          example: "Shared/Sales"
+        identifier:
+          type: string
+          description: "Email address or 'anyone'"
+          example: "user@example.com"
+      required:
+        - owner
+        - mailbox
+        - identifier
+
+    ACLEntry:
+      type: object
+      properties:
+        identifier:
+          type: string
+          description: "Email address or 'anyone'"
+          example: "user@example.com"
+        rights:
+          type: string
+          description: "ACL rights string"
+          example: "lrs"
+      required:
+        - identifier
+        - rights
+
+    ACLListResponse:
+      type: object
+      properties:
+        mailbox:
+          type: string
+          description: "Mailbox name"
+          example: "Shared/Sales"
+        owner:
+          type: string
+          format: email
+          description: "Owner email address"
+          example: "owner@example.com"
+        acls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ACLEntry'
+          description: "List of ACL entries"
+      required:
+        - mailbox
+        - owner
+        - acls
+
 # Global security requirement
 security:
   - ApiKeyAuth: []
@@ -1823,6 +1908,237 @@ paths:
                       type: array
                       items:
                         type: string
+
+  /mailboxes/acl/grant:
+    post:
+      tags:
+        - ACL Management
+      summary: Grant ACL rights to a user on a mailbox
+      description: |
+        Grant ACL (Access Control List) rights to a specific user or identifier on a mailbox.
+
+        Supported ACL rights:
+        - `l` (lookup) - Mailbox is visible in listings
+        - `r` (read) - Read messages
+        - `s` (seen) - Change \Seen flag
+        - `w` (write) - Change other flags
+        - `i` (insert) - Append/copy messages
+        - `p` (post) - Post to submission address
+        - `k` (create) - Create child mailboxes
+        - `x` (delete) - Delete/rename mailbox
+        - `t` (delete-msg) - Set \Deleted flag on messages
+        - `e` (expunge) - Expunge deleted messages
+        - `a` (admin) - Administer ACL
+
+        Use "anyone" as the identifier to grant access to all users in the same domain.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ACLGrantRequest'
+            examples:
+              user_access:
+                summary: Grant read-only access to a user
+                value:
+                  owner: "owner@example.com"
+                  mailbox: "Shared/Sales"
+                  identifier: "bob@example.com"
+                  rights: "lrs"
+              anyone_access:
+                summary: Grant domain-wide read access
+                value:
+                  owner: "owner@example.com"
+                  mailbox: "Shared/Public"
+                  identifier: "anyone"
+                  rights: "lr"
+      responses:
+        '200':
+          description: ACL rights granted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  message:
+                    type: string
+                    example: "ACL rights granted successfully"
+                  owner:
+                    type: string
+                    example: "owner@example.com"
+                  mailbox:
+                    type: string
+                    example: "Shared/Sales"
+                  identifier:
+                    type: string
+                    example: "bob@example.com"
+                  rights:
+                    type: string
+                    example: "lrs"
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /mailboxes/acl/revoke:
+    post:
+      tags:
+        - ACL Management
+      summary: Revoke ACL rights from a user on a mailbox
+      description: |
+        Revoke all ACL (Access Control List) rights from a specific user or identifier on a mailbox.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ACLRevokeRequest'
+            examples:
+              revoke_user:
+                summary: Revoke access from a user
+                value:
+                  owner: "owner@example.com"
+                  mailbox: "Shared/Sales"
+                  identifier: "bob@example.com"
+              revoke_anyone:
+                summary: Revoke domain-wide access
+                value:
+                  owner: "owner@example.com"
+                  mailbox: "Shared/Public"
+                  identifier: "anyone"
+      responses:
+        '200':
+          description: ACL rights revoked successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  message:
+                    type: string
+                    example: "ACL rights revoked successfully"
+                  owner:
+                    type: string
+                    example: "owner@example.com"
+                  mailbox:
+                    type: string
+                    example: "Shared/Sales"
+                  identifier:
+                    type: string
+                    example: "bob@example.com"
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /mailboxes/acl:
+    get:
+      tags:
+        - ACL Management
+      summary: List all ACL entries for a mailbox
+      description: |
+        Retrieve all ACL (Access Control List) entries for a specific mailbox.
+        Returns a list of identifiers (email addresses or "anyone") and their associated rights.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: owner
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+          description: "Email address of the mailbox owner"
+          example: "owner@example.com"
+        - name: mailbox
+          in: query
+          required: true
+          schema:
+            type: string
+          description: "Mailbox name (e.g., 'Shared/Sales')"
+          example: "Shared/Sales"
+      responses:
+        '200':
+          description: List of ACL entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ACLListResponse'
+              examples:
+                with_entries:
+                  summary: Mailbox with ACL entries
+                  value:
+                    mailbox: "Shared/Sales"
+                    owner: "owner@example.com"
+                    acls:
+                      - identifier: "owner@example.com"
+                        rights: "lrswipkxtea"
+                      - identifier: "bob@example.com"
+                        rights: "lrs"
+                      - identifier: "anyone"
+                        rights: "lr"
+                empty:
+                  summary: Mailbox with no ACL entries
+                  value:
+                    mailbox: "Shared/Empty"
+                    owner: "owner@example.com"
+                    acls: []
+        '400':
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - invalid or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /mail/deliver:
     post:
