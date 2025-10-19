@@ -3,7 +3,6 @@ package imapproxy
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -349,14 +348,12 @@ func (s *Server) acceptConnections() error {
 			case <-s.ctx.Done():
 				return nil // Graceful shutdown
 			default:
-				// Check if this is a TLS handshake error (connection-specific, not fatal)
-				var tlsRecordHeaderErr tls.RecordHeaderError
-				if errors.As(err, &tlsRecordHeaderErr) ||
-					strings.Contains(err.Error(), "tls:") ||
-					strings.Contains(err.Error(), "missing server name") {
-					log.Printf("[IMAP Proxy %s] TLS handshake error: %v", s.name, err)
+				// Check if this is a connection-specific error (non-fatal to the server)
+				if server.IsConnectionError(err) {
+					log.Printf("[IMAP Proxy %s] Connection error (non-fatal): %v", s.name, err)
 					continue // Continue accepting other connections
 				}
+				// For truly unexpected errors, crash the server
 				return fmt.Errorf("failed to accept connection: %w", err)
 			}
 		}
