@@ -64,7 +64,9 @@ func (s *Session) handleConnection() {
 	defer s.close()
 
 	clientAddr := s.clientConn.RemoteAddr().String()
-	log.Printf("IMAP Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	if s.server.debug {
+		log.Printf("IMAP Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	}
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -269,7 +271,9 @@ func (s *Session) handleConnection() {
 	}
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
-		log.Printf("IMAP Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
+		if s.server.debug {
+			log.Printf("IMAP Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
+		}
 		s.startProxy()
 	} else {
 		log.Printf("IMAP Proxy [%s] Cannot start proxy for user %s: no backend connection", s.server.name, s.username)
@@ -311,7 +315,7 @@ func (s *Session) sendResponse(response string) error {
 
 // Log logs a client command with password masking if debug is enabled.
 func (s *Session) Log(format string, args ...interface{}) {
-	if s.server.debugWriter != nil {
+	if s.server.debug {
 		message := fmt.Sprintf(format, args...)
 		s.server.debugWriter.Write([]byte(message))
 	}
@@ -337,7 +341,9 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Skip strict address validation if prelookup is enabled, as it may support master tokens
 	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
-		log.Printf("IMAP Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+		if s.server.debug {
+			log.Printf("IMAP Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+		}
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 		if err != nil {
@@ -353,7 +359,9 @@ func (s *Session) authenticateUser(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					log.Printf("IMAP Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+					if s.server.debug {
+						log.Printf("IMAP Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+					}
 					// Fallthrough to main DB auth
 				} else {
 					log.Printf("IMAP Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
@@ -362,15 +370,15 @@ func (s *Session) authenticateUser(username, password string) error {
 					return fmt.Errorf("prelookup service unavailable")
 				}
 			} else {
-				// Unknown error type - log and fallthrough
-				log.Printf("IMAP Proxy [%s] Prelookup unknown error for '%s': %v. Attempting fallback to main DB.", s.server.name, username, err)
-				// Fallthrough to main DB auth
+				// Unknown error type - fallthrough to main DB auth
 			}
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
-				log.Printf("IMAP Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+				if s.server.debug {
+					log.Printf("IMAP Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+				}
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -398,7 +406,9 @@ func (s *Session) authenticateUser(username, password string) error {
 
 			case proxy.AuthUserNotFound:
 				// User not in prelookup DB. Fallthrough to main DB auth.
-				log.Printf("IMAP Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+				if s.server.debug {
+					log.Printf("IMAP Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+				}
 			}
 		}
 	}
@@ -408,8 +418,9 @@ func (s *Session) authenticateUser(username, password string) error {
 	if err != nil {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
-
-	log.Printf("IMAP Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+	if s.server.debug {
+		log.Printf("IMAP Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+	}
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
@@ -528,7 +539,7 @@ func (s *Session) connectToBackend() error {
 	}
 
 	// Read greeting from backend
-	greeting, err := s.backendReader.ReadString('\n')
+	_, err = s.backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
 		log.Printf("IMAP Proxy [%s] Failed to read backend greeting from %s for user %s: %v", s.server.name, s.serverAddr, s.username, err)
@@ -538,10 +549,6 @@ func (s *Session) connectToBackend() error {
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
 		log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, s.serverAddr, err)
-	}
-
-	if s.server.debugWriter != nil {
-		log.Printf("IMAP Proxy [%s] Backend greeting from %s: %s", s.server.name, s.serverAddr, strings.TrimRight(greeting, "\r"))
 	}
 
 	return nil
@@ -587,7 +594,9 @@ func (s *Session) authenticateToBackend() (string, error) {
 		return "", fmt.Errorf("backend authentication failed: %s", response)
 	}
 
-	log.Printf("IMAP Proxy [%s] Backend authentication successful for user %s", s.server.name, s.username)
+	if s.server.debug {
+		log.Printf("IMAP Proxy [%s] Backend authentication successful for user %s", s.server.name, s.username)
+	}
 
 	return strings.TrimRight(response, "\r\n"), nil
 }

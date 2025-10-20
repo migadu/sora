@@ -54,6 +54,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Debug logging
+	debug       bool
 	debugWriter io.Writer
 }
 
@@ -171,7 +172,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			log.Printf("[IMAP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[IMAP Proxy %s] Prelookup client initialized successfully", opts.Name)
+			if opts.Debug {
+				log.Printf("[IMAP Proxy %s] Prelookup client initialized successfully", opts.Name)
+			}
 		}
 	}
 
@@ -230,6 +233,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		prelookupConfig:        opts.PreLookup,
 		remoteUseIDCommand:     opts.RemoteUseIDCommand,
 		limiter:                limiter,
+		debug:                  opts.Debug,
 		debugWriter:            debugWriter,
 	}, nil
 }
@@ -262,12 +266,6 @@ func (s *Server) Start() error {
 			NextProtos:               []string{"imap"},
 		}
 
-		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for IMAP proxy [%s] (tls_verify=true)", s.name)
-		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for IMAP proxy [%s] (tls_verify=false)", s.name)
-		}
-
 		s.listenerMu.Lock()
 		// Create base TCP listener
 		tcpListener, err := net.Listen("tcp", s.addr)
@@ -285,7 +283,6 @@ func (s *Server) Start() error {
 		}
 		s.listener = server.NewSoraTLSListener(tcpListener, tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using per-server certificate, SoraConn enabled)", s.name, s.addr)
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.listenerMu.Lock()
@@ -305,7 +302,6 @@ func (s *Server) Start() error {
 		}
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] listening with TLS on %s (using global TLS manager, SoraConn enabled)", s.name, s.addr)
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
 		s.cancel()
@@ -328,7 +324,6 @@ func (s *Server) Start() error {
 		}
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("IMAP proxy [%s] listening on %s (SoraConn enabled)", s.name, s.addr)
 	}
 
 	// Start connection limiter cleanup if enabled

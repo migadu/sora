@@ -346,7 +346,6 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 		// Check for "buffer full" error - might indicate partial read
 		if err == bufio.ErrBufferFull {
 			// This shouldn't happen with 3 bytes, but proceed anyway
-			log.Printf("[%s] TLS detection: buffer full during peek", c.protocol)
 			return nil
 		}
 		// Other errors will be caught by protocol handler
@@ -438,10 +437,6 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	// Log incoming connection for debugging
-	remoteAddr := tcpConn.RemoteAddr().String()
-	log.Printf("[%s] Accepted TCP connection from %s (TLS handshake deferred)", l.connConfig.Protocol, remoteAddr)
-
 	// Return SoraTLSConn that will perform handshake when PerformHandshake() is called
 	return NewSoraTLSConn(tcpConn, l.tlsConfig, l.connConfig), nil
 }
@@ -488,32 +483,20 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	c.handshakeComplete = true
 
 	remoteAddr := c.tcpConn.RemoteAddr().String()
-	log.Printf("[%s] Starting TLS handshake for %s", c.connConfig.Protocol, remoteAddr)
 
 	// Clone TLS config and add GetConfigForClient callback to capture JA4
 	tlsConfig := c.tlsConfig.Clone()
 	originalGetConfig := tlsConfig.GetConfigForClient
 
 	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		log.Printf("[%s] GetConfigForClient called for SNI=%s from %s", c.connConfig.Protocol, hello.ServerName, remoteAddr)
-
 		// Capture JA4 fingerprint
 		ja4 := ja4plus.JA4(hello)
 		c.SetJA4Fingerprint(ja4)
-		log.Printf("[JA4] Captured fingerprint during handshake: %s", ja4)
 
 		// Call original callback if it exists
 		if originalGetConfig != nil {
-			log.Printf("[%s] Calling original GetConfigForClient for %s", c.connConfig.Protocol, remoteAddr)
-			cfg, err := originalGetConfig(hello)
-			if err != nil {
-				log.Printf("[%s] Original GetConfigForClient failed for %s: %v", c.connConfig.Protocol, remoteAddr, err)
-			} else {
-				log.Printf("[%s] Original GetConfigForClient succeeded for %s", c.connConfig.Protocol, remoteAddr)
-			}
-			return cfg, err
+			return originalGetConfig(hello)
 		}
-		log.Printf("[%s] No original GetConfigForClient, using base config for %s", c.connConfig.Protocol, remoteAddr)
 		return nil, nil
 	}
 
@@ -536,14 +519,11 @@ func (c *SoraTLSConn) PerformHandshake() error {
 		c.handshakeErr = err
 		return err
 	}
-	handshakeDuration := time.Since(handshakeStart)
 
 	// Clear the deadline after successful handshake
 	if err := c.tlsConn.SetDeadline(time.Time{}); err != nil {
 		log.Printf("[%s] Warning: failed to clear handshake deadline: %v", c.connConfig.Protocol, err)
 	}
-
-	log.Printf("[%s] TLS handshake completed successfully for %s in %v", c.connConfig.Protocol, remoteAddr, handshakeDuration)
 
 	// Replace the underlying connection in SoraConn with the TLS connection
 	c.SoraConn.Conn = c.tlsConn

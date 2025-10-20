@@ -42,7 +42,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		fingerprint, err := ja4Conn.GetJA4Fingerprint()
 		if err == nil && fingerprint != "" {
 			forwardingParams.Variables["ja4-fingerprint"] = fingerprint
-			log.Printf("IMAP Proxy [%s] Forwarding JA4 fingerprint for %s: %s", s.server.name, s.username, fingerprint)
+			if s.server.debug {
+				log.Printf("IMAP Proxy [%s] Forwarding JA4 fingerprint for %s: %s", s.server.name, s.username, fingerprint)
+			}
 		}
 	}
 
@@ -96,11 +98,15 @@ func (s *Session) sendForwardingParametersToBackend() error {
 
 		response = strings.TrimRight(response, "\r\n")
 
-		// Log the backend's ID response for debugging
 		if strings.HasPrefix(response, "* ID") {
-			log.Printf("IMAP Proxy [%s] Backend ID response: %s", s.server.name, response)
+			// Backend sent ID response, continue reading
+			if s.server.debug {
+				log.Printf("IMAP Proxy [%s] Backend ID response: %s", s.server.name, response)
+			}
 		} else if strings.HasPrefix(response, tag+" OK") {
-			log.Printf("IMAP Proxy [%s] ID forwarding completed successfully for %s", s.server.name, s.username)
+			if s.server.debug {
+				log.Printf("IMAP Proxy [%s] ID forwarding completed successfully for %s", s.server.name, s.username)
+			}
 			break
 		} else if strings.HasPrefix(response, tag+" NO") || strings.HasPrefix(response, tag+" BAD") {
 			return fmt.Errorf("backend rejected ID command: %s", response)
