@@ -2,6 +2,7 @@ package tlsmanager
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -12,6 +13,16 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
+
+// ErrMissingServerName is returned when a TLS handshake is attempted without SNI
+var ErrMissingServerName = errors.New("missing server name")
+
+// ErrHostNotAllowed is returned when a TLS handshake is attempted for a domain not in the allowlist
+var ErrHostNotAllowed = errors.New("host not allowed")
+
+// ErrCertificateUnavailable is returned when a certificate cannot be retrieved (cache miss + ACME failure)
+// This is often a transient error (S3 down, ACME rate limit, network issues) and should not crash the server
+var ErrCertificateUnavailable = errors.New("certificate unavailable")
 
 // Manager handles TLS certificate management for Sora.
 // It supports both file-based certificates and automatic Let's Encrypt certificates.
@@ -190,20 +201,23 @@ func (m *Manager) initLetsEncryptProvider() error {
 			// Reject requests with no server name (missing SNI)
 			if hello.ServerName == "" {
 				logger.Debugf("[TLS] Rejected certificate request: missing server name (SNI)")
-				return nil, fmt.Errorf("missing server name")
+				return nil, ErrMissingServerName
 			}
 
 			// Check if the server name matches our configured domains using the HostPolicy
 			if err := m.autocertMgr.HostPolicy(nil, hello.ServerName); err != nil {
-				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s", hello.ServerName)
-				return nil, err
+				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s (error: %v)", hello.ServerName, err)
+				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, hello.ServerName)
 			}
 
 			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI)", hello.ServerName)
 			cert, err := baseTLSConfig.GetCertificate(hello)
 			if err != nil {
+				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
+				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
+				// This allows the server to continue serving cached certificates for other domains
 				logger.Errorf("[TLS] Failed to get certificate for %s: %v", hello.ServerName, err)
-				return nil, err
+				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, hello.ServerName, err)
 			}
 			logger.Debugf("[TLS] Certificate provided for: %s", hello.ServerName)
 			return cert, nil

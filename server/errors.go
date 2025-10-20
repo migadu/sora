@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"github.com/migadu/sora/tlsmanager"
 )
 
 // IsConnectionError checks if an error is a common, non-fatal network connection error.
@@ -50,6 +52,13 @@ func IsConnectionError(err error) bool {
 
 	// Handle TLS handshake errors
 	if errors.As(err, &tlsRecordHeaderError) {
+		return true
+	}
+
+	// Handle TLS errors from tlsmanager (client-side issues and transient server issues)
+	if errors.Is(err, tlsmanager.ErrMissingServerName) ||
+		errors.Is(err, tlsmanager.ErrHostNotAllowed) ||
+		errors.Is(err, tlsmanager.ErrCertificateUnavailable) {
 		return true
 	}
 

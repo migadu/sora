@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -242,7 +243,13 @@ func TestFallbackCache_S3ToLocalSync(t *testing.T) {
 		t.Errorf("Got wrong data: expected %q, got %q", testData, data)
 	}
 
-	// The sync happens in a goroutine, so we can't reliably test it completed
-	// Just verify that the Get succeeded and returned the right data
-	// The async sync is a performance optimization, not critical functionality
+	// The sync happens in a goroutine, so we need to give it time to complete
+	// to avoid test cleanup race condition
+	t.Cleanup(func() {
+		// Small delay to let async sync complete before cleanup
+		// This prevents "directory not empty" errors during test cleanup
+		time.Sleep(50 * time.Millisecond)
+		os.RemoveAll(fallbackDir)
+		os.RemoveAll(s3Dir)
+	})
 }
