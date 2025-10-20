@@ -6,10 +6,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io/fs"
 	"os"
 	"strconv"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/BurntSushi/toml"
 	"github.com/golang-migrate/migrate/v4"
@@ -216,7 +217,6 @@ func handleMigrateForce(ctx context.Context) {
 }
 
 func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrate, *sql.DB, error) {
-	logger.Info("Reading configuration...")
 	cfg := newDefaultAdminConfig()
 	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
@@ -238,43 +238,36 @@ func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrat
 	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
 		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
 
-	logger.Infof("Connecting to database at %s:%v...", dbCfg.Hosts[0], dbCfg.Port)
 	sqlDB, err := sql.Open("pgx", connString)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open sql.DB for migrations: %w", err)
 	}
 
-	logger.Info("Pinging database...")
 	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
 		return nil, nil, fmt.Errorf("failed to ping database: %w", err)
 	}
-	logger.Info("Database connection successful")
 
 	// Use the exported MigrationsFS from the db package. The go:embed directive
 	// includes the 'migrations' directory, so we create a sub-filesystem.
-	logger.Info("Loading embedded migrations...")
 	migrations, err := fs.Sub(db.MigrationsFS, "migrations")
 	if err != nil {
 		sqlDB.Close()
 		return nil, nil, fmt.Errorf("failed to get migrations subdirectory: %w", err)
 	}
 
-	logger.Info("Creating migration source driver...")
 	sourceDriver, err := iofs.New(migrations, ".")
 	if err != nil {
 		sqlDB.Close()
 		return nil, nil, fmt.Errorf("failed to create migration source driver: %w", err)
 	}
 
-	logger.Info("Creating migration database driver...")
 	dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{})
 	if err != nil {
 		sqlDB.Close()
 		return nil, nil, fmt.Errorf("failed to create migration db driver: %w", err)
 	}
 
-	logger.Info("Initializing golang-migrate (this may wait for advisory lock)...")
 	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
 	if err != nil {
 		sqlDB.Close()
@@ -282,7 +275,6 @@ func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrat
 	}
 
 	m.Log = &migrationLogger{}
-	logger.Info("Migration tool initialized successfully")
 	return m, sqlDB, nil
 }
 
