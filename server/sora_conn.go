@@ -148,20 +148,27 @@ func (c *SoraConn) timeoutChecker() {
 			}
 
 			// Check minimum throughput (protects against slowloris attacks)
+			// Skip the first check to allow time for initial handshake and greeting
 			if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
-				minutesElapsed := throughputDuration.Minutes()
-				bytesPerMinute := float64(bytesTransferred) / minutesElapsed
+				sessionDurationSinceStart := time.Since(c.sessionStart)
 
-				if bytesPerMinute < float64(c.minBytesPerMinute) {
-					remoteAddr := c.Conn.RemoteAddr().String()
-					log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=slow_throughput bytes_per_min=%.0f required=%d: Connection closed - throughput too slow",
-						c.protocol, remoteAddr, username, bytesPerMinute, c.minBytesPerMinute)
-					metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
-					c.Close()
-					return
+				// Only enforce throughput after the first 2 minutes of the session
+				// to allow time for TLS handshake, greeting, and initial authentication
+				if sessionDurationSinceStart >= 2*time.Minute {
+					minutesElapsed := throughputDuration.Minutes()
+					bytesPerMinute := float64(bytesTransferred) / minutesElapsed
+
+					if bytesPerMinute < float64(c.minBytesPerMinute) {
+						remoteAddr := c.Conn.RemoteAddr().String()
+						log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=slow_throughput bytes_per_min=%.0f required=%d: Connection closed - throughput too slow",
+							c.protocol, remoteAddr, username, bytesPerMinute, c.minBytesPerMinute)
+						metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
+						c.Close()
+						return
+					}
 				}
 
-				// Reset throughput counters
+				// Reset throughput counters (even if we didn't enforce the check yet)
 				c.mu.Lock()
 				c.lastThroughputCheck = time.Now()
 				c.bytesTransferred = 0
@@ -428,8 +435,14 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
+	// Create SoraConn config but DON'T start timeout checker yet
+	// The timeout checker will be started AFTER the TLS handshake completes
+	// to avoid false positives during the handshake phase
+	configWithoutChecker := l.connConfig
+	configWithoutChecker.EnableTimeoutChecker = false
+
 	// Create SoraConn that will store the JA4 fingerprint
-	soraConn := NewSoraConn(tcpConn, l.connConfig)
+	soraConn := NewSoraConn(tcpConn, configWithoutChecker)
 
 	// Clone TLS config and add GetConfigForClient callback to capture JA4
 	tlsConfig := l.tlsConfig.Clone()
@@ -459,6 +472,12 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 
 	// Replace the underlying connection in SoraConn with the TLS connection
 	soraConn.Conn = tlsConn
+
+	// NOW start the timeout checker, after TLS handshake is complete
+	// This prevents false positives during the handshake phase
+	if l.connConfig.EnableTimeoutChecker && (soraConn.idleTimeout > 0 || soraConn.absoluteTimeout > 0 || soraConn.minBytesPerMinute > 0) {
+		go soraConn.timeoutChecker()
+	}
 
 	return soraConn, nil
 }
