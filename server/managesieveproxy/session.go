@@ -65,11 +65,6 @@ func (s *Session) handleConnection() {
 	clientAddr := s.clientConn.RemoteAddr().String()
 	log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
 
-	// Debug: Log connection type
-	if s.server.debug {
-		log.Printf("ManageSieve Proxy [%s] [DEBUG] Connection type: %T", s.server.name, s.clientConn)
-	}
-
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {

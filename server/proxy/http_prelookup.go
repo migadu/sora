@@ -135,10 +135,6 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
 		}
 
-		// Log the raw response for debugging
-		log.Printf("[HTTP-PreLookup] DEBUG: Raw response for user '%s': HTTP %d", email, resp.StatusCode)
-		log.Printf("[HTTP-PreLookup] DEBUG: Response body: %s", string(bodyBytes))
-
 		// Check status code
 		if resp.StatusCode == http.StatusNotFound {
 			log.Printf("[HTTP-PreLookup] User '%s' not found (404)", email)
@@ -169,10 +165,6 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			log.Printf("[HTTP-PreLookup] Failed to parse JSON for user '%s': %v, body: %s", email, err, string(bodyBytes))
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
-
-		// Log parsed response (DEBUG)
-		log.Printf("[HTTP-PreLookup] DEBUG: Parsed response for user '%s': address=%s, server=%s, password_hash_length=%d",
-			email, lookupResp.Address, lookupResp.Server, len(lookupResp.PasswordHash))
 
 		// If server is null/empty, treat as user not found (404)
 		if strings.TrimSpace(lookupResp.Server) == "" {
