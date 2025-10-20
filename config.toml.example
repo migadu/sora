@@ -874,6 +874,50 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # More frequent = lower memory usage, slightly higher CPU
                                     # Less frequent = higher memory usage, lower CPU
 
+  # --- CIRCUIT BREAKER FOR PRELOOKUP ENDPOINT ---
+  # Protects the system from cascading failures when the HTTP prelookup endpoint becomes unavailable.
+  # When the endpoint starts failing (timeouts, 5xx errors, network issues), the circuit breaker
+  # automatically "opens" to prevent further requests and allow the service to recover.
+  #
+  # CIRCUIT BREAKER STATES:
+  # - CLOSED: Normal operation, all requests go through
+  # - OPEN: Endpoint is failing, all requests rejected immediately (respects fallback_to_default)
+  # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
+  #
+  # RECOVERY PROCESS:
+  # 1. Circuit opens after failure_ratio threshold reached (default: 60% of last 3 requests fail)
+  # 2. Waits for timeout period (default: 30s)
+  # 3. Transitions to half-open and allows max_requests concurrent test requests (default: 3)
+  # 4. If tests succeed → circuit closes and normal operation resumes
+  # 5. If tests fail → circuit re-opens and waits another timeout period
+  #
+  # IMPORTANT: Only server errors (5xx), timeouts, and network failures trigger the circuit breaker.
+  # Valid responses like 404 (user not found) do NOT count as failures.
+  #
+  # PRODUCTION RECOMMENDATIONS:
+  # - timeout: 60s-300s (longer allows more time for service recovery)
+  # - max_requests: 5-10 (more requests = better confidence in recovery)
+  # - min_requests: 5-10 (avoids opening circuit on brief hiccups)
+  # - failure_ratio: 0.6-0.8 (60-80% failure rate before opening)
+  #
+  # [server.prelookup.circuit_breaker]
+  # max_requests = 3                # Maximum concurrent requests in half-open state (default: 3)
+                                    # Higher values = more confidence that service recovered before closing circuit
+                                    # Lower values = faster recovery but may close prematurely
+  # timeout = "30s"                 # Time to wait before transitioning from open to half-open (default: 30s)
+                                    # How long to wait before testing if the service recovered
+                                    # Production: Consider 60s-300s to give services time to recover
+  # interval = "0s"                 # Time before resetting failure counts in closed state (default: 0s = never reset)
+                                    # Set to non-zero to allow "forgetting" old failures
+                                    # Example: "60s" = after 60s of no requests, reset failure counters
+  # failure_ratio = 0.6             # Failure ratio threshold to open circuit (0.0-1.0, default: 0.6 = 60%)
+                                    # Circuit opens when this percentage of recent requests fail
+                                    # Production: Consider 0.7-0.8 for less sensitive triggering
+  # min_requests = 3                # Minimum requests before evaluating failure ratio (default: 3)
+                                    # Prevents opening circuit on very few requests
+                                    # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
+                                    # Production: Consider 5-10 for more stable thresholds
+
 # --- MASTER TOKEN / ALIAS RESOLUTION ---
 # The HTTP endpoint can implement master token authentication or alias resolution.
 # The proxy simply passes the full email address to the endpoint and verifies the returned password hash.

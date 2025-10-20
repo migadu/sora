@@ -42,6 +42,15 @@ type HTTPPreLookupResponse struct {
 	AccountID    int64  // Derived from Address, not part of JSON response
 }
 
+// CircuitBreakerSettings holds configurable circuit breaker settings
+type CircuitBreakerSettings struct {
+	MaxRequests  uint32        // Maximum concurrent requests in half-open state
+	Interval     time.Duration // Time before resetting failure counts in closed state
+	Timeout      time.Duration // Time before transitioning from open to half-open
+	FailureRatio float64       // Failure ratio threshold to open circuit (0.0-1.0)
+	MinRequests  uint32        // Minimum requests before evaluating failure ratio
+}
+
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
 func NewHTTPPreLookupClient(
 	baseURL string,
@@ -55,19 +64,42 @@ func NewHTTPPreLookupClient(
 	remoteUseIDCommand bool,
 	remoteUseXCLIENT bool,
 	cache *prelookupCache,
+	cbSettings *CircuitBreakerSettings,
 ) *HTTPPreLookupClient {
-	// Create circuit breaker with reasonable defaults
-	settings := circuitbreaker.DefaultSettings("http-prelookup")
+	// Apply defaults if settings not provided
+	if cbSettings == nil {
+		cbSettings = &CircuitBreakerSettings{
+			MaxRequests:  3,
+			Interval:     0, // Never reset automatically
+			Timeout:      30 * time.Second,
+			FailureRatio: 0.6,
+			MinRequests:  3,
+		}
+	}
+
+	// Create circuit breaker with configured settings
+	settings := circuitbreaker.Settings{
+		Name:        "http-prelookup",
+		MaxRequests: cbSettings.MaxRequests,
+		Interval:    cbSettings.Interval,
+		Timeout:     cbSettings.Timeout,
+	}
+
+	// Capture values for closure
+	failureRatio := cbSettings.FailureRatio
+	minRequests := cbSettings.MinRequests
+
 	settings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		// Open circuit if 60% of last 5 requests failed
-		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 5 && failureRatio >= 0.6
+		// Open circuit if failure ratio exceeds threshold
+		ratio := float64(counts.TotalFailures) / float64(counts.Requests)
+		return counts.Requests >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		log.Printf("[HTTP-PreLookup] Circuit breaker '%s' changed from %s to %s", name, from, to)
 	}
 	breaker := circuitbreaker.NewCircuitBreaker(settings)
-	log.Printf("[HTTP-PreLookup] Initialized circuit breaker with 60%% failure threshold over 5 requests")
+	log.Printf("[HTTP-PreLookup] Initialized circuit breaker: max_requests=%d, timeout=%v, failure_ratio=%.0f%%, min_requests=%d",
+		cbSettings.MaxRequests, cbSettings.Timeout, cbSettings.FailureRatio*100, cbSettings.MinRequests)
 
 	return &HTTPPreLookupClient{
 		baseURL:                baseURL,
@@ -195,6 +227,11 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 			log.Printf("[HTTP-PreLookup] Circuit breaker is open for %s", c.baseURL)
 			// Circuit breaker open is a transient error - wrap it
 			return nil, AuthFailed, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
+		}
+		if err == circuitbreaker.ErrTooManyRequests {
+			log.Printf("[HTTP-PreLookup] Circuit breaker is half-open (testing recovery) for %s - rate limiting requests", c.baseURL)
+			// Too many requests in half-open state is also a transient error - wrap it
+			return nil, AuthFailed, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrPrelookupTransient)
 		}
 		// Return error as-is (already wrapped with ErrPrelookupTransient or ErrPrelookupInvalidResponse)
 		return nil, AuthFailed, err

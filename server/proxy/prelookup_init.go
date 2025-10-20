@@ -83,6 +83,28 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 	log.Printf("[Prelookup] Initializing HTTP prelookup: url=%s, timeout=%s, remote_port=%d, cache_enabled=%v, auth_enabled=%v",
 		cfg.URL, timeout, remotePort, cacheEnabled, hasAuth)
 
+	// Parse circuit breaker settings
+	var cbSettings *CircuitBreakerSettings
+	if cfg.CircuitBreaker != nil {
+		cbTimeout, err := cfg.CircuitBreaker.GetTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("invalid circuit_breaker.timeout: %w", err)
+		}
+		cbInterval, err := cfg.CircuitBreaker.GetInterval()
+		if err != nil {
+			return nil, fmt.Errorf("invalid circuit_breaker.interval: %w", err)
+		}
+
+		cbSettings = &CircuitBreakerSettings{
+			MaxRequests:  cfg.CircuitBreaker.GetMaxRequests(),
+			Interval:     cbInterval,
+			Timeout:      cbTimeout,
+			FailureRatio: cfg.CircuitBreaker.GetFailureRatio(),
+			MinRequests:  cfg.CircuitBreaker.GetMinRequests(),
+		}
+	}
+	// If nil, NewHTTPPreLookupClient will use defaults
+
 	client := NewHTTPPreLookupClient(
 		cfg.URL,
 		timeout,
@@ -95,6 +117,7 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 		cfg.RemoteUseIDCommand,
 		cfg.RemoteUseXCLIENT,
 		cache,
+		cbSettings,
 	)
 
 	return client, nil

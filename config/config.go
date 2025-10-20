@@ -507,6 +507,18 @@ type PreLookupConfig struct {
 
 	// Cache configuration
 	Cache *PreLookupCacheConfig `toml:"cache"` // Caching configuration
+
+	// Circuit breaker configuration
+	CircuitBreaker *PreLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
+}
+
+// PreLookupCircuitBreakerConfig holds circuit breaker configuration for prelookup
+type PreLookupCircuitBreakerConfig struct {
+	MaxRequests  int     `toml:"max_requests"`  // Maximum concurrent requests in half-open state (default: 3)
+	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
+	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
+	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
+	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
 }
 
 // GetTimeout returns the configured HTTP timeout duration
@@ -539,6 +551,48 @@ func (c *PreLookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
 		return 1 * time.Minute, nil
 	}
 	return helpers.ParseDuration(c.CleanupInterval)
+}
+
+// Circuit breaker configuration helpers
+
+// GetMaxRequests returns the maximum concurrent requests in half-open state
+func (c *PreLookupCircuitBreakerConfig) GetMaxRequests() uint32 {
+	if c.MaxRequests <= 0 {
+		return 3 // Default: 3 concurrent requests
+	}
+	return uint32(c.MaxRequests)
+}
+
+// GetInterval returns the interval before resetting failure counts in closed state
+func (c *PreLookupCircuitBreakerConfig) GetInterval() (time.Duration, error) {
+	if c.Interval == "" {
+		return 0, nil // Default: never reset automatically
+	}
+	return helpers.ParseDuration(c.Interval)
+}
+
+// GetTimeout returns the timeout before transitioning from open to half-open
+func (c *PreLookupCircuitBreakerConfig) GetTimeout() (time.Duration, error) {
+	if c.Timeout == "" {
+		return 30 * time.Second, nil // Default: 30 seconds
+	}
+	return helpers.ParseDuration(c.Timeout)
+}
+
+// GetFailureRatio returns the failure ratio threshold to open circuit
+func (c *PreLookupCircuitBreakerConfig) GetFailureRatio() float64 {
+	if c.FailureRatio <= 0 || c.FailureRatio > 1 {
+		return 0.6 // Default: 60% failure rate
+	}
+	return c.FailureRatio
+}
+
+// GetMinRequests returns the minimum requests before evaluating failure ratio
+func (c *PreLookupCircuitBreakerConfig) GetMinRequests() uint32 {
+	if c.MinRequests <= 0 {
+		return 3 // Default: 3 requests
+	}
+	return uint32(c.MinRequests)
 }
 
 // GetRemotePort parses the remote port and returns it as an int.

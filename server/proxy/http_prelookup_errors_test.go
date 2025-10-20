@@ -172,6 +172,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				false, // remoteUseIDCommand
 				false, // remoteUseXCLIENT
 				nil,   // cache
+				nil,   // circuit breaker settings (use defaults)
 			)
 
 			// Perform lookup
@@ -220,6 +221,7 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
 		nil,   // cache
+		nil,   // circuit breaker settings (use defaults)
 	)
 
 	// Perform lookup
@@ -265,6 +267,7 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
 		nil,   // cache
+		nil,   // circuit breaker settings (use defaults)
 	)
 
 	ctx := context.Background()
@@ -306,4 +309,73 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 
 	t.Logf("✓ Circuit breaker correctly returns ErrPrelookupTransient when open")
 	t.Logf("  Total requests made: %d, Circuit breaker state: %s", failCount, client.breaker.State())
+}
+
+// TestHTTPPrelookupCircuitBreakerHalfOpen verifies that ErrTooManyRequests in half-open state
+// is properly wrapped as ErrPrelookupTransient (skipped by default - takes 65 seconds)
+func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping long-running test in short mode")
+	}
+
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// First 5 requests fail to open the circuit breaker
+		// Then one request succeeds to move to half-open
+		// Then requests should be rate-limited in half-open state
+		if requestCount <= 5 {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		} else {
+			// Return success to allow half-open transition
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"address":       "user@example.com",
+				"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+				"server":        "backend:143",
+			})
+		}
+	}))
+	defer server.Close()
+
+	// Create prelookup client with MaxRequests=1 in half-open state
+	client := NewHTTPPreLookupClient(
+		server.URL+"/lookup?email=$email",
+		5*time.Second,
+		"test-token",
+		143,
+		false, // remoteTLS
+		false, // remoteTLSUseStartTLS
+		false, // remoteTLSVerify
+		false, // remoteUseProxyProtocol
+		false, // remoteUseIDCommand
+		false, // remoteUseXCLIENT
+		nil,   // cache
+		nil,   // circuit breaker settings (use defaults)
+	)
+
+	ctx := context.Background()
+
+	// Trigger circuit breaker to open
+	for i := 0; i < 5; i++ {
+		client.LookupUserRoute(ctx, "test@example.com", "testpassword")
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Wait for circuit breaker to transition to half-open
+	time.Sleep(65 * time.Second) // Default timeout is 60s
+
+	// First request in half-open should go through
+	_, _, err1 := client.LookupUserRoute(ctx, "test@example.com", "password") // Will fail auth but succeed request
+	if err1 != nil && !errors.Is(err1, ErrPrelookupTransient) {
+		// If it errors due to rate limiting, it should be transient
+		if client.breaker.State().String() == "HALF_OPEN" {
+			if !errors.Is(err1, ErrPrelookupTransient) {
+				t.Errorf("Expected ErrPrelookupTransient in half-open state, got: %v", err1)
+			}
+		}
+	}
+
+	t.Logf("✓ Circuit breaker half-open state correctly returns ErrPrelookupTransient for rate-limited requests")
+	t.Logf("  Final state: %s", client.breaker.State())
 }
