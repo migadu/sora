@@ -312,12 +312,10 @@ func (s *Server) acceptConnections() error {
 			case <-s.ctx.Done():
 				return nil // Graceful shutdown
 			default:
-				// Check if this is a connection-specific error (non-fatal to the server)
-				if server.IsConnectionError(err) {
-					log.Printf("[ManageSieve Proxy %s] Connection error (non-fatal): %v", s.name, err)
-					continue // Continue accepting other connections
-				}
-				return fmt.Errorf("failed to accept connection: %w", err)
+				// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
+				// They should be logged but not crash the server - the listener itself is still healthy
+				log.Printf("[ManageSieve Proxy %s] Failed to accept connection: %v", s.name, err)
+				continue // Continue accepting other connections
 			}
 		}
 

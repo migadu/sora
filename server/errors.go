@@ -62,6 +62,24 @@ func IsConnectionError(err error) bool {
 		return true
 	}
 
+	// Handle general TLS handshake errors from crypto/tls package
+	// These include: unsupported versions, bad certificates, protocol errors, etc.
+	// All TLS handshake failures are client-side issues and should not crash the server
+	// Note: We use string matching because crypto/tls doesn't export typed errors for these cases
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "unsupported versions") ||
+		strings.Contains(errMsg, "tls: handshake failure") ||
+		strings.Contains(errMsg, "tls: bad certificate") ||
+		strings.Contains(errMsg, "tls: certificate required") ||
+		strings.Contains(errMsg, "tls: unknown certificate") ||
+		strings.Contains(errMsg, "tls: client offered only") ||
+		strings.Contains(errMsg, "tls: no cipher suite") ||
+		strings.Contains(errMsg, "tls: oversized record") ||
+		strings.Contains(errMsg, "tls: first record does not look like a TLS handshake") ||
+		strings.Contains(errMsg, "remote error: tls:") {
+		return true
+	}
+
 	// Handle EOF, which can occur if the client disconnects abruptly
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true

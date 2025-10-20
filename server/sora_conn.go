@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -435,6 +436,10 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
+	// Log incoming connection for debugging
+	remoteAddr := tcpConn.RemoteAddr().String()
+	log.Printf("[%s] Accepted TCP connection from %s, starting TLS handshake", l.connConfig.Protocol, remoteAddr)
+
 	// Create SoraConn config but DON'T start timeout checker yet
 	// The timeout checker will be started AFTER the TLS handshake completes
 	// to avoid false positives during the handshake phase
@@ -449,6 +454,8 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 	originalGetConfig := tlsConfig.GetConfigForClient
 
 	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		log.Printf("[%s] GetConfigForClient called for SNI=%s from %s", l.connConfig.Protocol, hello.ServerName, remoteAddr)
+
 		// Capture JA4 fingerprint
 		ja4 := ja4plus.JA4(hello)
 		soraConn.SetJA4Fingerprint(ja4)
@@ -456,19 +463,48 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 
 		// Call original callback if it exists
 		if originalGetConfig != nil {
-			return originalGetConfig(hello)
+			log.Printf("[%s] Calling original GetConfigForClient for %s", l.connConfig.Protocol, remoteAddr)
+			cfg, err := originalGetConfig(hello)
+			if err != nil {
+				log.Printf("[%s] Original GetConfigForClient failed for %s: %v", l.connConfig.Protocol, remoteAddr, err)
+			} else {
+				log.Printf("[%s] Original GetConfigForClient succeeded for %s", l.connConfig.Protocol, remoteAddr)
+			}
+			return cfg, err
 		}
+		log.Printf("[%s] No original GetConfigForClient, using base config for %s", l.connConfig.Protocol, remoteAddr)
 		return nil, nil
 	}
 
-	// Perform TLS handshake
+	// Perform TLS handshake with timeout to prevent hanging connections
 	tlsConn := tls.Server(tcpConn, tlsConfig)
 
+	// Set a deadline for the TLS handshake (10 seconds should be more than enough)
+	// This prevents Accept() from blocking forever if the client hangs during handshake
+	handshakeDeadline := time.Now().Add(10 * time.Second)
+	if err := tcpConn.SetDeadline(handshakeDeadline); err != nil {
+		log.Printf("[%s] Failed to set handshake deadline: %v", l.connConfig.Protocol, err)
+		tcpConn.Close()
+		return nil, fmt.Errorf("failed to set handshake deadline: %w", err)
+	}
+
 	// Force TLS handshake to complete (this triggers JA4 capture via GetConfigForClient)
+	log.Printf("[%s] Starting Handshake() for %s", l.connConfig.Protocol, remoteAddr)
+	handshakeStart := time.Now()
 	if err := tlsConn.Handshake(); err != nil {
+		handshakeDuration := time.Since(handshakeStart)
+		log.Printf("[%s] TLS handshake failed from %s after %v: %v", l.connConfig.Protocol, tcpConn.RemoteAddr(), handshakeDuration, err)
 		tcpConn.Close()
 		return nil, err
 	}
+	handshakeDuration := time.Since(handshakeStart)
+
+	// Clear the deadline after successful handshake
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("[%s] Warning: failed to clear handshake deadline: %v", l.connConfig.Protocol, err)
+	}
+
+	log.Printf("[%s] TLS handshake completed successfully for %s in %v", l.connConfig.Protocol, remoteAddr, handshakeDuration)
 
 	// Replace the underlying connection in SoraConn with the TLS connection
 	soraConn.Conn = tlsConn

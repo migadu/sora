@@ -330,13 +330,10 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			if s.appCtx.Err() != nil {
 				return nil
 			}
-			// Check if this is a connection-specific error (non-fatal to the server)
-			if server.IsConnectionError(err) {
-				log.Printf("[POP3 Proxy %s] Connection error (non-fatal): %v", s.name, err)
-				continue // Continue accepting other connections
-			}
-			// Otherwise, it's an unexpected error.
-			return fmt.Errorf("failed to accept connection: %w", err)
+			// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
+			// They should be logged but not crash the server - the listener itself is still healthy
+			log.Printf("[POP3 Proxy %s] Failed to accept connection: %v", s.name, err)
+			continue // Continue accepting other connections
 		}
 
 		// Check connection limits before processing
