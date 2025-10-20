@@ -239,8 +239,71 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 }
 
 func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration) error {
-	// The go:embed directive includes the 'migrations' directory, so we need to
-	// create a sub-filesystem rooted at that directory.
+	// FAST PATH: Check current database version BEFORE setting up migration infrastructure.
+	// This avoids expensive migration driver initialization when migrations are already up-to-date.
+	// This is critical during concurrent instance restarts to prevent contention on migration locks.
+
+	var currentVersion uint
+	var dirty bool
+
+	// Query the schema_migrations table directly using the existing pool
+	err := db.WritePool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&currentVersion, &dirty)
+	if err != nil && err != pgx.ErrNoRows {
+		// If the table doesn't exist yet, we'll catch it below and run migrations
+		log.Printf("[DB] Could not query schema_migrations table (may not exist yet): %v", err)
+	} else if err == nil {
+		// Table exists and we got a version
+		if dirty {
+			return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
+		}
+
+		// Now check the latest available migration version from embedded files
+		migrations, err := fs.Sub(MigrationsFS, "migrations")
+		if err != nil {
+			return fmt.Errorf("failed to get migrations subdirectory: %w", err)
+		}
+
+		sourceDriver, err := iofs.New(migrations, ".")
+		if err != nil {
+			return fmt.Errorf("failed to create migration source driver: %w", err)
+		}
+
+		firstVersion, err := sourceDriver.First()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				log.Printf("[DB] No migration files found. Database is at version %d.", currentVersion)
+				return nil
+			}
+			return fmt.Errorf("failed to get first migration version: %w", err)
+		}
+
+		// Find the latest migration version
+		latestVersion := firstVersion
+		currentSourceVersion := firstVersion
+		for {
+			next, err := sourceDriver.Next(currentSourceVersion)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					break
+				}
+				return fmt.Errorf("failed to iterate migration versions: %w", err)
+			}
+			latestVersion = next
+			currentSourceVersion = next
+		}
+
+		// Fast exit if already up-to-date
+		if currentVersion >= latestVersion {
+			log.Printf("[DB] Migrations are up to date (database: %d, latest: %d). Skipping migration infrastructure setup.", currentVersion, latestVersion)
+			return nil
+		}
+
+		log.Printf("[DB] Migrations needed (database: %d, latest: %d). Proceeding with migration...", currentVersion, latestVersion)
+	}
+
+	// SLOW PATH: Migrations are needed or schema_migrations doesn't exist yet.
+	// Set up the full migration infrastructure and run migrations.
+
 	migrations, err := fs.Sub(MigrationsFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("failed to get migrations subdirectory: %w", err)
@@ -249,6 +312,30 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	sourceDriver, err := iofs.New(migrations, ".")
 	if err != nil {
 		return fmt.Errorf("failed to create migration source driver: %w", err)
+	}
+
+	// Find the latest available migration version for verification later
+	firstVersion, err := sourceDriver.First()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Println("[DB] No migration files found. Skipping migrations.")
+			return nil
+		}
+		return fmt.Errorf("failed to get first migration version: %w", err)
+	}
+
+	latestVersion := firstVersion
+	currentSourceVersion := firstVersion
+	for {
+		next, err := sourceDriver.Next(currentSourceVersion)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				break
+			}
+			return fmt.Errorf("failed to iterate migration versions: %w", err)
+		}
+		latestVersion = next
+		currentSourceVersion = next
 	}
 
 	// The pgx/v5 migrate driver's WithInstance function expects a *sql.DB instance.
@@ -260,7 +347,6 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	defer sqlDB.Close()
 
 	if err := sqlDB.PingContext(ctx); err != nil {
-		// The deferred sqlDB.Close() will run on function exit.
 		return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
 	}
 
@@ -276,8 +362,8 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 	m.Log = &migrationLogger{}
 
-	// Check current version before attempting migrations
-	currentVersion, dirty, err := m.Version()
+	// Get current version from migration driver (needed for proper state tracking)
+	currentVersion, dirty, err = m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
 		return fmt.Errorf("failed to get current migration version: %w", err)
 	}
@@ -285,42 +371,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
 	}
 
-	log.Printf("[DB] Current migration version: %d, checking for updates...", currentVersion)
-
-	// Check if we need to run migrations at all
-	// This prevents waiting for locks when migrations are already up-to-date
-	firstVersion, err := sourceDriver.First()
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// No migrations exist, nothing to do
-			log.Println("[DB] No migration files found. Skipping migration check.")
-			return nil
-		}
-		return fmt.Errorf("failed to get first migration version: %w", err)
-	}
-
-	// Find the latest migration version by iterating through all migrations
-	latestVersion := firstVersion
-	currentSourceVersion := firstVersion
-	for {
-		next, err := sourceDriver.Next(currentSourceVersion)
-		if err != nil {
-			// Check if we've reached the end of migrations (no more files)
-			if errors.Is(err, fs.ErrNotExist) {
-				// Reached the end, latestVersion is the last one we saw
-				break
-			}
-			return fmt.Errorf("failed to iterate migration versions: %w", err)
-		}
-		latestVersion = next
-		currentSourceVersion = next
-	}
-
-	// If current version matches latest, skip migrations entirely
-	if currentVersion == latestVersion {
-		log.Printf("[DB] Migrations are up to date (version %d). Skipping migration check.", currentVersion)
-		return nil
-	}
+	log.Printf("[DB] Current migration version: %d, running migrations...", currentVersion)
 
 	// Run migrations with timeout context to prevent hanging forever
 	// If another instance is running migrations, this will wait up to the configured timeout
@@ -656,17 +707,33 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 	if acquireLock {
 		// Acquire and hold an advisory lock to signal that the server is running.
-		lockConn, err := db.WritePool.Acquire(ctx)
+		log.Printf("[DB] Attempting to acquire connection from pool for advisory lock (pool stats: total=%d idle=%d acquired=%d max=%d)...",
+			db.WritePool.Stat().TotalConns(), db.WritePool.Stat().IdleConns(),
+			db.WritePool.Stat().AcquiredConns(), db.WritePool.Stat().MaxConns())
+
+		// Use a timeout context for connection acquisition to prevent infinite blocking
+		// if the pool is exhausted or the database is under heavy load during startup
+		acquireCtx, acquireCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer acquireCancel()
+
+		lockConn, err := db.WritePool.Acquire(acquireCtx)
 		if err != nil {
 			db.Close()
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("timeout acquiring connection for advisory lock after 30s (pool may be exhausted or database overloaded): pool stats: total=%d idle=%d acquired=%d max=%d",
+					db.WritePool.Stat().TotalConns(), db.WritePool.Stat().IdleConns(),
+					db.WritePool.Stat().AcquiredConns(), db.WritePool.Stat().MaxConns())
+			}
 			return nil, fmt.Errorf("failed to acquire connection for advisory lock: %w", err)
 		}
+		log.Println("[DB] Connection acquired from pool for advisory lock attempt")
 
 		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
-		// It will fail only if an exclusive lock is held (e.g., by the migration tool).
-		// For shared locks, we use faster retries since they don't conflict with each other.
+		// IMPORTANT: pg_try_advisory_lock_shared() returns immediately - it does NOT block.
+		// It returns false ONLY if an EXCLUSIVE lock is held (e.g., by sora-admin migrate).
+		// Multiple instances can hold shared locks simultaneously without any conflict.
 		var lockAcquired bool
-		maxRetries := 30                     // More attempts
+		maxRetries := 30                     // More attempts in case of transient exclusive locks
 		retryDelay := 100 * time.Millisecond // Start with shorter delay
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
@@ -675,7 +742,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 				jitter := time.Duration(attempt*10) * time.Millisecond
 				actualDelay := retryDelay + jitter
 
-				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d) after %v...", attempt+1, maxRetries, actualDelay)
+				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d) after %v (previous attempt returned false - exclusive lock held)...", attempt+1, maxRetries, actualDelay)
 				time.Sleep(actualDelay)
 
 				// Slower exponential backoff for shared locks (1.5x instead of 2x)
@@ -689,7 +756,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			if err != nil {
 				lockConn.Release()
 				db.Close()
-				return nil, fmt.Errorf("failed to attempt advisory lock: %w", err)
+				return nil, fmt.Errorf("failed to execute advisory lock query: %w", err)
 			}
 
 			if lockAcquired {
@@ -697,12 +764,15 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 				db.lockConn = lockConn // Store the *pgxpool.Conn
 				break
 			}
+
+			// Lock not acquired means an exclusive lock is currently held
+			log.Printf("[DB] Shared advisory lock not available (attempt %d/%d) - exclusive lock held by another process (possibly sora-admin migrate)", attempt+1, maxRetries)
 		}
 
 		if !lockAcquired {
 			lockConn.Release()
 			db.Close()
-			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d) after %d attempts. A migration may be in progress or another instance is shutting down", consts.SoraAdvisoryLockID, maxRetries)
+			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d) after %d attempts. An exclusive lock is being held (possibly by sora-admin migrate or another admin tool)", consts.SoraAdvisoryLockID, maxRetries)
 		}
 	}
 	return db, nil

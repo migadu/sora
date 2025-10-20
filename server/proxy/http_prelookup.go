@@ -51,6 +51,14 @@ type CircuitBreakerSettings struct {
 	MinRequests  uint32        // Minimum requests before evaluating failure ratio
 }
 
+// TransportSettings holds HTTP transport configuration for connection pooling
+type TransportSettings struct {
+	MaxIdleConns        int           // Maximum idle connections across all hosts
+	MaxIdleConnsPerHost int           // Maximum idle connections per host
+	MaxConnsPerHost     int           // Maximum total connections per host (0 = unlimited)
+	IdleConnTimeout     time.Duration // How long idle connections stay open
+}
+
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
 func NewHTTPPreLookupClient(
 	baseURL string,
@@ -65,6 +73,7 @@ func NewHTTPPreLookupClient(
 	remoteUseXCLIENT bool,
 	cache *prelookupCache,
 	cbSettings *CircuitBreakerSettings,
+	transportSettings *TransportSettings,
 ) *HTTPPreLookupClient {
 	// Apply defaults if settings not provided
 	if cbSettings == nil {
@@ -101,11 +110,38 @@ func NewHTTPPreLookupClient(
 	log.Printf("[HTTP-PreLookup] Initialized circuit breaker: max_requests=%d, timeout=%v, failure_ratio=%.0f%%, min_requests=%d",
 		cbSettings.MaxRequests, cbSettings.Timeout, cbSettings.FailureRatio*100, cbSettings.MinRequests)
 
+	// Apply defaults for transport settings if not provided
+	if transportSettings == nil {
+		transportSettings = &TransportSettings{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     0,
+			IdleConnTimeout:     90 * time.Second,
+		}
+	}
+
+	// Configure HTTP transport with connection pooling for high concurrency
+	transport := &http.Transport{
+		MaxIdleConns:        transportSettings.MaxIdleConns,
+		MaxIdleConnsPerHost: transportSettings.MaxIdleConnsPerHost,
+		MaxConnsPerHost:     transportSettings.MaxConnsPerHost,
+		IdleConnTimeout:     transportSettings.IdleConnTimeout,
+		DisableKeepAlives:   false, // Enable keep-alives for connection reuse
+		DisableCompression:  false, // Enable compression
+		ForceAttemptHTTP2:   true,  // Try HTTP/2 if available
+	}
+
+	log.Printf("[HTTP-PreLookup] Initialized HTTP transport: max_idle_conns=%d, max_idle_conns_per_host=%d, max_conns_per_host=%d, idle_conn_timeout=%v",
+		transportSettings.MaxIdleConns, transportSettings.MaxIdleConnsPerHost, transportSettings.MaxConnsPerHost, transportSettings.IdleConnTimeout)
+
 	return &HTTPPreLookupClient{
-		baseURL:                baseURL,
-		timeout:                timeout,
-		authToken:              authToken,
-		client:                 &http.Client{Timeout: timeout},
+		baseURL:   baseURL,
+		timeout:   timeout,
+		authToken: authToken,
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
 		breaker:                breaker,
 		cache:                  cache,
 		remotePort:             remotePort,

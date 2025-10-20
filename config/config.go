@@ -510,6 +510,9 @@ type PreLookupConfig struct {
 
 	// Circuit breaker configuration
 	CircuitBreaker *PreLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
+
+	// HTTP transport configuration
+	Transport *PreLookupTransportConfig `toml:"transport"` // HTTP transport connection pooling settings
 }
 
 // PreLookupCircuitBreakerConfig holds circuit breaker configuration for prelookup
@@ -519,6 +522,14 @@ type PreLookupCircuitBreakerConfig struct {
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
 	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+}
+
+// PreLookupTransportConfig holds HTTP transport configuration for prelookup connection pooling
+type PreLookupTransportConfig struct {
+	MaxIdleConns        int    `toml:"max_idle_conns"`         // Maximum idle connections across all hosts (default: 100)
+	MaxIdleConnsPerHost int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
+	MaxConnsPerHost     int    `toml:"max_conns_per_host"`     // Maximum total connections per host, 0 = unlimited (default: 0)
+	IdleConnTimeout     string `toml:"idle_conn_timeout"`      // How long idle connections stay open (default: "90s")
 }
 
 // GetTimeout returns the configured HTTP timeout duration
@@ -593,6 +604,37 @@ func (c *PreLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 		return 3 // Default: 3 requests
 	}
 	return uint32(c.MinRequests)
+}
+
+// Transport configuration helpers
+
+// GetMaxIdleConns returns the maximum idle connections across all hosts
+func (c *PreLookupTransportConfig) GetMaxIdleConns() int {
+	if c.MaxIdleConns <= 0 {
+		return 100 // Default: 100 idle connections
+	}
+	return c.MaxIdleConns
+}
+
+// GetMaxIdleConnsPerHost returns the maximum idle connections per host
+func (c *PreLookupTransportConfig) GetMaxIdleConnsPerHost() int {
+	if c.MaxIdleConnsPerHost <= 0 {
+		return 100 // Default: 100 idle connections per host
+	}
+	return c.MaxIdleConnsPerHost
+}
+
+// GetMaxConnsPerHost returns the maximum total connections per host (0 = unlimited)
+func (c *PreLookupTransportConfig) GetMaxConnsPerHost() int {
+	return c.MaxConnsPerHost // Default: 0 (unlimited)
+}
+
+// GetIdleConnTimeout returns the idle connection timeout duration
+func (c *PreLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
+	if c.IdleConnTimeout == "" {
+		return 90 * time.Second, nil // Default: 90 seconds
+	}
+	return helpers.ParseDuration(c.IdleConnTimeout)
 }
 
 // GetRemotePort parses the remote port and returns it as an int.

@@ -173,6 +173,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				false, // remoteUseXCLIENT
 				nil,   // cache
 				nil,   // circuit breaker settings (use defaults)
+				nil,   // transport settings (use defaults)
 			)
 
 			// Perform lookup
@@ -222,6 +223,7 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 		false, // remoteUseXCLIENT
 		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
 	)
 
 	// Perform lookup
@@ -268,6 +270,7 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 		false, // remoteUseXCLIENT
 		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
 	)
 
 	ctx := context.Background()
@@ -352,6 +355,7 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 		false, // remoteUseXCLIENT
 		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
 	)
 
 	ctx := context.Background()

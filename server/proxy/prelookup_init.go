@@ -105,6 +105,23 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 	}
 	// If nil, NewHTTPPreLookupClient will use defaults
 
+	// Parse transport settings
+	var transportSettings *TransportSettings
+	if cfg.Transport != nil {
+		idleConnTimeout, err := cfg.Transport.GetIdleConnTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("invalid transport.idle_conn_timeout: %w", err)
+		}
+
+		transportSettings = &TransportSettings{
+			MaxIdleConns:        cfg.Transport.GetMaxIdleConns(),
+			MaxIdleConnsPerHost: cfg.Transport.GetMaxIdleConnsPerHost(),
+			MaxConnsPerHost:     cfg.Transport.GetMaxConnsPerHost(),
+			IdleConnTimeout:     idleConnTimeout,
+		}
+	}
+	// If nil, NewHTTPPreLookupClient will use defaults
+
 	client := NewHTTPPreLookupClient(
 		cfg.URL,
 		timeout,
@@ -118,6 +135,7 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 		cfg.RemoteUseXCLIENT,
 		cache,
 		cbSettings,
+		transportSettings,
 	)
 
 	return client, nil

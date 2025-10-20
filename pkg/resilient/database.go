@@ -580,10 +580,17 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	}
 
 	// Create database pools for all write hosts
+	// NOTE: We create write pools SEQUENTIALLY (not in parallel like read pools) because:
+	// 1. Only the first pool runs migrations (requires exclusive migration lock)
+	// 2. Only the first pool acquires advisory lock (requires connection)
+	// 3. Parallel creation could cause connection pool exhaustion during startup
 	if config.Write != nil && len(config.Write.Hosts) > 0 {
 		for i, host := range config.Write.Hosts {
 			// Only run migrations and acquire lock for the very first write pool.
 			isFirstPool := (i == 0)
+
+			logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
+
 			pool, err := createDatabasePool(ctx, host, config.Write, config.GetDebug(), "write", runMigrations && isFirstPool, isFirstPool)
 			if err != nil {
 				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)

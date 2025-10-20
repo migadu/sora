@@ -918,6 +918,39 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
                                     # Production: Consider 5-10 for more stable thresholds
 
+  # --- HTTP TRANSPORT CONFIGURATION ---
+  # Connection pooling settings for the HTTP client used to query the prelookup endpoint.
+  # Proper connection pooling enables parallel authentication requests while reusing connections.
+  #
+  # TRANSPORT BEHAVIOR:
+  # - Multiple concurrent authentication requests reuse pooled HTTP connections
+  # - Idle connections are kept alive to avoid TCP handshake overhead
+  # - Unlimited concurrent connections per host (max_conns_per_host=0) for high throughput
+  #
+  # PERFORMANCE IMPACT:
+  # - Higher max_idle_conns = more connections kept alive = faster subsequent requests
+  # - max_conns_per_host=0 (unlimited) = no bottleneck for concurrent auth requests
+  # - Longer idle_conn_timeout = fewer reconnects = better performance under load
+  #
+  # EXAMPLE SCENARIOS:
+  # - 100 concurrent user logins → reuses up to 100 idle connections from pool
+  # - Low traffic → connections automatically closed after idle_conn_timeout
+  # - High traffic → connections stay warm and reused immediately
+  #
+  # [server.prelookup.transport]
+  # max_idle_conns = 100            # Maximum idle connections across all hosts (default: 100)
+                                    # Total number of connections kept alive in the pool
+                                    # Higher = more connections reused, less overhead
+  # max_idle_conns_per_host = 100   # Maximum idle connections per prelookup host (default: 100)
+                                    # For single prelookup endpoint, should match max_idle_conns
+                                    # For multiple endpoints, distributes pool across hosts
+  # max_conns_per_host = 0          # Maximum total connections per host, 0=unlimited (default: 0)
+                                    # Set to 0 (unlimited) for best parallel performance
+                                    # Only limit if prelookup endpoint has connection restrictions
+  # idle_conn_timeout = "90s"       # How long idle connections stay open (default: "90s")
+                                    # Longer = better for sustained traffic, more memory
+                                    # Shorter = less memory, more reconnects under load
+
 # --- MASTER TOKEN / ALIAS RESOLUTION ---
 # The HTTP endpoint can implement master token authentication or alias resolution.
 # The proxy simply passes the full email address to the endpoint and verifies the returned password hash.
