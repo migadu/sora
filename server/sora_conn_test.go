@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -593,7 +594,7 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 	addr := tcpListener.Addr().String()
 
 	// Accept in background
-	acceptDone := make(chan net.Conn)
+	acceptDone := make(chan net.Conn, 1) // Buffered to avoid blocking
 	acceptErr := make(chan error, 1)
 	go func() {
 		conn, err := soraListener.Accept()
@@ -601,6 +602,15 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 			acceptErr <- err
 			return
 		}
+
+		// Perform TLS handshake immediately so client's tls.Dial() can complete
+		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
+			if err := tlsConn.PerformHandshake(); err != nil {
+				acceptErr <- fmt.Errorf("handshake failed: %w", err)
+				return
+			}
+		}
+
 		acceptDone <- conn
 	}()
 
@@ -619,7 +629,7 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	// Get server connection (should complete now that TLS handshake happened)
+	// Get server connection (TLS handshake now deferred)
 	var serverConn net.Conn
 	select {
 	case serverConn = <-acceptDone:
@@ -634,14 +644,15 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 	}
 	defer serverConn.Close()
 
-	// Verify it's a SoraConn
-	soraConn, ok := serverConn.(*SoraConn)
+	// Handshake already performed in goroutine above
+	// Verify it's a SoraTLSConn (not SoraConn anymore)
+	soraTLSConn, ok := serverConn.(*SoraTLSConn)
 	if !ok {
-		t.Fatalf("Expected *SoraConn, got %T", serverConn)
+		t.Fatalf("Expected *SoraTLSConn, got %T", serverConn)
 	}
 
-	// Check JA4 was captured (handshake is already complete due to Accept())
-	ja4, err := soraConn.GetJA4Fingerprint()
+	// Check JA4 was captured during explicit handshake
+	ja4, err := soraTLSConn.GetJA4Fingerprint()
 	if err != nil {
 		t.Fatalf("GetJA4Fingerprint failed: %v", err)
 	}

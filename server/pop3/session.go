@@ -52,6 +52,15 @@ func (s *POP3Session) handleConnection() {
 	defer s.cancel()
 
 	defer s.Close()
+
+	// Perform TLS handshake if this is a TLS connection
+	if tlsConn, ok := (*s.conn).(interface{ PerformHandshake() error }); ok {
+		if err := tlsConn.PerformHandshake(); err != nil {
+			s.Log("TLS handshake failed: %v", err)
+			return
+		}
+	}
+
 	reader := bufio.NewReader(*s.conn)
 	writer := bufio.NewWriter(*s.conn)
 

@@ -66,6 +66,14 @@ func (s *Session) handleConnection() {
 	clientAddr := s.clientConn.RemoteAddr().String()
 	log.Printf("IMAP Proxy [%s] New connection from %s", s.server.name, clientAddr)
 
+	// Perform TLS handshake if this is a TLS connection
+	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
+		if err := tlsConn.PerformHandshake(); err != nil {
+			log.Printf("IMAP Proxy [%s] TLS handshake failed for %s: %v", s.server.name, clientAddr, err)
+			return
+		}
+	}
+
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
 		log.Printf("IMAP Proxy [%s] Failed to send greeting to %s: %v", s.server.name, clientAddr, err)

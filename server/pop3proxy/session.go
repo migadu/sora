@@ -44,6 +44,14 @@ func (s *POP3ProxySession) handleConnection() {
 	defer s.server.wg.Done()
 	defer s.close()
 
+	// Perform TLS handshake if this is a TLS connection
+	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
+		if err := tlsConn.PerformHandshake(); err != nil {
+			log.Printf("POP3 Proxy [%s] TLS handshake failed for %s: %v", s.server.name, s.RemoteIP, err)
+			return
+		}
+	}
+
 	// Send initial greeting to client
 	writer := bufio.NewWriter(s.clientConn)
 	writer.WriteString("+OK POP3 proxy ready\r\n")

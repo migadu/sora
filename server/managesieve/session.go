@@ -73,6 +73,14 @@ func (s *ManageSieveSession) sendCapabilities() {
 func (s *ManageSieveSession) handleConnection() {
 	defer s.Close()
 
+	// Perform TLS handshake if this is a TLS connection
+	if tlsConn, ok := (*s.conn).(interface{ PerformHandshake() error }); ok {
+		if err := tlsConn.PerformHandshake(); err != nil {
+			s.Log("TLS handshake failed: %v", err)
+			return
+		}
+	}
+
 	s.sendCapabilitiesGreeting()
 
 	for {

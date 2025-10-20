@@ -70,6 +70,14 @@ func (s *Session) handleConnection() {
 		log.Printf("ManageSieve Proxy [%s] [DEBUG] Connection type: %T", s.server.name, s.clientConn)
 	}
 
+	// Perform TLS handshake if this is a TLS connection
+	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
+		if err := tlsConn.PerformHandshake(); err != nil {
+			log.Printf("ManageSieve Proxy [%s] TLS handshake failed for %s: %v", s.server.name, clientAddr, err)
+			return
+		}
+	}
+
 	// Send initial greeting with capabilities
 	if err := s.sendGreeting(); err != nil {
 		log.Printf("ManageSieve Proxy [%s] Failed to send greeting to %s: %v", s.server.name, clientAddr, err)

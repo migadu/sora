@@ -148,6 +148,17 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			continue // Try to accept the next connection
 		}
 
+		// Perform TLS handshake if this is a TLS connection (before any I/O)
+		// Must happen before go-imap library starts reading from the connection
+		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
+			if err := tlsConn.PerformHandshake(); err != nil {
+				log.Printf("IMAP [%s] TLS handshake failed for %s: %v", l.name, conn.RemoteAddr(), err)
+				releaseConn() // Release the connection limit
+				conn.Close()
+				continue // Try to accept the next connection
+			}
+		}
+
 		// Wrap the connection to ensure cleanup on close and preserve PROXY info
 		return &connectionLimitingConn{
 			Conn:        conn,
@@ -602,6 +613,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	// TLS handshake is now performed in connectionLimitingListener.Accept()
 	// Connection limits are now handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 

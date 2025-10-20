@@ -53,16 +53,15 @@ func TestJA4TLSWithRealCertificates(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// Connection is already wrapped for JA4 capture and TLS
-		// Perform handshake
-		if tlsConn, ok := conn.(*tls.Conn); ok {
-			if err := tlsConn.Handshake(); err != nil {
+		// Perform explicit TLS handshake (deferred from Accept)
+		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
+			if err := tlsConn.PerformHandshake(); err != nil {
 				t.Logf("TLS handshake failed: %v", err)
 				return
 			}
 		}
 
-		// Keep connection open briefly and read data to ensure handshake completes
+		// Keep connection open briefly and read data
 		buf := make([]byte, 100)
 		conn.Read(buf)
 
@@ -164,15 +163,15 @@ func TestJA4ProxyV2WithRealTLS(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// Perform handshake
-		if tlsConn, ok := conn.(*tls.Conn); ok {
-			if err := tlsConn.Handshake(); err != nil {
+		// Perform explicit TLS handshake
+		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
+			if err := tlsConn.PerformHandshake(); err != nil {
 				t.Logf("Handshake failed: %v", err)
 				return
 			}
 		}
 
-		// Read data to ensure handshake completes
+		// Read data
 		buf := make([]byte, 100)
 		conn.Read(buf)
 
@@ -311,8 +310,9 @@ func TestJA4ConsistencyAcrossConnections(t *testing.T) {
 			}
 			defer conn.Close()
 
-			if tlsConn, ok := conn.(*tls.Conn); ok {
-				tlsConn.Handshake()
+			// Perform explicit TLS handshake
+			if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
+				tlsConn.PerformHandshake()
 			}
 
 			// Read data first
