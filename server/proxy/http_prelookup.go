@@ -412,9 +412,6 @@ func (c *HTTPPreLookupClient) Close() error {
 // hashPassword creates a simple hash of the password for cache keying
 // This is NOT for storage, just for cache key generation
 func hashPassword(password string) string {
-	h := fmt.Sprintf("%x", password)
-	if len(h) > 16 {
-		return h[:16]
-	}
-	return h
+	h := sha256.Sum256([]byte(password))
+	return fmt.Sprintf("%x", h[:8]) // First 8 bytes as hex (16 chars)
 }
