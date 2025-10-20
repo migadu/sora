@@ -685,13 +685,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	if proxyJA4Fingerprint != "" {
 		// Use JA4 from PROXY v2 TLV (highest priority)
 		session.ja4Fingerprint = proxyJA4Fingerprint
-		log.Printf("[JA4-DEBUG] Using JA4 from PROXY v2 TLV: %s on session object %p", session.ja4Fingerprint, session)
 		// Apply filters to sessionCaps BEFORE greeting is sent
 		session.applyCapabilityFilters()
-		log.Printf("[JA4-DEBUG] After applyCapabilityFilters (PROXY TLV), ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 	} else if ja4Conn != nil {
-		log.Printf("[JA4-DEBUG] ja4Conn found, type=%T, attempting to retrieve fingerprint", ja4Conn)
-
 		// Try to perform TLS handshake explicitly if the method is available
 		// (Some connection types may have already completed the handshake)
 		if handshaker, ok := ja4Conn.(interface{ Handshake() error }); ok {
@@ -706,22 +702,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		// we called Handshake() explicitly. The handshake may have already completed
 		// during connection acceptance.
 		fingerprint, err := ja4Conn.GetJA4Fingerprint()
-		log.Printf("[JA4-DEBUG] GetJA4Fingerprint returned: fingerprint=%q, err=%v", fingerprint, err)
 
 		if err == nil && fingerprint != "" {
 			session.ja4Fingerprint = fingerprint
-			log.Printf("[JA4-DEBUG] Setting ja4Fingerprint=%s (direct) on session object %p", session.ja4Fingerprint, session)
 			// Apply filters to sessionCaps BEFORE greeting is sent
 			session.applyCapabilityFilters()
-			log.Printf("[JA4-DEBUG] After applyCapabilityFilters (direct), ja4Fingerprint=%s on session object %p", session.ja4Fingerprint, session)
 		} else {
 			// Fingerprint not yet available - store ja4Conn for lazy capture
 			// This should be rare since handshake typically completes during accept
-			log.Printf("[JA4-DEBUG] Fingerprint not ready (fp=%q, err=%v), storing ja4Conn for lazy capture", fingerprint, err)
 			session.ja4Conn = ja4Conn
 		}
-	} else {
-		log.Printf("[JA4-DEBUG] No JA4 fingerprint available from PROXY TLV or direct connection - may be available via ID command")
 	}
 
 	clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
