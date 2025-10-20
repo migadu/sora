@@ -11,18 +11,6 @@ CREATE TABLE accounts (
 -- Index for soft deletion queries
 CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at);
 
--- Table for tracking server affinity for proxy connections
-CREATE TABLE server_affinity (
-    account_id BIGINT NOT NULL,
-    is_prelookup_account BOOLEAN NOT NULL DEFAULT FALSE,
-    last_server_addr VARCHAR(255) NOT NULL,
-    last_server_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    PRIMARY KEY (account_id, is_prelookup_account)
-);
-
--- Index for faster lookups by last_server_addr (e.g., for maintenance)
-CREATE INDEX idx_server_affinity_last_server_addr ON server_affinity(last_server_addr);
-
 -- A table to store account passwords and identities
 CREATE TABLE credentials (
 	id BIGSERIAL PRIMARY KEY,
@@ -44,13 +32,15 @@ CREATE UNIQUE INDEX idx_credentials_account_id_one_primary ON credentials (accou
 CREATE INDEX idx_credentials_account_id ON credentials (account_id);
 
 CREATE TABLE mailboxes (
-	id BIGSERIAL PRIMARY KEY,	
+	id BIGSERIAL PRIMARY KEY,
 	account_id BIGINT REFERENCES accounts(id),
 	highest_uid BIGINT DEFAULT 0 NOT NULL,                       -- The highest UID in the mailbox
 	name TEXT NOT NULL,
 	uid_validity BIGINT NOT NULL,                                -- Include uid_validity column for IMAP
 	path TEXT NOT NULL DEFAULT '',                               -- Hex-encoded path of ancestor IDs
-	subscribed BOOLEAN DEFAULT TRUE,                             -- Track mailbox subscription status	
+	subscribed BOOLEAN DEFAULT TRUE,                             -- Track mailbox subscription status
+	is_shared BOOLEAN DEFAULT FALSE,                             -- Shared mailbox flag
+	owner_domain TEXT,                                           -- Domain of mailbox owner for shared mailboxes
 	created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
 	updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
 	CONSTRAINT mailboxes_account_id_name_unique UNIQUE (account_id, name) -- Enforce unique mailbox names per account
@@ -69,14 +59,22 @@ CREATE INDEX idx_mailboxes_account_id ON mailboxes (account_id);
 -- Composite index with account_id first to reduce search scope
 CREATE INDEX idx_mailboxes_path_prefix ON mailboxes (account_id, path text_pattern_ops);
 
+-- Indexes for shared mailbox lookups
+CREATE INDEX idx_mailboxes_is_shared ON mailboxes (is_shared) WHERE is_shared = TRUE;
+CREATE INDEX idx_mailboxes_owner_domain ON mailboxes (owner_domain) WHERE owner_domain IS NOT NULL;
+
+-- Composite index for shared mailbox + owner domain lookups
+-- Used by get_accessible_mailboxes() when checking "anyone" access with domain restriction
+CREATE INDEX idx_mailboxes_shared_domain ON mailboxes (is_shared, owner_domain) WHERE is_shared = TRUE AND owner_domain IS NOT NULL;
+
 CREATE SEQUENCE messages_modseq;
 
 CREATE TABLE messages (
 	-- Unique identifier for the message row in the database
-	id BIGSERIAL PRIMARY KEY,       
+	id BIGSERIAL PRIMARY KEY,
 
     -- The account who owns the message
-	account_id BIGINT REFERENCES accounts(id) ON DELETE RESTRICT, 
+	account_id BIGINT REFERENCES accounts(id) ON DELETE RESTRICT,
 
 	uid BIGINT NOT NULL,                -- The IMAP message UID within its mailbox
 	-- S3 key components, to ensure we can always find the object even if user email changes
@@ -105,7 +103,7 @@ CREATE TABLE messages (
 	--
 	-- Keep messages if mailbox is deleted by nullifying the mailbox_id
 	--
-	mailbox_id BIGINT REFERENCES mailboxes(id) ON DELETE SET NULL, 
+	mailbox_id BIGINT REFERENCES mailboxes(id) ON DELETE SET NULL,
 
 	--
 	-- Information for restoring messages from S3
@@ -188,7 +186,7 @@ CREATE INDEX idx_messages_recipients_json ON messages USING GIN (recipients_json
 -- For date range searches (SEARCH SINCE, SEARCH BEFORE)
 CREATE INDEX idx_messages_mailbox_dates_uid ON messages (mailbox_id, internal_date, sent_date, uid) WHERE expunged_at IS NULL;
 
--- For size-based searches (SEARCH LARGER, SEARCH SMALLER)  
+-- For size-based searches (SEARCH LARGER, SEARCH SMALLER)
 CREATE INDEX idx_messages_mailbox_size_uid ON messages (mailbox_id, size, uid) WHERE expunged_at IS NULL;
 
 -- Compound index for mailbox + multiple common search fields
@@ -201,6 +199,27 @@ CREATE INDEX idx_messages_to_email_sort ON messages (mailbox_id, to_email_sort) 
 CREATE INDEX idx_messages_cc_email_sort ON messages (mailbox_id, cc_email_sort) WHERE expunged_at IS NULL;
 -- Index for display name sort (name fallback to email)
 CREATE INDEX idx_messages_from_display_sort ON messages (mailbox_id, COALESCE(from_name_sort, from_email_sort)) WHERE expunged_at IS NULL;
+
+-- Message sequence numbers caching table
+-- Avoids expensive ROW_NUMBER() window functions on large mailboxes
+CREATE TABLE message_sequences (
+    mailbox_id BIGINT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+    uid BIGINT NOT NULL,
+    seqnum INT NOT NULL,
+    PRIMARY KEY (mailbox_id, uid),
+    UNIQUE (mailbox_id, seqnum)
+);
+
+-- Mailbox statistics caching table
+-- Avoids expensive COUNT(*) and SUM() queries on large mailboxes
+CREATE TABLE mailbox_stats (
+    mailbox_id BIGINT PRIMARY KEY REFERENCES mailboxes(id) ON DELETE CASCADE,
+    message_count INT NOT NULL DEFAULT 0,
+    unseen_count INT NOT NULL DEFAULT 0,
+    total_size BIGINT NOT NULL DEFAULT 0,
+    highest_modseq BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL
+);
 
 -- Table to store message bodies, separated for performance
 CREATE TABLE message_contents (
@@ -227,7 +246,7 @@ CREATE TABLE pending_uploads (
 	id BIGSERIAL PRIMARY KEY,
 	account_id BIGINT REFERENCES accounts(id) ON DELETE CASCADE,
 	instance_id TEXT NOT NULL, -- Unique identifier for the instance processing the upload, e.g., hostname
-	content_hash VARCHAR(64) NOT NULL,	
+	content_hash VARCHAR(64) NOT NULL,
 	attempts INTEGER DEFAULT 0,
 	last_attempt TIMESTAMPTZ,
 	size INTEGER NOT NULL,
@@ -380,3 +399,344 @@ CREATE INDEX idx_cache_metrics_instance_latest ON cache_metrics (instance_id, re
 
 -- Index for GetLatestCacheMetrics: efficiently find the latest record per instance and server
 CREATE INDEX idx_cache_metrics_latest_per_instance_server ON cache_metrics (instance_id, server_hostname, recorded_at DESC);
+
+-- METADATA extension support (RFC 5464)
+-- Stores server and mailbox annotations
+CREATE TABLE metadata (
+    id BIGSERIAL PRIMARY KEY,
+    account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    mailbox_id BIGINT REFERENCES mailboxes(id) ON DELETE CASCADE,
+    entry_name TEXT NOT NULL,
+    entry_value BYTEA,  -- NULL means entry exists but has no value
+    content_type TEXT DEFAULT 'text/plain',
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+
+    -- Server metadata has mailbox_id = NULL
+    -- Mailbox metadata has mailbox_id set
+    -- Each entry_name is unique per account/mailbox combination
+    CONSTRAINT metadata_unique_entry UNIQUE(account_id, mailbox_id, entry_name)
+);
+
+-- Index for fast lookups by account and mailbox
+CREATE INDEX idx_metadata_account_mailbox ON metadata(account_id, mailbox_id);
+
+-- Index for server metadata lookups (mailbox_id IS NULL)
+CREATE INDEX idx_metadata_server ON metadata(account_id) WHERE mailbox_id IS NULL;
+
+-- Index for mailbox metadata lookups
+CREATE INDEX idx_metadata_mailbox ON metadata(mailbox_id) WHERE mailbox_id IS NOT NULL;
+
+-- Index for entry name prefix searches (for DEPTH > 0 queries)
+CREATE INDEX idx_metadata_entry_prefix ON metadata(account_id, mailbox_id, entry_name text_pattern_ops);
+
+-- ACL table for mailbox permissions (RFC 4314)
+-- Stores access control entries for shared mailboxes
+CREATE TABLE mailbox_acls (
+    id BIGSERIAL PRIMARY KEY,
+    mailbox_id BIGINT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+    account_id BIGINT REFERENCES accounts(id) ON DELETE CASCADE,  -- NULL for "anyone"
+    identifier TEXT NOT NULL,  -- Email address or "anyone"
+    rights VARCHAR(20) NOT NULL, -- IMAP ACL rights: lrswipkxtea
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT mailbox_acls_unique_identifier UNIQUE (mailbox_id, identifier),
+    CONSTRAINT mailbox_acls_valid_rights CHECK (rights ~ '^[lrswipkxtea]+$'),
+    CONSTRAINT mailbox_acls_identifier_not_null CHECK (identifier IS NOT NULL AND identifier != ''),
+    CONSTRAINT mailbox_acls_anyone_null_account CHECK ((identifier = 'anyone' AND account_id IS NULL) OR (identifier != 'anyone' AND account_id IS NOT NULL))
+);
+
+-- Composite index for the most common ACL lookup pattern (mailbox + account)
+-- Used by has_mailbox_right() for direct user permission checks
+CREATE INDEX idx_mailbox_acls_mailbox_account ON mailbox_acls (mailbox_id, account_id);
+
+-- Composite index for "anyone" ACL lookups
+-- Used by has_mailbox_right() for domain-wide permission checks
+CREATE INDEX idx_mailbox_acls_mailbox_identifier ON mailbox_acls (mailbox_id, identifier);
+
+-- Index for finding all ACLs for a specific account (reverse lookup)
+-- Used by get_accessible_mailboxes() and ACL management operations
+CREATE INDEX idx_mailbox_acls_account_id ON mailbox_acls (account_id) WHERE account_id IS NOT NULL;
+
+-- Partial index for "anyone" ACLs only
+-- Used by get_accessible_mailboxes() for finding domain-wide shared mailboxes
+CREATE INDEX idx_mailbox_acls_anyone ON mailbox_acls (identifier, mailbox_id) WHERE identifier = 'anyone';
+
+-- Triggers for message_sequences maintenance
+CREATE OR REPLACE FUNCTION maintain_message_sequences()
+RETURNS TRIGGER AS
+$$
+DECLARE
+    v_mailbox_id BIGINT;
+    affected_mailboxes_query TEXT;
+BEGIN
+    -- This trigger function rebuilds the sequence numbers for affected mailboxes.
+    -- We get the mailbox_id from the transition tables, depending on trigger event.
+
+    -- Build query based on available transition tables
+    IF TG_OP = 'INSERT' THEN
+        affected_mailboxes_query := 'SELECT DISTINCT mailbox_id FROM new_table WHERE mailbox_id IS NOT NULL';
+    ELSIF TG_OP = 'DELETE' THEN
+        affected_mailboxes_query := 'SELECT DISTINCT mailbox_id FROM old_table WHERE mailbox_id IS NOT NULL';
+    ELSE -- UPDATE
+        affected_mailboxes_query := '
+            SELECT DISTINCT mailbox_id FROM new_table WHERE mailbox_id IS NOT NULL
+            UNION
+            SELECT DISTINCT mailbox_id FROM old_table WHERE mailbox_id IS NOT NULL';
+    END IF;
+
+    -- Process all affected mailboxes
+    FOR v_mailbox_id IN EXECUTE affected_mailboxes_query LOOP
+        -- Lock the mailbox to prevent concurrent modifications from other transactions.
+        PERFORM pg_advisory_xact_lock(v_mailbox_id);
+
+        -- Atomically rebuild the sequence numbers for the entire mailbox.
+        -- This is more robust and often faster for bulk operations than per-row adjustments.
+        DELETE FROM message_sequences WHERE mailbox_id = v_mailbox_id;
+        INSERT INTO message_sequences (mailbox_id, uid, seqnum)
+        SELECT m.mailbox_id, m.uid, ROW_NUMBER() OVER (ORDER BY m.uid)
+        FROM messages m
+        WHERE m.mailbox_id = v_mailbox_id AND m.expunged_at IS NULL;
+    END LOOP;
+
+    RETURN NULL; -- Result is ignored for AFTER STATEMENT triggers.
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_maintain_message_sequences_insert
+AFTER INSERT ON messages
+REFERENCING NEW TABLE AS new_table
+FOR EACH STATEMENT
+EXECUTE FUNCTION maintain_message_sequences();
+
+CREATE TRIGGER trigger_maintain_message_sequences_update
+AFTER UPDATE ON messages
+REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
+FOR EACH STATEMENT
+EXECUTE FUNCTION maintain_message_sequences();
+
+CREATE TRIGGER trigger_maintain_message_sequences_delete
+AFTER DELETE ON messages
+REFERENCING OLD TABLE AS old_table
+FOR EACH STATEMENT
+EXECUTE FUNCTION maintain_message_sequences();
+
+-- Triggers for mailbox_stats maintenance
+CREATE OR REPLACE FUNCTION maintain_mailbox_stats()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_mailbox_id BIGINT;
+    count_delta INT := 0;
+    unseen_delta INT := 0;
+    size_delta BIGINT := 0;
+    modseq_val BIGINT := 0;
+BEGIN
+    -- Determine which mailbox_id to use
+    IF TG_OP = 'INSERT' THEN
+        v_mailbox_id := NEW.mailbox_id;
+    ELSE -- DELETE or UPDATE
+        v_mailbox_id := OLD.mailbox_id;
+    END IF;
+
+    -- If mailbox_id is NULL, do nothing (e.g., message moved out of a deleted mailbox)
+    IF v_mailbox_id IS NULL THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+    END IF;
+
+    -- Calculate deltas based on operation
+    IF TG_OP = 'INSERT' AND NEW.expunged_at IS NULL THEN
+        count_delta := 1;
+        size_delta := NEW.size;
+        unseen_delta := 1 - (NEW.flags & 1); -- 1 if unseen, 0 if seen
+        modseq_val := NEW.created_modseq;
+
+    ELSIF TG_OP = 'DELETE' AND OLD.expunged_at IS NULL THEN
+        count_delta := -1;
+        size_delta := -OLD.size;
+        unseen_delta := -(1 - (OLD.flags & 1));
+        -- modseq is a high-water mark, not decreased on delete
+
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Case 1: Message is expunged (soft delete)
+        IF OLD.expunged_at IS NULL AND NEW.expunged_at IS NOT NULL THEN
+            count_delta := -1;
+            size_delta := -OLD.size;
+            unseen_delta := -(1 - (OLD.flags & 1));
+            modseq_val := COALESCE(NEW.expunged_modseq, 0);
+        -- Case 2: Message is restored (un-expunged)
+        ELSIF OLD.expunged_at IS NOT NULL AND NEW.expunged_at IS NULL THEN
+            count_delta := 1;
+            size_delta := NEW.size;
+            unseen_delta := 1 - (NEW.flags & 1);
+            -- modseq is not changed on restore, it's a new state
+        -- Case 3: Flags changed on an active message
+        ELSIF OLD.expunged_at IS NULL AND NEW.expunged_at IS NULL AND OLD.flags != NEW.flags THEN
+            unseen_delta := (1 - (NEW.flags & 1)) - (1 - (OLD.flags & 1));
+            modseq_val := COALESCE(NEW.updated_modseq, 0);
+        END IF;
+    END IF;
+
+    -- Apply the deltas if any change occurred
+    IF count_delta != 0 OR size_delta != 0 OR unseen_delta != 0 OR modseq_val != 0 THEN
+        INSERT INTO mailbox_stats (mailbox_id, message_count, unseen_count, total_size, highest_modseq, updated_at)
+        VALUES (v_mailbox_id, count_delta, unseen_delta, size_delta, modseq_val, now())
+        ON CONFLICT (mailbox_id) DO UPDATE SET
+            message_count = mailbox_stats.message_count + count_delta,
+            unseen_count = mailbox_stats.unseen_count + unseen_delta,
+            total_size = mailbox_stats.total_size + size_delta,
+            highest_modseq = GREATEST(mailbox_stats.highest_modseq, modseq_val),
+            updated_at = now();
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_messages_stats_insert AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION maintain_mailbox_stats();
+CREATE TRIGGER trigger_messages_stats_delete AFTER DELETE ON messages FOR EACH ROW EXECUTE FUNCTION maintain_mailbox_stats();
+CREATE TRIGGER trigger_messages_stats_update AFTER UPDATE ON messages FOR EACH ROW WHEN (OLD.flags IS DISTINCT FROM NEW.flags OR OLD.expunged_at IS DISTINCT FROM NEW.expunged_at) EXECUTE FUNCTION maintain_mailbox_stats();
+
+-- Function to check if an account has a specific right on a mailbox
+-- Returns TRUE if:
+--   1. User owns the mailbox (both shared and non-shared), OR
+--   2. User has an ACL entry with the requested right, OR
+--   3. User is in same domain and there's an "anyone" ACL entry with the requested right
+CREATE OR REPLACE FUNCTION has_mailbox_right(
+    p_mailbox_id BIGINT,
+    p_account_id BIGINT,
+    p_right CHAR(1)
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_rights TEXT;
+    v_is_owner BOOLEAN;
+    v_owner_domain TEXT;
+    v_user_domain TEXT;
+BEGIN
+    -- Check if user is the owner (both shared and non-shared mailboxes)
+    SELECT
+        (account_id = p_account_id),
+        owner_domain
+    INTO v_is_owner, v_owner_domain
+    FROM mailboxes
+    WHERE id = p_mailbox_id;
+
+    -- Owners have all rights (both shared and non-shared mailboxes)
+    IF v_is_owner THEN
+        RETURN TRUE;
+    END IF;
+
+    -- Check direct ACL entry for this user
+    SELECT rights INTO v_rights
+    FROM mailbox_acls
+    WHERE mailbox_id = p_mailbox_id AND account_id = p_account_id;
+
+    IF v_rights IS NOT NULL AND position(p_right IN v_rights) > 0 THEN
+        RETURN TRUE;
+    END IF;
+
+    -- Check "anyone" ACL entry (only for shared mailboxes in same domain)
+    IF v_owner_domain IS NOT NULL THEN
+        -- Get user's domain
+        SELECT SPLIT_PART(address, '@', 2) INTO v_user_domain
+        FROM credentials
+        WHERE account_id = p_account_id AND primary_identity = TRUE;
+
+        -- If user is in same domain as mailbox owner, check "anyone" rights
+        IF v_user_domain = v_owner_domain THEN
+            SELECT rights INTO v_rights
+            FROM mailbox_acls
+            WHERE mailbox_id = p_mailbox_id AND identifier = 'anyone';
+
+            IF v_rights IS NOT NULL AND position(p_right IN v_rights) > 0 THEN
+                RETURN TRUE;
+            END IF;
+        END IF;
+    END IF;
+
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Helper function to get all mailboxes accessible to a user
+-- Returns both owned mailboxes and shared mailboxes with ACL access
+CREATE OR REPLACE FUNCTION get_accessible_mailboxes(
+    p_account_id BIGINT
+) RETURNS TABLE (
+    mailbox_id BIGINT,
+    mailbox_name TEXT,
+    is_shared BOOLEAN,
+    access_rights TEXT
+) AS $$
+DECLARE
+    v_user_domain TEXT;
+BEGIN
+    -- Get user's domain
+    SELECT SPLIT_PART(address, '@', 2) INTO v_user_domain
+    FROM credentials
+    WHERE account_id = p_account_id AND primary_identity = TRUE;
+
+    RETURN QUERY
+    -- Personal mailboxes (owned by user)
+    SELECT
+        m.id,
+        m.name,
+        COALESCE(m.is_shared, FALSE),
+        'lrswipkxtea'::TEXT as access_rights  -- Full rights for owned mailboxes
+    FROM mailboxes m
+    WHERE m.account_id = p_account_id
+      AND NOT COALESCE(m.is_shared, FALSE)
+
+    UNION ALL
+
+    -- Shared mailboxes with direct ACL access
+    SELECT
+        m.id,
+        m.name,
+        COALESCE(m.is_shared, FALSE),
+        acl.rights
+    FROM mailboxes m
+    INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
+    WHERE acl.account_id = p_account_id
+      AND COALESCE(m.is_shared, FALSE) = TRUE
+
+    UNION ALL
+
+    -- Shared mailboxes with "anyone" access (same domain only)
+    SELECT
+        m.id,
+        m.name,
+        COALESCE(m.is_shared, FALSE),
+        acl.rights
+    FROM mailboxes m
+    INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
+    WHERE acl.identifier = 'anyone'
+      AND COALESCE(m.is_shared, FALSE) = TRUE
+      AND m.owner_domain = v_user_domain;  -- Same domain restriction
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Populate the message_sequences table for all existing non-expunged messages
+-- This is a one-time operation to bootstrap the cache.
+INSERT INTO message_sequences (mailbox_id, uid, seqnum)
+SELECT
+    m.mailbox_id,
+    m.uid,
+    ROW_NUMBER() OVER (PARTITION BY m.mailbox_id ORDER BY m.uid) AS seqnum
+FROM
+    messages m
+WHERE
+    m.expunged_at IS NULL AND m.mailbox_id IS NOT NULL;
+
+-- Populate the mailbox_stats table for all existing mailboxes
+-- This is a one-time operation to bootstrap the cache.
+INSERT INTO mailbox_stats (mailbox_id, message_count, unseen_count, total_size, highest_modseq, updated_at)
+SELECT
+    m.mailbox_id,
+    COUNT(m.id),
+    COUNT(m.id) FILTER (WHERE (m.flags & 1) = 0),
+    COALESCE(SUM(m.size), 0),
+    COALESCE((SELECT MAX(modseq) FROM (SELECT created_modseq as modseq FROM messages WHERE mailbox_id = m.mailbox_id UNION ALL SELECT updated_modseq as modseq FROM messages WHERE mailbox_id = m.mailbox_id AND updated_modseq IS NOT NULL UNION ALL SELECT expunged_modseq as modseq FROM messages WHERE mailbox_id = m.mailbox_id AND expunged_modseq IS NOT NULL) as modseqs), 0),
+    now()
+FROM messages m
+WHERE m.mailbox_id IS NOT NULL AND m.expunged_at IS NULL
+GROUP BY m.mailbox_id;
