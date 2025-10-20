@@ -526,10 +526,10 @@ type PreLookupCircuitBreakerConfig struct {
 
 // PreLookupTransportConfig holds HTTP transport configuration for prelookup connection pooling
 type PreLookupTransportConfig struct {
-	MaxIdleConns        int    `toml:"max_idle_conns"`         // Maximum idle connections across all hosts (default: 100)
+	MaxIdleConns        int    `toml:"max_idle_conns"`          // Maximum idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
-	MaxConnsPerHost     int    `toml:"max_conns_per_host"`     // Maximum total connections per host, 0 = unlimited (default: 0)
-	IdleConnTimeout     string `toml:"idle_conn_timeout"`      // How long idle connections stay open (default: "90s")
+	MaxConnsPerHost     int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
+	IdleConnTimeout     string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
 }
 
 // GetTimeout returns the configured HTTP timeout duration
