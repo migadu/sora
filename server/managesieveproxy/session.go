@@ -63,7 +63,9 @@ func (s *Session) handleConnection() {
 	defer s.close()
 
 	clientAddr := s.clientConn.RemoteAddr().String()
-	log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	if s.server.debug {
+		log.Printf("ManageSieve Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	}
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -119,7 +121,9 @@ func (s *Session) handleConnection() {
 			continue
 		}
 
-		log.Printf("ManageSieve Proxy [%s] Client %s: %s", s.server.name, clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] Client %s: %s", s.server.name, clientAddr, helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		}
 		switch command {
 		case "AUTHENTICATE":
 			if s.server.debug {
@@ -315,7 +319,9 @@ func (s *Session) handleConnection() {
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
 
-			log.Printf("ManageSieve Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+			}
 
 			// Re-send greeting with updated capabilities (now with SASL mechanisms available)
 			if err := s.sendGreeting(); err != nil {
@@ -345,7 +351,9 @@ func (s *Session) handleConnection() {
 
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
-		log.Printf("ManageSieve Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
+		}
 		s.startProxy()
 	} else {
 		log.Printf("ManageSieve Proxy [%s] Cannot start proxy for user %s: no backend connection", s.server.name, s.username)
@@ -443,8 +451,8 @@ func (s *Session) authenticateUser(username, password string) error {
 		switch authResult {
 		case proxy.AuthSuccess:
 			// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
-			log.Printf("ManageSieve Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
 			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
 				log.Printf("ManageSieve Proxy [%s] [DEBUG] Prelookup routing: server=%s, TLS=%t, StartTLS=%t, TLSVerify=%t, ProxyProtocol=%t",
 					s.server.name, routingInfo.ServerAddress, routingInfo.RemoteTLS, routingInfo.RemoteTLSUseStartTLS,
 					routingInfo.RemoteTLSVerify, routingInfo.RemoteUseProxyProtocol)
@@ -653,21 +661,23 @@ func (s *Session) connectToBackendAndAuth() error {
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
 		}
-		log.Printf("ManageSieve Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",
-			s.server.name, s.routingInfo.RemoteTLSVerify)
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",
+				s.server.name, s.routingInfo.RemoteTLSVerify)
+		}
 	} else if s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS
 		shouldUseStartTLS = true
 		tlsConfig = s.server.connManager.GetTLSConfig()
-		log.Printf("ManageSieve Proxy [%s] Using global StartTLS settings for backend", s.server.name)
+		if s.server.debug {
+			log.Printf("ManageSieve Proxy [%s] Using global StartTLS settings for backend", s.server.name)
+		}
 	}
 
 	if shouldUseStartTLS && tlsConfig != nil {
 		if s.server.debug {
-			log.Printf("ManageSieve Proxy [%s] [DEBUG] Negotiating StartTLS with backend %s (InsecureSkipVerify=%t)",
+			log.Printf("ManageSieve Proxy [%s] Negotiating StartTLS with backend %s (InsecureSkipVerify=%t)",
 				s.server.name, actualAddr, tlsConfig.InsecureSkipVerify)
-		} else {
-			log.Printf("ManageSieve Proxy [%s] Negotiating StartTLS with backend %s", s.server.name, actualAddr)
 		}
 
 		// Send STARTTLS command
@@ -678,19 +688,11 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		if s.server.debug {
-			log.Printf("ManageSieve Proxy [%s] [DEBUG] Sent STARTTLS command to backend", s.server.name)
-		}
-
 		// Read STARTTLS response
 		response, err := backendReader.ReadString('\n')
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("failed to read STARTTLS response: %w", err)
-		}
-
-		if s.server.debug {
-			log.Printf("ManageSieve Proxy [%s] [DEBUG] Backend STARTTLS response: %s", s.server.name, strings.TrimSpace(response))
 		}
 
 		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {

@@ -67,7 +67,9 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	response = strings.TrimRight(response, "\r\n")
 
 	if strings.HasPrefix(response, "+OK") {
-		log.Printf("POP3 Proxy [%s] XCLIENT forwarding completed successfully for %s: %s", s.server.name, s.username, xclientParams)
+		if s.server.debug {
+			log.Printf("POP3 Proxy [%s] XCLIENT forwarding completed successfully for %s: %s", s.server.name, s.username, xclientParams)
+		}
 	} else if strings.HasPrefix(response, "-ERR") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {

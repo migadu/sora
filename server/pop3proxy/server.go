@@ -49,6 +49,7 @@ type POP3ProxyServer struct {
 	limiter *server.ConnectionLimiter
 
 	// Debug logging
+	debug       bool
 	debugWriter io.Writer
 }
 
@@ -153,7 +154,9 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			log.Printf("[POP3 Proxy %s] Continuing without prelookup due to fallback_to_default=true", options.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[POP3 Proxy %s] Prelookup client initialized successfully", options.Name)
+			if options.Debug {
+				log.Printf("[POP3 Proxy %s] Prelookup client initialized successfully", options.Name)
+			}
 		}
 	}
 
@@ -224,6 +227,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		remoteUseXCLIENT:       options.RemoteUseXCLIENT,
 		limiter:                limiter,
+		debug:                  options.Debug,
 		debugWriter:            debugWriter,
 	}
 
@@ -251,17 +255,9 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"pop3"},
 		}
-
-		if options.TLSVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for POP3 proxy [%s] (tls_verify=true)", options.Name)
-		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for POP3 proxy [%s] (tls_verify=false)", options.Name)
-		}
-		log.Printf("POP3 proxy [%s] using per-server TLS certificate", options.Name)
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager
 		server.tlsConfig = options.TLSConfig
-		log.Printf("POP3 proxy [%s] using global TLS manager", options.Name)
 	} else if options.TLS {
 		// TLS enabled but no cert files and no global TLS config provided
 		serverCancel()
@@ -292,8 +288,6 @@ func (s *POP3ProxyServer) Start() error {
 		}
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
-		log.Printf("POP3 proxy [%s] listening with TLS on %s (JA4 enabled, timeout protection: %v)",
-			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	} else {
 		// Create base TCP listener
 		tcpListener, err := net.Listen("tcp", s.addr)
@@ -303,8 +297,6 @@ func (s *POP3ProxyServer) Start() error {
 		}
 		// Use SoraListener for non-TLS with timeout protection
 		listener = server.NewSoraListener(tcpListener, connConfig)
-		log.Printf("POP3 proxy [%s] listening on %s (timeout protection: %v)",
-			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	}
 	defer listener.Close()
 
@@ -358,7 +350,9 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		}
 
 		session.RemoteIP = conn.RemoteAddr().String()
-		log.Printf("POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
+		if s.debug {
+			log.Printf("POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
+		}
 
 		// Track proxy connection
 		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()

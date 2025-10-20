@@ -53,6 +53,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Debug logging
+	debug       bool
 	debugWriter io.Writer
 }
 
@@ -122,7 +123,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			log.Printf("[LMTP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 		} else {
 			routingLookup = prelookupClient
-			log.Printf("[LMTP Proxy %s] Prelookup client initialized successfully", opts.Name)
+			if opts.Debug {
+				log.Printf("[LMTP Proxy %s] Prelookup client initialized successfully", opts.Name)
+			}
 		}
 	}
 
@@ -192,6 +195,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
 		limiter:            limiter,
+		debug:              opts.Debug,
 		debugWriter:        debugWriter,
 	}
 
@@ -219,11 +223,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"lmtp"},
 		}
-		log.Printf("LMTP proxy [%s] using per-server TLS certificate", opts.Name)
 	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.tlsConfig = opts.TLSConfig
-		log.Printf("LMTP proxy [%s] using global TLS manager", opts.Name)
 	} else if opts.TLS && !opts.TLSUseStartTLS {
 		// TLS enabled but no cert files and no global TLS config provided
 		cancel()
@@ -237,12 +239,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 func (s *Server) Start() error {
 	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
 	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for LMTP proxy [%s] (tls_verify=true)", s.name)
-		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for LMTP proxy [%s] (tls_verify=false)", s.name)
-		}
-
 		// Configure SoraConn (LMTP proxy doesn't have timeout protection currently)
 		connConfig := server.SoraConnConfig{
 			Protocol:             "lmtp_proxy",
@@ -259,7 +255,6 @@ func (s *Server) Start() error {
 		// Use SoraTLSListener for TLS with JA4 capture
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("LMTP proxy [%s] listening with implicit TLS on %s (JA4 enabled)", s.name, s.addr)
 	} else {
 		// Configure SoraConn (LMTP proxy doesn't have timeout protection currently)
 		connConfig := server.SoraConnConfig{
@@ -276,11 +271,6 @@ func (s *Server) Start() error {
 		// Use SoraListener for non-TLS
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
-		if s.tlsUseStartTLS {
-			log.Printf("LMTP proxy [%s] listening on %s (STARTTLS enabled)", s.name, s.addr)
-		} else {
-			log.Printf("LMTP proxy [%s] listening on %s", s.name, s.addr)
-		}
 	}
 
 	// Start connection limiter cleanup if enabled

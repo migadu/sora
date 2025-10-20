@@ -61,7 +61,9 @@ func (s *Session) handleConnection() {
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
 	clientAddr := s.clientConn.RemoteAddr().String()
-	log.Printf("LMTP Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	if s.server.debug {
+		log.Printf("LMTP Proxy [%s] New connection from %s", s.server.name, clientAddr)
+	}
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -102,7 +104,9 @@ func (s *Session) handleConnection() {
 		}
 
 		line = strings.TrimRight(line, "\r\n")
-		log.Printf("LMTP Proxy [%s] Client %s: %s", s.server.name, clientAddr, line)
+		if s.server.debug {
+			log.Printf("LMTP Proxy [%s] Client %s: %s", s.server.name, clientAddr, line)
+		}
 
 		// Log client command if debug is enabled
 		s.Log("C: %s\r\n", line)
@@ -198,7 +202,9 @@ func (s *Session) handleConnection() {
 
 			// Start proxying only if backend connection was successful
 			if s.backendConn != nil {
-				log.Printf("LMTP Proxy [%s] Starting proxy for recipient %s (account ID: %d)", s.server.name, s.to, s.accountID)
+				if s.server.debug {
+					log.Printf("LMTP Proxy [%s] Starting proxy for recipient %s (account ID: %d)", s.server.name, s.to, s.accountID)
+				}
 				s.startProxy(line)
 			} else {
 				log.Printf("LMTP Proxy [%s] Cannot start proxy for recipient %s: no backend connection", s.server.name, s.to)
@@ -251,7 +257,9 @@ func (s *Session) handleConnection() {
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
 
-			log.Printf("LMTP Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+			if s.server.debug {
+				log.Printf("LMTP Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)
+			}
 
 			// Client must send EHLO/LHLO again after STARTTLS (RFC 3207)
 			// Continue to next iteration to wait for new EHLO/LHLO
@@ -346,9 +354,13 @@ func (s *Session) handleRecipient(to string) error {
 
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			log.Printf("LMTP Proxy [%s] Prelookup for %s failed: %v. Falling back to main DB for affinity check.", s.server.name, s.username, lookupErr)
+			if s.server.debug {
+				log.Printf("LMTP Proxy [%s] Prelookup for %s failed: %v. Falling back to main DB for affinity check.", s.server.name, s.username, lookupErr)
+			}
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			log.Printf("LMTP Proxy [%s] Routing %s to %s via prelookup", s.server.name, s.username, routingInfo.ServerAddress)
+			if s.server.debug {
+				log.Printf("LMTP Proxy [%s] Routing %s to %s via prelookup", s.server.name, s.username, routingInfo.ServerAddress)
+			}
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
@@ -389,7 +401,7 @@ func (s *Session) connectToBackend() error {
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 
-	if s.server.debugWriter != nil {
+	if s.server.debug {
 		log.Printf("LMTP Proxy [%s] [DEBUG] Routing for %s: method=%s, preferredAddr=%s, isPrelookup=%t",
 			s.server.name, s.username, routeResult.RoutingMethod, preferredAddr, isPrelookupRoute)
 		if s.routingInfo != nil {
@@ -445,14 +457,10 @@ func (s *Session) connectToBackend() error {
 	}
 
 	// Read greeting from backend
-	greeting, err := s.backendReader.ReadString('\n')
+	_, err = s.backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
 		return fmt.Errorf("failed to read backend greeting: %w", err)
-	}
-
-	if s.server.debugWriter != nil {
-		log.Printf("LMTP Proxy [%s] Backend greeting: %s", s.server.name, strings.TrimRight(greeting, "\r"))
 	}
 
 	// Send LHLO to backend
@@ -472,7 +480,7 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("failed to read LHLO response: %w", err)
 		}
 
-		if s.server.debugWriter != nil {
+		if s.server.debug {
 			log.Printf("LMTP Proxy [%s] Backend LHLO response: %s", s.server.name, strings.TrimRight(response, "\r"))
 		}
 
@@ -497,21 +505,23 @@ func (s *Session) connectToBackend() error {
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
 		}
-		log.Printf("LMTP Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",
-			s.server.name, s.routingInfo.RemoteTLSVerify)
+		if s.server.debug {
+			log.Printf("LMTP Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",
+				s.server.name, s.routingInfo.RemoteTLSVerify)
+		}
 	} else if s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS
 		shouldUseStartTLS = true
 		tlsConfig = s.server.connManager.GetTLSConfig()
-		log.Printf("LMTP Proxy [%s] Using global StartTLS settings for backend", s.server.name)
+		if s.server.debug {
+			log.Printf("LMTP Proxy [%s] Using global StartTLS settings for backend", s.server.name)
+		}
 	}
 
 	if shouldUseStartTLS && tlsConfig != nil {
-		if s.server.debugWriter != nil {
-			log.Printf("LMTP Proxy [%s] [DEBUG] Negotiating StartTLS with backend %s (InsecureSkipVerify=%t)",
+		if s.server.debug {
+			log.Printf("LMTP Proxy [%s] Negotiating StartTLS with backend %s (InsecureSkipVerify=%t)",
 				s.server.name, actualAddr, tlsConfig.InsecureSkipVerify)
-		} else {
-			log.Printf("LMTP Proxy [%s] Negotiating StartTLS with backend %s", s.server.name, actualAddr)
 		}
 
 		// Send STARTTLS command
@@ -522,19 +532,11 @@ func (s *Session) connectToBackend() error {
 		}
 		s.backendWriter.Flush()
 
-		if s.server.debugWriter != nil {
-			log.Printf("LMTP Proxy [%s] [DEBUG] Sent STARTTLS command to backend", s.server.name)
-		}
-
 		// Read STARTTLS response
 		response, err := s.backendReader.ReadString('\n')
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("failed to read STARTTLS response: %w", err)
-		}
-
-		if s.server.debugWriter != nil {
-			log.Printf("LMTP Proxy [%s] [DEBUG] Backend STARTTLS response: %s", s.server.name, strings.TrimSpace(response))
 		}
 
 		if !strings.HasPrefix(strings.TrimSpace(response), "220") {
@@ -550,7 +552,9 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
 		}
 
-		log.Printf("LMTP Proxy [%s] StartTLS negotiation successful with backend %s", s.server.name, actualAddr)
+		if s.server.debug {
+			log.Printf("LMTP Proxy [%s] StartTLS negotiation successful with backend %s", s.server.name, actualAddr)
+		}
 		s.backendConn = tlsConn
 		s.backendReader = bufio.NewReader(tlsConn)
 		s.backendWriter = bufio.NewWriter(tlsConn)
@@ -572,7 +576,7 @@ func (s *Session) connectToBackend() error {
 				return fmt.Errorf("failed to read LHLO response after STARTTLS: %w", err)
 			}
 
-			if s.server.debugWriter != nil {
+			if s.server.debug {
 				log.Printf("LMTP Proxy [%s] Backend LHLO response after STARTTLS: %s", s.server.name, strings.TrimRight(response, "\r"))
 			}
 

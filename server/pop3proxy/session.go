@@ -331,7 +331,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Skip strict address validation if prelookup is enabled, as it may support master tokens
 	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
-		log.Printf("POP3 Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+		if s.server.debug {
+			log.Printf("POP3 Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+		}
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 		if err != nil {
@@ -347,7 +349,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+					if s.server.debug {
+						log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+					}
 					// Fallthrough to main DB auth
 				} else {
 					log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
@@ -356,15 +360,15 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					return fmt.Errorf("prelookup service unavailable")
 				}
 			} else {
-				// Unknown error type - log and fallthrough
-				log.Printf("POP3 Proxy [%s] Prelookup unknown error for '%s': %v. Attempting fallback to main DB.", s.server.name, username, err)
-				// Fallthrough to main DB auth
+				// Unknown error type - fallthrough to main DB auth
 			}
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup auth was successful.
-				log.Printf("POP3 Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+				if s.server.debug {
+					log.Printf("POP3 Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+				}
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -398,7 +402,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			case proxy.AuthUserNotFound:
 				// User not in prelookup DB. Fallthrough to main DB auth.
-				log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+				if s.server.debug {
+					log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+				}
 			}
 		}
 	}
@@ -409,7 +415,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 
-	log.Printf("POP3 Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+	if s.server.debug {
+		log.Printf("POP3 Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+	}
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
@@ -552,7 +560,9 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("backend authentication failed: %s", authResp)
 	}
 
-	log.Printf("POP3 Proxy [%s] authenticated to backend as %s", s.server.name, s.username)
+	if s.server.debug {
+		log.Printf("POP3 Proxy [%s] authenticated to backend as %s", s.server.name, s.username)
+	}
 
 	return nil
 }
@@ -565,7 +575,9 @@ func (s *POP3ProxySession) startProxying() {
 
 	defer s.backendConn.Close()
 
-	log.Printf("POP3 Proxy [%s] starting bidirectional proxy for %s", s.server.name, s.username)
+	if s.server.debug {
+		log.Printf("POP3 Proxy [%s] starting bidirectional proxy for %s", s.server.name, s.username)
+	}
 
 	var wg sync.WaitGroup
 
@@ -606,7 +618,9 @@ func (s *POP3ProxySession) startProxying() {
 	}()
 
 	wg.Wait() // Wait for both copy operations to finish
-	log.Printf("POP3 Proxy [%s] proxy session ended for %s", s.server.name, s.username)
+	if s.server.debug {
+		log.Printf("POP3 Proxy [%s] proxy session ended for %s", s.server.name, s.username)
+	}
 }
 
 // close closes all connections and unregisters from tracking.

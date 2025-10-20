@@ -222,11 +222,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"sieve"},
 		}
-		log.Printf("ManageSieve proxy [%s] using per-server TLS certificate", opts.Name)
 	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.tlsConfig = opts.TLSConfig
-		log.Printf("ManageSieve proxy [%s] using global TLS manager", opts.Name)
 	} else if opts.TLS && !opts.TLSUseStartTLS {
 		// TLS enabled but no cert files and no global TLS config provided
 		cancel()
@@ -240,12 +238,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 func (s *Server) Start() error {
 	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
 	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		if s.tlsVerify {
-			log.Printf("Client TLS certificate verification is REQUIRED for ManageSieve proxy [%s] (tls_verify=true)", s.name)
-		} else {
-			log.Printf("Client TLS certificate verification is DISABLED for ManageSieve proxy [%s] (tls_verify=false)", s.name)
-		}
-
 		// Configure SoraConn with timeout protection
 		connConfig := server.SoraConnConfig{
 			Protocol:             "managesieve_proxy",
@@ -265,8 +257,6 @@ func (s *Server) Start() error {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-		log.Printf("ManageSieve proxy [%s] listening with implicit TLS on %s (JA4 enabled, timeout protection: %v)",
-			s.name, s.addr, connConfig.EnableTimeoutChecker)
 	} else {
 		// Configure SoraConn with timeout protection
 		connConfig := server.SoraConnConfig{
@@ -286,13 +276,6 @@ func (s *Server) Start() error {
 		// Use SoraListener for non-TLS with timeout protection
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
-		if s.tlsUseStartTLS {
-			log.Printf("ManageSieve proxy [%s] listening on %s (STARTTLS enabled, timeout protection: %v)",
-				s.name, s.addr, connConfig.EnableTimeoutChecker)
-		} else {
-			log.Printf("ManageSieve proxy [%s] listening on %s (timeout protection: %v)",
-				s.name, s.addr, connConfig.EnableTimeoutChecker)
-		}
 	}
 
 	// Start connection limiter cleanup if enabled
