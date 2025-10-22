@@ -1172,6 +1172,38 @@ tls_key_file = ""
 tls_verify = false
 
 
+# USER API PROXY SERVER EXAMPLE
+# =============================================================================
+# HTTP reverse proxy for User API - routes requests to backend User API servers
+# Authenticates JWT tokens on the proxy and forwards trusted requests to backends
+# Supports user-based routing with consistent hashing for affinity
+# Use for horizontal scaling of User API across multiple backend servers
+
+#[[server]]
+#type = "user_api_proxy"
+#name = "user-api-proxy"
+#addr = ":8082"                      # Frontend proxy listening address
+#remote_addrs = ["backend1:8081", "backend2:8081", "backend3:8081"]  # Backend User API servers
+#remote_port = 8081                  # Default backend port if not specified in remote_addrs
+#jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Same JWT secret as backend servers
+#max_connections = 10000             # Maximum total concurrent connections (0 = unlimited)
+#max_connections_per_ip = 100        # Maximum connections per client IP (0 = unlimited)
+#connect_timeout = "10s"             # Timeout for establishing backend connections
+#enable_affinity = true              # Enable user-to-backend affinity (sticky routing via consistent hashing)
+#tls = false                         # Enable TLS on frontend proxy listener
+#tls_cert_file = ""
+#tls_key_file = ""
+#tls_verify = false
+#remote_tls = false                  # Use HTTPS for backend connections
+#remote_tls_verify = true            # Verify backend TLS certificates
+
+# IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
+# Backend configuration example:
+# [[server]]
+# type = "http_user_api"
+# allowed_hosts = ["10.0.0.0/8"]  # Trust requests from proxy network
+
+
 # CONNECTION TRACKING CONFIGURATION
 # =============================================================================
 # Monitor and log active connections across all servers for operational visibility.

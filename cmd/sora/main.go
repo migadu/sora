@@ -35,6 +35,7 @@ import (
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	mailapi "github.com/migadu/sora/server/userapi"
+	"github.com/migadu/sora/server/userapiproxy"
 	"github.com/migadu/sora/storage"
 	"github.com/migadu/sora/tlsmanager"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -564,6 +565,8 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			go startDynamicHTTPAdminAPIServer(ctx, deps, server, errChan)
 		case "http_user_api":
 			go startDynamicHTTPUserAPIServer(ctx, deps, server, errChan)
+		case "user_api_proxy":
+			go startDynamicUserAPIProxyServer(ctx, deps, server, errChan)
 		default:
 			logger.Infof("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
 		}
@@ -1366,4 +1369,70 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 	}
 
 	mailapi.Start(ctx, deps.resilientDB, options, errChan)
+}
+
+func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
+	deps.serverManager.Add()
+	defer deps.serverManager.Done()
+
+	if serverConfig.JWTSecret == "" {
+		logger.Infof("WARNING: User API proxy server '%s' enabled but no JWT secret configured, skipping", serverConfig.Name)
+		return
+	}
+
+	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+
+	remotePort, err := serverConfig.GetRemotePort()
+	if err != nil {
+		errChan <- fmt.Errorf("invalid remote_port for User API proxy %s: %w", serverConfig.Name, err)
+		return
+	}
+
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
+	server, err := userapiproxy.New(ctx, deps.resilientDB, userapiproxy.ServerOptions{
+		Name:                serverConfig.Name,
+		Addr:                serverConfig.Addr,
+		RemoteAddrs:         serverConfig.RemoteAddrs,
+		RemotePort:          remotePort,
+		JWTSecret:           serverConfig.JWTSecret,
+		TLS:                 serverConfig.TLS,
+		TLSCertFile:         serverConfig.TLSCertFile,
+		TLSKeyFile:          serverConfig.TLSKeyFile,
+		TLSVerify:           serverConfig.TLSVerify,
+		TLSConfig:           tlsConfig,
+		RemoteTLS:           serverConfig.RemoteTLS,
+		RemoteTLSVerify:     serverConfig.RemoteTLSVerify,
+		ConnectTimeout:      connectTimeout,
+		MaxConnections:      serverConfig.MaxConnections,
+		MaxConnectionsPerIP: serverConfig.MaxConnectionsPerIP,
+		TrustedNetworks:     deps.config.Servers.TrustedNetworks,
+		TrustedProxies:      deps.config.Servers.TrustedNetworks,
+	})
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)
+		return
+	}
+
+	// Set affinity manager on connection manager if cluster is enabled
+	if connMgr := server.GetConnectionManager(); connMgr != nil {
+		if deps.affinityManager != nil {
+			connMgr.SetAffinityManager(deps.affinityManager)
+			logger.Infof("User API Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		logger.Infof("Shutting down User API proxy server %s...", serverConfig.Name)
+		server.Stop()
+	}()
+
+	if err := server.Start(); err != nil && ctx.Err() == nil {
+		errChan <- fmt.Errorf("User API proxy server error: %w", err)
+	}
 }

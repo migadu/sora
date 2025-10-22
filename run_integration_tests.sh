@@ -183,7 +183,7 @@ main() {
                 echo "  Core Protocols: imap, lmtp, pop3, managesieve, config"
                 echo "  HTTP APIs: adminapi, userapi"
                 echo "  Admin Tools: sora-admin (importer/exporter tests)"
-                echo "  Proxy: imapproxy, lmtpproxy, pop3proxy, managesieveproxy"
+                echo "  Proxy: imapproxy, lmtpproxy, pop3proxy, managesieveproxy, userapiproxy"
                 echo "  Limits: connection_limits, lmtp_connection_limits, pop3_connection_limits,"
                 echo "          managesieve_connection_limits, proxy_connection_limits"
                 echo ""
@@ -209,7 +209,7 @@ main() {
     if [ ${#SCOPES[@]} -eq 0 ]; then
         SCOPES=(
             "imap" "lmtp" "pop3" "managesieve"
-            "imapproxy" "lmtpproxy" "pop3proxy" "managesieveproxy"
+            "imapproxy" "lmtpproxy" "pop3proxy" "managesieveproxy" "userapiproxy"
             "connection_limits" "lmtp_connection_limits" "pop3_connection_limits"
             "managesieve_connection_limits" "proxy_connection_limits"
             "adminapi" "userapi" "config"

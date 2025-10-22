@@ -1068,6 +1068,40 @@ type HTTPAPIConfig struct {
 	TLSVerify    bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
 }
 
+// UserAPIServerConfig holds User API server configuration
+type UserAPIServerConfig struct {
+	Start          bool     `toml:"start"`
+	Addr           string   `toml:"addr"`
+	JWTSecret      string   `toml:"jwt_secret"`
+	TokenDuration  string   `toml:"token_duration"`  // JWT token validity duration (default: 24h)
+	TokenIssuer    string   `toml:"token_issuer"`    // JWT issuer (default: sora-mail-api)
+	AllowedOrigins []string `toml:"allowed_origins"` // CORS allowed origins
+	AllowedHosts   []string `toml:"allowed_hosts"`   // If empty, all hosts are allowed
+	TLS            bool     `toml:"tls"`
+	TLSCertFile    string   `toml:"tls_cert_file"`
+	TLSKeyFile     string   `toml:"tls_key_file"`
+	TLSVerify      bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
+}
+
+// UserAPIProxyServerConfig holds User API proxy server configuration
+type UserAPIProxyServerConfig struct {
+	Start               bool        `toml:"start"`
+	Addr                string      `toml:"addr"`
+	RemoteAddrs         []string    `toml:"remote_addrs"`
+	RemotePort          interface{} `toml:"remote_port"`            // Default port for backends if not in address
+	JWTSecret           string      `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
+	MaxConnections      int         `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int         `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                 bool        `toml:"tls"`
+	TLSCertFile         string      `toml:"tls_cert_file"`
+	TLSKeyFile          string      `toml:"tls_key_file"`
+	TLSVerify           bool        `toml:"tls_verify"`
+	RemoteTLS           bool        `toml:"remote_tls"`
+	RemoteTLSVerify     bool        `toml:"remote_tls_verify"`
+	ConnectTimeout      string      `toml:"connect_timeout"`
+	EnableAffinity      bool        `toml:"enable_affinity"`
+}
+
 // ServerLimitsConfig holds resource limits for a server
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin int    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
@@ -1195,6 +1229,8 @@ type ServersConfig struct {
 	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
 	Metrics            MetricsConfig                `toml:"metrics"`
 	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
+	UserAPI            UserAPIServerConfig          `toml:"user_api,omitempty"`
+	UserAPIProxy       UserAPIProxyServerConfig     `toml:"user_api_proxy,omitempty"`
 }
 
 // LoggingConfig holds logging configuration

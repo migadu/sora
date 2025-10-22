@@ -191,6 +191,32 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 // jwtAuthMiddleware validates JWT tokens and adds user context
 func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check if request is from trusted proxy (via X-Forwarded-User header)
+		if forwardedUser := r.Header.Get("X-Forwarded-User"); forwardedUser != "" {
+			// Verify the request comes from a trusted network
+			clientIP := getClientIP(r)
+			if isIPAllowed(clientIP, s.allowedHosts) {
+				// Trust the proxy's authentication - extract user info from headers
+				forwardedUserIDStr := r.Header.Get("X-Forwarded-User-ID")
+				var accountID int64
+				if forwardedUserIDStr != "" {
+					if id, err := fmt.Sscanf(forwardedUserIDStr, "%d", &accountID); err == nil && id == 1 {
+						// Successfully parsed account ID
+						ctx := context.WithValue(r.Context(), contextKeyEmail, forwardedUser)
+						ctx = context.WithValue(ctx, contextKeyAccountID, accountID)
+						next.ServeHTTP(w, r.WithContext(ctx))
+						return
+					}
+				}
+				// If we couldn't parse account ID, still trust the email
+				ctx := context.WithValue(r.Context(), contextKeyEmail, forwardedUser)
+				ctx = context.WithValue(ctx, contextKeyAccountID, int64(0)) // Unknown account ID
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+		}
+
+		// Standard JWT authentication for direct clients (not from proxy)
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
