@@ -3,6 +3,8 @@
 package imap_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	imap "github.com/emersion/go-imap/v2"
@@ -348,6 +350,45 @@ func TestIMAP_MetadataErrors(t *testing.T) {
 		_, exists := result.Entries["/private/nonexistent"]
 		assert.False(t, exists, "Non-existent entry should not be in result")
 	})
+
+	t.Run("TooManyEntries", func(t *testing.T) {
+		// Note: This test relies on server having max_entries_per_server configured
+		// The default in config.toml.example is 50, so we'll try to exceed that
+
+		// First, clean up any existing entries
+		existingResult, _ := c.GetMetadata("", []string{"/private"}, &imap.GetMetadataOptions{
+			Depth: imap.GetMetadataDepthInfinity,
+		}).Wait()
+
+		if existingResult != nil {
+			deleteEntries := make(map[string]*[]byte)
+			for key := range existingResult.Entries {
+				deleteEntries[key] = nil
+			}
+			if len(deleteEntries) > 0 {
+				c.SetMetadata("", deleteEntries).Wait()
+			}
+		}
+
+		// Try to set more entries than allowed (assuming limit is 50)
+		entries := make(map[string]*[]byte)
+		for i := 0; i < 60; i++ {
+			value := []byte(fmt.Sprintf("value-%d", i))
+			entries[fmt.Sprintf("/private/test-%d", i)] = &value
+		}
+
+		err := c.SetMetadata("", entries).Wait()
+		assert.Error(t, err, "Should fail when exceeding entry limit")
+
+		// The error should mention "too many" or "limit"
+		if err != nil {
+			errStr := strings.ToLower(err.Error())
+			hasLimitMsg := strings.Contains(errStr, "too many") ||
+				strings.Contains(errStr, "limit") ||
+				strings.Contains(errStr, "toomany")
+			assert.True(t, hasLimitMsg, "Error should indicate limit exceeded: %v", err)
+		}
+	})
 }
 
 // TestIMAP_MetadataMultipleEntries tests operations with multiple entries
@@ -386,6 +427,88 @@ func TestIMAP_MetadataMultipleEntries(t *testing.T) {
 	assert.Equal(t, "important urgent", string(*result.Entries["/private/keywords"]))
 	assert.Equal(t, "admin@example.com", string(*result.Entries["/shared/admin"]))
 	assert.Equal(t, "VendorX", string(*result.Entries["/shared/vendor"]))
+}
+
+// TestIMAP_MetadataJSONValues tests setting metadata with JSON values
+func TestIMAP_MetadataJSONValues(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	require.NoError(t, err)
+	defer c.Logout()
+
+	err = c.Login(account.Email, account.Password).Wait()
+	require.NoError(t, err)
+
+	t.Run("SimpleJSON", func(t *testing.T) {
+		// Test with simple JSON value
+		jsonValue := []byte(`{"challenge":""}`)
+		entryName := "/private/vendor/alps/webauthn_session"
+
+		entries := map[string]*[]byte{
+			entryName: &jsonValue,
+		}
+
+		err := c.SetMetadata("", entries).Wait()
+		require.NoError(t, err, "SetMetadata should succeed with simple JSON value")
+
+		// Verify the metadata was set correctly
+		result, err := c.GetMetadata("", []string{entryName}, nil).Wait()
+		require.NoError(t, err, "GetMetadata should succeed")
+		require.NotNil(t, result)
+
+		value, exists := result.Entries[entryName]
+		require.True(t, exists, "Entry should exist")
+		require.NotNil(t, value, "Value should not be nil")
+		assert.Equal(t, `{"challenge":""}`, string(*value), "Value should match")
+	})
+
+	t.Run("ComplexNestedJSON", func(t *testing.T) {
+		// Test with complex nested JSON (like the failing case)
+		complexJSON := []byte(`{"challenge":"{\"challenge\":\"55XnJr9ImtuqjE11sccap49AwO4aPROZk_OmyGYdkS0\",\"rpId\":\"localhost\",\"user_id\":\"m63y6cNGMgx6kCb01T/S8w7HxbwLcLIjwiCMuZCF/Hw=\",\"allowed_credentials\":[\"8KPfe60lAoSt1iTGJ7jBMvWxrWQ=\"],\"expires\":\"0001-01-01T00:00:00Z\",\"userVerification\":\"\"}"}`)
+		entryName := "/private/vendor/alps/webauthn_session"
+
+		entries := map[string]*[]byte{
+			entryName: &complexJSON,
+		}
+
+		err := c.SetMetadata("", entries).Wait()
+		require.NoError(t, err, "SetMetadata should succeed with complex nested JSON")
+
+		// Verify
+		result, err := c.GetMetadata("", []string{entryName}, nil).Wait()
+		require.NoError(t, err)
+
+		value, exists := result.Entries[entryName]
+		require.True(t, exists)
+		require.NotNil(t, value)
+		assert.Equal(t, string(complexJSON), string(*value))
+	})
+
+	t.Run("JSONWithSpecialCharacters", func(t *testing.T) {
+		// Test with JSON containing various special characters
+		jsonWithSpecial := []byte(`{"data":"value with \"quotes\" and \n newlines and \t tabs"}`)
+		entryName := "/private/vendor/myapp/data"
+
+		entries := map[string]*[]byte{
+			entryName: &jsonWithSpecial,
+		}
+
+		err := c.SetMetadata("", entries).Wait()
+		require.NoError(t, err, "SetMetadata should succeed with special characters")
+
+		// Verify
+		result, err := c.GetMetadata("", []string{entryName}, nil).Wait()
+		require.NoError(t, err)
+
+		value, exists := result.Entries[entryName]
+		require.True(t, exists)
+		require.NotNil(t, value)
+		assert.Equal(t, string(jsonWithSpecial), string(*value))
+	})
 }
 
 func bytePtr(b []byte) *[]byte {

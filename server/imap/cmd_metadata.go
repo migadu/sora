@@ -58,7 +58,11 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	result, err := s.server.rdb.GetMetadataWithRetry(s.ctx, s.UserID(), mailboxID, entries, options)
 	if err != nil {
 		s.Log("[GETMETADATA] failed to get metadata: %v", err)
-		return nil, fmt.Errorf("failed to get metadata: %w", err)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: fmt.Sprintf("failed to get metadata: %v", err),
+		}
 	}
 
 	result.Mailbox = mailboxName
@@ -153,13 +157,34 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 		var metaErr *db.MetadataError
 		if errors.As(err, &metaErr) {
 			s.Log("[SETMETADATA] metadata limit exceeded: %v", metaErr)
-			// Return the error with the proper response code
-			// The go-imap library will handle converting this to the proper IMAP response
-			return fmt.Errorf("[%s] %s", metaErr.ResponseCode(), metaErr.Message)
+
+			// Map MetadataError types to proper IMAP response codes
+			var responseCode imap.ResponseCode
+			switch metaErr.Type {
+			case db.MetadataErrMaxSize:
+				responseCode = imap.ResponseCodeTooBig
+			case db.MetadataErrTooMany, db.MetadataErrQuotaExceeded:
+				responseCode = imap.ResponseCodeTooMany
+			case db.MetadataErrNoPrivate:
+				responseCode = imap.ResponseCodeNoPrivate
+			default:
+				responseCode = imap.ResponseCodeLimit
+			}
+
+			// Return proper IMAP error with response code
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: responseCode,
+				Text: metaErr.Message,
+			}
 		}
 
 		s.Log("[SETMETADATA] failed to set metadata: %v", err)
-		return fmt.Errorf("failed to set metadata: %w", err)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeServerBug,
+			Text: fmt.Sprintf("failed to set metadata: %v", err),
+		}
 	}
 
 	return nil

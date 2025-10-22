@@ -408,11 +408,14 @@ health_status_retention = "30d" # How long to retain health status history in th
 # =============================================================================
 # IMAP METADATA extension (RFC 5464) limits to prevent storage abuse.
 # These limits apply per-account and help protect against excessive metadata usage.
+#
+# NOTE: "server-level" (SETMETADATA "") means account-level metadata (global, not mailbox-specific).
+#       "mailbox-level" (SETMETADATA "INBOX") means per-mailbox metadata.
 
 [metadata]
 max_entry_size = 65536         # Maximum size per metadata entry (64KB). Prevents huge single values.
-max_entries_per_mailbox = 100  # Maximum number of metadata entries per mailbox. Prevents entry spam.
-max_entries_per_server = 50    # Maximum number of server-level metadata entries per account.
+max_entries_per_mailbox = 1000 # Maximum number of metadata entries per mailbox (mailbox-level).
+max_entries_per_server = 1000  # Maximum number of account-level metadata entries (server-level).
 max_total_size = 1048576       # Maximum total metadata size per account (1MB). Overall quota protection.
 
 
