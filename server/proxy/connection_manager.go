@@ -40,8 +40,11 @@ type ConnectionManager struct {
 	remoteUseProxyProtocol bool
 	connectTimeout         time.Duration
 
-	// Round-robin index
+	// Round-robin index (fallback when consistent hash not used)
 	nextIndex atomic.Uint32
+
+	// Consistent hashing for deterministic backend selection
+	consistentHash *ConsistentHash
 
 	// Track healthy servers (legacy simple health tracking)
 	healthyMu     sync.RWMutex
@@ -95,6 +98,14 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		}
 	}
 
+	// Initialize consistent hash ring with all backends
+	consistentHash := NewConsistentHash(150) // 150 virtual nodes per backend
+	for _, addr := range normalizedAddrs {
+		consistentHash.AddBackend(addr)
+	}
+
+	log.Printf("[ConnectionManager] Initialized consistent hash ring with %d backends", len(normalizedAddrs))
+
 	return &ConnectionManager{
 		remoteAddrs:            normalizedAddrs,
 		remotePort:             remotePort,
@@ -103,6 +114,7 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		remoteTLSVerify:        remoteTLSVerify,
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
 		connectTimeout:         connectTimeout,
+		consistentHash:         consistentHash,
 		healthyStatus:          healthyStatus,
 		lastCheck:              lastCheck,
 		backendHealth:          backendHealth,
@@ -118,6 +130,38 @@ func (cm *ConnectionManager) SetAffinityManager(am AffinityManager) {
 // GetAffinityManager returns the affinity manager (may be nil)
 func (cm *ConnectionManager) GetAffinityManager() AffinityManager {
 	return cm.affinityManager
+}
+
+// GetBackendByConsistentHash returns a backend for a username using consistent hashing
+// Automatically excludes unhealthy backends and tries the next one in the ring
+// Returns empty string if all backends are unhealthy
+func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string {
+	if cm.consistentHash == nil {
+		return ""
+	}
+
+	// Try to get a healthy backend from the consistent hash ring
+	exclude := make(map[string]bool)
+
+	// Try up to len(remoteAddrs) times (all backends)
+	for i := 0; i < len(cm.remoteAddrs); i++ {
+		backend := cm.consistentHash.GetBackendWithExclusions(username, exclude)
+		if backend == "" {
+			// No more backends available
+			return ""
+		}
+
+		// Check if this backend is healthy
+		if cm.IsBackendHealthy(backend) {
+			return backend
+		}
+
+		// Backend unhealthy, exclude it and try next
+		exclude[backend] = true
+	}
+
+	// All backends unhealthy
+	return ""
 }
 
 // IsBackendHealthy checks if a backend is healthy based on detailed health tracking
@@ -825,10 +869,10 @@ type RouteResult struct {
 }
 
 // DetermineRoute centralizes the logic for choosing a backend server.
-// The precedence is: Prelookup > Affinity > Round-robin.
+// The precedence is: Prelookup > Affinity > Consistent Hash > Round-robin.
 func DetermineRoute(params RouteParams) (RouteResult, error) {
 	result := RouteResult{
-		RoutingMethod: "roundrobin", // Default
+		RoutingMethod: "consistent_hash", // Default: consistent hashing
 		RoutingInfo:   params.RoutingInfo,
 	}
 
@@ -871,11 +915,29 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		}
 	}
 
+	// 3. If no affinity, try consistent hashing (deterministic, no race condition)
+	if result.PreferredAddr == "" && params.Username != "" {
+		if backend := params.ConnManager.GetBackendByConsistentHash(params.Username); backend != "" {
+			result.PreferredAddr = backend
+			result.RoutingMethod = "consistent_hash"
+			logger.Infof("[%s] Using consistent hash for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+		} else {
+			// All backends unhealthy in consistent hash, fall back to round-robin
+			result.RoutingMethod = "roundrobin"
+			logger.Infof("[%s] All consistent hash backends unhealthy for %s, falling back to round-robin", params.ProxyName, params.Username)
+		}
+	}
+
 	return result, nil
 }
 
 // UpdateAffinityAfterConnection updates affinity after a successful connection
 // This should be called by proxies after establishing a backend connection
+//
+// With consistent hashing, affinity is primarily used to track failover:
+// - If consistent hash placed user on backend A, no affinity is set (deterministic)
+// - If backend A fails and user moves to backend B, affinity tracks the failover
+// - Affinity ensures user stays on backend B even after A recovers (session continuity)
 func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, wasAffinityRoute bool) {
 	// Only update affinity for non-prelookup users
 	if params.IsPrelookupAccount {
@@ -887,17 +949,54 @@ func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, 
 		return
 	}
 
+	// Get the consistent hash placement for this user
+	consistentHashBackend := params.ConnManager.GetBackendByConsistentHash(params.Username)
+
 	// Check current affinity
 	currentBackend, hasAffinity := affinityMgr.GetBackend(params.Username, params.Protocol)
 
 	if !hasAffinity {
-		// No affinity exists, set new affinity
-		affinityMgr.SetBackend(params.Username, connectedBackend, params.Protocol)
-		logger.Infof("[%s] Set new affinity for %s → %s", params.ProxyName, params.Username, connectedBackend)
+		// No affinity exists yet
+		if connectedBackend != consistentHashBackend {
+			// User connected to different backend than consistent hash suggests
+			// This means failover occurred - set affinity to track this
+			affinityMgr.SetBackend(params.Username, connectedBackend, params.Protocol)
+			logger.Infof("[%s] Set failover affinity for %s: %s (consistent hash: %s)",
+				params.ProxyName, params.Username, connectedBackend, consistentHashBackend)
+		} else {
+			// User on consistent hash backend - no affinity needed (deterministic)
+			logger.Debugf("[%s] User %s on consistent hash backend %s, no affinity needed",
+				params.ProxyName, params.Username, connectedBackend)
+		}
 	} else if currentBackend != connectedBackend {
-		// Affinity changed (due to failover)
-		affinityMgr.UpdateBackend(params.Username, currentBackend, connectedBackend, params.Protocol)
-		logger.Infof("[%s] Updated affinity for %s: %s → %s", params.ProxyName, params.Username, currentBackend, connectedBackend)
+		// Affinity exists but we connected to a different backend
+		if wasAffinityRoute {
+			// We tried to use affinity but ended up on different backend (another failover)
+			affinityMgr.UpdateBackend(params.Username, currentBackend, connectedBackend, params.Protocol)
+			logger.Infof("[%s] Updated affinity for %s after failover: %s → %s", params.ProxyName, params.Username, currentBackend, connectedBackend)
+		} else {
+			// We used consistent hash but affinity exists pointing elsewhere
+			// Check if we're back on consistent hash backend - if so, clear affinity
+			if connectedBackend == consistentHashBackend {
+				// User is back on consistent hash backend, clear affinity
+				affinityMgr.DeleteBackend(params.Username, params.Protocol)
+				logger.Infof("[%s] Cleared affinity for %s: reconnected to consistent hash backend %s",
+					params.ProxyName, params.Username, connectedBackend)
+			} else {
+				// Connected to different backend via consistent hash, keep existing affinity
+				// This can happen if consistent hash changed (backend added/removed)
+				logger.Infof("[%s] Affinity exists for %s: %s (connected via consistent hash to %s, keeping affinity)",
+					params.ProxyName, params.Username, currentBackend, connectedBackend)
+			}
+		}
+	} else {
+		// Connected backend matches affinity - check if we can clear affinity
+		if connectedBackend == consistentHashBackend {
+			// User is back on consistent hash backend, clear affinity
+			affinityMgr.DeleteBackend(params.Username, params.Protocol)
+			logger.Infof("[%s] Cleared affinity for %s: back on consistent hash backend %s",
+				params.ProxyName, params.Username, connectedBackend)
+		}
+		// Otherwise keep affinity (still in failover state)
 	}
-	// If affinity matches connected backend, no update needed (affinity is still valid)
 }

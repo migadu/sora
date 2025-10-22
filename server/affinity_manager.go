@@ -149,7 +149,7 @@ func (am *AffinityManager) SetBackend(username, backend, protocol string) {
 		NodeID:     am.clusterManager.GetNodeID(),
 	}
 
-	logger.Debugf("[AFFINITY] Set affinity: %s → %s", username, backend)
+	logger.Infof("[AFFINITY] Set affinity: %s → %s (broadcasting to cluster)", username, backend)
 
 	// Broadcast to cluster
 	am.queueEvent(AffinityEvent{
@@ -276,8 +276,12 @@ func (am *AffinityManager) HandleClusterEvent(data []byte) {
 		return
 	}
 
+	logger.Debugf("[AFFINITY] Received gossip event: type=%s user=%s backend=%s from=%s",
+		event.Type, event.Username, event.Backend, event.NodeID)
+
 	// Skip events from this node (we already applied them locally)
 	if event.NodeID == am.clusterManager.GetNodeID() {
+		logger.Debugf("[AFFINITY] Skipping own event from node %s", event.NodeID)
 		return
 	}
 
@@ -312,9 +316,12 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 	if exists {
 		// Only apply if event is newer than our local state
 		if existing.AssignedAt.After(event.Timestamp) {
-			logger.Debugf("[AFFINITY] Ignoring older SET for %s from %s", event.Username, event.NodeID)
+			logger.Infof("[AFFINITY] Ignoring older SET for %s from %s (existing: %s from %s, event: %s)",
+				event.Username, event.NodeID, existing.Backend, existing.NodeID, event.Backend)
 			return
 		}
+		logger.Infof("[AFFINITY] Overwriting existing affinity for %s: %s → %s (node %s → %s)",
+			event.Username, existing.Backend, event.Backend, existing.NodeID, event.NodeID)
 	}
 
 	// Apply the affinity
@@ -326,7 +333,7 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 		NodeID:     event.NodeID,
 	}
 
-	logger.Debugf("[AFFINITY] Applied cluster affinity: %s → %s (from node %s)",
+	logger.Infof("[AFFINITY] Applied cluster affinity: %s → %s (from node %s)",
 		event.Username, event.Backend, event.NodeID)
 }
 
