@@ -32,18 +32,19 @@ type ConnectionStats struct {
 }
 
 // RegisterConnection registers a new active connection
-func (db *Database) RegisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
+func (db *Database) RegisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr, serverAddr, instanceID, email string) error {
 	query := `
-		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
-		VALUES ($1, false, $2, $3, $4, $5)
+		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id, email)
+		VALUES ($1, false, $2, $3, $4, $5, $6)
 		ON CONFLICT (account_id, is_prelookup_account, protocol, client_addr)
 		DO UPDATE SET server_addr = EXCLUDED.server_addr,
 		              instance_id = EXCLUDED.instance_id,
+		              email = EXCLUDED.email,
 		              last_activity = now()
 		RETURNING id`
 
 	var id int64
-	err := tx.QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID).Scan(&id)
+	err := tx.QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID, email).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("failed to register connection: %w", err)
 	}
@@ -165,19 +166,19 @@ func (db *Database) CleanupConnectionsByInstanceID(ctx context.Context, tx pgx.T
 // GetActiveConnections retrieves all active connections
 func (db *Database) GetActiveConnections(ctx context.Context) ([]ConnectionInfo, error) {
 	query := `
-		SELECT 
-			ac.id,
-			ac.account_id,
-			ac.protocol,
-			ac.client_addr,
-			ac.server_addr,
-			ac.instance_id,
-			ac.connected_at,
-			ac.last_activity,
-			ac.should_terminate,
-			COALESCE(c.address, '') as email
-		FROM active_connections ac
-		LEFT JOIN credentials c ON ac.account_id = c.account_id AND c.primary_identity = true		ORDER BY ac.server_addr, ac.protocol, c.address`
+		SELECT
+			id,
+			account_id,
+			protocol,
+			client_addr,
+			server_addr,
+			instance_id,
+			connected_at,
+			last_activity,
+			should_terminate,
+			email
+		FROM active_connections
+		ORDER BY server_addr, protocol, email`
 
 	rows, err := db.GetReadPool().Query(ctx, query)
 	if err != nil {

@@ -331,6 +331,7 @@ CREATE TABLE active_connections (
     protocol VARCHAR(20) NOT NULL,
     client_addr VARCHAR(255) NOT NULL,
     server_addr VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL DEFAULT '',
     connected_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     last_activity TIMESTAMP WITH TIME ZONE DEFAULT now(),
     should_terminate BOOLEAN DEFAULT false,

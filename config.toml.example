@@ -402,6 +402,7 @@ max_age_restriction = ""      # Max message age before auto-expungement. Empty =
 fts_retention = "730d"        # How long to keep full-text search content in DB. Older messages lose searchability.
 auth_attempts_retention = "7d"  # How long to retain authentication attempt logs in the database.
 health_status_retention = "30d" # How long to retain health status history in the database.
+stale_connections_retention = "30m" # How long before inactive connections are removed. Catches ungraceful disconnects.
 
 
 # METADATA LIMITS CONFIGURATION

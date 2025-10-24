@@ -87,6 +87,24 @@ func CreateTestAccount(t *testing.T, rdb *resilient.ResilientDatabase) TestAccou
 	return TestAccount{Email: email, Password: password}
 }
 
+// CreateTestAccountWithEmail creates a test account with a specific email
+func CreateTestAccountWithEmail(t *testing.T, rdb *resilient.ResilientDatabase, email, password string) TestAccount {
+	t.Helper()
+
+	req := db.CreateAccountRequest{
+		Email:     email,
+		Password:  password,
+		HashType:  "bcrypt",
+		IsPrimary: true,
+	}
+
+	if err := rdb.CreateAccountWithRetry(context.Background(), req); err != nil {
+		t.Fatalf("Failed to create test account: %v", err)
+	}
+
+	return TestAccount{Email: email, Password: password}
+}
+
 // GetTimestamp returns current Unix nano timestamp for unique identifiers
 func GetTimestamp() int64 {
 	return time.Now().UnixNano()

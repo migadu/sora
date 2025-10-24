@@ -91,8 +91,9 @@ func setupMailboxTestDatabase(t *testing.T) (*Database, int64) {
 
 	ctx := context.Background()
 
-	// Use test name and timestamp to create unique email
-	testEmail := fmt.Sprintf("test_%s_%d@example.com", t.Name(), time.Now().UnixNano())
+	// Use test name and timestamp to create unique email with unique domain
+	// This prevents test isolation issues with shared mailboxes that have "anyone" ACL
+	testEmail := fmt.Sprintf("test_%s_%d@test-%d.example.com", t.Name(), time.Now().UnixNano(), time.Now().UnixNano())
 
 	// Create test account
 	tx, err := db.GetWritePool().Begin(ctx)

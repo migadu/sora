@@ -72,11 +72,14 @@ func setupTestEnvironment(t *testing.T) *TestContext {
 	// Get backend address for proxy configuration
 	backendAddr := backendServer.Listener.Addr().String()
 
+	// Get a random port for the proxy
+	proxyAddr := common.GetRandomAddress(t)
+
 	// Create proxy server
 	ctx, cancel := context.WithCancel(context.Background())
 	proxyOptions := userapiproxy.ServerOptions{
 		Name:        "test-proxy",
-		Addr:        "127.0.0.1:0",
+		Addr:        proxyAddr,
 		RemoteAddrs: []string{backendAddr},
 		RemotePort:  8081,
 		JWTSecret:   testJWTSecret,
@@ -89,9 +92,6 @@ func setupTestEnvironment(t *testing.T) *TestContext {
 	}
 
 	// Start proxy in goroutine
-	proxyAddr := common.GetRandomAddress(t)
-	proxy.(*userapiproxy.Server).addr = proxyAddr
-
 	go func() {
 		if err := proxy.Start(); err != nil && ctx.Err() == nil {
 			t.Logf("Proxy server error: %v", err)
@@ -103,7 +103,7 @@ func setupTestEnvironment(t *testing.T) *TestContext {
 
 	tc := &TestContext{
 		BackendServer: backendServer,
-		ProxyServer:   proxy.(*userapiproxy.Server),
+		ProxyServer:   proxy,
 		ProxyAddr:     proxyAddr,
 		RDB:           rdb,
 		HTTPClient:    &http.Client{Timeout: 10 * time.Second},
@@ -260,7 +260,7 @@ func TestProxyUserRouting(t *testing.T) {
 
 	// Create test accounts
 	account1 := common.CreateTestAccount(t, rdb)
-	account2 := common.CreateTestAccountWithEmail(t, rdb, "user2@example.com", "password123")
+	account2 := common.CreateTestAccount(t, rdb)
 
 	// Create backend servers
 	backend1 := createBackendServer(t, rdb, "backend1")
@@ -272,9 +272,10 @@ func TestProxyUserRouting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	proxyAddr := common.GetRandomAddress(t)
 	proxyOptions := userapiproxy.ServerOptions{
 		Name:        "test-proxy-routing",
-		Addr:        "127.0.0.1:0",
+		Addr:        proxyAddr,
 		RemoteAddrs: []string{backend1.Listener.Addr().String(), backend2.Listener.Addr().String()},
 		JWTSecret:   testJWTSecret,
 	}
@@ -283,9 +284,6 @@ func TestProxyUserRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
-
-	proxyAddr := common.GetRandomAddress(t)
-	proxy.(*userapiproxy.Server).addr = proxyAddr
 
 	go proxy.Start()
 	time.Sleep(100 * time.Millisecond)
@@ -391,9 +389,10 @@ func TestProxyConnectionLimits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	proxyAddr := common.GetRandomAddress(t)
 	proxyOptions := userapiproxy.ServerOptions{
 		Name:           "test-proxy-limits",
-		Addr:           "127.0.0.1:0",
+		Addr:           proxyAddr,
 		RemoteAddrs:    []string{backend.Listener.Addr().String()},
 		JWTSecret:      testJWTSecret,
 		MaxConnections: 2, // Very low limit for testing
@@ -403,9 +402,6 @@ func TestProxyConnectionLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
-
-	proxyAddr := common.GetRandomAddress(t)
-	proxy.(*userapiproxy.Server).addr = proxyAddr
 
 	go proxy.Start()
 	time.Sleep(100 * time.Millisecond)

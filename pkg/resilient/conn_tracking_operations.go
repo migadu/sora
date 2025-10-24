@@ -11,7 +11,7 @@ import (
 
 // --- Connection Tracker Wrappers ---
 
-func (rd *ResilientDatabase) RegisterConnectionWithRetry(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, instanceID string) error {
+func (rd *ResilientDatabase) RegisterConnectionWithRetry(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, instanceID, email string) error {
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -20,7 +20,7 @@ func (rd *ResilientDatabase) RegisterConnectionWithRetry(ctx context.Context, ac
 		MaxRetries:      3,
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).RegisterConnection(ctx, tx, accountID, protocol, clientAddr, serverAddr, instanceID)
+		return nil, rd.getOperationalDatabaseForOperation(true).RegisterConnection(ctx, tx, accountID, protocol, clientAddr, serverAddr, instanceID, email)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
 	if err != nil {

@@ -50,6 +50,10 @@ func (m *mockDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, re
 	args := m.Called(ctx, retention)
 	return args.Get(0).(int64), args.Error(1)
 }
+func (m *mockDatabase) CleanupStaleConnectionsWithRetry(ctx context.Context, staleDuration time.Duration) (int64, error) {
+	args := m.Called(ctx, staleDuration)
+	return args.Get(0).(int64), args.Error(1)
+}
 func (m *mockDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error) {
 	args := m.Called(ctx, gracePeriod, limit)
 	return args.Get(0).([]db.UserScopedObjectForCleanup), args.Error(1)

@@ -40,6 +40,7 @@ type DatabaseManager interface {
 	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldAuthAttemptsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	CleanupStaleConnectionsWithRetry(ctx context.Context, staleDuration time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
@@ -60,34 +61,36 @@ type CacheManager interface {
 }
 
 type CleanupWorker struct {
-	rdb                   DatabaseManager
-	s3                    S3Manager
-	cache                 CacheManager
-	interval              time.Duration
-	gracePeriod           time.Duration
-	maxAgeRestriction     time.Duration
-	ftsRetention          time.Duration
-	authAttemptsRetention time.Duration
-	healthStatusRetention time.Duration
-	stopCh                chan struct{}
+	rdb                       DatabaseManager
+	s3                        S3Manager
+	cache                     CacheManager
+	interval                  time.Duration
+	gracePeriod               time.Duration
+	maxAgeRestriction         time.Duration
+	ftsRetention              time.Duration
+	authAttemptsRetention     time.Duration
+	healthStatusRetention     time.Duration
+	staleConnectionsRetention time.Duration
+	stopCh                    chan struct{}
 }
 
 // New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention time.Duration) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, staleConnectionsRetention time.Duration) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
 	return &CleanupWorker{
-		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
-		s3:                    resilientS3, // *resilient.ResilientS3Storage implements S3Manager
-		cache:                 cache,       // *cache.Cache implements CacheManager
-		interval:              interval,
-		gracePeriod:           gracePeriod,
-		maxAgeRestriction:     maxAgeRestriction,
-		ftsRetention:          ftsRetention,
-		authAttemptsRetention: authAttemptsRetention,
-		healthStatusRetention: healthStatusRetention,
-		stopCh:                make(chan struct{}),
+		rdb:                       rdb,         // *resilient.ResilientDatabase implements DatabaseManager
+		s3:                        resilientS3, // *resilient.ResilientS3Storage implements S3Manager
+		cache:                     cache,       // *cache.Cache implements CacheManager
+		interval:                  interval,
+		gracePeriod:               gracePeriod,
+		maxAgeRestriction:         maxAgeRestriction,
+		ftsRetention:              ftsRetention,
+		authAttemptsRetention:     authAttemptsRetention,
+		healthStatusRetention:     healthStatusRetention,
+		staleConnectionsRetention: staleConnectionsRetention,
+		stopCh:                    make(chan struct{}),
 	}
 }
 
@@ -101,6 +104,7 @@ func (w *CleanupWorker) Start(ctx context.Context) {
 	logParts = append(logParts, fmt.Sprintf("FTS retention: %v", w.ftsRetention))
 	logParts = append(logParts, fmt.Sprintf("auth attempts retention: %v", w.authAttemptsRetention))
 	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
+	logParts = append(logParts, fmt.Sprintf("stale connections retention: %v", w.staleConnectionsRetention))
 
 	log.Printf("[CLEANUP] worker starting with %s", strings.Join(logParts, ", "))
 	interval := w.interval
@@ -210,6 +214,18 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			log.Printf("[CLEANUP] failed to clean up old health statuses: %v", err)
 		} else if healthCount > 0 {
 			log.Printf("[CLEANUP] deleted %d old health statuses older than %v", healthCount, w.healthStatusRetention)
+		}
+	}
+
+	// --- Cleanup of stale connections ---
+	// Remove connections that haven't had activity for the configured retention period
+	// This catches ungraceful disconnects (network issues, client crashes, etc.)
+	if w.staleConnectionsRetention > 0 {
+		staleConnCount, err := w.rdb.CleanupStaleConnectionsWithRetry(ctx, w.staleConnectionsRetention)
+		if err != nil {
+			log.Printf("[CLEANUP] failed to clean up stale connections: %v", err)
+		} else if staleConnCount > 0 {
+			log.Printf("[CLEANUP] deleted %d stale connections (no activity for %v)", staleConnCount, w.staleConnectionsRetention)
 		}
 	}
 

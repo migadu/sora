@@ -437,8 +437,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
 		authAttemptsRetention := cfg.Cleanup.GetAuthAttemptsRetentionWithDefault()
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
+		staleConnectionsRetention := cfg.Cleanup.GetStaleConnectionsRetentionWithDefault()
 
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, staleConnectionsRetention)
 		deps.cleanupWorker.Start(ctx)
 
 		// Initialize and start the upload worker

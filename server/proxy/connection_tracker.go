@@ -17,6 +17,7 @@ type ConnectionInfo struct {
 	Protocol        string
 	ClientAddr      string
 	ServerAddr      string
+	Email           string
 	InstanceID      string
 	ConnectedAt     time.Time
 	LastActivity    time.Time
@@ -108,7 +109,7 @@ func (ct *ConnectionTracker) Stop() {
 }
 
 // RegisterConnection registers a new connection
-func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr string) error {
+func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, email string) error {
 	if !ct.enabled {
 		return nil
 	}
@@ -121,6 +122,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		Protocol:     protocol,
 		ClientAddr:   clientAddr,
 		ServerAddr:   serverAddr,
+		Email:        email,
 		InstanceID:   ct.instanceID,
 		ConnectedAt:  time.Now(),
 		LastActivity: time.Now(),
@@ -130,7 +132,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 
 	// If not batching, write immediately
 	if ct.persistToDB && !ct.batchUpdates {
-		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID)
+		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID, email)
 	}
 
 	return nil

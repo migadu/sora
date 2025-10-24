@@ -287,12 +287,13 @@ type TLSConfig struct {
 
 // CleanupConfig holds cleaner worker configuration.
 type CleanupConfig struct {
-	GracePeriod           string `toml:"grace_period"`
-	WakeInterval          string `toml:"wake_interval"`
-	MaxAgeRestriction     string `toml:"max_age_restriction"`
-	FTSRetention          string `toml:"fts_retention"`
-	AuthAttemptsRetention string `toml:"auth_attempts_retention"`
-	HealthStatusRetention string `toml:"health_status_retention"`
+	GracePeriod               string `toml:"grace_period"`
+	WakeInterval              string `toml:"wake_interval"`
+	MaxAgeRestriction         string `toml:"max_age_restriction"`
+	FTSRetention              string `toml:"fts_retention"`
+	AuthAttemptsRetention     string `toml:"auth_attempts_retention"`
+	HealthStatusRetention     string `toml:"health_status_retention"`
+	StaleConnectionsRetention string `toml:"stale_connections_retention"`
 }
 
 // GetGracePeriod parses the grace period duration
@@ -341,6 +342,14 @@ func (c *CleanupConfig) GetHealthStatusRetention() (time.Duration, error) {
 		return 30 * 24 * time.Hour, nil // 30 days default
 	}
 	return helpers.ParseDuration(c.HealthStatusRetention)
+}
+
+// GetStaleConnectionsRetention parses the stale connections retention duration
+func (c *CleanupConfig) GetStaleConnectionsRetention() (time.Duration, error) {
+	if c.StaleConnectionsRetention == "" {
+		return 30 * time.Minute, nil // 30 minutes default
+	}
+	return helpers.ParseDuration(c.StaleConnectionsRetention)
 }
 
 // LocalCacheConfig holds local disk cache configuration.
@@ -1956,6 +1965,15 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	if err != nil {
 		log.Printf("WARNING: Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
+	}
+	return retention
+}
+
+func (c *CleanupConfig) GetStaleConnectionsRetentionWithDefault() time.Duration {
+	retention, err := c.GetStaleConnectionsRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup stale_connections_retention: %v, using default (30 minutes)", err)
+		return 30 * time.Minute
 	}
 	return retention
 }
