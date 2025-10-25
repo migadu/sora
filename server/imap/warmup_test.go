@@ -9,7 +9,7 @@ import (
 // This test validates the interval checking logic without actually running warmup
 func TestWarmupInterval(t *testing.T) {
 	server := &IMAPServer{
-		name:           "test-imap",
+		// name:           "test-imap",
 		warmupInterval: 100 * time.Millisecond,
 	}
 
@@ -46,8 +46,8 @@ func TestWarmupInterval(t *testing.T) {
 // TestWarmupIntervalPerUser tests that warmup intervals are tracked independently per user
 func TestWarmupIntervalPerUser(t *testing.T) {
 	server := &IMAPServer{
-		name:           "test-imap",
-		warmupInterval: 1 * time.Hour,
+		// name:           "test-imap",
+		// warmupInterval: 1 * time.Hour,
 	}
 
 	user1 := int64(123)

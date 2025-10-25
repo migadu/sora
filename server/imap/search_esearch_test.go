@@ -319,7 +319,7 @@ func TestESEARCHBadResponsePreventsLoop(t *testing.T) {
 	}
 
 	// Step 1: Detect ESEARCH
-	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
+	isESEARCH := options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave
 	if !isESEARCH {
 		t.Fatal("Expected ESEARCH to be detected")
 	}

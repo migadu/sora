@@ -9,6 +9,10 @@ import (
 	"github.com/migadu/sora/db"
 )
 
+type contextKey string
+
+const configContextKey contextKey = "config"
+
 // Create a new mailbox
 func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	// First phase: validation and mailbox lookup using read lock
@@ -23,7 +27,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	// Add config to context for shared mailbox detection
 	ctx := s.ctx
 	if s.server.config != nil {
-		ctx = context.WithValue(ctx, "config", s.server.config)
+		ctx = context.WithValue(ctx, configContextKey, s.server.config)
 	}
 
 	// Prevent creating the shared namespace root explicitly
