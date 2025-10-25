@@ -1313,21 +1313,41 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 
+	// Collect valid backends from all proxy server configs
+	validBackends := make(map[string][]string)
+
+	// Collect IMAP proxy backends
+	if deps.config.Servers.IMAPProxy.Start && len(deps.config.Servers.IMAPProxy.RemoteAddrs) > 0 {
+		validBackends["imap"] = append(validBackends["imap"], deps.config.Servers.IMAPProxy.RemoteAddrs...)
+	}
+
+	// Collect POP3 proxy backends
+	if deps.config.Servers.POP3Proxy.Start && len(deps.config.Servers.POP3Proxy.RemoteAddrs) > 0 {
+		validBackends["pop3"] = append(validBackends["pop3"], deps.config.Servers.POP3Proxy.RemoteAddrs...)
+	}
+
+	// Collect ManageSieve proxy backends
+	if deps.config.Servers.ManageSieveProxy.Start && len(deps.config.Servers.ManageSieveProxy.RemoteAddrs) > 0 {
+		validBackends["managesieve"] = append(validBackends["managesieve"], deps.config.Servers.ManageSieveProxy.RemoteAddrs...)
+	}
+
 	options := adminapi.ServerOptions{
-		Name:          serverConfig.Name,
-		Addr:          serverConfig.Addr,
-		APIKey:        serverConfig.APIKey,
-		AllowedHosts:  serverConfig.AllowedHosts,
-		Cache:         deps.cacheInstance,
-		Uploader:      deps.uploadWorker,
-		Storage:       deps.storage,
-		ExternalRelay: serverConfig.ExternalRelay,
-		TLS:           serverConfig.TLS,
-		TLSCertFile:   serverConfig.TLSCertFile,
-		TLSKeyFile:    serverConfig.TLSKeyFile,
-		TLSVerify:     serverConfig.TLSVerify,
-		Hostname:      deps.hostname,
-		FTSRetention:  ftsRetention,
+		Name:            serverConfig.Name,
+		Addr:            serverConfig.Addr,
+		APIKey:          serverConfig.APIKey,
+		AllowedHosts:    serverConfig.AllowedHosts,
+		Cache:           deps.cacheInstance,
+		Uploader:        deps.uploadWorker,
+		Storage:         deps.storage,
+		ExternalRelay:   serverConfig.ExternalRelay,
+		TLS:             serverConfig.TLS,
+		TLSCertFile:     serverConfig.TLSCertFile,
+		TLSKeyFile:      serverConfig.TLSKeyFile,
+		TLSVerify:       serverConfig.TLSVerify,
+		Hostname:        deps.hostname,
+		FTSRetention:    ftsRetention,
+		AffinityManager: deps.affinityManager,
+		ValidBackends:   validBackends,
 	}
 
 	adminapi.Start(ctx, deps.resilientDB, options, errChan)

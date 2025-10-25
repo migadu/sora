@@ -1528,6 +1528,216 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /affinity:
+    get:
+      tags:
+        - Affinity Management
+      summary: Get backend affinity for a user
+      description: Retrieves the backend server affinity for a specific user and protocol. Returns 404 if no affinity is set.
+      parameters:
+        - name: user
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+          description: "User email address"
+          example: "user@example.com"
+        - name: protocol
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [imap, pop3, managesieve]
+          description: "Protocol (imap, pop3, or managesieve)"
+          example: "imap"
+      responses:
+        '200':
+          description: Backend affinity found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  protocol:
+                    type: string
+                    example: "imap"
+                  backend:
+                    type: string
+                    example: "192.168.1.10:993"
+        '400':
+          description: Missing or invalid parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No affinity set for this user/protocol.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      tags:
+        - Affinity Management
+      summary: Set backend affinity for a user
+      description: |
+        Sets the backend server affinity for a specific user and protocol. The affinity will be gossiped to all nodes in the cluster.
+
+        The backend address must be configured in the proxy's remote_addrs for the specified protocol.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user:
+                  type: string
+                  format: email
+                  description: "User email address"
+                  example: "user@example.com"
+                protocol:
+                  type: string
+                  enum: [imap, pop3, managesieve]
+                  description: "Protocol (imap, pop3, or managesieve)"
+                  example: "imap"
+                backend:
+                  type: string
+                  description: "Backend server address (must be in configured remote_addrs)"
+                  example: "192.168.1.10:993"
+              required:
+                - user
+                - protocol
+                - backend
+            examples:
+              imap_affinity:
+                summary: Set IMAP affinity
+                value:
+                  user: "user@example.com"
+                  protocol: "imap"
+                  backend: "192.168.1.10:993"
+              pop3_affinity:
+                summary: Set POP3 affinity
+                value:
+                  user: "user@example.com"
+                  protocol: "pop3"
+                  backend: "192.168.1.11:995"
+      responses:
+        '200':
+          description: Affinity set successfully and gossiped to cluster.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Affinity set for user@example.com (imap) -> 192.168.1.10:993 and gossiped to cluster"
+                  user:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  protocol:
+                    type: string
+                    example: "imap"
+                  backend:
+                    type: string
+                    example: "192.168.1.10:993"
+        '400':
+          description: Invalid request or backend not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing_field:
+                  summary: Missing required field
+                  value:
+                    error: "user, protocol, and backend are required"
+                invalid_protocol:
+                  summary: Invalid protocol
+                  value:
+                    error: "protocol must be imap, pop3, or managesieve"
+                invalid_backend:
+                  summary: Backend not configured
+                  value:
+                    error: "Backend 192.168.1.99:993 is not configured for protocol imap. Valid backends: [192.168.1.10:993, 192.168.1.11:993]"
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Affinity Management
+      summary: Delete backend affinity for a user
+      description: Removes the backend server affinity for a specific user and protocol. The change will be gossiped to all nodes in the cluster.
+      parameters:
+        - name: user
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+          description: "User email address"
+          example: "user@example.com"
+        - name: protocol
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [imap, pop3, managesieve]
+          description: "Protocol (imap, pop3, or managesieve)"
+          example: "imap"
+      responses:
+        '200':
+          description: Affinity deleted successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Affinity deleted for user@example.com (imap) and gossiped to cluster"
+                  user:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  protocol:
+                    type: string
+                    example: "imap"
+        '400':
+          description: Missing or invalid parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /cache/stats:
     get:
       tags:

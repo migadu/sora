@@ -25,40 +25,51 @@ import (
 
 // Server represents the HTTP API server
 type Server struct {
-	name          string
-	addr          string
-	apiKey        string
-	allowedHosts  []string
-	rdb           *resilient.ResilientDatabase
-	cache         *cache.Cache
-	uploader      *uploader.UploadWorker
-	storage       *storage.S3Storage
-	externalRelay string
-	server        *http.Server
-	tls           bool
-	tlsCertFile   string
-	tlsKeyFile    string
-	tlsVerify     bool
-	hostname      string
-	ftsRetention  time.Duration
+	name            string
+	addr            string
+	apiKey          string
+	allowedHosts    []string
+	rdb             *resilient.ResilientDatabase
+	cache           *cache.Cache
+	uploader        *uploader.UploadWorker
+	storage         *storage.S3Storage
+	externalRelay   string
+	server          *http.Server
+	tls             bool
+	tlsCertFile     string
+	tlsKeyFile      string
+	tlsVerify       bool
+	hostname        string
+	ftsRetention    time.Duration
+	affinityManager AffinityManager
+	validBackends   map[string][]string
 }
 
 // ServerOptions holds configuration options for the HTTP API server
 type ServerOptions struct {
-	Name          string
-	Addr          string
-	APIKey        string
-	AllowedHosts  []string
-	Cache         *cache.Cache
-	Uploader      *uploader.UploadWorker
-	Storage       *storage.S3Storage
-	ExternalRelay string
-	TLS           bool
-	TLSCertFile   string
-	TLSKeyFile    string
-	TLSVerify     bool
-	Hostname      string
-	FTSRetention  time.Duration
+	Name            string
+	Addr            string
+	APIKey          string
+	AllowedHosts    []string
+	Cache           *cache.Cache
+	Uploader        *uploader.UploadWorker
+	Storage         *storage.S3Storage
+	ExternalRelay   string
+	TLS             bool
+	TLSCertFile     string
+	TLSKeyFile      string
+	TLSVerify       bool
+	Hostname        string
+	FTSRetention    time.Duration
+	AffinityManager AffinityManager
+	ValidBackends   map[string][]string // Map of protocol -> valid backend addresses
+}
+
+// AffinityManager interface for managing user-to-backend affinity
+type AffinityManager interface {
+	GetBackend(username, protocol string) (string, bool)
+	SetBackend(username, backend, protocol string)
+	DeleteBackend(username, protocol string)
 }
 
 // New creates a new HTTP API server
@@ -75,21 +86,23 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	}
 
 	s := &Server{
-		name:          options.Name,
-		addr:          options.Addr,
-		apiKey:        options.APIKey,
-		allowedHosts:  options.AllowedHosts,
-		rdb:           rdb,
-		cache:         options.Cache,
-		uploader:      options.Uploader,
-		storage:       options.Storage,
-		externalRelay: options.ExternalRelay,
-		tls:           options.TLS,
-		tlsCertFile:   options.TLSCertFile,
-		tlsKeyFile:    options.TLSKeyFile,
-		tlsVerify:     options.TLSVerify,
-		hostname:      options.Hostname,
-		ftsRetention:  options.FTSRetention,
+		name:            options.Name,
+		addr:            options.Addr,
+		apiKey:          options.APIKey,
+		allowedHosts:    options.AllowedHosts,
+		rdb:             rdb,
+		cache:           options.Cache,
+		uploader:        options.Uploader,
+		storage:         options.Storage,
+		externalRelay:   options.ExternalRelay,
+		tls:             options.TLS,
+		tlsCertFile:     options.TLSCertFile,
+		tlsKeyFile:      options.TLSKeyFile,
+		tlsVerify:       options.TLSVerify,
+		hostname:        options.Hostname,
+		ftsRetention:    options.FTSRetention,
+		affinityManager: options.AffinityManager,
+		validBackends:   options.ValidBackends,
 	}
 
 	return s, nil
@@ -199,6 +212,14 @@ func (s *Server) setupRoutes() http.Handler {
 	mux.HandleFunc("/admin/mailboxes/acl/grant", routeHandler("POST", s.handleACLGrant))
 	mux.HandleFunc("/admin/mailboxes/acl/revoke", routeHandler("POST", s.handleACLRevoke))
 	mux.HandleFunc("/admin/mailboxes/acl", routeHandler("GET", s.handleACLList))
+
+	// Affinity management routes
+	mux.HandleFunc("/admin/affinity", multiMethodHandler(map[string]http.HandlerFunc{
+		"GET":    s.handleAffinityGet,
+		"POST":   s.handleAffinitySet,
+		"DELETE": s.handleAffinityDelete,
+	}))
+	mux.HandleFunc("/admin/affinity/list", routeHandler("GET", s.handleAffinityList))
 
 	// Wrap with middleware (in reverse order - last applied is outermost)
 	handler := s.loggingMiddleware(mux)

@@ -384,9 +384,6 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		// Is this a request for all headers of the main message? (e.g., BODY[HEADER])
 		isAllHeadersRequest := section.Specifier == imap.PartSpecifierHeader && len(section.HeaderFields) == 0 && len(section.HeaderFieldsNot) == 0 && len(section.Part) == 0
 
-		// Is this a request for the main body text? (e.g., BODY[TEXT])
-		isMainBodyTextRequest := section.Specifier == imap.PartSpecifierText && (len(section.Part) == 0)
-
 		if isHeaderFieldsRequest {
 			headersText, dbErr := s.server.rdb.GetMessageHeadersWithRetry(s.ctx, msg.UID, selectedMailboxID)
 			if dbErr == nil && headersText != "" {
@@ -438,35 +435,11 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 					s.Log("[FETCH] UID %d: Headers from DB for BODY[HEADER] are empty. Falling back.", msg.UID)
 				}
 			}
-		} else if isMainBodyTextRequest {
-			// Attempt to serve BODY[TEXT] from the pre-extracted text_body in the database.
-			textBody, dbErr := s.server.rdb.GetMessageTextBodyWithRetry(s.ctx, msg.UID, selectedMailboxID)
-
-			if dbErr == nil { // DB fetch successful, textBody might be empty or populated.
-				isSuspectDueToEncoding := false
-				if textBody != "" { // Only suspect if non-empty and potentially encoded.
-					if bodyStructureHasEncodedText(msg.BodyStructure) {
-						s.Log("[FETCH] UID %d: BODY[TEXT] from DB is non-empty, and original message structure contains encoded text parts. Suspect, will fall back to ensure decoding.", msg.UID)
-						isSuspectDueToEncoding = true
-					}
-				}
-
-				if !isSuspectDueToEncoding {
-					sectionContent = []byte(textBody)
-					if section.Partial != nil {
-						sectionContent = extractPartial(sectionContent, section.Partial)
-					}
-					satisfiedFromDB = true
-					s.Log("[FETCH] UID %d: Served BODY[TEXT] from message_contents.text_body.", msg.UID)
-				} else {
-					// isSuspectDueToEncoding is true. Fallback will be triggered by satisfiedFromDB = false.
-					s.Log("[FETCH] UID %d: text_body from DB for BODY[TEXT] is suspect due to original encoding. Falling back.", msg.UID)
-				}
-			} else { // dbErr != nil
-				s.Log("[FETCH] UID %d: Failed to get text_body from DB for BODY[TEXT] ('%v'). Falling back.", msg.UID, dbErr)
-				// satisfiedFromDB remains false. Fallback will occur.
-			}
 		}
+		// Note: We do NOT serve BODY[TEXT] from the database's text_body field.
+		// The text_body field contains decoded plaintext for search/indexing purposes only.
+		// BODY[TEXT] must return the raw encoded body as it appears in the original message,
+		// which requires fetching and parsing the full message body.
 
 		// Fallback or other section types
 		// If not satisfied from DB, or if there was an error extracting from DB-sourced content (extractionErr != nil),
@@ -642,31 +615,4 @@ func extractRequestedHeaders(parsedDBHeader textproto.Header, section *imap.Fetc
 	}
 
 	return buf.Bytes(), nil
-}
-
-// bodyStructureHasEncodedText checks if any text part (text/plain, text/html, etc.)
-// within the given body structure uses base64 or quoted-printable encoding.
-// This is used to determine if a pre-extracted text_body from the database
-// might be undecoded raw content.
-func bodyStructureHasEncodedText(bs imap.BodyStructure) bool {
-	if bs == nil {
-		return false
-	}
-	switch b := bs.(type) {
-	case *imap.BodyStructureSinglePart:
-		// Check if it's a text part and uses an encoding that needs decoding for BODY[TEXT].
-		// b.MediaType() returns "type/subtype" in lowercase.
-		if strings.HasPrefix(b.MediaType(), "text/") &&
-			(strings.EqualFold(b.Encoding, "base64") || strings.EqualFold(b.Encoding, "quoted-printable")) {
-			return true
-		}
-	case *imap.BodyStructureMultiPart:
-		// Recursively check parts of a multipart message.
-		for _, childPart := range b.Children {
-			if bodyStructureHasEncodedText(childPart) { // Recurse
-				return true
-			}
-		}
-	}
-	return false
 }

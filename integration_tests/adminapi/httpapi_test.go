@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2090,5 +2091,342 @@ func TestACLManagement(t *testing.T) {
 		}
 
 		t.Log("Revoke operation completed (idempotent behavior)")
+	})
+}
+
+// Mock AffinityManager for testing
+type mockAffinityManager struct {
+	mu       sync.RWMutex
+	affinity map[string]string // key: "username:protocol" -> backend
+}
+
+func newMockAffinityManager() *mockAffinityManager {
+	return &mockAffinityManager{
+		affinity: make(map[string]string),
+	}
+}
+
+func (m *mockAffinityManager) GetBackend(username, protocol string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	key := username + ":" + protocol
+	backend, ok := m.affinity[key]
+	return backend, ok
+}
+
+func (m *mockAffinityManager) SetBackend(username, backend, protocol string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := username + ":" + protocol
+	m.affinity[key] = backend
+}
+
+func (m *mockAffinityManager) DeleteBackend(username, protocol string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := username + ":" + protocol
+	delete(m.affinity, key)
+}
+
+// TestAffinityManagement tests the affinity management endpoints
+func TestAffinityManagement(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Set up database
+	rdb := common.SetupTestDatabase(t)
+
+	// Set up cache
+	cacheDir := t.TempDir()
+	sourceDB := &testSourceDB{rdb: rdb}
+	testCache, err := cache.New(cacheDir, 100*1024*1024, 10*1024*1024, 5*time.Minute, 1*time.Hour, sourceDB)
+	if err != nil {
+		t.Fatalf("Failed to create test cache: %v", err)
+	}
+	defer testCache.Close()
+
+	// Create mock affinity manager
+	mockAffinity := newMockAffinityManager()
+
+	// Get random port
+	addr := common.GetRandomAddress(t)
+
+	// Create server options with affinity manager and valid backends
+	options := adminapi.ServerOptions{
+		Addr:            addr,
+		APIKey:          testAPIKey,
+		AllowedHosts:    []string{},
+		Cache:           testCache,
+		TLS:             false,
+		AffinityManager: mockAffinity,
+		ValidBackends: map[string][]string{
+			"imap":        {"192.168.1.10:993", "192.168.1.11:993"},
+			"pop3":        {"192.168.1.20:995", "192.168.1.21:995"},
+			"managesieve": {"192.168.1.30:4190"},
+		},
+	}
+
+	// Start server in background
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errChan := make(chan error, 1)
+	go adminapi.Start(ctx, rdb, options, errChan)
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Check if server started successfully
+	select {
+	case err := <-errChan:
+		t.Fatalf("Failed to start HTTP API server: %v", err)
+	default:
+		// Server started successfully
+	}
+
+	baseURL := fmt.Sprintf("http://%s", addr)
+
+	makeRequest := func(t *testing.T, method, endpoint string, body interface{}) (*http.Response, []byte) {
+		t.Helper()
+
+		var reqBody []byte
+		if body != nil {
+			var err error
+			reqBody, err = json.Marshal(body)
+			if err != nil {
+				t.Fatalf("Failed to marshal request body: %v", err)
+			}
+		}
+
+		url := baseURL + endpoint
+		req, err := http.NewRequest(method, url, bytes.NewBuffer(reqBody))
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testAPIKey)
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Failed to make request: %v", err)
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to read response body: %v", err)
+		}
+		resp.Body.Close()
+
+		return resp, respBody
+	}
+
+	t.Run("SetAffinity_Success", func(t *testing.T) {
+		setReq := map[string]interface{}{
+			"user":     "user@example.com",
+			"protocol": "imap",
+			"backend":  "192.168.1.10:993",
+		}
+
+		resp, body := makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+
+		if result["success"] != true {
+			t.Errorf("Expected success=true, got %v", result["success"])
+		}
+
+		// Verify affinity was set in mock
+		backend, ok := mockAffinity.GetBackend("user@example.com", "imap")
+		if !ok {
+			t.Fatal("Affinity was not set in manager")
+		}
+		if backend != "192.168.1.10:993" {
+			t.Errorf("Expected backend 192.168.1.10:993, got %s", backend)
+		}
+
+		t.Logf("Successfully set affinity: %v", result["message"])
+	})
+
+	t.Run("GetAffinity_Success", func(t *testing.T) {
+		// First set an affinity
+		mockAffinity.SetBackend("user2@example.com", "192.168.1.11:993", "imap")
+
+		resp, body := makeRequest(t, "GET", "/admin/affinity?user=user2@example.com&protocol=imap", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+
+		if result["backend"] != "192.168.1.11:993" {
+			t.Errorf("Expected backend 192.168.1.11:993, got %v", result["backend"])
+		}
+
+		t.Logf("Successfully retrieved affinity: backend=%s", result["backend"])
+	})
+
+	t.Run("GetAffinity_NotFound", func(t *testing.T) {
+		resp, body := makeRequest(t, "GET", "/admin/affinity?user=noaffinity@example.com&protocol=imap", nil)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		t.Log("Correctly returned 404 for non-existent affinity")
+	})
+
+	t.Run("SetAffinity_InvalidBackend", func(t *testing.T) {
+		setReq := map[string]interface{}{
+			"user":     "user@example.com",
+			"protocol": "imap",
+			"backend":  "192.168.1.99:993", // Not in ValidBackends
+		}
+
+		resp, body := makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var errorResp map[string]interface{}
+		if err := json.Unmarshal(body, &errorResp); err != nil {
+			t.Fatalf("Failed to unmarshal error response: %v", err)
+		}
+
+		if !strings.Contains(errorResp["error"].(string), "not configured") {
+			t.Errorf("Expected error about backend not configured, got: %v", errorResp["error"])
+		}
+
+		t.Logf("Correctly rejected invalid backend: %v", errorResp["error"])
+	})
+
+	t.Run("SetAffinity_InvalidProtocol", func(t *testing.T) {
+		setReq := map[string]interface{}{
+			"user":     "user@example.com",
+			"protocol": "smtp", // Invalid protocol
+			"backend":  "192.168.1.10:25",
+		}
+
+		resp, body := makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var errorResp map[string]interface{}
+		if err := json.Unmarshal(body, &errorResp); err != nil {
+			t.Fatalf("Failed to unmarshal error response: %v", err)
+		}
+
+		if !strings.Contains(errorResp["error"].(string), "protocol must be") {
+			t.Errorf("Expected error about invalid protocol, got: %v", errorResp["error"])
+		}
+
+		t.Log("Correctly rejected invalid protocol")
+	})
+
+	t.Run("SetAffinity_MissingFields", func(t *testing.T) {
+		setReq := map[string]interface{}{
+			"user":     "user@example.com",
+			"protocol": "imap",
+			// Missing backend
+		}
+
+		resp, body := makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		t.Log("Correctly rejected request with missing fields")
+	})
+
+	t.Run("DeleteAffinity_Success", func(t *testing.T) {
+		// First set an affinity
+		mockAffinity.SetBackend("user3@example.com", "192.168.1.20:995", "pop3")
+
+		// Verify it exists
+		_, ok := mockAffinity.GetBackend("user3@example.com", "pop3")
+		if !ok {
+			t.Fatal("Failed to set test affinity")
+		}
+
+		// Delete it
+		resp, body := makeRequest(t, "DELETE", "/admin/affinity?user=user3@example.com&protocol=pop3", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatalf("Failed to unmarshal response: %v", err)
+		}
+
+		if result["success"] != true {
+			t.Errorf("Expected success=true, got %v", result["success"])
+		}
+
+		// Verify it was deleted
+		_, ok = mockAffinity.GetBackend("user3@example.com", "pop3")
+		if ok {
+			t.Error("Affinity was not deleted from manager")
+		}
+
+		t.Logf("Successfully deleted affinity: %v", result["message"])
+	})
+
+	t.Run("DeleteAffinity_NotFound", func(t *testing.T) {
+		// Try to delete non-existent affinity (should succeed idempotently)
+		resp, body := makeRequest(t, "DELETE", "/admin/affinity?user=nonexistent@example.com&protocol=imap", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200 (idempotent delete), got %d - %s", resp.StatusCode, string(body))
+		}
+
+		t.Log("Delete operation is idempotent for non-existent affinity")
+	})
+
+	t.Run("MultipleProtocols", func(t *testing.T) {
+		user := "multiproto@example.com"
+
+		// Set affinity for IMAP
+		setReq := map[string]interface{}{
+			"user":     user,
+			"protocol": "imap",
+			"backend":  "192.168.1.10:993",
+		}
+		resp, body := makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to set IMAP affinity: %s", string(body))
+		}
+
+		// Set affinity for POP3 (different backend)
+		setReq = map[string]interface{}{
+			"user":     user,
+			"protocol": "pop3",
+			"backend":  "192.168.1.20:995",
+		}
+		resp, body = makeRequest(t, "POST", "/admin/affinity", setReq)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Failed to set POP3 affinity: %s", string(body))
+		}
+
+		// Verify both exist independently
+		imapBackend, ok := mockAffinity.GetBackend(user, "imap")
+		if !ok || imapBackend != "192.168.1.10:993" {
+			t.Errorf("IMAP affinity incorrect: got %s, exists=%v", imapBackend, ok)
+		}
+
+		pop3Backend, ok := mockAffinity.GetBackend(user, "pop3")
+		if !ok || pop3Backend != "192.168.1.20:995" {
+			t.Errorf("POP3 affinity incorrect: got %s, exists=%v", pop3Backend, ok)
+		}
+
+		t.Log("Successfully managed affinity for multiple protocols")
 	})
 }
