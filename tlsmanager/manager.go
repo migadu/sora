@@ -194,32 +194,51 @@ func (m *Manager) initLetsEncryptProvider() error {
 		},
 	}
 
+	// Determine default domain for SNI-less connections
+	defaultDomain := leCfg.DefaultDomain
+	if defaultDomain == "" && len(leCfg.Domains) > 0 {
+		// If not specified, use the first configured domain
+		defaultDomain = leCfg.Domains[0]
+	}
+
 	// Create TLS config with autocert and logging wrapper
 	baseTLSConfig := m.autocertMgr.TLSConfig()
 	m.tlsConfig = &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			// Reject requests with no server name (missing SNI)
-			if hello.ServerName == "" {
-				logger.Debugf("[TLS] Rejected certificate request: missing server name (SNI)")
-				return nil, ErrMissingServerName
+			serverName := hello.ServerName
+
+			// Handle missing SNI by using default domain
+			if serverName == "" {
+				if defaultDomain != "" {
+					logger.Debugf("[TLS] Missing SNI - using default domain: %s", defaultDomain)
+					serverName = defaultDomain
+				} else {
+					logger.Debugf("[TLS] Rejected certificate request: missing server name (SNI) and no default domain configured")
+					return nil, ErrMissingServerName
+				}
 			}
 
 			// Check if the server name matches our configured domains using the HostPolicy
-			if err := m.autocertMgr.HostPolicy(nil, hello.ServerName); err != nil {
-				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s (error: %v)", hello.ServerName, err)
-				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, hello.ServerName)
+			if err := m.autocertMgr.HostPolicy(nil, serverName); err != nil {
+				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s (error: %v)", serverName, err)
+				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
 
-			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI)", hello.ServerName)
-			cert, err := baseTLSConfig.GetCertificate(hello)
+			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI: %v)", serverName, hello.ServerName != "")
+
+			// Create a modified ClientHelloInfo with the resolved server name
+			modifiedHello := *hello
+			modifiedHello.ServerName = serverName
+
+			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
 			if err != nil {
 				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
 				// This allows the server to continue serving cached certificates for other domains
-				logger.Errorf("[TLS] Failed to get certificate for %s: %v", hello.ServerName, err)
-				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, hello.ServerName, err)
+				logger.Errorf("[TLS] Failed to get certificate for %s: %v", serverName, err)
+				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 			}
-			logger.Debugf("[TLS] Certificate provided for: %s", hello.ServerName)
+			logger.Debugf("[TLS] Certificate provided for: %s", serverName)
 			return cert, nil
 		},
 		MinVersion: tls.VersionTLS12,
@@ -227,6 +246,9 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 
 	logger.Infof("Let's Encrypt autocert initialized for domains: %v", leCfg.Domains)
+	if defaultDomain != "" {
+		logger.Infof("Default domain for SNI-less connections: %s", defaultDomain)
+	}
 	logger.Infof("Certificates will be stored in S3 bucket: %s", leCfg.S3.Bucket)
 
 	return nil

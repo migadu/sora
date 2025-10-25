@@ -156,6 +156,8 @@ key_file = "/path/to/key.pem"                   # Full path to PEM-encoded priva
 [tls.letsencrypt]
 email = "admin@example.com"                     # REQUIRED: Email for Let's Encrypt account (used for expiration notices and account recovery)
 domains = ["mail.example.com"]                  # REQUIRED: List of domains for certificate (supports multiple: ["mail.example.com", "imap.example.com", "smtp.example.com"])
+default_domain = ""                             # OPTIONAL: Default domain to use when client doesn't provide SNI (Server Name Indication). If not specified, uses first domain from list.
+                                                # Use this to handle legacy clients that don't support SNI.
 storage_provider = "s3"                         # Certificate storage backend (currently only "s3" is supported)
 
 # OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)

@@ -269,6 +269,7 @@ type TLSLetsEncryptS3Config struct {
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
 	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	DefaultDomain   string                 `toml:"default_domain"`   // Default domain to use when client doesn't provide SNI (optional, defaults to first domain in list)
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
 	RenewBefore     string                 `toml:"renew_before"`     // Renew certificates this duration before expiry (e.g., "720h" = 30 days). Default: 30 days
