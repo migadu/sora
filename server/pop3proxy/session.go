@@ -401,9 +401,18 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthUserNotFound:
-				// User not in prelookup DB. Fallthrough to main DB auth.
-				if s.server.debug {
-					log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Falling back to main DB.", s.server.name, username)
+				// User not found in prelookup. Check if fallback is enabled.
+				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
+					// Fallback enabled - try main DB auth
+					if s.server.debug {
+						log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Fallback enabled - attempting main DB authentication.", s.server.name, username)
+					}
+				} else {
+					// Fallback disabled - reject immediately
+					log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+					return fmt.Errorf("authentication failed: user not found")
 				}
 			}
 		}

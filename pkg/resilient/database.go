@@ -169,6 +169,23 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
+	// Configure IsSuccessful to treat business logic errors as successes
+	// Only system errors (connection failures, timeouts, etc.) should count as failures
+	querySettings.IsSuccessful = func(err error) bool {
+		if err == nil {
+			return true // Success
+		}
+		// Business logic errors that should NOT trip the circuit breaker
+		if errors.Is(err, consts.ErrUserNotFound) ||
+			errors.Is(err, consts.ErrMailboxNotFound) ||
+			errors.Is(err, consts.ErrMessageNotAvailable) ||
+			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
+			errors.Is(err, consts.ErrNotPermitted) ||
+			errors.Is(err, pgx.ErrNoRows) {
+			return true // Treat as success - these are expected application errors
+		}
+		return false // Actual system failure
+	}
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
 	writeSettings.MaxRequests = 3
@@ -180,6 +197,24 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	}
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
+	}
+	// Configure IsSuccessful to treat business logic errors as successes
+	// Only system errors (connection failures, timeouts, etc.) should count as failures
+	writeSettings.IsSuccessful = func(err error) bool {
+		if err == nil {
+			return true // Success
+		}
+		// Business logic errors that should NOT trip the circuit breaker
+		if errors.Is(err, consts.ErrUserNotFound) ||
+			errors.Is(err, consts.ErrMailboxNotFound) ||
+			errors.Is(err, consts.ErrMessageNotAvailable) ||
+			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
+			errors.Is(err, consts.ErrNotPermitted) ||
+			errors.Is(err, consts.ErrDBUniqueViolation) ||
+			errors.Is(err, pgx.ErrNoRows) {
+			return true // Treat as success - these are expected application errors
+		}
+		return false // Actual system failure
 	}
 
 	// Create failover manager
