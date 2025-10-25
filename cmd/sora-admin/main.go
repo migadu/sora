@@ -3308,7 +3308,7 @@ func handleConnectionStats(ctx context.Context) {
 	// Database connection flags (overrides from config file)
 
 	fs.Usage = func() {
-		fmt.Printf(`Show active proxy connections and statistics
+		fmt.Printf(`Show active connections and statistics (both proxy and direct backend connections)
 
 Usage:
   sora-admin connection-stats [options]
@@ -3322,10 +3322,11 @@ Options:
   --config string        Path to TOML configuration file (required)
 
 This command shows:
-  - Total number of active connections
+  - Total number of active connections (both proxy and direct backend)
   - Connections grouped by protocol (IMAP, POP3, ManageSieve)
   - Connections grouped by server
   - Detailed list of all connections with user, protocol, client address, etc.
+  - Each connection is marked as (proxy) or (direct)
   - Option to filter by specific user or server
   - Option to cleanup stale connections
 
@@ -3430,15 +3431,15 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 	}
 
 	if stats.TotalConnections == 0 && userEmail == "" && serverFilter == "" {
-		fmt.Println("No active proxy connections found.")
-		fmt.Println("\nNote: This command only shows connections made to Sora proxy servers (e.g., imap_proxy).")
-		fmt.Println("Ensure your clients are connecting to the proxy ports defined in your configuration.")
+		fmt.Println("No active connections found.")
+		fmt.Println("\nNote: This command shows all active connections (both proxy and direct backend connections).")
+		fmt.Println("Ensure your servers are running and clients are connected.")
 		return nil
 	}
 
 	// Display statistics
-	fmt.Printf("Active Proxy Connections\n")
-	fmt.Printf("========================\n\n")
+	fmt.Printf("Active Connections\n")
+	fmt.Printf("==================\n\n")
 
 	if userEmail != "" {
 		fmt.Printf("User: %s\n\n", userEmail)
@@ -3472,12 +3473,14 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 	// Show detailed connection list
 	if showDetail && len(stats.Users) > 0 {
 		fmt.Printf("Active Connections:\n")
-		fmt.Printf("%-30s %-20s %-21s %-21s %-19s %-19s\n", "Email", "Protocol", "Client Address", "Server Address", "Connected At", "Last Activity")
-		fmt.Printf("%s\n", strings.Repeat("-", 143))
+		fmt.Printf("%-30s %-20s %-21s %-21s %-12s %-12s\n", "Email", "Protocol", "Client Address", "Server Address", "Duration", "Idle")
+		fmt.Printf("%s\n", strings.Repeat("-", 120))
 
+		now := time.Now()
 		for _, conn := range stats.Users {
-			connectedTime := conn.ConnectedAt.Format("2006-01-02 15:04:05")
-			lastActivityTime := conn.LastActivity.Format("2006-01-02 15:04:05")
+			// Calculate durations
+			duration := now.Sub(conn.ConnectedAt)
+			idle := now.Sub(conn.LastActivity)
 
 			// Format protocol with proxy indicator
 			protocol := conn.Protocol
@@ -3487,28 +3490,15 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 				protocol = protocol + " (direct)"
 			}
 
-			fmt.Printf("%-30s %-20s %-21s %-21s %-19s %-19s\n",
+			fmt.Printf("%-30s %-20s %-21s %-21s %-12s %-12s\n",
 				conn.Email,
 				protocol,
 				conn.ClientAddr,
 				conn.ServerAddr,
-				connectedTime,
-				lastActivityTime)
-		}
-		fmt.Printf("\n")
-
-		// Show connection duration info
-		now := time.Now()
-		fmt.Printf("Connection Durations:\n")
-		for _, conn := range stats.Users {
-			duration := now.Sub(conn.ConnectedAt)
-			idle := now.Sub(conn.LastActivity)
-			fmt.Printf("  %s (%s): Connected for %s, idle for %s\n",
-				conn.Email,
-				conn.Protocol,
 				formatDuration(duration),
 				formatDuration(idle))
 		}
+		fmt.Printf("\n")
 	}
 
 	return nil
