@@ -348,8 +348,9 @@ func (s *POP3Session) handleConnection() {
 
 			s.inboxMailboxID = inboxMailboxID.ID
 			s.authenticated = true
-			s.deleted = make(map[int]bool) // Initialize deletion map on authentication
-			s.useMasterDB = true           // Pin session to master DB after a write to ensure consistency
+			s.User = server.NewUser(*userAddress, userID) // Initialize User for connection tracking
+			s.deleted = make(map[int]bool)                // Initialize deletion map on authentication
+			s.useMasterDB = true                          // Pin session to master DB after a write to ensure consistency
 			release()
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
@@ -365,6 +366,12 @@ func (s *POP3Session) handleConnection() {
 				metrics.TrackDomainConnection("pop3", s.Domain())
 				metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
 			}
+
+			// Register connection for tracking
+			s.registerConnection(userAddress.FullAddress())
+
+			// Start termination poller to check for kick commands
+			s.startTerminationPoller()
 
 			writer.WriteString("+OK Password accepted\r\n")
 			success = true
@@ -1418,6 +1425,16 @@ func (s *POP3Session) handleConnection() {
 
 			s.inboxMailboxID = inboxMailboxID.ID
 			s.authenticated = true
+			// Initialize User for connection tracking - will use correct email below
+			// For impersonation: authzID, otherwise: authnID
+			var userEmail string
+			if impersonating {
+				userEmail = authzID
+			} else {
+				userEmail = authnID
+			}
+			userAddr, _ := server.NewAddress(userEmail)
+			s.User = server.NewUser(userAddr, userID)
 			s.deleted = make(map[int]bool) // Initialize deletion map on authentication
 			s.useMasterDB = true           // Pin session to master DB after a write to ensure consistency
 			release()
@@ -1426,9 +1443,16 @@ func (s *POP3Session) handleConnection() {
 			totalCount := s.server.totalConnections.Load()
 			if impersonating {
 				s.Log("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)", authzID, totalCount, authCount)
+				// Register connection for tracking with the impersonated user's email
+				s.registerConnection(authzID)
 			} else {
 				s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)", totalCount, authCount)
+				// Register connection for tracking with the authenticated user's email
+				s.registerConnection(authnID)
 			}
+
+			// Start termination poller to check for kick commands
+			s.startTerminationPoller()
 
 			writer.WriteString("+OK Authentication successful\r\n")
 			success = true
@@ -1696,6 +1720,9 @@ func (s *POP3Session) closeWithoutLock() error {
 		if s.authenticated {
 			authCount = s.server.authenticatedConnections.Add(-1)
 			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3").Dec()
+
+			// Unregister connection from tracker
+			s.unregisterConnection()
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
@@ -1805,4 +1832,82 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		}
 	}
 	return data, nil
+}
+
+// registerConnection registers the connection in the connection tracker
+func (s *POP3Session) registerConnection(email string) {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
+		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer cancel()
+
+		clientAddr := (*s.conn).RemoteAddr().String()
+		serverAddr := s.server.addr
+
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "POP3", clientAddr, serverAddr, email, false); err != nil {
+			s.Log("Failed to register connection: %v", err)
+		}
+	}
+}
+
+// unregisterConnection removes the connection from the connection tracker
+func (s *POP3Session) unregisterConnection() {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		clientAddr := (*s.conn).RemoteAddr().String()
+
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.UserID(), "POP3", clientAddr); err != nil {
+			s.Log("Failed to unregister connection: %v", err)
+		}
+	}
+}
+
+// startTerminationPoller starts a goroutine that periodically checks if the connection should be terminated
+func (s *POP3Session) startTerminationPoller() {
+	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || !s.authenticated {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		kickChan := s.server.connTracker.KickChannel()
+		clientAddr := (*s.conn).RemoteAddr().String()
+
+		checkAndTerminate := func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "POP3", clientAddr)
+			if err != nil {
+				s.Log("Failed to check termination: %v", err)
+				return false
+			}
+			if shouldTerminate {
+				s.Log("Connection kicked - disconnecting user")
+				(*s.conn).Close()
+				return true
+			}
+			return false
+		}
+
+		for {
+			select {
+			case <-kickChan:
+				s.Log("Received kick notification")
+				if checkAndTerminate() {
+					return
+				}
+			case <-ticker.C:
+				// Periodic check in case kick notification was missed
+				if checkAndTerminate() {
+					return
+				}
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
 }

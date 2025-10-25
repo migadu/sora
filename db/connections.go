@@ -21,6 +21,7 @@ type ConnectionInfo struct {
 	LastActivity    time.Time
 	ShouldTerminate bool
 	Email           string // Primary email for display
+	IsProxy         bool   // Whether this is a proxy connection
 }
 
 // ConnectionStats represents aggregated connection statistics
@@ -32,19 +33,20 @@ type ConnectionStats struct {
 }
 
 // RegisterConnection registers a new active connection
-func (db *Database) RegisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr, serverAddr, instanceID, email string) error {
+func (db *Database) RegisterConnection(ctx context.Context, tx pgx.Tx, accountID int64, protocol, clientAddr, serverAddr, instanceID, email string, isProxy bool) error {
 	query := `
-		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id, email)
-		VALUES ($1, false, $2, $3, $4, $5, $6)
+		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id, email, is_proxy)
+		VALUES ($1, false, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (account_id, is_prelookup_account, protocol, client_addr)
 		DO UPDATE SET server_addr = EXCLUDED.server_addr,
 		              instance_id = EXCLUDED.instance_id,
 		              email = EXCLUDED.email,
+		              is_proxy = EXCLUDED.is_proxy,
 		              last_activity = now()
 		RETURNING id`
 
 	var id int64
-	err := tx.QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID, email).Scan(&id)
+	err := tx.QueryRow(ctx, query, accountID, protocol, clientAddr, serverAddr, instanceID, email, isProxy).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("failed to register connection: %w", err)
 	}
@@ -92,15 +94,17 @@ func (db *Database) BatchRegisterConnections(ctx context.Context, tx pgx.Tx, con
 	}
 
 	query := `
-		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id)
-		VALUES ($1, false, $2, $3, $4, $5)
+		INSERT INTO active_connections (account_id, is_prelookup_account, protocol, client_addr, server_addr, instance_id, email, is_proxy)
+		VALUES ($1, false, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (account_id, is_prelookup_account, protocol, client_addr)
 		DO UPDATE SET server_addr = EXCLUDED.server_addr,
 		              instance_id = EXCLUDED.instance_id,
+		              email = EXCLUDED.email,
+		              is_proxy = EXCLUDED.is_proxy,
 		              last_activity = now()`
 
 	for _, conn := range connections {
-		_, err := tx.Exec(ctx, query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID)
+		_, err := tx.Exec(ctx, query, conn.AccountID, conn.Protocol, conn.ClientAddr, conn.ServerAddr, conn.InstanceID, conn.Email, conn.IsProxy)
 		if err != nil {
 			// Log the error for the specific failed insert/update but continue.
 			// A single failure shouldn't stop the whole batch.
@@ -176,7 +180,8 @@ func (db *Database) GetActiveConnections(ctx context.Context) ([]ConnectionInfo,
 			connected_at,
 			last_activity,
 			should_terminate,
-			email
+			email,
+			is_proxy
 		FROM active_connections
 		ORDER BY server_addr, protocol, email`
 
@@ -190,7 +195,7 @@ func (db *Database) GetActiveConnections(ctx context.Context) ([]ConnectionInfo,
 	for rows.Next() {
 		var conn ConnectionInfo
 		err := rows.Scan(&conn.ID, &conn.AccountID, &conn.Protocol, &conn.ClientAddr,
-			&conn.ServerAddr, &conn.InstanceID, &conn.ConnectedAt, &conn.LastActivity, &conn.ShouldTerminate, &conn.Email)
+			&conn.ServerAddr, &conn.InstanceID, &conn.ConnectedAt, &conn.LastActivity, &conn.ShouldTerminate, &conn.Email, &conn.IsProxy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan connection: %w", err)
 		}

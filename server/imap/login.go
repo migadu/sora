@@ -85,6 +85,12 @@ func (s *IMAPSession) Login(address, password string) error {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
 			}
 
+			// Register connection for tracking
+			s.registerConnection(address.FullAddress())
+
+			// Start termination poller to check for kick commands
+			s.startTerminationPoller()
+
 			return nil
 		}
 
@@ -150,6 +156,12 @@ func (s *IMAPSession) Login(address, password string) error {
 	if s.server.authLimiter != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressSt.FullAddress(), true)
 	}
+
+	// Register connection for tracking
+	s.registerConnection(addressSt.FullAddress())
+
+	// Start termination poller to check for kick commands
+	s.startTerminationPoller()
 
 	// Trigger cache warmup for the authenticated user
 	s.triggerCacheWarmup()

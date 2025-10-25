@@ -1065,14 +1065,22 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 
 	// Show what will be kicked
 	fmt.Printf("Connections to be kicked:\n")
-	fmt.Printf("%-30s %-12s %-21s %-21s\n", "Email", "Protocol", "Client Address", "Server Address")
-	fmt.Printf("%s\n", strings.Repeat("-", 84))
+	fmt.Printf("%-30s %-20s %-21s %-21s\n", "Email", "Protocol", "Client Address", "Server Address")
+	fmt.Printf("%s\n", strings.Repeat("-", 92))
 
 	for _, conn := range stats.Users {
 		if matches(conn, criteria, all) {
-			fmt.Printf("%-30s %-12s %-21s %-21s\n",
+			// Format protocol with proxy indicator
+			protocol := conn.Protocol
+			if conn.IsProxy {
+				protocol = protocol + " (proxy)"
+			} else {
+				protocol = protocol + " (direct)"
+			}
+
+			fmt.Printf("%-30s %-20s %-21s %-21s\n",
 				conn.Email,
-				conn.Protocol,
+				protocol,
 				conn.ClientAddr,
 				conn.ServerAddr)
 		}
@@ -3464,16 +3472,24 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 	// Show detailed connection list
 	if showDetail && len(stats.Users) > 0 {
 		fmt.Printf("Active Connections:\n")
-		fmt.Printf("%-30s %-12s %-21s %-21s %-19s %-19s\n", "Email", "Protocol", "Client Address", "Server Address", "Connected At", "Last Activity")
-		fmt.Printf("%s\n", strings.Repeat("-", 135))
+		fmt.Printf("%-30s %-20s %-21s %-21s %-19s %-19s\n", "Email", "Protocol", "Client Address", "Server Address", "Connected At", "Last Activity")
+		fmt.Printf("%s\n", strings.Repeat("-", 143))
 
 		for _, conn := range stats.Users {
 			connectedTime := conn.ConnectedAt.Format("2006-01-02 15:04:05")
 			lastActivityTime := conn.LastActivity.Format("2006-01-02 15:04:05")
 
-			fmt.Printf("%-30s %-12s %-21s %-21s %-19s %-19s\n",
+			// Format protocol with proxy indicator
+			protocol := conn.Protocol
+			if conn.IsProxy {
+				protocol = protocol + " (proxy)"
+			} else {
+				protocol = protocol + " (direct)"
+			}
+
+			fmt.Printf("%-30s %-20s %-21s %-21s %-19s %-19s\n",
 				conn.Email,
-				conn.Protocol,
+				protocol,
 				conn.ClientAddr,
 				conn.ServerAddr,
 				connectedTime,

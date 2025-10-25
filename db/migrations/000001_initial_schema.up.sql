@@ -332,6 +332,7 @@ CREATE TABLE active_connections (
     client_addr VARCHAR(255) NOT NULL,
     server_addr VARCHAR(255) NOT NULL,
     email VARCHAR(255) NOT NULL DEFAULT '',
+    is_proxy BOOLEAN NOT NULL DEFAULT FALSE,
     connected_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     last_activity TIMESTAMP WITH TIME ZONE DEFAULT now(),
     should_terminate BOOLEAN DEFAULT false,

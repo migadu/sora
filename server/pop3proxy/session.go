@@ -659,7 +659,7 @@ func (s *POP3ProxySession) registerConnection() error {
 	defer cancel()
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr, s.username)
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr, s.username, true)
 	}
 	return nil
 }

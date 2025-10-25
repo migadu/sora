@@ -227,6 +227,10 @@ func (s *IMAPSession) Close() error {
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
 		s.Log("closing session for user: %v (connections: total=%d, authenticated=%d)",
 			s.IMAPUser.FullAddress(), totalCount, authCount)
+
+		// Unregister connection from tracker
+		s.unregisterConnection()
+
 		s.IMAPUser = nil
 		s.Session.User = nil
 	} else {
@@ -368,4 +372,82 @@ func (s *IMAPSession) triggerCacheWarmup() {
 		// The WarmupCache method already logs its own errors, so just log a generic failure here.
 		s.Log("cache warmup trigger failed: %v", err)
 	}
+}
+
+// registerConnection registers the connection in the connection tracker
+func (s *IMAPSession) registerConnection(email string) {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
+		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer cancel()
+
+		clientAddr := s.conn.NetConn().RemoteAddr().String()
+		serverAddr := s.server.addr
+
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "IMAP", clientAddr, serverAddr, email, false); err != nil {
+			s.Log("Failed to register connection: %v", err)
+		}
+	}
+}
+
+// unregisterConnection removes the connection from the connection tracker
+func (s *IMAPSession) unregisterConnection() {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		clientAddr := s.conn.NetConn().RemoteAddr().String()
+
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.UserID(), "IMAP", clientAddr); err != nil {
+			s.Log("Failed to unregister connection: %v", err)
+		}
+	}
+}
+
+// startTerminationPoller starts a goroutine that periodically checks if the connection should be terminated
+func (s *IMAPSession) startTerminationPoller() {
+	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || s.IMAPUser == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		kickChan := s.server.connTracker.KickChannel()
+		clientAddr := s.conn.NetConn().RemoteAddr().String()
+
+		checkAndTerminate := func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "IMAP", clientAddr)
+			if err != nil {
+				s.Log("Failed to check termination: %v", err)
+				return false
+			}
+			if shouldTerminate {
+				s.Log("Connection kicked - disconnecting user")
+				s.conn.NetConn().Close()
+				return true
+			}
+			return false
+		}
+
+		for {
+			select {
+			case <-kickChan:
+				s.Log("Received kick notification")
+				if checkAndTerminate() {
+					return
+				}
+			case <-ticker.C:
+				// Periodic check in case kick notification was missed
+				if checkAndTerminate() {
+					return
+				}
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
 }

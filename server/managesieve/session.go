@@ -253,6 +253,12 @@ func (s *ManageSieveSession) handleConnection() {
 				metrics.TrackUserActivity("managesieve", s.FullAddress(), "connection", 1)
 			}
 
+			// Register connection for tracking
+			s.registerConnection(address.FullAddress())
+
+			// Start termination poller to check for kick commands
+			s.startTerminationPoller()
+
 			s.sendResponse("OK Authenticated\r\n")
 			success = true
 
@@ -901,6 +907,9 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		if s.authenticated {
 			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve").Dec()
 			authCount = s.server.authenticatedConnections.Add(-1)
+
+			// Unregister connection from tracker
+			s.unregisterConnection()
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
@@ -1178,6 +1187,12 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve").Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 
+	// Register connection for tracking
+	s.registerConnection(targetAddress.FullAddress())
+
+	// Start termination poller to check for kick commands
+	s.startTerminationPoller()
+
 	// Track domain and user connection activity
 	if s.User != nil {
 		metrics.TrackDomainConnection("managesieve", s.Domain())
@@ -1187,4 +1202,82 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	s.sendResponse("OK Authenticated\r\n")
 	success = true
 	return true
+}
+
+// registerConnection registers the connection in the connection tracker
+func (s *ManageSieveSession) registerConnection(email string) {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
+		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		defer cancel()
+
+		clientAddr := (*s.conn).RemoteAddr().String()
+		serverAddr := s.server.addr
+
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "ManageSieve", clientAddr, serverAddr, email, false); err != nil {
+			s.Log("Failed to register connection: %v", err)
+		}
+	}
+}
+
+// unregisterConnection removes the connection from the connection tracker
+func (s *ManageSieveSession) unregisterConnection() {
+	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		clientAddr := (*s.conn).RemoteAddr().String()
+
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.UserID(), "ManageSieve", clientAddr); err != nil {
+			s.Log("Failed to unregister connection: %v", err)
+		}
+	}
+}
+
+// startTerminationPoller starts a goroutine that periodically checks if the connection should be terminated
+func (s *ManageSieveSession) startTerminationPoller() {
+	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || s.User == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		kickChan := s.server.connTracker.KickChannel()
+		clientAddr := (*s.conn).RemoteAddr().String()
+
+		checkAndTerminate := func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "ManageSieve", clientAddr)
+			if err != nil {
+				s.Log("Failed to check termination: %v", err)
+				return false
+			}
+			if shouldTerminate {
+				s.Log("Connection kicked - disconnecting user")
+				(*s.conn).Close()
+				return true
+			}
+			return false
+		}
+
+		for {
+			select {
+			case <-kickChan:
+				s.Log("Received kick notification")
+				if checkAndTerminate() {
+					return
+				}
+			case <-ticker.C:
+				// Periodic check in case kick notification was missed
+				if checkAndTerminate() {
+					return
+				}
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
 }

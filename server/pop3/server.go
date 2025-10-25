@@ -15,6 +15,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -56,6 +57,9 @@ type POP3Server struct {
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+
+	// Connection tracking
+	connTracker *proxy.ConnectionTracker
 }
 
 type POP3ServerOptions struct {
@@ -181,6 +185,12 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	if server.commandTimeout > 0 {
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("pop3").Set(server.commandTimeout.Seconds())
 	}
+
+	// Initialize connection tracker for monitoring active connections
+	// Use 5 minute update interval and 10 second termination poll interval
+	// Disable batch updates (batchUpdates=false) for immediate database writes
+	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, true, false, true)
+	server.connTracker.Start()
 
 	return server, nil
 }

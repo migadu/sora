@@ -15,6 +15,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
+	"github.com/migadu/sora/server/proxy"
 )
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
@@ -51,6 +52,9 @@ type ManageSieveServer struct {
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+
+	// Connection tracking
+	connTracker *proxy.ConnectionTracker
 }
 
 type ManageSieveServerOptions struct {
@@ -179,6 +183,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	if serverInstance.commandTimeout > 0 {
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
 	}
+
+	// Initialize connection tracker for monitoring active connections
+	// Use 5 minute update interval and 10 second termination poll interval
+	// Disable batch updates (batchUpdates=false) for immediate database writes
+	serverInstance.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, true, false, true)
+	serverInstance.connTracker.Start()
 
 	return serverInstance, nil
 }

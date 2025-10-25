@@ -22,6 +22,7 @@ type ConnectionInfo struct {
 	ConnectedAt     time.Time
 	LastActivity    time.Time
 	ShouldTerminate bool
+	IsProxy         bool // Whether this is a proxy connection
 	// Fields for tracking changes
 	isNew      bool
 	isModified bool
@@ -109,7 +110,7 @@ func (ct *ConnectionTracker) Stop() {
 }
 
 // RegisterConnection registers a new connection
-func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, email string) error {
+func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, email string, isProxy bool) error {
 	if !ct.enabled {
 		return nil
 	}
@@ -126,13 +127,14 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		InstanceID:   ct.instanceID,
 		ConnectedAt:  time.Now(),
 		LastActivity: time.Now(),
+		IsProxy:      isProxy,
 		isNew:        true,
 	}
 	ct.mu.Unlock()
 
 	// If not batching, write immediately
 	if ct.persistToDB && !ct.batchUpdates {
-		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID, email)
+		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID, email, isProxy)
 	}
 
 	return nil
@@ -387,6 +389,8 @@ func (ct *ConnectionTracker) flushChanges() {
 				ClientAddr: conn.ClientAddr,
 				ServerAddr: conn.ServerAddr,
 				InstanceID: conn.InstanceID,
+				Email:      conn.Email,
+				IsProxy:    conn.IsProxy,
 			})
 			conn.isNew = false
 		} else if conn.isModified {

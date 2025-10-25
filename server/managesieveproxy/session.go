@@ -848,7 +848,7 @@ func (s *Session) registerConnection() error {
 	clientAddr := s.clientConn.RemoteAddr().String()
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "ManageSieve", clientAddr, s.serverAddr, s.username)
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "ManageSieve", clientAddr, s.serverAddr, s.username, true)
 	}
 	return nil
 }

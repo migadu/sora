@@ -101,6 +101,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -269,6 +270,9 @@ type IMAPServer struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+
+	// Connection tracking
+	connTracker *proxy.ConnectionTracker
 
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
@@ -608,6 +612,12 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if s.commandTimeout > 0 {
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
 	}
+
+	// Initialize connection tracker for monitoring active connections
+	// Use 5 minute update interval and 10 second termination poll interval
+	// Disable batch updates (batchUpdates=false) for immediate database writes
+	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, true, false, true)
+	s.connTracker.Start()
 
 	return s, nil
 }
