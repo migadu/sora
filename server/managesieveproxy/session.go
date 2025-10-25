@@ -483,18 +483,10 @@ func (s *Session) authenticateUser(username, password string) error {
 			return fmt.Errorf("authentication failed")
 
 		case proxy.AuthUserNotFound:
-			// User not found in prelookup. Check if fallback is enabled.
-			if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-				// Fallback enabled - try main DB auth
-				if s.server.debug {
-					log.Printf("ManageSieve Proxy [%s] [DEBUG] User '%s' not found in prelookup. Fallback enabled - attempting main DB authentication.", s.server.name, username)
-				}
-			} else {
-				// Fallback disabled - reject immediately
-				log.Printf("ManageSieve Proxy [%s] User '%s' not found in prelookup. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-				return fmt.Errorf("authentication failed: user not found")
+			// User not found in prelookup (404). This means the user is NOT in the other system.
+			// Always fall through to main DB auth - this is the expected behavior for partitioning.
+			if s.server.debug {
+				log.Printf("ManageSieve Proxy [%s] [DEBUG] User '%s' not found in prelookup. Attempting main DB authentication.", s.server.name, username)
 			}
 		}
 	}
