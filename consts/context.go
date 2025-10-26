@@ -9,4 +9,9 @@ const (
 	// executed on the primary (write) database connection pool, bypassing
 	// the read replica pool. This is crucial for read-your-writes consistency.
 	UseMasterDBKey = ContextKey("use_master")
+
+	// ConfigContextKey is the context key for passing the server configuration
+	// to database operations. This is used to access shared mailbox settings
+	// and other configuration when creating or managing mailboxes.
+	ConfigContextKey = ContextKey("config")
 )

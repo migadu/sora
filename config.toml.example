@@ -10,6 +10,12 @@
 # - All sections and options are documented with their default values
 # - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
 # - Size values accept common suffixes: "1gb", "100mb", "5kb"
+#
+# CONFIG VALIDATION:
+# - Unknown keys will log warnings but are ignored (helps detect typos)
+# - Duplicate keys will log warnings and use first occurrence
+# - Syntax errors (e.g., "f" instead of "false") will fail with helpful hints
+# - Run './sora --config config.toml' to validate your configuration
 
 # LOGGING CONFIGURATION
 # =============================================================================

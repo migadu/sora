@@ -363,6 +363,11 @@ func (s *POP3Server) Start(errChan chan error) {
 }
 
 func (s *POP3Server) Close() {
+	// Stop connection tracker first to prevent it from trying to access closed database
+	if s.connTracker != nil {
+		s.connTracker.Stop()
+	}
+
 	// Cancel the app context if it's still active
 	// This will propagate to all session contexts
 	if s.cancel != nil {

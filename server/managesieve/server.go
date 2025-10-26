@@ -365,6 +365,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 }
 
 func (s *ManageSieveServer) Close() {
+	// Stop connection tracker first to prevent it from trying to access closed database
+	if s.connTracker != nil {
+		s.connTracker.Stop()
+	}
+
 	if s.cancel != nil {
 		s.cancel()
 	}

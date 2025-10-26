@@ -16,6 +16,7 @@ import (
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/adminapi"
@@ -1866,7 +1867,7 @@ func TestACLManagement(t *testing.T) {
 			NamespacePrefix: "Shared/",
 		},
 	}
-	ctx = context.WithValue(ctx, "config", cfg)
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
 	ownerID, _ := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
 	mailboxName := "Shared/TestACL"

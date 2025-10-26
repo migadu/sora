@@ -43,6 +43,7 @@ type ConnectionTracker struct {
 	kickCh                  chan struct{}
 	stopCh                  chan struct{}
 	wg                      sync.WaitGroup
+	stopped                 bool
 }
 
 // NewConnectionTracker creates a new connection tracker
@@ -100,6 +101,14 @@ func (ct *ConnectionTracker) IsEnabled() bool {
 
 // Stop stops the connection tracker
 func (ct *ConnectionTracker) Stop() {
+	ct.mu.Lock()
+	if ct.stopped {
+		ct.mu.Unlock()
+		return
+	}
+	ct.stopped = true
+	ct.mu.Unlock()
+
 	close(ct.stopCh)
 	ct.wg.Wait()
 

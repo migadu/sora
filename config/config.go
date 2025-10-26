@@ -1,89 +1,3 @@
-// Package config provides configuration management for the Sora email server.
-//
-// Configuration is loaded from TOML files with support for:
-//   - Multiple database endpoints with failover
-//   - Protocol-specific server settings (IMAP, LMTP, POP3, ManageSieve)
-//   - Proxy mode for horizontal scaling
-//   - TLS configuration with custom certificates
-//   - Connection limits and rate limiting
-//   - Client capability filtering (e.g., by JA4 fingerprint)
-//   - S3 storage configuration
-//   - Logging options (file, syslog, console)
-//
-// # Configuration File
-//
-// The default configuration file is config.toml. Example:
-//
-//	[database]
-//	[[database.endpoints]]
-//	hosts = ["db1.example.com:5432", "db2.example.com:5432"]
-//	user = "sora"
-//	password = "secret"
-//	database = "sora_mail_db"
-//	max_conns = 50
-//
-//	[s3]
-//	endpoint = "s3.amazonaws.com"
-//	bucket = "email-bodies"
-//	encryption_key = "hex-encoded-32-byte-key"
-//
-//	[servers.imap]
-//	start = true
-//	addr = ":143"
-//	tls_addr = ":993"
-//
-// # Loading Configuration
-//
-//	cfg := &config.Config{}
-//	if _, err := toml.DecodeFile("config.toml", cfg); err != nil {
-//		log.Fatal(err)
-//	}
-//
-//	// Validate configuration
-//	if err := cfg.Validate(); err != nil {
-//		log.Fatal(err)
-//	}
-//
-// # Proxy Mode
-//
-// For horizontal scaling, configure proxy mode:
-//
-//	[servers.imap_proxy]
-//	start = true
-//	addr = ":1143"
-//	remote_addrs = ["backend1:143", "backend2:143", "backend3:143"]
-//	affinity_method = "consistent_hash"  # or "round_robin"
-//
-// The proxy distributes connections across backends with optional
-// consistent hashing for session affinity.
-//
-// # Client Capability Filtering
-//
-// Filter capabilities for specific clients or TLS fingerprints:
-//
-//	[[capability_filters]]
-//	client_name = "BrokenClient"
-//	ja4_fingerprint = "t13d.*"
-//	disable_caps = ["IDLE", "NOTIFY"]
-//	reason = "Client has buggy IDLE implementation"
-//
-// # TLS Configuration
-//
-// Configure TLS with custom certificates:
-//
-//	[tls]
-//	cert_file = "/path/to/cert.pem"
-//	key_file = "/path/to/key.pem"
-//	min_version = "1.2"
-//	ciphers = ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]
-//
-// # Connection Limits
-//
-// Prevent resource exhaustion with connection limits:
-//
-//	[servers.imap]
-//	max_connections = 1000        # Total connections
-//	max_connections_per_ip = 10   # Per IP address
 package config
 
 import (
@@ -2245,7 +2159,11 @@ func (c *Config) GetAllServers() []ServerConfig {
 }
 
 // LoadConfigFromFile loads configuration from a TOML file and trims whitespace from all string fields
-// This function is lenient with duplicate keys - it will log a warning and use the first occurrence
+// This function is lenient with:
+//   - Duplicate keys: logs warning and uses first occurrence
+//   - Unknown keys: logs warning and ignores them
+//
+// All other syntax errors will cause the server to fail with helpful error messages
 func LoadConfigFromFile(configPath string, cfg *Config) error {
 	// Read the file content first
 	content, err := os.ReadFile(configPath)
@@ -2253,8 +2171,8 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 		return err
 	}
 
-	// Try to decode - if it fails due to duplicate keys, we'll handle it gracefully
-	_, err = toml.Decode(string(content), cfg)
+	// Try to decode - capture metadata to check for unknown keys
+	metadata, err := toml.Decode(string(content), cfg)
 	if err != nil {
 		// Check if this is a duplicate key error
 		if strings.Contains(err.Error(), "has already been defined") {
@@ -2272,7 +2190,7 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 			}
 
 			// Try decoding the cleaned content
-			_, err = toml.Decode(cleanedContent, cfg)
+			metadata, err = toml.Decode(cleanedContent, cfg)
 			if err != nil {
 				return enhanceConfigError(err)
 			}
@@ -2282,6 +2200,15 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 		}
 	}
 
+	// Warn about unknown keys (might be typos or deprecated settings)
+	if len(metadata.Undecoded()) > 0 {
+		log.Printf("WARNING: Configuration file '%s' contains unknown keys that will be ignored:", configPath)
+		for _, key := range metadata.Undecoded() {
+			log.Printf("WARNING:   - %s", key)
+		}
+		log.Printf("WARNING: These keys may be typos or deprecated settings. Please review your configuration.")
+	}
+
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
 	return nil
@@ -2289,11 +2216,14 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 
 // removeDuplicateKeysFromTOML removes duplicate keys from TOML content
 // This is a simple implementation that keeps the first occurrence of each key
+// Supports nested tables ([table.subtable]) and array tables ([[array.table]])
+// Note: Array tables reset key tracking per instance since each [[table]] is a new array element
 func removeDuplicateKeysFromTOML(content string) (string, error) {
 	lines := strings.Split(content, "\n")
 	seenKeys := make(map[string]int) // Maps key path to line number
 	var result []string
 	var currentSection string
+	var lastArrayTable string
 
 	for lineNum, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -2304,9 +2234,31 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 			continue
 		}
 
-		// Track section changes
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			currentSection = trimmed
+		// Track section changes - handle both regular tables and array tables
+		if strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]") {
+			// Array table: [[table.name]]
+			// Remove outer brackets to get the section name
+			currentSection = strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+
+			// Reset key tracking for this array table instance
+			// Each [[table]] is a new array element, so same keys are expected
+			if currentSection == lastArrayTable {
+				// Same array table name - clear keys for this section
+				for k := range seenKeys {
+					if strings.HasPrefix(k, currentSection+".") {
+						delete(seenKeys, k)
+					}
+				}
+			}
+			lastArrayTable = currentSection
+
+			result = append(result, line)
+			continue
+		} else if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			// Regular table: [table.name]
+			// Remove brackets to get the section name
+			currentSection = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			lastArrayTable = "" // Not an array table
 			result = append(result, line)
 			continue
 		}
@@ -2316,7 +2268,13 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 			parts := strings.SplitN(trimmed, "=", 2)
 			if len(parts) == 2 {
 				key := strings.TrimSpace(parts[0])
-				fullKey := currentSection + "." + key
+				// Build full key path: section.key
+				var fullKey string
+				if currentSection != "" {
+					fullKey = currentSection + "." + key
+				} else {
+					fullKey = key
+				}
 
 				// Check if we've seen this key before
 				if prevLine, exists := seenKeys[fullKey]; exists {
@@ -2354,6 +2312,18 @@ func enhanceConfigError(err error) error {
 			"  - Uncommenting a setting that already exists elsewhere", err)
 	}
 
+	// Check for common boolean typos
+	if strings.Contains(errMsg, "expected value but found \"f\"") ||
+		strings.Contains(errMsg, "expected value but found \"t\"") {
+		return fmt.Errorf("%w\n\nHINT: Invalid boolean value in your TOML configuration file.\n"+
+			"Common mistakes:\n"+
+			"  - Using 'f' instead of 'false'\n"+
+			"  - Using 't' instead of 'true'\n"+
+			"  - Using 'yes'/'no' instead of 'true'/'false'\n"+
+			"  - Using '1'/'0' instead of 'true'/'false'\n\n"+
+			"In TOML, boolean values must be exactly 'true' or 'false' (lowercase, unquoted).", err)
+	}
+
 	// Check for invalid TOML syntax
 	if strings.Contains(errMsg, "expected") || strings.Contains(errMsg, "invalid") {
 		return fmt.Errorf("%w\n\nHINT: There is a syntax error in your TOML configuration file.\n"+
@@ -2361,11 +2331,27 @@ func enhanceConfigError(err error) error {
 			"  - All strings are properly quoted\n"+
 			"  - All brackets and braces are balanced\n"+
 			"  - No special characters are unescaped\n"+
-			"  - Section headers use [section] or [[array]] format", err)
+			"  - Section headers use [section] or [[array]] format\n"+
+			"  - Boolean values are 'true' or 'false' (not 'yes'/'no', '1'/'0', 'f'/'t')", err)
 	}
 
 	// Return original error if we don't have specific guidance
 	return err
+}
+
+// extractLineNumber extracts line number from TOML error message
+// Format: "toml: line X (last key "key.name"): error message"
+func extractLineNumber(errMsg string) int {
+	if strings.Contains(errMsg, "line ") {
+		parts := strings.Split(errMsg, "line ")
+		if len(parts) >= 2 {
+			numPart := strings.Split(parts[1], " ")[0]
+			if n, err := strconv.Atoi(numPart); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 // trimStringFields recursively trims whitespace from all string fields in a struct

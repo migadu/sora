@@ -837,6 +837,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 }
 
 func (s *IMAPServer) Close() {
+	// Stop connection tracker first to prevent it from trying to access closed database
+	if s.connTracker != nil {
+		s.connTracker.Stop()
+	}
+
 	if s.server != nil {
 		// This will close the listener and cause s.server.Serve(listener) to return.
 		// It will also start closing active client connections.

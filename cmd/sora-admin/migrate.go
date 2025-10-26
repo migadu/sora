@@ -10,14 +10,12 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/migadu/sora/logger"
-
-	"github.com/BurntSushi/toml"
 	"github.com/golang-migrate/migrate/v4"
 	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/migadu/sora/db" // Import the db package to access MigrationsFS
+	"github.com/migadu/sora/logger"
 )
 
 // Migrations are now embedded in the `db` package and accessed via `db.MigrationsFS`.
@@ -218,7 +216,7 @@ func handleMigrateForce(ctx context.Context) {
 
 func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrate, *sql.DB, error) {
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+	if err := loadAdminConfig(configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			logger.Infof("WARNING: configuration file '%s' not found. Using defaults.", configPath)
 		} else {

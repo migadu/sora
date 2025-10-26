@@ -353,6 +353,11 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 func (s *Server) Stop() error {
 	log.Printf("ManageSieve Proxy [%s] stopping...", s.name)
 
+	// Stop connection tracker first to prevent it from trying to access closed database
+	if s.connTracker != nil {
+		s.connTracker.Stop()
+	}
+
 	s.cancel()
 
 	s.listenerMu.RLock()

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/aclservice"
 )
@@ -84,7 +84,7 @@ func handleACLGrant(ctx context.Context) {
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -101,7 +101,7 @@ func handleACLGrant(ctx context.Context) {
 	fullConfig := &config.Config{
 		SharedMailboxes: cfg.SharedMailboxes,
 	}
-	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)
@@ -158,7 +158,7 @@ func handleACLRevoke(ctx context.Context) {
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -175,7 +175,7 @@ func handleACLRevoke(ctx context.Context) {
 	fullConfig := &config.Config{
 		SharedMailboxes: cfg.SharedMailboxes,
 	}
-	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)
@@ -219,7 +219,7 @@ func handleACLList(ctx context.Context) {
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -236,7 +236,7 @@ func handleACLList(ctx context.Context) {
 	fullConfig := &config.Config{
 		SharedMailboxes: cfg.SharedMailboxes,
 	}
-	ctxWithConfig := context.WithValue(ctx, "config", fullConfig)
+	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 
 	// Create ACL service
 	aclSvc := aclservice.New(rdb)

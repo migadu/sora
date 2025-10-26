@@ -389,6 +389,12 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 
 func (s *POP3ProxyServer) Stop() error {
 	log.Printf("POP3 Proxy [%s] stopping...", s.name)
+
+	// Stop connection tracker first to prevent it from trying to access closed database
+	if s.connTracker != nil {
+		s.connTracker.Stop()
+	}
+
 	if s.cancel != nil {
 		s.cancel()
 	}

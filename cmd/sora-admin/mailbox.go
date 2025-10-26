@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/pkg/resilient"
 )
 
@@ -88,7 +87,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -161,7 +160,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -262,7 +261,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -347,7 +346,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -428,7 +427,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}
@@ -502,7 +501,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		fmt.Printf("Failed to load configuration: %v\n", err)
 		os.Exit(1)
 	}

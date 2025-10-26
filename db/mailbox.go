@@ -215,7 +215,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 	sharedPrefix := "Shared/" // Default prefix
 
 	// Try to get config from context
-	if cfg, ok := ctx.Value("config").(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
 		sharedPrefix = cfg.SharedMailboxes.NamespacePrefix
 		// Check if name starts with prefix, or is the prefix itself (without trailing slash)
 		prefixWithoutSlash := strings.TrimSuffix(sharedPrefix, "/")
@@ -307,7 +307,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		} else {
 			// No parent, grant creator full rights (or configured default rights)
 			defaultRights := "lrswipkxtea" // Full rights by default
-			if cfg, ok := ctx.Value("config").(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
+			if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
 				defaultRights = cfg.SharedMailboxes.DefaultRights
 			}
 

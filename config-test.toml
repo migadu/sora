@@ -74,23 +74,39 @@ use_ssl = false
 # SERVER CONFIGURATION (MINIMAL FOR TESTS)
 # =============================================================================
 # Basic server config for tests that might need it
+# NOTE: Using array of tables format [[server]] to match main config
 
-[server.imap]
-enabled = false                 # Disable servers for unit tests
-bind = "127.0.0.1:1143"
-tls = false
+[[server]]
+type = "imap"
+name = "test-imap"
+addr = "127.0.0.1:1143"
+max_connections = 10
+max_connections_per_ip = 5
+debug = false
 
-[server.lmtp]
-enabled = false
-bind = "127.0.0.1:1024"
+[[server]]
+type = "lmtp"
+name = "test-lmtp"
+addr = "127.0.0.1:1024"
+max_connections = 10
+max_connections_per_ip = 5
+debug = false
 
-[server.pop3]
-enabled = false
-bind = "127.0.0.1:1110"
+[[server]]
+type = "pop3"
+name = "test-pop3"
+addr = "127.0.0.1:1110"
+max_connections = 10
+max_connections_per_ip = 5
+debug = false
 
-[server.managesieve]
-enabled = false
-bind = "127.0.0.1:14190"
+[[server]]
+type = "managesieve"
+name = "test-managesieve"
+addr = "127.0.0.1:14190"
+max_connections = 10
+max_connections_per_ip = 5
+debug = false
 
 # ADMIN CONFIGURATION (MINIMAL)
 [admin]

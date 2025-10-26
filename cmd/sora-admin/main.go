@@ -41,6 +41,7 @@ type AdminConfig struct {
 	Uploader        config.UploaderConfig        `toml:"uploader"`
 	Cleanup         config.CleanupConfig         `toml:"cleanup"`
 	SharedMailboxes config.SharedMailboxesConfig `toml:"shared_mailboxes"`
+	Server          []map[string]interface{}     `toml:"server"` // Ignore server config array, not needed for admin commands
 }
 
 func newDefaultAdminConfig() AdminConfig {
@@ -99,6 +100,26 @@ func newDefaultAdminConfig() AdminConfig {
 			HealthStatusRetention: "30d",  // 30 days
 		},
 	}
+}
+
+// loadAdminConfig loads admin configuration from a TOML file with the same safety features as LoadConfigFromFile
+// This provides: duplicate key handling, unknown key warnings, enhanced error messages, and whitespace trimming
+func loadAdminConfig(configPath string, cfg *AdminConfig) error {
+	// Use the full config loader from the config package for consistency
+	fullCfg := &config.Config{}
+	if err := config.LoadConfigFromFile(configPath, fullCfg); err != nil {
+		return err
+	}
+
+	// Extract the parts we need for admin operations
+	cfg.Database = fullCfg.Database
+	cfg.S3 = fullCfg.S3
+	cfg.LocalCache = fullCfg.LocalCache
+	cfg.Uploader = fullCfg.Uploader
+	cfg.Cleanup = fullCfg.Cleanup
+	cfg.SharedMailboxes = fullCfg.SharedMailboxes
+
+	return nil
 }
 
 func main() {
@@ -585,7 +606,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -701,7 +722,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -854,7 +875,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1041,7 +1062,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1287,7 +1308,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1369,7 +1390,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1475,7 +1496,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1575,7 +1596,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1653,7 +1674,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1764,7 +1785,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -1834,7 +1855,7 @@ Examples:
 
 	// Load configuration
 	var cfg AdminConfig
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		// Check if this is a file not found error and if so, be more flexible.
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
@@ -1977,7 +1998,7 @@ Examples:
 
 	// Load configuration
 	var cfg AdminConfig
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		// Check if this is a file not found error and if so, be more flexible.
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
@@ -2163,7 +2184,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -2279,7 +2300,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -2686,7 +2707,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -2902,7 +2923,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -2998,7 +3019,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -3056,7 +3077,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -3213,7 +3234,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -3384,7 +3405,7 @@ Examples:
 	}
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -3582,7 +3603,7 @@ Examples:
 
 	// Load configuration
 	var adminConfig AdminConfig
-	if _, err := toml.DecodeFile(*configPath, &adminConfig); err != nil {
+	if err := loadAdminConfig(*configPath, &adminConfig); err != nil {
 		logger.Fatalf("Failed to load config: %v", err)
 	}
 
@@ -3768,7 +3789,7 @@ Examples:
 	// Load configuration
 	cfg := AdminConfig{}
 	if _, err := os.Stat(*configPath); err == nil {
-		if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+		if err := loadAdminConfig(*configPath, &cfg); err != nil {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
 		}
 	} else {
@@ -4169,7 +4190,7 @@ Examples:
 
 	// Load configuration
 	cfg := newDefaultAdminConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
@@ -4345,6 +4366,8 @@ func handleConfigCommand(ctx context.Context) {
 	switch subcommand {
 	case "dump":
 		handleConfigDump(ctx)
+	case "validate":
+		handleConfigValidate(ctx)
 	case "--help", "-h":
 		printConfigUsage()
 	default:
@@ -4361,15 +4384,120 @@ Usage:
   sora-admin config <subcommand> [options]
 
 Subcommands:
+  validate Validate configuration file syntax and settings
   dump     Dump the parsed configuration for debugging
 
 Examples:
+  sora-admin config validate --config sora.config.toml
   sora-admin config dump --config sora.config.toml
   sora-admin config dump --format json --mask-secrets=false
   sora-admin config dump --format pretty
 
 Use 'sora-admin config <subcommand> --help' for detailed help.
 `)
+}
+
+func handleConfigValidate(ctx context.Context) {
+	// Parse config-validate specific flags
+	var configFile string
+
+	flagSet := flag.NewFlagSet("config-validate", flag.ExitOnError)
+	flagSet.StringVar(&configFile, "config", "", "Path to configuration file (required)")
+	flagSet.Usage = func() {
+		fmt.Printf(`Validate configuration file syntax and settings
+
+Usage:
+  sora-admin config validate --config PATH
+
+Options:
+  --config PATH        Path to configuration file (required)
+
+Description:
+  Validates the configuration file by:
+  - Checking TOML syntax
+  - Detecting duplicate keys (warns and uses first occurrence)
+  - Detecting unknown/deprecated keys (warns)
+  - Detecting common typos (e.g., 'f' instead of 'false')
+  - Validating server configurations
+  - Checking for conflicts (duplicate names, addresses)
+
+  Exit codes:
+    0 - Configuration is valid (warnings OK)
+    1 - Configuration has errors
+
+Examples:
+  sora-admin config validate --config sora.config.toml
+`)
+	}
+
+	flagSet.Parse(os.Args[3:])
+
+	if configFile == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		flagSet.Usage()
+		os.Exit(1)
+	}
+
+	fmt.Printf("Validating configuration file: %s\n\n", configFile)
+
+	// Load full configuration - this will show all warnings
+	cfg := config.NewDefaultConfig()
+	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+		fmt.Printf("❌ Configuration validation FAILED:\n")
+		fmt.Printf("   %v\n", err)
+		os.Exit(1)
+	}
+
+	// Validate all server configurations
+	allServers := cfg.GetAllServers()
+
+	if len(allServers) == 0 {
+		fmt.Printf("⚠️  Warning: No servers configured\n")
+		fmt.Printf("   Please configure at least one server in the config file\n\n")
+	}
+
+	hasErrors := false
+	for _, server := range allServers {
+		if err := server.Validate(); err != nil {
+			fmt.Printf("❌ Server '%s' validation failed:\n", server.Name)
+			fmt.Printf("   %v\n", err)
+			hasErrors = true
+		}
+	}
+
+	// Check for server name conflicts
+	serverNames := make(map[string]bool)
+	serverAddresses := make(map[string]string) // addr -> server name
+	for _, server := range allServers {
+		if serverNames[server.Name] {
+			fmt.Printf("❌ Duplicate server name '%s' found\n", server.Name)
+			fmt.Printf("   Each server must have a unique name\n")
+			hasErrors = true
+		}
+		serverNames[server.Name] = true
+
+		// Check for address conflicts
+		if existingServerName, exists := serverAddresses[server.Addr]; exists {
+			fmt.Printf("❌ Duplicate server address '%s' found\n", server.Addr)
+			fmt.Printf("   Server '%s' and '%s' cannot bind to the same address\n",
+				existingServerName, server.Name)
+			hasErrors = true
+		}
+		serverAddresses[server.Addr] = server.Name
+	}
+
+	if hasErrors {
+		fmt.Printf("\n❌ Configuration validation FAILED with errors\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Configuration is valid!\n")
+	if len(allServers) > 0 {
+		fmt.Printf("\nConfigured servers:\n")
+		for _, server := range allServers {
+			fmt.Printf("  - %s listening on %s\n", server.Name, server.Addr)
+		}
+	}
 }
 
 func handleConfigDump(ctx context.Context) {
@@ -4409,7 +4537,7 @@ Examples:
 
 	// Load full configuration
 	cfg := config.NewDefaultConfig()
-	if _, err := toml.DecodeFile(configFile, &cfg); err != nil {
+	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
@@ -4610,7 +4738,7 @@ func handleImportS3(ctx context.Context) {
 
 	// Load configuration
 	var cfg AdminConfig
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
 
@@ -4784,7 +4912,7 @@ Examples:
 
 	// Load configuration to get admin API details
 	cfg := config.NewDefaultConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := config.LoadConfigFromFile(*configPath, &cfg); err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
@@ -4864,7 +4992,7 @@ Examples:
 
 	// Load configuration to get admin API details
 	cfg := config.NewDefaultConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := config.LoadConfigFromFile(*configPath, &cfg); err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 
@@ -4944,7 +5072,7 @@ Examples:
 
 	// Load configuration to get admin API details
 	cfg := config.NewDefaultConfig()
-	if _, err := toml.DecodeFile(*configPath, &cfg); err != nil {
+	if err := config.LoadConfigFromFile(*configPath, &cfg); err != nil {
 		logger.Fatalf("Failed to load configuration: %v", err)
 	}
 

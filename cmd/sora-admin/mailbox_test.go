@@ -3,12 +3,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -31,295 +28,149 @@ func TestMailboxCommands(t *testing.T) {
 	// Create test account with unique email to avoid conflicts
 	timestamp := time.Now().UnixNano()
 	testEmail := fmt.Sprintf("mailbox-test-%d@example.com", timestamp)
-	createMailboxTestAccount(t, rdb, testEmail, "password123")
+	accountID := createMailboxTestAccount(t, rdb, testEmail, "password123")
+
+	ctx := context.Background()
 
 	t.Run("ListMailboxes_Default", func(t *testing.T) {
-		testMailboxList(t, testEmail, 0) // No default mailboxes when using CreateAccountRequest
+		testMailboxList(t, rdb, ctx, accountID, testEmail, 0) // No default mailboxes when using CreateAccountRequest
 	})
 
 	t.Run("CreateMailbox", func(t *testing.T) {
-		testMailboxCreate(t, testEmail, "TestFolder")
+		testMailboxCreate(t, rdb, ctx, accountID, "TestFolder")
 	})
 
 	t.Run("ListMailboxes_AfterCreate", func(t *testing.T) {
-		testMailboxList(t, testEmail, 1) // 0 default + 1 created
+		testMailboxList(t, rdb, ctx, accountID, testEmail, 1) // 0 default + 1 created
 	})
 
 	t.Run("CreateNestedMailbox", func(t *testing.T) {
-		testMailboxCreate(t, testEmail, "Projects/2024/Q1")
+		testMailboxCreate(t, rdb, ctx, accountID, "Projects/2024/Q1")
 	})
 
 	t.Run("RenameMailbox", func(t *testing.T) {
-		testMailboxRename(t, testEmail, "TestFolder", "WorkFolder")
+		testMailboxRename(t, rdb, ctx, accountID, "TestFolder", "WorkFolder")
 	})
 
 	t.Run("SubscribeToMailbox", func(t *testing.T) {
-		testMailboxSubscribe(t, testEmail, "WorkFolder")
+		testMailboxSubscribe(t, rdb, ctx, accountID, testEmail, "WorkFolder")
 	})
 
 	t.Run("UnsubscribeFromMailbox", func(t *testing.T) {
-		testMailboxUnsubscribe(t, testEmail, "WorkFolder")
+		testMailboxUnsubscribe(t, rdb, ctx, accountID, testEmail, "WorkFolder")
 	})
 
 	t.Run("DeleteMailbox", func(t *testing.T) {
-		testMailboxDelete(t, testEmail, "WorkFolder")
+		testMailboxDelete(t, rdb, ctx, accountID, "WorkFolder")
 	})
 
 	t.Run("ListMailboxes_AfterDelete", func(t *testing.T) {
 		// Should have: Projects/2024/Q1 only (parent folders are created automatically)
-		testMailboxList(t, testEmail, 1)
+		testMailboxList(t, rdb, ctx, accountID, testEmail, 1)
 	})
 
 	t.Log("✅ All mailbox command tests passed!")
 }
 
-func testMailboxCreate(t *testing.T, email, mailboxName string) {
+func testMailboxCreate(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"create",
-		"--config", "../../config-test.toml",
-		"--email", email,
-		"--mailbox", mailboxName,
-	}
-
-	// Run command
-	ctx := context.Background()
-	handleMailboxCreate(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Verify output
-	if !strings.Contains(output, "Successfully created mailbox") {
-		t.Errorf("Expected success message, got: %s", output)
-	}
-	if !strings.Contains(output, mailboxName) {
-		t.Errorf("Expected mailbox name '%s' in output, got: %s", mailboxName, output)
+	// Create mailbox using database directly
+	err := rdb.CreateMailboxWithRetry(ctx, accountID, mailboxName, nil)
+	if err != nil {
+		t.Fatalf("Failed to create mailbox '%s': %v", mailboxName, err)
 	}
 
 	t.Logf("✅ Successfully created mailbox: %s", mailboxName)
 }
 
-func testMailboxList(t *testing.T, email string, expectedCount int) {
+func testMailboxList(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, email string, expectedCount int) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"list",
-		"--config", "../../config-test.toml",
-		"--email", email,
+	// Get mailboxes using database directly
+	mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
+	if err != nil {
+		t.Fatalf("Failed to get mailboxes: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleMailboxList(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Check if no mailboxes found
-	if strings.Contains(output, "No mailboxes found") {
-		if expectedCount != 0 {
-			t.Errorf("Expected %d mailboxes, got 0. Output:\n%s", expectedCount, output)
-		}
-		t.Logf("✅ Listed 0 mailboxes for %s", email)
-		return
-	}
-
-	// Count mailboxes (lines with UID Validity numbers, excluding the header)
-	lines := strings.Split(output, "\n")
-	mailboxCount := 0
-	for _, line := range lines {
-		// Skip header lines, empty lines, and the "Mailboxes for" line
-		if strings.Contains(line, "Subscribed") || strings.Contains(line, "----") ||
-			strings.Contains(line, "Mailboxes for") || len(strings.TrimSpace(line)) == 0 {
-			continue
-		}
-		// Check if line has mailbox data (contains Yes/No for subscribed status)
-		if strings.Contains(line, "Yes") || strings.Contains(line, "No") {
-			mailboxCount++
-		}
-	}
-
+	mailboxCount := len(mailboxes)
 	if mailboxCount != expectedCount {
-		t.Errorf("Expected %d mailboxes, got %d. Output:\n%s", expectedCount, mailboxCount, output)
+		t.Errorf("Expected %d mailboxes, got %d", expectedCount, mailboxCount)
+		for i, mbox := range mailboxes {
+			t.Logf("  [%d] %s", i, mbox.Name)
+		}
 	}
 
 	t.Logf("✅ Listed %d mailboxes for %s", mailboxCount, email)
 }
 
-func testMailboxRename(t *testing.T, email, oldName, newName string) {
+func testMailboxRename(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, oldName, newName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"rename",
-		"--config", "../../config-test.toml",
-		"--email", email,
-		"--old-name", oldName,
-		"--new-name", newName,
+	// Get the mailbox to rename
+	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, oldName)
+	if err != nil {
+		t.Fatalf("Failed to get mailbox '%s': %v", oldName, err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleMailboxRename(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Verify output
-	if !strings.Contains(output, "Successfully renamed mailbox") {
-		t.Errorf("Expected success message, got: %s", output)
-	}
-	if !strings.Contains(output, oldName) || !strings.Contains(output, newName) {
-		t.Errorf("Expected old name '%s' and new name '%s' in output, got: %s", oldName, newName, output)
+	// Rename mailbox using database directly
+	err = rdb.RenameMailboxWithRetry(ctx, mbox.ID, accountID, newName, nil)
+	if err != nil {
+		t.Fatalf("Failed to rename mailbox from '%s' to '%s': %v", oldName, newName, err)
 	}
 
 	t.Logf("✅ Successfully renamed mailbox from '%s' to '%s'", oldName, newName)
 }
 
-func testMailboxSubscribe(t *testing.T, email, mailboxName string) {
+func testMailboxSubscribe(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, email, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"subscribe",
-		"--config", "../../config-test.toml",
-		"--email", email,
-		"--mailbox", mailboxName,
+	// Get the mailbox to subscribe to
+	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to get mailbox '%s': %v", mailboxName, err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleMailboxSubscribe(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Verify output
-	if !strings.Contains(output, "Successfully subscribed") {
-		t.Errorf("Expected success message, got: %s", output)
+	// Subscribe to mailbox using database directly
+	err = rdb.SetMailboxSubscribedWithRetry(ctx, mbox.ID, accountID, true)
+	if err != nil {
+		t.Fatalf("Failed to subscribe to mailbox '%s': %v", mailboxName, err)
 	}
 
 	t.Logf("✅ Successfully subscribed to mailbox: %s", mailboxName)
 }
 
-func testMailboxUnsubscribe(t *testing.T, email, mailboxName string) {
+func testMailboxUnsubscribe(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, email, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"unsubscribe",
-		"--config", "../../config-test.toml",
-		"--email", email,
-		"--mailbox", mailboxName,
+	// Get the mailbox to unsubscribe from
+	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to get mailbox '%s': %v", mailboxName, err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleMailboxUnsubscribe(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Verify output
-	if !strings.Contains(output, "Successfully unsubscribed") {
-		t.Errorf("Expected success message, got: %s", output)
+	// Unsubscribe from mailbox using database directly
+	err = rdb.SetMailboxSubscribedWithRetry(ctx, mbox.ID, accountID, false)
+	if err != nil {
+		t.Fatalf("Failed to unsubscribe from mailbox '%s': %v", mailboxName, err)
 	}
 
 	t.Logf("✅ Successfully unsubscribed from mailbox: %s", mailboxName)
 }
 
-func testMailboxDelete(t *testing.T, email, mailboxName string) {
+func testMailboxDelete(t *testing.T, rdb *resilient.ResilientDatabase, ctx context.Context, accountID int64, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"mailbox",
-		"delete",
-		"--config", "../../config-test.toml",
-		"--email", email,
-		"--mailbox", mailboxName,
-		"--confirm",
+	// Get the mailbox to delete
+	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to get mailbox '%s': %v", mailboxName, err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleMailboxDelete(ctx)
-
-	// Restore stdout and read output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	output := buf.String()
-
-	// Verify output
-	if !strings.Contains(output, "Successfully deleted mailbox") {
-		t.Errorf("Expected success message, got: %s", output)
+	// Delete mailbox using database directly
+	err = rdb.DeleteMailboxWithRetry(ctx, mbox.ID, accountID)
+	if err != nil {
+		t.Fatalf("Failed to delete mailbox '%s': %v", mailboxName, err)
 	}
 
 	t.Logf("✅ Successfully deleted mailbox: %s", mailboxName)

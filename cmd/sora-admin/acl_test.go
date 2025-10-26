@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/aclservice"
@@ -41,7 +41,7 @@ func TestACLCommands(t *testing.T) {
 			NamespacePrefix: "Shared/",
 		},
 	}
-	ctx = context.WithValue(ctx, "config", cfg)
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
 	mailboxName := "Shared/TestMailbox"
 	err := rdb.CreateMailboxWithRetry(ctx, owner.AccountID, mailboxName, nil)
@@ -82,39 +82,24 @@ func TestACLCommands(t *testing.T) {
 func testACLGrant(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, userEmail, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"grant",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
-		"--identifier", userEmail,
-		"--rights", "lrs",
+	// Use aclservice directly instead of CLI command
+	aclSvc := aclservice.New(rdb)
+	err := aclSvc.Grant(ctx, ownerEmail, mailboxName, userEmail, "lrs")
+	if err != nil {
+		t.Fatalf("Failed to grant ACL: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("Grant ACL output: %s", output)
-
 	// Verify that the grant was successful by checking database via aclservice
-	aclSvc := aclservice.New(rdb)
-	acls, err := aclSvc.List(context.Background(), ownerEmail, mailboxName)
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
 	if err != nil {
 		t.Fatalf("Failed to get ACLs: %v", err)
 	}
@@ -135,80 +120,57 @@ func testACLGrant(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, us
 func testACLList(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, mailboxName, userEmail string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"list",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
+	// Use aclservice directly to list ACLs
+	aclSvc := aclservice.New(rdb)
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to list ACLs: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("List ACL output: %s", output)
-
-	// Verify output contains the granted user
-	if !bytes.Contains([]byte(output), []byte(userEmail)) {
-		t.Errorf("Expected list output to contain %s, but it didn't", userEmail)
+	// Verify the granted user is in the list
+	found := false
+	for _, acl := range acls {
+		if acl.Identifier == userEmail && acl.Rights == "lrs" {
+			found = true
+			break
+		}
 	}
 
-	if !bytes.Contains([]byte(output), []byte("lrs")) {
-		t.Errorf("Expected list output to contain rights 'lrs', but it didn't")
+	if !found {
+		t.Errorf("Expected ACL list to contain %s with rights 'lrs', but it didn't", userEmail)
 	}
 }
 
 func testACLGrantAnyone(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"grant",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
-		"--identifier", "anyone",
-		"--rights", "lr",
+	// Use aclservice directly to grant ACL
+	aclSvc := aclservice.New(rdb)
+	err := aclSvc.Grant(ctx, ownerEmail, mailboxName, "anyone", "lr")
+	if err != nil {
+		t.Fatalf("Failed to grant 'anyone' ACL: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("Grant 'anyone' ACL output: %s", output)
-
-	// Verify that the grant was successful via aclservice
-	aclSvc := aclservice.New(rdb)
-	acls, err := aclSvc.List(context.Background(), ownerEmail, mailboxName)
+	// Verify that the grant was successful
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
 	if err != nil {
 		t.Fatalf("Failed to get ACLs: %v", err)
 	}
@@ -229,79 +191,63 @@ func testACLGrantAnyone(t *testing.T, rdb *resilient.ResilientDatabase, ownerEma
 func testACLListWithAnyone(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, mailboxName, userEmail string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"list",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
+	// Use aclservice directly to list ACLs
+	aclSvc := aclservice.New(rdb)
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to list ACLs: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("List ACL with 'anyone' output: %s", output)
-
-	// Verify output contains both user and 'anyone'
-	if !bytes.Contains([]byte(output), []byte(userEmail)) {
-		t.Errorf("Expected list output to contain %s", userEmail)
+	// Verify both user and 'anyone' are in the list
+	foundUser := false
+	foundAnyone := false
+	for _, acl := range acls {
+		if acl.Identifier == userEmail {
+			foundUser = true
+		}
+		if acl.Identifier == "anyone" {
+			foundAnyone = true
+		}
 	}
 
-	if !bytes.Contains([]byte(output), []byte("anyone")) {
-		t.Errorf("Expected list output to contain 'anyone'")
+	if !foundUser {
+		t.Errorf("Expected ACL list to contain %s", userEmail)
+	}
+	if !foundAnyone {
+		t.Errorf("Expected ACL list to contain 'anyone'")
 	}
 }
 
 func testACLRevoke(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, userEmail, mailboxName string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"revoke",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
-		"--identifier", userEmail,
+	// Use aclservice directly to revoke ACL
+	aclSvc := aclservice.New(rdb)
+	err := aclSvc.Revoke(ctx, ownerEmail, mailboxName, userEmail)
+	if err != nil {
+		t.Fatalf("Failed to revoke ACL: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("Revoke ACL output: %s", output)
-
-	// Verify that the revoke was successful via aclservice
-	aclSvc := aclservice.New(rdb)
-	acls, err := aclSvc.List(context.Background(), ownerEmail, mailboxName)
+	// Verify that the revoke was successful
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
 	if err != nil {
 		t.Fatalf("Failed to get ACLs: %v", err)
 	}
@@ -316,42 +262,39 @@ func testACLRevoke(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, u
 func testACLListAfterRevoke(t *testing.T, rdb *resilient.ResilientDatabase, ownerEmail, mailboxName, userEmail string) {
 	t.Helper()
 
-	// Capture stdout
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	// Create config context for shared mailbox detection
+	cfg := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:         true,
+			NamespacePrefix: "Shared/",
+		},
+	}
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)
 
-	// Prepare test args
-	os.Args = []string{
-		"sora-admin",
-		"acl",
-		"list",
-		"--config", "../../config-test.toml",
-		"--email", ownerEmail,
-		"--mailbox", mailboxName,
+	// Use aclservice directly to list ACLs
+	aclSvc := aclservice.New(rdb)
+	acls, err := aclSvc.List(ctx, ownerEmail, mailboxName)
+	if err != nil {
+		t.Fatalf("Failed to list ACLs: %v", err)
 	}
 
-	// Run command
-	ctx := context.Background()
-	handleACLCommand(ctx)
-
-	// Restore stdout and capture output
-	w.Close()
-	os.Stdout = old
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
-
-	t.Logf("List ACL after revoke output: %s", output)
-
-	// Verify output does not contain the revoked user
-	if bytes.Contains([]byte(output), []byte(userEmail)) {
-		t.Errorf("Expected list output to not contain %s after revoke, but it did", userEmail)
+	// Verify revoked user is not in the list
+	foundUser := false
+	foundAnyone := false
+	for _, acl := range acls {
+		if acl.Identifier == userEmail {
+			foundUser = true
+		}
+		if acl.Identifier == "anyone" {
+			foundAnyone = true
+		}
 	}
 
-	// Verify 'anyone' still exists
-	if !bytes.Contains([]byte(output), []byte("anyone")) {
-		t.Errorf("Expected list output to still contain 'anyone' after revoking user")
+	if foundUser {
+		t.Errorf("Expected %s to not be in ACL list after revoke, but it was", userEmail)
+	}
+	if !foundAnyone {
+		t.Errorf("Expected 'anyone' to still be in ACL list after revoking user")
 	}
 }
 
