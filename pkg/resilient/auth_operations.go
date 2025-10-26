@@ -106,7 +106,17 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 
 // AuthenticateWithRetry handles the full authentication flow with resilience.
 // It fetches credentials, verifies the password, and triggers a rehash if necessary.
+// Uses authentication cache if enabled to reduce database load.
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
+	// Check auth cache first if enabled
+	if rd.authCache != nil {
+		if cachedAccountID, found := rd.authCache.Authenticate(address, password); found {
+			// Cache hit with successful authentication
+			return cachedAccountID, nil
+		}
+		// Cache miss or auth failure - continue to database
+	}
+
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -130,6 +140,11 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
+		// Cache negative result if enabled
+		if rd.authCache != nil {
+			// AuthUserNotFound = 1 (from authcache package)
+			rd.authCache.SetFailure(address, 1)
+		}
 		return 0, err // Return error from fetching credentials
 	}
 
@@ -139,7 +154,17 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
+		// Cache negative result for invalid password if enabled
+		if rd.authCache != nil {
+			// AuthInvalidPassword = 2 (from authcache package)
+			rd.authCache.SetFailure(address, 2)
+		}
 		return 0, err // Invalid password
+	}
+
+	// Cache successful authentication if enabled
+	if rd.authCache != nil {
+		rd.authCache.SetSuccess(address, accountID, hashedPassword)
 	}
 
 	// Asynchronously rehash if needed
@@ -169,6 +194,10 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 				log.Printf("[REHASH] Failed to update password for %s: %v", address, err)
 			} else {
 				log.Printf("[REHASH] Successfully rehashed and updated password for %s", address)
+				// Invalidate cache entry since password hash changed
+				if rd.authCache != nil {
+					rd.authCache.Invalidate(address)
+				}
 			}
 		}()
 	}

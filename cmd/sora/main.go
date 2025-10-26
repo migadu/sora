@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/authcache"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
@@ -332,6 +333,37 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	deps.resilientDB.StartPoolMetrics(ctx)
 	deps.resilientDB.StartPoolHealthMonitoring(ctx)
 	logger.Infof("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+
+	// Initialize authentication cache if enabled
+	if cfg.AuthCache.Enabled {
+		logger.Info("Initializing authentication cache...")
+
+		positiveTTL, err := time.ParseDuration(cfg.AuthCache.PositiveTTL)
+		if err != nil {
+			logger.Errorf("Invalid auth_cache.positive_ttl: %v, using default 30s", err)
+			positiveTTL = 30 * time.Second
+		}
+
+		negativeTTL, err := time.ParseDuration(cfg.AuthCache.NegativeTTL)
+		if err != nil {
+			logger.Errorf("Invalid auth_cache.negative_ttl: %v, using default 5m", err)
+			negativeTTL = 5 * time.Minute
+		}
+
+		cleanupInterval, err := time.ParseDuration(cfg.AuthCache.CleanupInterval)
+		if err != nil {
+			logger.Errorf("Invalid auth_cache.cleanup_interval: %v, using default 5m", err)
+			cleanupInterval = 5 * time.Minute
+		}
+
+		authCache := authcache.New(positiveTTL, negativeTTL, cfg.AuthCache.MaxSize, cleanupInterval)
+		deps.resilientDB.SetAuthCache(authCache)
+
+		logger.Infof("Authentication cache enabled: positive_ttl=%s, negative_ttl=%s, max_size=%d",
+			positiveTTL, negativeTTL, cfg.AuthCache.MaxSize)
+	} else {
+		logger.Info("Authentication cache is disabled")
+	}
 
 	// Initialize health monitoring
 	logger.Infof("Initializing health monitoring...")

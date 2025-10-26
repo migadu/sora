@@ -489,6 +489,26 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	}
 }
 
+// AuthCacheConfig holds configuration for authentication result caching
+type AuthCacheConfig struct {
+	Enabled         bool   `toml:"enabled"`          // Enable in-memory caching of authentication results
+	PositiveTTL     string `toml:"positive_ttl"`     // TTL for successful auth (default: "30s")
+	NegativeTTL     string `toml:"negative_ttl"`     // TTL for failed auth (default: "5m")
+	MaxSize         int    `toml:"max_size"`         // Maximum number of cached entries (default: 10000)
+	CleanupInterval string `toml:"cleanup_interval"` // How often to clean expired entries (default: "5m")
+}
+
+// DefaultAuthCacheConfig returns sensible defaults for authentication caching
+func DefaultAuthCacheConfig() AuthCacheConfig {
+	return AuthCacheConfig{
+		Enabled:         false,
+		PositiveTTL:     "30s",
+		NegativeTTL:     "5m",
+		MaxSize:         10000,
+		CleanupInterval: "5m",
+	}
+}
+
 // PreLookupConfig holds configuration for HTTP-based user routing
 // PreLookupCacheConfig holds caching configuration for prelookup
 type PreLookupCacheConfig struct {
@@ -1291,6 +1311,7 @@ type Config struct {
 	Uploader        UploaderConfig        `toml:"uploader"`
 	Metadata        MetadataConfig        `toml:"metadata"`
 	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
+	AuthCache       AuthCacheConfig       `toml:"auth_cache"`
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`

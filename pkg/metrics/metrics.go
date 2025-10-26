@@ -119,7 +119,7 @@ var (
 	)
 )
 
-// Cache metrics
+// Cache metrics (S3 object cache)
 var (
 	CacheOperationsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -140,6 +140,37 @@ var (
 		prometheus.GaugeOpts{
 			Name: "sora_cache_objects_total",
 			Help: "Current number of objects in cache",
+		},
+	)
+)
+
+// Authentication cache metrics
+var (
+	AuthCacheHitsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_auth_cache_hits_total",
+			Help: "Total number of authentication cache hits",
+		},
+	)
+
+	AuthCacheMissesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_auth_cache_misses_total",
+			Help: "Total number of authentication cache misses",
+		},
+	)
+
+	AuthCacheEntriesTotal = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_cache_entries_total",
+			Help: "Current number of entries in authentication cache",
+		},
+	)
+
+	AuthCacheHitRate = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_cache_hit_rate",
+			Help: "Authentication cache hit rate percentage (0-100)",
 		},
 	)
 )

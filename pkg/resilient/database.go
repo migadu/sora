@@ -154,6 +154,19 @@ type ResilientDatabase struct {
 
 	// Database configuration for timeouts
 	config *config.DatabaseConfig
+
+	// Authentication cache (optional, set if enabled in config)
+	authCache AuthCache
+}
+
+// AuthCache interface for authentication caching
+type AuthCache interface {
+	Authenticate(address, password string) (int64, bool)
+	SetSuccess(address string, accountID int64, hashedPassword string)
+	SetFailure(address string, result int)
+	Invalidate(address string)
+	GetStats() (hits, misses uint64, size int, hitRate float64)
+	Stop(ctx context.Context) error
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
@@ -506,6 +519,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 }
 
 // UpdatePasswordWithRetry updates a user's password with resilience.
+// Invalidates the auth cache entry for this user if cache is enabled.
 func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, address, newHashedPassword string) error {
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
@@ -518,7 +532,18 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(ctx, tx, address, newHashedPassword)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+
+	// Invalidate cache entry on successful password update
+	if err == nil && rd.authCache != nil {
+		rd.authCache.Invalidate(address)
+	}
+
 	return err
+}
+
+// SetAuthCache sets the authentication cache for this database instance
+func (rd *ResilientDatabase) SetAuthCache(cache AuthCache) {
+	rd.authCache = cache
 }
 
 func (rd *ResilientDatabase) Close() {
@@ -527,6 +552,17 @@ func (rd *ResilientDatabase) Close() {
 		// The current code doesn't do this, but it's safe.
 		return
 	}
+
+	// Stop auth cache if enabled
+	if rd.authCache != nil {
+		logger.Info("Stopping authentication cache...", "component", "RESILIENT-FAILOVER")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := rd.authCache.Stop(ctx); err != nil {
+			logger.Error("Error stopping authentication cache", "component", "RESILIENT-FAILOVER", "error", err)
+		}
+	}
+
 	// Stop the health checker
 	close(rd.failoverManager.healthCheckStop)
 

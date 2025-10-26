@@ -407,6 +407,26 @@ health_status_retention = "30d" # How long to retain health status history in th
 stale_connections_retention = "30m" # How long before inactive connections are removed. Catches ungraceful disconnects.
 
 
+# AUTHENTICATION CACHE CONFIGURATION
+# =============================================================================
+# In-memory authentication result caching to reduce database load.
+# Particularly useful for:
+# - Parallel client connections (mail clients often open 3-5+ IMAP connections)
+# - Mitigating DoS attacks from non-existent account lookups
+# - Reducing latency for repeated authentication attempts
+#
+# Security note: Cached credentials are verified on every use. Only successful
+# credential lookups are cached temporarily to avoid repeated DB queries.
+
+[auth_cache]
+enabled = false              # Enable authentication result caching. Default: false (disabled).
+positive_ttl = "30s"         # How long to cache successful authentications. Short TTL recommended for security.
+negative_ttl = "5m"          # How long to cache failed authentication attempts (user not found, invalid password).
+                            # Longer TTL helps mitigate brute force attacks against non-existent accounts.
+max_size = 10000            # Maximum number of cached authentication results. LRU eviction when exceeded.
+cleanup_interval = "5m"     # How often to remove expired cache entries and update metrics.
+
+
 # METADATA LIMITS CONFIGURATION
 # =============================================================================
 # IMAP METADATA extension (RFC 5464) limits to prevent storage abuse.
