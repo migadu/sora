@@ -288,19 +288,6 @@ func (cm *ConnectionManager) IsRemoteStartTLS() bool {
 	return cm.remoteTLS && cm.remoteTLSUseStartTLS
 }
 
-// Connect attempts to connect to a remote server with round-robin and failover
-// Deprecated: Use ConnectWithContext instead to properly propagate context cancellation
-func (cm *ConnectionManager) Connect(preferredAddr string) (net.Conn, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
-	defer cancel()
-	return cm.ConnectWithProxy(ctx, preferredAddr, "", 0, "", 0, nil)
-}
-
-// ConnectWithContext attempts to connect to a remote server with proper context propagation
-func (cm *ConnectionManager) ConnectWithContext(ctx context.Context, preferredAddr string) (net.Conn, string, error) {
-	return cm.ConnectWithProxy(ctx, preferredAddr, "", 0, "", 0, nil)
-}
-
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
 	if preferredAddr != "" {
@@ -784,14 +771,6 @@ func (cm *ConnectionManager) shouldRetry(addr string) bool {
 	}
 
 	return time.Since(lastCheck) > 30*time.Second
-}
-
-// ConnectToSpecific attempts to connect to a specific server address
-// Deprecated: Use ConnectToSpecificWithContext instead to properly propagate context cancellation
-func (cm *ConnectionManager) ConnectToSpecific(addr string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), cm.connectTimeout)
-	defer cancel()
-	return cm.ConnectToSpecificWithContext(ctx, addr)
 }
 
 // ConnectToSpecificWithContext attempts to connect to a specific server address with proper context propagation

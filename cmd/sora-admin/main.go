@@ -47,7 +47,6 @@ type AdminConfig struct {
 func newDefaultAdminConfig() AdminConfig {
 	return AdminConfig{
 		Database: config.DatabaseConfig{
-			LogQueries: false,
 			Write: &config.DatabaseEndpointConfig{
 				Hosts:    []string{"localhost"},
 				Port:     "5432",
@@ -4632,7 +4631,7 @@ func printPrettyConfig(cfg config.Config) {
 	fmt.Printf("  Access Key: %s\n", cfg.S3.AccessKey)
 	fmt.Printf("  Secret Key: %s\n", cfg.S3.SecretKey)
 	fmt.Printf("  Bucket: %s\n", cfg.S3.Bucket)
-	fmt.Printf("  Trace: %t\n", cfg.S3.GetDebug())
+	fmt.Printf("  Debug: %t\n", cfg.S3.GetDebug())
 	fmt.Printf("  Encrypt: %t\n", cfg.S3.Encrypt)
 	fmt.Printf("  Encryption Key: %s\n", cfg.S3.EncryptionKey)
 

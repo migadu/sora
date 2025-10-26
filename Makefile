@@ -69,26 +69,24 @@ DB_PORT = 5432
 
 # Reset test database to clean state
 reset-test-db:
-	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) > /dev/null 2>&1 <<-'EOF' || true
-		SET session_replication_role = replica;
-		TRUNCATE TABLE vacation_responses CASCADE;
-		TRUNCATE TABLE sieve_scripts CASCADE;
-		TRUNCATE TABLE pending_uploads CASCADE;
-		TRUNCATE TABLE message_contents CASCADE;
-		TRUNCATE TABLE message_sequences CASCADE;
-		TRUNCATE TABLE messages CASCADE;
-		TRUNCATE TABLE mailbox_stats CASCADE;
-		TRUNCATE TABLE mailbox_acls CASCADE;
-		TRUNCATE TABLE mailboxes CASCADE;
-		TRUNCATE TABLE credentials CASCADE;
-		TRUNCATE TABLE accounts CASCADE;
-		TRUNCATE TABLE metadata CASCADE;
-		TRUNCATE TABLE auth_attempts CASCADE;
-		TRUNCATE TABLE active_connections CASCADE;
-		TRUNCATE TABLE health_status CASCADE;
-		TRUNCATE TABLE cache_metrics CASCADE;
-		SET session_replication_role = DEFAULT;
-	EOF
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) -d $(DB_NAME) -c "SET session_replication_role = replica; \
+		TRUNCATE TABLE vacation_responses CASCADE; \
+		TRUNCATE TABLE sieve_scripts CASCADE; \
+		TRUNCATE TABLE pending_uploads CASCADE; \
+		TRUNCATE TABLE message_contents CASCADE; \
+		TRUNCATE TABLE message_sequences CASCADE; \
+		TRUNCATE TABLE messages CASCADE; \
+		TRUNCATE TABLE mailbox_stats CASCADE; \
+		TRUNCATE TABLE mailbox_acls CASCADE; \
+		TRUNCATE TABLE mailboxes CASCADE; \
+		TRUNCATE TABLE credentials CASCADE; \
+		TRUNCATE TABLE accounts CASCADE; \
+		TRUNCATE TABLE metadata CASCADE; \
+		TRUNCATE TABLE auth_attempts CASCADE; \
+		TRUNCATE TABLE active_connections CASCADE; \
+		TRUNCATE TABLE health_status CASCADE; \
+		TRUNCATE TABLE cache_metrics CASCADE; \
+		SET session_replication_role = DEFAULT;" > /dev/null 2>&1 || true
 
 # Run all integration tests (requires PostgreSQL)
 integration-tests: integration-tests-imap integration-tests-lmtp integration-tests-pop3 \

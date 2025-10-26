@@ -153,7 +153,6 @@ func setupSimpleTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
 	cfg := &config.DatabaseConfig{
-		LogQueries: false,
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     "5432",

@@ -117,9 +117,8 @@ func TestACL_GETACL(t *testing.T) {
 
 	// Grant user2 read-only access via database
 	accountID1, _ := server.ResilientDB.GetAccountIDByAddressWithRetry(context.Background(), account1.Email)
-	accountID2, _ := server.ResilientDB.GetAccountIDByAddressWithRetry(context.Background(), email2)
 
-	if err := server.ResilientDB.GrantMailboxAccessWithRetry(context.Background(), accountID1, accountID2, sharedMailbox, "lr"); err != nil {
+	if err := server.ResilientDB.GrantMailboxAccessByIdentifierWithRetry(context.Background(), accountID1, email2, sharedMailbox, "lr"); err != nil {
 		t.Fatalf("Failed to grant access: %v", err)
 	}
 

@@ -42,7 +42,7 @@
 //	)
 //
 //	// Connect to appropriate backend
-//	conn, backend, err := cm.ConnectWithContext(ctx, username)
+//	conn, backend, err := cm.ConnectWithProxy(ctx, username, clientIP, clientPort, serverIP, serverPort, nil)
 //	if err != nil {
 //		// Handle error (all backends unhealthy?)
 //	}

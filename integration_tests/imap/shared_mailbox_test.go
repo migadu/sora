@@ -18,64 +18,55 @@ import (
 func TestNamespace_SharedMailboxSupport(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// TODO: Need to implement SetupIMAPServerWithConfig that allows config modifications
-	// For now, skip this test
-	t.Skip("Requires SetupIMAPServerWithConfig implementation")
+	// SetupIMAPServer already enables shared mailboxes with "Shared/" prefix
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
 
-	// Expected code after helper is implemented:
-	/*
-		server, account := common.SetupIMAPServerWithConfig(t, func(cfg *config.Config) {
-			cfg.SharedMailboxes.Enabled = true
-			cfg.SharedMailboxes.NamespacePrefix = "Shared/"
-		})
-		defer server.Close()
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
 
-		c, err := imapclient.DialInsecure(server.Address, nil)
-		if err != nil {
-			t.Fatalf("Failed to dial IMAP server: %v", err)
-		}
-		defer c.Logout()
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
 
-		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-			t.Fatalf("Login failed: %v", err)
-		}
+	// Test NAMESPACE command
+	namespaceCmd := c.Namespace()
+	namespaceData, err := namespaceCmd.Wait()
+	if err != nil {
+		t.Fatalf("NAMESPACE command failed: %v", err)
+	}
 
-		// Test NAMESPACE command
-		namespaceCmd := c.Namespace()
-		namespaceData, err := namespaceCmd.Wait()
-		if err != nil {
-			t.Fatalf("NAMESPACE command failed: %v", err)
-		}
+	// Verify Personal namespace
+	if len(namespaceData.Personal) != 1 {
+		t.Fatalf("Expected 1 personal namespace, got %d", len(namespaceData.Personal))
+	}
+	if namespaceData.Personal[0].Prefix != "" {
+		t.Errorf("Personal namespace prefix should be empty, got %q", namespaceData.Personal[0].Prefix)
+	}
+	if namespaceData.Personal[0].Delim != '/' {
+		t.Errorf("Personal namespace delimiter should be '/', got %q", namespaceData.Personal[0].Delim)
+	}
 
-		// Verify Personal namespace
-		if len(namespaceData.Personal) != 1 {
-			t.Fatalf("Expected 1 personal namespace, got %d", len(namespaceData.Personal))
-		}
-		if namespaceData.Personal[0].Prefix != "" {
-			t.Errorf("Personal namespace prefix should be empty, got %q", namespaceData.Personal[0].Prefix)
-		}
-		if namespaceData.Personal[0].Delim != '/' {
-			t.Errorf("Personal namespace delimiter should be '/', got %q", namespaceData.Personal[0].Delim)
-		}
+	// Verify Shared namespace
+	if len(namespaceData.Shared) != 1 {
+		t.Fatalf("Expected 1 shared namespace, got %d", len(namespaceData.Shared))
+	}
+	if namespaceData.Shared[0].Prefix != "Shared/" {
+		t.Errorf("Shared namespace prefix should be 'Shared/', got %q", namespaceData.Shared[0].Prefix)
+	}
+	if namespaceData.Shared[0].Delim != '/' {
+		t.Errorf("Shared namespace delimiter should be '/', got %q", namespaceData.Shared[0].Delim)
+	}
 
-		// Verify Shared namespace
-		if len(namespaceData.Shared) != 1 {
-			t.Fatalf("Expected 1 shared namespace, got %d", len(namespaceData.Shared))
-		}
-		if namespaceData.Shared[0].Prefix != "Shared/" {
-			t.Errorf("Shared namespace prefix should be 'Shared/', got %q", namespaceData.Shared[0].Prefix)
-		}
-		if namespaceData.Shared[0].Delim != '/' {
-			t.Errorf("Shared namespace delimiter should be '/', got %q", namespaceData.Shared[0].Delim)
-		}
+	// Verify Other namespace is nil
+	if namespaceData.Other != nil {
+		t.Errorf("Other namespace should be nil, got %v", namespaceData.Other)
+	}
 
-		// Verify Other namespace is nil
-		if namespaceData.Other != nil {
-			t.Errorf("Other namespace should be nil, got %v", namespaceData.Other)
-		}
-
-		t.Logf("✓ NAMESPACE command returned correct data with shared mailbox support")
-	*/
+	t.Logf("✓ NAMESPACE command returned correct data with shared mailbox support")
 }
 
 // TestSharedMailbox_CreateAndList tests creating a shared mailbox and listing it
@@ -608,7 +599,7 @@ func TestSharedMailbox_CrossDomainRestriction(t *testing.T) {
 	t.Logf("✓ Cross-domain test infrastructure ready")
 
 	// TODO: When ACL implementation is complete, verify that:
-	// - GrantMailboxAccess returns error for cross-domain access
+	// - GrantMailboxAccessByIdentifier returns error for cross-domain access
 	// - User2 cannot see User1's shared mailboxes
 }
 

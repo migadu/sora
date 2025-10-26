@@ -525,7 +525,6 @@ func setupTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
 	cfg := &config.DatabaseConfig{
-		LogQueries: false,
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     "5432",
@@ -576,7 +575,6 @@ func runMigrations(t *testing.T, rdb *resilient.ResilientDatabase) error {
 
 	// Recreate the database connection to trigger fresh migrations
 	cfg := &config.DatabaseConfig{
-		LogQueries: false,
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     "5432",

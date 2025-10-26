@@ -217,59 +217,9 @@ func (rd *ResilientDatabase) GetUniqueCustomFlagsForMailboxWithRetry(ctx context
 
 // --- ACL (Access Control List) Wrappers ---
 
-func (rd *ResilientDatabase) GrantMailboxAccessWithRetry(ctx context.Context, ownerAccountID, granteeAccountID int64, mailboxName string, rights string) error {
-	// GrantMailboxAccess already begins its own transaction, so we can't use executeWriteInTxWithRetry
-	// Instead, call it directly with retry logic
-	config := writeRetryConfig
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		opErr := rd.getOperationalDatabaseForOperation(true).GrantMailboxAccess(writeCtx, ownerAccountID, granteeAccountID, mailboxName, rights)
-		if opErr != nil {
-			if !rd.isRetryableError(opErr) {
-				return retry.Stop(opErr)
-			}
-			return opErr
-		}
-		return nil
-	}, config)
-	return err
-}
-
-func (rd *ResilientDatabase) RevokeMailboxAccessWithRetry(ctx context.Context, mailboxID, accountID int64) error {
-	config := writeRetryConfig
-	err := retry.WithRetryAdvanced(ctx, func() error {
-		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
-		defer cancel()
-
-		opErr := rd.getOperationalDatabaseForOperation(true).RevokeMailboxAccess(writeCtx, mailboxID, accountID)
-		if opErr != nil {
-			if !rd.isRetryableError(opErr) {
-				return retry.Stop(opErr)
-			}
-			return opErr
-		}
-		return nil
-	}, config)
-	return err
-}
-
-func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailboxID int64) ([]db.ACLEntry, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMailboxACLs(ctx, mailboxID)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []db.ACLEntry{}, nil
-	}
-	return result.([]db.ACLEntry), nil
-}
-
 func (rd *ResilientDatabase) GrantMailboxAccessByIdentifierWithRetry(ctx context.Context, ownerAccountID int64, identifier string, mailboxName string, rights string) error {
+	// GrantMailboxAccessByIdentifier already begins its own transaction, so we can't use executeWriteInTxWithRetry
+	// Instead, call it directly with retry logic
 	config := writeRetryConfig
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
@@ -303,6 +253,20 @@ func (rd *ResilientDatabase) RevokeMailboxAccessByIdentifierWithRetry(ctx contex
 		return nil
 	}, config)
 	return err
+}
+
+func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailboxID int64) ([]db.ACLEntry, error) {
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetMailboxACLs(ctx, mailboxID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.ACLEntry{}, nil
+	}
+	return result.([]db.ACLEntry), nil
 }
 
 func (rd *ResilientDatabase) CheckMailboxPermissionWithRetry(ctx context.Context, mailboxID, accountID int64, right db.ACLRight) (bool, error) {

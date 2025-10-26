@@ -106,8 +106,7 @@ func TestSharedMailbox_OtherUserWithACLCanList(t *testing.T) {
 
 	// Grant user2 access via ACL
 	ownerID, _ := server.ResilientDB.GetAccountIDByAddressWithRetry(context.Background(), owner.Email)
-	user2ID, _ := server.ResilientDB.GetAccountIDByAddressWithRetry(context.Background(), user2.Email)
-	err = server.ResilientDB.GrantMailboxAccessWithRetry(context.Background(), ownerID, user2ID, sharedMailbox, "lr")
+	err = server.ResilientDB.GrantMailboxAccessByIdentifierWithRetry(context.Background(), ownerID, user2.Email, sharedMailbox, "lr")
 	require.NoError(t, err, "Failed to grant ACL")
 
 	// User2 should now see the shared mailbox in LIST

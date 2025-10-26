@@ -771,7 +771,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
 	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
 	tempConfig := &config.DatabaseConfig{
-		LogQueries: logQueries,
+		Debug: logQueries,
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:           []string{host},
 			Port:            endpointConfig.Port,

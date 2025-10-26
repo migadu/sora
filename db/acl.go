@@ -63,22 +63,6 @@ func IsSpecialIdentifier(identifier string) bool {
 	return identifier == AnyoneIdentifier
 }
 
-// GrantMailboxAccess grants access to a mailbox for a user with specified rights
-// Enforces same-domain restriction for security
-// Deprecated: Use GrantMailboxAccessByIdentifier for new code
-func (db *Database) GrantMailboxAccess(ctx context.Context, ownerAccountID, granteeAccountID int64, mailboxName string, rights string) error {
-	// Get grantee's email address
-	var granteeEmail string
-	err := db.GetReadPool().QueryRow(ctx, `
-		SELECT address FROM credentials WHERE account_id = $1 AND primary_identity = TRUE
-	`, granteeAccountID).Scan(&granteeEmail)
-	if err != nil {
-		return fmt.Errorf("failed to get grantee email: %w", err)
-	}
-
-	return db.GrantMailboxAccessByIdentifier(ctx, ownerAccountID, granteeEmail, mailboxName, rights)
-}
-
 // GrantMailboxAccessByIdentifier grants access to a mailbox using an identifier (email or "anyone")
 // Enforces same-domain restriction for security
 func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAccountID int64, identifier string, mailboxName string, rights string) error {
@@ -174,23 +158,6 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
-// RevokeMailboxAccess removes ACL entry for a user
-// Deprecated: Use RevokeMailboxAccessByIdentifier for new code
-func (db *Database) RevokeMailboxAccess(ctx context.Context, mailboxID, accountID int64) error {
-	result, err := db.GetWritePool().Exec(ctx, `
-		DELETE FROM mailbox_acls WHERE mailbox_id = $1 AND account_id = $2
-	`, mailboxID, accountID)
-	if err != nil {
-		return fmt.Errorf("failed to revoke access: %w", err)
-	}
-
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("ACL entry not found")
 	}
 
 	return nil

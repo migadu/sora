@@ -51,8 +51,7 @@ type DatabaseEndpointConfig struct {
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
 type DatabaseConfig struct {
-	Debug            bool                    `toml:"debug"`             // Enable SQL query logging (replaces log_queries)
-	LogQueries       bool                    `toml:"log_queries"`       // DEPRECATED: Use debug instead
+	Debug            bool                    `toml:"debug"`             // Enable SQL query logging
 	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
 	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
@@ -94,10 +93,9 @@ func (d *DatabaseConfig) GetQueryTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(d.QueryTimeout)
 }
 
-// GetDebug returns the debug flag with backward compatibility
+// GetDebug returns the debug flag
 func (d *DatabaseConfig) GetDebug() bool {
-	// Check new field first, fall back to deprecated LogQueries
-	return d.Debug || d.LogQueries
+	return d.Debug
 }
 
 // GetSearchTimeout parses the search timeout duration
@@ -131,16 +129,14 @@ type S3Config struct {
 	AccessKey     string `toml:"access_key"`
 	SecretKey     string `toml:"secret_key"`
 	Bucket        string `toml:"bucket"`
-	Debug         bool   `toml:"debug"` // Enable detailed S3 request/response tracing (replaces trace)
-	Trace         bool   `toml:"trace"` // DEPRECATED: Use debug instead
+	Debug         bool   `toml:"debug"` // Enable detailed S3 request/response tracing
 	Encrypt       bool   `toml:"encrypt"`
 	EncryptionKey string `toml:"encryption_key"`
 }
 
-// GetDebug returns the debug flag with backward compatibility
+// GetDebug returns the debug flag
 func (s *S3Config) GetDebug() bool {
-	// Check new field first, fall back to deprecated Trace
-	return s.Debug || s.Trace
+	return s.Debug
 }
 
 // ClusterRateLimitSyncConfig holds configuration for cluster-wide auth rate limiting
@@ -1143,16 +1139,6 @@ type ServerConfig struct {
 	// Pre-lookup (embedded)
 	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
 
-	// DEPRECATED: Backward compatibility fields (kept for migration)
-	// These fields are deprecated and will be removed in a future version.
-	// Use server.limits and server.timeouts sections instead.
-	SearchRateLimitPerMin  int    `toml:"search_rate_limit_per_min,omitempty"` // DEPRECATED: Use limits.search_rate_limit_per_min
-	SearchRateLimitWindow  string `toml:"search_rate_limit_window,omitempty"`  // DEPRECATED: Use limits.search_rate_limit_window
-	SessionMemoryLimit     string `toml:"session_memory_limit,omitempty"`      // DEPRECATED: Use limits.session_memory_limit
-	CommandTimeout         string `toml:"command_timeout,omitempty"`           // DEPRECATED: Use timeouts.command_timeout
-	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"`  // DEPRECATED: Use timeouts.absolute_session_timeout
-	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`      // DEPRECATED: Use timeouts.min_bytes_per_minute
-
 	// Client capability filtering (IMAP specific)
 	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`
 	DisabledCaps  []string                 `toml:"disabled_caps,omitempty"` // Globally disabled capabilities (IMAP specific)
@@ -1243,7 +1229,6 @@ func NewDefaultConfig() Config {
 			QueryTimeout:  "30s",
 			SearchTimeout: "1m",
 			WriteTimeout:  "15s",
-			LogQueries:    false,
 			Write: &DatabaseEndpointConfig{
 				Hosts:           []string{"localhost"},
 				Port:            "5432",
@@ -1673,85 +1658,58 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
-	// Check new location first
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
 		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
 	}
-	// Fall back to old location for backward compatibility
-	if s.SearchRateLimitWindow == "" {
-		return time.Minute, nil // Default: 1 minute
-	}
-	return helpers.ParseDuration(s.SearchRateLimitWindow)
+	return time.Minute, nil // Default: 1 minute
 }
 
 // GetSessionMemoryLimit parses the session memory limit
 func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
-	// Check new location first
 	if s.Limits != nil && s.Limits.SessionMemoryLimit != "" {
 		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
 	}
-	// Fall back to old location for backward compatibility
-	if s.SessionMemoryLimit == "" {
-		return 100 * 1024 * 1024, nil // Default: 100MB
-	}
-	return helpers.ParseSize(s.SessionMemoryLimit)
+	return 100 * 1024 * 1024, nil // Default: 100MB
 }
 
 // GetCommandTimeout parses the command timeout duration with protocol-specific defaults
 func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
-	// Check new location first
 	if s.Timeouts != nil && s.Timeouts.CommandTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.CommandTimeout)
 	}
-	// Fall back to old location for backward compatibility
-	if s.CommandTimeout == "" {
-		// Protocol-specific defaults
-		switch s.Type {
-		case "pop3", "pop3_proxy":
-			return 2 * time.Minute, nil // 2 minutes for POP3
-		case "imap", "imap_proxy":
-			return 5 * time.Minute, nil // 5 minutes for IMAP
-		case "managesieve", "managesieve_proxy":
-			return 3 * time.Minute, nil // 3 minutes for ManageSieve
-		default:
-			return 2 * time.Minute, nil // Default: 2 minutes
-		}
+	// Protocol-specific defaults
+	switch s.Type {
+	case "pop3", "pop3_proxy":
+		return 2 * time.Minute, nil // 2 minutes for POP3
+	case "imap", "imap_proxy":
+		return 5 * time.Minute, nil // 5 minutes for IMAP
+	case "managesieve", "managesieve_proxy":
+		return 3 * time.Minute, nil // 3 minutes for ManageSieve
+	default:
+		return 2 * time.Minute, nil // Default: 2 minutes
 	}
-	return helpers.ParseDuration(s.CommandTimeout)
 }
 
 // GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 30 minutes for all protocols)
 func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
-	// Check new location first
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	// Fall back to old location for backward compatibility
-	if s.AbsoluteSessionTimeout == "" {
-		return 30 * time.Minute, nil // Default: 30 minutes for all protocols
-	}
-	return helpers.ParseDuration(s.AbsoluteSessionTimeout)
+	return 30 * time.Minute, nil // Default: 30 minutes for all protocols
 }
 
-// GetSearchRateLimitPerMin returns search rate limit per minute with backward compatibility
+// GetSearchRateLimitPerMin returns search rate limit per minute
 func (s *ServerConfig) GetSearchRateLimitPerMin() int {
-	// Check new location first
 	if s.Limits != nil && s.Limits.SearchRateLimitPerMin > 0 {
 		return s.Limits.SearchRateLimitPerMin
 	}
-	// Fall back to old location for backward compatibility
-	return s.SearchRateLimitPerMin
+	return 0
 }
 
-// GetMinBytesPerMinute returns minimum bytes per minute with backward compatibility
+// GetMinBytesPerMinute returns minimum bytes per minute
 func (s *ServerConfig) GetMinBytesPerMinute() int64 {
-	// Check new location first
 	if s.Timeouts != nil && s.Timeouts.MinBytesPerMinute > 0 {
 		return s.Timeouts.MinBytesPerMinute
-	}
-	// Fall back to old location for backward compatibility
-	if s.MinBytesPerMinute > 0 {
-		return s.MinBytesPerMinute
 	}
 	return 1024 // Default: 1024 bytes/min
 }
