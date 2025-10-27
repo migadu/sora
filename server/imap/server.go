@@ -580,6 +580,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			ServerName:               hostname,
 			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
 			NextProtos:               []string{"imap"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		// This setting on the server listener is intended to control client certificate

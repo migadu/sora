@@ -167,6 +167,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			ServerName:               hostname,
 			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
 			NextProtos:               []string{"pop3"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		// Set InsecureSkipVerify if requested (for self-signed certificates)

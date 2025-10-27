@@ -264,6 +264,7 @@ func (s *Server) Start() error {
 			ServerName:               s.hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"imap"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		s.listenerMu.Lock()

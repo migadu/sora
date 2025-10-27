@@ -285,6 +285,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"lmtp"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		if !options.TLSVerify {

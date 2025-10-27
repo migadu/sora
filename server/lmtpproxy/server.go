@@ -222,6 +222,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"lmtp"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {
 		// Scenario 2: Global TLS manager

@@ -254,6 +254,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"pop3"},
+			Renegotiation:            tls.RenegotiateNever,
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager
