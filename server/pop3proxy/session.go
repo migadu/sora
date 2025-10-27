@@ -419,7 +419,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	if s.server.debug {
 		log.Printf("POP3 Proxy [%s] Authenticating user %s via main database", s.server.name, username)
 	}
-	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
+	// Use base address (without +detail) for authentication
+	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()

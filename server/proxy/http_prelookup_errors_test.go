@@ -383,3 +383,166 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 	t.Logf("✓ Circuit breaker half-open state correctly returns ErrPrelookupTransient for rate-limited requests")
 	t.Logf("  Final state: %s", client.breaker.State())
 }
+
+// TestHTTPPrelookupInvalidEmail verifies that invalid email addresses are rejected early
+// without making HTTP requests
+func TestHTTPPrelookupInvalidEmail(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"address":       "user@example.com",
+			"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+			"server":        "backend:143",
+		})
+	}))
+	defer server.Close()
+
+	client := NewHTTPPreLookupClient(
+		server.URL+"/lookup?email=$email",
+		5*time.Second,
+		"test-token",
+		143,
+		false, // remoteTLS
+		false, // remoteTLSUseStartTLS
+		false, // remoteTLSVerify
+		false, // remoteUseProxyProtocol
+		false, // remoteUseIDCommand
+		false, // remoteUseXCLIENT
+		nil,   // cache
+		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
+	)
+
+	invalidCases := []struct {
+		email       string
+		description string
+	}{
+		{"bennai+yamina", "username without domain"},
+		{"user", "username without @ symbol"},
+		{"", "empty string"},
+		{"   ", "whitespace only"},
+		{"user @example.com", "space before domain"},
+		{"user@ example.com", "space after @"},
+		{"user @example.com", "space before and after @"},
+		{"user@exam ple.com", "space in domain"},
+		{"us er@example.com", "space in local part"},
+		{"user\t@example.com", "internal tab character"},
+		{"user@exam\nple.com", "internal newline character"},
+	}
+
+	ctx := context.Background()
+
+	// Test invalid emails - should be rejected without HTTP request
+	for _, tc := range invalidCases {
+		t.Run(tc.description, func(t *testing.T) {
+			initialCount := requestCount
+			routingInfo, authResult, err := client.LookupUserRoute(ctx, tc.email, "testpassword")
+
+			// Should return AuthFailed (not AuthUserNotFound) to prevent fallback to database auth
+			if authResult != AuthFailed {
+				t.Errorf("Expected AuthFailed for '%s', got %v", tc.email, authResult)
+			}
+
+			if routingInfo != nil {
+				t.Errorf("Expected nil routing info for invalid email '%s', got %+v", tc.email, routingInfo)
+			}
+
+			if err != nil {
+				t.Errorf("Expected no error for invalid email '%s', got %v", tc.email, err)
+			}
+
+			if requestCount != initialCount {
+				t.Errorf("HTTP request was made for invalid email '%s' (request count: %d -> %d)", tc.email, initialCount, requestCount)
+			}
+
+			t.Logf("✓ Invalid email '%s' rejected with AuthFailed (no HTTP request, no DB fallback)", tc.email)
+		})
+	}
+
+	// Test emails with leading/trailing whitespace - should be trimmed and make HTTP request
+	trimCases := []struct {
+		email       string
+		description string
+	}{
+		{"  user@example.com  ", "leading and trailing spaces"},
+		{" user@example.com", "leading space"},
+		{"user@example.com ", "trailing space"},
+		{"\tuser@example.com\t", "leading and trailing tabs"},
+		{"user@example.com\n", "trailing newline"},
+		{"\nuser@example.com", "leading newline"},
+	}
+
+	for _, tc := range trimCases {
+		t.Run("trim_"+tc.description, func(t *testing.T) {
+			initialCount := requestCount
+			client.LookupUserRoute(ctx, tc.email, "testpassword")
+
+			if requestCount == initialCount {
+				t.Errorf("Email '%s' should have been trimmed and made HTTP request", tc.email)
+			} else {
+				t.Logf("✓ Email '%s' trimmed correctly and made HTTP request", tc.email)
+			}
+		})
+	}
+
+	// Verify valid email DOES make a request
+	initialCount := requestCount
+	client.LookupUserRoute(ctx, "user@example.com", "testpassword")
+	if requestCount == initialCount {
+		t.Error("Valid email should have made HTTP request")
+	} else {
+		t.Logf("✓ Valid email made HTTP request as expected")
+	}
+
+	// Verify master token format (multiple @) is allowed and makes HTTP request
+	initialCount = requestCount
+	routingInfo, authResult, err := client.LookupUserRoute(ctx, "user@example.com@TOKEN", "testpassword")
+	if authResult == AuthFailed && routingInfo == nil && err == nil && requestCount == initialCount {
+		t.Error("Master token format should not be rejected as invalid (should make HTTP request)")
+	} else if requestCount == initialCount {
+		t.Error("Master token format should have made HTTP request")
+	} else {
+		t.Logf("✓ Master token format (user@example.com@TOKEN) allowed and made HTTP request")
+	}
+
+	// Verify +detail addressing is stripped before making HTTP request
+	t.Run("plus_addressing_stripped", func(t *testing.T) {
+		client := NewHTTPPreLookupClient(
+			server.URL+"/lookup?email=$email",
+			5*time.Second,
+			"test-token",
+			143,
+			false, // remoteTLS
+			false, // remoteTLSUseStartTLS
+			false, // remoteTLSVerify
+			false, // remoteUseProxyProtocol
+			false, // remoteUseIDCommand
+			false, // remoteUseXCLIENT
+			nil,   // cache
+			nil,   // circuit breaker settings (use defaults)
+			nil,   // transport settings (use defaults)
+		)
+
+		// Test that user+tag@example.com sends user@example.com to HTTP endpoint
+		initialCount := requestCount
+		client.LookupUserRoute(ctx, "user+tag@example.com", "testpassword")
+
+		if requestCount == initialCount {
+			t.Error("Should have made HTTP request for +detail address")
+		} else {
+			t.Logf("✓ Email with +detail (user+tag@example.com) made HTTP request")
+		}
+
+		// Test that user+tag@example.com@TOKEN sends user@example.com@TOKEN (strip +tag, keep @TOKEN)
+		initialCount = requestCount
+		client.LookupUserRoute(ctx, "user+tag@example.com@TOKEN", "testpassword")
+
+		if requestCount == initialCount {
+			t.Error("Should have made HTTP request for +detail address with master token")
+		} else {
+			t.Logf("✓ Email with +detail and master token (user+tag@example.com@TOKEN) made HTTP request")
+		}
+	})
+}

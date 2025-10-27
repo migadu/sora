@@ -293,7 +293,8 @@ func (s *POP3Session) handleConnection() {
 
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
-				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.FullAddress(), password)
+				// Use base address (without +detail) for authentication
+				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.BaseAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -1374,7 +1375,7 @@ func (s *POP3Session) handleConnection() {
 					}
 				}
 
-				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
+				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {

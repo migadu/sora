@@ -135,7 +135,7 @@ func (h *AffinityHTTPHandler) handleGet(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleList lists all affinities (if supported by AffinityManager)
-func (h *AffinityHTTPHandler) handleList(w http.ResponseWriter, r *http.Request) {
+func (h *AffinityHTTPHandler) handleList(w http.ResponseWriter, _ *http.Request) {
 	// Get affinity manager
 	affinityMgr := h.connManager.GetAffinityManager()
 	if affinityMgr == nil {

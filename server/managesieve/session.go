@@ -201,7 +201,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
-				userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
+				userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.BaseAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -1134,7 +1134,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			}
 		}
 
-		userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.FullAddress(), password)
+		userID, err = s.server.rdb.AuthenticateWithRetry(s.ctx, address.BaseAddress(), password)
 		if err != nil {
 			// Record failed attempt
 			if s.server.authLimiter != nil {

@@ -4396,7 +4396,7 @@ Use 'sora-admin config <subcommand> --help' for detailed help.
 `)
 }
 
-func handleConfigValidate(ctx context.Context) {
+func handleConfigValidate(_ context.Context) {
 	// Parse config-validate specific flags
 	var configFile string
 
@@ -4499,7 +4499,7 @@ Examples:
 	}
 }
 
-func handleConfigDump(ctx context.Context) {
+func handleConfigDump(_ context.Context) {
 	// Parse config-dump specific flags
 	var configFile, format string
 	var maskSecrets bool
@@ -5107,7 +5107,7 @@ Examples:
 	}
 }
 
-func handleListAffinity(ctx context.Context) {
+func handleListAffinity(_ context.Context) {
 	fmt.Println("List operation not yet supported - affinities are distributed via gossip.")
 	fmt.Println("Use 'get' with specific user/protocol to check individual affinities.")
 }

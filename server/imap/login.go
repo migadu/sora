@@ -113,7 +113,8 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	s.Log("[LOGIN] authentication attempt with address %s", addressSt.FullAddress())
 
-	userID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.FullAddress(), password)
+	// Use base address (without +detail) for authentication
+	userID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.BaseAddress(), password)
 	if err != nil {
 		s.Log("[LOGIN] authentication failed: %v", err)
 

@@ -2273,13 +2273,13 @@ func enhanceConfigError(err error) error {
 	// Check for common boolean typos
 	if strings.Contains(errMsg, "expected value but found \"f\"") ||
 		strings.Contains(errMsg, "expected value but found \"t\"") {
-		return fmt.Errorf("%w\n\nHINT: Invalid boolean value in your TOML configuration file.\n"+
+		return fmt.Errorf("%w\n\nHINT: Invalid boolean value in your TOML configuration file\n"+
 			"Common mistakes:\n"+
 			"  - Using 'f' instead of 'false'\n"+
 			"  - Using 't' instead of 'true'\n"+
 			"  - Using 'yes'/'no' instead of 'true'/'false'\n"+
 			"  - Using '1'/'0' instead of 'true'/'false'\n\n"+
-			"In TOML, boolean values must be exactly 'true' or 'false' (lowercase, unquoted).", err)
+			"In TOML, boolean values must be exactly 'true' or 'false' (lowercase, unquoted)", err)
 	}
 
 	// Check for invalid TOML syntax
@@ -2295,21 +2295,6 @@ func enhanceConfigError(err error) error {
 
 	// Return original error if we don't have specific guidance
 	return err
-}
-
-// extractLineNumber extracts line number from TOML error message
-// Format: "toml: line X (last key "key.name"): error message"
-func extractLineNumber(errMsg string) int {
-	if strings.Contains(errMsg, "line ") {
-		parts := strings.Split(errMsg, "line ")
-		if len(parts) >= 2 {
-			numPart := strings.Split(parts[1], " ")[0]
-			if n, err := strconv.Atoi(numPart); err == nil {
-				return n
-			}
-		}
-	}
-	return 0
 }
 
 // trimStringFields recursively trims whitespace from all string fields in a struct

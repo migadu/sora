@@ -501,7 +501,8 @@ func (s *Session) authenticateUser(username, password string) error {
 	if s.server.debug {
 		log.Printf("ManageSieve Proxy [%s] [DEBUG] Authenticating user %s via main database", s.server.name, username)
 	}
-	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.FullAddress(), password)
+	// Use base address (without +detail) for authentication
+	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 	if err != nil {
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
