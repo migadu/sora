@@ -66,6 +66,7 @@ type ManageSieveServerOptions struct {
 	TLSKeyFile             string
 	TLSVerify              bool
 	TLSUseStartTLS         bool
+	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	MaxScriptSize          int64
 	SupportedExtensions    []string // List of supported Sieve extensions
 	MasterSASLUsername     string
@@ -156,8 +157,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
-	// Set up TLS config if TLS is enabled and certificates are provided
+	// Set up TLS config: Support both file-based certificates and global TLS manager
+	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
+	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
+	// 3. No TLS: options.TLS=false
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+		// Scenario 1: Per-server TLS with explicit cert files
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			serverCancel()
@@ -182,6 +187,13 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			serverInstance.tlsConfig.InsecureSkipVerify = true
 			log.Printf("ManageSieve [%s] WARNING: TLS certificate verification disabled", name)
 		}
+	} else if options.TLS && options.TLSConfig != nil {
+		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
+		serverInstance.tlsConfig = options.TLSConfig
+	} else if options.TLS {
+		// TLS enabled but no cert files and no global TLS config provided
+		serverCancel()
+		return nil, fmt.Errorf("TLS enabled for ManageSieve [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
 	}
 
 	// Start connection limiter cleanup

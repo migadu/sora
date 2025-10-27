@@ -198,11 +198,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		supportedExtensions:    opts.SupportedExtensions,
 	}
 
-	// Setup TLS config: Three scenarios
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided
-	// 3. No implicit TLS (may use STARTTLS): opts.TLS=false or opts.TLSUseStartTLS=true
-	if opts.TLS && !opts.TLSUseStartTLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
+	// Setup TLS config: Support both implicit TLS and STARTTLS
+	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
+	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
+	// 3. No TLS: opts.TLS=false
+	if opts.TLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
 		// Scenario 1: Per-server TLS with explicit cert files
 		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
 		if err != nil {
@@ -221,12 +221,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"sieve"},
-			Renegotiation:            tls.RenegotiateNever,
 		}
-	} else if opts.TLS && !opts.TLSUseStartTLS && opts.TLSConfig != nil {
-		// Scenario 2: Global TLS manager
+		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
+		if !opts.TLSUseStartTLS {
+			s.tlsConfig.Renegotiation = tls.RenegotiateNever
+		}
+	} else if opts.TLS && opts.TLSConfig != nil {
+		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
 		s.tlsConfig = opts.TLSConfig
-	} else if opts.TLS && !opts.TLSUseStartTLS {
+	} else if opts.TLS {
 		// TLS enabled but no cert files and no global TLS config provided
 		cancel()
 		return nil, fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)

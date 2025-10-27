@@ -762,6 +762,12 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		maxMessageSize = 50 * 1024 * 1024
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		ExternalRelay:        serverConfig.ExternalRelay,
 		TLSVerify:            serverConfig.TLSVerify,
@@ -769,6 +775,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		TLSCertFile:          serverConfig.TLSCertFile,
 		TLSKeyFile:           serverConfig.TLSKeyFile,
 		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
+		TLSConfig:            tlsConfig,
 		Debug:                serverConfig.Debug,
 		MaxConnections:       serverConfig.MaxConnections,
 		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
@@ -889,6 +896,12 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+	}
+
 	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
 		InsecureAuth:           serverConfig.InsecureAuth,
 		TLSVerify:              serverConfig.TLSVerify,
@@ -896,6 +909,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		TLSCertFile:            serverConfig.TLSCertFile,
 		TLSKeyFile:             serverConfig.TLSKeyFile,
 		TLSUseStartTLS:         serverConfig.TLSUseStartTLS,
+		TLSConfig:              tlsConfig,
 		Debug:                  serverConfig.Debug,
 		MaxScriptSize:          maxSize,
 		SupportedExtensions:    serverConfig.SupportedExtensions,
