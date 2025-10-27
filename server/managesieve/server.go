@@ -113,6 +113,13 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		return nil, fmt.Errorf("invalid ManageSieve configuration: %w", err)
 	}
 
+	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
+	if !options.TLS && options.TLSUseStartTLS {
+		log.Printf("ManageSieve [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", name)
+		// Force TLSUseStartTLS to false to avoid confusion
+		options.TLSUseStartTLS = false
+	}
+
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
 
@@ -175,12 +182,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"sieve"},
-		}
-
-		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
-		// STARTTLS upgrades an existing plaintext connection and doesn't support renegotiation setting
-		if !options.TLSUseStartTLS {
-			serverInstance.tlsConfig.Renegotiation = tls.RenegotiateNever
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		if !options.TLSVerify {

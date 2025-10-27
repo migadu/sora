@@ -244,9 +244,9 @@ func (s *Session) handleConnection() {
 				}
 
 				tlsConfig = &tls.Config{
-					Certificates: []tls.Certificate{cert},
-					ClientAuth:   tls.NoClientCert,
-					// Don't set Renegotiation for STARTTLS - it breaks the upgrade handshake
+					Certificates:  []tls.Certificate{cert},
+					ClientAuth:    tls.NoClientCert,
+					Renegotiation: tls.RenegotiateNever,
 				}
 				if s.server.tlsVerify {
 					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert

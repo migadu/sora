@@ -241,6 +241,13 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		}
 	}
 
+	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
+	if !options.TLS && options.TLSUseStartTLS {
+		log.Printf("LMTP [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", name)
+		// Force TLSUseStartTLS to false to avoid confusion
+		options.TLSUseStartTLS = false
+	}
+
 	backend := &LMTPServerBackend{
 		addr:           addr,
 		name:           name,
@@ -291,12 +298,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"lmtp"},
-		}
-
-		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
-		// STARTTLS upgrades an existing plaintext connection and doesn't support renegotiation setting
-		if !options.TLSUseStartTLS {
-			backend.tlsConfig.Renegotiation = tls.RenegotiateNever
+			Renegotiation:            tls.RenegotiateNever,
 		}
 
 		if !options.TLSVerify {

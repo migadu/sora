@@ -121,6 +121,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		opts.PreLookup = &config.PreLookupConfig{}
 	}
 
+	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
+	if !opts.TLS && opts.TLSUseStartTLS {
+		log.Printf("ManageSieve Proxy [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", opts.Name)
+		// Force TLSUseStartTLS to false to avoid confusion
+		opts.TLSUseStartTLS = false
+	}
+
 	// Initialize prelookup client if configured
 	routingLookup, err := proxy.InitializePrelookup(opts.PreLookup)
 	if err != nil {
@@ -221,10 +228,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"sieve"},
-		}
-		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
-		if !opts.TLSUseStartTLS {
-			s.tlsConfig.Renegotiation = tls.RenegotiateNever
+			Renegotiation:            tls.RenegotiateNever,
 		}
 	} else if opts.TLS && opts.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)

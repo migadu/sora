@@ -80,9 +80,10 @@ func (m *Manager) initFileProvider() error {
 	}
 
 	m.tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		Certificates:  []tls.Certificate{cert},
+		MinVersion:    tls.VersionTLS12,
+		NextProtos:    []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		Renegotiation: tls.RenegotiateNever,
 	}
 
 	logger.Infof("Loaded TLS certificate from files: cert=%s, key=%s", m.config.CertFile, m.config.KeyFile)
@@ -241,8 +242,9 @@ func (m *Manager) initLetsEncryptProvider() error {
 			logger.Debugf("[TLS] Certificate provided for: %s", serverName)
 			return cert, nil
 		},
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		MinVersion:    tls.VersionTLS12,
+		NextProtos:    []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		Renegotiation: tls.RenegotiateNever,
 	}
 
 	logger.Infof("Let's Encrypt autocert initialized for domains: %v", leCfg.Domains)
