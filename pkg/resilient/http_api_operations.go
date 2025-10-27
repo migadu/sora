@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 )
 
@@ -33,17 +32,6 @@ func (rd *ResilientDatabase) GetActiveConnectionsWithRetry(ctx context.Context) 
 		return []db.ConnectionInfo{}, nil
 	}
 	return result.([]db.ConnectionInfo), nil
-}
-
-func (rd *ResilientDatabase) MarkConnectionsForTerminationWithRetry(ctx context.Context, criteria db.TerminationCriteria) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(true).MarkConnectionsForTermination(ctx, tx, criteria)
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, apiRetryConfig, timeoutWrite, op)
-	if err != nil {
-		return 0, err
-	}
-	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) GetConnectionStatsWithRetry(ctx context.Context) (*db.ConnectionStats, error) {
@@ -198,17 +186,6 @@ func (rd *ResilientDatabase) GetAuthAttemptsStatsWithRetry(ctx context.Context, 
 		return map[string]interface{}{}, nil
 	}
 	return result.(map[string]interface{}), nil
-}
-
-func (rd *ResilientDatabase) CleanupStaleConnectionsWithRetry(ctx context.Context, staleDuration time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(true).CleanupStaleConnections(ctx, tx, staleDuration)
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutWrite, op)
-	if err != nil {
-		return 0, err
-	}
-	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) GetBlockedIPsWithRetry(ctx context.Context, ipWindow, usernameWindow time.Duration, maxAttemptsIP, maxAttemptsUsername int) ([]map[string]interface{}, error) {

@@ -197,24 +197,9 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("pop3").Set(server.commandTimeout.Seconds())
 	}
 
-	// Initialize connection tracker for monitoring active connections
-	// Use 5 minute update interval and 10 second termination poll interval
-	// Disable batch updates (batchUpdates=false) for immediate database writes
-	// Get timeout values from config (with defaults if not configured)
-	var operationTimeout, batchFlushTimeout time.Duration
-	var maxBatchSize int
-	if options.Config != nil {
-		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
-	} else {
-		// Use safe defaults when config is not provided (e.g., in tests)
-		operationTimeout = 5 * time.Second
-		batchFlushTimeout = 1 * time.Second
-		maxBatchSize = 100
-	}
-	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
-	server.connTracker.Start()
+	// Connection tracking is only used for proxy servers with gossip/cluster mode
+	// For non-proxy (backend) servers, connection tracking is disabled
+	server.connTracker = nil
 
 	return server, nil
 }

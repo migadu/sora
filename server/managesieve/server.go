@@ -213,24 +213,9 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
 	}
 
-	// Initialize connection tracker for monitoring active connections
-	// Use 5 minute update interval and 10 second termination poll interval
-	// Disable batch updates (batchUpdates=false) for immediate database writes
-	// Get timeout values from config (with defaults if not configured)
-	var operationTimeout, batchFlushTimeout time.Duration
-	var maxBatchSize int
-	if options.Config != nil {
-		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
-	} else {
-		// Use safe defaults when config is not provided (e.g., in tests)
-		operationTimeout = 5 * time.Second
-		batchFlushTimeout = 1 * time.Second
-		maxBatchSize = 100
-	}
-	serverInstance.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
-	serverInstance.connTracker.Start()
+	// Connection tracking is only used for proxy servers with gossip/cluster mode
+	// For non-proxy (backend) servers, connection tracking is disabled
+	serverInstance.connTracker = nil
 
 	return serverInstance, nil
 }

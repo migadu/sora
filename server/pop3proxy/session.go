@@ -685,7 +685,7 @@ func (s *POP3ProxySession) registerConnection() error {
 	defer cancel()
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "POP3", s.RemoteIP, s.serverAddr, s.username, true)
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP)
 	}
 	return nil
 }
@@ -698,44 +698,19 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 		return
 	}
 
-	// New mechanism: listen for kick notifications and only update activity periodically.
-	activityTicker := time.NewTicker(30 * time.Second)
-	defer activityTicker.Stop()
-
-	kickChan := s.server.connTracker.KickChannel()
-
-	// This function only checks for termination and closes the connection if needed.
-	checkAndTerminate := func() (terminated bool) {
-		checkCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-		defer cancel()
-
-		shouldTerminate, err := s.server.connTracker.CheckTermination(checkCtx, s.accountID, "POP3", s.RemoteIP)
-		if err != nil {
-			log.Printf("POP3 Proxy [%s] Failed to check termination for %s: %v", s.server.name, s.username, err)
-			return false
-		}
-		if shouldTerminate {
-			log.Printf("POP3 Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.server.name, s.username, s.RemoteIP, s.serverAddr)
-			s.clientConn.Close()
-			s.backendConn.Close()
-			return true
-		}
-		return false
-	}
+	// Register for kick notifications
+	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {
 		select {
 		case <-kickChan:
-			log.Printf("POP3 Proxy [%s] Received kick notification for %s", s.server.name, s.username)
-			if checkAndTerminate() {
-				return
-			}
-		case <-activityTicker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to update activity for %s: %v", s.server.name, s.username, err)
-			}
-			cancel()
+			// Kick notification received - close connections
+			log.Printf("POP3 Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)",
+				s.server.name, s.username, s.RemoteIP, s.serverAddr)
+			s.clientConn.Close()
+			s.backendConn.Close()
+			return
 		case <-ctx.Done():
 			return
 		}

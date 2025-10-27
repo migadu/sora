@@ -389,9 +389,8 @@ func (s *IMAPSession) registerConnection(email string) {
 		defer cancel()
 
 		clientAddr := s.conn.NetConn().RemoteAddr().String()
-		serverAddr := s.server.addr
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "IMAP", clientAddr, serverAddr, email, false); err != nil {
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), email, "IMAP", clientAddr); err != nil {
 			s.Log("Failed to register connection: %v", err)
 		}
 	}
@@ -422,13 +421,12 @@ func (s *IMAPSession) startTerminationPoller() {
 		defer ticker.Stop()
 
 		kickChan := s.server.connTracker.KickChannel()
-		clientAddr := s.conn.NetConn().RemoteAddr().String()
 
 		checkAndTerminate := func() bool {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "IMAP", clientAddr)
+			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "IMAP")
 			if err != nil {
 				s.Log("Failed to check termination: %v", err)
 				return false

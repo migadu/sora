@@ -1215,9 +1215,8 @@ func (s *ManageSieveSession) registerConnection(email string) {
 		defer cancel()
 
 		clientAddr := (*s.conn).RemoteAddr().String()
-		serverAddr := s.server.addr
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "ManageSieve", clientAddr, serverAddr, email, false); err != nil {
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), email, "ManageSieve", clientAddr); err != nil {
 			s.Log("Failed to register connection: %v", err)
 		}
 	}
@@ -1248,13 +1247,12 @@ func (s *ManageSieveSession) startTerminationPoller() {
 		defer ticker.Stop()
 
 		kickChan := s.server.connTracker.KickChannel()
-		clientAddr := (*s.conn).RemoteAddr().String()
 
 		checkAndTerminate := func() bool {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "ManageSieve", clientAddr)
+			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "ManageSieve")
 			if err != nil {
 				s.Log("Failed to check termination: %v", err)
 				return false

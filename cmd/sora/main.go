@@ -73,19 +73,20 @@ func (sm *serverManager) Wait() {
 
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
-	storage           *storage.S3Storage
-	resilientDB       *resilient.ResilientDatabase
-	uploadWorker      *uploader.UploadWorker
-	cacheInstance     *cache.Cache
-	cleanupWorker     *cleaner.CleanupWorker
-	healthIntegration *health.HealthIntegration
-	metricsCollector  *metrics.Collector
-	clusterManager    *cluster.Manager
-	tlsManager        *tlsmanager.Manager
-	affinityManager   *serverPkg.AffinityManager
-	hostname          string
-	config            config.Config
-	serverManager     *serverManager
+	storage            *storage.S3Storage
+	resilientDB        *resilient.ResilientDatabase
+	uploadWorker       *uploader.UploadWorker
+	cacheInstance      *cache.Cache
+	cleanupWorker      *cleaner.CleanupWorker
+	healthIntegration  *health.HealthIntegration
+	metricsCollector   *metrics.Collector
+	clusterManager     *cluster.Manager
+	tlsManager         *tlsmanager.Manager
+	affinityManager    *serverPkg.AffinityManager
+	hostname           string
+	config             config.Config
+	serverManager      *serverManager
+	connectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker (for admin API kick)
 }
 
 func main() {
@@ -284,9 +285,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	deps := &serverDependencies{
-		hostname:      hostname,
-		config:        cfg,
-		serverManager: &serverManager{}, // Initialize server manager for coordinated shutdown
+		hostname:           hostname,
+		config:             cfg,
+		serverManager:      &serverManager{}, // Initialize server manager for coordinated shutdown
+		connectionTrackers: make(map[string]*proxy.ConnectionTracker),
 	}
 
 	// Initialize S3 storage if needed
@@ -469,9 +471,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
 		authAttemptsRetention := cfg.Cleanup.GetAuthAttemptsRetentionWithDefault()
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
-		staleConnectionsRetention := cfg.Cleanup.GetStaleConnectionsRetentionWithDefault()
 
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, staleConnectionsRetention)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention)
 		deps.cleanupWorker.Start(ctx)
 
 		// Initialize and start the upload worker
@@ -608,46 +609,24 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	return errChan
 }
 
-// startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol.
-func startConnectionTrackerForProxy(protocol string, serverName string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *config.ConnectionTrackingConfig, server interface {
+// startConnectionTrackerForProxy initializes and starts a gossip-based connection tracker for a given proxy protocol.
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, clusterMgr *cluster.Manager, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
-	if !trackingConfig.Enabled {
+	if clusterMgr == nil {
+		logger.Debugf("%s Proxy [%s] Connection tracking disabled (requires cluster mode).", protocol, serverName)
 		return nil
 	}
 
-	updateInterval, err := trackingConfig.GetUpdateInterval()
-	if err != nil {
-		logger.Infof("WARNING: invalid connection_tracking update_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.UpdateInterval, protocol, serverName, err)
-		updateInterval = 10 * time.Second
+	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
+
+	logger.Infof("%s Proxy [%s] Starting gossip connection tracker: instance=%s, max_per_user=%d",
+		protocol, serverName, instanceID, maxConnectionsPerUser)
+
+	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser)
+	if tracker != nil {
+		server.SetConnectionTracker(tracker)
 	}
-
-	terminationPollInterval, err := trackingConfig.GetTerminationPollInterval()
-	if err != nil {
-		logger.Infof("WARNING: invalid connection_tracking termination_poll_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.TerminationPollInterval, protocol, serverName, err)
-		terminationPollInterval = 30 * time.Second
-	}
-
-	operationTimeout := trackingConfig.GetOperationTimeoutWithDefault()
-	batchFlushTimeout := trackingConfig.GetBatchFlushTimeoutWithDefault()
-	maxBatchSize := trackingConfig.GetMaxBatchSize()
-
-	logger.Infof("%s Proxy [%s] Starting connection tracker.", protocol, serverName)
-	tracker := proxy.NewConnectionTracker(
-		protocol,
-		rdb,
-		hostname,
-		updateInterval,
-		terminationPollInterval,
-		operationTimeout,
-		batchFlushTimeout,
-		maxBatchSize,
-		trackingConfig.PersistToDB,
-		trackingConfig.BatchUpdates,
-		trackingConfig.Enabled,
-	)
-	server.SetConnectionTracker(tracker)
-	tracker.Start()
 	return tracker
 }
 
@@ -1063,8 +1042,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["IMAP"] = tracker
 	}
 
 	go func() {
@@ -1168,8 +1148,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["POP3"] = tracker
 	}
 
 	go func() {
@@ -1274,8 +1255,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["ManageSieve"] = tracker
 	}
 
 	go func() {
@@ -1356,8 +1338,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["LMTP"] = tracker
 	}
 
 	go func() {
@@ -1399,22 +1382,23 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	}
 
 	options := adminapi.ServerOptions{
-		Name:            serverConfig.Name,
-		Addr:            serverConfig.Addr,
-		APIKey:          serverConfig.APIKey,
-		AllowedHosts:    serverConfig.AllowedHosts,
-		Cache:           deps.cacheInstance,
-		Uploader:        deps.uploadWorker,
-		Storage:         deps.storage,
-		ExternalRelay:   serverConfig.ExternalRelay,
-		TLS:             serverConfig.TLS,
-		TLSCertFile:     serverConfig.TLSCertFile,
-		TLSKeyFile:      serverConfig.TLSKeyFile,
-		TLSVerify:       serverConfig.TLSVerify,
-		Hostname:        deps.hostname,
-		FTSRetention:    ftsRetention,
-		AffinityManager: deps.affinityManager,
-		ValidBackends:   validBackends,
+		Name:               serverConfig.Name,
+		Addr:               serverConfig.Addr,
+		APIKey:             serverConfig.APIKey,
+		AllowedHosts:       serverConfig.AllowedHosts,
+		Cache:              deps.cacheInstance,
+		Uploader:           deps.uploadWorker,
+		Storage:            deps.storage,
+		ExternalRelay:      serverConfig.ExternalRelay,
+		TLS:                serverConfig.TLS,
+		TLSCertFile:        serverConfig.TLSCertFile,
+		TLSKeyFile:         serverConfig.TLSKeyFile,
+		TLSVerify:          serverConfig.TLSVerify,
+		Hostname:           deps.hostname,
+		FTSRetention:       ftsRetention,
+		AffinityManager:    deps.affinityManager,
+		ValidBackends:      validBackends,
+		ConnectionTrackers: deps.connectionTrackers,
 	}
 
 	adminapi.Start(ctx, deps.resilientDB, options, errChan)

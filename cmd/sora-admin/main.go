@@ -42,6 +42,22 @@ type AdminConfig struct {
 	Cleanup         config.CleanupConfig         `toml:"cleanup"`
 	SharedMailboxes config.SharedMailboxesConfig `toml:"shared_mailboxes"`
 	Server          []map[string]interface{}     `toml:"server"` // Ignore server config array, not needed for admin commands
+	HTTPAPIAddr     string                       // HTTP API address for kick operations (e.g., "http://localhost:8080")
+	HTTPAPIKey      string                       // HTTP API key for authentication
+}
+
+// createHTTPAPIClient creates an HTTP client for calling the HTTP API
+func createHTTPAPIClient(cfg AdminConfig) (*http.Client, error) {
+	if cfg.HTTPAPIAddr == "" {
+		return nil, fmt.Errorf("http_api_addr not configured (required for kick operations)")
+	}
+	if cfg.HTTPAPIKey == "" {
+		return nil, fmt.Errorf("http_api_key not configured (required for kick operations)")
+	}
+
+	return &http.Client{
+		Timeout: 30 * time.Second,
+	}, nil
 }
 
 func newDefaultAdminConfig() AdminConfig {
@@ -996,30 +1012,28 @@ func handleKickConnections(ctx context.Context) {
 	// Database connection flags (overrides from config file)
 
 	fs.Usage = func() {
-		fmt.Printf(`Force disconnect proxy connections
+		fmt.Printf(`Force disconnect proxy connections via gossip protocol
 
 Usage:
-  sora-admin kick-connections [options]
+  sora-admin connections kick [options]
 
 Options:
-  --user string         Kick all connections for specific user email
+  --user string         Kick all connections for specific user email (REQUIRED)
   --protocol string     Kick connections using specific protocol (IMAP, POP3, ManageSieve)
-  --server string       Kick connections to specific server
-  --client string       Kick connection from specific client address
-  --all                 Kick all active connections
   --confirm             Confirm kick without interactive prompt
   --config string        Path to TOML configuration file (required)
 
-This command marks connections for termination. The proxy servers check for
-termination marks every 30 seconds and will close marked connections.
+This command uses the HTTP API to broadcast a kick event via the gossip protocol.
+All cluster nodes will receive the kick and terminate matching connections within ~100ms.
 
-At least one filtering option (--user, --protocol, --server, --client, or --all) must be specified.
+Configuration Requirements:
+  - http_api_addr must be set in config (e.g., "http://localhost:8080")
+  - http_api_key must be set in config
 
 Examples:
-  sora-admin kick-connections --user user@example.com
-  sora-admin kick-connections --user user@example.com --protocol IMAP
-  sora-admin kick-connections --server 127.0.0.1:143
-  sora-admin kick-connections --all --confirm
+  sora-admin connections kick --user user@example.com
+  sora-admin connections kick --user user@example.com --protocol IMAP
+  sora-admin connections kick --user user@example.com --confirm
 `)
 	}
 
@@ -1080,69 +1094,30 @@ Examples:
 }
 
 func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
-
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
-	if err != nil {
-		return fmt.Errorf("failed to initialize resilient database: %w", err)
-	}
-	defer rdb.Close()
-
-	// Build criteria
-	criteria := db.TerminationCriteria{
-		Email:      userEmail,
-		Protocol:   protocol,
-		ServerAddr: serverAddr,
-		ClientAddr: clientAddr,
+	// Gossip-based kick requires user email (we need accountID)
+	if userEmail == "" && !all {
+		return fmt.Errorf("--user is required for gossip-based kick (or use --all)")
 	}
 
-	// Get preview of what will be kicked
-	stats, err := rdb.GetConnectionStatsWithRetry(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get connection stats: %w", err)
+	// serverAddr and clientAddr filtering not supported with gossip
+	if serverAddr != "" || clientAddr != "" {
+		return fmt.Errorf("--server and --client filtering not supported with gossip-based tracking")
 	}
 
-	// Count matching connections
-	matchCount := 0
-	for _, conn := range stats.Users {
-		if matches(conn, criteria, all) {
-			matchCount++
-		}
+	if all {
+		return fmt.Errorf("--all not yet implemented for gossip-based tracking (kick users individually)")
 	}
-
-	if matchCount == 0 {
-		fmt.Println("No matching connections found.")
-		return nil
-	}
-
-	// Show what will be kicked
-	fmt.Printf("Connections to be kicked:\n")
-	fmt.Printf("%-30s %-20s %-21s %-21s\n", "Email", "Protocol", "Client Address", "Server Address")
-	fmt.Printf("%s\n", strings.Repeat("-", 92))
-
-	for _, conn := range stats.Users {
-		if matches(conn, criteria, all) {
-			// Format protocol with proxy indicator
-			protocol := conn.Protocol
-			if conn.IsProxy {
-				protocol = protocol + " (proxy)"
-			} else {
-				protocol = protocol + " (direct)"
-			}
-
-			fmt.Printf("%-30s %-20s %-21s %-21s\n",
-				conn.Email,
-				protocol,
-				conn.ClientAddr,
-				conn.ServerAddr)
-		}
-	}
-
-	fmt.Printf("\nTotal connections to kick: %d\n", matchCount)
 
 	// Confirm if not auto-confirmed
 	if !autoConfirm {
-		fmt.Printf("\nAre you sure you want to kick these connections? (y/N): ")
+		fmt.Printf("Kick user %s", userEmail)
+		if protocol != "" {
+			fmt.Printf(" from protocol %s", protocol)
+		} else {
+			fmt.Printf(" from all protocols")
+		}
+		fmt.Printf("? (y/N): ")
+
 		var response string
 		if _, err := fmt.Scanln(&response); err != nil {
 			return fmt.Errorf("failed to read confirmation: %w", err)
@@ -1154,42 +1129,62 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		}
 	}
 
-	// Mark connections for termination
-	affected, err := rdb.MarkConnectionsForTerminationWithRetry(ctx, criteria)
+	// Use HTTP API to kick via gossip
+	client, err := createHTTPAPIClient(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to mark connections for termination: %w", err)
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
 	}
 
-	fmt.Printf("\n%d connections marked for termination.\n", affected)
-	fmt.Println("Connections will be closed within a few seconds.")
+	reqBody := map[string]string{
+		"user_email": userEmail,
+	}
+	if protocol != "" {
+		reqBody["protocol"] = protocol
+	}
+
+	bodyJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/admin/connections/kick", cfg.HTTPAPIAddr)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send kick request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("kick failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	fmt.Printf("\n✅ %s\n", result["message"])
+	if protocols, ok := result["protocols"].([]interface{}); ok {
+		fmt.Printf("   Protocols: %v\n", protocols)
+	}
+	if note, ok := result["note"].(string); ok {
+		fmt.Printf("   %s\n", note)
+	}
+
 	return nil
-}
-
-// matches checks if a connection matches the given criteria
-func matches(conn db.ConnectionInfo, criteria db.TerminationCriteria, all bool) bool {
-	if all {
-		return true
-	}
-
-	// Check each criteria
-	if criteria.Email != "" && !strings.EqualFold(conn.Email, criteria.Email) {
-		return false
-	}
-
-	if criteria.Protocol != "" && conn.Protocol != criteria.Protocol {
-		return false
-	}
-
-	if criteria.ServerAddr != "" && conn.ServerAddr != criteria.ServerAddr {
-		return false
-	}
-
-	if criteria.ClientAddr != "" && conn.ClientAddr != criteria.ClientAddr {
-		return false
-	}
-
-	// If we get here, all specified criteria matched
-	return criteria.Email != "" || criteria.Protocol != "" || criteria.ServerAddr != "" || criteria.ClientAddr != ""
 }
 
 func addCredential(ctx context.Context, cfg AdminConfig, primaryIdentity, email, password, passwordHash string, makePrimary bool, hashType string) error {
@@ -3353,8 +3348,6 @@ func handleConnectionStats(ctx context.Context) {
 	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	userEmail := fs.String("user", "", "Show connections for specific user email")
 	server := fs.String("server", "", "Show connections for specific server")
-	cleanupStale := fs.Bool("cleanup-stale", false, "Remove stale connections (no activity for 30 minutes)")
-	staleMinutes := fs.Int("stale-minutes", 30, "Minutes of inactivity to consider connection stale")
 	showDetail := fs.Bool("detail", true, "Show detailed connection list")
 
 	// Database connection flags (overrides from config file)
@@ -3368,19 +3361,20 @@ Usage:
 Options:
   --user string         Show connections for specific user email
   --server string       Show connections for specific server
-  --cleanup-stale       Remove stale connections (no activity for specified minutes)
-  --stale-minutes int   Minutes of inactivity to consider connection stale (default: 30)
   --detail              Show detailed connection list (default: true)
   --config string        Path to TOML configuration file (required)
 
+NOTE: Connection tracking now uses gossip protocol (cluster mode).
+      Statistics shown here are from the local instance's in-memory state only.
+      For cluster-wide view, query all nodes.
+
 This command shows:
-  - Total number of active connections (both proxy and direct backend)
+  - Total number of active connections (local instance)
   - Connections grouped by protocol (IMAP, POP3, ManageSieve)
   - Connections grouped by server
   - Detailed list of all connections with user, protocol, client address, etc.
   - Each connection is marked as (proxy) or (direct)
   - Option to filter by specific user or server
-  - Option to cleanup stale connections
 
 Examples:
   sora-admin connection-stats
@@ -3417,12 +3411,12 @@ Examples:
 	}
 
 	// Show connection statistics
-	if err := showConnectionStats(ctx, cfg, *userEmail, *server, *cleanupStale, *staleMinutes, *showDetail); err != nil {
+	if err := showConnectionStats(ctx, cfg, *userEmail, *server, *showDetail); err != nil {
 		logger.Fatalf("Failed to show connection stats: %v", err)
 	}
 }
 
-func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, serverFilter string, cleanupStale bool, staleMinutes int, showDetail bool) error {
+func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, serverFilter string, showDetail bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -3430,16 +3424,6 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, server
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
 	defer rdb.Close()
-
-	// Cleanup stale connections if requested
-	if cleanupStale {
-		staleDuration := time.Duration(staleMinutes) * time.Minute
-		removed, err := rdb.CleanupStaleConnectionsWithRetry(ctx, staleDuration)
-		if err != nil {
-			return fmt.Errorf("failed to cleanup stale connections: %w", err)
-		}
-		fmt.Printf("Cleaned up %d stale connections (no activity for %d minutes)\n\n", removed, staleMinutes)
-	}
 
 	// Get connection statistics
 	var stats *db.ConnectionStats

@@ -339,7 +339,6 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 		tableName string
 		query     string
 	}{
-		{"active_connections", "DELETE FROM active_connections WHERE account_id = ANY($1)"},
 		{"vacation_responses", "DELETE FROM vacation_responses WHERE account_id = ANY($1)"},
 		{"sieve_scripts", "DELETE FROM sieve_scripts WHERE account_id = ANY($1)"},
 		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1)"},

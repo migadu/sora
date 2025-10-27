@@ -410,8 +410,6 @@ max_age_restriction = ""      # Max message age before auto-expungement. Empty =
 fts_retention = "730d"        # How long to keep full-text search content in DB. Older messages lose searchability.
 auth_attempts_retention = "7d"  # How long to retain authentication attempt logs in the database.
 health_status_retention = "30d" # How long to retain health status history in the database.
-stale_connections_retention = "30m" # How long before inactive connections are removed. Catches ungraceful disconnects.
-
 
 # AUTHENTICATION CACHE CONFIGURATION
 # =============================================================================
@@ -513,7 +511,7 @@ addr = ":143"                 # Listen address and port. Use :993 for IMAPS.
 debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
-max_connections = 1000        # Maximum concurrent IMAP connections across all clients.
+max_connections = 1000        # Maximum concurrent IMAP connections to this server instance.
 max_connections_per_ip = 10   # Max connections per client IP. Set to 0 if behind a load balancer.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
@@ -760,8 +758,9 @@ type = "imap_proxy"
 name = "imap-proxy-1"
 addr = ":1143"                # Proxy listen address. Must be different from backend IMAP port.
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
-max_connections = 2000
-max_connections_per_ip = 50
+max_connections = 2000                # Max connections to this proxy instance
+max_connections_per_ip = 50           # Max connections per client IP
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1038,6 +1037,7 @@ addr = ":1110"                # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
 max_connections = 1000
 max_connections_per_ip = 20
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1080,6 +1080,7 @@ addr = ":14190"               # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
 max_connections_per_ip = 10
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1129,7 +1130,8 @@ name = "lmtp-proxy-1"
 addr = ":124"                 # Proxy listen address. Must be different from backend LMTP port.
 remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
 max_connections = 1000
-max_connections_per_ip = 0    # Typically no per-IP limits for LMTP (trusted sources)
+max_connections_per_ip = 0            # Typically no per-IP limits for LMTP (trusted sources)
+# Note: max_connections_per_user not applicable for LMTP (no user authentication)
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
@@ -1243,18 +1245,3 @@ tls_verify = false
 # [[server]]
 # type = "http_user_api"
 # allowed_hosts = ["10.0.0.0/8"]  # Trust requests from proxy network
-
-
-# CONNECTION TRACKING CONFIGURATION
-# =============================================================================
-# Monitor and log active connections across all servers for operational visibility.
-
-[servers.connection_tracking]
-enabled = true                    # Enable connection tracking across all protocols.
-update_interval = "15s"           # How often to update connection statistics in the database.
-termination_poll_interval = "30s" # How often to check for connections marked for termination.
-batch_updates = true              # Batch multiple connection updates together for efficiency.
-persist_to_db = true              # Store connection tracking information in the database (required for multi-proxy setups).
-operation_timeout = "10s"         # Timeout for individual register/unregister operations. Increase if seeing timeout errors during high load. (default: "10s")
-batch_flush_timeout = "90s"       # Timeout for batch flush operations. For high-scale deployments (5000+ connections), use "180s" to "600s". (default: "45s")
-max_batch_size = 1000             # Maximum connections per batch chunk. Larger values = fewer DB round-trips but longer transactions. Range: 100-10000. (default: 1000)
