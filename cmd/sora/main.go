@@ -630,6 +630,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 
 	operationTimeout := trackingConfig.GetOperationTimeoutWithDefault()
 	batchFlushTimeout := trackingConfig.GetBatchFlushTimeoutWithDefault()
+	maxBatchSize := trackingConfig.GetMaxBatchSize()
 
 	logger.Infof("%s Proxy [%s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
@@ -640,6 +641,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 		terminationPollInterval,
 		operationTimeout,
 		batchFlushTimeout,
+		maxBatchSize,
 		trackingConfig.PersistToDB,
 		trackingConfig.BatchUpdates,
 		trackingConfig.Enabled,

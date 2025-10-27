@@ -24,8 +24,10 @@ type ConnectionInfo struct {
 	ShouldTerminate bool
 	IsProxy         bool // Whether this is a proxy connection
 	// Fields for tracking changes
-	isNew      bool
-	isModified bool
+	isNew       bool
+	isModified  bool
+	retryCount  int       // Number of times this connection has failed to persist
+	lastRetryAt time.Time // When the last retry attempt was made
 }
 
 // ConnectionTracker manages connection tracking with in-memory caching
@@ -39,6 +41,7 @@ type ConnectionTracker struct {
 	terminationPollInterval time.Duration
 	operationTimeout        time.Duration // Timeout for individual operations (register/unregister)
 	batchFlushTimeout       time.Duration // Timeout for batch flush operations
+	maxBatchSize            int           // Maximum connections per batch chunk
 	persistToDB             bool
 	batchUpdates            bool
 	enabled                 bool
@@ -49,7 +52,7 @@ type ConnectionTracker struct {
 }
 
 // NewConnectionTracker creates a new connection tracker
-func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval, operationTimeout, batchFlushTimeout time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
+func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval, operationTimeout, batchFlushTimeout time.Duration, maxBatchSize int, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
 	tracker := &ConnectionTracker{
 		rdb:                     rdb,
 		name:                    name,
@@ -59,6 +62,7 @@ func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanc
 		terminationPollInterval: terminationPollInterval,
 		operationTimeout:        operationTimeout,
 		batchFlushTimeout:       batchFlushTimeout,
+		maxBatchSize:            maxBatchSize,
 		persistToDB:             persistToDB,
 		batchUpdates:            batchUpdates,
 		enabled:                 enabled,
@@ -434,32 +438,104 @@ func (ct *ConnectionTracker) flushChanges() {
 
 	// Apply changes to database in real batches
 	// Connection tracking is non-critical monitoring data, so we tolerate failures gracefully
+	// For very large batches, process in chunks to avoid timeout
+	maxBatchSize := ct.maxBatchSize
+
 	if len(toInsert) > 0 {
-		if err := ct.rdb.BatchRegisterConnectionsWithRetry(ctx, toInsert); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to batch insert %d connections (non-critical, will retry on next flush): %v", ct.name, len(toInsert), err)
-			// Mark connections as new again so they'll be retried on next flush
-			ct.mu.Lock()
-			for _, connInfo := range toInsert {
-				key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-				if conn, exists := ct.connections[key]; exists {
-					conn.isNew = true
-				}
+		// Process inserts in chunks if batch is large
+		for i := 0; i < len(toInsert); i += maxBatchSize {
+			end := i + maxBatchSize
+			if end > len(toInsert) {
+				end = len(toInsert)
 			}
-			ct.mu.Unlock()
+			chunk := toInsert[i:end]
+
+			if err := ct.rdb.BatchRegisterConnectionsWithRetry(ctx, chunk); err != nil {
+				log.Printf("[ConnectionTracker:%s] Failed to batch insert %d connections in chunk %d-%d (non-critical, will retry on next flush): %v", ct.name, len(chunk), i, end, err)
+				// Mark connections in failed chunk as new again for retry, but limit retry attempts to prevent unbounded growth
+				ct.mu.Lock()
+				retried := 0
+				dropped := 0
+				for _, connInfo := range chunk {
+					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+					if conn, exists := ct.connections[key]; exists {
+						// Limit retries to 5 attempts to prevent unbounded accumulation
+						if conn.retryCount < 5 {
+							conn.isNew = true
+							conn.retryCount++
+							conn.lastRetryAt = time.Now()
+							retried++
+						} else {
+							// After 5 failures, drop the connection from tracking
+							// It will be re-added if the connection is still active
+							delete(ct.connections, key)
+							dropped++
+						}
+					}
+				}
+				ct.mu.Unlock()
+				if dropped > 0 {
+					log.Printf("[ConnectionTracker:%s] Dropped %d connections from chunk after 5 failed retry attempts (will re-register if still active)", ct.name, dropped)
+				}
+			} else {
+				// Success - reset retry counters for successfully inserted connections in this chunk
+				ct.mu.Lock()
+				for _, connInfo := range chunk {
+					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+					if conn, exists := ct.connections[key]; exists {
+						conn.retryCount = 0
+					}
+				}
+				ct.mu.Unlock()
+			}
 		}
 	}
 	if len(toUpdate) > 0 {
-		if err := ct.rdb.BatchUpdateConnectionsWithRetry(ctx, toUpdate); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to batch update %d connections (non-critical, will retry on next flush): %v", ct.name, len(toUpdate), err)
-			// Mark connections as modified again so they'll be retried on next flush
-			ct.mu.Lock()
-			for _, connInfo := range toUpdate {
-				key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-				if conn, exists := ct.connections[key]; exists {
-					conn.isModified = true
-				}
+		// Process updates in chunks if batch is large
+		for i := 0; i < len(toUpdate); i += maxBatchSize {
+			end := i + maxBatchSize
+			if end > len(toUpdate) {
+				end = len(toUpdate)
 			}
-			ct.mu.Unlock()
+			chunk := toUpdate[i:end]
+
+			if err := ct.rdb.BatchUpdateConnectionsWithRetry(ctx, chunk); err != nil {
+				log.Printf("[ConnectionTracker:%s] Failed to batch update %d connections in chunk %d-%d (non-critical, will retry on next flush): %v", ct.name, len(chunk), i, end, err)
+				// Mark connections in failed chunk as modified again for retry, but limit retry attempts
+				ct.mu.Lock()
+				retried := 0
+				dropped := 0
+				for _, connInfo := range chunk {
+					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+					if conn, exists := ct.connections[key]; exists {
+						// Limit retries to 5 attempts
+						if conn.retryCount < 5 {
+							conn.isModified = true
+							conn.retryCount++
+							conn.lastRetryAt = time.Now()
+							retried++
+						} else {
+							// After 5 failures, drop the connection from tracking
+							delete(ct.connections, key)
+							dropped++
+						}
+					}
+				}
+				ct.mu.Unlock()
+				if dropped > 0 {
+					log.Printf("[ConnectionTracker:%s] Dropped %d connections from chunk after 5 failed update attempts (will re-register if still active)", ct.name, dropped)
+				}
+			} else {
+				// Success - reset retry counters for successfully updated connections in this chunk
+				ct.mu.Lock()
+				for _, connInfo := range chunk {
+					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+					if conn, exists := ct.connections[key]; exists {
+						conn.retryCount = 0
+					}
+				}
+				ct.mu.Unlock()
+			}
 		}
 	}
 }

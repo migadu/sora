@@ -77,10 +77,10 @@ type POP3ServerOptions struct {
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
 	AuthRateLimit          serverPkg.AuthRateLimiterConfig
-	SessionMemoryLimit     int64         // Memory limit per session in bytes
-	CommandTimeout         time.Duration // Maximum idle time before disconnection
-	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
+	SessionMemoryLimit     int64          // Memory limit per session in bytes
+	CommandTimeout         time.Duration  // Maximum idle time before disconnection
+	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
 	Config                 *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
@@ -195,7 +195,8 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// Get timeout values from config (with defaults if not configured)
 	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
 	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, true, false, true)
+	maxBatchSize := options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
 	server.connTracker.Start()
 
 	return server, nil

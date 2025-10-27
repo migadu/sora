@@ -620,7 +620,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Get timeout values from config (with defaults if not configured)
 	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
 	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, true, false, true)
+	maxBatchSize := options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
 	s.connTracker.Start()
 
 	return s, nil

@@ -984,6 +984,7 @@ type ConnectionTrackingConfig struct {
 	PersistToDB             bool   `toml:"persist_to_db"`
 	OperationTimeout        string `toml:"operation_timeout"`   // Timeout for individual register/unregister operations (default: "10s")
 	BatchFlushTimeout       string `toml:"batch_flush_timeout"` // Timeout for batch flush operations (default: "45s")
+	MaxBatchSize            int    `toml:"max_batch_size"`      // Maximum connections per batch chunk (default: 1000)
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1989,6 +1990,22 @@ func (c *ConnectionTrackingConfig) GetBatchFlushTimeoutWithDefault() time.Durati
 		return 45 * time.Second
 	}
 	return timeout
+}
+
+// GetMaxBatchSize returns the maximum batch size for connection tracking operations
+func (c *ConnectionTrackingConfig) GetMaxBatchSize() int {
+	if c.MaxBatchSize <= 0 {
+		return 1000 // Default: 1000 connections per batch chunk
+	}
+	if c.MaxBatchSize < 100 {
+		log.Printf("WARNING: connection_tracking max_batch_size %d is too small (min 100). Using 100.", c.MaxBatchSize)
+		return 100
+	}
+	if c.MaxBatchSize > 10000 {
+		log.Printf("WARNING: connection_tracking max_batch_size %d is too large (max 10000). Using 10000.", c.MaxBatchSize)
+		return 10000
+	}
+	return c.MaxBatchSize
 }
 
 // IsEnabled checks if a server should be started based on its configuration
