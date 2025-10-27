@@ -230,20 +230,31 @@ func (s *Session) handleConnection() {
 				return
 			}
 
-			// Load TLS config
-			cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
-			if err != nil {
-				log.Printf("LMTP Proxy [%s] Failed to load TLS certificate: %v", s.server.name, err)
-				return
-			}
+			// Load TLS config: Use global TLS manager config if available, otherwise load from files
+			var tlsConfig *tls.Config
+			if s.server.tlsConfig != nil {
+				// Use global TLS manager (e.g., Let's Encrypt autocert)
+				tlsConfig = s.server.tlsConfig
+			} else if s.server.tlsCertFile != "" && s.server.tlsKeyFile != "" {
+				// Load from cert files
+				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
+				if err != nil {
+					log.Printf("LMTP Proxy [%s] Failed to load TLS certificate: %v", s.server.name, err)
+					return
+				}
 
-			tlsConfig := &tls.Config{
-				Certificates:  []tls.Certificate{cert},
-				ClientAuth:    tls.NoClientCert,
-				Renegotiation: tls.RenegotiateNever,
-			}
-			if s.server.tlsVerify {
-				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+				tlsConfig = &tls.Config{
+					Certificates: []tls.Certificate{cert},
+					ClientAuth:   tls.NoClientCert,
+					// Don't set Renegotiation for STARTTLS - it breaks the upgrade handshake
+				}
+				if s.server.tlsVerify {
+					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+				}
+			} else {
+				log.Printf("LMTP Proxy [%s] STARTTLS enabled but no TLS config or certificate files available", s.server.name)
+				s.sendResponse("454 4.3.0 TLS not available due to configuration error")
+				continue
 			}
 
 			// Upgrade connection to TLS

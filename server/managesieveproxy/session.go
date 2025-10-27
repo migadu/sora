@@ -301,7 +301,8 @@ func (s *Session) handleConnection() {
 			var tlsConfig *tls.Config
 			if s.server.tlsConfig != nil {
 				// Use global TLS manager (e.g., Let's Encrypt autocert)
-				tlsConfig = s.server.tlsConfig.Clone()
+				// Don't clone - use directly like the non-proxy ManageSieve server does
+				tlsConfig = s.server.tlsConfig
 			} else if s.server.tlsCertFile != "" && s.server.tlsKeyFile != "" {
 				// Load from cert files
 				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
@@ -311,9 +312,9 @@ func (s *Session) handleConnection() {
 				}
 
 				tlsConfig = &tls.Config{
-					Certificates:  []tls.Certificate{cert},
-					ClientAuth:    tls.NoClientCert,
-					Renegotiation: tls.RenegotiateNever,
+					Certificates: []tls.Certificate{cert},
+					ClientAuth:   tls.NoClientCert,
+					// Don't set Renegotiation for STARTTLS - it breaks the upgrade handshake
 				}
 				if s.server.tlsVerify {
 					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert

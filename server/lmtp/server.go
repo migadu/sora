@@ -285,7 +285,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"lmtp"},
-			Renegotiation:            tls.RenegotiateNever,
+		}
+
+		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
+		// STARTTLS upgrades an existing plaintext connection and doesn't support renegotiation setting
+		if !options.TLSUseStartTLS {
+			backend.tlsConfig.Renegotiation = tls.RenegotiateNever
 		}
 
 		if !options.TLSVerify {

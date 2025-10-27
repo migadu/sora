@@ -170,7 +170,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			ServerName:               hostname,
 			PreferServerCipherSuites: true,
 			NextProtos:               []string{"sieve"},
-			Renegotiation:            tls.RenegotiateNever,
+		}
+
+		// Only set RenegotiateNever for implicit TLS (not STARTTLS)
+		// STARTTLS upgrades an existing plaintext connection and doesn't support renegotiation setting
+		if !options.TLSUseStartTLS {
+			serverInstance.tlsConfig.Renegotiation = tls.RenegotiateNever
 		}
 
 		if !options.TLSVerify {
