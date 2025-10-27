@@ -37,7 +37,8 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 	}
 
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion:    tls.VersionTLS12,
+		Renegotiation: tls.RenegotiateNever,
 	}
 
 	c, err := smtp.DialTLS(s.backend.externalRelay, tlsConfig)

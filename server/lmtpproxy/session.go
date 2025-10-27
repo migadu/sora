@@ -238,8 +238,9 @@ func (s *Session) handleConnection() {
 			}
 
 			tlsConfig := &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				ClientAuth:   tls.NoClientCert,
+				Certificates:  []tls.Certificate{cert},
+				ClientAuth:    tls.NoClientCert,
+				Renegotiation: tls.RenegotiateNever,
 			}
 			if s.server.tlsVerify {
 				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
@@ -504,6 +505,7 @@ func (s *Session) connectToBackend() error {
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
+			Renegotiation:      tls.RenegotiateNever,
 		}
 		if s.server.debug {
 			log.Printf("LMTP Proxy [%s] Using prelookup StartTLS settings for backend: remoteTLSVerify=%t",

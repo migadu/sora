@@ -153,7 +153,9 @@ func (s *Server) start(ctx context.Context) error {
 	// Start server with or without TLS
 	if s.tls {
 		// Add TLS config for mTLS
-		tlsConfig := &tls.Config{}
+		tlsConfig := &tls.Config{
+			Renegotiation: tls.RenegotiateNever,
+		}
 		if s.tlsVerify {
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 		} else {

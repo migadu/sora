@@ -158,6 +158,7 @@ func (s *Server) Start() error {
 			MinVersion:               tls.VersionTLS12,
 			ClientAuth:               clientAuth,
 			PreferServerCipherSuites: true,
+			Renegotiation:            tls.RenegotiateNever,
 		}
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
@@ -245,6 +246,7 @@ func (s *Server) setupHandler() http.Handler {
 			proxy.Transport = &http.Transport{
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: !s.connManager.IsRemoteTLSVerifyEnabled(),
+					Renegotiation:      tls.RenegotiateNever,
 				},
 				DialContext: (&net.Dialer{
 					Timeout:   10 * time.Second,

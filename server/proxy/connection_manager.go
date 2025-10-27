@@ -280,6 +280,8 @@ func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return nil, nil
 		},
+		// Disable renegotiation (not supported in TLS 1.3, causes errors)
+		Renegotiation: tls.RenegotiateNever,
 	}
 }
 

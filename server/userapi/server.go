@@ -140,7 +140,8 @@ func (s *Server) start(ctx context.Context) error {
 	// Start server with or without TLS
 	if s.tls {
 		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:    tls.VersionTLS12,
+			Renegotiation: tls.RenegotiateNever,
 		}
 		if s.tlsVerify {
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
