@@ -617,7 +617,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Initialize connection tracker for monitoring active connections
 	// Use 5 minute update interval and 10 second termination poll interval
 	// Disable batch updates (batchUpdates=false) for immediate database writes
-	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, true, false, true)
+	// Get timeout values from config (with defaults if not configured)
+	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
+	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
+	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, true, false, true)
 	s.connTracker.Start()
 
 	return s, nil

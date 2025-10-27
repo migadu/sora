@@ -1243,3 +1243,5 @@ update_interval = "15s"           # How often to update connection statistics in
 termination_poll_interval = "30s" # How often to check for connections marked for termination.
 batch_updates = true              # Batch multiple connection updates together for efficiency.
 persist_to_db = true              # Store connection tracking information in the database.
+operation_timeout = "10s"         # Timeout for individual register/unregister operations. Increase if seeing timeout errors during high load. (default: "10s")
+batch_flush_timeout = "45s"       # Timeout for batch flush operations. Increase if seeing batch timeout errors during high load. (default: "45s")

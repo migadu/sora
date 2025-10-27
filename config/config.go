@@ -982,6 +982,8 @@ type ConnectionTrackingConfig struct {
 	TerminationPollInterval string `toml:"termination_poll_interval"`
 	BatchUpdates            bool   `toml:"batch_updates"`
 	PersistToDB             bool   `toml:"persist_to_db"`
+	OperationTimeout        string `toml:"operation_timeout"`   // Timeout for individual register/unregister operations (default: "10s")
+	BatchFlushTimeout       string `toml:"batch_flush_timeout"` // Timeout for batch flush operations (default: "45s")
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1951,6 +1953,42 @@ func (c *ConnectionTrackingConfig) GetTerminationPollIntervalWithDefault() time.
 		return 30 * time.Second
 	}
 	return interval
+}
+
+// GetOperationTimeout parses the operation timeout duration for connection tracking
+func (c *ConnectionTrackingConfig) GetOperationTimeout() (time.Duration, error) {
+	if c.OperationTimeout == "" {
+		return 10 * time.Second, nil
+	}
+	return helpers.ParseDuration(c.OperationTimeout)
+}
+
+// GetOperationTimeoutWithDefault returns the operation timeout or default if invalid
+func (c *ConnectionTrackingConfig) GetOperationTimeoutWithDefault() time.Duration {
+	timeout, err := c.GetOperationTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking operation_timeout '%s': %v. Using default.", c.OperationTimeout, err)
+		return 10 * time.Second
+	}
+	return timeout
+}
+
+// GetBatchFlushTimeout parses the batch flush timeout duration for connection tracking
+func (c *ConnectionTrackingConfig) GetBatchFlushTimeout() (time.Duration, error) {
+	if c.BatchFlushTimeout == "" {
+		return 45 * time.Second, nil
+	}
+	return helpers.ParseDuration(c.BatchFlushTimeout)
+}
+
+// GetBatchFlushTimeoutWithDefault returns the batch flush timeout or default if invalid
+func (c *ConnectionTrackingConfig) GetBatchFlushTimeoutWithDefault() time.Duration {
+	timeout, err := c.GetBatchFlushTimeout()
+	if err != nil {
+		log.Printf("WARNING: invalid connection_tracking batch_flush_timeout '%s': %v. Using default.", c.BatchFlushTimeout, err)
+		return 45 * time.Second
+	}
+	return timeout
 }
 
 // IsEnabled checks if a server should be started based on its configuration

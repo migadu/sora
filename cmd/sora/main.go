@@ -628,6 +628,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 		terminationPollInterval = 30 * time.Second
 	}
 
+	operationTimeout := trackingConfig.GetOperationTimeoutWithDefault()
+	batchFlushTimeout := trackingConfig.GetBatchFlushTimeoutWithDefault()
+
 	logger.Infof("%s Proxy [%s] Starting connection tracker.", protocol, serverName)
 	tracker := proxy.NewConnectionTracker(
 		protocol,
@@ -635,6 +638,8 @@ func startConnectionTrackerForProxy(protocol string, serverName string, rdb *res
 		hostname,
 		updateInterval,
 		terminationPollInterval,
+		operationTimeout,
+		batchFlushTimeout,
 		trackingConfig.PersistToDB,
 		trackingConfig.BatchUpdates,
 		trackingConfig.Enabled,
@@ -838,6 +843,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
+		Config:                 &deps.config,
 	})
 
 	if err != nil {
@@ -902,6 +908,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
+		Config:                 &deps.config,
 	})
 
 	if err != nil {

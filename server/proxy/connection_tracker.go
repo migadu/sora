@@ -37,6 +37,8 @@ type ConnectionTracker struct {
 	mu                      sync.RWMutex
 	updateInterval          time.Duration
 	terminationPollInterval time.Duration
+	operationTimeout        time.Duration // Timeout for individual operations (register/unregister)
+	batchFlushTimeout       time.Duration // Timeout for batch flush operations
 	persistToDB             bool
 	batchUpdates            bool
 	enabled                 bool
@@ -47,7 +49,7 @@ type ConnectionTracker struct {
 }
 
 // NewConnectionTracker creates a new connection tracker
-func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
+func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval, operationTimeout, batchFlushTimeout time.Duration, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
 	tracker := &ConnectionTracker{
 		rdb:                     rdb,
 		name:                    name,
@@ -55,6 +57,8 @@ func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanc
 		connections:             make(map[string]*ConnectionInfo),
 		updateInterval:          updateInterval,
 		terminationPollInterval: terminationPollInterval,
+		operationTimeout:        operationTimeout,
+		batchFlushTimeout:       batchFlushTimeout,
 		persistToDB:             persistToDB,
 		batchUpdates:            batchUpdates,
 		enabled:                 enabled,
@@ -97,6 +101,11 @@ func (ct *ConnectionTracker) Start() {
 // IsEnabled returns true if the connection tracker is enabled.
 func (ct *ConnectionTracker) IsEnabled() bool {
 	return ct.enabled
+}
+
+// GetOperationTimeout returns the configured timeout for individual operations
+func (ct *ConnectionTracker) GetOperationTimeout() time.Duration {
+	return ct.operationTimeout
 }
 
 // Stop stops the connection tracker
@@ -419,20 +428,38 @@ func (ct *ConnectionTracker) flushChanges() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Use configurable timeout for batch operations - connection tracking is not time-critical
+	ctx, cancel := context.WithTimeout(context.Background(), ct.batchFlushTimeout)
 	defer cancel()
 
 	// Apply changes to database in real batches
+	// Connection tracking is non-critical monitoring data, so we tolerate failures gracefully
 	if len(toInsert) > 0 {
-		// This requires a new method in the db package that uses pgx.Batch
 		if err := ct.rdb.BatchRegisterConnectionsWithRetry(ctx, toInsert); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to batch insert connections: %v", ct.name, err)
+			log.Printf("[ConnectionTracker:%s] Failed to batch insert %d connections (non-critical, will retry on next flush): %v", ct.name, len(toInsert), err)
+			// Mark connections as new again so they'll be retried on next flush
+			ct.mu.Lock()
+			for _, connInfo := range toInsert {
+				key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+				if conn, exists := ct.connections[key]; exists {
+					conn.isNew = true
+				}
+			}
+			ct.mu.Unlock()
 		}
 	}
 	if len(toUpdate) > 0 {
-		// This requires a new method in the db package that uses pgx.Batch
 		if err := ct.rdb.BatchUpdateConnectionsWithRetry(ctx, toUpdate); err != nil {
-			log.Printf("[ConnectionTracker:%s] Failed to batch update connections: %v", ct.name, err)
+			log.Printf("[ConnectionTracker:%s] Failed to batch update %d connections (non-critical, will retry on next flush): %v", ct.name, len(toUpdate), err)
+			// Mark connections as modified again so they'll be retried on next flush
+			ct.mu.Lock()
+			for _, connInfo := range toUpdate {
+				key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
+				if conn, exists := ct.connections[key]; exists {
+					conn.isModified = true
+				}
+			}
+			ct.mu.Unlock()
 		}
 	}
 }

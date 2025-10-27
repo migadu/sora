@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
@@ -80,6 +81,7 @@ type POP3ServerOptions struct {
 	CommandTimeout         time.Duration // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
+	Config                 *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
 func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -190,7 +192,10 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// Initialize connection tracker for monitoring active connections
 	// Use 5 minute update interval and 10 second termination poll interval
 	// Disable batch updates (batchUpdates=false) for immediate database writes
-	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, true, false, true)
+	// Get timeout values from config (with defaults if not configured)
+	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
+	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
+	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, true, false, true)
 	server.connTracker.Start()
 
 	return server, nil

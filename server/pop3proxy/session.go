@@ -640,17 +640,29 @@ func (s *POP3ProxySession) close() {
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Dec()
 
-	// Unregister connection
+	// Unregister connection asynchronously - don't block session cleanup
 	if s.accountID > 0 {
-		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		accountID := s.accountID
+		remoteIP := s.RemoteIP
+		username := s.username
+		connTracker := s.server.connTracker
+		serverName := s.server.name
 
-		if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
-			if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "POP3", s.RemoteIP); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to unregister connection for %s: %v", s.server.name, s.username, err)
+		// Fire-and-forget: unregister in background to avoid blocking session teardown
+		go func() {
+			// Use a new background context for this final operation, as s.ctx is likely already cancelled.
+			// Use configurable timeout from connection tracker to handle database load spikes during heavy connection churn.
+			timeout := connTracker.GetOperationTimeout()
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			if connTracker != nil && connTracker.IsEnabled() {
+				if err := connTracker.UnregisterConnection(ctx, accountID, "POP3", remoteIP); err != nil {
+					// Connection tracking is non-critical monitoring data, so log but continue
+					log.Printf("POP3 Proxy [%s] Failed to unregister connection for %s: %v", serverName, username, err)
+				}
 			}
-		}
+		}()
 	}
 
 	if s.clientConn != nil {
