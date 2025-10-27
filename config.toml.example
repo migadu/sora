@@ -1242,6 +1242,7 @@ enabled = true                    # Enable connection tracking across all protoc
 update_interval = "15s"           # How often to update connection statistics in the database.
 termination_poll_interval = "30s" # How often to check for connections marked for termination.
 batch_updates = true              # Batch multiple connection updates together for efficiency.
-persist_to_db = true              # Store connection tracking information in the database.
+persist_to_db = true              # Store connection tracking information in the database (required for multi-proxy setups).
 operation_timeout = "10s"         # Timeout for individual register/unregister operations. Increase if seeing timeout errors during high load. (default: "10s")
-batch_flush_timeout = "45s"       # Timeout for batch flush operations. Increase if seeing batch timeout errors during high load. (default: "45s")
+batch_flush_timeout = "90s"       # Timeout for batch flush operations. For high-scale deployments (5000+ connections), use "180s" to "600s". (default: "45s")
+max_batch_size = 1000             # Maximum connections per batch chunk. Larger values = fewer DB round-trips but longer transactions. Range: 100-10000. (default: 1000)
