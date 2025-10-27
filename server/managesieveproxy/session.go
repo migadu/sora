@@ -238,7 +238,12 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			s.username = authnID
+			// Parse and use base address (without +detail) for backend impersonation
+			if addr, err := server.NewAddress(authnID); err == nil {
+				s.username = addr.BaseAddress()
+			} else {
+				s.username = authnID // Fallback if parsing fails
+			}
 
 			// Connect to backend and authenticate
 			if err := s.connectToBackendAndAuth(); err != nil {

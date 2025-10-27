@@ -468,6 +468,8 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return nil, nil
 			},
+			// Disable renegotiation (not supported in TLS 1.3, causes errors)
+			Renegotiation: tls.RenegotiateNever,
 		}
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
@@ -601,6 +603,8 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 				return nil, nil
 			},
+			// Disable renegotiation (not supported in TLS 1.3, causes errors)
+			Renegotiation: tls.RenegotiateNever,
 		}
 		log.Printf("[ConnectionManager] Starting TLS handshake to %s (InsecureSkipVerify=%t)", addr, !remoteTLSVerify)
 		tlsConn := tls.Client(conn, tlsConfig)

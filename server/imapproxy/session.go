@@ -160,7 +160,12 @@ func (s *Session) handleConnection() {
 
 			// Only set username if it wasn't already set by prelookup (which may have extracted actual email from token)
 			if s.username == "" {
-				s.username = username
+				// Parse and use base address (without +detail) for backend impersonation
+				if addr, err := server.NewAddress(username); err == nil {
+					s.username = addr.BaseAddress()
+				} else {
+					s.username = username // Fallback if parsing fails
+				}
 			}
 			s.postAuthenticationSetup(tag)
 			authenticated = true
@@ -231,7 +236,12 @@ func (s *Session) handleConnection() {
 
 			// Only set username if it wasn't already set by prelookup (which may have extracted actual email from token)
 			if s.username == "" {
-				s.username = authnID
+				// Parse and use base address (without +detail) for backend impersonation
+				if addr, err := server.NewAddress(authnID); err == nil {
+					s.username = addr.BaseAddress()
+				} else {
+					s.username = authnID // Fallback if parsing fails
+				}
 			}
 			s.postAuthenticationSetup(tag)
 			authenticated = true

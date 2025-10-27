@@ -436,7 +436,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Store user details on the session
 	s.authenticated = true
-	s.username = address.FullAddress()
+	// Use base address (without +detail) for backend impersonation
+	s.username = address.BaseAddress()
 	s.accountID = accountID
 	s.isPrelookupAccount = false // Authenticated against the main DB
 
