@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -283,15 +284,20 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
 			log.Printf("[HTTP-PreLookup] Circuit breaker is open for %s", c.baseURL)
-			// Circuit breaker open is a transient error - wrap it
-			return nil, AuthFailed, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
+			// Circuit breaker open is a transient error - return temporarily unavailable
+			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
 		}
 		if err == circuitbreaker.ErrTooManyRequests {
 			log.Printf("[HTTP-PreLookup] Circuit breaker is half-open (testing recovery) for %s - rate limiting requests", c.baseURL)
-			// Too many requests in half-open state is also a transient error - wrap it
-			return nil, AuthFailed, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrPrelookupTransient)
+			// Too many requests in half-open state is also a transient error - return temporarily unavailable
+			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrPrelookupTransient)
 		}
-		// Return error as-is (already wrapped with ErrPrelookupTransient or ErrPrelookupInvalidResponse)
+		// Check if this is a transient error or invalid response
+		if errors.Is(err, ErrPrelookupTransient) {
+			// Transient errors (network, timeout, 5xx) - temporarily unavailable
+			return nil, AuthTemporarilyUnavailable, err
+		}
+		// Invalid response errors (malformed 2xx) - authentication failed
 		return nil, AuthFailed, err
 	}
 

@@ -488,6 +488,12 @@ func (s *Session) authenticateUser(username, password string) error {
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed")
 
+		case proxy.AuthTemporarilyUnavailable:
+			// Prelookup service is temporarily unavailable - tell user to retry later
+			log.Printf("ManageSieve Proxy [%s] Prelookup service temporarily unavailable for user %s", s.server.name, username)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
+			return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+
 		case proxy.AuthUserNotFound:
 			// User not found in prelookup (404). This means the user is NOT in the other system.
 			// Always fall through to main DB auth - this is the expected behavior for partitioning.

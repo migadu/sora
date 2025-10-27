@@ -43,18 +43,18 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrPrelookupTransient,
-			description:      "5xx errors should return ErrPrelookupTransient",
+			description:      "5xx errors should return AuthTemporarilyUnavailable with ErrPrelookupTransient",
 		},
 		{
 			name: "503_ServiceUnavailable",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "service unavailable"}`, http.StatusServiceUnavailable)
 			},
-			expectAuthResult: AuthFailed,
+			expectAuthResult: AuthTemporarilyUnavailable,
 			expectErrorType:  ErrPrelookupTransient,
-			description:      "503 should return ErrPrelookupTransient",
+			description:      "503 should return AuthTemporarilyUnavailable with ErrPrelookupTransient",
 		},
 		{
 			name: "200_InvalidJSON",
@@ -230,9 +230,9 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 	ctx := context.Background()
 	_, authResult, err := client.LookupUserRoute(ctx, "test@example.com", "testpassword")
 
-	// Should return AuthFailed with ErrPrelookupTransient
-	if authResult != AuthFailed {
-		t.Errorf("Expected AuthFailed for network error, got %v", authResult)
+	// Should return AuthTemporarilyUnavailable with ErrPrelookupTransient
+	if authResult != AuthTemporarilyUnavailable {
+		t.Errorf("Expected AuthTemporarilyUnavailable for network error, got %v", authResult)
 	}
 
 	if err == nil {
@@ -243,7 +243,7 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 		t.Errorf("Expected ErrPrelookupTransient for network error, got: %v", err)
 	}
 
-	t.Logf("✓ Network error correctly returns ErrPrelookupTransient: %v", err)
+	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrPrelookupTransient: %v", err)
 }
 
 // TestHTTPPrelookupCircuitBreaker verifies that circuit breaker open returns ErrPrelookupTransient
@@ -280,9 +280,9 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		_, authResult, err := client.LookupUserRoute(ctx, "test@example.com", "testpassword")
 
-		// All should return AuthFailed
-		if authResult != AuthFailed {
-			t.Errorf("Request %d: Expected AuthFailed, got %v", i+1, authResult)
+		// All should return AuthTemporarilyUnavailable (service errors are transient)
+		if authResult != AuthTemporarilyUnavailable {
+			t.Errorf("Request %d: Expected AuthTemporarilyUnavailable, got %v", i+1, authResult)
 		}
 
 		// All should have an error with ErrPrelookupTransient
@@ -301,16 +301,16 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Verify final error is still ErrPrelookupTransient
+	// Verify final error is still ErrPrelookupTransient with AuthTemporarilyUnavailable
 	_, authResult, err := client.LookupUserRoute(ctx, "test@example.com", "testpassword")
-	if authResult != AuthFailed {
-		t.Errorf("Final request: Expected AuthFailed, got %v", authResult)
+	if authResult != AuthTemporarilyUnavailable {
+		t.Errorf("Final request: Expected AuthTemporarilyUnavailable, got %v", authResult)
 	}
 	if !errors.Is(err, ErrPrelookupTransient) {
 		t.Errorf("Final request: Expected ErrPrelookupTransient even with circuit breaker open, got: %v", err)
 	}
 
-	t.Logf("✓ Circuit breaker correctly returns ErrPrelookupTransient when open")
+	t.Logf("✓ Circuit breaker correctly returns AuthTemporarilyUnavailable with ErrPrelookupTransient when open")
 	t.Logf("  Total requests made: %d, Circuit breaker state: %s", failCount, client.breaker.State())
 }
 

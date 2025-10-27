@@ -13,9 +13,10 @@ import (
 type AuthResult int
 
 const (
-	AuthUserNotFound AuthResult = iota // User doesn't exist in prelookup - fallback allowed
-	AuthSuccess                        // User found and authenticated - proceed with routing
-	AuthFailed                         // User found but auth failed - reject, no fallback
+	AuthUserNotFound           AuthResult = iota // User doesn't exist in prelookup - fallback allowed
+	AuthSuccess                                  // User found and authenticated - proceed with routing
+	AuthFailed                                   // User found but auth failed - reject, no fallback
+	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - user should retry later
 )
 
 // Prelookup error types for distinguishing failure modes
