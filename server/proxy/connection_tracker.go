@@ -113,6 +113,14 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 	return ct
 }
 
+// trackerType returns the name of the tracker for logging purposes.
+func (ct *ConnectionTracker) trackerType() string {
+	if ct.clusterManager == nil {
+		return "LOCAL-TRACKER"
+	}
+	return "GOSSIP-TRACKER"
+}
+
 // RegisterConnection registers a new connection and broadcasts to cluster
 func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, username, protocol, clientAddr string) error {
 	if ct == nil {
@@ -158,14 +166,11 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	info.LastUpdate = time.Now()
 	info.LocalInstances[ct.instanceID]++
 
-	trackerType := "GOSSIP-TRACKER"
 	if ct.clusterManager == nil {
-		trackerType = "LOCAL-TRACKER"
 		info.TotalCount = info.LocalCount // In local mode, total = local
 	}
 
-	logger.Debugf("[%s-%s] Registered: user=%s, local=%d, total=%d",
-		ct.name, trackerType, username, info.LocalCount, info.TotalCount)
+	logger.Debugf("[%s-%s] Registered: user=%s, local=%d, total=%d", ct.name, ct.trackerType(), username, info.LocalCount, info.TotalCount)
 
 	// Broadcast to cluster (only in cluster mode)
 	if ct.clusterManager != nil {
@@ -195,11 +200,7 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	info, exists := ct.connections[accountID]
 	if !exists {
-		trackerType := "GOSSIP-TRACKER"
-		if ct.clusterManager == nil {
-			trackerType = "LOCAL-TRACKER"
-		}
-		logger.Debugf("[%s-%s] Unregister called for unknown accountID=%d", ct.name, trackerType, accountID)
+		logger.Debugf("[%s-%s] Unregister called for unknown accountID=%d", ct.name, ct.trackerType(), accountID)
 		return nil
 	}
 
@@ -221,13 +222,8 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	info.LastUpdate = time.Now()
 
-	trackerType := "GOSSIP-TRACKER"
-	if ct.clusterManager == nil {
-		trackerType = "LOCAL-TRACKER"
-	}
-
 	logger.Debugf("[%s-%s] Unregistered: user=%s, local=%d, total=%d",
-		ct.name, trackerType, info.Username, info.LocalCount, info.TotalCount)
+		ct.name, ct.trackerType(), info.Username, info.LocalCount, info.TotalCount)
 
 	// Clean up if no local connections remain
 	cleanupThreshold := info.TotalCount
@@ -297,10 +293,12 @@ func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
 
 	result := make([]UserConnectionInfo, 0, len(ct.connections))
 	for _, info := range ct.connections {
-		// Deep copy the map
-		instancesCopy := make(map[string]int, len(info.LocalInstances))
-		for k, v := range info.LocalInstances {
-			instancesCopy[k] = v
+		var instancesCopy map[string]int
+		if len(info.LocalInstances) > 0 {
+			instancesCopy = make(map[string]int, len(info.LocalInstances))
+			for k, v := range info.LocalInstances {
+				instancesCopy[k] = v
+			}
 		}
 
 		result = append(result, UserConnectionInfo{

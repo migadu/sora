@@ -3404,41 +3404,34 @@ func handleConnectionStats(ctx context.Context) {
 
 	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	userEmail := fs.String("user", "", "Show connections for specific user email")
-	server := fs.String("server", "", "Show connections for specific server")
 	showDetail := fs.Bool("detail", true, "Show detailed connection list")
 
 	// Database connection flags (overrides from config file)
 
 	fs.Usage = func() {
-		fmt.Printf(`Show active connections and statistics (both proxy and direct backend connections)
+		fmt.Printf(`Show active connections and statistics
 
 Usage:
-  sora-admin connection-stats [options]
+  sora-admin stats connection [options]
 
 Options:
   --user string         Show connections for specific user email
-  --server string       Show connections for specific server
   --detail              Show detailed connection list (default: true)
-  --config string        Path to TOML configuration file (required)
+  --config string       Path to TOML configuration file (required)
 
-NOTE: Connection tracking now uses gossip protocol (cluster mode).
-      Statistics shown here are from the local instance's in-memory state only.
-      For cluster-wide view, query all nodes.
+NOTE: Connection tracking uses in-memory gossip (cluster mode) or local tracking.
+      Statistics are retrieved via HTTP Admin API.
 
 This command shows:
-  - Total number of active connections (local instance)
-  - Connections grouped by protocol (IMAP, POP3, ManageSieve)
-  - Connections grouped by server
-  - Detailed list of all connections with user, protocol, client address, etc.
-  - Each connection is marked as (proxy) or (direct)
-  - Option to filter by specific user or server
+  - Total number of active connections
+  - Connections grouped by protocol (IMAP, POP3, ManageSieve, LMTP)
+  - Per-user connection counts (local and cluster-wide totals)
+  - Option to filter by specific user
 
 Examples:
-  sora-admin connection-stats
-  sora-admin connection-stats --user user@example.com
-  sora-admin connection-stats --server 127.0.0.1:143
-  sora-admin connection-stats --cleanup-stale
-  sora-admin connection-stats --cleanup-stale --stale-minutes 60
+  sora-admin stats connection --config config.toml
+  sora-admin stats connection --config config.toml --user user@example.com
+  sora-admin stats connection --config config.toml --detail
 `)
 	}
 
@@ -3468,12 +3461,12 @@ Examples:
 	}
 
 	// Show connection statistics
-	if err := showConnectionStats(ctx, cfg, *userEmail, *server, *showDetail); err != nil {
+	if err := showConnectionStats(ctx, cfg, *userEmail, *showDetail); err != nil {
 		logger.Fatalf("Failed to show connection stats: %v", err)
 	}
 }
 
-func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, serverFilter string, showDetail bool) error {
+func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string, showDetail bool) error {
 	// Create HTTP API client
 	client, err := createHTTPAPIClient(cfg)
 	if err != nil {
