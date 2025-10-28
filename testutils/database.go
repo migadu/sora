@@ -165,7 +165,6 @@ func (td *TestDatabase) TruncateAllTables(t *testing.T) {
 		"mailboxes",
 		"credentials",
 		"accounts",
-		"active_connections",
 		"sieve_scripts",
 		"vacation_responses",
 	}

@@ -322,10 +322,6 @@ CREATE TABLE locks (
 	expires_at TIMESTAMPTZ NOT NULL
 );
 
--- active_connections table removed - connection tracking now uses gossip protocol instead of database
--- Gossip-based tracking eliminates database writes for every connection, improving scalability
--- See servers.connection_tracking configuration for gossip-based limits
-
 -- Health status tracking for system components
 CREATE TABLE health_status (
     component_name VARCHAR(255) NOT NULL,

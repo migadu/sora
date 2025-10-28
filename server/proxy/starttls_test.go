@@ -56,6 +56,7 @@ func TestNewConnectionManagerWithRoutingAndStartTLS(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				10*time.Second,
 				nil, // routingLookup
+				"",  // serverName (empty for tests)
 			)
 
 			if err != nil {
@@ -144,6 +145,7 @@ func TestConnectionManagerGetTLSConfig(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				10*time.Second,
 				nil,
+				"", // serverName (empty for tests)
 			)
 
 			if err != nil {
@@ -228,6 +230,7 @@ func TestConnectionManagerIsRemoteStartTLS(t *testing.T) {
 				false,
 				10*time.Second,
 				nil,
+				"", // serverName (empty for tests)
 			)
 
 			if err != nil {
@@ -277,6 +280,7 @@ func TestConnectionManagerBackwardCompatibility(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		10*time.Second,
 		nil, // routingLookup
+		"",  // serverName (empty for tests)
 	)
 
 	if err != nil {
@@ -307,6 +311,7 @@ func TestConnectionManagerTLSConfigIndependence(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		10*time.Second,
 		nil,
+		"", // serverName (empty for tests)
 	)
 
 	if err != nil {

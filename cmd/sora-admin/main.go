@@ -909,91 +909,148 @@ Examples:
 }
 
 func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, instanceID string) error {
-
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Create HTTP API client
+	client, err := createHTTPAPIClient(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to initialize resilient database: %w", err)
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
 	}
-	defer rdb.Close()
 
-	// Get all active connections
-	connections, err := rdb.GetActiveConnectionsWithRetry(ctx)
+	// Build URL based on whether user email is specified
+	var url string
+	if userEmail != "" {
+		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
+	} else {
+		url = fmt.Sprintf("%s/admin/connections", cfg.HTTPAPIAddr)
+	}
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to get active connections: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Apply filters
-	var filteredConnections []db.ConnectionInfo
-	for _, conn := range connections {
-		// Filter by user email
-		if userEmail != "" && !strings.Contains(strings.ToLower(conn.Email), strings.ToLower(userEmail)) {
-			continue
-		}
-		// Filter by protocol
-		if protocol != "" && !strings.EqualFold(conn.Protocol, protocol) {
-			continue
-		}
-		// Filter by instance ID
-		if instanceID != "" && !strings.Contains(conn.InstanceID, instanceID) {
-			continue
-		}
-		filteredConnections = append(filteredConnections, conn)
+	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get connections: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	if len(filteredConnections) == 0 {
-		if userEmail != "" || protocol != "" || instanceID != "" {
-			fmt.Println("No active connections found matching the specified filters.")
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API request failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var result struct {
+		Connections []struct {
+			Protocol    string    `json:"protocol"`
+			AccountID   int64     `json:"account_id"`
+			Email       string    `json:"email"`
+			LocalCount  int       `json:"local_count"`
+			TotalCount  int       `json:"total_count"`
+			LastUpdate  time.Time `json:"last_update"`
+		} `json:"connections"`
+		Count  int    `json:"count"`
+		Source string `json:"source,omitempty"`
+		Note   string `json:"note,omitempty"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Display note if present (e.g., tracking not available)
+	if result.Note != "" {
+		fmt.Printf("Note: %s\n\n", result.Note)
+	}
+
+	// Check if no connections found
+	if result.Count == 0 {
+		if userEmail != "" {
+			fmt.Printf("No active connections found for user: %s\n", userEmail)
 		} else {
 			fmt.Println("No active connections found.")
 		}
 		return nil
 	}
 
-	fmt.Printf("Found %d active connection(s):\n\n", len(filteredConnections))
+	// Display results
+	if userEmail != "" {
+		fmt.Printf("Active connections for user: %s\n\n", userEmail)
+	} else {
+		fmt.Printf("Found %d active connection(s):\n\n", result.Count)
+	}
+
+	// Apply filters (protocol and instanceID are client-side filters)
+	filteredConnections := result.Connections
+	if protocol != "" || instanceID != "" {
+		filtered := make([]struct {
+			Protocol    string    `json:"protocol"`
+			AccountID   int64     `json:"account_id"`
+			Email       string    `json:"email"`
+			LocalCount  int       `json:"local_count"`
+			TotalCount  int       `json:"total_count"`
+			LastUpdate  time.Time `json:"last_update"`
+		}, 0)
+		for _, conn := range result.Connections {
+			// Filter by protocol
+			if protocol != "" && !strings.EqualFold(conn.Protocol, protocol) {
+				continue
+			}
+			// Note: instanceID filtering not available with gossip tracking
+			if instanceID != "" {
+				fmt.Println("Warning: --instance filtering not available with gossip-based tracking")
+			}
+			filtered = append(filtered, conn)
+		}
+		filteredConnections = filtered
+	}
+
+	if len(filteredConnections) == 0 {
+		fmt.Println("No connections matching the specified filters.")
+		return nil
+	}
 
 	// Print header
-	fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
-		"User", "Protocol", "Client", "Server", "Instance", "Connected", "Duration")
-	fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
-		"----", "--------", "------", "------", "--------", "---------", "--------")
+	fmt.Printf("%-25s %-12s %-12s %-12s %-20s\n",
+		"User", "Protocol", "Local", "Total", "Last Update")
+	fmt.Printf("%-25s %-12s %-12s %-12s %-20s\n",
+		"----", "--------", "-----", "-----", "-----------")
 
 	// Print connection details
-	now := time.Now()
 	for _, conn := range filteredConnections {
 		email := conn.Email
 		if email == "" {
 			email = fmt.Sprintf("account-%d", conn.AccountID)
 		}
 
-		duration := now.Sub(conn.ConnectedAt)
-		durationStr := formatDuration(duration)
-
-		// Truncate long fields for better display
+		// Truncate long emails
 		if len(email) > 24 {
 			email = email[:21] + "..."
 		}
-		if len(conn.ClientAddr) > 19 {
-			conn.ClientAddr = conn.ClientAddr[:16] + "..."
-		}
-		if len(conn.ServerAddr) > 19 {
-			conn.ServerAddr = conn.ServerAddr[:16] + "..."
-		}
-		if len(conn.InstanceID) > 14 {
-			conn.InstanceID = conn.InstanceID[:11] + "..."
-		}
 
-		fmt.Printf("%-25s %-8s %-20s %-20s %-15s %-20s %-10s\n",
+		fmt.Printf("%-25s %-12s %-12d %-12d %-20s\n",
 			email,
 			conn.Protocol,
-			conn.ClientAddr,
-			conn.ServerAddr,
-			conn.InstanceID,
-			conn.ConnectedAt.Format("2006-01-02 15:04:05"),
-			durationStr)
+			conn.LocalCount,
+			conn.TotalCount,
+			conn.LastUpdate.Format("2006-01-02 15:04:05"))
 	}
 
-	fmt.Printf("\nTotal active connections: %d\n", len(filteredConnections))
+	fmt.Printf("\nTotal connections: %d\n", len(filteredConnections))
+	if result.Source != "" {
+		fmt.Printf("Source: %s\n", result.Source)
+	}
+
 	return nil
 }
 
@@ -3417,124 +3474,149 @@ Examples:
 }
 
 func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail, serverFilter string, showDetail bool) error {
-
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Create HTTP API client
+	client, err := createHTTPAPIClient(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to initialize resilient database: %w", err)
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
 	}
-	defer rdb.Close()
 
-	// Get connection statistics
-	var stats *db.ConnectionStats
+	// Build URL based on whether user email is specified
+	var url string
 	if userEmail != "" {
-		// Get connections for specific user
-		connections, err := rdb.GetUserConnectionsWithRetry(ctx, userEmail)
-		if err != nil {
-			return fmt.Errorf("failed to get user connections: %w", err)
-		}
-
-		// Build stats from user connections
-		stats = &db.ConnectionStats{
-			TotalConnections:      int64(len(connections)),
-			ConnectionsByProtocol: make(map[string]int64),
-			ConnectionsByServer:   make(map[string]int64),
-			Users:                 connections,
-		}
-
-		// Count by protocol and server
-		for _, conn := range connections {
-			stats.ConnectionsByProtocol[conn.Protocol]++
-			stats.ConnectionsByServer[conn.ServerAddr]++
-		}
+		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
 	} else {
-		// Get all connection statistics
-		stats, err = rdb.GetConnectionStatsWithRetry(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get connection stats: %w", err)
-		}
+		url = fmt.Sprintf("%s/admin/connections/stats", cfg.HTTPAPIAddr)
 	}
 
-	// Apply server filter if specified
-	if serverFilter != "" && userEmail == "" {
-		filteredUsers := []db.ConnectionInfo{}
-		for _, conn := range stats.Users {
-			if conn.ServerAddr == serverFilter {
-				filteredUsers = append(filteredUsers, conn)
-			}
-		}
-		stats.Users = filteredUsers
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	if stats.TotalConnections == 0 && userEmail == "" && serverFilter == "" {
-		fmt.Println("No active connections found.")
-		fmt.Println("\nNote: This command shows all active connections (both proxy and direct backend connections).")
-		fmt.Println("Ensure your servers are running and clients are connected.")
-		return nil
+	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get connection stats: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Display statistics
-	fmt.Printf("Active Connections\n")
-	fmt.Printf("==================\n\n")
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API request failed (status %d): %s", resp.StatusCode, string(body))
+	}
 
+	// Parse response based on endpoint
 	if userEmail != "" {
-		fmt.Printf("User: %s\n\n", userEmail)
-	}
-	if serverFilter != "" {
-		fmt.Printf("Server: %s\n\n", serverFilter)
-	}
+		// User-specific connections
+		var result struct {
+			Email       string `json:"email"`
+			Connections []struct {
+				Protocol    string    `json:"protocol"`
+				AccountID   int64     `json:"account_id"`
+				Email       string    `json:"email"`
+				LocalCount  int       `json:"local_count"`
+				TotalCount  int       `json:"total_count"`
+				LastUpdate  time.Time `json:"last_update"`
+			} `json:"connections"`
+			Count  int    `json:"count"`
+			Source string `json:"source,omitempty"`
+			Note   string `json:"note,omitempty"`
+		}
 
-	fmt.Printf("Summary:\n")
-	fmt.Printf("  Total connections: %d\n", stats.TotalConnections)
-	fmt.Printf("\n")
+		if err := json.Unmarshal(body, &result); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
 
-	// Show connections by protocol
-	if len(stats.ConnectionsByProtocol) > 0 {
-		fmt.Printf("By Protocol:\n")
-		for protocol, count := range stats.ConnectionsByProtocol {
+		if result.Note != "" {
+			fmt.Printf("Note: %s\n\n", result.Note)
+		}
+
+		if result.Count == 0 {
+			fmt.Printf("No active connections found for user: %s\n", userEmail)
+			return nil
+		}
+
+		fmt.Printf("Active Connections for User: %s\n", userEmail)
+		fmt.Printf("==========================================\n\n")
+		fmt.Printf("Total connections: %d\n\n", result.Count)
+
+		// Group by protocol
+		protocolCounts := make(map[string]int)
+		for _, conn := range result.Connections {
+			protocolCounts[conn.Protocol] += conn.TotalCount
+		}
+
+		fmt.Println("By Protocol:")
+		for protocol, count := range protocolCounts {
 			fmt.Printf("  %-12s %d\n", protocol+":", count)
 		}
-		fmt.Printf("\n")
-	}
+		fmt.Println()
 
-	// Show connections by server
-	if len(stats.ConnectionsByServer) > 0 && userEmail == "" && serverFilter == "" {
-		fmt.Printf("By Server:\n")
-		for server, count := range stats.ConnectionsByServer {
-			fmt.Printf("  %-20s %d\n", server+":", count)
-		}
-		fmt.Printf("\n")
-	}
-
-	// Show detailed connection list
-	if showDetail && len(stats.Users) > 0 {
-		fmt.Printf("Active Connections:\n")
-		fmt.Printf("%-30s %-20s %-21s %-21s %-12s %-12s\n", "Email", "Protocol", "Client Address", "Server Address", "Duration", "Idle")
-		fmt.Printf("%s\n", strings.Repeat("-", 120))
-
-		now := time.Now()
-		for _, conn := range stats.Users {
-			// Calculate durations
-			duration := now.Sub(conn.ConnectedAt)
-			idle := now.Sub(conn.LastActivity)
-
-			// Format protocol with proxy indicator
-			protocol := conn.Protocol
-			if conn.IsProxy {
-				protocol = protocol + " (proxy)"
-			} else {
-				protocol = protocol + " (direct)"
+		if showDetail {
+			fmt.Println("Details:")
+			fmt.Printf("%-12s %-12s %-12s %-20s\n", "Protocol", "Local", "Total", "Last Update")
+			fmt.Printf("%-12s %-12s %-12s %-20s\n", "--------", "-----", "-----", "-----------")
+			for _, conn := range result.Connections {
+				fmt.Printf("%-12s %-12d %-12d %-20s\n",
+					conn.Protocol,
+					conn.LocalCount,
+					conn.TotalCount,
+					conn.LastUpdate.Format("2006-01-02 15:04:05"))
 			}
-
-			fmt.Printf("%-30s %-20s %-21s %-21s %-12s %-12s\n",
-				conn.Email,
-				protocol,
-				conn.ClientAddr,
-				conn.ServerAddr,
-				formatDuration(duration),
-				formatDuration(idle))
+			fmt.Println()
 		}
-		fmt.Printf("\n")
+
+		if result.Source != "" {
+			fmt.Printf("Source: %s\n", result.Source)
+		}
+
+	} else {
+		// Overall statistics
+		var result struct {
+			TotalConnections      int            `json:"total_connections"`
+			ConnectionsByProtocol map[string]int `json:"connections_by_protocol"`
+			Source                string         `json:"source,omitempty"`
+			Note                  string         `json:"note,omitempty"`
+		}
+
+		if err := json.Unmarshal(body, &result); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		if result.Note != "" {
+			fmt.Printf("Note: %s\n\n", result.Note)
+		}
+
+		if result.TotalConnections == 0 {
+			fmt.Println("No active connections found.")
+			return nil
+		}
+
+		fmt.Printf("Active Connections\n")
+		fmt.Printf("==================\n\n")
+		fmt.Printf("Summary:\n")
+		fmt.Printf("  Total connections: %d\n\n", result.TotalConnections)
+
+		if len(result.ConnectionsByProtocol) > 0 {
+			fmt.Printf("By Protocol:\n")
+			for protocol, count := range result.ConnectionsByProtocol {
+				fmt.Printf("  %-12s %d\n", protocol+":", count)
+			}
+			fmt.Println()
+		}
+
+		if result.Source != "" {
+			fmt.Printf("Source: %s\n", result.Source)
+		}
 	}
 
 	return nil

@@ -400,6 +400,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	}
 }
 
+// SetConnTracker sets the connection tracker for this server
+func (s *ManageSieveServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+	s.connTracker = tracker
+}
+
 func (s *ManageSieveServer) Close() {
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {

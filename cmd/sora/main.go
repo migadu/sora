@@ -609,7 +609,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	return errChan
 }
 
-// startConnectionTrackerForProxy initializes and starts a gossip-based connection tracker for a given proxy protocol.
+// startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, clusterMgr *cluster.Manager, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
@@ -715,6 +715,20 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	if err != nil {
 		errChan <- err
 		return
+	}
+
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
+			}
+		}
 	}
 
 	go func() {
@@ -841,6 +855,20 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		return
 	}
 
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
+			}
+		}
+	}
+
 	go func() {
 		<-ctx.Done()
 		logger.Infof("Shutting down POP3 server %s...", serverConfig.Name)
@@ -913,6 +941,20 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	if err != nil {
 		errChan <- err
 		return
+	}
+
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
+			}
+		}
 	}
 
 	go func() {

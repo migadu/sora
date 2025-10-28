@@ -144,7 +144,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		log.Printf("[ManageSieve Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
 	}
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

@@ -784,6 +784,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	return err
 }
 
+// SetConnTracker sets the connection tracker for this server
+func (s *IMAPServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+	s.connTracker = tracker
+}
+
 func (s *IMAPServer) Close() {
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {

@@ -606,43 +606,35 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - If client_name/version specified: matches if BOTH name AND version match (AND)
 # - Between ja4_fingerprints and client_name/version: matches if EITHER criteria is met (OR)
 
-# --- AUTHENTICATION RATE LIMITING ---
-[server.auth_rate_limit]
-enabled = false                   # Enable authentication rate limiting.
-max_attempts_per_ip = 10          # Max failed auth attempts per IP address.
-max_attempts_per_username = 5     # Max failed auth attempts per username (across all IPs).
-ip_window_duration = "15m"        # Time window for IP-based rate limiting.
-username_window_duration = "30m"  # Time window for username-based rate limiting.
-cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
-fast_block_threshold = 10         # Failed attempts before immediate IP blocking.
-fast_block_duration = "5m"        # Duration of the fast IP block.
-delay_start_threshold = 2         # Failed attempts before applying authentication delays.
-initial_delay = "2s"              # Initial authentication delay after threshold is reached.
-max_delay = "30s"                 # Maximum authentication delay.
-delay_multiplier = 2.0            # Multiplier for progressive delay (exponential backoff).
-cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
-db_sync_interval = "30s"          # How often to sync batched auth attempts to the database.
-max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
-db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
-
 # --- RESOURCE LIMITS ---
-[server.limits]
-# Search rate limiting - prevent DoS attacks via excessive search queries
-search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
-search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
+# Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
+limits.search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
+limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
 
-# Session memory limiting - prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
-session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
+# --- TIMEOUT CONFIGURATION ---
+# Multi-layered timeout protection against various DoS attacks
+timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration regardless of activity (e.g., "30m", default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 1024)
 
-# --- SESSION TIMEOUTS ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout (command_timeout): Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement (min_bytes_per_minute): Closes connections transferring data too slowly
-[server.timeouts]
-command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- AUTHENTICATION RATE LIMITING ---
+# Use dotted notation for nested config within [[server]] array element
+auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
+auth_rate_limit.max_attempts_per_ip = 10          # Max failed auth attempts per IP address.
+auth_rate_limit.max_attempts_per_username = 5     # Max failed auth attempts per username (across all IPs).
+auth_rate_limit.ip_window_duration = "15m"        # Time window for IP-based rate limiting.
+auth_rate_limit.username_window_duration = "30m"  # Time window for username-based rate limiting.
+auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
+auth_rate_limit.fast_block_threshold = 10         # Failed attempts before immediate IP blocking.
+auth_rate_limit.fast_block_duration = "5m"        # Duration of the fast IP block.
+auth_rate_limit.delay_start_threshold = 2         # Failed attempts before applying authentication delays.
+auth_rate_limit.initial_delay = "2s"              # Initial authentication delay after threshold is reached.
+auth_rate_limit.max_delay = "30s"                 # Maximum authentication delay.
+auth_rate_limit.delay_multiplier = 2.0            # Multiplier for progressive delay (exponential backoff).
+auth_rate_limit.cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
+auth_rate_limit.db_sync_interval = "30s"          # How often to sync batched auth attempts to the database.
+auth_rate_limit.max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
+auth_rate_limit.db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
 
 
 # LMTP SERVER EXAMPLE
@@ -693,21 +685,12 @@ proxy_protocol_timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# auth_rate_limit.enabled = false
 
-# --- SESSION MEMORY LIMITING ---
-# Per-session memory limit to prevent memory exhaustion attacks (POP3 RETR/TOP commands)
-session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
-
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "2m"             # Maximum idle time (default: 2 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -721,7 +704,19 @@ addr = ":4190"
 max_connections = 200
 max_connections_per_ip = 3
 max_script_size = "16kb"      # Maximum size for a SIEVE script.
-supported_extensions = ["fileinto", "vacation", "envelope", "regex"]  # Supported SIEVE extensions. Available: envelope, fileinto, redirect, encoded-character, imap4flags, variables, relational, vacation, copy, regex
+# Supported SIEVE extensions that scripts can use via "require" statement.
+# This list controls which extensions are validated and allowed when scripts are uploaded.
+#
+# IMPORTANT: Extensions listed here will be advertised to clients in CAPABILITY responses.
+# Clients can then use "require 'extension'" in their scripts, and scripts using those
+# extensions will be accepted during PUTSCRIPT validation.
+#
+# Available extensions that go-sieve supports:
+#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
+#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
+#
+# Common production configuration:
+supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
 insecure_auth = false                            # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = ""
 master_sasl_password = ""
@@ -736,17 +731,12 @@ proxy_protocol_timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# auth_rate_limit.enabled = false
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "3m"             # Maximum idle time (default: 3 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 
 # IMAP PROXY EXAMPLE
@@ -783,19 +773,10 @@ connect_timeout = "30s"
 session_timeout = "30m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
-
-# --- AUTHENTICATION RATE LIMITING ---
-# Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -1060,10 +1041,10 @@ connect_timeout = "30s"
 session_timeout = "10m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-command_timeout = "5m"
-absolute_session_timeout = "30m"
-min_bytes_per_minute = 1024
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1103,18 +1084,24 @@ connect_timeout = "30s"
 session_timeout = "15m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-command_timeout = "5m"
-absolute_session_timeout = "30m"
-min_bytes_per_minute = 1024
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- SIEVE EXTENSIONS ---
-# Builtin extensions are always advertised: fileinto, reject, envelope, encoded-character,
-# subaddress, comparator-i;ascii-numeric, relational, imap4flags, copy, include, variables,
-# body, enotify, environment, mailbox, date, index, ihave, duplicate, mime, foreverypart, extracttext
+# Supported SIEVE extensions advertised to clients and validated during script upload.
+# MUST match (or be a subset of) what your backend ManageSieve servers support.
 #
-# Add additional extensions here (e.g., vacation, regex, spamtest, virustest)
-supported_extensions = ["vacation", "regex"]
+# This list determines which extensions clients can use in their SIEVE scripts.
+# Extensions not in this list will be rejected during PUTSCRIPT with "extension not supported" error.
+#
+# Available extensions that go-sieve supports:
+#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
+#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
+#
+# Common production configuration (should match your backend):
+supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)

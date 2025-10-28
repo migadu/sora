@@ -15,14 +15,11 @@
 # - pg_trgm extension enabled
 # - User with CREATE/DROP privileges for test isolation
 
-log_output = "stderr"
-
 # TEST DATABASE CONFIGURATION
 # =============================================================================
 # Uses local PostgreSQL with dedicated test database
 
 [database]
-log_queries = true              # Enable for test debugging
 query_timeout = "10s"           # Shorter timeout for faster test feedback
 search_timeout = "30s"          # Reduced timeout for tests
 write_timeout = "10s"           # Faster timeout for test writes
@@ -67,9 +64,6 @@ query_timeout = "10s"
 endpoint = "http://localhost:9000"  # Local minio if needed
 access_key = "test_access_key"
 secret_key = "test_secret_key"
-bucket_name = "sora-test"
-region = "us-east-1"
-use_ssl = false
 
 # SERVER CONFIGURATION (MINIMAL FOR TESTS)
 # =============================================================================
@@ -108,33 +102,6 @@ max_connections = 10
 max_connections_per_ip = 5
 debug = false
 
-# ADMIN CONFIGURATION (MINIMAL)
-[admin]
-enabled = false
-bind = "127.0.0.1:18080"
-username = "admin"
-password = "test_password"
-
-# CACHE CONFIGURATION (MINIMAL FOR TESTS)
-[cache]
-enabled = false
-max_size = "10mb"               # Small cache for tests
-default_ttl = "1m"
-cleanup_interval = "30s"
-storage_path = "/tmp/sora-test-cache"
-
-# RETENTION CONFIGURATION (ACCELERATED FOR TESTS)
-[retention]
-grace_period = "1m"             # Very short grace period for testing
-cleanup_interval = "30s"       # Frequent cleanup for tests
-max_cleanup_batch_size = 100
-
-# RATE LIMITING (DISABLED FOR TESTS)
-[rate_limiting]
-enabled = false
-
 # LOGGING (VERBOSE FOR TESTS)
 [logging]
 level = "debug"                 # Verbose logging for test debugging
-include_caller = true
-include_timestamp = true

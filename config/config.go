@@ -969,7 +969,7 @@ type LMTPProxyServerConfig struct {
 // ConnectionTrackingConfig is deprecated - connection tracking is now configured per-server
 // via ServerConfig.MaxConnectionsPerUser. This type is kept for backward compatibility.
 type ConnectionTrackingConfig struct {
-	Enabled               bool `toml:"enabled"` // Ignored
+	Enabled               bool `toml:"enabled"`                  // Ignored
 	MaxConnectionsPerUser int  `toml:"max_connections_per_user"` // Ignored - use per-server config instead
 }
 
@@ -1477,7 +1477,6 @@ func (c *ManageSieveProxyServerConfig) GetConnectTimeout() (time.Duration, error
 	return helpers.ParseDuration(c.ConnectTimeout)
 }
 
-
 // GetConnectTimeout parses the connect timeout duration for LMTP proxy
 func (c *LMTPProxyServerConfig) GetConnectTimeout() (time.Duration, error) {
 	if c.ConnectTimeout == "" {
@@ -1835,7 +1834,6 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	}
 	return retention
 }
-
 
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()

@@ -74,6 +74,7 @@ import (
 	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // For database/sql compatibility
 	"github.com/migadu/sora/config"
@@ -201,7 +202,15 @@ func (db *Database) Close() {
 		var unlocked bool
 		err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
 		if err != nil {
-			log.Printf("[DB] Failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+			// Check if this is a connection termination error (expected during shutdown)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
+				// 57P01 = admin_shutdown - connection terminated by administrator
+				// This is expected during graceful shutdown, lock is auto-released
+				log.Println("[DB] Advisory lock auto-released (connection terminated during shutdown).")
+			} else {
+				log.Printf("[DB] Failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+			}
 		} else if unlocked {
 			log.Println("[DB] Released shared database advisory lock.")
 		} else {

@@ -72,15 +72,13 @@ type ConnectionTracker struct {
 	// Shutdown
 	stopBroadcast chan struct{}
 	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 }
 
-// NewConnectionTracker creates a new gossip-based connection tracker
+// NewConnectionTracker creates a new connection tracker.
+// If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
+// If clusterMgr is nil, operates in local-only mode (for backend servers).
 func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int) *ConnectionTracker {
-	if clusterMgr == nil {
-		logger.Warnf("[%s-GOSSIP-TRACKER] Cluster manager is nil, connection tracking disabled", name)
-		return nil
-	}
-
 	ct := &ConnectionTracker{
 		name:                  name,
 		instanceID:            instanceID,
@@ -93,16 +91,24 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		stopCleanup:           make(chan struct{}),
 	}
 
-	// Register with cluster manager
-	clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
-	clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
+	if clusterMgr != nil {
+		// Cluster mode: register with cluster manager for gossip
+		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
+		clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
 
-	// Start background routines
-	go ct.broadcastRoutine()
-	go ct.cleanupRoutine()
+		// Start background routines
+		go ct.broadcastRoutine()
+		go ct.cleanupRoutine()
 
-	logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d",
-		name, instanceID, maxConnectionsPerUser)
+		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d (cluster mode)",
+			name, instanceID, maxConnectionsPerUser)
+	} else {
+		// Local mode: no gossip, just track connections locally
+		go ct.cleanupRoutine()
+
+		logger.Infof("[%s-LOCAL-TRACKER] Initialized: instance=%s, max_per_user=%d (local mode)",
+			name, instanceID, maxConnectionsPerUser)
+	}
 
 	return ct
 }
@@ -130,10 +136,20 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		ct.connections[accountID] = info
 	}
 
-	// Check cluster-wide limit (if configured)
-	if ct.maxConnectionsPerUser > 0 && info.TotalCount >= ct.maxConnectionsPerUser {
-		return fmt.Errorf("user %s has reached maximum connections (%d/%d across cluster)",
-			username, info.TotalCount, ct.maxConnectionsPerUser)
+	// Check limit (if configured)
+	// In cluster mode, check cluster-wide count. In local mode, check local count.
+	checkCount := info.TotalCount // cluster mode
+	if ct.clusterManager == nil {
+		checkCount = info.LocalCount // local mode
+	}
+
+	if ct.maxConnectionsPerUser > 0 && checkCount >= ct.maxConnectionsPerUser {
+		scope := "across cluster"
+		if ct.clusterManager == nil {
+			scope = "on this server"
+		}
+		return fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
+			username, checkCount, ct.maxConnectionsPerUser, scope)
 	}
 
 	// Increment local count
@@ -142,20 +158,28 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	info.LastUpdate = time.Now()
 	info.LocalInstances[ct.instanceID]++
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Registered: user=%s, local=%d, cluster=%d",
-		ct.name, username, info.LocalCount, info.TotalCount)
+	trackerType := "GOSSIP-TRACKER"
+	if ct.clusterManager == nil {
+		trackerType = "LOCAL-TRACKER"
+		info.TotalCount = info.LocalCount // In local mode, total = local
+	}
 
-	// Broadcast to cluster
-	ct.queueEvent(ConnectionEvent{
-		Type:       ConnectionEventRegister,
-		AccountID:  accountID,
-		Username:   username,
-		Protocol:   protocol,
-		ClientAddr: clientAddr,
-		Timestamp:  time.Now(),
-		NodeID:     ct.clusterManager.GetNodeID(),
-		InstanceID: ct.instanceID,
-	})
+	logger.Debugf("[%s-%s] Registered: user=%s, local=%d, total=%d",
+		ct.name, trackerType, username, info.LocalCount, info.TotalCount)
+
+	// Broadcast to cluster (only in cluster mode)
+	if ct.clusterManager != nil {
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventRegister,
+			AccountID:  accountID,
+			Username:   username,
+			Protocol:   protocol,
+			ClientAddr: clientAddr,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
+		})
+	}
 
 	return nil
 }
@@ -171,7 +195,11 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	info, exists := ct.connections[accountID]
 	if !exists {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Unregister called for unknown accountID=%d", ct.name, accountID)
+		trackerType := "GOSSIP-TRACKER"
+		if ct.clusterManager == nil {
+			trackerType = "LOCAL-TRACKER"
+		}
+		logger.Debugf("[%s-%s] Unregister called for unknown accountID=%d", ct.name, trackerType, accountID)
 		return nil
 	}
 
@@ -186,27 +214,44 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 		info.LocalInstances[ct.instanceID] = count - 1
 	}
 
+	// In local mode, keep total = local
+	if ct.clusterManager == nil {
+		info.TotalCount = info.LocalCount
+	}
+
 	info.LastUpdate = time.Now()
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Unregistered: user=%s, local=%d, cluster=%d",
-		ct.name, info.Username, info.LocalCount, info.TotalCount)
+	trackerType := "GOSSIP-TRACKER"
+	if ct.clusterManager == nil {
+		trackerType = "LOCAL-TRACKER"
+	}
 
-	// Clean up if no connections remain
-	if info.TotalCount <= 0 {
+	logger.Debugf("[%s-%s] Unregistered: user=%s, local=%d, total=%d",
+		ct.name, trackerType, info.Username, info.LocalCount, info.TotalCount)
+
+	// Clean up if no local connections remain
+	cleanupThreshold := info.TotalCount
+	if ct.clusterManager == nil {
+		cleanupThreshold = info.LocalCount // In local mode, clean up when no local connections
+	}
+
+	if cleanupThreshold <= 0 {
 		delete(ct.connections, accountID)
 	}
 
-	// Broadcast to cluster
-	ct.queueEvent(ConnectionEvent{
-		Type:       ConnectionEventUnregister,
-		AccountID:  accountID,
-		Username:   info.Username,
-		Protocol:   protocol,
-		ClientAddr: clientAddr,
-		Timestamp:  time.Now(),
-		NodeID:     ct.clusterManager.GetNodeID(),
-		InstanceID: ct.instanceID,
-	})
+	// Broadcast to cluster (only in cluster mode)
+	if ct.clusterManager != nil {
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventUnregister,
+			AccountID:  accountID,
+			Username:   info.Username,
+			Protocol:   protocol,
+			ClientAddr: clientAddr,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
+		})
+	}
 
 	return nil
 }
@@ -270,7 +315,9 @@ func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
 	return result
 }
 
-// KickUser broadcasts a kick command for a user
+// KickUser kicks a user's connections.
+// In cluster mode, broadcasts kick event via gossip.
+// In local mode, directly closes all sessions for the user.
 func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 	if ct == nil {
 		return fmt.Errorf("connection tracker not initialized")
@@ -284,19 +331,46 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 	}
 	ct.mu.RUnlock()
 
-	logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
-		ct.name, accountID, protocol)
+	if ct.clusterManager != nil {
+		// Cluster mode: broadcast kick event via gossip
+		logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
+			ct.name, accountID, protocol)
 
-	// Broadcast kick event
-	ct.queueEvent(ConnectionEvent{
-		Type:       ConnectionEventKick,
-		AccountID:  accountID,
-		Username:   username,
-		Protocol:   protocol,
-		Timestamp:  time.Now(),
-		NodeID:     ct.clusterManager.GetNodeID(),
-		InstanceID: ct.instanceID,
-	})
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventKick,
+			AccountID:  accountID,
+			Username:   username,
+			Protocol:   protocol,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
+		})
+	} else {
+		// Local mode: directly kick sessions on this server
+		logger.Infof("[%s-LOCAL-TRACKER] Kicking local sessions for accountID=%d, protocol=%s",
+			ct.name, accountID, protocol)
+
+		ct.kickSessionsMu.Lock()
+		sessions := ct.kickSessions[accountID]
+		if len(sessions) > 0 {
+			// Close all kick channels for this user
+			for _, ch := range sessions {
+				select {
+				case <-ch:
+					// Already closed
+				default:
+					close(ch)
+				}
+			}
+			delete(ct.kickSessions, accountID)
+			logger.Infof("[%s-LOCAL-TRACKER] Kicked %d local sessions for accountID=%d",
+				ct.name, len(sessions), accountID)
+		} else {
+			logger.Debugf("[%s-LOCAL-TRACKER] No active sessions to kick for accountID=%d",
+				ct.name, accountID)
+		}
+		ct.kickSessionsMu.Unlock()
+	}
 
 	return nil
 }
@@ -562,14 +636,16 @@ func (ct *ConnectionTracker) cleanup() {
 	}
 }
 
-// Stop stops the gossip tracker
+// Stop stops the gossip tracker (idempotent)
 func (ct *ConnectionTracker) Stop() {
 	if ct == nil {
 		return
 	}
 
-	close(ct.stopBroadcast)
-	close(ct.stopCleanup)
+	ct.stopOnce.Do(func() {
+		close(ct.stopBroadcast)
+		close(ct.stopCleanup)
+	})
 }
 
 // GetOperationTimeout returns a timeout for operations (for compatibility with old interface)

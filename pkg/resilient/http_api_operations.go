@@ -20,48 +20,6 @@ func (rd *ResilientDatabase) AccountExistsWithRetry(ctx context.Context, email s
 	return result.(bool), nil
 }
 
-func (rd *ResilientDatabase) GetActiveConnectionsWithRetry(ctx context.Context) ([]db.ConnectionInfo, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetActiveConnections(ctx)
-	}
-	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []db.ConnectionInfo{}, nil
-	}
-	return result.([]db.ConnectionInfo), nil
-}
-
-func (rd *ResilientDatabase) GetConnectionStatsWithRetry(ctx context.Context) (*db.ConnectionStats, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetConnectionStats(ctx)
-	}
-	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return nil, nil
-	}
-	return result.(*db.ConnectionStats), nil
-}
-
-func (rd *ResilientDatabase) GetUserConnectionsWithRetry(ctx context.Context, email string) ([]db.ConnectionInfo, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetUserConnections(ctx, email)
-	}
-	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []db.ConnectionInfo{}, nil
-	}
-	return result.([]db.ConnectionInfo), nil
-}
-
 func (rd *ResilientDatabase) GetLatestCacheMetricsWithRetry(ctx context.Context) ([]*db.CacheMetricsRecord, error) {
 	op := func(ctx context.Context) (interface{}, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetLatestCacheMetrics(ctx)
