@@ -535,6 +535,10 @@ tls = false                               # Enable TLS for IMAP (IMAPS). Typical
 # tls_cert_file = "/path/to/your/imap.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/imap.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false                        # Verify client certificates (mutual TLS). Usually false.
+# tls_default_domain = "imap.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
+                                          # Useful when different protocols should have different default certificates
+                                          # (e.g., imap.example.com for IMAP, pop3.example.com for POP3).
+                                          # If not set, uses global [tls.letsencrypt].default_domain or first domain in list.
 
 # --- PROXY PROTOCOL CONFIGURATION ---
 # Enable if this server is behind a load balancer or reverse proxy
@@ -660,6 +664,7 @@ tls_use_starttls = false      # Use STARTTLS for opportunistic encryption.
 # tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/lmtp.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false
+# tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
 
@@ -684,6 +689,7 @@ tls = false
 # tls_cert_file = "/path/to/your/pop3.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/pop3.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false
+# tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
 
@@ -723,6 +729,7 @@ master_sasl_username = ""
 master_sasl_password = ""
 tls = false
 tls_use_starttls = false
+# tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 tls_cert_file = "/path/to/your/managesieve.crt"
 tls_key_file = "/path/to/your/managesieve.key"
 tls_verify = true
@@ -763,6 +770,7 @@ tls = false
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true
+# tls_default_domain = "imap.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
@@ -1038,6 +1046,7 @@ tls = false
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true
+# tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
@@ -1080,6 +1089,7 @@ tls_use_starttls = false              # Use STARTTLS on listening port (client c
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true
+# tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
@@ -1127,6 +1137,7 @@ tls_use_starttls = false              # Use STARTTLS on listening port (client c
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true
+# tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
@@ -1223,6 +1234,7 @@ tls_verify = false
 #tls_cert_file = ""
 #tls_key_file = ""
 #tls_verify = false
+#tls_default_domain = "api.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 #remote_tls = false                  # Use HTTPS for backend connections
 #remote_tls_verify = true            # Verify backend TLS certificates
 
