@@ -334,6 +334,8 @@ func TestLMTPProxyStartTLSWithXCLIENT(t *testing.T) {
 		RemotePort:           24,
 		TLS:                  true,
 		TLSUseStartTLS:       true,
+		TLSCertFile:          "../../testdata/sora.crt",
+		TLSKeyFile:           "../../testdata/sora.key",
 		RemoteTLS:            true,
 		RemoteTLSUseStartTLS: true,
 		RemoteUseXCLIENT:     true, // XCLIENT forwarding enabled

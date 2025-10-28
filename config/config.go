@@ -1066,11 +1066,12 @@ type ServerConfig struct {
 	Addr string `toml:"addr"`
 
 	// Common server options
-	TLS         bool   `toml:"tls,omitempty"`
-	TLSCertFile string `toml:"tls_cert_file,omitempty"`
-	TLSKeyFile  string `toml:"tls_key_file,omitempty"`
-	TLSVerify   bool   `toml:"tls_verify,omitempty"`
-	Debug       bool   `toml:"debug,omitempty"` // Enable debug logging for this server
+	TLS              bool   `toml:"tls,omitempty"`
+	TLSCertFile      string `toml:"tls_cert_file,omitempty"`
+	TLSKeyFile       string `toml:"tls_key_file,omitempty"`
+	TLSVerify        bool   `toml:"tls_verify,omitempty"`
+	TLSDefaultDomain string `toml:"tls_default_domain,omitempty"` // Default domain for SNI-less connections (overrides global default)
+	Debug            bool   `toml:"debug,omitempty"`              // Enable debug logging for this server
 
 	// PROXY protocol support (for non-proxy servers)
 	ProxyProtocol        bool   `toml:"proxy_protocol,omitempty"`

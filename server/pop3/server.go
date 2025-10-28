@@ -1,12 +1,14 @@
 package pop3
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +63,11 @@ type POP3Server struct {
 
 	// Connection tracking
 	connTracker *proxy.ConnectionTracker
+
+	// Active session tracking for graceful shutdown
+	activeSessionsMutex sync.RWMutex
+	activeSessions      map[*POP3Session]struct{}
+	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
 }
 
 type POP3ServerOptions struct {
@@ -134,6 +141,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
+		activeSessions:         make(map[*POP3Session]struct{}),
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -193,9 +201,18 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// Use 5 minute update interval and 10 second termination poll interval
 	// Disable batch updates (batchUpdates=false) for immediate database writes
 	// Get timeout values from config (with defaults if not configured)
-	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-	maxBatchSize := options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	var operationTimeout, batchFlushTimeout time.Duration
+	var maxBatchSize int
+	if options.Config != nil {
+		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
+		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
+		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	} else {
+		// Use safe defaults when config is not provided (e.g., in tests)
+		operationTimeout = 5 * time.Second
+		batchFlushTimeout = 1 * time.Second
+		maxBatchSize = 100
+	}
 	server.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
 	server.connTracker.Start()
 
@@ -365,7 +382,16 @@ func (s *POP3Server) Start(errChan chan error) {
 		log.Printf("POP3 [%s] new connection from %s (connections: total=%d, authenticated=%d)",
 			s.name, remoteInfo, totalCount, authCount)
 
-		go session.handleConnection()
+		// Track session for graceful shutdown
+		s.addSession(session)
+
+		// Track session in WaitGroup for graceful drain
+		s.sessionsWg.Add(1)
+
+		go func() {
+			defer s.sessionsWg.Done()
+			session.handleConnection()
+		}()
 	}
 }
 
@@ -375,11 +401,79 @@ func (s *POP3Server) Close() {
 		s.connTracker.Stop()
 	}
 
-	// Cancel the app context if it's still active
+	// Step 1: Send graceful shutdown messages to all active sessions
+	s.sendGracefulShutdownMessage()
+
+	// Step 2: Cancel context to signal sessions to finish
 	// This will propagate to all session contexts
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Step 3: Wait for active sessions to finish gracefully (with timeout)
+	s.waitForSessionsDrain(30 * time.Second)
+}
+
+// waitForSessionsDrain waits for all active sessions to finish with a timeout
+func (s *POP3Server) waitForSessionsDrain(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.sessionsWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("POP3 [%s] All sessions drained gracefully", s.name)
+	case <-time.After(timeout):
+		log.Printf("POP3 [%s] Session drain timeout after %v, forcing shutdown", s.name, timeout)
+	}
+}
+
+// addSession tracks an active session for graceful shutdown
+func (s *POP3Server) addSession(session *POP3Session) {
+	s.activeSessionsMutex.Lock()
+	defer s.activeSessionsMutex.Unlock()
+	s.activeSessions[session] = struct{}{}
+}
+
+// removeSession removes a session from active tracking
+func (s *POP3Server) removeSession(session *POP3Session) {
+	s.activeSessionsMutex.Lock()
+	defer s.activeSessionsMutex.Unlock()
+	delete(s.activeSessions, session)
+}
+
+// sendGracefulShutdownMessage sends a graceful shutdown notice to all active sessions
+func (s *POP3Server) sendGracefulShutdownMessage() {
+	s.activeSessionsMutex.RLock()
+	activeSessions := make([]*POP3Session, 0, len(s.activeSessions))
+	for session := range s.activeSessions {
+		activeSessions = append(activeSessions, session)
+	}
+	s.activeSessionsMutex.RUnlock()
+
+	if len(activeSessions) == 0 {
+		return
+	}
+
+	log.Printf("POP3 [%s] Sending graceful shutdown message to %d active connection(s)", s.name, len(activeSessions))
+
+	// Send shutdown message to all active connections
+	for _, session := range activeSessions {
+		if session.conn != nil && *session.conn != nil {
+			writer := bufio.NewWriter(*session.conn)
+			// POP3 doesn't have a specific "server shutting down" response code
+			// But we can send a polite message before disconnection
+			writer.WriteString("-ERR Server shutting down, please reconnect\r\n")
+			writer.Flush()
+		}
+	}
+
+	// Give clients a brief moment (1 second) to receive the message
+	time.Sleep(1 * time.Second)
+
+	log.Printf("POP3 [%s] Proceeding with connection cleanup", s.name)
 }
 
 // GetTotalConnections returns the current total connection count

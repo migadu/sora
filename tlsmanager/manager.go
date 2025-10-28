@@ -291,3 +291,38 @@ func (m *Manager) HTTPHandler() http.Handler {
 func (m *Manager) GetAutocertManager() *autocert.Manager {
 	return m.autocertMgr
 }
+
+// WrapTLSConfigWithDefaultDomain creates a new TLS config that wraps the base config
+// with a server-specific default domain for SNI-less connections.
+// If serverDefaultDomain is empty, returns the base config unchanged.
+func WrapTLSConfigWithDefaultDomain(baseCfg *tls.Config, serverDefaultDomain string) *tls.Config {
+	if serverDefaultDomain == "" || baseCfg == nil {
+		return baseCfg
+	}
+
+	// Clone the base config to avoid modifying the original
+	wrapped := baseCfg.Clone()
+
+	// Save the original GetCertificate function
+	originalGetCert := baseCfg.GetCertificate
+
+	// If there's no GetCertificate function in the base config, just return the clone
+	if originalGetCert == nil {
+		return wrapped
+	}
+
+	// Wrap the GetCertificate function with server-specific default domain handling
+	wrapped.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		// If no SNI provided, use server-specific default domain
+		if hello.ServerName == "" {
+			logger.Debugf("[TLS] Missing SNI - using server-specific default domain: %s", serverDefaultDomain)
+			modifiedHello := *hello
+			modifiedHello.ServerName = serverDefaultDomain
+			return originalGetCert(&modifiedHello)
+		}
+		// Otherwise use the original function as-is
+		return originalGetCert(hello)
+	}
+
+	return wrapped
+}

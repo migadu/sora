@@ -305,6 +305,11 @@ type IMAPServer struct {
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+
+	// Active connection tracking for graceful shutdown
+	activeConnsMutex sync.RWMutex
+	activeConns      map[*imapserver.Conn]struct{}
+	sessionsWg       sync.WaitGroup // Tracks active sessions for graceful drain
 }
 
 type IMAPServerOptions struct {
@@ -468,6 +473,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
+		activeConns:            make(map[*imapserver.Conn]struct{}),
 	}
 
 	// Pre-compile regex patterns for capability filters for performance and correctness
@@ -618,9 +624,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Use 5 minute update interval and 10 second termination poll interval
 	// Disable batch updates (batchUpdates=false) for immediate database writes
 	// Get timeout values from config (with defaults if not configured)
-	operationTimeout := options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-	batchFlushTimeout := options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-	maxBatchSize := options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	var operationTimeout, batchFlushTimeout time.Duration
+	var maxBatchSize int
+	if options.Config != nil {
+		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
+		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
+		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	} else {
+		// Use safe defaults when config is not provided (e.g., in tests)
+		operationTimeout = 5 * time.Second
+		batchFlushTimeout = 1 * time.Second
+		maxBatchSize = 100
+	}
 	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
 	s.connTracker.Start()
 
@@ -755,6 +770,12 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		PreAuth: false,
 	}
 
+	// Track active connection for graceful shutdown
+	s.trackConnection(conn)
+
+	// Track session in WaitGroup for graceful drain
+	s.sessionsWg.Add(1)
+
 	authCount := s.authenticatedConnections.Load()
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
@@ -764,6 +785,20 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
 	}
 	return session, greeting, nil
+}
+
+// trackConnection adds a connection to the active connections map
+func (s *IMAPServer) trackConnection(conn *imapserver.Conn) {
+	s.activeConnsMutex.Lock()
+	defer s.activeConnsMutex.Unlock()
+	s.activeConns[conn] = struct{}{}
+}
+
+// untrackConnection removes a connection from the active connections map
+func (s *IMAPServer) untrackConnection(conn *imapserver.Conn) {
+	s.activeConnsMutex.Lock()
+	defer s.activeConnsMutex.Unlock()
+	delete(s.activeConns, conn)
 }
 
 func (s *IMAPServer) Serve(imapAddr string) error {
@@ -848,10 +883,65 @@ func (s *IMAPServer) Close() {
 	}
 
 	if s.server != nil {
-		// This will close the listener and cause s.server.Serve(listener) to return.
-		// It will also start closing active client connections.
+		// Step 1: Send graceful BYE messages to all active sessions
+		s.sendGracefulShutdownBye()
+
+		// Step 2: Close listener to stop accepting new connections
+		// This will cause s.server.Serve(listener) to return
 		s.server.Close()
+
+		// Step 3: Wait for active sessions to finish gracefully (with timeout)
+		s.waitForSessionsDrain(30 * time.Second)
 	}
+}
+
+// waitForSessionsDrain waits for all active sessions to finish with a timeout
+func (s *IMAPServer) waitForSessionsDrain(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.sessionsWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("IMAP [%s] All sessions drained gracefully", s.name)
+	case <-time.After(timeout):
+		log.Printf("IMAP [%s] Session drain timeout after %v, forcing shutdown", s.name, timeout)
+	}
+}
+
+// sendGracefulShutdownBye sends a BYE response with UNAVAILABLE code to all active sessions
+// This informs clients that the server is shutting down and they should reconnect
+func (s *IMAPServer) sendGracefulShutdownBye() {
+	// Get snapshot of active connections
+	s.activeConnsMutex.RLock()
+	activeConns := make([]*imapserver.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		activeConns = append(activeConns, conn)
+	}
+	s.activeConnsMutex.RUnlock()
+
+	if len(activeConns) == 0 {
+		return
+	}
+
+	log.Printf("IMAP [%s] Sending graceful shutdown BYE to %d active connection(s)", s.name, len(activeConns))
+
+	// Send BYE to all active connections
+	for _, conn := range activeConns {
+		// Send untagged BYE with text message
+		// RFC 3501 Section 7.1.5: BYE response indicates the server is closing the connection
+		if err := conn.Bye("Server shutting down, please reconnect"); err != nil {
+			log.Printf("IMAP [%s] Failed to send BYE to %s: %v", s.name, conn.NetConn().RemoteAddr(), err)
+		}
+	}
+
+	// Give clients a brief moment (1 second) to receive and process the BYE
+	// This prevents abrupt connection termination that could be misinterpreted as auth failure
+	time.Sleep(1 * time.Second)
+
+	log.Printf("IMAP [%s] Proceeding with connection cleanup", s.name)
 }
 
 // GetTotalConnections returns the current total connection count

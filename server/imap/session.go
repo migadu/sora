@@ -198,6 +198,11 @@ func (s *IMAPSession) Close() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	// Untrack connection from active connections
+	if s.conn != nil {
+		s.server.untrackConnection(s.conn)
+	}
+
 	// Release connection from limiter
 	if s.releaseConn != nil {
 		s.releaseConn()
@@ -244,6 +249,9 @@ func (s *IMAPSession) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Mark session as done in WaitGroup for graceful drain
+	s.server.sessionsWg.Done()
 
 	return nil
 }

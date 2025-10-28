@@ -1711,6 +1711,9 @@ func (s *POP3Session) closeWithoutLock() error {
 
 	(*s.conn).Close()
 
+	// Remove session from active tracking
+	s.server.removeSession(s)
+
 	// Release connection from limiter
 	if s.releaseConn != nil {
 		s.releaseConn()
@@ -1744,6 +1747,7 @@ func (s *POP3Session) closeWithoutLock() error {
 		s.Log("closed unauthenticated connection (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
+
 	return nil
 }
 

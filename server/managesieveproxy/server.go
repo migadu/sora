@@ -1,6 +1,7 @@
 package managesieveproxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -57,6 +58,10 @@ type Server struct {
 
 	// SIEVE extensions (additional to builtin)
 	supportedExtensions []string
+
+	// Active session tracking for graceful shutdown
+	activeSessionsMu sync.RWMutex
+	activeSessions   map[*Session]struct{}
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
@@ -203,6 +208,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter:                limiter,
 		debug:                  opts.Debug,
 		supportedExtensions:    opts.SupportedExtensions,
+		activeSessions:         make(map[*Session]struct{}),
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
@@ -342,6 +348,7 @@ func (s *Server) acceptConnections() error {
 			metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Inc()
 
 			session := newSession(s, conn)
+			s.addSession(session)
 			session.handleConnection()
 		}()
 	}
@@ -365,6 +372,9 @@ func (s *Server) Stop() error {
 	if s.connTracker != nil {
 		s.connTracker.Stop()
 	}
+
+	// Send graceful shutdown messages to all active sessions
+	s.sendGracefulShutdownBye()
 
 	s.cancel()
 
@@ -400,4 +410,58 @@ func (s *Server) Stop() error {
 	}
 
 	return nil
+}
+
+// addSession tracks an active session for graceful shutdown
+func (s *Server) addSession(session *Session) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	s.activeSessions[session] = struct{}{}
+}
+
+// removeSession removes a session from active tracking
+func (s *Server) removeSession(session *Session) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	delete(s.activeSessions, session)
+}
+
+// sendGracefulShutdownBye sends a BYE message to all active client connections
+// and LOGOUT to backend servers for clean shutdown
+func (s *Server) sendGracefulShutdownBye() {
+	s.activeSessionsMu.RLock()
+	activeSessions := make([]*Session, 0, len(s.activeSessions))
+	for session := range s.activeSessions {
+		activeSessions = append(activeSessions, session)
+	}
+	s.activeSessionsMu.RUnlock()
+
+	if len(activeSessions) == 0 {
+		return
+	}
+
+	log.Printf("ManageSieve Proxy [%s] Sending graceful shutdown messages to %d active connection(s)", s.name, len(activeSessions))
+
+	// Send shutdown messages to both client and backend
+	for _, session := range activeSessions {
+		// Send BYE to client
+		if session.clientWriter != nil {
+			// Send BYE with TRYLATER response code (RFC 5804)
+			session.clientWriter.WriteString("BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
+			session.clientWriter.Flush()
+		}
+
+		// Send LOGOUT to backend for clean disconnect
+		if session.backendConn != nil {
+			// ManageSieve uses LOGOUT command (RFC 5804 Section 2.3)
+			writer := bufio.NewWriter(session.backendConn)
+			writer.WriteString("LOGOUT\r\n")
+			writer.Flush()
+		}
+	}
+
+	// Give both clients and backends a brief moment to process
+	time.Sleep(1 * time.Second)
+
+	log.Printf("ManageSieve Proxy [%s] Proceeding with connection cleanup", s.name)
 }

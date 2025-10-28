@@ -762,10 +762,12 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		maxMessageSize = 50 * 1024 * 1024
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
@@ -896,10 +898,12 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
@@ -999,10 +1003,12 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	server, err := imapproxy.New(ctx, deps.resilientDB, deps.hostname, imapproxy.ServerOptions{
@@ -1103,10 +1109,12 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
@@ -1204,10 +1212,12 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	server, err := managesieveproxy.New(ctx, deps.resilientDB, deps.hostname, managesieveproxy.ServerOptions{
@@ -1291,10 +1301,12 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		return
 	}
 
-	// Get global TLS config if available
+	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	server, err := lmtpproxy.New(ctx, deps.resilientDB, deps.hostname, lmtpproxy.ServerOptions{
@@ -1468,6 +1480,8 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	var tlsConfig *tls.Config
 	if deps.tlsManager != nil {
 		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
 	server, err := userapiproxy.New(ctx, deps.resilientDB, userapiproxy.ServerOptions{

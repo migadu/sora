@@ -489,9 +489,19 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	originalGetConfig := tlsConfig.GetConfigForClient
 
 	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		// Capture JA4 fingerprint
-		ja4 := ja4plus.JA4(hello)
-		c.SetJA4Fingerprint(ja4)
+		// Capture JA4 fingerprint with panic recovery
+		// The ja4plus library can panic on malformed ClientHello messages
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[%s] JA4 fingerprinting panic recovered (likely malformed ClientHello): %v", c.connConfig.Protocol, r)
+					// Set empty fingerprint on panic
+					c.SetJA4Fingerprint("")
+				}
+			}()
+			ja4 := ja4plus.JA4(hello)
+			c.SetJA4Fingerprint(ja4)
+		}()
 
 		// Call original callback if it exists
 		if originalGetConfig != nil {

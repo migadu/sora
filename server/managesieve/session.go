@@ -893,6 +893,9 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 
 	(*s.conn).Close()
 
+	// Remove session from active tracking
+	s.server.removeSession(s)
+
 	// Release connection from limiter
 	if s.releaseConn != nil {
 		s.releaseConn()
@@ -926,6 +929,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		s.Log("session closed unauthenticated (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
+
 	return nil
 }
 

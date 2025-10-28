@@ -808,17 +808,20 @@ func (s *Session) close() {
 
 		// Fire-and-forget: unregister in background to avoid blocking session teardown
 		go func() {
+			// Check if connection tracker is available before using it
+			if connTracker == nil || !connTracker.IsEnabled() {
+				return
+			}
+
 			// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 			// Use configurable timeout from connection tracker to handle database load spikes during heavy connection churn.
 			timeout := connTracker.GetOperationTimeout()
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
-			if connTracker != nil && connTracker.IsEnabled() {
-				if err := connTracker.UnregisterConnection(ctx, accountID, "LMTP", clientAddr); err != nil {
-					// Connection tracking is non-critical monitoring data, so log but continue
-					log.Printf("LMTP Proxy [%s] Failed to unregister connection for %s: %v", serverName, username, err)
-				}
+			if err := connTracker.UnregisterConnection(ctx, accountID, "LMTP", clientAddr); err != nil {
+				// Connection tracking is non-critical monitoring data, so log but continue
+				log.Printf("LMTP Proxy [%s] Failed to unregister connection for %s: %v", serverName, username, err)
 			}
 		}()
 	}

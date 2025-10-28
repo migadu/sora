@@ -1,6 +1,7 @@
 package pop3proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -51,6 +52,10 @@ type POP3ProxyServer struct {
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
+
+	// Active session tracking for graceful shutdown
+	activeSessionsMu sync.RWMutex
+	activeSessions   map[*POP3ProxySession]struct{}
 }
 
 // maskingWriter wraps an io.Writer to mask sensitive information in POP3 commands
@@ -229,6 +234,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		limiter:                limiter,
 		debug:                  options.Debug,
 		debugWriter:            debugWriter,
+		activeSessions:         make(map[*POP3ProxySession]struct{}),
 	}
 
 	// Setup TLS: Three scenarios
@@ -359,8 +365,12 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Inc()
 
+		// Track session for graceful shutdown
+		s.addSession(session)
+
 		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			defer func() {
 				// Release connection limit when session ends
 				if releaseConn != nil {
@@ -396,6 +406,9 @@ func (s *POP3ProxyServer) Stop() error {
 		s.connTracker.Stop()
 	}
 
+	// Send graceful shutdown messages to all active sessions
+	s.sendGracefulShutdownMessage()
+
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -424,4 +437,57 @@ func (s *POP3ProxyServer) Stop() error {
 	}
 
 	return nil
+}
+
+// addSession tracks an active session for graceful shutdown
+func (s *POP3ProxyServer) addSession(session *POP3ProxySession) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	s.activeSessions[session] = struct{}{}
+}
+
+// removeSession removes a session from active tracking
+func (s *POP3ProxyServer) removeSession(session *POP3ProxySession) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	delete(s.activeSessions, session)
+}
+
+// sendGracefulShutdownMessage sends a shutdown error message to all active client connections
+// and QUIT to backend servers for clean shutdown
+func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
+	s.activeSessionsMu.RLock()
+	activeSessions := make([]*POP3ProxySession, 0, len(s.activeSessions))
+	for session := range s.activeSessions {
+		activeSessions = append(activeSessions, session)
+	}
+	s.activeSessionsMu.RUnlock()
+
+	if len(activeSessions) == 0 {
+		return
+	}
+
+	log.Printf("POP3 Proxy [%s] Sending graceful shutdown messages to %d active connection(s)", s.name, len(activeSessions))
+
+	// Send shutdown messages to both client and backend
+	for _, session := range activeSessions {
+		// Send error response to client
+		if session.clientConn != nil {
+			writer := bufio.NewWriter(session.clientConn)
+			writer.WriteString("-ERR Server shutting down, please reconnect\r\n")
+			writer.Flush()
+		}
+
+		// Send QUIT to backend for clean disconnect
+		if session.backendConn != nil {
+			writer := bufio.NewWriter(session.backendConn)
+			writer.WriteString("QUIT\r\n")
+			writer.Flush()
+		}
+	}
+
+	// Give both clients and backends a brief moment to process
+	time.Sleep(1 * time.Second)
+
+	log.Printf("POP3 Proxy [%s] Proceeding with connection cleanup", s.name)
 }
