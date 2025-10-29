@@ -950,7 +950,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
 
 	// Send request
 	resp, err := client.Do(req)
@@ -1232,7 +1232,7 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -3508,7 +3508,7 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("X-API-Key", cfg.HTTPAPIKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
 
 	// Send request
 	resp, err := client.Do(req)
@@ -4915,7 +4915,7 @@ func callAdminAPI(ctx context.Context, addr, apiKey, method, path string, body i
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
