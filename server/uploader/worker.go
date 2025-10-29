@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -59,6 +59,9 @@ type UploadWorker struct {
 	notifyCh      chan struct{}
 	stopCh        chan struct{}
 	errCh         chan<- error
+	wg            sync.WaitGroup
+	mu            sync.Mutex
+	running       bool
 }
 
 func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
@@ -88,41 +91,73 @@ func New(ctx context.Context, path string, batchSize int, concurrency int, maxAt
 	}, nil
 }
 
-func (w *UploadWorker) Start(ctx context.Context) {
-	log.Println("[UPLOADER] starting worker")
+func (w *UploadWorker) Start(ctx context.Context) error {
+	w.mu.Lock()
+	if w.running {
+		w.mu.Unlock()
+		return nil
+	}
+	w.running = true
+	w.mu.Unlock()
 
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+	w.wg.Add(1)
+	go w.run(ctx)
 
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("[UPLOADER] worker stopped due to context cancellation")
-				return
-			case <-w.stopCh:
-				log.Println("[UPLOADER] worker stopped due to stop signal")
-				return
-			case <-ticker.C:
-				log.Println("[UPLOADER] timer tick")
-				if err := w.processPendingUploads(ctx); err != nil {
-					select {
-					case w.errCh <- err:
-					default:
-						log.Printf("[UPLOADER] worker error (no listener): %v", err)
-					}
-				}
-			case <-w.notifyCh:
-				log.Println("[UPLOADER] worker notified")
-				_ = w.processPendingUploads(ctx)
-			}
-		}
-	}()
+	logger.Info("[UPLOADER] worker started")
+	return nil
 }
 
-// Stop signals the upload worker to stop
+func (w *UploadWorker) run(ctx context.Context) {
+	defer func() {
+		w.mu.Lock()
+		w.running = false
+		w.mu.Unlock()
+		w.wg.Done()
+	}()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	logger.Info("[UPLOADER] worker processing every 30s")
+
+	// Process immediately on start
+	w.processQueue(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("[UPLOADER] worker stopped due to context cancellation")
+			return
+		case <-w.stopCh:
+			logger.Info("[UPLOADER] worker stopped due to stop signal")
+			return
+		case <-ticker.C:
+			logger.Info("[UPLOADER] timer tick")
+			if err := w.processQueue(ctx); err != nil {
+				w.reportError(err)
+			}
+		case <-w.notifyCh:
+			logger.Info("[UPLOADER] worker notified")
+			_ = w.processQueue(ctx)
+		}
+	}
+}
+
+// Stop gracefully stops the worker and waits for all goroutines to complete.
+// It is safe to call Stop multiple times - subsequent calls are no-ops if already stopped.
 func (w *UploadWorker) Stop() {
+	w.mu.Lock()
+	if !w.running {
+		w.mu.Unlock()
+		return
+	}
+	w.running = false
+	w.mu.Unlock()
+
 	close(w.stopCh)
+	w.wg.Wait()
+
+	logger.Info("[UPLOADER] worker stopped")
 }
 
 func (w *UploadWorker) NotifyUploadQueued() {
@@ -131,6 +166,10 @@ func (w *UploadWorker) NotifyUploadQueued() {
 	default:
 		// Don't block if notifyCh already has a signal
 	}
+}
+
+func (w *UploadWorker) processQueue(ctx context.Context) error {
+	return w.processPendingUploads(ctx)
 }
 
 func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
@@ -154,13 +193,14 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 		for _, upload := range uploads {
 			// Check if this upload has exceeded max attempts before processing
 			if upload.Attempts >= w.maxAttempts {
-				log.Printf("[UPLOADER] skipping upload for hash %s (ID %d) due to excessive failed attempts (%d)", upload.ContentHash, upload.ID, upload.Attempts)
+				logger.Infof("[UPLOADER] skipping upload for hash %s (ID %d) due to excessive failed attempts (%d)", upload.ContentHash, upload.ID, upload.Attempts)
 				continue // Skip this upload and move to the next one in the batch
 			}
 
 			select {
 			case <-ctx.Done():
-				log.Println("[UPLOADER] request aborted")
+				logger.Info("[UPLOADER] request aborted, waiting for in-flight uploads")
+				wg.Wait()
 				return nil
 			case sem <- struct{}{}:
 				wg.Add(1)
@@ -179,19 +219,19 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) {
 	// Early validation of upload data
 	if !isValidContentHash(upload.ContentHash) {
-		log.Printf("[UPLOADER] ERROR: invalid content hash in upload record: %s", upload.ContentHash)
+		logger.Errorf("[UPLOADER] invalid content hash in upload record: %s (account %d)", upload.ContentHash, upload.AccountID)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for invalid hash %s: %v", upload.ContentHash, err)
+			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for invalid hash %s (account %d): %v", upload.ContentHash, upload.AccountID, err)
 		}
 		return
 	}
 
-	log.Printf("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
+	logger.Infof("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
 
 	// Check for context cancellation early
 	select {
 	case <-ctx.Done():
-		log.Printf("[UPLOADER] request aborted during upload of hash %s", upload.ContentHash)
+		logger.Infof("[UPLOADER] request aborted during upload of hash %s", upload.ContentHash)
 		return
 	default:
 	}
@@ -199,9 +239,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Get primary address to construct S3 path
 	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
 	if err != nil {
-		log.Printf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
+		logger.Errorf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after email lookup failure: %v", upload.ContentHash, err)
+			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after email lookup failure: %v", upload.ContentHash, upload.AccountID, err)
 		}
 		return
 	}
@@ -213,22 +253,22 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Check if this content hash is already marked as uploaded by another worker for this user
 	isUploaded, err := w.rdb.IsContentHashUploadedWithRetry(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
-		log.Printf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
+		logger.Errorf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
 		// Mark attempt and let it be retried
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after upload check failure: %v", upload.ContentHash, err)
+			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after upload check failure: %v", upload.ContentHash, upload.AccountID, err)
 		}
 		return
 	}
 
 	if isUploaded {
-		log.Printf("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
+		logger.Infof("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
 		// Content is already in S3. Mark this specific message instance as uploaded
 		// and delete the pending upload record.
 		if err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] WARNING: failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
+			logger.Warnf("[UPLOADER] failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
 		} else {
-			log.Printf("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
+			logger.Infof("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
 		}
 		// The local file is unique to this upload task, so it can be safely removed.
 		if err := w.RemoveLocalFile(filePath); err != nil {
@@ -240,9 +280,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after file read failure: %v", upload.ContentHash, err)
+			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after file read failure: %v", upload.ContentHash, upload.AccountID, err)
 		}
-		log.Printf("[UPLOADER] could not read file %s: %v", filePath, err)
+		logger.Errorf("[UPLOADER] could not read file %s (account %d): %v", filePath, upload.AccountID, err)
 		return // Cannot proceed without the file
 	}
 
@@ -252,9 +292,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			log.Printf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s after S3 failure: %v", upload.ContentHash, err)
+			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after S3 failure: %v", upload.ContentHash, upload.AccountID, err)
 		}
-		log.Printf("[UPLOADER] upload failed for %s (key: %s): %v", upload.ContentHash, s3Key, err)
+		logger.Errorf("[UPLOADER] upload failed for %s (account %d, key: %s): %v", upload.ContentHash, upload.AccountID, s3Key, err)
 
 		// Track upload failure
 		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
@@ -270,19 +310,19 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// If this fails, the S3 object might be orphaned temporarily, but the task is not lost.
 		// The task will be retried after the lease expires. Because the local file still
 		// exists, the retry can succeed.
-		log.Printf("[UPLOADER] CRITICAL: failed to finalize DB after S3 upload for hash %s, account %d: %v. Will retry.", upload.ContentHash, upload.AccountID, err)
+		logger.Errorf("[UPLOADER] CRITICAL: failed to finalize DB after S3 upload for hash %s, account %d: %v. Will retry.", upload.ContentHash, upload.AccountID, err)
 		return
 	}
 
 	// Move the uploaded file to the global cache. If the move fails (e.g., file
 	// already in cache from another user's upload), delete the local file.
 	if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
-		log.Printf("[UPLOADER] failed to move uploaded hash %s to cache: %v. Deleting local file.", upload.ContentHash, err)
+		logger.Errorf("[UPLOADER] failed to move uploaded hash %s to cache: %v. Deleting local file.", upload.ContentHash, err)
 		if removeErr := w.RemoveLocalFile(filePath); removeErr != nil {
 			// Log is inside RemoveLocalFile
 		}
 	} else {
-		log.Printf("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
+		logger.Infof("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
 	}
 
 	// Track successful upload
@@ -290,13 +330,26 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	metrics.S3UploadAttempts.WithLabelValues("success").Inc()
 	metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
-	log.Printf("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
+	logger.Infof("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
+}
+
+// reportError sends an error to the error channel if configured, otherwise logs it
+func (w *UploadWorker) reportError(err error) {
+	if w.errCh != nil {
+		select {
+		case w.errCh <- err:
+		default:
+			logger.Errorf("[UPLOADER] worker error (no listener): %v", err)
+		}
+	} else {
+		logger.Errorf("[UPLOADER] worker error: %v", err)
+	}
 }
 
 func (w *UploadWorker) FilePath(contentHash string, accountID int64) string {
 	// Validate content hash to prevent path traversal attacks
 	if !isValidContentHash(contentHash) {
-		log.Printf("[UPLOADER] WARNING: invalid content hash attempted: %s", contentHash)
+		logger.Warnf("[UPLOADER] invalid content hash attempted: %s", contentHash)
 		// Return a safe fallback path that will fail cleanly
 		return filepath.Join(w.path, "invalid", "invalid")
 	}
@@ -332,7 +385,7 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 
 func (w *UploadWorker) RemoveLocalFile(path string) error {
 	if err := os.Remove(path); err != nil {
-		log.Printf("[UPLOADER] WARNING: uploaded but could not delete file %s: %v", path, err)
+		logger.Warnf("[UPLOADER] uploaded but could not delete file %s: %v", path, err)
 	} else {
 		stopAt, _ := filepath.Abs(w.path)
 		removeEmptyParents(path, stopAt)

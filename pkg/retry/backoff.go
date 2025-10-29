@@ -38,10 +38,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 type BackoffConfig struct {
@@ -163,10 +164,10 @@ func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConf
 			if IsStopError(err) {
 				var stopErr StopError
 				errors.As(err, &stopErr)
-				log.Printf("[RETRY-DEBUG] StopError detected on attempt %d, stopping retries: %v", attempts, stopErr.Err)
+				logger.Infof("[RETRY-DEBUG] StopError detected on attempt %d, stopping retries: %v", attempts, stopErr.Err)
 				return stopErr.Err
 			}
-			log.Printf("[RETRY-DEBUG] Error on attempt %d (will retry if < %d): %v", attempts, config.MaxRetries+1, err)
+			logger.Infof("[RETRY-DEBUG] Error on attempt %d (will retry if < %d): %v", attempts, config.MaxRetries+1, err)
 			if attempt < config.MaxRetries {
 				continue
 			}

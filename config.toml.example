@@ -431,6 +431,90 @@ max_size = 10000            # Maximum number of cached authentication results. L
 cleanup_interval = "5m"     # How often to remove expired cache entries and update metrics.
 
 
+# EXTERNAL RELAY CONFIGURATION
+# =============================================================================
+# Global configuration for external SMTP/HTTP relay used by Sieve redirect and vacation actions.
+# This relay is used by LMTP servers and Admin API for sending messages to external recipients.
+#
+# Use cases:
+#   - Sieve redirect action: forward messages to external email addresses
+#   - Sieve vacation action: send auto-reply vacation responses
+#
+# You can choose between SMTP or HTTP relay:
+#   - SMTP: Traditional SMTP relay (most common)
+#   - HTTP: HTTP API relay for services that provide REST API for email delivery
+
+[relay]
+type = "smtp"                                      # Relay type: "smtp" or "http"
+
+# SMTP Relay Configuration (when type="smtp")
+smtp_host = "smtp.example.com:587"                # SMTP relay host and port
+smtp_tls = true                                   # Use TLS (recommended: true)
+smtp_tls_verify = true                            # Verify TLS certificates (recommended: true)
+smtp_use_starttls = true                          # Use STARTTLS (port 587) instead of direct TLS (port 465)
+# smtp_tls_cert_file = "/path/to/client.crt"     # Client certificate for mTLS (optional)
+# smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
+
+# HTTP API Relay Configuration (when type="http")
+# http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint
+# auth_token = "your-bearer-token"                      # Bearer token for Authorization header
+
+# Common relay providers:
+#   Gmail: smtp.gmail.com:587 (requires app-specific password)
+#   SendGrid: smtp.sendgrid.net:587 (API key as password)
+#   Mailgun: smtp.mailgun.org:587 (API credentials)
+#   Amazon SES: email-smtp.us-east-1.amazonaws.com:587 (SMTP credentials)
+
+# RELAY QUEUE CONFIGURATION
+# =============================================================================
+# Disk-based queue for relay delivery with automatic retry on failure.
+# The queue is ALWAYS ENABLED when relay is configured (see [relay] section above).
+# Messages are queued to disk and processed by background worker with exponential backoff.
+# This prevents message loss if external relay is temporarily unavailable.
+#
+# Benefits:
+#   - No message loss if relay fails temporarily
+#   - Exponential backoff retry mechanism
+#   - Circuit breaker protection (automatic fail-fast when endpoint is down)
+#   - Persistent across server restarts
+#   - No database overhead for non-critical relay messages
+#
+# Circuit Breaker:
+#   The relay handler includes an automatic circuit breaker that:
+#   - Opens after 5 consecutive failures (stops attempting delivery)
+#   - Tries recovery after 30 seconds (half-open state)
+#   - Closes after successful deliveries (normal operation resumed)
+#   - Prevents resource waste when external relay is down
+#   - Visible in health checks as circuit_breaker_smtp_relay or circuit_breaker_http_relay
+#
+# Directory structure:
+#   {path}/pending/    - Messages waiting for delivery
+#   {path}/processing/ - Currently being processed
+#   {path}/failed/     - Exceeded max_attempts, requires manual intervention
+#
+# Management: Use `sora-admin relay` commands to inspect and manage the queue
+#
+# NOTE: If max_attempts > len(retry_backoff), the last backoff value is used for all remaining attempts.
+#       Example: With 6 backoff values and 10 max_attempts, attempts 7-10 will all use the 6th backoff (24h).
+
+[relay.queue]
+path = "/var/spool/sora/relay"                                    # Base path for queue storage (default: /var/spool/sora/relay)
+worker_interval = "1m"                                            # How often worker processes queue (default: 1m)
+batch_size = 100                                                  # Number of messages to process per worker cycle (default: 100)
+concurrency = 5                                                   # Number of concurrent messages to process (default: 5)
+max_attempts = 10                                                 # Maximum delivery attempts before moving to failed (default: 10)
+retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]           # Backoff durations between retries (exponential, default shown)
+                                                                  # With these 6 values and 10 max_attempts:
+                                                                  # Attempts 1-6 use the configured backoff values
+                                                                  # Attempts 7-10 all use 24h (last value is repeated)
+                                                                  # Total retry time: ~1m+5m+15m+1h+6h+24h+24h+24h+24h ≈ 99 hours (4 days)
+
+# Circuit Breaker Configuration
+circuit_breaker_threshold = 5                                     # Consecutive failures before opening circuit (default: 5)
+circuit_breaker_timeout = "30s"                                   # Recovery test interval (default: 30s)
+circuit_breaker_max_requests = 3                                  # Max requests allowed in half-open state (default: 3)
+
+
 # METADATA LIMITS CONFIGURATION
 # =============================================================================
 # IMAP METADATA extension (RFC 5464) limits to prevent storage abuse.
@@ -640,6 +724,19 @@ auth_rate_limit.db_error_threshold = "1m"         # Time to wait before retrying
 # LMTP SERVER EXAMPLE
 # =============================================================================
 # Local Mail Transfer Protocol - handles incoming mail delivery from MTAs
+#
+# NOTE: Uses global [relay] configuration for Sieve redirect/vacation actions.
+#
+# Multi-server LMTP example:
+# [[server]]
+# type = "lmtp"
+# name = "production-lmtp"
+# addr = ":24"
+#
+# [[server]]
+# type = "lmtp"
+# name = "test-lmtp"
+# addr = ":2424"
 
 [[server]]
 type = "lmtp"
@@ -648,7 +745,6 @@ addr = ":24"
 debug = true                  # Enable debug logging for LMTP server
 max_connections = 500
 max_connections_per_ip = 5
-external_relay = ""           # External SMTP relay for mail forwarding (optional).
 tls = false
 tls_use_starttls = false      # Use STARTTLS for opportunistic encryption.
 # tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
@@ -661,6 +757,8 @@ proxy_protocol_timeout = "5s"
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
 max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+
+# NOTE: External relay for Sieve redirect/vacation is configured globally in [relay] section above
 
 
 # POP3 SERVER EXAMPLE
@@ -1178,6 +1276,8 @@ tls_key_file = ""
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
+
+# NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 
 
 # HTTP USER API SERVER EXAMPLE

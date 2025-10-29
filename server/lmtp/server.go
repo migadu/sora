@@ -102,6 +102,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
@@ -179,11 +180,12 @@ type LMTPServerBackend struct {
 	uploader       *uploader.UploadWorker
 	server         *smtp.Server
 	appCtx         context.Context
-	externalRelay  string
 	tlsConfig      *tls.Config
 	debug          bool
 	ftsRetention   time.Duration
-	maxMessageSize int64 // Maximum size for incoming messages
+	maxMessageSize int64               // Maximum size for incoming messages
+	relayQueue     delivery.RelayQueue // Disk-based queue for relay retry
+	relayWorker    RelayWorkerNotifier // Optional: notifies worker for immediate processing
 
 	// Connection counters
 	totalConnections atomic.Int64
@@ -202,8 +204,14 @@ type LMTPServerBackend struct {
 	proxyReader *server.ProxyProtocolReader
 }
 
+// RelayWorkerNotifier provides immediate processing notification for relay workers
+type RelayWorkerNotifier interface {
+	NotifyQueued()
+}
+
 type LMTPServerOptions struct {
-	ExternalRelay        string
+	RelayQueue           delivery.RelayQueue // Global relay queue for Sieve redirect/vacation
+	RelayWorker          RelayWorkerNotifier // Optional: notifies worker for immediate processing
 	Debug                bool
 	TLS                  bool
 	TLSCertFile          string
@@ -256,11 +264,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		rdb:            rdb,
 		s3:             s3,
 		uploader:       uploadWorker,
-		externalRelay:  options.ExternalRelay,
 		debug:          options.Debug,
 		ftsRetention:   options.FTSRetention,
 		maxMessageSize: options.MaxMessageSize,
 		proxyReader:    proxyReader,
+		relayQueue:     options.RelayQueue,
+		relayWorker:    options.RelayWorker,
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration

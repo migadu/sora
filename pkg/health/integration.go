@@ -3,11 +3,11 @@ package health
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -16,9 +16,10 @@ import (
 
 // HealthIntegration manages health monitoring for the Sora server
 type HealthIntegration struct {
-	monitor  *HealthMonitor
-	database *resilient.ResilientDatabase
-	hostname string
+	monitor    *HealthMonitor
+	database   *resilient.ResilientDatabase
+	hostname   string
+	relayQueue RelayQueueStatsProvider // For including stats in metadata
 }
 
 func NewHealthIntegration(database *resilient.ResilientDatabase) *HealthIntegration {
@@ -142,6 +143,44 @@ func (hi *HealthIntegration) RegisterCustomCheck(check *HealthCheck) {
 	hi.monitor.RegisterCheck(check)
 }
 
+// RelayQueueStatsProvider interface for relay queue statistics
+type RelayQueueStatsProvider interface {
+	GetStats() (pending, processing, failed int, err error)
+}
+
+// RegisterRelayQueueCheck registers a health check for the relay queue
+func (hi *HealthIntegration) RegisterRelayQueueCheck(relayQueue RelayQueueStatsProvider) {
+	// Store the relay queue reference for use in storeHealthStatus
+	hi.relayQueue = relayQueue
+
+	relayQueueCheck := &HealthCheck{
+		Name:     "relay_queue",
+		Interval: 60 * time.Second,
+		Timeout:  5 * time.Second,
+		Critical: false, // Not critical since relay is for async delivery
+		Enabled:  true,
+		Check: func(ctx context.Context) error {
+			pending, processing, failed, err := relayQueue.GetStats()
+			if err != nil {
+				return fmt.Errorf("failed to get relay queue stats: %w", err)
+			}
+
+			// Check if failed count is excessive (more than 100 failed messages)
+			if failed > 100 {
+				return fmt.Errorf("high number of failed messages: %d (pending: %d, processing: %d)", failed, pending, processing)
+			}
+
+			// Check if processing queue is backed up (more than 1000 pending)
+			if pending > 1000 {
+				return fmt.Errorf("relay queue backed up: %d pending messages (processing: %d, failed: %d)", pending, processing, failed)
+			}
+
+			return nil
+		},
+	}
+	hi.monitor.RegisterCheck(relayQueueCheck)
+}
+
 // PrelookupHealthChecker interface for prelookup clients that support health checks
 type PrelookupHealthChecker interface {
 	HealthCheck(ctx context.Context) error
@@ -211,6 +250,17 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	metadata["critical"] = critical
 	metadata["enabled"] = enabled
 
+	// Add relay queue statistics to metadata if this is the relay_queue component
+	if componentName == "relay_queue" && hi.relayQueue != nil {
+		pending, processing, failed, err := hi.relayQueue.GetStats()
+		if err == nil {
+			metadata["pending"] = pending
+			metadata["processing"] = processing
+			metadata["failed"] = failed
+			metadata["total"] = pending + processing + failed
+		}
+	}
+
 	// Convert health status to db status type
 	var dbStatus db.ComponentStatus
 	switch status {
@@ -239,7 +289,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	)
 
 	if err != nil {
-		log.Printf("Failed to store health status for %s: %v", componentName, err)
+		logger.Errorf("Failed to store health status for %s: %v", componentName, err)
 	}
 }
 

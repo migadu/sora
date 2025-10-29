@@ -1203,6 +1203,7 @@ type Config struct {
 	Metadata        MetadataConfig        `toml:"metadata"`
 	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
 	AuthCache       AuthCacheConfig       `toml:"auth_cache"`
+	Relay           RelayConfig           `toml:"relay"`
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`

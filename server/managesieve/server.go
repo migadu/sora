@@ -79,6 +79,7 @@ type ManageSieveServerOptions struct {
 	MasterSASLPassword     string
 	MaxConnections         int
 	MaxConnectionsPerIP    int
+	MaxConnectionsPerUser  int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
 	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
@@ -213,9 +214,26 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
 	}
 
-	// Connection tracking is only used for proxy servers with gossip/cluster mode
-	// For non-proxy (backend) servers, connection tracking is disabled
-	serverInstance.connTracker = nil
+	// Initialize local connection tracking (no gossip, just local tracking)
+	// This enables per-user connection limits and kick functionality on backend servers
+	if options.MaxConnectionsPerUser > 0 {
+		// Generate unique instance ID for this server instance
+		instanceID := fmt.Sprintf("managesieve-%s-%d", name, time.Now().UnixNano())
+
+		// Create ConnectionTracker with nil cluster manager (local mode only)
+		serverInstance.connTracker = proxy.NewConnectionTracker(
+			"ManageSieve",                 // protocol name
+			instanceID,                    // unique instance identifier
+			nil,                           // no cluster manager = local mode
+			options.MaxConnectionsPerUser, // per-user connection limit
+		)
+
+		log.Printf("ManageSieve [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)
+	} else {
+		// Connection tracking disabled (unlimited connections per user)
+		serverInstance.connTracker = nil
+		log.Printf("ManageSieve [%s] Local connection tracking disabled (max_connections_per_user not configured)", name)
+	}
 
 	return serverInstance, nil
 }

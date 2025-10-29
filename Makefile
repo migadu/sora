@@ -5,7 +5,7 @@
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin \
+	integration-tests-config integration-tests-sora-admin integration-tests-relay \
 	performance-tests performance-tests-short
 
 # Binary names - can be overridden by environment variables
@@ -94,7 +94,7 @@ integration-tests: integration-tests-imap integration-tests-lmtp integration-tes
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
-	integration-tests-config integration-tests-sora-admin
+	integration-tests-config integration-tests-sora-admin integration-tests-relay
 
 # Core protocol integration tests
 integration-tests-imap: reset-test-db
@@ -172,6 +172,10 @@ integration-tests-config: reset-test-db
 integration-tests-sora-admin: reset-test-db
 	@echo "Running sora-admin integration tests..."
 	@cd cmd/sora-admin && go test $(TEST_FLAGS) .
+
+integration-tests-relay:
+	@echo "Running relay integration tests..."
+	@cd integration_tests/relay && go test $(TEST_FLAGS) .
 
 # Performance tests
 performance-tests:
@@ -251,6 +255,7 @@ help:
 	@echo "Other integration tests:"
 	@echo "  integration-tests-config        - Configuration tests"
 	@echo "  integration-tests-sora-admin    - Import/export tests"
+	@echo "  integration-tests-relay         - Relay (SMTP/HTTP) tests"
 	@echo ""
 	@echo "Cross-compilation targets:"
 	@echo "  build-linux-musl - Cross-compile static binaries for Linux with musl"

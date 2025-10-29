@@ -3,7 +3,6 @@ package lmtp
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -30,57 +29,23 @@ import (
 //go:embed default.sieve
 var defaultSieveScript string
 
-// sendToExternalRelay sends a message to the external relay using TLS
+// sendToExternalRelay queues a message for external relay delivery
 func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte) error {
-	if s.backend.externalRelay == "" {
-		return fmt.Errorf("external relay not configured")
+	if s.backend.relayQueue == nil {
+		return fmt.Errorf("relay queue not configured")
 	}
 
-	tlsConfig := &tls.Config{
-		MinVersion:    tls.VersionTLS12,
-		Renegotiation: tls.RenegotiateNever,
-	}
-
-	c, err := smtp.DialTLS(s.backend.externalRelay, tlsConfig)
+	// Queue the message for background delivery
+	err := s.backend.relayQueue.Enqueue(from, to, "redirect", message)
 	if err != nil {
-		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to connect to external relay with TLS: %w", err)
-	}
-	defer c.Close()
-
-	// Defer the failure metric increment to avoid multiple calls.
-	var relayErr error
-	defer func() {
-		if relayErr != nil {
-			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		}
-	}()
-
-	if relayErr = c.Mail(from, nil); relayErr != nil {
-		return fmt.Errorf("failed to set sender: %w", relayErr)
-	}
-	if relayErr = c.Rcpt(to, nil); relayErr != nil {
-		return fmt.Errorf("failed to set recipient: %w", relayErr)
+		return fmt.Errorf("failed to enqueue relay message: %w", err)
 	}
 
-	wc, relayErr := c.Data()
-	if relayErr != nil {
-		return fmt.Errorf("failed to start data: %w", relayErr)
-	}
-	if _, relayErr = wc.Write(message); relayErr != nil {
-		// Attempt to close the data writer even if write fails, to send the final dot.
-		_ = wc.Close()
-		return fmt.Errorf("failed to write message: %w", relayErr)
-	}
-	if relayErr = wc.Close(); relayErr != nil {
-		return fmt.Errorf("failed to close data writer: %w", relayErr)
+	// Notify worker for immediate processing if available
+	if s.backend.relayWorker != nil {
+		s.backend.relayWorker.NotifyQueued()
 	}
 
-	if relayErr = c.Quit(); relayErr != nil {
-		return fmt.Errorf("failed to quit: %w", relayErr)
-	}
-
-	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
 	return nil
 }
 
@@ -512,16 +477,16 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.Log("[SIEVE][REDIRECT] redirect action - redirecting message to: %s", result.RedirectTo)
 		}
 
-		// Send the message to the external relay if configured
-		if s.backend.externalRelay != "" {
-			s.Log("[SIEVE][REDIRECT] redirected message via external relay: %s", s.backend.externalRelay)
+		// Queue the message for external relay delivery if configured
+		if s.backend.relayQueue != nil {
+			s.Log("[SIEVE][REDIRECT] queueing message for relay delivery")
 			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, fullMessageBytes)
 			if err != nil {
-				s.Log("[SIEVE][REDIRECT] WARNING: error sending redirected message to external relay, falling back to local INBOX delivery: %v", err)
-				// Continue processing even if relay fails, store in INBOX as fallback
+				s.Log("[SIEVE][REDIRECT] WARNING: error enqueuing redirected message, falling back to local INBOX delivery: %v", err)
+				// Continue processing even if queue fails, store in INBOX as fallback
 			} else {
-				s.Log("[SIEVE][REDIRECT] successfully redirected message to %s via external relay %s",
-					result.RedirectTo, s.backend.externalRelay)
+				s.Log("[SIEVE][REDIRECT] successfully queued message to %s for relay delivery",
+					result.RedirectTo)
 
 				// If :copy is not specified and relay succeeded, we don't store the message locally
 				if !result.Copy {
@@ -664,8 +629,8 @@ func (s *LMTPSession) InternalError(format string, a ...interface{}) error {
 // The decision to send and the recording of the response event are handled
 // by the Sieve engine's policy, using the VacationOracle.
 func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
-	if s.backend.externalRelay == "" {
-		s.Log("[SIEVE][VACATION] WARNING: external relay not configured, cannot send vacation response for sender: %s", s.sender.FullAddress())
+	if s.backend.relayQueue == nil {
+		s.Log("[SIEVE][VACATION] WARNING: relay queue not configured, cannot send vacation response for sender: %s", s.sender.FullAddress())
 		// Do not return error, as the Sieve engine might have already recorded the attempt.
 		return nil
 	}
@@ -740,12 +705,12 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 
 	sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
 	if sendErr != nil {
-		s.Log("[SIEVE][VACATION] WARNING: error sending vacation response via external relay: %v", sendErr)
+		s.Log("[SIEVE][VACATION] WARNING: error enqueuing vacation response: %v", sendErr)
 		// The Sieve engine's policy should have already recorded the response attempt.
 		// Failure here is a delivery issue.
 	} else {
-		s.Log("[SIEVE][VACATION] sent vacation response to %s via external relay %s",
-			s.sender.FullAddress(), s.backend.externalRelay)
+		s.Log("[SIEVE][VACATION] queued vacation response to %s for relay delivery",
+			s.sender.FullAddress())
 	}
 
 	// The recording of the vacation response is now handled by SievePolicy via VacationOracle

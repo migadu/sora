@@ -19,6 +19,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
@@ -34,7 +35,7 @@ type Server struct {
 	cache              *cache.Cache
 	uploader           *uploader.UploadWorker
 	storage            *storage.S3Storage
-	externalRelay      string
+	relayQueue         delivery.RelayQueue // Global relay queue for mail delivery
 	server             *http.Server
 	tls                bool
 	tlsCertFile        string
@@ -56,7 +57,7 @@ type ServerOptions struct {
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
 	Storage            *storage.S3Storage
-	ExternalRelay      string
+	RelayQueue         delivery.RelayQueue // Global relay queue for mail delivery
 	TLS                bool
 	TLSCertFile        string
 	TLSKeyFile         string
@@ -97,7 +98,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		cache:              options.Cache,
 		uploader:           options.Uploader,
 		storage:            options.Storage,
-		externalRelay:      options.ExternalRelay,
+		relayQueue:         options.RelayQueue,
 		tls:                options.TLS,
 		tlsCertFile:        options.TLSCertFile,
 		tlsKeyFile:         options.TLSKeyFile,

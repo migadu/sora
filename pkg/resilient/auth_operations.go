@@ -2,13 +2,13 @@ package resilient
 
 import (
 	"context"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/retry"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -172,7 +172,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		go func() {
 			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			if hashErr != nil {
-				log.Printf("[REHASH] Failed to generate new hash for %s: %v", address, hashErr)
+				logger.Errorf("[REHASH] Failed to generate new hash for %s: %v", address, hashErr)
 				return
 			}
 
@@ -191,9 +191,9 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 			// Use a new resilient call for the update
 			if err := rd.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
-				log.Printf("[REHASH] Failed to update password for %s: %v", address, err)
+				logger.Errorf("[REHASH] Failed to update password for %s: %v", address, err)
 			} else {
-				log.Printf("[REHASH] Successfully rehashed and updated password for %s", address)
+				logger.Infof("[REHASH] Successfully rehashed and updated password for %s", address)
 				// Invalidate cache entry since password hash changed
 				if rd.authCache != nil {
 					rd.authCache.Invalidate(address)

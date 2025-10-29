@@ -72,10 +72,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"time"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -95,7 +95,7 @@ func New(endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool,
 		Secure: useSSL, // Use SSL (https) if true
 	})
 	if err != nil {
-		log.Printf("[STORAGE] failed to initialize MinIO client: %v", err)
+		logger.Errorf("[STORAGE] failed to initialize MinIO client: %v", err)
 		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
 	}
 
@@ -131,7 +131,7 @@ func (s *S3Storage) EnableEncryption(encryptionKey string) error {
 
 	s.Encrypt = true
 	s.EncryptionKey = masterKey
-	log.Printf("[STORAGE] client-side encryption enabled")
+	logger.Infof("[STORAGE] client-side encryption enabled")
 
 	return nil
 }
@@ -160,12 +160,12 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 
 	exists, _, err := s.Exists(key)
 	if err != nil {
-		log.Printf("[STORAGE] error checking existence of object %s: %v", key, err)
+		logger.Errorf("[STORAGE] error checking existence of object %s: %v", key, err)
 		metrics.StorageOperationErrors.WithLabelValues("HEAD", classifyS3Error(err)).Inc()
 		return err
 	}
 	if exists {
-		log.Printf("[STORAGE] object %s already exists in S3, skipping upload.", key)
+		logger.Infof("[STORAGE] object %s already exists in S3, skipping upload.", key)
 		return nil // Object already exists, no need to upload
 	}
 
@@ -286,7 +286,7 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 
 		// Close the original reader since we've read all the data
 		if err := object.Close(); err != nil {
-			log.Printf("[STORAGE] WARNING: failed to close S3 object: %v", err)
+			logger.Warnf("[STORAGE] WARNING: failed to close S3 object: %v", err)
 		}
 
 		decryptedData, err := s.decryptData(encryptedData)
@@ -308,13 +308,13 @@ func (s *S3Storage) Delete(key string) error {
 	// This makes DeleteMessage idempotent.
 	exists, versionId, err := s.Exists(key)
 	if err != nil {
-		log.Printf("[STORAGE] error checking existence of object %s: %v", key, err)
+		logger.Errorf("[STORAGE] error checking existence of object %s: %v", key, err)
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
 		return err
 	}
 	if !exists {
 		// Object does not exist, consider it successfully "deleted"
-		log.Printf("[STORAGE] object %s does not exist in S3, skipping deletion.", key)
+		logger.Infof("[STORAGE] object %s does not exist in S3, skipping deletion.", key)
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "skipped").Inc()
 		return nil
 	}

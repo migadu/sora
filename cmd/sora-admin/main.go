@@ -188,6 +188,8 @@ func main() {
 		handleUploaderCommand(ctx)
 	case "messages":
 		handleMessagesCommand(ctx)
+	case "relay":
+		handleRelayCommand(ctx)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -384,6 +386,7 @@ Commands:
   migrate       Database schema migration management
   uploader      Upload queue management
   messages      List and restore deleted messages
+  relay         Relay queue management (stats, list, show, delete, requeue)
   import        Import maildir data
   export        Export maildir data
   version       Show version information
@@ -952,12 +955,12 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	// Parse response
 	var result struct {
 		Connections []struct {
-			Protocol    string    `json:"protocol"`
-			AccountID   int64     `json:"account_id"`
-			Email       string    `json:"email"`
-			LocalCount  int       `json:"local_count"`
-			TotalCount  int       `json:"total_count"`
-			LastUpdate  time.Time `json:"last_update"`
+			Protocol   string    `json:"protocol"`
+			AccountID  int64     `json:"account_id"`
+			Email      string    `json:"email"`
+			LocalCount int       `json:"local_count"`
+			TotalCount int       `json:"total_count"`
+			LastUpdate time.Time `json:"last_update"`
 		} `json:"connections"`
 		Count  int    `json:"count"`
 		Source string `json:"source,omitempty"`
@@ -994,12 +997,12 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	filteredConnections := result.Connections
 	if protocol != "" || instanceID != "" {
 		filtered := make([]struct {
-			Protocol    string    `json:"protocol"`
-			AccountID   int64     `json:"account_id"`
-			Email       string    `json:"email"`
-			LocalCount  int       `json:"local_count"`
-			TotalCount  int       `json:"total_count"`
-			LastUpdate  time.Time `json:"last_update"`
+			Protocol   string    `json:"protocol"`
+			AccountID  int64     `json:"account_id"`
+			Email      string    `json:"email"`
+			LocalCount int       `json:"local_count"`
+			TotalCount int       `json:"total_count"`
+			LastUpdate time.Time `json:"last_update"`
 		}, 0)
 		for _, conn := range result.Connections {
 			// Filter by protocol
@@ -3513,12 +3516,12 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 		var result struct {
 			Email       string `json:"email"`
 			Connections []struct {
-				Protocol    string    `json:"protocol"`
-				AccountID   int64     `json:"account_id"`
-				Email       string    `json:"email"`
-				LocalCount  int       `json:"local_count"`
-				TotalCount  int       `json:"total_count"`
-				LastUpdate  time.Time `json:"last_update"`
+				Protocol   string    `json:"protocol"`
+				AccountID  int64     `json:"account_id"`
+				Email      string    `json:"email"`
+				LocalCount int       `json:"local_count"`
+				TotalCount int       `json:"total_count"`
+				LastUpdate time.Time `json:"last_update"`
 			} `json:"connections"`
 			Count  int    `json:"count"`
 			Source string `json:"source,omitempty"`
