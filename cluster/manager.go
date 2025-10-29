@@ -171,6 +171,11 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Start leader election loop
 	go m.leaderElectionLoop()
 
+	// Start retry loop for cluster membership
+	if len(filteredPeers) > 0 {
+		go m.joinRetryLoop(filteredPeers)
+	}
+
 	// Start a test routine to verify GetBroadcasts is being called
 	go func() {
 		time.Sleep(5 * time.Second)
@@ -181,7 +186,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 			broadcasterCount := len(m.connectionBroadcasts)
 			m.connectionBroadcastMu.RUnlock()
 			logger.Infof("[Cluster] After %d seconds: %d connection broadcasters registered, memberlist members=%d",
-				(i+1)*10, broadcasterCount, ml.NumMembers())
+				(i+1)*10, broadcasterCount, m.memberlist.NumMembers())
 		}
 	}()
 
@@ -194,6 +199,43 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	}
 
 	return m, nil
+}
+
+// joinRetryLoop periodically retries joining the cluster if we haven't joined all peers
+func (m *Manager) joinRetryLoop(peers []string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	expectedMembers := len(peers) + 1 // peers + ourselves
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			logger.Info("Cluster join retry loop stopping")
+			return
+		case <-ticker.C:
+			currentMembers := m.memberlist.NumMembers()
+			if currentMembers < expectedMembers {
+				logger.Infof("[Cluster] Retry join: have %d members, expected %d - attempting to rejoin %v",
+					currentMembers, expectedMembers, peers)
+				n, err := m.memberlist.Join(peers)
+				if err != nil {
+					logger.Warnf("[Cluster] Retry join failed for %v: %v", peers, err)
+				} else {
+					newMembers := m.memberlist.NumMembers()
+					logger.Infof("[Cluster] Retry join contacted %d peers, now have %d members", n, newMembers)
+					if newMembers >= expectedMembers {
+						logger.Infof("[Cluster] Successfully joined all peers - stopping retry loop")
+						return
+					}
+				}
+			} else {
+				// We have all expected members, stop retrying
+				logger.Debugf("[Cluster] Join retry: have %d/%d members - cluster complete", currentMembers, expectedMembers)
+				return
+			}
+		}
+	}
 }
 
 // leaderElectionLoop continuously monitors cluster membership and determines leader
