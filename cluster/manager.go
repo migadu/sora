@@ -3,6 +3,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -95,6 +96,9 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	mlConfig.BindPort = cfg.BindPort
 	mlConfig.Delegate = m.delegate
 
+	// Enable more verbose memberlist logging to debug gossip
+	mlConfig.LogOutput = &memberlistLogger{prefix: "[Memberlist] "}
+
 	// Set up encryption if secret key is provided
 	if cfg.SecretKey != "" {
 		keyBytes, err := base64.StdEncoding.DecodeString(cfg.SecretKey)
@@ -150,6 +154,20 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 
 	// Start leader election loop
 	go m.leaderElectionLoop()
+
+	// Start a test routine to verify GetBroadcasts is being called
+	go func() {
+		time.Sleep(5 * time.Second)
+		logger.Infof("[Cluster] Testing if GetBroadcasts is being called by memberlist...")
+		for i := 0; i < 6; i++ {
+			time.Sleep(10 * time.Second)
+			m.connectionBroadcastMu.RLock()
+			broadcasterCount := len(m.connectionBroadcasts)
+			m.connectionBroadcastMu.RUnlock()
+			logger.Infof("[Cluster] After %d seconds: %d connection broadcasters registered, memberlist members=%d",
+				(i+1)*10, broadcasterCount, ml.NumMembers())
+		}
+	}()
 
 	if selfReferenceFound {
 		logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, original_peers=%v, filtered_peers=%v",
@@ -491,6 +509,22 @@ type MemberInfo struct {
 	Port uint16
 }
 
+// memberlistLogger adapts memberlist's log output to our logger
+type memberlistLogger struct {
+	prefix string
+}
+
+func (m *memberlistLogger) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	// Memberlist logs are very verbose, only log important ones
+	if bytes.Contains(p, []byte("broadcasting")) ||
+	   bytes.Contains(p, []byte("GetBroadcasts")) ||
+	   bytes.Contains(p, []byte("gossip")) {
+		logger.Debugf("%s%s", m.prefix, msg)
+	}
+	return len(p), nil
+}
+
 // Shutdown gracefully shuts down the cluster manager
 func (m *Manager) Shutdown() error {
 	logger.Info("Shutting down cluster manager")
@@ -519,26 +553,28 @@ func (d *clusterDelegate) NodeMeta(limit int) []byte {
 }
 
 func (d *clusterDelegate) NotifyMsg(msg []byte) {
+	logger.Infof("[Cluster] NotifyMsg called with message (len=%d)", len(msg))
+
 	if len(msg) < 2 {
-		logger.Debugf("[Cluster] Received invalid message (len=%d)", len(msg))
+		logger.Warnf("[Cluster] Received invalid message (len=%d)", len(msg))
 		return // Invalid message
 	}
 
 	// Check message type by magic marker
 	if msg[0] == 0x52 && msg[1] == 0x4C { // 'R' 'L' - Rate Limit
-		logger.Debugf("[Cluster] Received rate limit message (len=%d)", len(msg))
+		logger.Infof("[Cluster] Received rate limit message (len=%d)", len(msg))
 		// Strip marker and forward to rate limit handlers
 		d.manager.notifyRateLimitHandlers(msg[2:])
 	} else if msg[0] == 0x41 && msg[1] == 0x46 { // 'A' 'F' - Affinity
-		logger.Debugf("[Cluster] Received affinity message (len=%d)", len(msg))
+		logger.Infof("[Cluster] Received affinity message (len=%d)", len(msg))
 		// Strip marker and forward to affinity handlers
 		d.manager.notifyAffinityHandlers(msg[2:])
 	} else if msg[0] == 0x43 && msg[1] == 0x4E { // 'C' 'N' - Connection
-		logger.Debugf("[Cluster] Received connection tracking message (len=%d)", len(msg))
+		logger.Infof("[Cluster] Received connection tracking message (len=%d)", len(msg))
 		// Strip marker and forward to connection handlers
 		d.manager.notifyConnectionHandlers(msg[2:])
 	} else {
-		logger.Debugf("[Cluster] Received unknown message type: 0x%02x%02x (len=%d)", msg[0], msg[1], len(msg))
+		logger.Warnf("[Cluster] Received unknown message type: 0x%02x%02x (len=%d)", msg[0], msg[1], len(msg))
 	}
 }
 
