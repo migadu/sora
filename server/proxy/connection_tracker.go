@@ -463,14 +463,20 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 
 // HandleClusterEvent processes a connection event from another node
 func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
+	logger.Debugf("[%s-GOSSIP-TRACKER] HandleClusterEvent called with data (len=%d)", ct.name, len(data))
+
 	event, err := decodeConnectionEvent(data)
 	if err != nil {
 		logger.Warnf("[%s-GOSSIP-TRACKER] Failed to decode event: %v", ct.name, err)
 		return
 	}
 
+	logger.Debugf("[%s-GOSSIP-TRACKER] Decoded event: type=%s, user=%s, instance=%s",
+		ct.name, event.Type, event.Username, event.InstanceID)
+
 	// Skip events from this instance (we already applied them locally)
 	if event.InstanceID == ct.instanceID {
+		logger.Debugf("[%s-GOSSIP-TRACKER] Skipping event from self (instance=%s)", ct.name, event.InstanceID)
 		return
 	}
 

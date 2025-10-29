@@ -301,7 +301,10 @@ func (m *Manager) notifyConnectionHandlers(data []byte) {
 	m.connectionMu.RLock()
 	handlers := make([]func([]byte), len(m.connectionHandlers))
 	copy(handlers, m.connectionHandlers)
+	handlerCount := len(m.connectionHandlers)
 	m.connectionMu.RUnlock()
+
+	logger.Debugf("[Cluster] Notifying %d connection handlers with data (len=%d)", handlerCount, len(data))
 
 	// Call handlers asynchronously to avoid blocking gossip receive
 	for _, handler := range handlers {
@@ -506,19 +509,25 @@ func (d *clusterDelegate) NodeMeta(limit int) []byte {
 
 func (d *clusterDelegate) NotifyMsg(msg []byte) {
 	if len(msg) < 2 {
+		logger.Debugf("[Cluster] Received invalid message (len=%d)", len(msg))
 		return // Invalid message
 	}
 
 	// Check message type by magic marker
 	if msg[0] == 0x52 && msg[1] == 0x4C { // 'R' 'L' - Rate Limit
+		logger.Debugf("[Cluster] Received rate limit message (len=%d)", len(msg))
 		// Strip marker and forward to rate limit handlers
 		d.manager.notifyRateLimitHandlers(msg[2:])
 	} else if msg[0] == 0x41 && msg[1] == 0x46 { // 'A' 'F' - Affinity
+		logger.Debugf("[Cluster] Received affinity message (len=%d)", len(msg))
 		// Strip marker and forward to affinity handlers
 		d.manager.notifyAffinityHandlers(msg[2:])
 	} else if msg[0] == 0x43 && msg[1] == 0x4E { // 'C' 'N' - Connection
+		logger.Debugf("[Cluster] Received connection tracking message (len=%d)", len(msg))
 		// Strip marker and forward to connection handlers
 		d.manager.notifyConnectionHandlers(msg[2:])
+	} else {
+		logger.Debugf("[Cluster] Received unknown message type: 0x%02x%02x (len=%d)", msg[0], msg[1], len(msg))
 	}
 }
 
