@@ -317,6 +317,7 @@ func (m *Manager) RegisterConnectionBroadcaster(broadcaster func(int, int) [][]b
 	m.connectionBroadcastMu.Lock()
 	defer m.connectionBroadcastMu.Unlock()
 	m.connectionBroadcasts = append(m.connectionBroadcasts, broadcaster)
+	logger.Debugf("[Cluster] RegisterConnectionBroadcaster: now have %d broadcasters", len(m.connectionBroadcasts))
 }
 
 // getConnectionBroadcasts collects broadcasts from all registered connection broadcasters
@@ -538,6 +539,8 @@ func (d *clusterDelegate) NotifyMsg(msg []byte) {
 }
 
 func (d *clusterDelegate) GetBroadcasts(overhead, limit int) [][]byte {
+	logger.Debugf("[Cluster] GetBroadcasts called by memberlist: overhead=%d, limit=%d", overhead, limit)
+
 	// Collect broadcasts from all registered broadcasters
 	var allBroadcasts [][]byte
 	totalSize := 0

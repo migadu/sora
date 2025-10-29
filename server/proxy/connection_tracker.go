@@ -93,8 +93,10 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 
 	if clusterMgr != nil {
 		// Cluster mode: register with cluster manager for gossip
+		logger.Debugf("[%s-GOSSIP-TRACKER] Registering handlers with cluster manager", name)
 		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
 		clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
+		logger.Debugf("[%s-GOSSIP-TRACKER] Handlers registered successfully", name)
 
 		// Start background routines
 		go ct.broadcastRoutine()
