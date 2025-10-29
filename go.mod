@@ -31,7 +31,7 @@ replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20250924
 
 replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20251025213219-e4dddcf942d2
 
-replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20250924085942-8257c76f9245
+replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20251029052528-e0c3029cea7e
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

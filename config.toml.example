@@ -398,6 +398,63 @@ max_attempts = 5              # Maximum retry attempts for failed uploads.
 retry_interval = "30s"        # Initial delay between retry attempts (exponential backoff is applied).
 
 
+# RELAY CONFIGURATION
+# =============================================================================
+# External relay configuration for SIEVE redirect and vacation response delivery.
+# When SIEVE scripts use "redirect" or generate vacation responses, messages are
+# sent via this relay instead of directly. Supports SMTP and HTTP relay methods.
+#
+# The relay queue is ALWAYS enabled when relay is configured. Messages are queued
+# to disk and delivered asynchronously with automatic retry on failure.
+#
+# QUEUE MANAGEMENT:
+# Use the sora-admin relay commands to monitor and manage the queue:
+#   ./sora-admin relay stats           - Show queue statistics (pending, processing, failed)
+#   ./sora-admin relay list            - List messages in queue
+#   ./sora-admin relay show --id <id>  - Show detailed message info
+#   ./sora-admin relay delete --id <id> --confirm  - Delete message from queue
+#   ./sora-admin relay requeue --id <id>           - Move failed message back to pending
+
+[relay]
+type = "smtp"                     # Relay type: "smtp" or "http"
+smtp_host = "smtp.example.com:587" # SMTP relay hostname and port (required for type="smtp")
+# http_url = "https://api.example.com/send"  # HTTP API endpoint (required for type="http")
+# http_token = "your-bearer-token"           # Bearer token for HTTP Authorization header
+
+# TLS/STARTTLS configuration (SMTP only)
+tls = false                       # Use direct TLS (SMTPS, typically port 465)
+tls_verify = true                 # Verify server certificate (recommended: true)
+tls_use_starttls = true           # Use opportunistic STARTTLS (typically port 587)
+# tls_cert_file = "/path/to/relay-client.crt"  # Client certificate (if relay requires mutual TLS)
+# tls_key_file = "/path/to/relay-client.key"   # Client key (if relay requires mutual TLS)
+
+# RELAY QUEUE CONFIGURATION
+# The queue is ALWAYS ENABLED when relay is configured.
+# Messages are persisted to disk and processed asynchronously with automatic retry.
+#
+# NOTE: If max_attempts > len(retry_backoff), the last backoff value is used for all remaining attempts.
+# Example with current settings below:
+#   - Attempts 1-6: Use configured backoff values (1m, 5m, 15m, 1h, 6h, 24h)
+#   - Attempts 7-10: All use 24h (last value is repeated)
+#   - Total retry time: ~99 hours (4 days) before moving to failed queue
+
+[relay.queue]
+path = "/var/spool/sora/relay"    # Queue directory path (default: /var/spool/sora/relay)
+worker_interval = "1m"            # How often the worker checks for messages to deliver
+batch_size = 100                  # Maximum messages to process per worker tick
+concurrency = 5                   # Number of concurrent delivery attempts
+max_attempts = 10                 # Maximum delivery attempts before moving to failed queue
+retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]  # Exponential backoff schedule
+
+# CIRCUIT BREAKER CONFIGURATION
+# Protects against cascading failures when the relay endpoint is down.
+# When failures exceed threshold, the circuit opens and stops delivery attempts.
+# After timeout, it enters half-open state to test if the endpoint has recovered.
+circuit_breaker_threshold = 5     # Consecutive failures before opening circuit (default: 5)
+circuit_breaker_timeout = "30s"   # How long to wait before attempting recovery (default: 30s)
+circuit_breaker_max_requests = 3  # Max requests in half-open state before closing circuit (default: 3)
+
+
 # CLEANUP PROCESS CONFIGURATION
 # =============================================================================
 # Background worker that manages message lifecycle and removes old/deleted

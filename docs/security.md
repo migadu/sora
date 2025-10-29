@@ -211,3 +211,346 @@ Monitor these metrics to:
 - Detect potential attack patterns (sudden spikes in timeouts)
 - Tune timeout values for your workload
 - Identify misbehaving clients
+
+## Cluster-Wide Rate Limiting
+
+When cluster mode is enabled, Sora can synchronize authentication rate limiting across all nodes using the gossip protocol.
+
+### Benefits
+
+- **3x Better Protection**: Distributed attacks hitting different nodes are detected and blocked cluster-wide
+- **Fast Synchronization**: Rate limit state propagated in 50-200ms via gossip
+- **Low Overhead**: <200KB memory, <15 KB/s bandwidth per protocol
+- **Eventually Consistent**: All nodes converge to the same blocked IP list
+
+### Configuration
+
+```toml
+[cluster]
+enabled = true
+bind_addr = "0.0.0.0"
+bind_port = 7946
+node_id = "node-1"
+peers = ["node-2:7946", "node-3:7946"]
+secret_key = "base64-encoded-32-byte-key"  # Generate: openssl rand -base64 32
+
+# Cluster-wide rate limiting (enabled by default when cluster is enabled)
+[cluster.rate_limit_sync]
+enabled = true              # Enable cluster-wide rate limiting
+sync_blocks = true          # Sync IP blocks across nodes
+sync_failure_counts = true  # Sync progressive delays across nodes
+```
+
+### How It Works
+
+1. Node 1 detects authentication failure from IP `192.0.2.1`
+2. After threshold failures, Node 1 blocks the IP locally
+3. Node 1 broadcasts BLOCK_IP event via gossip (50-200ms)
+4. Node 2 and Node 3 receive the event and block the IP locally
+5. Future attempts from `192.0.2.1` to any node are rejected
+
+### Security Guarantees
+
+- **Encrypted Communication**: All gossip messages encrypted with AES-256
+- **Replay Protection**: Events older than 5 minutes automatically rejected
+- **Authentication**: Only nodes with correct `secret_key` can participate
+- **Fail-Safe**: If gossip fails, per-node rate limiting still works
+
+## TLS Certificate Management
+
+Sora supports both manual certificate management and automatic Let's Encrypt integration.
+
+### Let's Encrypt Integration
+
+Automatic certificate issuance and renewal with cluster coordination:
+
+```toml
+[tls]
+enabled = true
+provider = "letsencrypt"
+
+[tls.letsencrypt]
+email = "admin@example.com"
+domains = ["mail.example.com", "imap.example.com"]
+storage_provider = "s3"      # Store certificates in S3
+renew_before = "720h"        # Optional: renew 30 days before expiry (default)
+
+[tls.letsencrypt.s3]
+bucket = "sora-tls-certificates"
+region = "us-east-1"
+```
+
+### Security Features
+
+- **Automatic Renewal**: Certificates renewed 30 days before expiry
+- **Hot Reload**: No server restart required for certificate updates
+- **S3 Storage**: Certificates encrypted at rest with AES-256
+- **Cluster Coordination**: Leader-only renewal prevents duplicate requests
+- **HTTP-01 Challenges**: All nodes can respond to Let's Encrypt challenges
+- **Graceful Failover**: 5-10 second recovery if leader fails
+
+### Requirements
+
+- Port 80 must be accessible from the internet for HTTP-01 challenges
+- DNS A records must point to server public IPs
+- S3 bucket with appropriate IAM permissions
+- In cluster mode, all nodes must have network access to S3
+
+### Monitoring
+
+Monitor certificate expiration:
+```bash
+echo | openssl s_client -connect mail.example.com:993 -servername mail.example.com 2>/dev/null | \
+  openssl x509 -noout -dates
+```
+
+Check renewal logs:
+```bash
+journalctl -u sora | grep -i "certificate\|renewal"
+```
+
+## Shared Mailbox Security (ACL)
+
+Sora implements RFC 4314 Access Control Lists (ACL) with strict security boundaries.
+
+### Same-Domain Enforcement
+
+ACL entries are restricted to the same domain:
+- Users in `example.com` can only grant access to other `example.com` users
+- Cross-domain access is blocked at both database and application layers
+- Domain extracted from primary credential, not from alias/credential
+
+### Permission Model
+
+11 standard ACL rights (lrswipkxtea):
+- `l` (lookup) - Mailbox visible in LIST/LSUB
+- `r` (read) - SELECT, FETCH, SEARCH, COPY source
+- `s` (seen) - Keep \Seen flag across sessions
+- `w` (write) - STORE flags (except \Seen, \Deleted)
+- `i` (insert) - APPEND, COPY into mailbox
+- `p` (post) - Send mail to submission address
+- `k` (create) - CREATE child mailboxes
+- `x` (delete) - DELETE mailbox
+- `t` (delete-msg) - STORE \Deleted flag
+- `e` (expunge) - EXPUNGE messages
+- `a` (admin) - SETACL/DELETEACL/GETACL/LISTRIGHTS
+
+### Security Guarantees
+
+- **Owner Protection**: Owner always has full rights (cannot be locked out)
+- **Admin Required**: Modifying ACLs requires `a` (admin) right
+- **Visibility Control**: Mailbox invisible without `l` (lookup) right
+- **Operation Enforcement**: Every operation checks required permissions
+- **Database Validation**: Foreign key constraints prevent orphaned ACLs
+
+### Configuration
+
+```toml
+[shared_mailboxes]
+enabled = true
+namespace_prefix = "Shared/"
+allow_user_create = true          # Or false for admin-only
+default_rights = "lrswipkxtea"    # Full rights for creators
+```
+
+### IMAP ACL Commands
+
+```
+# Check your rights
+A001 MYRIGHTS "Shared/TeamInbox"
+
+# List all ACL entries
+A002 GETACL "Shared/TeamInbox"
+
+# Grant read-write access
+A003 SETACL "Shared/TeamInbox" user2@example.com lrswi
+
+# Revoke access
+A004 DELETEACL "Shared/TeamInbox" user2@example.com
+```
+
+## JA4 TLS Fingerprinting
+
+Sora can identify TLS clients using JA4 fingerprints and selectively disable problematic capabilities.
+
+### Use Case
+
+Some email clients have bugs with specific IMAP extensions (e.g., iOS Mail with IDLE). JA4 fingerprinting allows you to work around these bugs without affecting other clients.
+
+### Configuration
+
+```toml
+[[servers]]
+type = "imap"
+addr = ":993"
+tls = true
+# ... other settings ...
+
+# Disable IDLE for iOS Mail clients
+[[servers.client_filters]]
+ja4_fingerprint = "^t13d1516h2_.*"
+disable_caps = ["IDLE"]
+reason = "iOS Mail client with known IDLE issues"
+```
+
+### Security Considerations
+
+- **Non-blocking**: Fingerprint capture doesn't delay TLS handshake
+- **Standard Format**: Uses industry-standard JA4 format
+- **Regex Matching**: Flexible pattern-based client detection
+- **Per-Client Filtering**: Only affects matched clients, others unaffected
+
+### Limitations
+
+- Only works with TLS connections (plaintext connections not fingerprinted)
+- Fingerprints can change with client updates
+- Requires regular testing with actual client devices
+
+## API Security
+
+The HTTP API provides comprehensive administration capabilities and must be properly secured.
+
+### Authentication
+
+Use a strong random API key:
+```bash
+# Generate a secure API key
+openssl rand -hex 32
+```
+
+Configure in `config.toml`:
+```toml
+[[servers]]
+type = "http_api"
+start = true
+addr = ":8080"
+api_key = "your-secure-random-api-key"
+allowed_hosts = ["127.0.0.1", "10.0.0.0/8"]  # IP/CIDR restrictions
+```
+
+### Best Practices
+
+1. **Strong API Key**: Use a random 32-byte key
+2. **Host Restrictions**: Limit access to trusted IPs/networks
+3. **TLS**: Always use TLS in production (configure `tls_cert_file` and `tls_key_file`)
+4. **Rotate Keys**: Periodically rotate API keys
+5. **Monitor Access**: Log and monitor API access patterns
+6. **Least Privilege**: Use separate API keys for different services if possible
+
+### Security Features
+
+- **Bearer Token Authentication**: Standard OAuth 2.0 style
+- **CIDR Support**: Fine-grained IP access control
+- **Secure Error Handling**: No information leakage in error messages
+- **Request Logging**: Comprehensive audit trail
+- **Rate Limiting**: Can be added at reverse proxy level
+
+## Cluster Security
+
+When running in cluster mode, secure the gossip protocol communication.
+
+### Encryption
+
+All cluster communication is encrypted with AES-256:
+```toml
+[cluster]
+secret_key = "base64-encoded-32-byte-key"
+```
+
+Generate a secure key:
+```bash
+openssl rand -base64 32
+```
+
+### Network Isolation
+
+- Bind gossip to private network: `bind_addr = "10.0.0.1"`
+- Use firewall rules to restrict port 7946 to cluster nodes only
+- Do not expose gossip port to the internet
+
+### Best Practices
+
+1. **Strong Secret Key**: Use a random 32-byte key
+2. **Private Network**: Run gossip on private network only
+3. **Firewall Rules**: Restrict port 7946 to cluster nodes
+4. **Key Rotation**: Rotate secret key periodically (requires cluster restart)
+5. **Monitor Health**: Track gossip health and node membership changes
+
+## Security Checklist
+
+### Before Production Deployment
+
+- [ ] Enable TLS on all public-facing servers
+- [ ] Configure authentication rate limiting
+- [ ] Set strong API keys for HTTP API
+- [ ] Enable PROXY protocol only from trusted proxies
+- [ ] Configure connection limits (per-protocol, per-IP)
+- [ ] Set session memory limits
+- [ ] Enable cluster-wide rate limiting (if using cluster mode)
+- [ ] Use strong secret key for cluster (if using cluster mode)
+- [ ] Restrict HTTP API to trusted IPs
+- [ ] Configure Let's Encrypt or provide TLS certificates
+- [ ] Enable S3 encryption for message bodies (optional)
+- [ ] Set appropriate file permissions on config files (chmod 600)
+- [ ] Configure timeout protection on all protocols
+- [ ] Review and tune search rate limits
+- [ ] Monitor authentication failures and blocked IPs
+- [ ] Set up alerting for security events
+
+### Regular Maintenance
+
+- [ ] Monitor authentication failure rates
+- [ ] Review blocked IPs and user accounts
+- [ ] Check TLS certificate expiration (if not using Let's Encrypt)
+- [ ] Rotate API keys periodically
+- [ ] Update Sora to latest security patches
+- [ ] Review and audit access logs
+- [ ] Test failover and recovery procedures
+- [ ] Monitor cluster health and gossip connectivity
+- [ ] Review and tune rate limiting thresholds
+
+## Incident Response
+
+### Suspected Brute-Force Attack
+
+1. Check blocked IPs: `psql -c "SELECT ip, blocked_until FROM auth_attempts WHERE blocked_until > now()"`
+2. Review auth statistics: `./sora-admin stats auth --config config.toml`
+3. Increase rate limit sensitivity if needed
+4. Consider blocking entire IP ranges at firewall level
+
+### Suspected DoS Attack
+
+1. Check connection counts: `./sora-admin connections list --config config.toml`
+2. Review timeout metrics in logs and Prometheus
+3. Kick connections if needed: `./sora-admin connections kick --config config.toml --protocol imap`
+4. Adjust timeout values and connection limits as needed
+5. Enable or tighten rate limiting
+
+### Certificate Compromise
+
+1. If using Let's Encrypt: Revoke certificate via ACME
+2. Rotate to new certificate immediately
+3. Review logs for suspicious access during compromise window
+4. Notify affected users if necessary
+
+### API Key Compromise
+
+1. Generate new API key: `openssl rand -hex 32`
+2. Update config and restart Sora
+3. Review API access logs for suspicious activity
+4. Audit what operations were performed with compromised key
+
+### Cluster Secret Compromise
+
+1. Generate new secret key: `openssl rand -base64 32`
+2. Update config on all nodes
+3. Restart entire cluster in coordinated fashion
+4. Review cluster communication logs for suspicious activity
+
+## Additional Resources
+
+- **Let's Encrypt Documentation**: https://letsencrypt.org/docs/
+- **RFC 4314 (IMAP ACL)**: https://tools.ietf.org/html/rfc4314
+- **JA4 Fingerprinting**: https://github.com/FoxIO-LLC/ja4
+- **Prometheus Security**: https://prometheus.io/docs/operating/security/
+- **PostgreSQL Security**: https://www.postgresql.org/docs/current/security.html
