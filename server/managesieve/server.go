@@ -151,7 +151,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		activeSessions:         make(map[*ManageSieveSession]struct{}),
 	}
 
-	// No default extensions - only use what's explicitly configured
+	// Use all supported extensions by default if none are configured
+	if len(serverInstance.supportedExtensions) == 0 {
+		serverInstance.supportedExtensions = GoSieveSupportedExtensions
+		log.Printf("ManageSieve [%s] No supported_extensions configured, using all available extensions: %v", name, GoSieveSupportedExtensions)
+	}
 
 	// Create connection limiter with trusted networks from server configuration
 	// For ManageSieve backend:

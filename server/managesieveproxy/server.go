@@ -214,6 +214,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		activeSessions:         make(map[*Session]struct{}),
 	}
 
+	// Use all supported extensions by default if none are configured
+	if len(s.supportedExtensions) == 0 {
+		s.supportedExtensions = managesieve.GoSieveSupportedExtensions
+		log.Printf("ManageSieve Proxy [%s] No supported_extensions configured, using all available extensions: %v", opts.Name, managesieve.GoSieveSupportedExtensions)
+	}
+
 	// Setup TLS config: Support both implicit TLS and STARTTLS
 	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
 	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
