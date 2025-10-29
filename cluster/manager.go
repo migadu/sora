@@ -88,6 +88,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		meta:    []byte(nodeID),
 		manager: m,
 	}
+	logger.Infof("Cluster delegate created: %p", m.delegate)
 
 	// Configure memberlist
 	mlConfig := memberlist.DefaultLANConfig()
@@ -95,6 +96,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	mlConfig.BindAddr = cfg.BindAddr
 	mlConfig.BindPort = cfg.BindPort
 	mlConfig.Delegate = m.delegate
+	logger.Infof("Cluster delegate attached to memberlist config: %p", mlConfig.Delegate)
 
 	// Enable more verbose memberlist logging to debug gossip
 	mlConfig.LogOutput = &memberlistLogger{prefix: "[Memberlist] "}
@@ -130,26 +132,40 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 
 	// Filter out self-references from peers list
 	// A node should never list itself in the peers array as this causes gossip issues
+	logger.Infof("Filtering peers: nodeID='%s', configured peers=%v", nodeID, cfg.Peers)
 	filteredPeers := make([]string, 0, len(cfg.Peers))
 	selfReferenceFound := false
 	for _, peer := range cfg.Peers {
+		logger.Infof("Checking peer '%s' against nodeID '%s'", peer, nodeID)
 		if peer == nodeID {
 			selfReferenceFound = true
 			logger.Warnf("Cluster configuration WARNING: node_id '%s' found in peers list - ignoring self-reference", nodeID)
 			logger.Warnf("The peers list should only contain OTHER nodes in the cluster, not this node itself")
 		} else {
+			logger.Infof("Peer '%s' accepted (not self)", peer)
 			filteredPeers = append(filteredPeers, peer)
 		}
 	}
+	logger.Infof("Peer filtering complete: %d peers remain: %v", len(filteredPeers), filteredPeers)
 
 	// Join cluster if peers are specified (after filtering)
 	if len(filteredPeers) > 0 {
+		logger.Infof("Attempting to join cluster with peers: %v", filteredPeers)
 		n, err := ml.Join(filteredPeers)
 		if err != nil {
-			logger.Warn("Failed to join cluster peers: %v (will retry in background)", err)
+			logger.Warnf("Failed to join cluster peers %v: %v (will retry in background)", filteredPeers, err)
 		} else {
-			logger.Infof("Successfully joined cluster with %d peers", n)
+			logger.Infof("Join returned: contacted %d peers from %v", n, filteredPeers)
+			// Check actual member count after join
+			actualMembers := ml.NumMembers()
+			logger.Infof("Cluster members after join: %d (expected 2+)", actualMembers)
+			if actualMembers < 2 {
+				logger.Warnf("WARNING: Join succeeded but cluster only has %d member(s) - peer may have rejected us", actualMembers)
+				logger.Warnf("Common causes: encryption key mismatch, network issues, or peer not running")
+			}
 		}
+	} else {
+		logger.Warnf("No peers to join - running as standalone single-node cluster")
 	}
 
 	// Start leader election loop
