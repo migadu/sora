@@ -86,7 +86,17 @@ func (s *IMAPSession) Login(address, password string) error {
 			}
 
 			// Register connection for tracking
-			s.registerConnection(address.FullAddress())
+			if err := s.registerConnection(address.FullAddress()); err != nil {
+				// Connection limit reached - undo authentication and reject
+				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
+				s.IMAPUser = nil
+				s.Session.User = nil
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeLimit,
+					Text: "Maximum connections reached",
+				}
+			}
 
 			// Start termination poller to check for kick commands
 			s.startTerminationPoller()
@@ -159,7 +169,17 @@ func (s *IMAPSession) Login(address, password string) error {
 	}
 
 	// Register connection for tracking
-	s.registerConnection(addressSt.FullAddress())
+	if err := s.registerConnection(addressSt.FullAddress()); err != nil {
+		// Connection limit reached - undo authentication and reject
+		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
+		s.IMAPUser = nil
+		s.Session.User = nil
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeLimit,
+			Text: "Maximum connections reached",
+		}
+	}
 
 	// Start termination poller to check for kick commands
 	s.startTerminationPoller()

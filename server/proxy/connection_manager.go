@@ -32,6 +32,7 @@ type BackendHealth struct {
 
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
+	serverName             string // Server name for logging
 	remoteAddrs            []string
 	remotePort             int // Default port for backends if not in address
 	remoteTLS              bool
@@ -64,16 +65,16 @@ type ConnectionManager struct {
 
 // NewConnectionManager creates a new connection manager
 func NewConnectionManager(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration) (*ConnectionManager, error) {
-	return NewConnectionManagerWithRouting(remoteAddrs, remotePort, remoteTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, nil)
+	return NewConnectionManagerWithRouting(remoteAddrs, remotePort, remoteTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, nil, "")
 }
 
 // NewConnectionManagerWithRouting creates a new connection manager with optional user routing
-func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
-	return NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs, remotePort, remoteTLS, false, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, routingLookup)
+func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs, remotePort, remoteTLS, false, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, routingLookup, serverName)
 }
 
 // NewConnectionManagerWithRoutingAndStartTLS creates a new connection manager with optional user routing and StartTLS support
-func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup) (*ConnectionManager, error) {
+func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
@@ -104,9 +105,8 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		consistentHash.AddBackend(addr)
 	}
 
-	log.Printf("[ConnectionManager] Initialized consistent hash ring with %d backends", len(normalizedAddrs))
-
-	return &ConnectionManager{
+	cm := &ConnectionManager{
+		serverName:             serverName,
 		remoteAddrs:            normalizedAddrs,
 		remotePort:             remotePort,
 		remoteTLS:              remoteTLS,
@@ -119,7 +119,19 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		lastCheck:              lastCheck,
 		backendHealth:          backendHealth,
 		routingLookup:          routingLookup,
-	}, nil
+	}
+
+	log.Printf("%s Initialized consistent hash ring with %d backends", cm.logPrefix(), len(normalizedAddrs))
+
+	return cm, nil
+}
+
+// logPrefix returns a consistent log prefix for this connection manager
+func (cm *ConnectionManager) logPrefix() string {
+	if cm.serverName != "" {
+		return fmt.Sprintf("[ConnectionManager] [%s]", cm.serverName)
+	}
+	return "[ConnectionManager]"
 }
 
 // SetAffinityManager sets the affinity manager for cluster-wide affinity

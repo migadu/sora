@@ -198,13 +198,12 @@ type TLSConfig struct {
 
 // CleanupConfig holds cleaner worker configuration.
 type CleanupConfig struct {
-	GracePeriod               string `toml:"grace_period"`
-	WakeInterval              string `toml:"wake_interval"`
-	MaxAgeRestriction         string `toml:"max_age_restriction"`
-	FTSRetention              string `toml:"fts_retention"`
-	AuthAttemptsRetention     string `toml:"auth_attempts_retention"`
-	HealthStatusRetention     string `toml:"health_status_retention"`
-	StaleConnectionsRetention string `toml:"stale_connections_retention"`
+	GracePeriod           string `toml:"grace_period"`
+	WakeInterval          string `toml:"wake_interval"`
+	MaxAgeRestriction     string `toml:"max_age_restriction"`
+	FTSRetention          string `toml:"fts_retention"`
+	AuthAttemptsRetention string `toml:"auth_attempts_retention"`
+	HealthStatusRetention string `toml:"health_status_retention"`
 }
 
 // GetGracePeriod parses the grace period duration
@@ -253,14 +252,6 @@ func (c *CleanupConfig) GetHealthStatusRetention() (time.Duration, error) {
 		return 30 * 24 * time.Hour, nil // 30 days default
 	}
 	return helpers.ParseDuration(c.HealthStatusRetention)
-}
-
-// GetStaleConnectionsRetention parses the stale connections retention duration
-func (c *CleanupConfig) GetStaleConnectionsRetention() (time.Duration, error) {
-	if c.StaleConnectionsRetention == "" {
-		return 30 * time.Minute, nil // 30 minutes default
-	}
-	return helpers.ParseDuration(c.StaleConnectionsRetention)
 }
 
 // LocalCacheConfig holds local disk cache configuration.
@@ -975,16 +966,11 @@ type LMTPProxyServerConfig struct {
 	PreLookup              *PreLookupConfig `toml:"prelookup"` // Database-driven user routing
 }
 
-// ConnectionTrackingConfig holds connection tracking configuration.
+// ConnectionTrackingConfig is deprecated - connection tracking is now configured per-server
+// via ServerConfig.MaxConnectionsPerUser. This type is kept for backward compatibility.
 type ConnectionTrackingConfig struct {
-	Enabled                 bool   `toml:"enabled"`
-	UpdateInterval          string `toml:"update_interval"`
-	TerminationPollInterval string `toml:"termination_poll_interval"`
-	BatchUpdates            bool   `toml:"batch_updates"`
-	PersistToDB             bool   `toml:"persist_to_db"`
-	OperationTimeout        string `toml:"operation_timeout"`   // Timeout for individual register/unregister operations (default: "10s")
-	BatchFlushTimeout       string `toml:"batch_flush_timeout"` // Timeout for batch flush operations (default: "45s")
-	MaxBatchSize            int    `toml:"max_batch_size"`      // Maximum connections per batch chunk (default: 1000)
+	Enabled               bool `toml:"enabled"`                  // Ignored
+	MaxConnectionsPerUser int  `toml:"max_connections_per_user"` // Ignored - use per-server config instead
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1078,8 +1064,9 @@ type ServerConfig struct {
 	ProxyProtocolTimeout string `toml:"proxy_protocol_timeout,omitempty"`
 
 	// Connection limits
-	MaxConnections      int `toml:"max_connections,omitempty"`
-	MaxConnectionsPerIP int `toml:"max_connections_per_ip,omitempty"`
+	MaxConnections        int `toml:"max_connections,omitempty"`
+	MaxConnectionsPerIP   int `toml:"max_connections_per_ip,omitempty"`
+	MaxConnectionsPerUser int `toml:"max_connections_per_user,omitempty"` // Cluster-wide per-user limit (proxy only, requires cluster mode)
 
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`
@@ -1216,6 +1203,7 @@ type Config struct {
 	Metadata        MetadataConfig        `toml:"metadata"`
 	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
 	AuthCache       AuthCacheConfig       `toml:"auth_cache"`
+	Relay           RelayConfig           `toml:"relay"`
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
@@ -1411,11 +1399,8 @@ func NewDefaultConfig() Config {
 				EnableAffinity:         true,
 			},
 			ConnectionTracking: ConnectionTrackingConfig{
-				Enabled:                 true,
-				UpdateInterval:          "15s",
-				TerminationPollInterval: "30s",
-				BatchUpdates:            true,
-				PersistToDB:             true,
+				Enabled:               true,
+				MaxConnectionsPerUser: 0, // Unlimited by default
 			},
 			Metrics: MetricsConfig{
 				Enabled:              true,
@@ -1491,22 +1476,6 @@ func (c *ManageSieveProxyServerConfig) GetConnectTimeout() (time.Duration, error
 		return 30 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.ConnectTimeout)
-}
-
-// GetUpdateInterval parses the update interval duration for connection tracking
-func (c *ConnectionTrackingConfig) GetUpdateInterval() (time.Duration, error) {
-	if c.UpdateInterval == "" {
-		return 15 * time.Second, nil
-	}
-	return helpers.ParseDuration(c.UpdateInterval)
-}
-
-// GetTerminationPollInterval parses the termination poll interval duration for connection tracking
-func (c *ConnectionTrackingConfig) GetTerminationPollInterval() (time.Duration, error) {
-	if c.TerminationPollInterval == "" {
-		return 30 * time.Second, nil
-	}
-	return helpers.ParseDuration(c.TerminationPollInterval)
 }
 
 // GetConnectTimeout parses the connect timeout duration for LMTP proxy
@@ -1867,15 +1836,6 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	return retention
 }
 
-func (c *CleanupConfig) GetStaleConnectionsRetentionWithDefault() time.Duration {
-	retention, err := c.GetStaleConnectionsRetention()
-	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup stale_connections_retention: %v, using default (30 minutes)", err)
-		return 30 * time.Minute
-	}
-	return retention
-}
-
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()
 	if err != nil {
@@ -1939,74 +1899,12 @@ func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	return interval
 }
 
-func (c *ConnectionTrackingConfig) GetUpdateIntervalWithDefault() time.Duration {
-	interval, err := c.GetUpdateInterval()
-	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking update_interval '%s': %v. Using default.", c.UpdateInterval, err)
-		return 10 * time.Second
+// GetMaxConnectionsPerUser returns the cluster-wide connection limit per user
+func (c *ConnectionTrackingConfig) GetMaxConnectionsPerUser() int {
+	if c.MaxConnectionsPerUser < 0 {
+		return 0 // Unlimited
 	}
-	return interval
-}
-
-func (c *ConnectionTrackingConfig) GetTerminationPollIntervalWithDefault() time.Duration {
-	interval, err := c.GetTerminationPollInterval()
-	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking termination_poll_interval '%s': %v. Using default.", c.TerminationPollInterval, err)
-		return 30 * time.Second
-	}
-	return interval
-}
-
-// GetOperationTimeout parses the operation timeout duration for connection tracking
-func (c *ConnectionTrackingConfig) GetOperationTimeout() (time.Duration, error) {
-	if c.OperationTimeout == "" {
-		return 10 * time.Second, nil
-	}
-	return helpers.ParseDuration(c.OperationTimeout)
-}
-
-// GetOperationTimeoutWithDefault returns the operation timeout or default if invalid
-func (c *ConnectionTrackingConfig) GetOperationTimeoutWithDefault() time.Duration {
-	timeout, err := c.GetOperationTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking operation_timeout '%s': %v. Using default.", c.OperationTimeout, err)
-		return 10 * time.Second
-	}
-	return timeout
-}
-
-// GetBatchFlushTimeout parses the batch flush timeout duration for connection tracking
-func (c *ConnectionTrackingConfig) GetBatchFlushTimeout() (time.Duration, error) {
-	if c.BatchFlushTimeout == "" {
-		return 45 * time.Second, nil
-	}
-	return helpers.ParseDuration(c.BatchFlushTimeout)
-}
-
-// GetBatchFlushTimeoutWithDefault returns the batch flush timeout or default if invalid
-func (c *ConnectionTrackingConfig) GetBatchFlushTimeoutWithDefault() time.Duration {
-	timeout, err := c.GetBatchFlushTimeout()
-	if err != nil {
-		log.Printf("WARNING: invalid connection_tracking batch_flush_timeout '%s': %v. Using default.", c.BatchFlushTimeout, err)
-		return 45 * time.Second
-	}
-	return timeout
-}
-
-// GetMaxBatchSize returns the maximum batch size for connection tracking operations
-func (c *ConnectionTrackingConfig) GetMaxBatchSize() int {
-	if c.MaxBatchSize <= 0 {
-		return 1000 // Default: 1000 connections per batch chunk
-	}
-	if c.MaxBatchSize < 100 {
-		log.Printf("WARNING: connection_tracking max_batch_size %d is too small (min 100). Using 100.", c.MaxBatchSize)
-		return 100
-	}
-	if c.MaxBatchSize > 10000 {
-		log.Printf("WARNING: connection_tracking max_batch_size %d is too large (max 10000). Using 10000.", c.MaxBatchSize)
-		return 10000
-	}
-	return c.MaxBatchSize
+	return c.MaxConnectionsPerUser
 }
 
 // IsEnabled checks if a server should be started based on its configuration

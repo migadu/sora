@@ -174,6 +174,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		options.RemoteUseProxyProtocol,
 		options.ConnectTimeout,
 		routingLookup,
+		options.Name,
 	)
 	if err != nil {
 		if routingLookup != nil {

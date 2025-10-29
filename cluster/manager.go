@@ -40,6 +40,12 @@ type Manager struct {
 	affinityMu          sync.RWMutex
 	affinityBroadcasts  []func(int, int) [][]byte
 	affinityBroadcastMu sync.RWMutex
+
+	// Connection tracking event handling
+	connectionHandlers    []func([]byte)
+	connectionMu          sync.RWMutex
+	connectionBroadcasts  []func(int, int) [][]byte
+	connectionBroadcastMu sync.RWMutex
 }
 
 // clusterDelegate implements memberlist.Delegate for custom cluster behavior
@@ -283,6 +289,65 @@ func (m *Manager) RegisterAffinityBroadcaster(broadcaster func(int, int) [][]byt
 	m.affinityBroadcasts = append(m.affinityBroadcasts, broadcaster)
 }
 
+// RegisterConnectionHandler registers a callback to handle connection events from the cluster
+func (m *Manager) RegisterConnectionHandler(handler func([]byte)) {
+	m.connectionMu.Lock()
+	defer m.connectionMu.Unlock()
+	m.connectionHandlers = append(m.connectionHandlers, handler)
+}
+
+// notifyConnectionHandlers calls all registered connection handlers
+func (m *Manager) notifyConnectionHandlers(data []byte) {
+	m.connectionMu.RLock()
+	handlers := make([]func([]byte), len(m.connectionHandlers))
+	copy(handlers, m.connectionHandlers)
+	m.connectionMu.RUnlock()
+
+	// Call handlers asynchronously to avoid blocking gossip receive
+	for _, handler := range handlers {
+		go handler(data)
+	}
+}
+
+// RegisterConnectionBroadcaster registers a callback to generate connection broadcasts
+func (m *Manager) RegisterConnectionBroadcaster(broadcaster func(int, int) [][]byte) {
+	m.connectionBroadcastMu.Lock()
+	defer m.connectionBroadcastMu.Unlock()
+	m.connectionBroadcasts = append(m.connectionBroadcasts, broadcaster)
+}
+
+// getConnectionBroadcasts collects broadcasts from all registered connection broadcasters
+func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
+	m.connectionBroadcastMu.RLock()
+	broadcasters := make([]func(int, int) [][]byte, len(m.connectionBroadcasts))
+	copy(broadcasters, m.connectionBroadcasts)
+	m.connectionBroadcastMu.RUnlock()
+
+	var allBroadcasts [][]byte
+	totalSize := 0
+
+	for _, broadcaster := range broadcasters {
+		broadcasts := broadcaster(overhead, limit-totalSize)
+		for _, msg := range broadcasts {
+			// Add 'CN' magic marker to identify connection messages
+			marked := make([]byte, len(msg)+2)
+			marked[0] = 0x43 // 'C'
+			marked[1] = 0x4E // 'N'
+			copy(marked[2:], msg)
+
+			msgSize := overhead + len(marked)
+			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
+				return allBroadcasts
+			}
+
+			allBroadcasts = append(allBroadcasts, marked)
+			totalSize += msgSize
+		}
+	}
+
+	return allBroadcasts
+}
+
 // getAffinityBroadcasts collects broadcasts from all registered affinity broadcasters
 func (m *Manager) getAffinityBroadcasts(overhead, limit int) [][]byte {
 	m.affinityBroadcastMu.RLock()
@@ -451,6 +516,9 @@ func (d *clusterDelegate) NotifyMsg(msg []byte) {
 	} else if msg[0] == 0x41 && msg[1] == 0x46 { // 'A' 'F' - Affinity
 		// Strip marker and forward to affinity handlers
 		d.manager.notifyAffinityHandlers(msg[2:])
+	} else if msg[0] == 0x43 && msg[1] == 0x4E { // 'C' 'N' - Connection
+		// Strip marker and forward to connection handlers
+		d.manager.notifyConnectionHandlers(msg[2:])
 	}
 }
 
@@ -473,6 +541,17 @@ func (d *clusterDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 	// Get affinity broadcasts
 	affinityBroadcasts := d.manager.getAffinityBroadcasts(overhead, limit-totalSize)
 	for _, msg := range affinityBroadcasts {
+		msgSize := overhead + len(msg)
+		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
+			return allBroadcasts
+		}
+		allBroadcasts = append(allBroadcasts, msg)
+		totalSize += msgSize
+	}
+
+	// Get connection broadcasts
+	connectionBroadcasts := d.manager.getConnectionBroadcasts(overhead, limit-totalSize)
+	for _, msg := range connectionBroadcasts {
 		msgSize := overhead + len(msg)
 		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
 			return allBroadcasts

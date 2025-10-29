@@ -19,50 +19,54 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/delivery"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
 // Server represents the HTTP API server
 type Server struct {
-	name            string
-	addr            string
-	apiKey          string
-	allowedHosts    []string
-	rdb             *resilient.ResilientDatabase
-	cache           *cache.Cache
-	uploader        *uploader.UploadWorker
-	storage         *storage.S3Storage
-	externalRelay   string
-	server          *http.Server
-	tls             bool
-	tlsCertFile     string
-	tlsKeyFile      string
-	tlsVerify       bool
-	hostname        string
-	ftsRetention    time.Duration
-	affinityManager AffinityManager
-	validBackends   map[string][]string
+	name               string
+	addr               string
+	apiKey             string
+	allowedHosts       []string
+	rdb                *resilient.ResilientDatabase
+	cache              *cache.Cache
+	uploader           *uploader.UploadWorker
+	storage            *storage.S3Storage
+	relayQueue         delivery.RelayQueue // Global relay queue for mail delivery
+	server             *http.Server
+	tls                bool
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsVerify          bool
+	hostname           string
+	ftsRetention       time.Duration
+	affinityManager    AffinityManager
+	validBackends      map[string][]string
+	connectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker
 }
 
 // ServerOptions holds configuration options for the HTTP API server
 type ServerOptions struct {
-	Name            string
-	Addr            string
-	APIKey          string
-	AllowedHosts    []string
-	Cache           *cache.Cache
-	Uploader        *uploader.UploadWorker
-	Storage         *storage.S3Storage
-	ExternalRelay   string
-	TLS             bool
-	TLSCertFile     string
-	TLSKeyFile      string
-	TLSVerify       bool
-	Hostname        string
-	FTSRetention    time.Duration
-	AffinityManager AffinityManager
-	ValidBackends   map[string][]string // Map of protocol -> valid backend addresses
+	Name               string
+	Addr               string
+	APIKey             string
+	AllowedHosts       []string
+	Cache              *cache.Cache
+	Uploader           *uploader.UploadWorker
+	Storage            *storage.S3Storage
+	RelayQueue         delivery.RelayQueue // Global relay queue for mail delivery
+	TLS                bool
+	TLSCertFile        string
+	TLSKeyFile         string
+	TLSVerify          bool
+	Hostname           string
+	FTSRetention       time.Duration
+	AffinityManager    AffinityManager
+	ValidBackends      map[string][]string                 // Map of protocol -> valid backend addresses
+	ConnectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker (for gossip-based kick)
 }
 
 // AffinityManager interface for managing user-to-backend affinity
@@ -86,23 +90,24 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	}
 
 	s := &Server{
-		name:            options.Name,
-		addr:            options.Addr,
-		apiKey:          options.APIKey,
-		allowedHosts:    options.AllowedHosts,
-		rdb:             rdb,
-		cache:           options.Cache,
-		uploader:        options.Uploader,
-		storage:         options.Storage,
-		externalRelay:   options.ExternalRelay,
-		tls:             options.TLS,
-		tlsCertFile:     options.TLSCertFile,
-		tlsKeyFile:      options.TLSKeyFile,
-		tlsVerify:       options.TLSVerify,
-		hostname:        options.Hostname,
-		ftsRetention:    options.FTSRetention,
-		affinityManager: options.AffinityManager,
-		validBackends:   options.ValidBackends,
+		name:               options.Name,
+		addr:               options.Addr,
+		apiKey:             options.APIKey,
+		allowedHosts:       options.AllowedHosts,
+		rdb:                rdb,
+		cache:              options.Cache,
+		uploader:           options.Uploader,
+		storage:            options.Storage,
+		relayQueue:         options.RelayQueue,
+		tls:                options.TLS,
+		tlsCertFile:        options.TLSCertFile,
+		tlsKeyFile:         options.TLSKeyFile,
+		tlsVerify:          options.TLSVerify,
+		hostname:           options.Hostname,
+		ftsRetention:       options.FTSRetention,
+		affinityManager:    options.AffinityManager,
+		validBackends:      options.ValidBackends,
+		connectionTrackers: options.ConnectionTrackers,
 	}
 
 	return s, nil
@@ -271,11 +276,12 @@ func (s *Server) handleAccountOperations(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if strings.Contains(path, "/credentials") {
-		if r.Method == "GET" {
+		switch r.Method {
+		case "GET":
 			s.handleListCredentials(w, r)
-		} else if r.Method == "POST" {
+		case "POST":
 			s.handleAddCredential(w, r)
-		} else {
+		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 		return
@@ -890,18 +896,39 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	connections, err := s.rdb.GetActiveConnectionsWithRetry(ctx)
-	if err != nil {
-		log.Printf("HTTP API [%s] Error getting connections: %v", s.name, err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to get connections")
+	if len(s.connectionTrackers) == 0 {
+		// No connection trackers available
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"connections": []interface{}{},
+			"count":       0,
+			"note":        "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
+		})
 		return
 	}
 
+	// Collect connections from all trackers
+	allConnections := make([]map[string]interface{}, 0)
+	for protocol, tracker := range s.connectionTrackers {
+		if tracker == nil {
+			continue
+		}
+		conns := tracker.GetAllConnections()
+		for _, connInfo := range conns {
+			allConnections = append(allConnections, map[string]interface{}{
+				"protocol":    protocol,
+				"account_id":  connInfo.AccountID,
+				"local_count": connInfo.LocalCount,
+				"total_count": connInfo.TotalCount,
+				"last_update": connInfo.LastUpdate,
+				"email":       connInfo.Username,
+			})
+		}
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"connections": connections,
-		"count":       len(connections),
+		"connections": allConnections,
+		"count":       len(allConnections),
+		"source":      "in-memory connection tracker",
 	})
 }
 
@@ -915,56 +942,152 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	criteria := db.TerminationCriteria{
-		Email:      req.UserEmail,
-		Protocol:   req.Protocol,
-		ServerAddr: req.ServerAddr,
-		ClientAddr: req.ClientAddr,
+	// Require user email for gossip-based kick
+	if req.UserEmail == "" {
+		s.writeError(w, http.StatusBadRequest, "user_email is required for kick operation")
+		return
 	}
 
-	count, err := s.rdb.MarkConnectionsForTerminationWithRetry(ctx, criteria)
+	// Get account ID from email
+	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error kicking connections: %v", s.name, err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to kick connections")
+		log.Printf("HTTP API [%s] Error getting account ID for %s: %v", s.name, req.UserEmail, err)
+		s.writeError(w, http.StatusNotFound, "User not found")
+		return
+	}
+
+	// Determine which protocols to kick
+	protocols := []string{}
+	if req.Protocol != "" {
+		protocols = []string{req.Protocol}
+	} else {
+		// Kick all protocols if not specified
+		for proto := range s.connectionTrackers {
+			protocols = append(protocols, proto)
+		}
+	}
+
+	if len(s.connectionTrackers) == 0 {
+		// No connection trackers available (not running in cluster/proxy mode)
+		log.Printf("HTTP API [%s] No connection trackers available - gossip-based kick requires cluster mode", s.name)
+		s.writeError(w, http.StatusServiceUnavailable, "Connection tracking not available (requires cluster mode)")
+		return
+	}
+
+	// Kick user on all specified protocols
+	kickedProtocols := []string{}
+	for _, protocol := range protocols {
+		tracker := s.connectionTrackers[protocol]
+		if tracker == nil {
+			log.Printf("HTTP API [%s] No tracker for protocol %s", s.name, protocol)
+			continue
+		}
+
+		if err := tracker.KickUser(accountID, protocol); err != nil {
+			log.Printf("HTTP API [%s] Error kicking user %s on protocol %s: %v", s.name, req.UserEmail, protocol, err)
+			continue
+		}
+
+		kickedProtocols = append(kickedProtocols, protocol)
+		log.Printf("HTTP API [%s] Kicked user %s (accountID=%d) on protocol %s", s.name, req.UserEmail, accountID, protocol)
+	}
+
+	if len(kickedProtocols) == 0 {
+		s.writeError(w, http.StatusInternalServerError, "Failed to kick user on any protocol")
 		return
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"message":            "Connections marked for termination successfully",
-		"connections_marked": count,
+		"message":   "User kicked successfully via gossip protocol",
+		"user":      req.UserEmail,
+		"protocols": kickedProtocols,
+		"note":      "Kick event broadcast to cluster. Connections will be terminated within seconds.",
 	})
 }
 
 func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	stats, err := s.rdb.GetConnectionStatsWithRetry(ctx)
-	if err != nil {
-		log.Printf("HTTP API [%s] Error getting connection stats: %v", s.name, err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to get connection stats")
+	if len(s.connectionTrackers) == 0 {
+		// No connection trackers available
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"total_connections":       0,
+			"connections_by_protocol": map[string]int{},
+			"note":                    "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
+		})
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, stats)
+	// Aggregate stats from all trackers
+	totalConnections := 0
+	byProtocol := make(map[string]int)
+
+	for protocol, tracker := range s.connectionTrackers {
+		if tracker == nil {
+			continue
+		}
+		conns := tracker.GetAllConnections()
+		count := len(conns)
+		totalConnections += count
+		byProtocol[protocol] = count
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total_connections":       totalConnections,
+		"connections_by_protocol": byProtocol,
+		"source":                  "in-memory connection tracker",
+	})
 }
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
 	// Extract email from path: /admin/connections/user/{email}
 	email := extractLastPathSegment(r.URL.Path)
 
+	if len(s.connectionTrackers) == 0 {
+		// No connection trackers available
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"email":       email,
+			"connections": []interface{}{},
+			"count":       0,
+			"note":        "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
+		})
+		return
+	}
+
 	ctx := r.Context()
 
-	connections, err := s.rdb.GetUserConnectionsWithRetry(ctx, email)
+	// Get account ID from email
+	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, email)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting user connections: %v", s.name, err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to get user connections")
+		log.Printf("HTTP API [%s] Error getting account ID for %s: %v", s.name, email, err)
+		s.writeError(w, http.StatusNotFound, "User not found")
 		return
+	}
+
+	// Collect connections for this user from all trackers
+	userConnections := make([]map[string]interface{}, 0)
+	for protocol, tracker := range s.connectionTrackers {
+		if tracker == nil {
+			continue
+		}
+		conns := tracker.GetAllConnections()
+		for _, connInfo := range conns {
+			if connInfo.AccountID == accountID {
+				userConnections = append(userConnections, map[string]interface{}{
+					"protocol":    protocol,
+					"account_id":  accountID,
+					"email":       connInfo.Username,
+					"local_count": connInfo.LocalCount,
+					"total_count": connInfo.TotalCount,
+					"last_update": connInfo.LastUpdate,
+				})
+			}
+		}
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"email":       email,
-		"connections": connections,
-		"count":       len(connections),
+		"connections": userConnections,
+		"count":       len(userConnections),
+		"source":      "in-memory connection tracker",
 	})
 }
 

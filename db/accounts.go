@@ -479,11 +479,9 @@ func (db *Database) DeleteAccount(ctx context.Context, tx pgx.Tx, email string) 
 		return fmt.Errorf("account not found or already deleted")
 	}
 
-	// Disconnect all active connections for this account
-	_, err = tx.Exec(ctx, "DELETE FROM active_connections WHERE account_id = $1", accountID)
-	if err != nil {
-		return fmt.Errorf("failed to disconnect active connections: %w", err)
-	}
+	// NOTE: Connection tracking no longer uses database.
+	// Active connections are tracked in-memory via gossip/local tracking.
+	// To disconnect users, use ConnectionTracker.KickUser() instead.
 
 	return nil
 }

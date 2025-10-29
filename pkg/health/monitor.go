@@ -3,10 +3,10 @@ package health
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -97,14 +97,14 @@ func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
 	ticker := time.NewTicker(check.Interval)
 	defer ticker.Stop()
 
-	log.Printf("[HEALTH] Started monitoring '%s' with interval %v", check.Name, check.Interval)
+	logger.Infof("[HEALTH] Started monitoring '%s' with interval %v", check.Name, check.Interval)
 
 	// Don't perform the first check immediately - wait for the first ticker interval
 	// to allow the application to fully initialize and avoid context cancellation issues
 	for {
 		select {
 		case <-hm.ctx.Done():
-			log.Printf("[HEALTH] Monitoring stopped for '%s' due to context cancellation", check.Name)
+			logger.Infof("[HEALTH] Monitoring stopped for '%s' due to context cancellation", check.Name)
 			return
 		case <-ticker.C:
 			hm.performCheck(check)
@@ -118,7 +118,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 		if r := recover(); r != nil {
 			// A panic is a critical failure, so we mark the component as unhealthy.
 			err := fmt.Errorf("panic: %v", r)
-			log.Printf("[HEALTH] PANIC during check for component '%s': %v", check.Name, err)
+			logger.Errorf("[HEALTH] PANIC during check for component '%s': %v", check.Name, err)
 
 			check.mu.Lock()
 			check.Status = StatusUnhealthy
@@ -164,7 +164,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 			check.Status = StatusDegraded
 		}
 
-		log.Printf("[HEALTH] check '%s' failed: %v (status: %s, failure rate: %.2f)",
+		logger.Warnf("[HEALTH] check '%s' failed: %v (status: %s, failure rate: %.2f)",
 			check.Name, err, check.Status, failureRate)
 	} else {
 		check.LastError = nil
@@ -194,9 +194,9 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 
 	if previousStatus != currentStatus || isFirstCheck {
 		if isFirstCheck {
-			log.Printf("[HEALTH] check '%s' initialized: %s", check.Name, currentStatus)
+			logger.Infof("[HEALTH] check '%s' initialized: %s", check.Name, currentStatus)
 		} else {
-			log.Printf("[HEALTH] check '%s' status changed: %s -> %s", check.Name, previousStatus, currentStatus)
+			logger.Infof("[HEALTH] check '%s' status changed: %s -> %s", check.Name, previousStatus, currentStatus)
 		}
 		hm.notifyStatusChange(check.Name, currentStatus)
 	}
@@ -254,7 +254,7 @@ func (hm *HealthMonitor) updateOverallStatus() {
 	}
 
 	if previousStatus != hm.overallStatus {
-		log.Printf("[HEALTH] overall system status changed: %s -> %s", previousStatus, hm.overallStatus)
+		logger.Infof("[HEALTH] overall system status changed: %s -> %s", previousStatus, hm.overallStatus)
 	}
 }
 

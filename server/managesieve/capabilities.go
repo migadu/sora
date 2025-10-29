@@ -5,101 +5,89 @@ import (
 	"strings"
 )
 
-// BuiltinSieveCapabilities lists the SIEVE extensions that are always available
-// without additional configuration. These are the core RFC-standardized extensions
-// that most SIEVE implementations support.
+// GoSieveSupportedExtensions lists all SIEVE extensions that the underlying
+// go-sieve library (github.com/migadu/go-sieve) can validate and execute.
 //
-// Additional extensions (like vacation, regex) should be explicitly configured
-// via the supported_extensions configuration option.
-var BuiltinSieveCapabilities = []string{
-	"fileinto",                   // RFC 5228 - Store messages in specified mailbox
-	"reject",                     // RFC 5429 - Reject messages with custom message
-	"envelope",                   // RFC 5228 - Test envelope addresses
-	"encoded-character",          // RFC 5228 - Encoded character support
-	"subaddress",                 // RFC 5233 - Subaddress (user+detail) support
-	"comparator-i;ascii-numeric", // RFC 4790 - ASCII numeric comparator
-	"relational",                 // RFC 5231 - Relational tests (gt, lt, etc.)
-	"imap4flags",                 // RFC 5232 - IMAP flag manipulation
-	"copy",                       // RFC 3894 - Copy messages without implicit keep
-	"include",                    // RFC 6609 - Include other scripts
-	"variables",                  // RFC 5229 - Variable support
-	"body",                       // RFC 5173 - Body content tests
-	"enotify",                    // RFC 5435 - Email notifications
-	"environment",                // RFC 5183 - Environment variable access
-	"mailbox",                    // RFC 5490 - Mailbox existence tests
-	"date",                       // RFC 5260 - Date/time tests
-	"index",                      // RFC 5260 - Index extension
-	"ihave",                      // RFC 5463 - Conditional script compilation
-	"duplicate",                  // RFC 7352 - Duplicate message detection
-	"mime",                       // RFC 5703 - MIME part tests
-	"foreverypart",               // RFC 5703 - Iterate over MIME parts
-	"extracttext",                // RFC 5703 - Extract text from MIME parts
-}
+// This is the authoritative list of what can be configured in supported_extensions.
+// Extensions not in this list will cause script validation to fail.
+//
+// NOTE: Core RFC 5228 commands (require, if/elsif/else, stop, redirect, keep, discard)
+// are always available and don't need to be in this list.
+//
+// Based on: github.com/migadu/go-sieve@v0.0.0-20250924160026-17d8f94a0a43/interp/load.go
+var GoSieveSupportedExtensions = []string{
+	// Core extensions from RFC 5228
+	"fileinto",          // RFC 5228 - Store messages in specified mailbox
+	"envelope",          // RFC 5228 - Test envelope addresses
+	"encoded-character", // RFC 5228 - Encoded character support
 
-// AvailableAdditionalExtensions lists SIEVE extensions that can be optionally
-// enabled via configuration. These extensions may require additional implementation
-// or external dependencies.
-var AvailableAdditionalExtensions = []string{
+	// Comparators
+	"comparator-i;octet",           // RFC 4790 - Octet comparator
+	"comparator-i;ascii-casemap",   // RFC 4790 - ASCII case-insensitive
+	"comparator-i;ascii-numeric",   // RFC 4790 - ASCII numeric
+	"comparator-i;unicode-casemap", // RFC 4790 - Unicode case-insensitive
+
+	// Common extensions
+	"imap4flags", // RFC 5232 - IMAP flag manipulation
+	"variables",  // RFC 5229 - Variable support
+	"relational", // RFC 5231 - Relational tests (gt, lt, etc.)
 	"vacation",   // RFC 5230 - Vacation auto-responder
-	"regex",      // RFC 5229 - Regular expression support (draft)
-	"editheader", // RFC 5293 - Header manipulation
-	"spamtest",   // RFC 5235 - Spam test interface
-	"virustest",  // RFC 5235 - Virus test interface
+	"copy",       // RFC 3894 - Copy extension for redirect and fileinto
+	"regex",      // draft-murchison-sieve-regex - Regular expression match type
 }
 
-// ValidateExtensions checks if the provided extensions are valid (either builtin or available).
+// CommonlyUsedExtensions provides a recommended default list of extensions
+// for production use. This is what gets configured in config.toml.example.
+var CommonlyUsedExtensions = []string{
+	"fileinto",
+	"vacation",
+	"envelope",
+	"imap4flags",
+	"variables",
+	"relational",
+	"copy",
+	"regex",
+}
+
+// ValidateExtensions checks if the provided extensions are supported by go-sieve.
 // Returns an error listing any invalid extensions.
 func ValidateExtensions(extensions []string) error {
 	if len(extensions) == 0 {
 		return nil
 	}
 
-	// Build map of all valid extensions
-	validExtensions := make(map[string]bool)
-	for _, ext := range BuiltinSieveCapabilities {
-		validExtensions[ext] = true
-	}
-	for _, ext := range AvailableAdditionalExtensions {
-		validExtensions[ext] = true
+	// Build map of all supported extensions
+	supportedMap := make(map[string]bool)
+	for _, ext := range GoSieveSupportedExtensions {
+		supportedMap[ext] = true
 	}
 
 	// Check for invalid extensions
 	var invalid []string
 	for _, ext := range extensions {
-		if !validExtensions[ext] {
+		if !supportedMap[ext] {
 			invalid = append(invalid, ext)
 		}
 	}
 
 	if len(invalid) > 0 {
-		return fmt.Errorf("invalid SIEVE extensions: %s (available: %s)",
+		return fmt.Errorf("invalid SIEVE extensions: %s (go-sieve supports: %s)",
 			strings.Join(invalid, ", "),
-			strings.Join(AvailableAdditionalExtensions, ", "))
+			strings.Join(GoSieveSupportedExtensions, ", "))
 	}
 
 	return nil
 }
 
-// GetSieveCapabilities returns the complete list of SIEVE capabilities
-// by combining builtin capabilities with configured additional extensions.
-// It filters out duplicates (extensions already in builtin list).
-func GetSieveCapabilities(additionalExtensions []string) []string {
-	// Build set of builtin capabilities for fast lookup
-	builtinSet := make(map[string]bool)
-	for _, cap := range BuiltinSieveCapabilities {
-		builtinSet[cap] = true
-	}
-
-	// Start with builtin capabilities
-	capabilities := make([]string, 0, len(BuiltinSieveCapabilities)+len(additionalExtensions))
-	capabilities = append(capabilities, BuiltinSieveCapabilities...)
-
-	// Add additional extensions that aren't already builtin
-	for _, ext := range additionalExtensions {
-		if !builtinSet[ext] {
-			capabilities = append(capabilities, ext)
-		}
-	}
-
+// GetSieveCapabilities returns the SIEVE capabilities that should be advertised
+// to clients. This is simply the configured supported_extensions list.
+//
+// NOTE: This used to combine a "builtin" list with additional extensions, but that
+// was incorrect. We should only advertise what's explicitly configured, because
+// go-sieve validates against the enabled extensions list during script upload.
+func GetSieveCapabilities(supportedExtensions []string) []string {
+	// Return a copy to prevent external modification
+	capabilities := make([]string, len(supportedExtensions))
+	copy(capabilities, supportedExtensions)
 	return capabilities
 }

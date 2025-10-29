@@ -2,8 +2,9 @@ package metrics
 
 import (
 	"context"
-	"log"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 // MetricsStats holds aggregate statistics returned by the database
@@ -66,15 +67,15 @@ func (c *Collector) Start(ctx context.Context) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	log.Printf("[METRICS-COLLECTOR] Started with interval %v", c.interval)
+	logger.Infof("[METRICS-COLLECTOR] Started with interval %v", c.interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[METRICS-COLLECTOR] Stopping due to context cancellation")
+			logger.Infof("[METRICS-COLLECTOR] Stopping due to context cancellation")
 			return
 		case <-c.stopCh:
-			log.Printf("[METRICS-COLLECTOR] Stopping due to stop signal")
+			logger.Infof("[METRICS-COLLECTOR] Stopping due to stop signal")
 			return
 		case <-ticker.C:
 			c.collect(ctx)
@@ -91,7 +92,7 @@ func (c *Collector) Stop() {
 func (c *Collector) collect(ctx context.Context) {
 	stats, err := c.provider.GetMetricsStatsWithRetry(ctx)
 	if err != nil {
-		log.Printf("[METRICS-COLLECTOR] Error collecting metrics: %v", err)
+		logger.Errorf("[METRICS-COLLECTOR] Error collecting metrics: %v", err)
 		return
 	}
 
@@ -102,18 +103,18 @@ func (c *Collector) collect(ctx context.Context) {
 	// Individual mailbox metrics would require more complex queries
 	// For now, we'll skip the per-mailbox metric
 
-	log.Printf("[METRICS-COLLECTOR] Updated DB metrics: accounts=%d, mailboxes=%d, messages=%d",
+	logger.Infof("[METRICS-COLLECTOR] Updated DB metrics: accounts=%d, mailboxes=%d, messages=%d",
 		stats.TotalAccounts, stats.TotalMailboxes, stats.TotalMessages)
 
 	// Update cache metrics if cache provider is available
 	if c.cacheProvider != nil {
 		objectCount, totalSize, err := c.cacheProvider.GetStats()
 		if err != nil {
-			log.Printf("[METRICS-COLLECTOR] Error collecting cache metrics: %v", err)
+			logger.Errorf("[METRICS-COLLECTOR] Error collecting cache metrics: %v", err)
 		} else {
 			CacheObjectsTotal.Set(float64(objectCount))
 			CacheSizeBytes.Set(float64(totalSize))
-			log.Printf("[METRICS-COLLECTOR] Updated cache metrics: objects=%d, size_bytes=%d",
+			logger.Infof("[METRICS-COLLECTOR] Updated cache metrics: objects=%d, size_bytes=%d",
 				objectCount, totalSize)
 		}
 	}

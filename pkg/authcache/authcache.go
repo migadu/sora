@@ -2,11 +2,11 @@ package authcache
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -65,7 +65,7 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	log.Printf("[AuthCache] Initialized: positive_ttl=%s, negative_ttl=%s, max_size=%d, cleanup_interval=%s",
+	logger.Infof("[AuthCache] Initialized: positive_ttl=%s, negative_ttl=%s, max_size=%d, cleanup_interval=%s",
 		positiveTTL, negativeTTL, maxSize, cleanupInterval)
 
 	return cache
@@ -221,7 +221,7 @@ func (c *AuthCache) cleanup() {
 	}
 
 	if removed > 0 {
-		log.Printf("[AuthCache] Cleanup removed %d expired entries, %d remaining", removed, len(c.entries))
+		logger.Infof("[AuthCache] Cleanup removed %d expired entries, %d remaining", removed, len(c.entries))
 		metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
 	}
 
@@ -275,5 +275,5 @@ func (c *AuthCache) Clear() {
 	c.hits = 0
 	c.misses = 0
 
-	log.Printf("[AuthCache] Cache cleared")
+	logger.Infof("[AuthCache] Cache cleared")
 }

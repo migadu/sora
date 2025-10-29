@@ -1215,9 +1215,8 @@ func (s *ManageSieveSession) registerConnection(email string) {
 		defer cancel()
 
 		clientAddr := (*s.conn).RemoteAddr().String()
-		serverAddr := s.server.addr
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), "ManageSieve", clientAddr, serverAddr, email, false); err != nil {
+		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), email, "ManageSieve", clientAddr); err != nil {
 			s.Log("Failed to register connection: %v", err)
 		}
 	}
@@ -1237,51 +1236,26 @@ func (s *ManageSieveSession) unregisterConnection() {
 	}
 }
 
-// startTerminationPoller starts a goroutine that periodically checks if the connection should be terminated
+// startTerminationPoller starts a goroutine that waits for kick notifications
 func (s *ManageSieveSession) startTerminationPoller() {
 	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || s.User == nil {
 		return
 	}
 
+	// Register session for kick notifications and get a channel that closes on kick
+	kickChan := s.server.connTracker.RegisterSession(s.UserID())
+
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+		// Unregister when done
+		defer s.server.connTracker.UnregisterSession(s.UserID(), kickChan)
 
-		kickChan := s.server.connTracker.KickChannel()
-		clientAddr := (*s.conn).RemoteAddr().String()
-
-		checkAndTerminate := func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			shouldTerminate, err := s.server.connTracker.CheckTermination(ctx, s.UserID(), "ManageSieve", clientAddr)
-			if err != nil {
-				s.Log("Failed to check termination: %v", err)
-				return false
-			}
-			if shouldTerminate {
-				s.Log("Connection kicked - disconnecting user")
-				(*s.conn).Close()
-				return true
-			}
-			return false
-		}
-
-		for {
-			select {
-			case <-kickChan:
-				s.Log("Received kick notification")
-				if checkAndTerminate() {
-					return
-				}
-			case <-ticker.C:
-				// Periodic check in case kick notification was missed
-				if checkAndTerminate() {
-					return
-				}
-			case <-s.ctx.Done():
-				return
-			}
+		select {
+		case <-kickChan:
+			// Kick notification received - close connection
+			s.Log("Connection kicked - disconnecting user")
+			(*s.conn).Close()
+		case <-s.ctx.Done():
+			// Session ended normally
 		}
 	}()
 }

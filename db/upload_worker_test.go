@@ -26,7 +26,6 @@ func setupUploadWorkerTest(t *testing.T) *Database {
 	tables := []string{
 		"cache_metrics",
 		"health_status",
-		"active_connections",
 		"locks",
 		"auth_attempts",
 		"vacation_responses",

@@ -25,6 +25,7 @@ import (
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
+	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/imapproxy"
 	"github.com/migadu/sora/server/lmtp"
@@ -34,6 +35,7 @@ import (
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/pop3proxy"
 	"github.com/migadu/sora/server/proxy"
+	"github.com/migadu/sora/server/relayqueue"
 	"github.com/migadu/sora/server/uploader"
 	mailapi "github.com/migadu/sora/server/userapi"
 	"github.com/migadu/sora/server/userapiproxy"
@@ -73,19 +75,22 @@ func (sm *serverManager) Wait() {
 
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
-	storage           *storage.S3Storage
-	resilientDB       *resilient.ResilientDatabase
-	uploadWorker      *uploader.UploadWorker
-	cacheInstance     *cache.Cache
-	cleanupWorker     *cleaner.CleanupWorker
-	healthIntegration *health.HealthIntegration
-	metricsCollector  *metrics.Collector
-	clusterManager    *cluster.Manager
-	tlsManager        *tlsmanager.Manager
-	affinityManager   *serverPkg.AffinityManager
-	hostname          string
-	config            config.Config
-	serverManager     *serverManager
+	storage            *storage.S3Storage
+	resilientDB        *resilient.ResilientDatabase
+	uploadWorker       *uploader.UploadWorker
+	cacheInstance      *cache.Cache
+	cleanupWorker      *cleaner.CleanupWorker
+	relayQueue         *relayqueue.DiskQueue
+	relayWorker        *relayqueue.Worker
+	healthIntegration  *health.HealthIntegration
+	metricsCollector   *metrics.Collector
+	clusterManager     *cluster.Manager
+	tlsManager         *tlsmanager.Manager
+	affinityManager    *serverPkg.AffinityManager
+	hostname           string
+	config             config.Config
+	serverManager      *serverManager
+	connectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker (for admin API kick)
 }
 
 func main() {
@@ -173,6 +178,9 @@ func main() {
 	}
 	if deps.uploadWorker != nil {
 		defer deps.uploadWorker.Stop()
+	}
+	if deps.relayWorker != nil {
+		defer deps.relayWorker.Stop()
 	}
 
 	// Start all configured servers
@@ -284,9 +292,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	deps := &serverDependencies{
-		hostname:      hostname,
-		config:        cfg,
-		serverManager: &serverManager{}, // Initialize server manager for coordinated shutdown
+		hostname:           hostname,
+		config:             cfg,
+		serverManager:      &serverManager{}, // Initialize server manager for coordinated shutdown
+		connectionTrackers: make(map[string]*proxy.ConnectionTracker),
 	}
 
 	// Initialize S3 storage if needed
@@ -469,22 +478,195 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
 		authAttemptsRetention := cfg.Cleanup.GetAuthAttemptsRetentionWithDefault()
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
-		staleConnectionsRetention := cfg.Cleanup.GetStaleConnectionsRetentionWithDefault()
 
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, staleConnectionsRetention)
-		deps.cleanupWorker.Start(ctx)
+		cleanupErrChan := make(chan error, 1)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, cleanupErrChan)
+
+		// Start error listener for cleanup worker
+		go func() {
+			for err := range cleanupErrChan {
+				logger.Errorf("Cleanup worker error: %v", err)
+			}
+		}()
+
+		if err := deps.cleanupWorker.Start(ctx); err != nil {
+			errorHandler.FatalError("start cleanup worker", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
 
 		// Initialize and start the upload worker
 		retryInterval := cfg.Uploader.GetRetryIntervalWithDefault()
-		errChan := make(chan error, 1)
-		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, errChan)
+		uploadErrChan := make(chan error, 1)
+		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, uploadErrChan)
 		if err != nil {
 			errorHandler.FatalError("create upload worker", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		deps.uploadWorker.Start(ctx)
+
+		// Start error listener for upload worker
+		go func() {
+			for err := range uploadErrChan {
+				logger.Errorf("Upload worker error: %v", err)
+			}
+		}()
+
+		if err := deps.uploadWorker.Start(ctx); err != nil {
+			errorHandler.FatalError("start upload worker", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
 	} else {
 		logger.Info("Skipping startup of cache, uploader, and cleaner services as no mail storage services (IMAP, POP3, LMTP) are enabled.")
+	}
+
+	// Initialize relay queue and worker if enabled
+	if cfg.Relay.IsQueueEnabled() {
+		logger.Info("Initializing relay queue and worker")
+
+		// Parse configuration
+		backoff, err := cfg.Relay.Queue.GetRetryBackoff()
+		if err != nil {
+			logger.Warnf("Invalid relay queue backoff configuration, using defaults: %v", err)
+			backoff = nil // Will use defaults in NewDiskQueue
+		}
+
+		workerInterval, err := cfg.Relay.Queue.GetWorkerInterval()
+		if err != nil {
+			logger.Warnf("Invalid relay queue worker interval, using default (1m): %v", err)
+			workerInterval = 1 * time.Minute
+		}
+
+		// Create disk queue
+		queuePath := cfg.Relay.GetQueuePath()
+		deps.relayQueue, err = relayqueue.NewDiskQueue(
+			queuePath,
+			cfg.Relay.Queue.MaxAttempts,
+			backoff,
+		)
+		if err != nil {
+			errorHandler.FatalError("create relay queue", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
+		logger.Infof("Relay queue initialized: path=%s, max_attempts=%d",
+			queuePath, cfg.Relay.Queue.MaxAttempts)
+
+		// Create relay handler from global relay config if configured
+		if cfg.Relay.IsConfigured() {
+			var relayHandler delivery.RelayHandler
+			var relayType string
+
+			// Parse circuit breaker configuration
+			cbThreshold := cfg.Relay.Queue.GetCircuitBreakerThreshold()
+			cbTimeout, err := cfg.Relay.Queue.GetCircuitBreakerTimeout()
+			if err != nil {
+				errorHandler.FatalError("parse circuit breaker timeout", err)
+				os.Exit(errorHandler.WaitForExit())
+			}
+			cbMaxRequests := cfg.Relay.Queue.GetCircuitBreakerMaxRequests()
+
+			cbConfig := delivery.CircuitBreakerConfig{
+				Threshold:   cbThreshold,
+				Timeout:     cbTimeout,
+				MaxRequests: cbMaxRequests,
+			}
+
+			if cfg.Relay.IsSMTP() {
+				relayType = "smtp"
+				relayHandler = delivery.NewRelayHandlerFromConfig(
+					relayType,
+					cfg.Relay.SMTPHost,
+					"",
+					"",
+					"relay_queue",
+					cfg.Relay.SMTPTLS,
+					cfg.Relay.SMTPTLSVerify,
+					cfg.Relay.SMTPUseStartTLS,
+					cfg.Relay.SMTPTLSCertFile,
+					cfg.Relay.SMTPTLSKeyFile,
+					&serverLogger{},
+					cbConfig,
+				)
+				logger.Infof("Relay handler configured: type=smtp, host=%s, tls=%v, starttls=%v, circuit_breaker=enabled (threshold=%d, timeout=%s, max_requests=%d)",
+					cfg.Relay.SMTPHost, cfg.Relay.SMTPTLS, cfg.Relay.SMTPUseStartTLS, cbThreshold, cbTimeout, cbMaxRequests)
+			} else if cfg.Relay.IsHTTP() {
+				relayType = "http"
+				relayHandler = delivery.NewRelayHandlerFromConfig(
+					relayType,
+					"",
+					cfg.Relay.HTTPURL,
+					cfg.Relay.AuthToken,
+					"relay_queue",
+					false,
+					false,
+					false,
+					"",
+					"",
+					&serverLogger{},
+					cbConfig,
+				)
+				logger.Infof("Relay handler configured: type=http, url=%s, circuit_breaker=enabled (threshold=%d, timeout=%s, max_requests=%d)",
+					cfg.Relay.HTTPURL, cbThreshold, cbTimeout, cbMaxRequests)
+			}
+
+			if relayHandler != nil {
+				batchSize := cfg.Relay.Queue.BatchSize
+				if batchSize <= 0 {
+					batchSize = 100 // Default
+				}
+
+				concurrency := cfg.Relay.Queue.Concurrency
+				if concurrency <= 0 {
+					concurrency = 5 // Default concurrency for concurrent message processing
+				}
+
+				errCh := make(chan error, 10) // Buffered error channel
+
+				// Start error listener
+				go func() {
+					for err := range errCh {
+						logger.Errorf("Relay worker error: %v", err)
+					}
+				}()
+
+				deps.relayWorker = relayqueue.NewWorker(
+					deps.relayQueue,
+					relayHandler,
+					workerInterval,
+					batchSize,
+					concurrency,
+					errCh,
+				)
+
+				if err := deps.relayWorker.Start(ctx); err != nil {
+					errorHandler.FatalError("start relay worker", err)
+					os.Exit(errorHandler.WaitForExit())
+				}
+
+				logger.Infof("Relay worker started: interval=%s, batch_size=%d, concurrency=%d",
+					workerInterval, batchSize, concurrency)
+
+				// Register relay queue health check
+				deps.healthIntegration.RegisterRelayQueueCheck(deps.relayQueue)
+				logger.Info("Registered relay queue health check")
+
+				// Register circuit breaker health check for the relay handler
+				if smtpHandler, ok := relayHandler.(*delivery.SMTPRelayHandler); ok {
+					if cb := smtpHandler.GetCircuitBreaker(); cb != nil {
+						deps.healthIntegration.RegisterCircuitBreakerCheck("smtp_relay", cb)
+						logger.Info("Registered SMTP relay circuit breaker health check")
+					}
+				} else if httpHandler, ok := relayHandler.(*delivery.HTTPRelayHandler); ok {
+					if cb := httpHandler.GetCircuitBreaker(); cb != nil {
+						deps.healthIntegration.RegisterCircuitBreakerCheck("http_relay", cb)
+						logger.Info("Registered HTTP relay circuit breaker health check")
+					}
+				}
+			} else {
+				logger.Warn("Relay queue enabled but no valid relay handler configured")
+			}
+		} else {
+			logger.Warn("Relay queue enabled but global [relay] configuration is missing")
+		}
 	}
 
 	// Initialize cluster manager if enabled
@@ -608,46 +790,24 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	return errChan
 }
 
-// startConnectionTrackerForProxy initializes and starts a connection tracker for a given proxy protocol.
-func startConnectionTrackerForProxy(protocol string, serverName string, rdb *resilient.ResilientDatabase, hostname string, trackingConfig *config.ConnectionTrackingConfig, server interface {
+// startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, clusterMgr *cluster.Manager, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
-	if !trackingConfig.Enabled {
+	if clusterMgr == nil {
+		logger.Debugf("%s Proxy [%s] Connection tracking disabled (requires cluster mode).", protocol, serverName)
 		return nil
 	}
 
-	updateInterval, err := trackingConfig.GetUpdateInterval()
-	if err != nil {
-		logger.Infof("WARNING: invalid connection_tracking update_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.UpdateInterval, protocol, serverName, err)
-		updateInterval = 10 * time.Second
+	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
+
+	logger.Infof("%s Proxy [%s] Starting gossip connection tracker: instance=%s, max_per_user=%d",
+		protocol, serverName, instanceID, maxConnectionsPerUser)
+
+	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser)
+	if tracker != nil {
+		server.SetConnectionTracker(tracker)
 	}
-
-	terminationPollInterval, err := trackingConfig.GetTerminationPollInterval()
-	if err != nil {
-		logger.Infof("WARNING: invalid connection_tracking termination_poll_interval '%s' for %s proxy [%s]: %v. Using default.", trackingConfig.TerminationPollInterval, protocol, serverName, err)
-		terminationPollInterval = 30 * time.Second
-	}
-
-	operationTimeout := trackingConfig.GetOperationTimeoutWithDefault()
-	batchFlushTimeout := trackingConfig.GetBatchFlushTimeoutWithDefault()
-	maxBatchSize := trackingConfig.GetMaxBatchSize()
-
-	logger.Infof("%s Proxy [%s] Starting connection tracker.", protocol, serverName)
-	tracker := proxy.NewConnectionTracker(
-		protocol,
-		rdb,
-		hostname,
-		updateInterval,
-		terminationPollInterval,
-		operationTimeout,
-		batchFlushTimeout,
-		maxBatchSize,
-		trackingConfig.PersistToDB,
-		trackingConfig.BatchUpdates,
-		trackingConfig.Enabled,
-	)
-	server.SetConnectionTracker(tracker)
-	tracker.Start()
 	return tracker
 }
 
@@ -738,6 +898,20 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		return
 	}
 
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
+			}
+		}
+	}
+
 	go func() {
 		<-ctx.Done()
 		s.Close()
@@ -771,7 +945,8 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
-		ExternalRelay:        serverConfig.ExternalRelay,
+		RelayQueue:           deps.relayQueue,  // Global relay queue
+		RelayWorker:          deps.relayWorker, // Global relay worker for immediate processing
 		TLSVerify:            serverConfig.TLSVerify,
 		TLS:                  serverConfig.TLS,
 		TLSCertFile:          serverConfig.TLSCertFile,
@@ -862,6 +1037,20 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		return
 	}
 
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
+			}
+		}
+	}
+
 	go func() {
 		<-ctx.Done()
 		logger.Infof("Shutting down POP3 server %s...", serverConfig.Name)
@@ -934,6 +1123,20 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	if err != nil {
 		errChan <- err
 		return
+	}
+
+	// Start local connection tracker for backend server
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+		tracker := proxy.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser)
+		if tracker != nil {
+			s.SetConnTracker(tracker)
+			defer tracker.Stop()
+			// Store in deps for admin API access
+			if deps.connectionTrackers != nil {
+				deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
+			}
+		}
 	}
 
 	go func() {
@@ -1063,8 +1266,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["IMAP"] = tracker
 	}
 
 	go func() {
@@ -1168,8 +1372,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["POP3"] = tracker
 	}
 
 	go func() {
@@ -1274,8 +1479,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["ManageSieve"] = tracker
 	}
 
 	go func() {
@@ -1356,8 +1562,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.resilientDB, deps.hostname, &deps.config.Servers.ConnectionTracking, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackers["LMTP"] = tracker
 	}
 
 	go func() {
@@ -1399,22 +1606,23 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	}
 
 	options := adminapi.ServerOptions{
-		Name:            serverConfig.Name,
-		Addr:            serverConfig.Addr,
-		APIKey:          serverConfig.APIKey,
-		AllowedHosts:    serverConfig.AllowedHosts,
-		Cache:           deps.cacheInstance,
-		Uploader:        deps.uploadWorker,
-		Storage:         deps.storage,
-		ExternalRelay:   serverConfig.ExternalRelay,
-		TLS:             serverConfig.TLS,
-		TLSCertFile:     serverConfig.TLSCertFile,
-		TLSKeyFile:      serverConfig.TLSKeyFile,
-		TLSVerify:       serverConfig.TLSVerify,
-		Hostname:        deps.hostname,
-		FTSRetention:    ftsRetention,
-		AffinityManager: deps.affinityManager,
-		ValidBackends:   validBackends,
+		Name:               serverConfig.Name,
+		Addr:               serverConfig.Addr,
+		APIKey:             serverConfig.APIKey,
+		AllowedHosts:       serverConfig.AllowedHosts,
+		Cache:              deps.cacheInstance,
+		Uploader:           deps.uploadWorker,
+		Storage:            deps.storage,
+		RelayQueue:         deps.relayQueue, // Global relay queue
+		TLS:                serverConfig.TLS,
+		TLSCertFile:        serverConfig.TLSCertFile,
+		TLSKeyFile:         serverConfig.TLSKeyFile,
+		TLSVerify:          serverConfig.TLSVerify,
+		Hostname:           deps.hostname,
+		FTSRetention:       ftsRetention,
+		AffinityManager:    deps.affinityManager,
+		ValidBackends:      validBackends,
+		ConnectionTrackers: deps.connectionTrackers,
 	}
 
 	adminapi.Start(ctx, deps.resilientDB, options, errChan)
@@ -1525,4 +1733,11 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	if err := server.Start(); err != nil && ctx.Err() == nil {
 		errChan <- fmt.Errorf("User API proxy server error: %w", err)
 	}
+}
+
+// serverLogger implements delivery.Logger interface using the global logger
+type serverLogger struct{}
+
+func (l *serverLogger) Log(format string, args ...interface{}) {
+	logger.Infof(format, args...)
 }

@@ -477,36 +477,64 @@ func TestConnectionManagement(t *testing.T) {
 		// The exact fields returned depend on the actual server state
 	})
 
-	t.Run("kick connections by criteria", func(t *testing.T) {
-		reqBody := map[string]string{
-			"protocol": "IMAP",
-		}
-
-		resp, body := server.makeRequest(t, "POST", "/admin/connections/kick", reqBody)
-
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
-		}
-
-		var result map[string]interface{}
-		server.expectJSON(t, body, &result)
-
-		if !strings.Contains(result["message"].(string), "marked for termination") {
-			t.Errorf("Expected termination message, got %v", result["message"])
-		}
-
-		if _, ok := result["connections_marked"]; !ok {
-			t.Error("Expected connections_marked field")
-		}
-	})
-
-	// Create a test account to test user connections
+	// Create a test account to test user connections and kick
 	testEmail := fmt.Sprintf("conn-test-%d@example.com", time.Now().UnixNano())
 	reqBody := adminapi.CreateAccountRequest{
 		Email:    testEmail,
 		Password: "test-password-123",
 	}
 	server.makeRequest(t, "POST", "/admin/accounts", reqBody)
+
+	t.Run("kick user connections", func(t *testing.T) {
+		// Test gossip-based kick (requires user_email)
+		kickReqBody := map[string]string{
+			"user_email": testEmail,
+			"protocol":   "IMAP",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/connections/kick", kickReqBody)
+
+		// Expect either 200 (kicked successfully) or 503 (cluster mode not available)
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("Expected status %d or %d, got %d. Body: %s",
+				http.StatusOK, http.StatusServiceUnavailable, resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		if resp.StatusCode == http.StatusOK {
+			// Successfully kicked via gossip protocol
+			if !strings.Contains(result["message"].(string), "kicked successfully") {
+				t.Errorf("Expected kick success message, got %v", result["message"])
+			}
+		} else {
+			// Cluster mode not available (expected in non-proxy tests)
+			if !strings.Contains(result["error"].(string), "not available") {
+				t.Errorf("Expected 'not available' error, got %v", result["error"])
+			}
+		}
+	})
+
+	t.Run("kick without user_email should fail", func(t *testing.T) {
+		// Test that kicking without user_email returns 400
+		kickReqBody := map[string]string{
+			"protocol": "IMAP",
+		}
+
+		resp, body := server.makeRequest(t, "POST", "/admin/connections/kick", kickReqBody)
+
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
+		}
+
+		var result map[string]interface{}
+		server.expectJSON(t, body, &result)
+
+		if !strings.Contains(result["error"].(string), "user_email is required") {
+			t.Errorf("Expected 'user_email is required' error, got %v", result["error"])
+		}
+	})
 
 	t.Run("get user connections", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/admin/connections/user/"+testEmail, nil)

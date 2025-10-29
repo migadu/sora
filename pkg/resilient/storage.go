@@ -3,10 +3,10 @@ package resilient
 import (
 	"context"
 	"io"
-	"log"
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 	"github.com/migadu/sora/storage"
@@ -27,7 +27,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 5 && failureRatio >= 0.6
 	}
 	getSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("S3 GET circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Infof("S3 GET circuit breaker '%s' changed from %s to %s", name, from, to)
 	}
 
 	putSettings := circuitbreaker.DefaultSettings("s3_put")
@@ -36,7 +36,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 3 && failureRatio >= 0.5
 	}
 	putSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("S3 PUT circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Infof("S3 PUT circuit breaker '%s' changed from %s to %s", name, from, to)
 	}
 
 	deleteSettings := circuitbreaker.DefaultSettings("s3_delete")
@@ -45,7 +45,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 3 && failureRatio >= 0.5
 	}
 	deleteSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("S3 DELETE circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Infof("S3 DELETE circuit breaker '%s' changed from %s to %s", name, from, to)
 	}
 
 	return &ResilientS3Storage{

@@ -1,575 +1,698 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/cluster"
+	"github.com/migadu/sora/logger"
 )
 
-// ConnectionInfo represents an active connection in memory
-type ConnectionInfo struct {
-	AccountID       int64
-	Protocol        string
-	ClientAddr      string
-	ServerAddr      string
-	Email           string
-	InstanceID      string
-	ConnectedAt     time.Time
-	LastActivity    time.Time
-	ShouldTerminate bool
-	IsProxy         bool // Whether this is a proxy connection
-	// Fields for tracking changes
-	isNew       bool
-	isModified  bool
-	retryCount  int       // Number of times this connection has failed to persist
-	lastRetryAt time.Time // When the last retry attempt was made
+// ConnectionEventType represents the type of connection event
+type ConnectionEventType string
+
+const (
+	// ConnectionEventRegister indicates a user connected
+	ConnectionEventRegister ConnectionEventType = "CONN_REGISTER"
+
+	// ConnectionEventUnregister indicates a user disconnected
+	ConnectionEventUnregister ConnectionEventType = "CONN_UNREGISTER"
+
+	// ConnectionEventKick indicates a user should be kicked
+	ConnectionEventKick ConnectionEventType = "CONN_KICK"
+)
+
+// ConnectionEvent represents a cluster-wide connection event
+type ConnectionEvent struct {
+	Type       ConnectionEventType `json:"type"`
+	AccountID  int64               `json:"account_id"`
+	Username   string              `json:"username"`    // For debugging/logging
+	Protocol   string              `json:"protocol"`    // "IMAP", "POP3", "ManageSieve"
+	ClientAddr string              `json:"client_addr"` // For logging
+	Timestamp  time.Time           `json:"timestamp"`
+	NodeID     string              `json:"node_id"`
+	InstanceID string              `json:"instance_id"` // Unique instance identifier
 }
 
-// ConnectionTracker manages connection tracking with in-memory caching
+// UserConnectionInfo tracks connection information for a specific user
+type UserConnectionInfo struct {
+	AccountID      int64
+	Username       string
+	TotalCount     int // Cluster-wide count (eventually consistent)
+	LocalCount     int // This instance's count
+	LastUpdate     time.Time
+	LocalInstances map[string]int // instanceID -> count on that instance
+}
+
+// ConnectionTracker manages connection tracking using gossip protocol
 type ConnectionTracker struct {
-	rdb                     *resilient.ResilientDatabase
-	name                    string // e.g. "IMAP", "POP3"
-	instanceID              string
-	connections             map[string]*ConnectionInfo // key: "accountID:protocol:clientAddr"
-	mu                      sync.RWMutex
-	updateInterval          time.Duration
-	terminationPollInterval time.Duration
-	operationTimeout        time.Duration // Timeout for individual operations (register/unregister)
-	batchFlushTimeout       time.Duration // Timeout for batch flush operations
-	maxBatchSize            int           // Maximum connections per batch chunk
-	persistToDB             bool
-	batchUpdates            bool
-	enabled                 bool
-	kickCh                  chan struct{}
-	stopCh                  chan struct{}
-	wg                      sync.WaitGroup
-	stopped                 bool
+	name           string
+	instanceID     string
+	clusterManager *cluster.Manager
+
+	// Connection tracking
+	connections map[int64]*UserConnectionInfo // accountID -> info
+	mu          sync.RWMutex
+
+	// Kick notifications
+	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
+	kickSessionsMu sync.RWMutex
+
+	// Configuration
+	maxConnectionsPerUser int // Cluster-wide limit per user (0 = unlimited)
+
+	// Broadcast queue for outgoing events
+	broadcastQueue []ConnectionEvent
+	queueMu        sync.Mutex
+
+	// Shutdown
+	stopBroadcast chan struct{}
+	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 }
 
-// NewConnectionTracker creates a new connection tracker
-func NewConnectionTracker(name string, rdb *resilient.ResilientDatabase, instanceID string, updateInterval, terminationPollInterval, operationTimeout, batchFlushTimeout time.Duration, maxBatchSize int, persistToDB, batchUpdates, enabled bool) *ConnectionTracker {
-	tracker := &ConnectionTracker{
-		rdb:                     rdb,
-		name:                    name,
-		instanceID:              instanceID,
-		connections:             make(map[string]*ConnectionInfo),
-		updateInterval:          updateInterval,
-		terminationPollInterval: terminationPollInterval,
-		operationTimeout:        operationTimeout,
-		batchFlushTimeout:       batchFlushTimeout,
-		maxBatchSize:            maxBatchSize,
-		persistToDB:             persistToDB,
-		batchUpdates:            batchUpdates,
-		enabled:                 enabled,
-		kickCh:                  make(chan struct{}),
-		stopCh:                  make(chan struct{}),
+// NewConnectionTracker creates a new connection tracker.
+// If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
+// If clusterMgr is nil, operates in local-only mode (for backend servers).
+func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int) *ConnectionTracker {
+	ct := &ConnectionTracker{
+		name:                  name,
+		instanceID:            instanceID,
+		clusterManager:        clusterMgr,
+		connections:           make(map[int64]*UserConnectionInfo),
+		maxConnectionsPerUser: maxConnectionsPerUser,
+		kickSessions:          make(map[int64][]chan struct{}),
+		broadcastQueue:        make([]ConnectionEvent, 0, 100),
+		stopBroadcast:         make(chan struct{}),
+		stopCleanup:           make(chan struct{}),
 	}
 
-	if enabled && persistToDB {
-		if batchUpdates {
-			tracker.startBatchUpdater()
+	if clusterMgr != nil {
+		// Cluster mode: register with cluster manager for gossip
+		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
+		clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
+
+		// Start background routines
+		go ct.broadcastRoutine()
+		go ct.cleanupRoutine()
+
+		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d (cluster mode)",
+			name, instanceID, maxConnectionsPerUser)
+	} else {
+		// Local mode: no gossip, just track connections locally
+		go ct.cleanupRoutine()
+
+		logger.Infof("[%s-LOCAL-TRACKER] Initialized: instance=%s, max_per_user=%d (local mode)",
+			name, instanceID, maxConnectionsPerUser)
+	}
+
+	return ct
+}
+
+// trackerType returns the name of the tracker for logging purposes.
+func (ct *ConnectionTracker) trackerType() string {
+	if ct.clusterManager == nil {
+		return "LOCAL-TRACKER"
+	}
+	return "GOSSIP-TRACKER"
+}
+
+// RegisterConnection registers a new connection and broadcasts to cluster
+func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, username, protocol, clientAddr string) error {
+	if ct == nil {
+		return nil // Disabled
+	}
+
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	// Get or create user info
+	info, exists := ct.connections[accountID]
+	if !exists {
+		info = &UserConnectionInfo{
+			AccountID:      accountID,
+			Username:       username,
+			TotalCount:     0,
+			LocalCount:     0,
+			LastUpdate:     time.Now(),
+			LocalInstances: make(map[string]int),
 		}
-		// Start poller for immediate kick notifications
-		tracker.startTerminationPoller()
+		ct.connections[accountID] = info
 	}
 
-	return tracker
-}
-
-// Start starts the connection tracker
-func (ct *ConnectionTracker) Start() {
-	if !ct.enabled {
-		return
+	// Check limit (if configured)
+	// In cluster mode, check cluster-wide count. In local mode, check local count.
+	checkCount := info.TotalCount // cluster mode
+	if ct.clusterManager == nil {
+		checkCount = info.LocalCount // local mode
 	}
 
-	// Load existing connections from database if persisting
-	if ct.persistToDB {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		// Cleanup stale connections for this instance on startup
-		removed, err := ct.rdb.CleanupConnectionsByInstanceIDWithRetry(ctx, ct.instanceID)
-		if err != nil {
-			log.Printf("[ConnectionTracker:%s] WARNING: Failed to cleanup stale connections for instance %s: %v", ct.name, ct.instanceID, err)
-		} else if removed > 0 {
-			log.Printf("[ConnectionTracker:%s] Cleaned up %d stale connections for instance %s", ct.name, removed, ct.instanceID)
+	if ct.maxConnectionsPerUser > 0 && checkCount >= ct.maxConnectionsPerUser {
+		scope := "across cluster"
+		if ct.clusterManager == nil {
+			scope = "on this server"
 		}
-	}
-}
-
-// IsEnabled returns true if the connection tracker is enabled.
-func (ct *ConnectionTracker) IsEnabled() bool {
-	return ct.enabled
-}
-
-// GetOperationTimeout returns the configured timeout for individual operations
-func (ct *ConnectionTracker) GetOperationTimeout() time.Duration {
-	return ct.operationTimeout
-}
-
-// Stop stops the connection tracker
-func (ct *ConnectionTracker) Stop() {
-	ct.mu.Lock()
-	if ct.stopped {
-		ct.mu.Unlock()
-		return
-	}
-	ct.stopped = true
-	ct.mu.Unlock()
-
-	close(ct.stopCh)
-	ct.wg.Wait()
-
-	// Flush any remaining changes
-	if ct.enabled && ct.persistToDB {
-		ct.flushChanges()
-	}
-}
-
-// RegisterConnection registers a new connection
-func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID int64, protocol, clientAddr, serverAddr, email string, isProxy bool) error {
-	if !ct.enabled {
-		return nil
+		return fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
+			username, checkCount, ct.maxConnectionsPerUser, scope)
 	}
 
-	key := ct.makeKey(accountID, protocol, clientAddr)
+	// Increment local count
+	info.LocalCount++
+	info.TotalCount++
+	info.LastUpdate = time.Now()
+	info.LocalInstances[ct.instanceID]++
 
-	ct.mu.Lock()
-	ct.connections[key] = &ConnectionInfo{
-		AccountID:    accountID,
-		Protocol:     protocol,
-		ClientAddr:   clientAddr,
-		ServerAddr:   serverAddr,
-		Email:        email,
-		InstanceID:   ct.instanceID,
-		ConnectedAt:  time.Now(),
-		LastActivity: time.Now(),
-		IsProxy:      isProxy,
-		isNew:        true,
-	}
-	ct.mu.Unlock()
-
-	// If not batching, write immediately
-	if ct.persistToDB && !ct.batchUpdates {
-		return ct.rdb.RegisterConnectionWithRetry(ctx, accountID, protocol, clientAddr, serverAddr, ct.instanceID, email, isProxy)
+	if ct.clusterManager == nil {
+		info.TotalCount = info.LocalCount // In local mode, total = local
 	}
 
-	return nil
-}
+	logger.Debugf("[%s-%s] Registered: user=%s, local=%d, total=%d", ct.name, ct.trackerType(), username, info.LocalCount, info.TotalCount)
 
-// UpdateActivity updates the last activity time for a connection
-func (ct *ConnectionTracker) UpdateActivity(ctx context.Context, accountID int64, protocol, clientAddr string) error {
-	if !ct.enabled {
-		return nil
-	}
-
-	key := ct.makeKey(accountID, protocol, clientAddr)
-
-	ct.mu.Lock()
-	if conn, exists := ct.connections[key]; exists {
-		conn.LastActivity = time.Now()
-		if !conn.isNew {
-			conn.isModified = true
-		}
-	}
-	ct.mu.Unlock()
-
-	// If not batching, write immediately
-	if ct.persistToDB && !ct.batchUpdates {
-		return ct.rdb.UpdateConnectionActivityWithRetry(ctx, accountID, protocol, clientAddr)
-	}
-
-	return nil
-}
-
-// UnregisterConnection removes a connection
-func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID int64, protocol, clientAddr string) error {
-	if !ct.enabled {
-		return nil
-	}
-
-	key := ct.makeKey(accountID, protocol, clientAddr)
-
-	ct.mu.Lock()
-	_, exists := ct.connections[key]
-	if exists {
-		delete(ct.connections, key)
-	}
-	ct.mu.Unlock()
-
-	// If persistence is enabled and the connection was tracked in memory,
-	// always attempt to unregister from the DB.
-	// The DB call is idempotent for non-existent rows.
-	if ct.persistToDB && exists {
-		return ct.rdb.UnregisterConnectionWithRetry(ctx, accountID, protocol, clientAddr)
-	}
-
-	return nil
-}
-
-// CheckTermination checks if a connection should be terminated
-func (ct *ConnectionTracker) CheckTermination(ctx context.Context, accountID int64, protocol, clientAddr string) (bool, error) {
-	if !ct.enabled {
-		return false, nil
-	}
-
-	key := ct.makeKey(accountID, protocol, clientAddr)
-
-	ct.mu.RLock()
-	conn, exists := ct.connections[key]
-	if exists {
-		shouldTerminate := conn.ShouldTerminate
-		ct.mu.RUnlock()
-		return shouldTerminate, nil
-	}
-	ct.mu.RUnlock()
-
-	// If not in memory and we're persisting, check database
-	if ct.persistToDB {
-		return ct.rdb.CheckConnectionTerminationWithRetry(ctx, accountID, protocol, clientAddr)
-	}
-
-	return false, nil
-}
-
-// GetActiveConnections returns all active connections
-func (ct *ConnectionTracker) GetActiveConnections(ctx context.Context) ([]db.ConnectionInfo, error) {
-	if !ct.enabled {
-		return []db.ConnectionInfo{}, nil
-	}
-
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-
-	var connections []db.ConnectionInfo
-	for _, conn := range ct.connections {
-		connections = append(connections, db.ConnectionInfo{
-			AccountID:       conn.AccountID,
-			Protocol:        conn.Protocol,
-			ClientAddr:      conn.ClientAddr,
-			ServerAddr:      conn.ServerAddr,
-			InstanceID:      conn.InstanceID,
-			ConnectedAt:     conn.ConnectedAt,
-			LastActivity:    conn.LastActivity,
-			ShouldTerminate: conn.ShouldTerminate,
+	// Broadcast to cluster (only in cluster mode)
+	if ct.clusterManager != nil {
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventRegister,
+			AccountID:  accountID,
+			Username:   username,
+			Protocol:   protocol,
+			ClientAddr: clientAddr,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
 		})
 	}
 
-	return connections, nil
+	return nil
 }
 
-// GetConnectionStats returns connection statistics
-func (ct *ConnectionTracker) GetConnectionStats(ctx context.Context) (*db.ConnectionStats, error) {
-	if !ct.enabled {
-		return &db.ConnectionStats{
-			ConnectionsByProtocol: make(map[string]int64),
-			ConnectionsByServer:   make(map[string]int64),
-			Users:                 []db.ConnectionInfo{},
-		}, nil
-	}
-
-	connections, err := ct.GetActiveConnections(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	stats := &db.ConnectionStats{
-		TotalConnections:      int64(len(connections)),
-		ConnectionsByProtocol: make(map[string]int64),
-		ConnectionsByServer:   make(map[string]int64),
-		Users:                 connections,
-	}
-
-	for _, conn := range connections {
-		stats.ConnectionsByProtocol[conn.Protocol]++
-		stats.ConnectionsByServer[conn.ServerAddr]++
-	}
-
-	return stats, nil
-}
-
-// MarkConnectionsForTermination marks connections for termination
-func (ct *ConnectionTracker) MarkConnectionsForTermination(ctx context.Context, criteria db.TerminationCriteria) (int64, error) {
-	if !ct.enabled {
-		return 0, nil
+// UnregisterConnection unregisters a connection and broadcasts to cluster
+func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID int64, protocol, clientAddr string) error {
+	if ct == nil {
+		return nil // Disabled
 	}
 
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
-	var marked int64
-	for _, conn := range ct.connections {
-		shouldMark := true
-
-		// Apply criteria
-		if criteria.Protocol != "" && conn.Protocol != criteria.Protocol {
-			shouldMark = false
-		}
-		if criteria.ServerAddr != "" && conn.ServerAddr != criteria.ServerAddr {
-			shouldMark = false
-		}
-		if criteria.ClientAddr != "" && conn.ClientAddr != criteria.ClientAddr {
-			shouldMark = false
-		}
-
-		// For email criteria, we'd need to look up in database
-		// For now, we'll mark in memory and let batch update handle it
-
-		if shouldMark {
-			conn.ShouldTerminate = true
-			conn.isModified = true
-			marked++
-		}
+	info, exists := ct.connections[accountID]
+	if !exists {
+		logger.Debugf("[%s-%s] Unregister called for unknown accountID=%d", ct.name, ct.trackerType(), accountID)
+		return nil
 	}
 
-	return marked, nil
+	// Decrement local count
+	if info.LocalCount > 0 {
+		info.LocalCount--
+	}
+	if info.TotalCount > 0 {
+		info.TotalCount--
+	}
+	if count := info.LocalInstances[ct.instanceID]; count > 0 {
+		info.LocalInstances[ct.instanceID] = count - 1
+	}
+
+	// In local mode, keep total = local
+	if ct.clusterManager == nil {
+		info.TotalCount = info.LocalCount
+	}
+
+	info.LastUpdate = time.Now()
+
+	logger.Debugf("[%s-%s] Unregistered: user=%s, local=%d, total=%d",
+		ct.name, ct.trackerType(), info.Username, info.LocalCount, info.TotalCount)
+
+	// Clean up if no local connections remain
+	cleanupThreshold := info.TotalCount
+	if ct.clusterManager == nil {
+		cleanupThreshold = info.LocalCount // In local mode, clean up when no local connections
+	}
+
+	if cleanupThreshold <= 0 {
+		delete(ct.connections, accountID)
+	}
+
+	// Broadcast to cluster (only in cluster mode)
+	if ct.clusterManager != nil {
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventUnregister,
+			AccountID:  accountID,
+			Username:   info.Username,
+			Protocol:   protocol,
+			ClientAddr: clientAddr,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
+		})
+	}
+
+	return nil
 }
 
-// KickChannel returns a channel that is closed when a kick notification is received.
-func (ct *ConnectionTracker) KickChannel() <-chan struct{} {
+// GetConnectionCount returns the cluster-wide connection count for a user
+func (ct *ConnectionTracker) GetConnectionCount(accountID int64) int {
+	if ct == nil {
+		return 0
+	}
+
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	return ct.kickCh
+
+	if info, exists := ct.connections[accountID]; exists {
+		return info.TotalCount
+	}
+	return 0
 }
 
-// startTerminationPoller periodically checks the database for connections that have been marked for termination.
-func (ct *ConnectionTracker) startTerminationPoller() {
-	ct.wg.Add(1)
-	go func() {
-		defer ct.wg.Done()
-		// This is more reliable than LISTEN/NOTIFY in a replicated DB environment.
-		ticker := time.NewTicker(ct.terminationPollInterval)
-		defer ticker.Stop()
+// GetLocalConnectionCount returns the connection count for a user on this instance
+func (ct *ConnectionTracker) GetLocalConnectionCount(accountID int64) int {
+	if ct == nil {
+		return 0
+	}
 
-		for {
-			select {
-			case <-ticker.C:
-				reloaded, err := ct.reloadTerminatedConnections(context.Background())
-				if err != nil {
-					log.Printf("[ConnectionTracker:%s] Error polling for terminations: %v", ct.name, err)
-					continue
-				}
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
 
-				if reloaded > 0 {
-					log.Printf("[ConnectionTracker:%s] Found %d newly terminated connections, broadcasting kick.", ct.name, reloaded)
-					ct.mu.Lock()
-					close(ct.kickCh)
-					ct.kickCh = make(chan struct{})
-					ct.mu.Unlock()
-				}
-			case <-ct.stopCh:
-				return
+	if info, exists := ct.connections[accountID]; exists {
+		return info.LocalCount
+	}
+	return 0
+}
+
+// GetAllConnections returns all tracked connections (for admin tool)
+func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
+	if ct == nil {
+		return nil
+	}
+
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	result := make([]UserConnectionInfo, 0, len(ct.connections))
+	for _, info := range ct.connections {
+		var instancesCopy map[string]int
+		if len(info.LocalInstances) > 0 {
+			instancesCopy = make(map[string]int, len(info.LocalInstances))
+			for k, v := range info.LocalInstances {
+				instancesCopy[k] = v
 			}
 		}
-	}()
+
+		result = append(result, UserConnectionInfo{
+			AccountID:      info.AccountID,
+			Username:       info.Username,
+			TotalCount:     info.TotalCount,
+			LocalCount:     info.LocalCount,
+			LastUpdate:     info.LastUpdate,
+			LocalInstances: instancesCopy,
+		})
+	}
+	return result
 }
 
-// startBatchUpdater starts the background batch updater
-func (ct *ConnectionTracker) startBatchUpdater() {
-	ct.wg.Add(1)
-	go func() {
-		defer ct.wg.Done()
+// KickUser kicks a user's connections.
+// In cluster mode, broadcasts kick event via gossip.
+// In local mode, directly closes all sessions for the user.
+func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
+	if ct == nil {
+		return fmt.Errorf("connection tracker not initialized")
+	}
 
-		ticker := time.NewTicker(ct.updateInterval)
-		defer ticker.Stop()
+	ct.mu.RLock()
+	info, exists := ct.connections[accountID]
+	username := ""
+	if exists {
+		username = info.Username
+	}
+	ct.mu.RUnlock()
 
-		for {
-			select {
-			case <-ticker.C:
-				ct.flushChanges()
-			case <-ct.stopCh:
-				return
+	if ct.clusterManager != nil {
+		// Cluster mode: broadcast kick event via gossip
+		logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
+			ct.name, accountID, protocol)
+
+		ct.queueEvent(ConnectionEvent{
+			Type:       ConnectionEventKick,
+			AccountID:  accountID,
+			Username:   username,
+			Protocol:   protocol,
+			Timestamp:  time.Now(),
+			NodeID:     ct.clusterManager.GetNodeID(),
+			InstanceID: ct.instanceID,
+		})
+	} else {
+		// Local mode: directly kick sessions on this server
+		logger.Infof("[%s-LOCAL-TRACKER] Kicking local sessions for accountID=%d, protocol=%s",
+			ct.name, accountID, protocol)
+
+		ct.kickSessionsMu.Lock()
+		sessions := ct.kickSessions[accountID]
+		if len(sessions) > 0 {
+			// Close all kick channels for this user
+			for _, ch := range sessions {
+				select {
+				case <-ch:
+					// Already closed
+				default:
+					close(ch)
+				}
 			}
+			delete(ct.kickSessions, accountID)
+			logger.Infof("[%s-LOCAL-TRACKER] Kicked %d local sessions for accountID=%d",
+				ct.name, len(sessions), accountID)
+		} else {
+			logger.Debugf("[%s-LOCAL-TRACKER] No active sessions to kick for accountID=%d",
+				ct.name, accountID)
 		}
-	}()
+		ct.kickSessionsMu.Unlock()
+	}
+
+	return nil
 }
 
-// flushChanges writes pending changes to the database
-func (ct *ConnectionTracker) flushChanges() {
-	if !ct.persistToDB {
+// RegisterSession registers a session for kick notifications
+// Returns a channel that will be closed when the user should be kicked
+func (ct *ConnectionTracker) RegisterSession(accountID int64) <-chan struct{} {
+	if ct == nil {
+		// Return a channel that never closes
+		ch := make(chan struct{})
+		return ch
+	}
+
+	ch := make(chan struct{})
+
+	ct.kickSessionsMu.Lock()
+	defer ct.kickSessionsMu.Unlock()
+
+	ct.kickSessions[accountID] = append(ct.kickSessions[accountID], ch)
+
+	logger.Debugf("[%s-GOSSIP-TRACKER] Registered session for accountID=%d", ct.name, accountID)
+
+	return ch
+}
+
+// UnregisterSession removes a session's kick notification channel
+func (ct *ConnectionTracker) UnregisterSession(accountID int64, ch <-chan struct{}) {
+	if ct == nil {
 		return
 	}
 
-	ct.mu.Lock()
+	ct.kickSessionsMu.Lock()
+	defer ct.kickSessionsMu.Unlock()
 
-	var (
-		toInsert []db.ConnectionInfo
-		toUpdate []db.ConnectionInfo
-	)
-
-	// Collect changes
-	for _, conn := range ct.connections {
-		if conn.isNew {
-			toInsert = append(toInsert, db.ConnectionInfo{
-				AccountID:  conn.AccountID,
-				Protocol:   conn.Protocol,
-				ClientAddr: conn.ClientAddr,
-				ServerAddr: conn.ServerAddr,
-				InstanceID: conn.InstanceID,
-				Email:      conn.Email,
-				IsProxy:    conn.IsProxy,
-			})
-			conn.isNew = false
-		} else if conn.isModified {
-			toUpdate = append(toUpdate, db.ConnectionInfo{
-				AccountID:       conn.AccountID,
-				Protocol:        conn.Protocol,
-				ClientAddr:      conn.ClientAddr,
-				LastActivity:    conn.LastActivity,
-				ShouldTerminate: conn.ShouldTerminate,
-			})
-			conn.isModified = false
+	sessions := ct.kickSessions[accountID]
+	for i, session := range sessions {
+		if session == ch {
+			// Remove from slice
+			ct.kickSessions[accountID] = append(sessions[:i], sessions[i+1:]...)
+			break
 		}
 	}
-	ct.mu.Unlock() // Release lock before making DB calls
 
-	if len(toInsert) == 0 && len(toUpdate) == 0 {
-		return
-	}
-
-	// Use configurable timeout for batch operations - connection tracking is not time-critical
-	ctx, cancel := context.WithTimeout(context.Background(), ct.batchFlushTimeout)
-	defer cancel()
-
-	// Apply changes to database in real batches
-	// Connection tracking is non-critical monitoring data, so we tolerate failures gracefully
-	// For very large batches, process in chunks to avoid timeout
-	maxBatchSize := ct.maxBatchSize
-
-	if len(toInsert) > 0 {
-		// Process inserts in chunks if batch is large
-		for i := 0; i < len(toInsert); i += maxBatchSize {
-			end := i + maxBatchSize
-			if end > len(toInsert) {
-				end = len(toInsert)
-			}
-			chunk := toInsert[i:end]
-
-			if err := ct.rdb.BatchRegisterConnectionsWithRetry(ctx, chunk); err != nil {
-				log.Printf("[ConnectionTracker:%s] Failed to batch insert %d connections in chunk %d-%d (non-critical, will retry on next flush): %v", ct.name, len(chunk), i, end, err)
-				// Mark connections in failed chunk as new again for retry, but limit retry attempts to prevent unbounded growth
-				ct.mu.Lock()
-				retried := 0
-				dropped := 0
-				for _, connInfo := range chunk {
-					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-					if conn, exists := ct.connections[key]; exists {
-						// Limit retries to 5 attempts to prevent unbounded accumulation
-						if conn.retryCount < 5 {
-							conn.isNew = true
-							conn.retryCount++
-							conn.lastRetryAt = time.Now()
-							retried++
-						} else {
-							// After 5 failures, drop the connection from tracking
-							// It will be re-added if the connection is still active
-							delete(ct.connections, key)
-							dropped++
-						}
-					}
-				}
-				ct.mu.Unlock()
-				if dropped > 0 {
-					log.Printf("[ConnectionTracker:%s] Dropped %d connections from chunk after 5 failed retry attempts (will re-register if still active)", ct.name, dropped)
-				}
-			} else {
-				// Success - reset retry counters for successfully inserted connections in this chunk
-				ct.mu.Lock()
-				for _, connInfo := range chunk {
-					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-					if conn, exists := ct.connections[key]; exists {
-						conn.retryCount = 0
-					}
-				}
-				ct.mu.Unlock()
-			}
-		}
-	}
-	if len(toUpdate) > 0 {
-		// Process updates in chunks if batch is large
-		for i := 0; i < len(toUpdate); i += maxBatchSize {
-			end := i + maxBatchSize
-			if end > len(toUpdate) {
-				end = len(toUpdate)
-			}
-			chunk := toUpdate[i:end]
-
-			if err := ct.rdb.BatchUpdateConnectionsWithRetry(ctx, chunk); err != nil {
-				log.Printf("[ConnectionTracker:%s] Failed to batch update %d connections in chunk %d-%d (non-critical, will retry on next flush): %v", ct.name, len(chunk), i, end, err)
-				// Mark connections in failed chunk as modified again for retry, but limit retry attempts
-				ct.mu.Lock()
-				retried := 0
-				dropped := 0
-				for _, connInfo := range chunk {
-					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-					if conn, exists := ct.connections[key]; exists {
-						// Limit retries to 5 attempts
-						if conn.retryCount < 5 {
-							conn.isModified = true
-							conn.retryCount++
-							conn.lastRetryAt = time.Now()
-							retried++
-						} else {
-							// After 5 failures, drop the connection from tracking
-							delete(ct.connections, key)
-							dropped++
-						}
-					}
-				}
-				ct.mu.Unlock()
-				if dropped > 0 {
-					log.Printf("[ConnectionTracker:%s] Dropped %d connections from chunk after 5 failed update attempts (will re-register if still active)", ct.name, dropped)
-				}
-			} else {
-				// Success - reset retry counters for successfully updated connections in this chunk
-				ct.mu.Lock()
-				for _, connInfo := range chunk {
-					key := ct.makeKey(connInfo.AccountID, connInfo.Protocol, connInfo.ClientAddr)
-					if conn, exists := ct.connections[key]; exists {
-						conn.retryCount = 0
-					}
-				}
-				ct.mu.Unlock()
-			}
-		}
+	// Clean up if no more sessions
+	if len(ct.kickSessions[accountID]) == 0 {
+		delete(ct.kickSessions, accountID)
 	}
 }
 
-// reloadTerminatedConnections reloads connections that may have been marked for termination in the database
-func (ct *ConnectionTracker) reloadTerminatedConnections(ctx context.Context) (int, error) {
-	// Get all connections for this instance that have been marked for termination
-	terminatedConns, err := ct.rdb.GetTerminatedConnectionsByInstanceWithRetry(ctx, ct.instanceID)
+// queueEvent adds an event to the broadcast queue
+func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
+	ct.queueMu.Lock()
+	defer ct.queueMu.Unlock()
+	ct.broadcastQueue = append(ct.broadcastQueue, event)
+}
+
+// GetBroadcasts returns events to broadcast (called by cluster manager)
+func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
+	ct.queueMu.Lock()
+	defer ct.queueMu.Unlock()
+
+	if len(ct.broadcastQueue) == 0 {
+		return nil
+	}
+
+	broadcasts := make([][]byte, 0, len(ct.broadcastQueue))
+	totalSize := 0
+
+	for i := 0; i < len(ct.broadcastQueue); i++ {
+		encoded, err := encodeConnectionEvent(ct.broadcastQueue[i])
+		if err != nil {
+			logger.Warnf("[%s-GOSSIP-TRACKER] Failed to encode event: %v", ct.name, err)
+			continue
+		}
+
+		// Check if adding this message would exceed the limit
+		msgSize := overhead + len(encoded)
+		if totalSize+msgSize > limit && len(broadcasts) > 0 {
+			// Keep remaining events for next broadcast
+			ct.broadcastQueue = ct.broadcastQueue[i:]
+			return broadcasts
+		}
+
+		broadcasts = append(broadcasts, encoded)
+		totalSize += msgSize
+	}
+
+	// All events broadcasted, clear queue
+	ct.broadcastQueue = ct.broadcastQueue[:0]
+	return broadcasts
+}
+
+// HandleClusterEvent processes a connection event from another node
+func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
+	event, err := decodeConnectionEvent(data)
 	if err != nil {
-		log.Printf("[ConnectionTracker:%s] Failed to get terminated connections: %v", ct.name, err)
-		return 0, err
+		logger.Warnf("[%s-GOSSIP-TRACKER] Failed to decode event: %v", ct.name, err)
+		return
 	}
 
-	if len(terminatedConns) == 0 {
-		return 0, nil
+	// Skip events from this instance (we already applied them locally)
+	if event.InstanceID == ct.instanceID {
+		return
 	}
 
-	var reloadedCount int
+	// Check if event is too old (prevent replays after network partition)
+	age := time.Since(event.Timestamp)
+	if age > 5*time.Minute {
+		logger.Debugf("[%s-GOSSIP-TRACKER] Ignoring stale event from %s (age: %v)",
+			ct.name, event.NodeID, age)
+		return
+	}
+
+	switch event.Type {
+	case ConnectionEventRegister:
+		ct.handleRegister(event)
+	case ConnectionEventUnregister:
+		ct.handleUnregister(event)
+	case ConnectionEventKick:
+		ct.handleKick(event)
+	default:
+		logger.Warnf("[%s-GOSSIP-TRACKER] Unknown event type: %s", ct.name, event.Type)
+	}
+}
+
+// handleRegister processes a register event from another node
+func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	for _, dbConn := range terminatedConns {
-		key := ct.makeKey(dbConn.AccountID, dbConn.Protocol, dbConn.ClientAddr)
-		if conn, exists := ct.connections[key]; exists {
-			// Only update and count if the state changes from not-terminated to terminated.
-			if dbConn.ShouldTerminate && !conn.ShouldTerminate {
-				conn.ShouldTerminate = true
-				reloadedCount++
-			}
+
+	info, exists := ct.connections[event.AccountID]
+	if !exists {
+		info = &UserConnectionInfo{
+			AccountID:      event.AccountID,
+			Username:       event.Username,
+			TotalCount:     0,
+			LocalCount:     0,
+			LastUpdate:     time.Now(),
+			LocalInstances: make(map[string]int),
 		}
+		ct.connections[event.AccountID] = info
 	}
-	return reloadedCount, nil
+
+	// Increment cluster-wide count
+	info.TotalCount++
+	info.LastUpdate = time.Now()
+	info.LocalInstances[event.InstanceID]++
+
+	logger.Debugf("[%s-GOSSIP-TRACKER] Cluster register: user=%s, instance=%s, cluster_total=%d",
+		ct.name, event.Username, event.InstanceID, info.TotalCount)
 }
 
-// makeKey creates a unique key for a connection
-func (ct *ConnectionTracker) makeKey(accountID int64, protocol, clientAddr string) string {
-	return fmt.Sprintf("%d:%s:%s", accountID, protocol, clientAddr)
+// handleUnregister processes an unregister event from another node
+func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	info, exists := ct.connections[event.AccountID]
+	if !exists {
+		return // Unknown user, ignore
+	}
+
+	// Decrement cluster-wide count
+	if info.TotalCount > 0 {
+		info.TotalCount--
+	}
+	if count := info.LocalInstances[event.InstanceID]; count > 0 {
+		info.LocalInstances[event.InstanceID] = count - 1
+	}
+	info.LastUpdate = time.Now()
+
+	logger.Debugf("[%s-GOSSIP-TRACKER] Cluster unregister: user=%s, instance=%s, cluster_total=%d",
+		ct.name, event.Username, event.InstanceID, info.TotalCount)
+
+	// Clean up if no connections remain
+	if info.TotalCount <= 0 {
+		delete(ct.connections, event.AccountID)
+	}
+}
+
+// handleKick processes a kick event from another node
+func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
+	logger.Infof("[%s-GOSSIP-TRACKER] Received kick for accountID=%d, protocol=%s from node=%s",
+		ct.name, event.AccountID, event.Protocol, event.NodeID)
+
+	// Notify all sessions for this user
+	ct.kickSessionsMu.Lock()
+	defer ct.kickSessionsMu.Unlock()
+
+	sessions := ct.kickSessions[event.AccountID]
+	for _, ch := range sessions {
+		select {
+		case <-ch:
+			// Already closed
+		default:
+			close(ch)
+		}
+	}
+
+	// Clear the sessions list
+	delete(ct.kickSessions, event.AccountID)
+
+	logger.Debugf("[%s-GOSSIP-TRACKER] Notified %d sessions for accountID=%d",
+		ct.name, len(sessions), event.AccountID)
+}
+
+// broadcastRoutine periodically triggers broadcasts
+func (ct *ConnectionTracker) broadcastRoutine() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ct.queueMu.Lock()
+			hasEvents := len(ct.broadcastQueue) > 0
+			ct.queueMu.Unlock()
+
+			if hasEvents {
+				// Cluster manager will call GetBroadcasts()
+				logger.Debugf("[%s-GOSSIP-TRACKER] Broadcasting %d queued events", ct.name, len(ct.broadcastQueue))
+			}
+
+		case <-ct.stopBroadcast:
+			return
+		}
+	}
+}
+
+// cleanupRoutine periodically cleans up stale connection entries
+func (ct *ConnectionTracker) cleanupRoutine() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ct.cleanup()
+
+		case <-ct.stopCleanup:
+			return
+		}
+	}
+}
+
+// cleanup removes stale entries (not updated recently and zero connections)
+func (ct *ConnectionTracker) cleanup() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	cleaned := 0
+	staleThreshold := time.Now().Add(-10 * time.Minute)
+
+	for accountID, info := range ct.connections {
+		if info.TotalCount <= 0 && info.LastUpdate.Before(staleThreshold) {
+			delete(ct.connections, accountID)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		logger.Debugf("[%s-GOSSIP-TRACKER] Cleaned up %d stale entries", ct.name, cleaned)
+	}
+}
+
+// Stop stops the gossip tracker (idempotent)
+func (ct *ConnectionTracker) Stop() {
+	if ct == nil {
+		return
+	}
+
+	ct.stopOnce.Do(func() {
+		close(ct.stopBroadcast)
+		close(ct.stopCleanup)
+	})
+}
+
+// GetOperationTimeout returns a timeout for operations (for compatibility with old interface)
+func (ct *ConnectionTracker) GetOperationTimeout() time.Duration {
+	return 5 * time.Second // Gossip is fast, short timeout is fine
+}
+
+// IsEnabled returns whether connection tracking is enabled
+func (ct *ConnectionTracker) IsEnabled() bool {
+	return ct != nil
+}
+
+// Start is a no-op for gossip tracker (background routines started in constructor)
+func (ct *ConnectionTracker) Start() {
+	// Background routines already started in NewConnectionTracker
+}
+
+// UpdateActivity is a no-op for gossip tracker (no activity tracking needed)
+func (ct *ConnectionTracker) UpdateActivity(ctx context.Context, accountID int64, protocol, clientAddr string) error {
+	// Gossip tracker doesn't track activity timestamps
+	return nil
+}
+
+// CheckTermination is deprecated - use RegisterSession instead
+func (ct *ConnectionTracker) CheckTermination(ctx context.Context, accountID int64, protocol string) (bool, error) {
+	return false, nil
+}
+
+// KickChannel is deprecated - use RegisterSession instead
+func (ct *ConnectionTracker) KickChannel() <-chan struct{} {
+	return nil
+}
+
+// encodeConnectionEvent encodes an event to bytes using gob
+func encodeConnectionEvent(event ConnectionEvent) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(event); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// decodeConnectionEvent decodes an event from bytes using gob
+func decodeConnectionEvent(data []byte) (ConnectionEvent, error) {
+	var event ConnectionEvent
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&event); err != nil {
+		return event, err
+	}
+	return event, nil
 }

@@ -6,24 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
-	"github.com/jackc/pgx/v5"
-	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/pkg/metrics"
-	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/sieveengine"
+	"github.com/migadu/sora/server/delivery"
 )
 
 // DeliverMailRequest represents the HTTP request for mail delivery
@@ -48,23 +41,14 @@ type DeliverMailResponse struct {
 	Error      string            `json:"error,omitempty"`
 }
 
-// dbVacationOracle implements the sieveengine.VacationOracle interface using the database.
-type dbVacationOracle struct {
-	rdb *resilient.ResilientDatabase
+// adminAPILogger implements the delivery.Logger interface for Admin API
+type adminAPILogger struct {
+	prefix string // e.g., "HTTP-DELIVERY [recipient@example.com]"
 }
 
-// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and handle.
-func (o *dbVacationOracle) IsVacationResponseAllowed(ctx context.Context, userID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	hasRecent, err := o.rdb.HasRecentVacationResponseWithRetry(ctx, userID, originalSender, duration)
-	if err != nil {
-		return false, fmt.Errorf("checking db for recent vacation response: %w", err)
-	}
-	return !hasRecent, nil
-}
-
-// RecordVacationResponseSent records that a vacation response has been sent.
-func (o *dbVacationOracle) RecordVacationResponseSent(ctx context.Context, userID int64, originalSender string, handle string) error {
-	return o.rdb.RecordVacationResponseWithRetry(ctx, userID, originalSender)
+func (l *adminAPILogger) Log(format string, args ...interface{}) {
+	// Log with prefix to identify HTTP delivery path
+	log.Printf("["+l.prefix+"] "+format, args...)
 }
 
 // handleDeliverMail handles HTTP mail delivery (mimics LMTP flow exactly)
@@ -231,7 +215,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// deliverToRecipient delivers a message to a single recipient (mirrors LMTP session.Data exactly)
+// deliverToRecipient delivers a message to a single recipient using the delivery package
 func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient string, messageBytes []byte, messageEntity *message.Entity) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
@@ -244,387 +228,76 @@ func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient 
 		return status
 	}
 
-	// Parse recipient address
-	toAddress, err := server.NewAddress(recipient)
+	// Create logger with recipient prefix
+	logger := &adminAPILogger{
+		prefix: fmt.Sprintf("HTTP-DELIVERY to=%s", recipient),
+	}
+
+	// Create delivery context with relay queue
+	vacationOracle := &delivery.VacationOracle{RDB: s.rdb}
+	vacationHandler := &delivery.StandardVacationHandler{
+		Hostname:   s.hostname,
+		RelayQueue: s.relayQueue,
+		Logger:     logger,
+	}
+
+	deliveryCtx := &delivery.DeliveryContext{
+		Ctx:          ctx,
+		RDB:          s.rdb,
+		Uploader:     s.uploader,
+		Hostname:     s.hostname,
+		FTSRetention: s.ftsRetention,
+		MetricsLabel: "http_delivery",
+		Logger:       logger,
+	}
+
+	sieveExecutor := &delivery.StandardSieveExecutor{
+		DeliveryCtx:     deliveryCtx,
+		VacationOracle:  vacationOracle,
+		VacationHandler: vacationHandler,
+		RelayQueue:      s.relayQueue,
+	}
+
+	deliveryCtx.SieveExecutor = sieveExecutor
+
+	logger.Log("starting delivery from=%s size=%d", from, len(messageBytes))
+
+	// Lookup recipient
+	recipientInfo, err := deliveryCtx.LookupRecipient(ctx, recipient)
 	if err != nil {
-		status.Error = "Invalid recipient address"
+		logger.Log("recipient lookup failed: %v", err)
+		status.Error = err.Error()
 		return status
 	}
 
-	lookupAddress := toAddress.BaseAddress()
+	logger.Log("recipient found userID=%d", recipientInfo.UserID)
 
-	// Lookup user account
-	var userID int64
-	err = s.rdb.QueryRowWithRetry(ctx, `
-		SELECT c.account_id 
-		FROM credentials c
-		JOIN accounts a ON c.account_id = a.id
-		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
-	`, lookupAddress).Scan(&userID)
-
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			status.Error = "Recipient not found"
-		} else {
-			status.Error = fmt.Sprintf("Database error: %v", err)
-		}
-		return status
-	}
-
-	// Create default mailboxes if needed
-	err = s.rdb.CreateDefaultMailboxesWithRetry(ctx, userID)
-	if err != nil {
-		status.Error = fmt.Sprintf("Failed to create default mailboxes: %v", err)
-		return status
-	}
-
-	// Metrics - same as LMTP
-	metrics.MessageSizeBytes.WithLabelValues("http_delivery").Observe(float64(len(messageBytes)))
-	metrics.BytesThroughput.WithLabelValues("http_delivery", "in").Add(float64(len(messageBytes)))
-	metrics.MessageThroughput.WithLabelValues("http_delivery", "received", "success").Inc()
-
-	// Extract raw headers
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(messageBytes[:headerEndIndex])
-	}
-
-	// Parse message metadata
-	mailHeader := mail.Header{Header: messageEntity.Header}
-	subject, _ := mailHeader.Subject()
-	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
-	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
-
-	// Calculate content hash
-	contentHash := helpers.HashContent(messageBytes)
-
-	// Extract plaintext body for FTS
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
-	if err != nil {
-		emptyBody := ""
-		plaintextBody = &emptyBody
-	}
-
-	// Extract body structure
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
-
-	// Extract recipients
-	recipients := helpers.ExtractRecipients(messageEntity.Header)
-
-	// Store message locally (EXACTLY like LMTP)
-	filePath, err := s.uploader.StoreLocally(contentHash, userID, messageBytes)
-	if err != nil {
-		status.Error = fmt.Sprintf("Failed to save message to disk: %v", err)
-		return status
-	}
-
-	// Execute Sieve scripts (EXACTLY like LMTP)
-	var fromAddr *server.Address
+	// Set from address if provided
 	if from != "" {
-		if addr, err := server.NewAddress(from); err == nil {
-			fromAddr = &addr
+		if addr, parseErr := server.NewAddress(from); parseErr == nil {
+			recipientInfo.FromAddress = &addr
 		}
 	}
 
-	mailboxName, discarded, err := s.executeSieveForDelivery(ctx, userID, fromAddr, &toAddress, messageEntity, plaintextBody, messageBytes)
+	// Deliver message
+	result, err := deliveryCtx.DeliverMessage(*recipientInfo, messageBytes)
 	if err != nil {
-		// Log but don't fail delivery on Sieve errors
-		_ = os.Remove(*filePath) // cleanup
-		status.Error = fmt.Sprintf("Sieve execution error: %v", err)
+		logger.Log("delivery failed: %v", err)
+		status.Error = result.ErrorMessage
 		return status
 	}
 
-	if discarded {
-		// Message was discarded by Sieve script
-		_ = os.Remove(*filePath) // cleanup
+	if result.Discarded {
+		logger.Log("message discarded by Sieve filter")
 		status.Accepted = true
 		status.Error = "Message discarded by Sieve filter"
 		return status
 	}
 
-	// Save message to mailbox (EXACTLY like LMTP saveMessageToMailbox)
-	size := int64(len(messageBytes))
-	_, _, err = s.rdb.InsertMessageWithRetry(ctx,
-		&db.InsertMessageOptions{
-			UserID:        userID,
-			MailboxID:     0, // Will be set by InsertMessage based on mailboxName
-			S3Domain:      toAddress.Domain(),
-			S3Localpart:   toAddress.LocalPart(),
-			MailboxName:   mailboxName,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			BodyStructure: bodyStructure,
-			Recipients:    recipients,
-			Flags:         []imap.Flag{}, // Unread
-			RawHeaders:    rawHeadersText,
-			FTSRetention:  s.ftsRetention,
-		},
-		db.PendingUpload{
-			ContentHash: contentHash,
-			InstanceID:  s.hostname,
-			Size:        size,
-			AccountID:   userID,
-		})
-
-	if err != nil {
-		_ = os.Remove(*filePath) // cleanup
-		if err == consts.ErrDBUniqueViolation {
-			status.Error = "Message already exists"
-			return status
-		}
-		status.Error = fmt.Sprintf("Failed to save message: %v", err)
-		return status
+	if result.Success {
+		logger.Log("message delivered successfully to mailbox=%s uid=%d", result.MailboxName, result.MessageUID)
 	}
 
-	// Notify uploader (EXACTLY like LMTP)
-	s.uploader.NotifyUploadQueued()
-
-	// Track metrics (same as LMTP)
-	metrics.MessageThroughput.WithLabelValues("http_delivery", "delivered", "success").Inc()
-	metrics.TrackDomainMessage("http_delivery", toAddress.Domain(), "delivered")
-	metrics.TrackDomainBytes("http_delivery", toAddress.Domain(), "in", size)
-	metrics.TrackUserActivity("http_delivery", toAddress.FullAddress(), "command", 1)
-
-	status.Accepted = true
+	status.Accepted = result.Success
 	return status
-}
-
-// executeSieveForDelivery executes Sieve scripts and returns target mailbox (EXACTLY like LMTP)
-// Returns: mailboxName, discarded, error
-func (s *Server) executeSieveForDelivery(ctx context.Context, userID int64, fromAddr *server.Address, toAddress *server.Address, messageEntity *message.Entity, plaintextBody *string, fullMessageBytes []byte) (string, bool, error) {
-	// Default to INBOX
-	mailboxName := consts.MailboxInbox
-
-	// Create vacation oracle
-	sieveVacOracle := &dbVacationOracle{
-		rdb: s.rdb,
-	}
-
-	// Create Sieve context
-	envelopeFrom := ""
-	if fromAddr != nil {
-		envelopeFrom = fromAddr.FullAddress()
-	}
-
-	sieveCtx := sieveengine.Context{
-		EnvelopeFrom: envelopeFrom,
-		EnvelopeTo:   toAddress.FullAddress(),
-		Header:       messageEntity.Header.Map(),
-		Body:         *plaintextBody,
-	}
-
-	// Get user's active script
-	activeScript, err := s.rdb.GetActiveScriptWithRetry(ctx, userID)
-	if err != nil && err != consts.ErrDBNotFound {
-		// Non-critical error, continue with INBOX delivery
-		return mailboxName, false, nil
-	}
-
-	var result sieveengine.Result
-	if activeScript != nil {
-		// Execute user script
-		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, userID, sieveVacOracle)
-		if err != nil {
-			metrics.SieveExecutions.WithLabelValues("http_delivery", "failure").Inc()
-			return mailboxName, false, nil
-		}
-
-		result, err = executor.Evaluate(ctx, sieveCtx)
-		if err != nil {
-			metrics.SieveExecutions.WithLabelValues("http_delivery", "failure").Inc()
-			return mailboxName, false, nil
-		}
-
-		metrics.SieveExecutions.WithLabelValues("http_delivery", "success").Inc()
-	} else {
-		// No script, keep in INBOX
-		result = sieveengine.Result{Action: sieveengine.ActionKeep}
-	}
-
-	// Process result (EXACTLY like LMTP)
-	switch result.Action {
-	case sieveengine.ActionDiscard:
-		return "", true, nil
-
-	case sieveengine.ActionFileInto:
-		mailboxName = result.Mailbox
-		if result.Copy {
-			// Save to specified mailbox
-			err := s.saveMessageToMailbox(ctx, userID, result.Mailbox, toAddress, fullMessageBytes, messageEntity, plaintextBody)
-			if err != nil {
-				return "", false, err
-			}
-			// Also save to INBOX
-			mailboxName = consts.MailboxInbox
-		}
-
-	case sieveengine.ActionRedirect:
-		// Handle redirect via external relay
-		if s.externalRelay != "" && fromAddr != nil {
-			err := s.sendToExternalRelay(fromAddr.FullAddress(), result.RedirectTo, fullMessageBytes)
-			if err == nil && !result.Copy {
-				// Successfully redirected without copy
-				return "", true, nil
-			}
-		}
-		// Fallback or copy: deliver to INBOX
-		mailboxName = consts.MailboxInbox
-
-	case sieveengine.ActionVacation:
-		// Handle vacation response
-		if fromAddr != nil {
-			_ = s.handleVacationResponse(ctx, userID, result, fromAddr, toAddress, messageEntity)
-		}
-		mailboxName = consts.MailboxInbox
-
-	default:
-		mailboxName = consts.MailboxInbox
-	}
-
-	return mailboxName, false, nil
-}
-
-// saveMessageToMailbox saves message to a specific mailbox (helper for :copy)
-func (s *Server) saveMessageToMailbox(ctx context.Context, userID int64, mailboxName string, toAddress *server.Address, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string) error {
-	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, userID, mailboxName)
-	if err != nil {
-		if err == consts.ErrMailboxNotFound {
-			// Fallback to INBOX
-			mailbox, err = s.rdb.GetMailboxByNameWithRetry(ctx, userID, consts.MailboxInbox)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-
-	// Parse message metadata
-	mailHeader := mail.Header{Header: messageEntity.Header}
-	subject, _ := mailHeader.Subject()
-	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := mailHeader.Date()
-	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
-
-	if sentDate.IsZero() {
-		sentDate = time.Now()
-	}
-
-	contentHash := helpers.HashContent(messageBytes)
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
-	recipients := helpers.ExtractRecipients(messageEntity.Header)
-
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(messageBytes[:headerEndIndex])
-	}
-
-	size := int64(len(messageBytes))
-
-	_, _, err = s.rdb.InsertMessageWithRetry(ctx,
-		&db.InsertMessageOptions{
-			UserID:        userID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      toAddress.Domain(),
-			S3Localpart:   toAddress.LocalPart(),
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			BodyStructure: bodyStructure,
-			Recipients:    recipients,
-			Flags:         []imap.Flag{},
-			RawHeaders:    rawHeadersText,
-			FTSRetention:  s.ftsRetention,
-		},
-		db.PendingUpload{
-			ContentHash: contentHash,
-			InstanceID:  s.hostname,
-			Size:        size,
-			AccountID:   userID,
-		})
-
-	return err
-}
-
-// sendToExternalRelay sends via external relay (EXACTLY like LMTP)
-func (s *Server) sendToExternalRelay(from string, to string, messageBytes []byte) error {
-	if s.externalRelay == "" {
-		return fmt.Errorf("external relay not configured")
-	}
-
-	// Use the same SMTP relay logic as LMTP
-	// This is simplified - full implementation would match LMTP exactly
-	metrics.LMTPExternalRelay.WithLabelValues("http_delivery").Inc()
-	return nil
-}
-
-// handleVacationResponse handles vacation auto-response (EXACTLY like LMTP)
-func (s *Server) handleVacationResponse(ctx context.Context, userID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
-	if s.externalRelay == "" {
-		return nil
-	}
-
-	// Create vacation response message (same as LMTP)
-	vacationFrom := toAddress.FullAddress()
-	if result.VacationFrom != "" {
-		vacationFrom = result.VacationFrom
-	}
-
-	vacationSubject := "Auto: Out of Office"
-	if result.VacationSubj != "" {
-		vacationSubject = result.VacationSubj
-	}
-
-	// Build vacation message
-	var vacationMessage bytes.Buffer
-	var h message.Header
-	h.Set("From", vacationFrom)
-	h.Set("To", fromAddr.FullAddress())
-	h.Set("Subject", vacationSubject)
-	h.Set("Message-ID", fmt.Sprintf("<%d.vacation@%s>", time.Now().UnixNano(), s.hostname))
-	h.Set("Auto-Submitted", "auto-replied")
-	h.Set("X-Auto-Response-Suppress", "All")
-	h.Set("Date", time.Now().Format(time.RFC1123Z))
-
-	originalHeader := mail.Header{Header: originalMessage.Header}
-	if originalMessageID, _ := originalHeader.MessageID(); originalMessageID != "" {
-		h.Set("In-Reply-To", originalMessageID)
-		h.Set("References", originalMessageID)
-	}
-
-	w, err := message.CreateWriter(&vacationMessage, h)
-	if err != nil {
-		return err
-	}
-
-	var textHeader message.Header
-	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
-	textWriter, _ := w.CreatePart(textHeader)
-	textWriter.Write([]byte(result.VacationMsg))
-	textWriter.Close()
-	w.Close()
-
-	// Send via external relay
-	return s.sendToExternalRelay(vacationFrom, fromAddr.FullAddress(), vacationMessage.Bytes())
 }

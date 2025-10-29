@@ -410,8 +410,6 @@ max_age_restriction = ""      # Max message age before auto-expungement. Empty =
 fts_retention = "730d"        # How long to keep full-text search content in DB. Older messages lose searchability.
 auth_attempts_retention = "7d"  # How long to retain authentication attempt logs in the database.
 health_status_retention = "30d" # How long to retain health status history in the database.
-stale_connections_retention = "30m" # How long before inactive connections are removed. Catches ungraceful disconnects.
-
 
 # AUTHENTICATION CACHE CONFIGURATION
 # =============================================================================
@@ -431,6 +429,90 @@ negative_ttl = "5m"          # How long to cache failed authentication attempts 
                             # Longer TTL helps mitigate brute force attacks against non-existent accounts.
 max_size = 10000            # Maximum number of cached authentication results. LRU eviction when exceeded.
 cleanup_interval = "5m"     # How often to remove expired cache entries and update metrics.
+
+
+# EXTERNAL RELAY CONFIGURATION
+# =============================================================================
+# Global configuration for external SMTP/HTTP relay used by Sieve redirect and vacation actions.
+# This relay is used by LMTP servers and Admin API for sending messages to external recipients.
+#
+# Use cases:
+#   - Sieve redirect action: forward messages to external email addresses
+#   - Sieve vacation action: send auto-reply vacation responses
+#
+# You can choose between SMTP or HTTP relay:
+#   - SMTP: Traditional SMTP relay (most common)
+#   - HTTP: HTTP API relay for services that provide REST API for email delivery
+
+[relay]
+type = "smtp"                                      # Relay type: "smtp" or "http"
+
+# SMTP Relay Configuration (when type="smtp")
+smtp_host = "smtp.example.com:587"                # SMTP relay host and port
+smtp_tls = true                                   # Use TLS (recommended: true)
+smtp_tls_verify = true                            # Verify TLS certificates (recommended: true)
+smtp_use_starttls = true                          # Use STARTTLS (port 587) instead of direct TLS (port 465)
+# smtp_tls_cert_file = "/path/to/client.crt"     # Client certificate for mTLS (optional)
+# smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
+
+# HTTP API Relay Configuration (when type="http")
+# http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint
+# auth_token = "your-bearer-token"                      # Bearer token for Authorization header
+
+# Common relay providers:
+#   Gmail: smtp.gmail.com:587 (requires app-specific password)
+#   SendGrid: smtp.sendgrid.net:587 (API key as password)
+#   Mailgun: smtp.mailgun.org:587 (API credentials)
+#   Amazon SES: email-smtp.us-east-1.amazonaws.com:587 (SMTP credentials)
+
+# RELAY QUEUE CONFIGURATION
+# =============================================================================
+# Disk-based queue for relay delivery with automatic retry on failure.
+# The queue is ALWAYS ENABLED when relay is configured (see [relay] section above).
+# Messages are queued to disk and processed by background worker with exponential backoff.
+# This prevents message loss if external relay is temporarily unavailable.
+#
+# Benefits:
+#   - No message loss if relay fails temporarily
+#   - Exponential backoff retry mechanism
+#   - Circuit breaker protection (automatic fail-fast when endpoint is down)
+#   - Persistent across server restarts
+#   - No database overhead for non-critical relay messages
+#
+# Circuit Breaker:
+#   The relay handler includes an automatic circuit breaker that:
+#   - Opens after 5 consecutive failures (stops attempting delivery)
+#   - Tries recovery after 30 seconds (half-open state)
+#   - Closes after successful deliveries (normal operation resumed)
+#   - Prevents resource waste when external relay is down
+#   - Visible in health checks as circuit_breaker_smtp_relay or circuit_breaker_http_relay
+#
+# Directory structure:
+#   {path}/pending/    - Messages waiting for delivery
+#   {path}/processing/ - Currently being processed
+#   {path}/failed/     - Exceeded max_attempts, requires manual intervention
+#
+# Management: Use `sora-admin relay` commands to inspect and manage the queue
+#
+# NOTE: If max_attempts > len(retry_backoff), the last backoff value is used for all remaining attempts.
+#       Example: With 6 backoff values and 10 max_attempts, attempts 7-10 will all use the 6th backoff (24h).
+
+[relay.queue]
+path = "/var/spool/sora/relay"                                    # Base path for queue storage (default: /var/spool/sora/relay)
+worker_interval = "1m"                                            # How often worker processes queue (default: 1m)
+batch_size = 100                                                  # Number of messages to process per worker cycle (default: 100)
+concurrency = 5                                                   # Number of concurrent messages to process (default: 5)
+max_attempts = 10                                                 # Maximum delivery attempts before moving to failed (default: 10)
+retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]           # Backoff durations between retries (exponential, default shown)
+                                                                  # With these 6 values and 10 max_attempts:
+                                                                  # Attempts 1-6 use the configured backoff values
+                                                                  # Attempts 7-10 all use 24h (last value is repeated)
+                                                                  # Total retry time: ~1m+5m+15m+1h+6h+24h+24h+24h+24h ≈ 99 hours (4 days)
+
+# Circuit Breaker Configuration
+circuit_breaker_threshold = 5                                     # Consecutive failures before opening circuit (default: 5)
+circuit_breaker_timeout = "30s"                                   # Recovery test interval (default: 30s)
+circuit_breaker_max_requests = 3                                  # Max requests allowed in half-open state (default: 3)
 
 
 # METADATA LIMITS CONFIGURATION
@@ -513,7 +595,7 @@ addr = ":143"                 # Listen address and port. Use :993 for IMAPS.
 debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
-max_connections = 1000        # Maximum concurrent IMAP connections across all clients.
+max_connections = 1000        # Maximum concurrent IMAP connections to this server instance.
 max_connections_per_ip = 10   # Max connections per client IP. Set to 0 if behind a load balancer.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
@@ -608,48 +690,53 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - If client_name/version specified: matches if BOTH name AND version match (AND)
 # - Between ja4_fingerprints and client_name/version: matches if EITHER criteria is met (OR)
 
-# --- AUTHENTICATION RATE LIMITING ---
-[server.auth_rate_limit]
-enabled = false                   # Enable authentication rate limiting.
-max_attempts_per_ip = 10          # Max failed auth attempts per IP address.
-max_attempts_per_username = 5     # Max failed auth attempts per username (across all IPs).
-ip_window_duration = "15m"        # Time window for IP-based rate limiting.
-username_window_duration = "30m"  # Time window for username-based rate limiting.
-cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
-fast_block_threshold = 10         # Failed attempts before immediate IP blocking.
-fast_block_duration = "5m"        # Duration of the fast IP block.
-delay_start_threshold = 2         # Failed attempts before applying authentication delays.
-initial_delay = "2s"              # Initial authentication delay after threshold is reached.
-max_delay = "30s"                 # Maximum authentication delay.
-delay_multiplier = 2.0            # Multiplier for progressive delay (exponential backoff).
-cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
-db_sync_interval = "30s"          # How often to sync batched auth attempts to the database.
-max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
-db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
-
 # --- RESOURCE LIMITS ---
-[server.limits]
-# Search rate limiting - prevent DoS attacks via excessive search queries
-search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
-search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
+# Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
+limits.search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
+limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
 
-# Session memory limiting - prevent memory exhaustion attacks (IMAP FETCH/SEARCH commands)
-session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
+# --- TIMEOUT CONFIGURATION ---
+# Multi-layered timeout protection against various DoS attacks
+timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration regardless of activity (e.g., "30m", default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 1024)
 
-# --- SESSION TIMEOUTS ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout (command_timeout): Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement (min_bytes_per_minute): Closes connections transferring data too slowly
-[server.timeouts]
-command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- AUTHENTICATION RATE LIMITING ---
+# Use dotted notation for nested config within [[server]] array element
+auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
+auth_rate_limit.max_attempts_per_ip = 10          # Max failed auth attempts per IP address.
+auth_rate_limit.max_attempts_per_username = 5     # Max failed auth attempts per username (across all IPs).
+auth_rate_limit.ip_window_duration = "15m"        # Time window for IP-based rate limiting.
+auth_rate_limit.username_window_duration = "30m"  # Time window for username-based rate limiting.
+auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
+auth_rate_limit.fast_block_threshold = 10         # Failed attempts before immediate IP blocking.
+auth_rate_limit.fast_block_duration = "5m"        # Duration of the fast IP block.
+auth_rate_limit.delay_start_threshold = 2         # Failed attempts before applying authentication delays.
+auth_rate_limit.initial_delay = "2s"              # Initial authentication delay after threshold is reached.
+auth_rate_limit.max_delay = "30s"                 # Maximum authentication delay.
+auth_rate_limit.delay_multiplier = 2.0            # Multiplier for progressive delay (exponential backoff).
+auth_rate_limit.cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
+auth_rate_limit.db_sync_interval = "30s"          # How often to sync batched auth attempts to the database.
+auth_rate_limit.max_pending_batch = 100           # Max pending auth attempts before forcing a DB sync.
+auth_rate_limit.db_error_threshold = "1m"         # Time to wait before retrying DB operations after an error.
 
 
 # LMTP SERVER EXAMPLE
 # =============================================================================
 # Local Mail Transfer Protocol - handles incoming mail delivery from MTAs
+#
+# NOTE: Uses global [relay] configuration for Sieve redirect/vacation actions.
+#
+# Multi-server LMTP example:
+# [[server]]
+# type = "lmtp"
+# name = "production-lmtp"
+# addr = ":24"
+#
+# [[server]]
+# type = "lmtp"
+# name = "test-lmtp"
+# addr = ":2424"
 
 [[server]]
 type = "lmtp"
@@ -658,7 +745,6 @@ addr = ":24"
 debug = true                  # Enable debug logging for LMTP server
 max_connections = 500
 max_connections_per_ip = 5
-external_relay = ""           # External SMTP relay for mail forwarding (optional).
 tls = false
 tls_use_starttls = false      # Use STARTTLS for opportunistic encryption.
 # tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
@@ -671,6 +757,8 @@ proxy_protocol_timeout = "5s"
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
 max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+
+# NOTE: External relay for Sieve redirect/vacation is configured globally in [relay] section above
 
 
 # POP3 SERVER EXAMPLE
@@ -695,21 +783,12 @@ proxy_protocol_timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# auth_rate_limit.enabled = false
 
-# --- SESSION MEMORY LIMITING ---
-# Per-session memory limit to prevent memory exhaustion attacks (POP3 RETR/TOP commands)
-session_memory_limit = "100mb"    # Maximum memory per session (e.g., "50mb", "200mb", 0 = unlimited).
-
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "2m"             # Maximum idle time (default: 2 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -723,7 +802,19 @@ addr = ":4190"
 max_connections = 200
 max_connections_per_ip = 3
 max_script_size = "16kb"      # Maximum size for a SIEVE script.
-supported_extensions = ["fileinto", "vacation", "envelope", "regex"]  # Supported SIEVE extensions. Available: envelope, fileinto, redirect, encoded-character, imap4flags, variables, relational, vacation, copy, regex
+# Supported SIEVE extensions that scripts can use via "require" statement.
+# This list controls which extensions are validated and allowed when scripts are uploaded.
+#
+# IMPORTANT: Extensions listed here will be advertised to clients in CAPABILITY responses.
+# Clients can then use "require 'extension'" in their scripts, and scripts using those
+# extensions will be accepted during PUTSCRIPT validation.
+#
+# Available extensions that go-sieve supports:
+#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
+#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
+#
+# Common production configuration:
+supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
 insecure_auth = false                            # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = ""
 master_sasl_password = ""
@@ -738,17 +829,12 @@ proxy_protocol_timeout = "5s"
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# auth_rate_limit.enabled = false
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "3m"             # Maximum idle time (default: 3 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 
 # IMAP PROXY EXAMPLE
@@ -760,8 +846,9 @@ type = "imap_proxy"
 name = "imap-proxy-1"
 addr = ":1143"                # Proxy listen address. Must be different from backend IMAP port.
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
-max_connections = 2000
-max_connections_per_ip = 50
+max_connections = 2000                # Max connections to this proxy instance
+max_connections_per_ip = 50           # Max connections per client IP
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -784,19 +871,10 @@ connect_timeout = "30s"
 session_timeout = "30m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-# Multi-layered timeout protection against various DoS attacks:
-# 1. Idle timeout: Closes connections with no activity
-# 2. Absolute session timeout: Maximum total session duration regardless of activity
-# 3. Throughput enforcement: Closes connections transferring data too slowly
-command_timeout = "5m"             # Maximum idle time (default: 5 minutes, e.g., "30s", "5m").
-absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes, e.g., "15m", "1h").
-min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (default: 1024 bytes/min, 0 = use default).
-
-# --- AUTHENTICATION RATE LIMITING ---
-# Same configuration available as shown in IMAP example above
-# [server.auth_rate_limit]
-# enabled = false
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -1038,6 +1116,7 @@ addr = ":1110"                # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
 max_connections = 1000
 max_connections_per_ip = 20
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1060,10 +1139,10 @@ connect_timeout = "30s"
 session_timeout = "10m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-command_timeout = "5m"
-absolute_session_timeout = "30m"
-min_bytes_per_minute = 1024
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1080,6 +1159,7 @@ addr = ":14190"               # Proxy listen address. Must be different from bac
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
 max_connections_per_ip = 10
+max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1102,18 +1182,24 @@ connect_timeout = "30s"
 session_timeout = "15m"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
-# --- COMMAND TIMEOUT AND SLOWLORIS PROTECTION ---
-command_timeout = "5m"
-absolute_session_timeout = "30m"
-min_bytes_per_minute = 1024
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.min_bytes_per_minute = 1024        # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default)
 
 # --- SIEVE EXTENSIONS ---
-# Builtin extensions are always advertised: fileinto, reject, envelope, encoded-character,
-# subaddress, comparator-i;ascii-numeric, relational, imap4flags, copy, include, variables,
-# body, enotify, environment, mailbox, date, index, ihave, duplicate, mime, foreverypart, extracttext
+# Supported SIEVE extensions advertised to clients and validated during script upload.
+# MUST match (or be a subset of) what your backend ManageSieve servers support.
 #
-# Add additional extensions here (e.g., vacation, regex, spamtest, virustest)
-supported_extensions = ["vacation", "regex"]
+# This list determines which extensions clients can use in their SIEVE scripts.
+# Extensions not in this list will be rejected during PUTSCRIPT with "extension not supported" error.
+#
+# Available extensions that go-sieve supports:
+#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
+#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
+#
+# Common production configuration (should match your backend):
+supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1129,7 +1215,8 @@ name = "lmtp-proxy-1"
 addr = ":124"                 # Proxy listen address. Must be different from backend LMTP port.
 remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
 max_connections = 1000
-max_connections_per_ip = 0    # Typically no per-IP limits for LMTP (trusted sources)
+max_connections_per_ip = 0            # Typically no per-IP limits for LMTP (trusted sources)
+# Note: max_connections_per_user not applicable for LMTP (no user authentication)
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
@@ -1190,6 +1277,8 @@ tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
 
+# NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
+
 
 # HTTP USER API SERVER EXAMPLE
 # =============================================================================
@@ -1243,18 +1332,3 @@ tls_verify = false
 # [[server]]
 # type = "http_user_api"
 # allowed_hosts = ["10.0.0.0/8"]  # Trust requests from proxy network
-
-
-# CONNECTION TRACKING CONFIGURATION
-# =============================================================================
-# Monitor and log active connections across all servers for operational visibility.
-
-[servers.connection_tracking]
-enabled = true                    # Enable connection tracking across all protocols.
-update_interval = "15s"           # How often to update connection statistics in the database.
-termination_poll_interval = "30s" # How often to check for connections marked for termination.
-batch_updates = true              # Batch multiple connection updates together for efficiency.
-persist_to_db = true              # Store connection tracking information in the database (required for multi-proxy setups).
-operation_timeout = "10s"         # Timeout for individual register/unregister operations. Increase if seeing timeout errors during high load. (default: "10s")
-batch_flush_timeout = "90s"       # Timeout for batch flush operations. For high-scale deployments (5000+ connections), use "180s" to "600s". (default: "45s")
-max_batch_size = 1000             # Maximum connections per batch chunk. Larger values = fewer DB round-trips but longer transactions. Range: 100-10000. (default: 1000)

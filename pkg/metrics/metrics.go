@@ -186,6 +186,59 @@ var (
 		[]string{"result"},
 	)
 
+	// Relay queue metrics
+	RelayQueueDepth = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_relay_queue_depth",
+			Help: "Number of messages in relay queue by state",
+		},
+		[]string{"state"}, // pending, processing, failed
+	)
+
+	RelayDelivery = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_relay_delivery_total",
+			Help: "Total number of relay delivery attempts",
+		},
+		[]string{"type", "result"}, // type: redirect, vacation; result: success, failure, no_handler
+	)
+
+	RelayDeliveryDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_relay_delivery_duration_seconds",
+			Help:    "Duration of relay delivery attempts",
+			Buckets: []float64{0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0},
+		},
+		[]string{"type", "result"}, // type: redirect, vacation; result: success, failure
+	)
+
+	RelayQueueAge = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_relay_queue_age_seconds",
+			Help:    "Age of messages in relay queue when processed",
+			Buckets: []float64{1, 5, 10, 30, 60, 300, 600, 1800, 3600, 7200, 14400, 28800, 86400}, // 1s to 1 day
+		},
+		[]string{"type"}, // type: redirect, vacation
+	)
+
+	// Relay queue operation metrics
+	RelayQueueOperations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_relay_queue_operations_total",
+			Help: "Total number of relay queue operations",
+		},
+		[]string{"operation", "result"}, // operation: enqueue, acquire, mark_success, mark_failure; result: success, error
+	)
+
+	RelayQueueOperationDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_relay_queue_operation_duration_seconds",
+			Help:    "Duration of relay queue operations",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0},
+		},
+		[]string{"operation"}, // operation: enqueue, acquire, mark_success, mark_failure
+	)
+
 	// IMAP-specific
 	IMAPIdleConnections = promauto.NewGauge(
 		prometheus.GaugeOpts{

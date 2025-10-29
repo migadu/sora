@@ -782,7 +782,7 @@ func (s *Session) registerConnection() error {
 	clientAddr := s.clientConn.RemoteAddr().String()
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, "IMAP", clientAddr, s.serverAddr, s.username, true)
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", clientAddr)
 	}
 	return nil
 }
@@ -797,43 +797,19 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 
-	// New mechanism: listen for kick notifications and only update activity periodically.
-	activityTicker := time.NewTicker(30 * time.Second)
-	defer activityTicker.Stop()
-
-	kickChan := s.server.connTracker.KickChannel()
-
-	checkAndTerminate := func() (terminated bool) {
-		checkCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-		defer cancel()
-
-		shouldTerminate, err := s.server.connTracker.CheckTermination(checkCtx, s.accountID, "IMAP", clientAddr)
-		if err != nil {
-			log.Printf("IMAP Proxy [%s] Failed to check termination for %s: %v", s.server.name, s.username, err)
-			return false
-		}
-		if shouldTerminate {
-			log.Printf("IMAP Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)", s.server.name, s.username, clientAddr, s.serverAddr)
-			s.clientConn.Close()
-			s.backendConn.Close()
-			return true
-		}
-		return false
-	}
+	// Register for kick notifications
+	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {
 		select {
 		case <-kickChan:
-			log.Printf("IMAP Proxy [%s] Received kick notification for %s", s.server.name, s.username)
-			if checkAndTerminate() {
-				return
-			}
-		case <-activityTicker.C:
-			updateCtx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-			if err := s.server.connTracker.UpdateActivity(updateCtx, s.accountID, "IMAP", clientAddr); err != nil {
-				log.Printf("IMAP Proxy [%s] Failed to update activity for %s: %v", s.server.name, s.username, err)
-			}
-			cancel()
+			// Kick notification received - close connections
+			log.Printf("IMAP Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)",
+				s.server.name, s.username, clientAddr, s.serverAddr)
+			s.clientConn.Close()
+			s.backendConn.Close()
+			return
 		case <-ctx.Done():
 			return
 		}

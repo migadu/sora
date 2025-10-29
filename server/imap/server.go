@@ -1,80 +1,3 @@
-// Package imap implements an IMAP4rev1 server with modern extensions.
-//
-// This package provides a production-ready IMAP server implementation with:
-//   - IMAP4rev1 (RFC 3501) core protocol
-//   - IDLE (RFC 2177) for push notifications
-//   - MOVE (RFC 6851) for efficient message moving
-//   - ESEARCH (RFC 4731) for extended search
-//   - COMPRESS=DEFLATE (RFC 4978) for bandwidth optimization
-//   - QUOTA (RFC 2087) for mailbox quota management
-//   - Full UTF-8 support
-//   - TLS/STARTTLS support
-//   - SASL authentication (PLAIN, LOGIN)
-//
-// # Server Architecture
-//
-// The server uses a connection-per-client model with goroutines.
-// Each connection has a state machine tracking authentication and
-// mailbox selection:
-//
-//	NOT AUTHENTICATED → AUTHENTICATED → SELECTED → LOGOUT
-//
-// # Starting an IMAP Server
-//
-//	cfg := &config.IMAPConfig{
-//		Addr:    ":143",
-//		TLSAddr: ":993",
-//		MaxConnections: 1000,
-//	}
-//	srv, err := imap.NewServer(cfg, db, s3, cache)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//
-//	// Start listeners
-//	go srv.ListenAndServe(ctx)
-//	go srv.ListenAndServeTLS(ctx, certFile, keyFile)
-//
-// # Supported Commands
-//
-// Pre-authentication:
-//   - CAPABILITY: List server capabilities
-//   - STARTTLS: Upgrade to TLS
-//   - LOGIN: Authenticate with username/password
-//
-// Authenticated:
-//   - SELECT/EXAMINE: Select a mailbox
-//   - CREATE/DELETE/RENAME: Mailbox management
-//   - SUBSCRIBE/UNSUBSCRIBE: Subscription management
-//   - LIST/LSUB: Mailbox listing
-//   - STATUS: Query mailbox status
-//   - APPEND: Add message to mailbox
-//
-// Selected:
-//   - FETCH: Retrieve message data
-//   - STORE: Modify message flags
-//   - SEARCH/ESEARCH: Search messages
-//   - COPY/MOVE: Copy or move messages
-//   - EXPUNGE: Permanently delete messages
-//   - IDLE: Wait for mailbox changes
-//
-// # IDLE Implementation
-//
-// The IDLE command allows clients to receive real-time updates:
-//
-//	C: A001 IDLE
-//	S: + idling
-//	... server sends EXISTS/EXPUNGE as changes occur ...
-//	C: DONE
-//	S: A001 OK IDLE terminated
-//
-// # Performance Features
-//
-//   - Connection pooling to PostgreSQL
-//   - Local cache for frequently accessed messages
-//   - Batch operations for FETCH and SEARCH
-//   - COMPRESS=DEFLATE reduces bandwidth by ~70%
-//   - Efficient UID handling with sequence caching
 package imap
 
 import (
@@ -325,6 +248,7 @@ type IMAPServerOptions struct {
 	AppendLimit           int64
 	MaxConnections        int
 	MaxConnectionsPerIP   int
+	MaxConnectionsPerUser int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
 	ProxyProtocol         bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
 	TrustedNetworks       []string // Global trusted networks for parameter forwarding
@@ -620,24 +544,26 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
 	}
 
-	// Initialize connection tracker for monitoring active connections
-	// Use 5 minute update interval and 10 second termination poll interval
-	// Disable batch updates (batchUpdates=false) for immediate database writes
-	// Get timeout values from config (with defaults if not configured)
-	var operationTimeout, batchFlushTimeout time.Duration
-	var maxBatchSize int
-	if options.Config != nil {
-		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	// Initialize local connection tracking (no gossip, just local tracking)
+	// This enables per-user connection limits and kick functionality on backend servers
+	if options.MaxConnectionsPerUser > 0 {
+		// Generate unique instance ID for this server instance
+		instanceID := fmt.Sprintf("imap-%s-%d", name, time.Now().UnixNano())
+
+		// Create ConnectionTracker with nil cluster manager (local mode only)
+		s.connTracker = proxy.NewConnectionTracker(
+			"IMAP",                        // protocol name
+			instanceID,                    // unique instance identifier
+			nil,                           // no cluster manager = local mode
+			options.MaxConnectionsPerUser, // per-user connection limit
+		)
+
+		log.Printf("IMAP [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)
 	} else {
-		// Use safe defaults when config is not provided (e.g., in tests)
-		operationTimeout = 5 * time.Second
-		batchFlushTimeout = 1 * time.Second
-		maxBatchSize = 100
+		// Connection tracking disabled (unlimited connections per user)
+		s.connTracker = nil
+		log.Printf("IMAP [%s] Local connection tracking disabled (max_connections_per_user not configured)", name)
 	}
-	s.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
-	s.connTracker.Start()
 
 	return s, nil
 }
@@ -874,6 +800,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	}
 
 	return err
+}
+
+// SetConnTracker sets the connection tracker for this server
+func (s *IMAPServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+	s.connTracker = tracker
 }
 
 func (s *IMAPServer) Close() {

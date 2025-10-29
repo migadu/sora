@@ -79,6 +79,7 @@ type ManageSieveServerOptions struct {
 	MasterSASLPassword     string
 	MaxConnections         int
 	MaxConnectionsPerIP    int
+	MaxConnectionsPerUser  int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
 	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
@@ -213,24 +214,26 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
 	}
 
-	// Initialize connection tracker for monitoring active connections
-	// Use 5 minute update interval and 10 second termination poll interval
-	// Disable batch updates (batchUpdates=false) for immediate database writes
-	// Get timeout values from config (with defaults if not configured)
-	var operationTimeout, batchFlushTimeout time.Duration
-	var maxBatchSize int
-	if options.Config != nil {
-		operationTimeout = options.Config.Servers.ConnectionTracking.GetOperationTimeoutWithDefault()
-		batchFlushTimeout = options.Config.Servers.ConnectionTracking.GetBatchFlushTimeoutWithDefault()
-		maxBatchSize = options.Config.Servers.ConnectionTracking.GetMaxBatchSize()
+	// Initialize local connection tracking (no gossip, just local tracking)
+	// This enables per-user connection limits and kick functionality on backend servers
+	if options.MaxConnectionsPerUser > 0 {
+		// Generate unique instance ID for this server instance
+		instanceID := fmt.Sprintf("managesieve-%s-%d", name, time.Now().UnixNano())
+
+		// Create ConnectionTracker with nil cluster manager (local mode only)
+		serverInstance.connTracker = proxy.NewConnectionTracker(
+			"ManageSieve",                 // protocol name
+			instanceID,                    // unique instance identifier
+			nil,                           // no cluster manager = local mode
+			options.MaxConnectionsPerUser, // per-user connection limit
+		)
+
+		log.Printf("ManageSieve [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)
 	} else {
-		// Use safe defaults when config is not provided (e.g., in tests)
-		operationTimeout = 5 * time.Second
-		batchFlushTimeout = 1 * time.Second
-		maxBatchSize = 100
+		// Connection tracking disabled (unlimited connections per user)
+		serverInstance.connTracker = nil
+		log.Printf("ManageSieve [%s] Local connection tracking disabled (max_connections_per_user not configured)", name)
 	}
-	serverInstance.connTracker = proxy.NewConnectionTracker(name, rdb, hostname, 5*time.Minute, 10*time.Second, operationTimeout, batchFlushTimeout, maxBatchSize, true, false, true)
-	serverInstance.connTracker.Start()
 
 	return serverInstance, nil
 }
@@ -413,6 +416,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			session.handleConnection()
 		}()
 	}
+}
+
+// SetConnTracker sets the connection tracker for this server
+func (s *ManageSieveServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+	s.connTracker = tracker
 }
 
 func (s *ManageSieveServer) Close() {

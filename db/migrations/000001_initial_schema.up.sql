@@ -322,41 +322,6 @@ CREATE TABLE locks (
 	expires_at TIMESTAMPTZ NOT NULL
 );
 
--- Table for tracking active proxy connections
-CREATE TABLE active_connections (
-    id BIGSERIAL PRIMARY KEY,
-    account_id BIGINT NOT NULL,
-    is_prelookup_account BOOLEAN NOT NULL DEFAULT FALSE,
-	instance_id VARCHAR(255) NOT NULL,
-    protocol VARCHAR(20) NOT NULL,
-    client_addr VARCHAR(255) NOT NULL,
-    server_addr VARCHAR(255) NOT NULL,
-    email VARCHAR(255) NOT NULL DEFAULT '',
-    is_proxy BOOLEAN NOT NULL DEFAULT FALSE,
-    connected_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    last_activity TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    should_terminate BOOLEAN DEFAULT false,
-    UNIQUE(account_id, is_prelookup_account, protocol, client_addr)
-);
-
--- It's a good idea to add an index for faster cleanup on startup.
-CREATE INDEX idx_active_connections_instance_id ON active_connections(instance_id);
-
--- Index for faster lookups by account_id
-CREATE INDEX idx_active_connections_account_id ON active_connections (account_id, is_prelookup_account);
-
--- Index for faster lookups by server_addr
-CREATE INDEX idx_active_connections_server_addr ON active_connections (server_addr);
-
--- Index for GetTerminatedConnectionsByInstance: efficiently find connections to terminate.
-CREATE INDEX idx_active_connections_term_instance ON active_connections (instance_id) WHERE should_terminate = true;
-
--- Index for cleanup of stale connections
-CREATE INDEX idx_active_connections_last_activity ON active_connections (last_activity);
-
--- Index for protocol-based queries
-CREATE INDEX idx_active_connections_protocol ON active_connections (protocol);
-
 -- Health status tracking for system components
 CREATE TABLE health_status (
     component_name VARCHAR(255) NOT NULL,
