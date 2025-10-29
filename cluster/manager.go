@@ -113,6 +113,8 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	}
 
 	// Create memberlist
+	logger.Infof("Creating memberlist with config: node=%s, bind=%s:%d, delegate=%p",
+		mlConfig.Name, mlConfig.BindAddr, mlConfig.BindPort, mlConfig.Delegate)
 	ml, err := memberlist.Create(mlConfig)
 	if err != nil {
 		cancel()
@@ -120,6 +122,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	}
 
 	m.memberlist = ml
+	logger.Infof("Memberlist created successfully, instance=%p", ml)
 
 	// Filter out self-references from peers list
 	// A node should never list itself in the peers array as this causes gossip issues
@@ -294,6 +297,7 @@ func (m *Manager) RegisterConnectionHandler(handler func([]byte)) {
 	m.connectionMu.Lock()
 	defer m.connectionMu.Unlock()
 	m.connectionHandlers = append(m.connectionHandlers, handler)
+	logger.Infof("[Cluster] RegisterConnectionHandler: now have %d handlers", len(m.connectionHandlers))
 }
 
 // notifyConnectionHandlers calls all registered connection handlers
