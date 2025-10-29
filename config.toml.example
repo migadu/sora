@@ -17,6 +17,17 @@
 # - Syntax errors (e.g., "f" instead of "false") will fail with helpful hints
 # - Run './sora --config config.toml' to validate your configuration
 
+# ADMIN CLI CONFIGURATION (for sora-admin tool)
+# =============================================================================
+# Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.
+# Required for commands like 'sora-admin connections list', 'connections kick', etc.
+
+[admin_cli]
+# addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
+# api_key = "your-api-key-here"               # API key matching the http_admin_api server configuration
+# insecure_skip_verify = true                 # Skip TLS certificate verification (default: true). Set to false for production with valid certs.
+
+
 # LOGGING CONFIGURATION
 # =============================================================================
 # Structured logging configuration using Go's standard slog library.
@@ -1334,13 +1345,15 @@ addr = ":8080"
 api_key = "your-secret-api-key-here"  # REQUIRED for API access.
 allowed_hosts = []            # Empty = all hosts (not recommended for production).
 tls = false
-tls_cert_file = ""
-tls_key_file = ""
+tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert from [tls] section)
+tls_key_file = ""             # Static key file (or use Let's Encrypt autocert from [tls] section)
+tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connections (uses global default_domain if not set)
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
+# NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
 
 
 # HTTP USER API SERVER EXAMPLE
@@ -1359,9 +1372,12 @@ token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validatio
 allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
 allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.
 tls = false
-tls_cert_file = ""
-tls_key_file = ""
+tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert from [tls] section)
+tls_key_file = ""             # Static key file (or use Let's Encrypt autocert from [tls] section)
+tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connections (uses global default_domain if not set)
 tls_verify = false
+
+# NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
 
 
 # USER API PROXY SERVER EXAMPLE

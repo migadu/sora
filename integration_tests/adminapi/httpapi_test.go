@@ -5,6 +5,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2458,4 +2459,209 @@ func TestAffinityManagement(t *testing.T) {
 
 		t.Log("Successfully managed affinity for multiple protocols")
 	})
+}
+
+// TLS Tests
+// =============================================================================
+
+// setupHTTPAPIServerWithTLS creates a test HTTP API server with TLS configuration
+func setupHTTPAPIServerWithTLS(t *testing.T, tlsConfig *tls.Config, useTLSConfig bool) *HTTPAPITestServer {
+	t.Helper()
+
+	// Set up database
+	rdb := common.SetupTestDatabase(t)
+
+	// Set up cache
+	cacheDir := t.TempDir()
+	sourceDB := &testSourceDB{rdb: rdb}
+	testCache, err := cache.New(cacheDir, 100*1024*1024, 10*1024*1024, 5*time.Minute, 1*time.Hour, sourceDB)
+	if err != nil {
+		t.Fatalf("Failed to create test cache: %v", err)
+	}
+
+	// Get random port
+	addr := common.GetRandomAddress(t)
+
+	// Create server options with TLS
+	options := adminapi.ServerOptions{
+		Addr:         addr,
+		APIKey:       testAPIKey,
+		AllowedHosts: []string{}, // Allow all for testing
+		Cache:        testCache,
+		TLS:          true,
+	}
+
+	if useTLSConfig {
+		// Use TLS config from manager
+		options.TLSConfig = tlsConfig
+	} else {
+		// Use static certificate files
+		options.TLSCertFile = "../../testdata/sora.crt"
+		options.TLSKeyFile = "../../testdata/sora.key"
+	}
+
+	// Create server
+	server, err := adminapi.New(rdb, options)
+	if err != nil {
+		t.Fatalf("Failed to create HTTP API server: %v", err)
+	}
+
+	// Start server in background
+	ctx, cancel := context.WithCancel(context.Background())
+	errChan := make(chan error, 1)
+
+	go adminapi.Start(ctx, rdb, options, errChan)
+
+	// Wait a bit for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Check if server started successfully
+	select {
+	case err := <-errChan:
+		cancel()
+		t.Fatalf("Failed to start HTTP API server: %v", err)
+	default:
+		// Server started successfully
+	}
+
+	cleanup := func() {
+		cancel()
+		testCache.Close()
+	}
+
+	baseURL := fmt.Sprintf("https://%s", addr)
+
+	return &HTTPAPITestServer{
+		URL:     baseURL,
+		server:  server,
+		rdb:     rdb,
+		cache:   testCache,
+		cleanup: cleanup,
+	}
+}
+
+func TestHTTPAdminAPI_TLS_StaticCertificates(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Test HTTP Admin API with static TLS certificates
+	srv := setupHTTPAPIServerWithTLS(t, nil, false)
+	defer srv.Close()
+
+	// Create HTTPS client with InsecureSkipVerify for self-signed cert
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Skip verification for self-signed test cert
+			},
+		},
+	}
+
+	// Test a simple health check endpoint
+	req, err := http.NewRequest("GET", srv.URL+"/admin/health/overview", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make HTTPS request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	t.Log("✓ HTTP Admin API works correctly with static TLS certificates")
+}
+
+func TestHTTPAdminAPI_TLS_TLSManager(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Load test certificate for TLS manager simulation
+	cert, err := tls.LoadX509KeyPair("../../testdata/sora.crt", "../../testdata/sora.key")
+	if err != nil {
+		t.Fatalf("Failed to load test certificate: %v", err)
+	}
+
+	// Create TLS config simulating what the TLS manager would provide
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Test HTTP Admin API with TLS config from manager
+	srv := setupHTTPAPIServerWithTLS(t, tlsConfig, true)
+	defer srv.Close()
+
+	// Create HTTPS client with InsecureSkipVerify for self-signed cert
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Skip verification for self-signed test cert
+			},
+		},
+	}
+
+	// Test a simple health check endpoint
+	req, err := http.NewRequest("GET", srv.URL+"/admin/health/overview", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make HTTPS request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	t.Log("✓ HTTP Admin API works correctly with TLS config from manager")
+}
+
+func TestHTTPAdminAPI_TLS_WithoutInsecureSkipVerify(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Test that connection fails when InsecureSkipVerify is false and cert is self-signed
+	srv := setupHTTPAPIServerWithTLS(t, nil, false)
+	defer srv.Close()
+
+	// Create HTTPS client WITHOUT InsecureSkipVerify
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: false, // Don't skip verification
+			},
+		},
+	}
+
+	// Test a simple health check endpoint
+	req, err := http.NewRequest("GET", srv.URL+"/admin/health/overview", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Expected TLS verification error, but request succeeded")
+	}
+
+	// Verify the error is certificate-related
+	if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("Expected certificate error, got: %v", err)
+	}
+
+	t.Logf("✓ TLS certificate verification correctly fails for self-signed cert: %v", err)
 }

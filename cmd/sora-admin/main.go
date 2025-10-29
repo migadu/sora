@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,15 +36,16 @@ var (
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database        config.DatabaseConfig        `toml:"database"`
-	S3              config.S3Config              `toml:"s3"`
-	LocalCache      config.LocalCacheConfig      `toml:"local_cache"`
-	Uploader        config.UploaderConfig        `toml:"uploader"`
-	Cleanup         config.CleanupConfig         `toml:"cleanup"`
-	SharedMailboxes config.SharedMailboxesConfig `toml:"shared_mailboxes"`
-	Server          []map[string]interface{}     `toml:"server"` // Ignore server config array, not needed for admin commands
-	HTTPAPIAddr     string                       // HTTP API address for kick operations (e.g., "http://localhost:8080")
-	HTTPAPIKey      string                       // HTTP API key for authentication
+	Database                 config.DatabaseConfig        `toml:"database"`
+	S3                       config.S3Config              `toml:"s3"`
+	LocalCache               config.LocalCacheConfig      `toml:"local_cache"`
+	Uploader                 config.UploaderConfig        `toml:"uploader"`
+	Cleanup                  config.CleanupConfig         `toml:"cleanup"`
+	SharedMailboxes          config.SharedMailboxesConfig `toml:"shared_mailboxes"`
+	Server                   []map[string]interface{}     `toml:"server"` // Ignore server config array, not needed for admin commands
+	HTTPAPIAddr              string                       `toml:"http_api_addr"`                // HTTP API address for kick operations (e.g., "http://localhost:8080")
+	HTTPAPIKey               string                       `toml:"http_api_key"`                 // HTTP API key for authentication
+	HTTPAPIInsecureSkipVerify bool                        `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
 }
 
 // createHTTPAPIClient creates an HTTP client for calling the HTTP API
@@ -55,8 +57,16 @@ func createHTTPAPIClient(cfg AdminConfig) (*http.Client, error) {
 		return nil, fmt.Errorf("http_api_key not configured (required for kick operations)")
 	}
 
+	// Create custom transport with optional TLS verification skip
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: cfg.HTTPAPIInsecureSkipVerify,
+		},
+	}
+
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout:   30 * time.Second,
+		Transport: transport,
 	}, nil
 }
 
@@ -133,6 +143,14 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.Uploader = fullCfg.Uploader
 	cfg.Cleanup = fullCfg.Cleanup
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
+	cfg.HTTPAPIAddr = fullCfg.AdminCLI.Addr
+	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
+
+	// Default to true for insecure skip verify (safer for localhost usage)
+	cfg.HTTPAPIInsecureSkipVerify = true
+	if fullCfg.AdminCLI.InsecureSkipVerify != nil {
+		cfg.HTTPAPIInsecureSkipVerify = *fullCfg.AdminCLI.InsecureSkipVerify
+	}
 
 	return nil
 }

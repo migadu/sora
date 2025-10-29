@@ -1606,6 +1606,15 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		validBackends["managesieve"] = append(validBackends["managesieve"], deps.config.Servers.ManageSieveProxy.RemoteAddrs...)
 	}
 
+	// Get TLS config from manager if TLS is enabled
+	var tlsConfig *tls.Config
+	if serverConfig.TLS && deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		if serverConfig.TLSDefaultDomain != "" {
+			tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+		}
+	}
+
 	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
@@ -1616,6 +1625,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		Storage:            deps.storage,
 		RelayQueue:         deps.relayQueue, // Global relay queue
 		TLS:                serverConfig.TLS,
+		TLSConfig:          tlsConfig, // From TLS manager (if available)
 		TLSCertFile:        serverConfig.TLSCertFile,
 		TLSKeyFile:         serverConfig.TLSKeyFile,
 		TLSVerify:          serverConfig.TLSVerify,
@@ -1648,7 +1658,15 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		}
 	}
 
-	// Use mailapi package (need to add import)
+	// Get TLS config from manager if TLS is enabled
+	var tlsConfig *tls.Config
+	if serverConfig.TLS && deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		if serverConfig.TLSDefaultDomain != "" {
+			tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+		}
+	}
+
 	options := mailapi.ServerOptions{
 		Name:           serverConfig.Name,
 		Addr:           serverConfig.Addr,
@@ -1660,6 +1678,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		Storage:        deps.storage,
 		Cache:          deps.cacheInstance,
 		TLS:            serverConfig.TLS,
+		TLSConfig:      tlsConfig, // From TLS manager (if available)
 		TLSCertFile:    serverConfig.TLSCertFile,
 		TLSKeyFile:     serverConfig.TLSKeyFile,
 		TLSVerify:      serverConfig.TLSVerify,

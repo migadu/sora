@@ -38,6 +38,7 @@ type Server struct {
 	relayQueue         delivery.RelayQueue // Global relay queue for mail delivery
 	server             *http.Server
 	tls                bool
+	tlsConfig          *tls.Config // TLS config from manager (takes precedence) or nil
 	tlsCertFile        string
 	tlsKeyFile         string
 	tlsVerify          bool
@@ -59,6 +60,7 @@ type ServerOptions struct {
 	Storage            *storage.S3Storage
 	RelayQueue         delivery.RelayQueue // Global relay queue for mail delivery
 	TLS                bool
+	TLSConfig          *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile        string
 	TLSKeyFile         string
 	TLSVerify          bool
@@ -84,8 +86,11 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 
 	// Validate TLS configuration
 	if options.TLS {
-		if options.TLSCertFile == "" || options.TLSKeyFile == "" {
-			return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled")
+		// If TLSConfig is provided (from manager), use it. Otherwise require cert files.
+		if options.TLSConfig == nil {
+			if options.TLSCertFile == "" || options.TLSKeyFile == "" {
+				return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled (or use TLS manager)")
+			}
 		}
 	}
 
@@ -100,6 +105,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		storage:            options.Storage,
 		relayQueue:         options.RelayQueue,
 		tls:                options.TLS,
+		tlsConfig:          options.TLSConfig,
 		tlsCertFile:        options.TLSCertFile,
 		tlsKeyFile:         options.TLSKeyFile,
 		tlsVerify:          options.TLSVerify,
@@ -157,10 +163,19 @@ func (s *Server) start(ctx context.Context) error {
 
 	// Start server with or without TLS
 	if s.tls {
-		// Add TLS config for mTLS
-		tlsConfig := &tls.Config{
-			Renegotiation: tls.RenegotiateNever,
+		// Use TLS config from manager if provided, otherwise create one for static certs
+		var tlsConfig *tls.Config
+		if s.tlsConfig != nil {
+			// Clone the manager's TLS config
+			tlsConfig = s.tlsConfig.Clone()
+		} else {
+			// Create new TLS config for static certificates
+			tlsConfig = &tls.Config{
+				Renegotiation: tls.RenegotiateNever,
+			}
 		}
+
+		// Apply client verification settings
 		if s.tlsVerify {
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 		} else {
@@ -168,6 +183,12 @@ func (s *Server) start(ctx context.Context) error {
 		}
 		s.server.TLSConfig = tlsConfig
 
+		// If using TLS manager (tlsConfig from manager), pass empty cert files
+		// The GetCertificate callback in the config will handle certificate retrieval
+		if s.tlsConfig != nil {
+			return s.server.ListenAndServeTLS("", "")
+		}
+		// Otherwise use static certificate files
 		return s.server.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
 	}
 	return s.server.ListenAndServe()

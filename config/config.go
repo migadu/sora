@@ -1190,6 +1190,13 @@ type SharedMailboxesConfig struct {
 	AllowAnyoneIdentifier bool   `toml:"allow_anyone_identifier"` // Enable RFC 4314 "anyone" identifier for domain-wide sharing
 }
 
+// AdminCLIConfig holds configuration for sora-admin CLI tool
+type AdminCLIConfig struct {
+	Addr              string `toml:"addr"`                 // HTTP Admin API endpoint address
+	APIKey            string `toml:"api_key"`              // API key for authentication
+	InsecureSkipVerify *bool `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
+}
+
 // Config holds all configuration for the application.
 type Config struct {
 	Logging         LoggingConfig         `toml:"logging"`
@@ -1205,6 +1212,7 @@ type Config struct {
 	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
 	AuthCache       AuthCacheConfig       `toml:"auth_cache"`
 	Relay           RelayConfig           `toml:"relay"`
+	AdminCLI        AdminCLIConfig        `toml:"admin_cli"` // Admin CLI tool configuration
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`

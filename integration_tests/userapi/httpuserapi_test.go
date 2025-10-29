@@ -4,11 +4,14 @@ package userapi
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -905,4 +908,212 @@ func TestSearchFunctionality(t *testing.T) {
 			t.Fatalf("Expected status 404, got %d", resp.StatusCode)
 		}
 	})
+}
+
+// TLS Tests
+// =============================================================================
+
+// setupTestServerWithTLS creates a test HTTP User API server with actual TLS
+func setupTestServerWithTLS(t *testing.T, tlsConfig *tls.Config, useTLSConfig bool) (*TestContext, string) {
+	t.Helper()
+
+	// Skip if database unavailable
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Setup database
+	rdb := common.SetupTestDatabase(t)
+
+	// Create test account
+	account := common.CreateTestAccount(t, rdb)
+
+	// Get random port
+	addr := common.GetRandomAddress(t)
+
+	// Create server options with TLS
+	serverOptions := userapi.ServerOptions{
+		Name:           "test-server-tls",
+		Addr:           addr,
+		JWTSecret:      "test-secret-key-for-testing-only",
+		TokenDuration:  1 * time.Hour,
+		TokenIssuer:    "test-issuer",
+		AllowedOrigins: []string{"*"},
+		Storage:        nil, // Can be nil for metadata-only tests
+		Cache:          nil, // Can be nil for tests
+		TLS:            true,
+	}
+
+	if useTLSConfig {
+		// Use TLS config from manager
+		serverOptions.TLSConfig = tlsConfig
+	} else {
+		// Use static certificate files
+		serverOptions.TLSCertFile = "../../testdata/sora.crt"
+		serverOptions.TLSKeyFile = "../../testdata/sora.key"
+	}
+
+	_, err := userapi.New(rdb, serverOptions)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	// Start server in background
+	ctx, cancel := context.WithCancel(context.Background())
+	errChan := make(chan error, 1)
+
+	go userapi.Start(ctx, rdb, serverOptions, errChan)
+
+	// Wait a bit for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Check if server started successfully
+	select {
+	case err := <-errChan:
+		cancel()
+		t.Fatalf("Failed to start HTTP User API server: %v", err)
+	default:
+		// Server started successfully
+	}
+
+	baseURL := fmt.Sprintf("https://%s", addr)
+
+	// Create HTTPS client
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Skip verification for self-signed test cert
+			},
+		},
+	}
+
+	tc := &TestContext{
+		Server:     nil, // Not using httptest.Server for TLS tests
+		RDB:        rdb,
+		HTTPClient: client,
+		TestUser:   account,
+	}
+
+	t.Cleanup(func() {
+		cancel()
+	})
+
+	return tc, baseURL
+}
+
+func TestHTTPUserAPI_TLS_StaticCertificates(t *testing.T) {
+	tc, baseURL := setupTestServerWithTLS(t, nil, false)
+
+	// Test login endpoint over HTTPS
+	loginBody := map[string]string{
+		"email":    tc.TestUser.Email,
+		"password": tc.TestUser.Password,
+	}
+	body, _ := json.Marshal(loginBody)
+
+	resp, err := tc.HTTPClient.Post(baseURL+"/user/auth/login", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("Failed to make HTTPS login request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response to get token
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		t.Fatalf("Failed to decode login response: %v", err)
+	}
+
+	if loginResp.Token == "" {
+		t.Fatal("Expected token in response")
+	}
+
+	t.Log("✓ HTTP User API works correctly with static TLS certificates")
+}
+
+func TestHTTPUserAPI_TLS_TLSManager(t *testing.T) {
+	// Load test certificate for TLS manager simulation
+	cert, err := tls.LoadX509KeyPair("../../testdata/sora.crt", "../../testdata/sora.key")
+	if err != nil {
+		t.Fatalf("Failed to load test certificate: %v", err)
+	}
+
+	// Create TLS config simulating what the TLS manager would provide
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	tc, baseURL := setupTestServerWithTLS(t, tlsConfig, true)
+
+	// Test login endpoint over HTTPS
+	loginBody := map[string]string{
+		"email":    tc.TestUser.Email,
+		"password": tc.TestUser.Password,
+	}
+	body, _ := json.Marshal(loginBody)
+
+	resp, err := tc.HTTPClient.Post(baseURL+"/user/auth/login", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("Failed to make HTTPS login request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response to get token
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		t.Fatalf("Failed to decode login response: %v", err)
+	}
+
+	if loginResp.Token == "" {
+		t.Fatal("Expected token in response")
+	}
+
+	t.Log("✓ HTTP User API works correctly with TLS config from manager")
+}
+
+func TestHTTPUserAPI_TLS_WithoutInsecureSkipVerify(t *testing.T) {
+	tc, baseURL := setupTestServerWithTLS(t, nil, false)
+
+	// Create HTTPS client WITHOUT InsecureSkipVerify
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: false, // Don't skip verification
+			},
+		},
+	}
+
+	// Test login endpoint - should fail with certificate error
+	loginBody := map[string]string{
+		"email":    tc.TestUser.Email,
+		"password": tc.TestUser.Password,
+	}
+	body, _ := json.Marshal(loginBody)
+
+	resp, err := client.Post(baseURL+"/user/auth/login", "application/json", bytes.NewReader(body))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("Expected TLS verification error, but request succeeded")
+	}
+
+	// Verify the error is certificate-related
+	if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("Expected certificate error, got: %v", err)
+	}
+
+	t.Logf("✓ TLS certificate verification correctly fails for self-signed cert: %v", err)
 }
