@@ -155,14 +155,15 @@ type ClusterAffinityConfig struct {
 
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
-	Enabled       bool                       `toml:"enabled"`         // Enable cluster mode
-	Addr          string                     `toml:"addr"`            // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
-	Port          int                        `toml:"port"`            // Gossip port (used if not specified in addr)
-	NodeID        string                     `toml:"node_id"`         // Unique node ID (defaults to hostname)
-	Peers         []string                   `toml:"peers"`           // Initial seed nodes
-	SecretKey     string                     `toml:"secret_key"`      // Cluster encryption key (base64-encoded 32-byte key)
-	RateLimitSync ClusterRateLimitSyncConfig `toml:"rate_limit_sync"` // Auth rate limiting sync configuration
-	Affinity      ClusterAffinityConfig      `toml:"affinity"`        // Server affinity configuration
+	Enabled           bool                       `toml:"enabled"`              // Enable cluster mode
+	Addr              string                     `toml:"addr"`                 // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
+	Port              int                        `toml:"port"`                 // Gossip port (used if not specified in addr)
+	NodeID            string                     `toml:"node_id"`              // Unique node ID (defaults to hostname)
+	Peers             []string                   `toml:"peers"`                // Initial seed nodes
+	SecretKey         string                     `toml:"secret_key"`           // Cluster encryption key (base64-encoded 32-byte key)
+	MaxEventQueueSize int                        `toml:"max_event_queue_size"` // Maximum events per protocol queue (default: 50000)
+	RateLimitSync     ClusterRateLimitSyncConfig `toml:"rate_limit_sync"`      // Auth rate limiting sync configuration
+	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
 }
 
 // GetBindAddr returns the bind address by parsing the addr field
@@ -197,6 +198,14 @@ func (c *ClusterConfig) GetBindPort() int {
 
 	// Default to 7946
 	return 7946
+}
+
+// GetMaxEventQueueSize returns the maximum event queue size with a default of 50000
+func (c *ClusterConfig) GetMaxEventQueueSize() int {
+	if c.MaxEventQueueSize > 0 {
+		return c.MaxEventQueueSize
+	}
+	return 50000 // Default: sufficient for busy servers
 }
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage

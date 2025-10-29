@@ -8,7 +8,7 @@ import (
 
 func TestLocalConnectionTracker_RegisterAndUnregister(t *testing.T) {
 	// Create tracker in local mode (no cluster manager)
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 5)
+	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 5, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil for local mode")
 	}
@@ -68,7 +68,7 @@ func TestLocalConnectionTracker_RegisterAndUnregister(t *testing.T) {
 
 func TestLocalConnectionTracker_EnforceLimit(t *testing.T) {
 	// Create tracker with limit of 3 connections per user
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 3)
+	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 3, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -129,7 +129,7 @@ func TestLocalConnectionTracker_EnforceLimit(t *testing.T) {
 }
 
 func TestLocalConnectionTracker_KickUser(t *testing.T) {
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 10)
+	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 10, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -190,7 +190,7 @@ func TestLocalConnectionTracker_KickUser(t *testing.T) {
 }
 
 func TestLocalConnectionTracker_MultipleUsers(t *testing.T) {
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 5)
+	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 5, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -245,7 +245,7 @@ func TestLocalConnectionTracker_MultipleUsers(t *testing.T) {
 }
 
 func TestLocalConnectionTracker_GetAllConnections(t *testing.T) {
-	tracker := NewConnectionTracker("POP3", "test-instance", nil, 10)
+	tracker := NewConnectionTracker("POP3", "test-instance", nil, 10, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -291,7 +291,7 @@ func TestLocalConnectionTracker_GetAllConnections(t *testing.T) {
 
 func TestLocalConnectionTracker_ZeroLimit(t *testing.T) {
 	// Create tracker with limit of 0 (unlimited)
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 0)
+	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 0, 0)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}

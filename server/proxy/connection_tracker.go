@@ -30,8 +30,8 @@ const (
 )
 
 const (
-	// Maximum size of event queue before we start dropping old events
-	maxEventQueueSize = 10000
+	// Default maximum size of event queue before we start dropping old events
+	defaultMaxEventQueueSize = 50000
 
 	// How often to broadcast full state snapshot for reconciliation
 	stateSnapshotInterval = 60 * time.Second
@@ -93,6 +93,7 @@ type ConnectionTracker struct {
 
 	// Configuration
 	maxConnectionsPerUser int // Cluster-wide limit per user (0 = unlimited)
+	maxEventQueueSize     int // Maximum events in broadcast queue
 
 	// Broadcast queue for outgoing events
 	broadcastQueue []ConnectionEvent
@@ -108,13 +109,19 @@ type ConnectionTracker struct {
 // NewConnectionTracker creates a new connection tracker.
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
-func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int) *ConnectionTracker {
+func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxEventQueueSize int) *ConnectionTracker {
+	// Use default if not specified
+	if maxEventQueueSize <= 0 {
+		maxEventQueueSize = defaultMaxEventQueueSize
+	}
+
 	ct := &ConnectionTracker{
 		name:                  name,
 		instanceID:            instanceID,
 		clusterManager:        clusterMgr,
 		connections:           make(map[int64]*UserConnectionInfo),
 		maxConnectionsPerUser: maxConnectionsPerUser,
+		maxEventQueueSize:     maxEventQueueSize,
 		kickSessions:          make(map[int64][]chan struct{}),
 		broadcastQueue:        make([]ConnectionEvent, 0, 100),
 		stopBroadcast:         make(chan struct{}),
@@ -134,8 +141,8 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		go ct.cleanupRoutine()
 		go ct.stateSnapshotRoutine()
 
-		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d (cluster mode)",
-			name, instanceID, maxConnectionsPerUser)
+		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d, queue_size=%d (cluster mode)",
+			name, instanceID, maxConnectionsPerUser, maxEventQueueSize)
 	} else {
 		// Local mode: no gossip, just track connections locally
 		go ct.cleanupRoutine()
@@ -458,11 +465,11 @@ func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
 	defer ct.queueMu.Unlock()
 
 	// If queue is full, drop oldest events (FIFO)
-	if len(ct.broadcastQueue) >= maxEventQueueSize {
+	if len(ct.broadcastQueue) >= ct.maxEventQueueSize {
 		// Drop the oldest 10% of events to make room
-		dropCount := maxEventQueueSize / 10
-		logger.Warnf("[%s-GOSSIP-TRACKER] Event queue overflow (%d events), dropping %d oldest events",
-			ct.name, len(ct.broadcastQueue), dropCount)
+		dropCount := ct.maxEventQueueSize / 10
+		logger.Warnf("[%s-GOSSIP-TRACKER] Event queue overflow (%d/%d events), dropping %d oldest events",
+			ct.name, len(ct.broadcastQueue), ct.maxEventQueueSize, dropCount)
 		ct.broadcastQueue = ct.broadcastQueue[dropCount:]
 	}
 

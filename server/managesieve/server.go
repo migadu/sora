@@ -230,6 +230,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			instanceID,                    // unique instance identifier
 			nil,                           // no cluster manager = local mode
 			options.MaxConnectionsPerUser, // per-user connection limit
+			0,                             // queue size (not used in local mode)
 		)
 
 		log.Printf("ManageSieve [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)

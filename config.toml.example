@@ -348,6 +348,27 @@ peers = []                                      # Initial seed nodes for cluster
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key (REQUIRED for production)
                                                 # Generate with: openssl rand -base64 32
 
+# --- GOSSIP EVENT QUEUE SETTINGS ---
+# Configure the maximum size of the event queue for gossip broadcasts. Each protocol
+# (IMAP, POP3, ManageSieve, LMTP) maintains its own queue of connection events to be
+# gossiped to other cluster nodes. When the queue fills up, oldest events are dropped.
+#
+# RECOMMENDED SIZING:
+# - Default (50,000): Suitable for most deployments with <2000 users per proxy
+# - Busy servers (100,000+): For >3000 active users or high connection churn
+# - Low-traffic (10,000): For small deployments with <500 users
+#
+# MEMORY IMPACT:
+# - ~200 bytes per event × 50,000 × 4 protocols = ~40 MB per proxy server
+# - Safe to increase significantly on modern hardware
+#
+# QUEUE OVERFLOW BEHAVIOR:
+# - When full, drops oldest 10% of events and logs a warning
+# - Periodic state snapshots (every 60s) recover from any lost events
+# - Temporary inconsistency acceptable; eventual consistency guaranteed
+#
+max_event_queue_size = 50000                    # Max events per protocol queue (default: 50000)
+
 # --- CLUSTER-WIDE AUTH RATE LIMITING ---
 # Synchronize authentication rate limiting across cluster nodes via gossip protocol.
 # When enabled, failed authentication attempts on one node immediately block the IP
