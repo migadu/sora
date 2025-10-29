@@ -430,9 +430,13 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 	ct.queueMu.Lock()
 	defer ct.queueMu.Unlock()
 
-	if len(ct.broadcastQueue) == 0 {
+	queueLen := len(ct.broadcastQueue)
+	if queueLen == 0 {
 		return nil
 	}
+
+	logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts called: queue_len=%d, overhead=%d, limit=%d",
+		ct.name, queueLen, overhead, limit)
 
 	broadcasts := make([][]byte, 0, len(ct.broadcastQueue))
 	totalSize := 0
@@ -449,6 +453,8 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 		if totalSize+msgSize > limit && len(broadcasts) > 0 {
 			// Keep remaining events for next broadcast
 			ct.broadcastQueue = ct.broadcastQueue[i:]
+			logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts returning %d messages (limit reached, %d remain queued)",
+				ct.name, len(broadcasts), len(ct.broadcastQueue))
 			return broadcasts
 		}
 
@@ -458,6 +464,8 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 
 	// All events broadcasted, clear queue
 	ct.broadcastQueue = ct.broadcastQueue[:0]
+	logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts returning %d messages (queue emptied)",
+		ct.name, len(broadcasts))
 	return broadcasts
 }
 

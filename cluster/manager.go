@@ -324,13 +324,17 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 	m.connectionBroadcastMu.RLock()
 	broadcasters := make([]func(int, int) [][]byte, len(m.connectionBroadcasts))
 	copy(broadcasters, m.connectionBroadcasts)
+	broadcasterCount := len(m.connectionBroadcasts)
 	m.connectionBroadcastMu.RUnlock()
+
+	logger.Debugf("[Cluster] getConnectionBroadcasts called: %d broadcasters registered", broadcasterCount)
 
 	var allBroadcasts [][]byte
 	totalSize := 0
 
-	for _, broadcaster := range broadcasters {
+	for idx, broadcaster := range broadcasters {
 		broadcasts := broadcaster(overhead, limit-totalSize)
+		logger.Debugf("[Cluster] Broadcaster %d returned %d messages", idx, len(broadcasts))
 		for _, msg := range broadcasts {
 			// Add 'CN' magic marker to identify connection messages
 			marked := make([]byte, len(msg)+2)
@@ -340,6 +344,7 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 
 			msgSize := overhead + len(marked)
 			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
+				logger.Debugf("[Cluster] Connection broadcast limit reached: returning %d messages", len(allBroadcasts))
 				return allBroadcasts
 			}
 
@@ -348,6 +353,7 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 		}
 	}
 
+	logger.Debugf("[Cluster] getConnectionBroadcasts returning %d total messages", len(allBroadcasts))
 	return allBroadcasts
 }
 
