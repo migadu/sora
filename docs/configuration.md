@@ -158,22 +158,23 @@ min_bytes_per_minute = 1024
 Enables gossip-based clustering for TLS certificate management, rate limiting synchronization, and connection tracking.
 
 *   `enabled`: Set to `true` to enable cluster mode.
-*   `bind_addr`: Address to bind for cluster communication (default: `"0.0.0.0"`).
-*   `bind_port`: Port for gossip protocol (default: `7946`).
+*   `addr`: **REQUIRED** - Specific IP address (with optional port) to bind for cluster communication. **MUST** be a real IP address reachable from other cluster nodes. **CANNOT** use `0.0.0.0`, `localhost`, `127.0.0.1`, `::`, or `::1`. Examples: `"10.10.10.40:7946"` or `"10.10.10.40"` (uses `port` field if port not specified).
+*   `port`: Port for gossip protocol (default: `7946`). Only used if `addr` does not include a port.
 *   `node_id`: Unique identifier for this node (e.g., `"node-1"`).
-*   `peers`: List of other cluster nodes (e.g., `["node-2:7946", "node-3:7946"]`).
+*   `peers`: List of other cluster nodes (e.g., `["10.10.10.41:7946", "10.10.10.42:7946"]`). **Do NOT include this node's address** - only list OTHER nodes in the cluster.
 *   `secret_key`: 32-byte base64-encoded key for encrypting cluster communication. Generate with: `openssl rand -base64 32`
 
 Example:
 ```toml
 [cluster]
 enabled = true
-bind_addr = "0.0.0.0"
-bind_port = 7946
+addr = "10.10.10.40:7946"  # Node 1 - MUST be specific IP reachable from peers
 node_id = "node-1"
-peers = ["node-2:7946", "node-3:7946"]
+peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # List OTHER nodes, not this node
 secret_key = "your-base64-encoded-secret-key"
 ```
+
+**CRITICAL:** The `addr` field must be a specific IP address that other cluster nodes can reach. The gossip protocol uses this address for both binding the listener and advertising to peers. Using `0.0.0.0` or `localhost` will prevent other nodes from connecting to this node.
 
 #### Cluster-Wide Rate Limiting
 
@@ -428,10 +429,9 @@ secret_key = "your-secret-key"
 
 [cluster]
 enabled = true
-bind_addr = "0.0.0.0"
-bind_port = 7946
+addr = "10.0.1.10:7946"  # Node 1 - MUST be specific IP reachable from peers
 node_id = "node-1"  # Unique per node
-peers = ["node-2.internal:7946", "node-3.internal:7946"]
+peers = ["10.0.1.11:7946", "10.0.1.12:7946"]  # List OTHER nodes, not this node
 secret_key = "base64-encoded-secret-key"
 
 [cluster.rate_limit_sync]

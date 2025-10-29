@@ -228,10 +228,9 @@ When cluster mode is enabled, Sora can synchronize authentication rate limiting 
 ```toml
 [cluster]
 enabled = true
-bind_addr = "0.0.0.0"
-bind_port = 7946
+addr = "10.10.10.40:7946"  # MUST be specific IP reachable from peers (NOT 0.0.0.0 or localhost)
 node_id = "node-1"
-peers = ["node-2:7946", "node-3:7946"]
+peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # List OTHER nodes, not this node
 secret_key = "base64-encoded-32-byte-key"  # Generate: openssl rand -base64 32
 
 # Cluster-wide rate limiting (enabled by default when cluster is enabled)
@@ -464,7 +463,7 @@ openssl rand -base64 32
 
 ### Network Isolation
 
-- Bind gossip to private network: `bind_addr = "10.0.0.1"`
+- Bind gossip to specific private network IP: `addr = "10.0.0.1:7946"` (NOT `0.0.0.0`)
 - Use firewall rules to restrict port 7946 to cluster nodes only
 - Do not expose gossip port to the internet
 

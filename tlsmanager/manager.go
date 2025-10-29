@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/migadu/sora/cluster"
@@ -218,6 +219,10 @@ func (m *Manager) initLetsEncryptProvider() error {
 					return nil, ErrMissingServerName
 				}
 			}
+
+			// Normalize server name to lowercase for case-insensitive comparison
+			// RFC 4343: DNS names are case-insensitive
+			serverName = strings.ToLower(serverName)
 
 			// Check if the server name matches our configured domains using the HostPolicy
 			if err := m.autocertMgr.HostPolicy(nil, serverName); err != nil {

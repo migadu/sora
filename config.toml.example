@@ -295,10 +295,45 @@ debug = false                                   # Enable detailed S3 request/res
 
 [cluster]
 enabled = false                                 # Enable cluster mode (default: false)
-bind_addr = "0.0.0.0"                           # Gossip protocol bind address (default: "0.0.0.0")
-bind_port = 7946                                # Gossip protocol port (default: 7946)
+
+# --- GOSSIP BIND ADDRESS ---
+# CRITICAL: The bind address MUST be a specific IP address that is reachable from other cluster nodes.
+# This address is used for:
+# 1. Binding the gossip UDP/TCP listener
+# 2. Advertising to other cluster nodes (they will connect to this address)
+# 3. Broadcasting gossip messages across the cluster
+#
+# VALID EXAMPLES:
+#   addr = "10.10.10.40:7946"         # Specific IP with port (recommended)
+#   addr = "10.10.10.40"              # Specific IP (uses port from 'port' field below)
+#   addr = "192.168.1.100:7946"       # Private network IP
+#
+# INVALID (WILL FAIL):
+#   addr = "0.0.0.0:7946"             # Cannot use 0.0.0.0 - other nodes cannot reach you
+#   addr = "localhost:7946"           # Cannot use localhost - only local machine can reach
+#   addr = "127.0.0.1:7946"           # Cannot use 127.0.0.1 - loopback not reachable
+#   addr = "[::]:7946"                # Cannot use :: - IPv6 any address not reachable
+#   addr = "[::1]:7946"               # Cannot use ::1 - IPv6 loopback not reachable
+#
+# WHY THIS MATTERS:
+# The gossip protocol needs to advertise a real IP address to other nodes. When you bind to
+# 0.0.0.0 or localhost, memberlist doesn't know what IP address to tell other nodes to connect to.
+# Using a specific IP solves this by using the same address for both binding and advertising.
+#
+# NETWORK REQUIREMENTS:
+# - This address must be accessible from all other cluster nodes on both TCP and UDP
+# - Firewall rules must allow TCP + UDP traffic on the gossip port (default: 7946)
+# - The address must be a network interface that exists on this machine
+#
+addr = "10.10.10.40:7946"                       # Gossip bind address - MUST be specific IP reachable from other nodes
+
+# --- GOSSIP PORT ---
+# Only used if 'addr' does not include a port. If addr="10.10.10.40:7946", this is ignored.
+# If addr="10.10.10.40", this port will be appended to create "10.10.10.40:7946".
+port = 7946                                     # Gossip port (default: 7946)
+
 node_id = ""                                    # Unique node ID (default: hostname)
-peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com", "node-2.example.com"])
+peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "node-2.example.com:7946"])
                                                 # IMPORTANT: Do NOT include this node's own node_id in the peers list!
                                                 # Only list OTHER nodes in the cluster. Self-references will be filtered out
                                                 # automatically and a warning will be logged.
@@ -327,20 +362,31 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 # EXAMPLE USAGE (Multi-instance deployment):
 # [cluster]
 # enabled = true
-# bind_addr = "0.0.0.0"
-# bind_port = 7946
+# addr = "10.10.10.40:7946"                     # Node 1 specific IP (MUST be reachable from peers)
 # node_id = "sora-1"                            # Or leave empty to use hostname
-# peers = ["sora-2.example.com", "sora-3.example.com"]  # Only need 1-2 seed nodes, gossip discovers others
+# peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # Only need 1-2 seed nodes, gossip discovers others
 # secret_key = "YOUR_BASE64_ENCODED_32_BYTE_SECRET_KEY_HERE"
+#
+# On node 2, use:
+# addr = "10.10.10.41:7946"                     # Node 2 specific IP
+# peers = ["10.10.10.40:7946"]                  # List node 1 (or any other node)
+#
+# On node 3, use:
+# addr = "10.10.10.42:7946"                     # Node 3 specific IP
+# peers = ["10.10.10.40:7946"]                  # List node 1 (or any other node)
 
 # SETUP STEPS:
 # 1. Generate cluster secret key:
 #    openssl rand -base64 32
 # 2. Configure same secret_key on all nodes (CRITICAL: must match across cluster)
 # 3. Set unique node_id for each node (or use default hostname)
-# 4. Specify 1-2 peer nodes for initial discovery
-# 5. Start all nodes - they will discover each other via gossip
-# 6. Verify cluster membership: check logs for "Cluster manager initialized"
+# 4. Configure addr with the SPECIFIC IP ADDRESS of each node (NOT 0.0.0.0 or localhost!)
+#    - Node 1: addr = "10.10.10.40:7946"
+#    - Node 2: addr = "10.10.10.41:7946"
+#    - Node 3: addr = "10.10.10.42:7946"
+# 5. Specify 1-2 peer nodes for initial discovery (each node lists OTHER nodes, not itself)
+# 6. Start all nodes - they will discover each other via gossip
+# 7. Verify cluster membership: check logs for "Cluster manager initialized" and member count
 #
 # FEATURES:
 # - Automatic leader election (lexicographically smallest node ID)
@@ -358,8 +404,9 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 # - Automatic leadership handoff when leader fails
 #
 # PORTS:
-# - bind_port (7946): Gossip protocol communication (TCP + UDP)
-# - Ensure this port is accessible between all cluster nodes
+# - Gossip port (default: 7946): Gossip protocol communication (TCP + UDP)
+# - Ensure this port is accessible between all cluster nodes (both TCP and UDP)
+# - If using a firewall, allow inbound/outbound TCP + UDP on the gossip port from cluster node IPs
 #
 # SECURITY:
 # - ALWAYS use secret_key in production for encrypted gossip communication

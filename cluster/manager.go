@@ -93,9 +93,33 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Configure memberlist
 	mlConfig := memberlist.DefaultLANConfig()
 	mlConfig.Name = nodeID
-	mlConfig.BindAddr = cfg.BindAddr
-	mlConfig.BindPort = cfg.BindPort
+
+	bindAddr := cfg.GetBindAddr()
+	bindPort := cfg.GetBindPort()
+
+	mlConfig.BindAddr = bindAddr
+	mlConfig.BindPort = bindPort
 	mlConfig.Delegate = m.delegate
+
+	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost
+	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" ||
+	   bindAddr == "localhost" || bindAddr == "127.0.0.1" || bindAddr == "::1" {
+		logger.Errorf("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
+		logger.Errorf("Current value: '%s' is not valid for cluster gossip", bindAddr)
+		logger.Errorf("The gossip protocol requires advertising a real IP address that other nodes can reach")
+		logger.Errorf("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
+		logger.Errorf("Cannot use: 0.0.0.0, localhost, 127.0.0.1, ::, or ::1")
+		cancel()
+		return nil, fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes", bindAddr)
+	}
+
+	// Use bind address as advertise address (they should be the same)
+	mlConfig.AdvertiseAddr = bindAddr
+	mlConfig.AdvertisePort = bindPort
+
+	// Log memberlist configuration
+	logger.Infof("Memberlist config: Name=%s, BindAddr=%s, BindPort=%d, AdvertiseAddr=%s, AdvertisePort=%d, GossipInterval=%v, GossipNodes=%d",
+		mlConfig.Name, mlConfig.BindAddr, mlConfig.BindPort, mlConfig.AdvertiseAddr, mlConfig.AdvertisePort, mlConfig.GossipInterval, mlConfig.GossipNodes)
 	logger.Infof("Cluster delegate attached to memberlist config: %p", mlConfig.Delegate)
 
 	// Enable more verbose memberlist logging to debug gossip
@@ -611,7 +635,7 @@ func (d *clusterDelegate) NodeMeta(limit int) []byte {
 }
 
 func (d *clusterDelegate) NotifyMsg(msg []byte) {
-	logger.Infof("[Cluster] NotifyMsg called with message (len=%d)", len(msg))
+	logger.Debugf("[Cluster] NotifyMsg called with message (len=%d)", len(msg))
 
 	if len(msg) < 2 {
 		logger.Warnf("[Cluster] Received invalid message (len=%d)", len(msg))
@@ -620,15 +644,15 @@ func (d *clusterDelegate) NotifyMsg(msg []byte) {
 
 	// Check message type by magic marker
 	if msg[0] == 0x52 && msg[1] == 0x4C { // 'R' 'L' - Rate Limit
-		logger.Infof("[Cluster] Received rate limit message (len=%d)", len(msg))
+		logger.Debugf("[Cluster] Received rate limit message (len=%d)", len(msg))
 		// Strip marker and forward to rate limit handlers
 		d.manager.notifyRateLimitHandlers(msg[2:])
 	} else if msg[0] == 0x41 && msg[1] == 0x46 { // 'A' 'F' - Affinity
-		logger.Infof("[Cluster] Received affinity message (len=%d)", len(msg))
+		logger.Debugf("[Cluster] Received affinity message (len=%d)", len(msg))
 		// Strip marker and forward to affinity handlers
 		d.manager.notifyAffinityHandlers(msg[2:])
 	} else if msg[0] == 0x43 && msg[1] == 0x4E { // 'C' 'N' - Connection
-		logger.Infof("[Cluster] Received connection tracking message (len=%d)", len(msg))
+		logger.Debugf("[Cluster] Received connection tracking message (len=%d)", len(msg))
 		// Strip marker and forward to connection handlers
 		d.manager.notifyConnectionHandlers(msg[2:])
 	} else {

@@ -179,10 +179,9 @@ max_connections_per_ip = 10  # Per-IP limit
 ```toml
 [cluster]
 enabled = true
-bind_addr = "0.0.0.0"
-bind_port = 7946
+addr = "10.10.10.40:7946"  # MUST be specific IP reachable from other nodes (NOT 0.0.0.0 or localhost)
 node_id = "node-1"
-peers = ["node-2:7946", "node-3:7946"]
+peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # List OTHER nodes, not this node
 secret_key = "base64-encoded-32-byte-key"  # Generate: openssl rand -base64 32
 
 # Cluster-wide rate limiting (enabled by default when cluster is enabled)

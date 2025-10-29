@@ -156,13 +156,58 @@ type ClusterAffinityConfig struct {
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
 	Enabled       bool                       `toml:"enabled"`         // Enable cluster mode
-	BindAddr      string                     `toml:"bind_addr"`       // Gossip protocol bind address
-	BindPort      int                        `toml:"bind_port"`       // Gossip protocol port
+	Addr          string                     `toml:"addr"`            // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
+	Port          int                        `toml:"port"`            // Gossip port (used if not specified in addr)
 	NodeID        string                     `toml:"node_id"`         // Unique node ID (defaults to hostname)
 	Peers         []string                   `toml:"peers"`           // Initial seed nodes
 	SecretKey     string                     `toml:"secret_key"`      // Cluster encryption key (base64-encoded 32-byte key)
 	RateLimitSync ClusterRateLimitSyncConfig `toml:"rate_limit_sync"` // Auth rate limiting sync configuration
 	Affinity      ClusterAffinityConfig      `toml:"affinity"`        // Server affinity configuration
+
+	// Deprecated fields (for backwards compatibility)
+	BindAddr      string                     `toml:"bind_addr"`       // Deprecated: use 'addr' instead
+	BindPort      int                        `toml:"bind_port"`       // Deprecated: use 'port' instead
+}
+
+// GetBindAddr returns the bind address, handling both new 'addr' and deprecated 'bind_addr'
+func (c *ClusterConfig) GetBindAddr() string {
+	// Support both new 'addr' field and deprecated 'bind_addr' for backwards compatibility
+	if c.Addr != "" {
+		// Parse addr to extract just the IP (not port)
+		if strings.Contains(c.Addr, ":") {
+			parts := strings.Split(c.Addr, ":")
+			return parts[0]
+		}
+		return c.Addr
+	}
+	// Fall back to deprecated bind_addr
+	return c.BindAddr
+}
+
+// GetBindPort returns the bind port, handling both new and deprecated fields
+func (c *ClusterConfig) GetBindPort() int {
+	// If addr contains a port, use that
+	if c.Addr != "" && strings.Contains(c.Addr, ":") {
+		parts := strings.Split(c.Addr, ":")
+		if len(parts) == 2 {
+			if port, err := strconv.Atoi(parts[1]); err == nil {
+				return port
+			}
+		}
+	}
+
+	// Otherwise use explicit port field
+	if c.Port > 0 {
+		return c.Port
+	}
+
+	// Fall back to deprecated bind_port
+	if c.BindPort > 0 {
+		return c.BindPort
+	}
+
+	// Default to 7946
+	return 7946
 }
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage

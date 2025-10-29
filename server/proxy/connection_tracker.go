@@ -333,7 +333,7 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 
 	if ct.clusterManager != nil {
 		// Cluster mode: broadcast kick event via gossip
-		logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
+		logger.Debugf("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
 			ct.name, accountID, protocol)
 
 		ct.queueEvent(ConnectionEvent{
@@ -567,7 +567,7 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 
 // handleKick processes a kick event from another node
 func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
-	logger.Infof("[%s-GOSSIP-TRACKER] Received kick for accountID=%d, protocol=%s from node=%s",
+	logger.Debugf("[%s-GOSSIP-TRACKER] Received kick for accountID=%d, protocol=%s from node=%s",
 		ct.name, event.AccountID, event.Protocol, event.NodeID)
 
 	// Notify all sessions for this user
