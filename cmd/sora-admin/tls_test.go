@@ -108,8 +108,8 @@ func TestInsecureSkipVerify_Enabled(t *testing.T) {
 
 	// Create HTTP client config with InsecureSkipVerify = true
 	cfg := AdminConfig{
-		HTTPAPIAddr:              baseURL,
-		HTTPAPIKey:               testAPIKeyForTLS,
+		HTTPAPIAddr:               baseURL,
+		HTTPAPIKey:                testAPIKeyForTLS,
 		HTTPAPIInsecureSkipVerify: true, // This is the default
 	}
 
@@ -153,8 +153,8 @@ func TestInsecureSkipVerify_Disabled(t *testing.T) {
 
 	// Create HTTP client config with InsecureSkipVerify = false
 	cfg := AdminConfig{
-		HTTPAPIAddr:              baseURL,
-		HTTPAPIKey:               testAPIKeyForTLS,
+		HTTPAPIAddr:               baseURL,
+		HTTPAPIKey:                testAPIKeyForTLS,
 		HTTPAPIInsecureSkipVerify: false, // Explicitly disable
 	}
 

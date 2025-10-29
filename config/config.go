@@ -163,28 +163,22 @@ type ClusterConfig struct {
 	SecretKey     string                     `toml:"secret_key"`      // Cluster encryption key (base64-encoded 32-byte key)
 	RateLimitSync ClusterRateLimitSyncConfig `toml:"rate_limit_sync"` // Auth rate limiting sync configuration
 	Affinity      ClusterAffinityConfig      `toml:"affinity"`        // Server affinity configuration
-
-	// Deprecated fields (for backwards compatibility)
-	BindAddr      string                     `toml:"bind_addr"`       // Deprecated: use 'addr' instead
-	BindPort      int                        `toml:"bind_port"`       // Deprecated: use 'port' instead
 }
 
-// GetBindAddr returns the bind address, handling both new 'addr' and deprecated 'bind_addr'
+// GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
-	// Support both new 'addr' field and deprecated 'bind_addr' for backwards compatibility
-	if c.Addr != "" {
-		// Parse addr to extract just the IP (not port)
-		if strings.Contains(c.Addr, ":") {
-			parts := strings.Split(c.Addr, ":")
-			return parts[0]
-		}
-		return c.Addr
+	if c.Addr == "" {
+		return ""
 	}
-	// Fall back to deprecated bind_addr
-	return c.BindAddr
+	// Parse addr to extract just the IP (not port)
+	if strings.Contains(c.Addr, ":") {
+		parts := strings.Split(c.Addr, ":")
+		return parts[0]
+	}
+	return c.Addr
 }
 
-// GetBindPort returns the bind port, handling both new and deprecated fields
+// GetBindPort returns the bind port from addr or the port field
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
 	if c.Addr != "" && strings.Contains(c.Addr, ":") {
@@ -199,11 +193,6 @@ func (c *ClusterConfig) GetBindPort() int {
 	// Otherwise use explicit port field
 	if c.Port > 0 {
 		return c.Port
-	}
-
-	// Fall back to deprecated bind_port
-	if c.BindPort > 0 {
-		return c.BindPort
 	}
 
 	// Default to 7946
@@ -230,6 +219,7 @@ type TLSLetsEncryptConfig struct {
 	RenewBefore     string                 `toml:"renew_before"`     // Renew certificates this duration before expiry (e.g., "720h" = 30 days). Default: 30 days
 	EnableFallback  bool                   `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true)
 	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
+	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -1237,9 +1227,9 @@ type SharedMailboxesConfig struct {
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
 type AdminCLIConfig struct {
-	Addr              string `toml:"addr"`                 // HTTP Admin API endpoint address
-	APIKey            string `toml:"api_key"`              // API key for authentication
-	InsecureSkipVerify *bool `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
+	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
+	APIKey             string `toml:"api_key"`              // API key for authentication
+	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
 }
 
 // Config holds all configuration for the application.

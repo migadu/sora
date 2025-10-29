@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -101,16 +102,28 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	mlConfig.BindPort = bindPort
 	mlConfig.Delegate = m.delegate
 
-	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost
-	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" ||
-	   bindAddr == "localhost" || bindAddr == "127.0.0.1" || bindAddr == "::1" {
+	// Warn if both addr contains port AND port field is set (port field will be ignored)
+	if cfg.Addr != "" && strings.Contains(cfg.Addr, ":") && cfg.Port > 0 {
+		logger.Warnf("Cluster configuration: 'addr' contains port (%s) and 'port' field is also set (%d)", cfg.Addr, cfg.Port)
+		logger.Warnf("The port from 'addr' (%d) will be used, and 'port' field (%d) will be ignored", bindPort, cfg.Port)
+		logger.Warnf("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
+	}
+
+	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost hostname
+	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" || bindAddr == "localhost" {
 		logger.Errorf("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
 		logger.Errorf("Current value: '%s' is not valid for cluster gossip", bindAddr)
 		logger.Errorf("The gossip protocol requires advertising a real IP address that other nodes can reach")
 		logger.Errorf("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
-		logger.Errorf("Cannot use: 0.0.0.0, localhost, 127.0.0.1, ::, or ::1")
+		logger.Errorf("Cannot use: 0.0.0.0, localhost, or ::")
 		cancel()
 		return nil, fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes", bindAddr)
+	}
+
+	// Warn about loopback addresses (allowed for testing but not recommended for production)
+	if bindAddr == "127.0.0.1" || bindAddr == "::1" {
+		logger.Warnf("Cluster mode: Using loopback address '%s' - this only works for single-machine testing", bindAddr)
+		logger.Warnf("For production clusters across multiple machines, use a real network IP address")
 	}
 
 	// Use bind address as advertise address (they should be the same)
@@ -215,11 +228,11 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	}()
 
 	if selfReferenceFound {
-		logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, original_peers=%v, filtered_peers=%v",
-			nodeID, cfg.BindAddr, cfg.BindPort, cfg.Peers, filteredPeers)
+		logger.Infof("Cluster manager started: node_id=%s, addr=%s, original_peers=%v, filtered_peers=%v",
+			nodeID, cfg.Addr, cfg.Peers, filteredPeers)
 	} else {
-		logger.Infof("Cluster manager started: node_id=%s, bind=%s:%d, peers=%v",
-			nodeID, cfg.BindAddr, cfg.BindPort, filteredPeers)
+		logger.Infof("Cluster manager started: node_id=%s, addr=%s, peers=%v",
+			nodeID, cfg.Addr, filteredPeers)
 	}
 
 	return m, nil
@@ -600,8 +613,8 @@ func (m *memberlistLogger) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	// Memberlist logs are very verbose, only log important ones
 	if bytes.Contains(p, []byte("broadcasting")) ||
-	   bytes.Contains(p, []byte("GetBroadcasts")) ||
-	   bytes.Contains(p, []byte("gossip")) {
+		bytes.Contains(p, []byte("GetBroadcasts")) ||
+		bytes.Contains(p, []byte("gossip")) {
 		logger.Debugf("%s%s", m.prefix, msg)
 	}
 	return len(p), nil

@@ -180,6 +180,12 @@ storage_provider = "s3"                         # Certificate storage backend (c
 # OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)
 # renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (format: "Xh", "Xd" not supported, use hours)
 
+# OPTIONAL: Certificate synchronization from S3 (enabled by default)
+# sync_interval = "5m"                          # Interval to check S3 for certificate updates (e.g., "5m", "10m", "1h"). Default: "5m"
+#                                               # Set to "0" to disable periodic sync. When enabled, all cluster nodes will automatically
+#                                               # download renewed certificates from S3 without restart. This ensures all nodes serve the
+#                                               # same certificate even when the leader renews it.
+
 # OPTIONAL: Local filesystem fallback for S3 outages (enabled by default)
 # enable_fallback = true                        # Enable local filesystem fallback when S3 is unavailable (default: true)
 # fallback_dir = "/var/lib/sora/certs"          # Local directory to cache certificates when S3 is unavailable (default: "/var/lib/sora/certs")
@@ -310,10 +316,12 @@ enabled = false                                 # Enable cluster mode (default: 
 #
 # INVALID (WILL FAIL):
 #   addr = "0.0.0.0:7946"             # Cannot use 0.0.0.0 - other nodes cannot reach you
-#   addr = "localhost:7946"           # Cannot use localhost - only local machine can reach
-#   addr = "127.0.0.1:7946"           # Cannot use 127.0.0.1 - loopback not reachable
+#   addr = "localhost:7946"           # Cannot use localhost - hostname resolution issues
 #   addr = "[::]:7946"                # Cannot use :: - IPv6 any address not reachable
-#   addr = "[::1]:7946"               # Cannot use ::1 - IPv6 loopback not reachable
+#
+# TESTING ONLY (works but not for production):
+#   addr = "127.0.0.1:7946"           # Loopback - works for single-machine testing only
+#   addr = "[::1]:7946"               # IPv6 loopback - works for single-machine testing only
 #
 # WHY THIS MATTERS:
 # The gossip protocol needs to advertise a real IP address to other nodes. When you bind to

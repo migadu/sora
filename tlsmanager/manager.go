@@ -258,6 +258,20 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 	logger.Infof("Certificates will be stored in S3 bucket: %s", leCfg.S3.Bucket)
 
+	// Start certificate sync worker if configured
+	if leCfg.SyncInterval != "" && leCfg.SyncInterval != "0" {
+		syncInterval, err := time.ParseDuration(leCfg.SyncInterval)
+		if err != nil {
+			return fmt.Errorf("invalid sync_interval duration: %w", err)
+		}
+		if syncInterval > 0 {
+			m.startCertificateSyncWorker(syncInterval)
+		}
+	} else if leCfg.SyncInterval == "" {
+		// Default to 5 minutes if not specified
+		m.startCertificateSyncWorker(5 * time.Minute)
+	}
+
 	return nil
 }
 

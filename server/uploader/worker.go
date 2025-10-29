@@ -122,10 +122,13 @@ func (w *UploadWorker) run(ctx context.Context) {
 	monitorTicker := time.NewTicker(5 * time.Minute)
 	defer monitorTicker.Stop()
 
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	logger.Info("[UPLOADER] worker processing every 30s")
+	logger.Info("[UPLOADER] worker processing every 30s, cleanup and monitoring every 5min")
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -147,6 +150,11 @@ func (w *UploadWorker) run(ctx context.Context) {
 			logger.Info("[UPLOADER] monitor tick")
 			if err := w.monitorStuckUploads(ctx); err != nil {
 				logger.Errorf("[UPLOADER] monitor error: %v", err)
+			}
+		case <-cleanupTicker.C:
+			logger.Info("[UPLOADER] cleanup tick")
+			if err := w.cleanupOrphanedFiles(ctx); err != nil {
+				logger.Errorf("[UPLOADER] cleanup error: %v", err)
 			}
 		case <-w.notifyCh:
 			logger.Info("[UPLOADER] worker notified")

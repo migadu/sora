@@ -17,8 +17,7 @@ func TestClusterRateLimitSync(t *testing.T) {
 	// Create 2-node test cluster
 	cfg1 := config.ClusterConfig{
 		Enabled:   true,
-		BindAddr:  "127.0.0.1",
-		BindPort:  17946, // Test port
+		Addr:      "127.0.0.1:17946",
 		NodeID:    "test-node-1",
 		Peers:     []string{"127.0.0.1:17947"},
 		SecretKey: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=", // base64 encoded 32-byte key
@@ -31,8 +30,7 @@ func TestClusterRateLimitSync(t *testing.T) {
 
 	cfg2 := config.ClusterConfig{
 		Enabled:   true,
-		BindAddr:  "127.0.0.1",
-		BindPort:  17947, // Test port
+		Addr:      "127.0.0.1:17947",
 		NodeID:    "test-node-2",
 		Peers:     []string{"127.0.0.1:17946"},
 		SecretKey: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=", // base64 encoded 32-byte key

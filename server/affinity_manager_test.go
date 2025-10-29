@@ -276,8 +276,7 @@ func testAffinityStaleEventRejection(t *testing.T) {
 func createTestCluster(nodeID string, port int, peers []string) (*cluster.Manager, error) {
 	cfg := config.ClusterConfig{
 		Enabled:   true,
-		BindAddr:  "127.0.0.1",
-		BindPort:  port,
+		Addr:      fmt.Sprintf("127.0.0.1:%d", port),
 		NodeID:    nodeID,
 		Peers:     peers,
 		SecretKey: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=", // Base64-encoded 32-byte key

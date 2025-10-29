@@ -43,7 +43,7 @@ func handleRelayCommand(ctx context.Context) {
 	}
 }
 
-func handleRelayStats(ctx context.Context) {
+func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
 	configPath := flags.String("config", "config.toml", "Configuration file path")
 	flags.Parse(os.Args[3:])
@@ -87,7 +87,7 @@ func handleRelayStats(ctx context.Context) {
 	fmt.Printf("Worker Interval:  %s\n", cfg.Relay.Queue.WorkerInterval)
 }
 
-func handleRelayList(ctx context.Context) {
+func handleRelayList(_ context.Context) {
 	flags := flag.NewFlagSet("relay list", flag.ExitOnError)
 	configPath := flags.String("config", "config.toml", "Configuration file path")
 	queueType := flags.String("queue", "pending", "Queue to list (pending, processing, failed)")
@@ -193,7 +193,7 @@ func handleRelayList(ctx context.Context) {
 	}
 }
 
-func handleRelayShow(ctx context.Context) {
+func handleRelayShow(_ context.Context) {
 	flags := flag.NewFlagSet("relay show", flag.ExitOnError)
 	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to display (required)")
@@ -278,7 +278,7 @@ func handleRelayShow(ctx context.Context) {
 	fmt.Println("---")
 }
 
-func handleRelayDelete(ctx context.Context) {
+func handleRelayDelete(_ context.Context) {
 	flags := flag.NewFlagSet("relay delete", flag.ExitOnError)
 	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to delete (use 'all' to delete all messages)")
@@ -359,7 +359,7 @@ func handleRelayDelete(ctx context.Context) {
 	}
 }
 
-func handleRelayRequeue(ctx context.Context) {
+func handleRelayRequeue(_ context.Context) {
 	flags := flag.NewFlagSet("relay requeue", flag.ExitOnError)
 	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to requeue (use 'all' to requeue all failed messages)")

@@ -462,14 +462,14 @@ The PostgreSQL schema (db/schema.sql) includes:
    ```toml
    [cluster]
    enabled = true
-   bind_addr = "0.0.0.0"
-   bind_port = 7946
+   addr = "10.10.10.40:7946"  # MUST be specific IP reachable from peers (NOT 0.0.0.0 or localhost)
    node_id = "node-1"
-   peers = ["node-2:7946", "node-3:7946"]
+   peers = ["10.10.10.41:7946", "10.10.10.42:7946"]  # List OTHER nodes, not this node
    secret_key = "base64-encoded-32-byte-key"
    ```
+   **CRITICAL:** Use a specific IP address for `addr` that other cluster nodes can reach. Cannot use `0.0.0.0`, `localhost`, `127.0.0.1`, `::`, or `::1`.
 2. **TLS Certificates**: Configure Let's Encrypt with S3 storage
-3. **Port Access**: Ensure port 7946 (gossip) accessible between nodes
+3. **Port Access**: Ensure port 7946 (gossip) accessible between nodes (both TCP and UDP)
 4. **Port 80**: Must be accessible from internet for HTTP-01 challenges
 5. **S3 Bucket**: Create bucket for certificate storage
 6. **Testing**: Verify leader election and certificate renewal

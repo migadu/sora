@@ -44,8 +44,7 @@ func TestIMAPProxyUserAffinity(t *testing.T) {
 	// Create a test cluster for affinity
 	clusterCfg := config.ClusterConfig{
 		Enabled:   true,
-		BindAddr:  "127.0.0.1",
-		BindPort:  getRandomPort(t),
+		Addr:      fmt.Sprintf("127.0.0.1:%d", getRandomPort(t)),
 		NodeID:    "test-proxy-node",
 		Peers:     []string{},
 		SecretKey: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=", // Base64-encoded 32-byte key
@@ -179,8 +178,7 @@ func TestIMAPProxyAffinityFailover(t *testing.T) {
 	// Create a test cluster for affinity
 	clusterCfg := config.ClusterConfig{
 		Enabled:   true,
-		BindAddr:  "127.0.0.1",
-		BindPort:  getRandomPort(t),
+		Addr:      fmt.Sprintf("127.0.0.1:%d", getRandomPort(t)),
 		NodeID:    "test-failover-node",
 		Peers:     []string{},
 		SecretKey: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=", // Base64-encoded 32-byte key

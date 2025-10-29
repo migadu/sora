@@ -36,16 +36,16 @@ var (
 
 // AdminConfig holds minimal configuration needed for admin operations
 type AdminConfig struct {
-	Database                 config.DatabaseConfig        `toml:"database"`
-	S3                       config.S3Config              `toml:"s3"`
-	LocalCache               config.LocalCacheConfig      `toml:"local_cache"`
-	Uploader                 config.UploaderConfig        `toml:"uploader"`
-	Cleanup                  config.CleanupConfig         `toml:"cleanup"`
-	SharedMailboxes          config.SharedMailboxesConfig `toml:"shared_mailboxes"`
-	Server                   []map[string]interface{}     `toml:"server"` // Ignore server config array, not needed for admin commands
-	HTTPAPIAddr              string                       `toml:"http_api_addr"`                // HTTP API address for kick operations (e.g., "http://localhost:8080")
-	HTTPAPIKey               string                       `toml:"http_api_key"`                 // HTTP API key for authentication
-	HTTPAPIInsecureSkipVerify bool                        `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
+	Database                  config.DatabaseConfig        `toml:"database"`
+	S3                        config.S3Config              `toml:"s3"`
+	LocalCache                config.LocalCacheConfig      `toml:"local_cache"`
+	Uploader                  config.UploaderConfig        `toml:"uploader"`
+	Cleanup                   config.CleanupConfig         `toml:"cleanup"`
+	SharedMailboxes           config.SharedMailboxesConfig `toml:"shared_mailboxes"`
+	Server                    []map[string]interface{}     `toml:"server"`                        // Ignore server config array, not needed for admin commands
+	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
+	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
+	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
 }
 
 // createHTTPAPIClient creates an HTTP client for calling the HTTP API
@@ -4750,8 +4750,7 @@ func printPrettyConfig(cfg config.Config) {
 	fmt.Println("CLUSTER CONFIGURATION:")
 	fmt.Printf("  Enabled: %t\n", cfg.Cluster.Enabled)
 	fmt.Printf("  Node ID: %s\n", cfg.Cluster.NodeID)
-	fmt.Printf("  Bind Addr: %s\n", cfg.Cluster.BindAddr)
-	fmt.Printf("  Bind Port: %d\n", cfg.Cluster.BindPort)
+	fmt.Printf("  Bind Addr: %s\n", cfg.Cluster.Addr)
 
 	fmt.Println()
 	fmt.Println("SERVERS:")
