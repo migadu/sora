@@ -24,6 +24,17 @@ const (
 
 	// ConnectionEventKick indicates a user should be kicked
 	ConnectionEventKick ConnectionEventType = "CONN_KICK"
+
+	// ConnectionEventStateSnapshot indicates a full state snapshot for reconciliation
+	ConnectionEventStateSnapshot ConnectionEventType = "CONN_STATE_SNAPSHOT"
+)
+
+const (
+	// Maximum size of event queue before we start dropping old events
+	maxEventQueueSize = 10000
+
+	// How often to broadcast full state snapshot for reconciliation
+	stateSnapshotInterval = 60 * time.Second
 )
 
 // ConnectionEvent represents a cluster-wide connection event
@@ -36,6 +47,24 @@ type ConnectionEvent struct {
 	Timestamp  time.Time           `json:"timestamp"`
 	NodeID     string              `json:"node_id"`
 	InstanceID string              `json:"instance_id"` // Unique instance identifier
+
+	// For state snapshots
+	StateSnapshot *ConnectionStateSnapshot `json:"state_snapshot,omitempty"`
+}
+
+// ConnectionStateSnapshot represents a full connection state for reconciliation
+type ConnectionStateSnapshot struct {
+	InstanceID  string                       `json:"instance_id"`
+	Timestamp   time.Time                    `json:"timestamp"`
+	Connections map[int64]UserConnectionData `json:"connections"` // accountID -> connection data
+}
+
+// UserConnectionData is the serializable version of UserConnectionInfo for gossip
+type UserConnectionData struct {
+	AccountID      int64          `json:"account_id"`
+	Username       string         `json:"username"`
+	LocalInstances map[string]int `json:"local_instances"` // instanceID -> count
+	LastUpdate     time.Time      `json:"last_update"`
 }
 
 // UserConnectionInfo tracks connection information for a specific user
@@ -70,9 +99,10 @@ type ConnectionTracker struct {
 	queueMu        sync.Mutex
 
 	// Shutdown
-	stopBroadcast chan struct{}
-	stopCleanup   chan struct{}
-	stopOnce      sync.Once
+	stopBroadcast     chan struct{}
+	stopCleanup       chan struct{}
+	stopStateSnapshot chan struct{}
+	stopOnce          sync.Once
 }
 
 // NewConnectionTracker creates a new connection tracker.
@@ -89,6 +119,7 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		broadcastQueue:        make([]ConnectionEvent, 0, 100),
 		stopBroadcast:         make(chan struct{}),
 		stopCleanup:           make(chan struct{}),
+		stopStateSnapshot:     make(chan struct{}),
 	}
 
 	if clusterMgr != nil {
@@ -101,6 +132,7 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		// Start background routines
 		go ct.broadcastRoutine()
 		go ct.cleanupRoutine()
+		go ct.stateSnapshotRoutine()
 
 		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d (cluster mode)",
 			name, instanceID, maxConnectionsPerUser)
@@ -420,10 +452,20 @@ func (ct *ConnectionTracker) UnregisterSession(accountID int64, ch <-chan struct
 	}
 }
 
-// queueEvent adds an event to the broadcast queue
+// queueEvent adds an event to the broadcast queue with bounded size
 func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
 	ct.queueMu.Lock()
 	defer ct.queueMu.Unlock()
+
+	// If queue is full, drop oldest events (FIFO)
+	if len(ct.broadcastQueue) >= maxEventQueueSize {
+		// Drop the oldest 10% of events to make room
+		dropCount := maxEventQueueSize / 10
+		logger.Warnf("[%s-GOSSIP-TRACKER] Event queue overflow (%d events), dropping %d oldest events",
+			ct.name, len(ct.broadcastQueue), dropCount)
+		ct.broadcastQueue = ct.broadcastQueue[dropCount:]
+	}
+
 	ct.broadcastQueue = append(ct.broadcastQueue, event)
 }
 
@@ -505,6 +547,8 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 		ct.handleUnregister(event)
 	case ConnectionEventKick:
 		ct.handleKick(event)
+	case ConnectionEventStateSnapshot:
+		ct.reconcileState(event.StateSnapshot)
 	default:
 		logger.Warnf("[%s-GOSSIP-TRACKER] Unknown event type: %s", ct.name, event.Type)
 	}
@@ -650,6 +694,146 @@ func (ct *ConnectionTracker) cleanup() {
 	}
 }
 
+// stateSnapshotRoutine periodically broadcasts full state for reconciliation
+func (ct *ConnectionTracker) stateSnapshotRoutine() {
+	ticker := time.NewTicker(stateSnapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			ct.broadcastStateSnapshot()
+
+		case <-ct.stopStateSnapshot:
+			return
+		}
+	}
+}
+
+// broadcastStateSnapshot creates and broadcasts a full state snapshot
+func (ct *ConnectionTracker) broadcastStateSnapshot() {
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	if len(ct.connections) == 0 {
+		return // Nothing to broadcast
+	}
+
+	// Build snapshot of connections
+	snapshot := &ConnectionStateSnapshot{
+		InstanceID:  ct.instanceID,
+		Timestamp:   time.Now(),
+		Connections: make(map[int64]UserConnectionData, len(ct.connections)),
+	}
+
+	for accountID, info := range ct.connections {
+		// Only include instances where we have actual connections
+		localInstances := make(map[string]int)
+		for instanceID, count := range info.LocalInstances {
+			if count > 0 {
+				localInstances[instanceID] = count
+			}
+		}
+
+		if len(localInstances) == 0 {
+			continue // Skip if no actual connections
+		}
+
+		snapshot.Connections[accountID] = UserConnectionData{
+			AccountID:      accountID,
+			Username:       info.Username,
+			LocalInstances: localInstances,
+			LastUpdate:     info.LastUpdate,
+		}
+	}
+
+	if len(snapshot.Connections) == 0 {
+		return // Nothing meaningful to broadcast
+	}
+
+	logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting state snapshot: %d users, instance=%s",
+		ct.name, len(snapshot.Connections), ct.instanceID)
+
+	// Queue the snapshot event
+	ct.queueEvent(ConnectionEvent{
+		Type:          ConnectionEventStateSnapshot,
+		Timestamp:     snapshot.Timestamp,
+		InstanceID:    ct.instanceID,
+		StateSnapshot: snapshot,
+	})
+}
+
+// reconcileState merges a remote state snapshot with local state
+func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
+	if snapshot == nil {
+		return
+	}
+
+	// Skip our own snapshots
+	if snapshot.InstanceID == ct.instanceID {
+		logger.Debugf("[%s-GOSSIP-TRACKER] Skipping own state snapshot", ct.name)
+		return
+	}
+
+	// Check if snapshot is too old (prevent stale reconciliation)
+	age := time.Since(snapshot.Timestamp)
+	if age > 5*time.Minute {
+		logger.Debugf("[%s-GOSSIP-TRACKER] Ignoring stale state snapshot from %s (age: %v)",
+			ct.name, snapshot.InstanceID, age)
+		return
+	}
+
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	reconciledCount := 0
+	addedCount := 0
+
+	for accountID, remoteData := range snapshot.Connections {
+		info, exists := ct.connections[accountID]
+		if !exists {
+			// New user we didn't know about
+			info = &UserConnectionInfo{
+				AccountID:      accountID,
+				Username:       remoteData.Username,
+				TotalCount:     0,
+				LocalCount:     0,
+				LastUpdate:     time.Now(),
+				LocalInstances: make(map[string]int),
+			}
+			ct.connections[accountID] = info
+			addedCount++
+		}
+
+		// Merge remote instance counts
+		for instanceID, count := range remoteData.LocalInstances {
+			if instanceID == ct.instanceID {
+				// Don't override our own local count
+				continue
+			}
+
+			oldCount := info.LocalInstances[instanceID]
+			if oldCount != count {
+				info.LocalInstances[instanceID] = count
+				reconciledCount++
+			}
+		}
+
+		// Recalculate total count
+		info.TotalCount = info.LocalCount // Start with local
+		for instanceID, count := range info.LocalInstances {
+			if instanceID != ct.instanceID {
+				info.TotalCount += count
+			}
+		}
+
+		info.LastUpdate = time.Now()
+	}
+
+	logger.Infof("[%s-GOSSIP-TRACKER] Reconciled state from %s: %d users updated, %d new users added",
+		ct.name, snapshot.InstanceID, reconciledCount, addedCount)
+}
+
 // Stop stops the gossip tracker (idempotent)
 func (ct *ConnectionTracker) Stop() {
 	if ct == nil {
@@ -659,6 +843,9 @@ func (ct *ConnectionTracker) Stop() {
 	ct.stopOnce.Do(func() {
 		close(ct.stopBroadcast)
 		close(ct.stopCleanup)
+		if ct.clusterManager != nil {
+			close(ct.stopStateSnapshot)
+		}
 	})
 }
 
