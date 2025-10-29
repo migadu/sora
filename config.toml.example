@@ -1217,6 +1217,7 @@ remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
 max_connections_per_ip = 10
 max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+insecure_auth = false                 # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 

@@ -453,13 +453,15 @@ func (s *ManageSieveSession) handleConnection() {
 				s.sendResponse("NO Server busy, try again later\r\n")
 				continue
 			}
-			defer release()
 
 			// Replace the connection and readers/writers
 			*s.conn = tlsConn
 			s.reader = bufio.NewReader(tlsConn)
 			s.writer = bufio.NewWriter(tlsConn)
 			s.isTLS = true
+
+			// Release lock immediately after updating connection state
+			release()
 
 			s.Log("TLS negotiation successful")
 			success = true
@@ -965,6 +967,12 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 	if len(parts) < 2 {
 		s.sendResponse("NO Syntax: AUTHENTICATE mechanism\r\n")
+		return false
+	}
+
+	// Check if authentication is allowed over non-TLS connection
+	if !s.isTLS && !s.server.insecureAuth {
+		s.sendResponse("NO Authentication not permitted on insecure connection. Use STARTTLS first.\r\n")
 		return false
 	}
 

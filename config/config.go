@@ -916,6 +916,7 @@ type ManageSieveProxyServerConfig struct {
 	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	InsecureAuth           bool                  `toml:"insecure_auth"`
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
 	MasterSASLPassword     string                `toml:"master_sasl_password"`
 	TLS                    bool                  `toml:"tls"`

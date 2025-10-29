@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,9 @@ type UploaderDB interface {
 	GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error)
 	IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
 	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error
+	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error)
+	GetFailedUploadsWithRetry(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
 }
 
 // UploaderS3 defines the S3 storage operations needed by the uploader worker.
@@ -115,6 +119,9 @@ func (w *UploadWorker) run(ctx context.Context) {
 		w.wg.Done()
 	}()
 
+	monitorTicker := time.NewTicker(5 * time.Minute)
+	defer monitorTicker.Stop()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -135,6 +142,11 @@ func (w *UploadWorker) run(ctx context.Context) {
 			logger.Info("[UPLOADER] timer tick")
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
+			}
+		case <-monitorTicker.C:
+			logger.Info("[UPLOADER] monitor tick")
+			if err := w.monitorStuckUploads(ctx); err != nil {
+				logger.Errorf("[UPLOADER] monitor error: %v", err)
 			}
 		case <-w.notifyCh:
 			logger.Info("[UPLOADER] worker notified")
@@ -265,11 +277,14 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		logger.Infof("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
 		// Content is already in S3. Mark this specific message instance as uploaded
 		// and delete the pending upload record.
-		if err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Warnf("[UPLOADER] failed to finalize S3 upload for hash %s, account %d: %v", upload.ContentHash, upload.AccountID, err)
-		} else {
-			logger.Infof("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
+		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err != nil {
+			logger.Warnf("[UPLOADER] failed to finalize S3 upload for hash %s, account %d: %v - Keeping local file for retry.", upload.ContentHash, upload.AccountID, err)
+			return
 		}
+		// Only delete after successful DB update
+		logger.Infof("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
+
 		// The local file is unique to this upload task, so it can be safely removed.
 		if err := w.RemoveLocalFile(filePath); err != nil {
 			// Log is inside RemoveLocalFile
@@ -393,6 +408,45 @@ func (w *UploadWorker) RemoveLocalFile(path string) error {
 	return nil
 }
 
+// monitorStuckUploads checks for uploads that have exceeded max attempts and logs warnings.
+// This provides visibility into failed uploads that need manual intervention.
+func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
+	stats, err := w.rdb.GetUploaderStatsWithRetry(ctx, w.maxAttempts)
+	if err != nil {
+		return fmt.Errorf("failed to get uploader stats: %w", err)
+	}
+
+	// Update Prometheus metrics
+	metrics.QueueDepth.WithLabelValues("s3_upload_pending").Set(float64(stats.TotalPending))
+	metrics.QueueDepth.WithLabelValues("s3_upload_failed").Set(float64(stats.FailedUploads))
+
+	// Log summary
+	if stats.TotalPending > 0 || stats.FailedUploads > 0 {
+		logger.Infof("[UPLOADER-MONITOR] Queue: %d pending (%d bytes), %d failed (max attempts reached)",
+			stats.TotalPending, stats.TotalPendingSize, stats.FailedUploads)
+	}
+
+	// Alert if failed uploads exist
+	if stats.FailedUploads > 0 {
+		logger.Warnf("[UPLOADER-MONITOR] ALERT: %d uploads have failed after %d attempts and need attention",
+			stats.FailedUploads, w.maxAttempts)
+
+		// Get details of failed uploads
+		failed, err := w.rdb.GetFailedUploadsWithRetry(ctx, w.maxAttempts, 10)
+		if err != nil {
+			logger.Errorf("[UPLOADER-MONITOR] failed to get failed upload details: %v", err)
+		} else {
+			for _, upload := range failed {
+				logger.Warnf("[UPLOADER-MONITOR] Stuck upload: ID=%d Account=%d Hash=%s Attempts=%d Age=%s",
+					upload.ID, upload.AccountID, upload.ContentHash[:16], upload.Attempts,
+					time.Since(upload.CreatedAt).Round(time.Minute))
+			}
+		}
+	}
+
+	return nil
+}
+
 func removeEmptyParents(path, stopAt string) {
 	for {
 		parent := filepath.Dir(path)
@@ -407,4 +461,137 @@ func removeEmptyParents(path, stopAt string) {
 		}
 		path = parent
 	}
+}
+
+// cleanupOrphanedFiles removes local files that no longer have a corresponding pending upload record.
+// This handles cases where:
+// - System crashes before pending upload was created
+// - Partial file writes that were never completed
+// - Race conditions during concurrent operations
+// - Files left behind from failed operations
+//
+// The cleanup is conservative and only removes files older than a grace period to avoid
+// deleting files that are currently being written or have very recent pending uploads.
+func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
+	start := time.Now()
+
+	// Grace period before considering a file orphaned (10 minutes)
+	// This ensures we don't delete files that are actively being processed
+	gracePeriod := 10 * time.Minute
+	cutoffTime := time.Now().Add(-gracePeriod)
+
+	var filesChecked, filesRemoved int64
+	var totalSize int64
+
+	// Walk the upload directory tree
+	err := filepath.Walk(w.path, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			logger.Warnf("[UPLOADER-CLEANUP] error accessing path %s: %v", path, err)
+			return nil // Continue walking despite errors
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Skip recently created/modified files (within grace period)
+		if info.ModTime().After(cutoffTime) {
+			return nil
+		}
+
+		filesChecked++
+
+		// Extract account ID and content hash from path
+		// Path structure: /path/to/uploads/{accountID}/{contentHash}
+		relPath, err := filepath.Rel(w.path, path)
+		if err != nil {
+			logger.Warnf("[UPLOADER-CLEANUP] failed to get relative path for %s: %v", path, err)
+			return nil
+		}
+
+		// Parse path components
+		parts := filepath.SplitList(relPath)
+		if len(parts) < 2 {
+			// Try with separator
+			parts = strings.Split(relPath, string(filepath.Separator))
+		}
+
+		if len(parts) < 2 {
+			logger.Warnf("[UPLOADER-CLEANUP] unexpected path structure: %s", relPath)
+			return nil
+		}
+
+		// Get account ID and content hash
+		accountIDStr := parts[0]
+		contentHash := parts[len(parts)-1] // Last component is the hash
+
+		// Parse account ID
+		var accountID int64
+		if _, err := fmt.Sscanf(accountIDStr, "%d", &accountID); err != nil {
+			logger.Warnf("[UPLOADER-CLEANUP] invalid account ID in path %s: %v", path, err)
+			return nil
+		}
+
+		// Validate content hash
+		if !isValidContentHash(contentHash) {
+			logger.Warnf("[UPLOADER-CLEANUP] invalid content hash in path %s", path)
+			// Remove invalid files
+			if removeErr := os.Remove(path); removeErr != nil {
+				logger.Warnf("[UPLOADER-CLEANUP] failed to remove invalid file %s: %v", path, removeErr)
+			} else {
+				filesRemoved++
+				totalSize += info.Size()
+				logger.Infof("[UPLOADER-CLEANUP] removed invalid file %s", path)
+			}
+			return nil
+		}
+
+		// Check if pending upload exists in database
+		exists, err := w.rdb.PendingUploadExistsWithRetry(ctx, contentHash, accountID)
+		if err != nil {
+			logger.Warnf("[UPLOADER-CLEANUP] failed to check pending upload for %s (account %d): %v", contentHash, accountID, err)
+			return nil // Don't delete if we can't verify
+		}
+
+		if !exists {
+			// File is orphaned - no pending upload record exists
+			if removeErr := os.Remove(path); removeErr != nil {
+				logger.Warnf("[UPLOADER-CLEANUP] failed to remove orphaned file %s: %v", path, removeErr)
+			} else {
+				filesRemoved++
+				totalSize += info.Size()
+				logger.Infof("[UPLOADER-CLEANUP] removed orphaned file %s (account %d, size %d bytes)", contentHash, accountID, info.Size())
+
+				// Try to remove empty parent directories
+				stopAt, _ := filepath.Abs(w.path)
+				removeEmptyParents(path, stopAt)
+			}
+		}
+
+		return nil
+	})
+
+	duration := time.Since(start)
+
+	if err != nil && err != context.Canceled {
+		logger.Errorf("[UPLOADER-CLEANUP] walk error: %v", err)
+		return err
+	}
+
+	// Log cleanup summary
+	logger.Infof("[UPLOADER-CLEANUP] completed in %v: checked %d files, removed %d orphaned files (%d bytes freed)",
+		duration, filesChecked, filesRemoved, totalSize)
+
+	// Track metrics
+	metrics.UploadWorkerJobs.WithLabelValues("cleanup").Add(float64(filesRemoved))
+
+	return nil
 }

@@ -42,3 +42,14 @@ func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context,
 	}
 	return result.(bool), nil
 }
+
+func (rd *ResilientDatabase) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+	op := func(ctx context.Context) (interface{}, error) {
+		return rd.getOperationalDatabaseForOperation(false).PendingUploadExists(ctx, contentHash, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}

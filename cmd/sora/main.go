@@ -1430,6 +1430,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		Addr:                   serverConfig.Addr,
 		RemoteAddrs:            serverConfig.RemoteAddrs,
 		RemotePort:             remotePort,
+		InsecureAuth:           serverConfig.InsecureAuth,
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		TLS:                    serverConfig.TLS,

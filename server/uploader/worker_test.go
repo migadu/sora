@@ -25,6 +25,8 @@ type mockDB struct {
 	GetPrimaryEmailForAccountWithRetryFunc     func(ctx context.Context, accountID int64) (server.Address, error)
 	IsContentHashUploadedWithRetryFunc         func(ctx context.Context, contentHash string, accountID int64) (bool, error)
 	CompleteS3UploadWithRetryFunc              func(ctx context.Context, contentHash string, accountID int64) error
+	PendingUploadExistsWithRetryFunc           func(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	GetFailedUploadsWithRetryFunc              func(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
 }
 
 func (m *mockDB) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
@@ -51,6 +53,21 @@ func (m *mockDB) IsContentHashUploadedWithRetry(ctx context.Context, contentHash
 
 func (m *mockDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	return m.CompleteS3UploadWithRetryFunc(ctx, contentHash, accountID)
+}
+
+func (m *mockDB) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+	if m.PendingUploadExistsWithRetryFunc != nil {
+		return m.PendingUploadExistsWithRetryFunc(ctx, contentHash, accountID)
+	}
+	return false, nil
+}
+
+func (m *mockDB) GetFailedUploadsWithRetry(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error) {
+	return nil, nil
+}
+
+func (m *mockDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
+	return nil, nil
 }
 
 type mockS3 struct {

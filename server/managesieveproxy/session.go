@@ -37,6 +37,7 @@ type Session struct {
 	isPrelookupAccount bool
 	routingInfo        *proxy.UserRoutingInfo
 	serverAddr         string
+	isTLS              bool // Whether the client connection is over TLS
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -46,11 +47,14 @@ type Session struct {
 // newSession creates a new ManageSieve proxy session.
 func newSession(server *Server, conn net.Conn) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(server.ctx)
+	// Check if connection is already TLS (implicit TLS)
+	_, isTLS := conn.(*tls.Conn)
 	return &Session{
 		server:       server,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
+		isTLS:        isTLS,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		errorCount:   0,
@@ -131,6 +135,14 @@ func (s *Session) handleConnection() {
 				for i, arg := range args {
 					log.Printf("ManageSieve Proxy [%s] [DEBUG] AUTHENTICATE: args[%d]=%q", s.server.name, i, arg)
 				}
+			}
+
+			// Check if authentication is allowed over non-TLS connection
+			if !s.isTLS && !s.server.insecureAuth {
+				if s.handleAuthError(`NO "Authentication not permitted on insecure connection. Use STARTTLS first."`) {
+					return
+				}
+				continue
 			}
 
 			if len(args) < 1 || strings.ToUpper(server.UnquoteString(args[0])) != "PLAIN" {
@@ -338,6 +350,7 @@ func (s *Session) handleConnection() {
 			s.clientConn = tlsConn
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
+			s.isTLS = true
 
 			if s.server.debug {
 				log.Printf("ManageSieve Proxy [%s] STARTTLS negotiation successful for %s", s.server.name, clientAddr)

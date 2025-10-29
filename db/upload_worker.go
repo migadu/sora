@@ -197,3 +197,16 @@ func (db *Database) GetFailedUploads(ctx context.Context, maxAttempts int, limit
 
 	return uploads, nil
 }
+
+// PendingUploadExists checks if a pending upload record exists for the given content hash and account.
+// This is used by the cleanup job to determine if a local file is orphaned.
+func (db *Database) PendingUploadExists(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+	var exists bool
+	err := db.GetReadPool().QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pending_uploads WHERE content_hash = $1 AND account_id = $2)
+	`, contentHash, accountID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if pending upload exists for content hash %s, account %d: %w", contentHash, accountID, err)
+	}
+	return exists, nil
+}
