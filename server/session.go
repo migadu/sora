@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+
 	"github.com/migadu/sora/logger"
 )
 
@@ -50,11 +51,11 @@ func (s *Session) Log(format string, args ...interface{}) {
 	if s.Stats != nil {
 		if s.Protocol == "LMTP" {
 			// LMTP has no authenticated sessions
-			logger.Debug("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "msg", fmt.Sprintf(format, args...))
+			logger.Info("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "msg", fmt.Sprintf(format, args...))
 		} else {
-			logger.Debug("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "conn_auth", s.Stats.GetAuthenticatedConnections(), "msg", fmt.Sprintf(format, args...))
+			logger.Info("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "conn_auth", s.Stats.GetAuthenticatedConnections(), "msg", fmt.Sprintf(format, args...))
 		}
 	} else {
-		logger.Debug("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "msg", fmt.Sprintf(format, args...))
+		logger.Info("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "msg", fmt.Sprintf(format, args...))
 	}
 }

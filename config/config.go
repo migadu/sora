@@ -210,12 +210,12 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
 type TLSLetsEncryptS3Config struct {
-	Bucket          string `toml:"bucket"`            // S3 bucket for certificate storage
-	Endpoint        string `toml:"endpoint"`          // S3-compatible storage endpoint (default: "s3.amazonaws.com")
-	DisableTLS      bool   `toml:"disable_tls"`       // Disable TLS for S3 endpoint (useful for local MinIO setups)
-	Debug           bool   `toml:"debug"`             // Enable detailed S3 request/response tracing
-	AccessKeyID     string `toml:"access_key_id"`     // AWS credentials (optional, uses default chain)
-	SecretAccessKey string `toml:"secret_access_key"` // AWS credentials (optional)
+	Bucket     string `toml:"bucket"`      // S3 bucket for certificate storage
+	Endpoint   string `toml:"endpoint"`    // S3-compatible storage endpoint (default: "s3.amazonaws.com")
+	DisableTLS bool   `toml:"disable_tls"` // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
+	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
+	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
 }
 
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration

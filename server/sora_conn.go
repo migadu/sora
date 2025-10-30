@@ -37,6 +37,10 @@ type SoraConn struct {
 	sessionStart        time.Time
 	lastThroughputCheck time.Time
 	bytesTransferred    int64
+	// Slowloris protection: rolling window tracking
+	throughputHistory      [3]int64 // Last 3 minutes of throughput measurements
+	throughputHistoryIndex int      // Current position in ring buffer
+	consecutiveSlowMinutes int      // Counter for consecutive slow periods
 
 	// JA4 TLS fingerprinting
 	ja4Fingerprint string
@@ -165,7 +169,7 @@ func (c *SoraConn) timeoutChecker() {
 			}
 
 			// Check minimum throughput (protects against slowloris attacks)
-			// Skip the first check to allow time for initial handshake and greeting
+			// IMPROVED: Uses 3-minute rolling average and requires 2 consecutive slow periods
 			if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
 				sessionDurationSinceStart := time.Since(c.sessionStart)
 
@@ -173,11 +177,44 @@ func (c *SoraConn) timeoutChecker() {
 				// to allow time for TLS handshake, greeting, and initial authentication
 				if sessionDurationSinceStart >= 2*time.Minute {
 					minutesElapsed := throughputDuration.Minutes()
-					bytesPerMinute := float64(bytesTransferred) / minutesElapsed
+					bytesPerMinute := int64(float64(bytesTransferred) / minutesElapsed)
 
-					if bytesPerMinute < float64(c.minBytesPerMinute) {
+					// Add current measurement to rolling history
+					c.mu.Lock()
+					c.throughputHistory[c.throughputHistoryIndex] = bytesPerMinute
+					c.throughputHistoryIndex = (c.throughputHistoryIndex + 1) % 3
+
+					// Calculate average over last 3 measurements (or fewer if we don't have 3 yet)
+					var sum int64
+					var count int
+					for i := 0; i < 3; i++ {
+						if c.throughputHistory[i] > 0 {
+							sum += c.throughputHistory[i]
+							count++
+						}
+					}
+					avgBytesPerMin := int64(0)
+					if count > 0 {
+						avgBytesPerMin = sum / int64(count)
+					}
+
+					// Check if current measurement is slow
+					if bytesPerMinute < c.minBytesPerMinute {
+						c.consecutiveSlowMinutes++
+					} else {
+						c.consecutiveSlowMinutes = 0
+					}
+
+					consecutiveSlow := c.consecutiveSlowMinutes
+					c.mu.Unlock()
+
+					// Disconnect only if:
+					// 1. Average over 3 minutes is below threshold, AND
+					// 2. We've had 2 consecutive slow minutes
+					// This reduces false positives for legitimate users
+					if avgBytesPerMin < c.minBytesPerMinute && consecutiveSlow >= 2 {
 						remoteAddr := c.Conn.RemoteAddr().String()
-						logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min", int(bytesPerMinute), "required", c.minBytesPerMinute)
+						logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min_avg", int(avgBytesPerMin), "bytes_per_min_current", int(bytesPerMinute), "required", c.minBytesPerMinute, "consecutive_slow", consecutiveSlow)
 						metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
 
 						// Call timeout handler before closing (if provided)
@@ -190,7 +227,7 @@ func (c *SoraConn) timeoutChecker() {
 					}
 				}
 
-				// Reset throughput counters (even if we didn't enforce the check yet)
+				// Reset throughput counters for next measurement period
 				c.mu.Lock()
 				c.lastThroughputCheck = time.Now()
 				c.bytesTransferred = 0

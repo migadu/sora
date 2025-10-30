@@ -4634,8 +4634,8 @@ Examples:
 		cfg.TLS.CertFile = "***MASKED***"
 		cfg.TLS.KeyFile = "***MASKED***"
 		if cfg.TLS.LetsEncrypt != nil {
-			cfg.TLS.LetsEncrypt.S3.AccessKeyID = "***MASKED***"
-			cfg.TLS.LetsEncrypt.S3.SecretAccessKey = "***MASKED***"
+			cfg.TLS.LetsEncrypt.S3.AccessKey = "***MASKED***"
+			cfg.TLS.LetsEncrypt.S3.SecretKey = "***MASKED***"
 		}
 		cfg.Cluster.SecretKey = "***MASKED***"
 	}

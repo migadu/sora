@@ -42,9 +42,9 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 
 	// Configure credentials
 	var creds *credentials.Credentials
-	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
 		// Use static credentials
-		creds = credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretAccessKey, "")
+		creds = credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, "")
 	} else {
 		// Use IAM credentials chain (environment vars, EC2 IAM role, etc.)
 		creds = credentials.NewIAM("")

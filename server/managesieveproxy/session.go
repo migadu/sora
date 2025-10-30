@@ -7,12 +7,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
@@ -929,7 +930,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			logger.Debug("ManageSieve Proxy: Connection kicked", "name", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
+			logger.Info("ManageSieve Proxy: Connection kicked", "name", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

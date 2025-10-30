@@ -1058,3 +1058,58 @@ func SetupIMAPServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*Te
 		ResilientDB: rdb,
 	}, account
 }
+
+// SetupIMAPServerWithSlowloris creates an IMAP server with custom timeouts and slowloris protection for testing
+func SetupIMAPServerWithSlowloris(t *testing.T, commandTimeout time.Duration, minBytesPerMinute int64) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	// Create minimal S3 storage mock
+	s3Storage := &storage.S3Storage{}
+
+	server, err := imap.New(
+		context.Background(),
+		"test-slowloris",
+		"localhost",
+		address,
+		s3Storage,
+		rdb,
+		nil, // upload worker
+		nil, // cache
+		imap.IMAPServerOptions{
+			CommandTimeout:    commandTimeout,
+			MinBytesPerMinute: minBytesPerMinute,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	// Start server in background
+	go func() {
+		err := server.Serve(address)
+		if err != nil {
+			t.Logf("IMAP server error: %v", err)
+		}
+	}()
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Cleanup function - database cleanup is already handled by SetupTestDatabase
+	cleanup := func() {
+		server.Close()
+	}
+
+	t.Cleanup(cleanup)
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}

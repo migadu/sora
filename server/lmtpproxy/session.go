@@ -6,13 +6,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"net/textproto"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -866,7 +867,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			logger.Debug("LMTP Proxy: Connection kicked", "name", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
+			logger.Info("LMTP Proxy: Connection kicked", "name", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

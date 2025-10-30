@@ -6,12 +6,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -717,7 +718,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			logger.Debug("POP3 Proxy: Connection kicked - disconnecting user: %s (client: %s, backend: %s)", "name", s.server.name, "param", s.username, s.RemoteIP, s.serverAddr)
+			logger.Info("POP3 Proxy: Connection kicked - disconnecting user: %s (client: %s, backend: %s)", "name", s.server.name, "param", s.username, s.RemoteIP, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return
