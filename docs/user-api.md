@@ -133,8 +133,8 @@ Exchange a valid (not expired) token for a new one with extended expiration.
 
 The default base URL depends on your configuration:
 
-- **Development**: `http://localhost:8081/user/v1`
-- **Production**: `https://mail.example.com/user/v1`
+- **Development**: `http://localhost:8081/user`
+- **Production**: `https://mail.example.com/user`
 
 All endpoints are prefixed with `/user/`.
 
@@ -978,7 +978,7 @@ print(f"Found {results['total']} messages")
 ```bash
 #!/bin/bash
 TOKEN="your-jwt-token"
-BASE_URL="http://localhost:8081/user/v1"
+BASE_URL="http://localhost:8081/user"
 
 # Create a spam filter
 curl -X PUT "$BASE_URL/filters/spam-filter" \
@@ -1055,7 +1055,7 @@ class SoraClient {
 }
 
 // Usage
-const client = new SoraClient('http://localhost:8081/user/v1');
+const client = new SoraClient('http://localhost:8081/user');
 await client.login('user@example.com', 'password');
 const mailboxes = await client.request('/mailboxes');
 ```

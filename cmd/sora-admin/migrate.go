@@ -137,12 +137,12 @@ func handleMigrateDown(ctx context.Context) {
 			logger.Fatalf("Database is in a dirty state (version %d). Please fix manually with 'force' command.", version)
 		}
 
-		logger.Infof("Reverting all %d migration(s)...", version)
+		logger.Info("Reverting all migrations", "count", version)
 		if err := m.Steps(-int(version)); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 			logger.Fatalf("Failed to revert all migrations: %v", err)
 		}
 	} else {
-		logger.Infof("Reverting %d migration(s)...", *limit)
+		logger.Info("Reverting migrations", "count", *limit)
 		if err := m.Steps(-(*limit)); err != nil {
 			logger.Fatalf("Failed to revert migrations: %v", err)
 		}
@@ -206,7 +206,7 @@ func handleMigrateForce(ctx context.Context) {
 	}
 	defer db.Close()
 
-	logger.Infof("Forcing database version to %d...", version)
+	logger.Info("Forcing database version", "version", version)
 	if err := m.Force(version); err != nil {
 		logger.Fatalf("Failed to force version: %v", err)
 	}
@@ -218,7 +218,7 @@ func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrat
 	cfg := newDefaultAdminConfig()
 	if err := loadAdminConfig(configPath, &cfg); err != nil {
 		if os.IsNotExist(err) {
-			logger.Infof("WARNING: configuration file '%s' not found. Using defaults.", configPath)
+			logger.Info("WARNING: Configuration file not found - using defaults", "config", configPath)
 		} else {
 			return nil, nil, fmt.Errorf("error parsing configuration file '%s': %w", configPath, err)
 		}
@@ -283,11 +283,11 @@ func showVersion(m *migrate.Migrate) {
 			logger.Info("Current migration version: none")
 			return
 		}
-		logger.Infof("Failed to get migration version: %v", err)
+		logger.Info("Failed to get migration version", "error", err)
 		return
 	}
 
-	logger.Infof("Current migration version: %d", version)
+	logger.Info("Current migration version", "version", version)
 	if dirty {
 		logger.Info("Dirty state: YES (Database may be in an inconsistent state. Use 'force' to fix.)")
 	} else {
@@ -299,7 +299,7 @@ func showVersion(m *migrate.Migrate) {
 type migrationLogger struct{}
 
 func (l *migrationLogger) Printf(format string, v ...interface{}) {
-	logger.Infof("[MIGRATE] "+format, v...)
+	logger.Info("MIGRATE", "msg", fmt.Sprintf(format, v...))
 }
 
 func (l *migrationLogger) Verbose() bool {

@@ -27,7 +27,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 5 && failureRatio >= 0.6
 	}
 	getSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		logger.Infof("S3 GET circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Info("S3 GET circuit breaker changed", "name", name, "from", from, "to", to)
 	}
 
 	putSettings := circuitbreaker.DefaultSettings("s3_put")
@@ -36,7 +36,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 3 && failureRatio >= 0.5
 	}
 	putSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		logger.Infof("S3 PUT circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Info("S3 PUT circuit breaker changed", "name", name, "from", from, "to", to)
 	}
 
 	deleteSettings := circuitbreaker.DefaultSettings("s3_delete")
@@ -45,7 +45,7 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 		return counts.Requests >= 3 && failureRatio >= 0.5
 	}
 	deleteSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		logger.Infof("S3 DELETE circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Info("S3 DELETE circuit breaker changed", "name", name, "from", from, "to", to)
 	}
 
 	return &ResilientS3Storage{

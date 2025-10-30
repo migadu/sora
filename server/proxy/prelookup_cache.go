@@ -2,9 +2,10 @@ package proxy
 
 import (
 	"context"
-	"log"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 // cacheEntry represents a cached prelookup result
@@ -50,8 +51,7 @@ func newPrelookupCache(positiveTTL, negativeTTL time.Duration, maxSize int, clea
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	log.Printf("[HTTP-PreLookup-Cache] Initialized: positive_ttl=%s, negative_ttl=%s, max_size=%d, cleanup_interval=%s",
-		positiveTTL, negativeTTL, maxSize, cleanupInterval)
+	logger.Info("Prelookup cache initialized", "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval)
 
 	return cache
 }
@@ -161,7 +161,7 @@ func (c *prelookupCache) cleanup() {
 	}
 
 	if removed > 0 {
-		log.Printf("[HTTP-PreLookup-Cache] Cleanup removed %d expired entries, %d remaining", removed, len(c.entries))
+		logger.Debug("Prelookup cache cleanup", "removed", removed, "remaining", len(c.entries))
 	}
 }
 

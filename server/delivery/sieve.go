@@ -119,7 +119,6 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		if recipient.FromAddress != nil {
 			// Try immediate delivery first if queue is not configured
 			if s.RelayQueue == nil && s.RelayHandler != nil {
-				// Legacy behavior: immediate relay without retry
 				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, fullMessageBytes)
 				if err == nil && !result.Copy {
 					// Successfully redirected without copy

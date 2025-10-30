@@ -107,20 +107,8 @@ func (s *Service) List(ctx context.Context, owner, mailboxName string) ([]ACLEnt
 	// Convert to service ACL entries
 	entries := make([]ACLEntry, 0, len(dbACLs))
 	for _, dbACL := range dbACLs {
-		// Get identifier (email or "anyone")
-		identifier := dbACL.Identifier
-		if identifier == "" && dbACL.AccountID != nil {
-			// Legacy entry with account_id only, get email
-			addr, err := s.rdb.GetPrimaryEmailForAccountWithRetry(ctx, *dbACL.AccountID)
-			if err != nil {
-				// Skip if we can't resolve the email
-				continue
-			}
-			identifier = addr.FullAddress()
-		}
-
 		entries = append(entries, ACLEntry{
-			Identifier: identifier,
+			Identifier: dbACL.Identifier,
 			Rights:     dbACL.Rights,
 		})
 	}

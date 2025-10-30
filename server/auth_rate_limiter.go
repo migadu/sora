@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"time"
@@ -140,9 +140,7 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimit
 	go limiter.cleanupRoutine(config.CacheCleanupInterval)
 	go limiter.syncRoutine()
 
-	log.Printf("[%s-AUTH-LIMITER] Initialized: fast_block=%d/%v, delay_after=%d, max_delay=%v",
-		protocol, config.FastBlockThreshold, config.FastBlockDuration,
-		config.DelayStartThreshold, config.MaxDelay)
+	logger.Debug("Auth limiter: Initialized", "protocol", protocol, "fast_block_threshold", config.FastBlockThreshold, "fast_block_duration", config.FastBlockDuration, "delay_start_threshold", config.DelayStartThreshold, "max_delay", config.MaxDelay)
 
 	return limiter
 }
@@ -186,7 +184,7 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 
 		if err != nil {
 			a.markDBUnhealthy()
-			log.Printf("[%s-AUTH-LIMITER] CRITICAL: database check failed, denying authentication for security: %v", a.protocol, err)
+			logger.Debug("Auth limiter: CRITICAL - database check failed, denying auth for security", "protocol", a.protocol, "error", err)
 			// Fail closed - deny authentication when database is unavailable
 			// This prevents attackers from bypassing rate limiting by causing DB errors
 			return fmt.Errorf("authentication rate limiting unavailable, access temporarily denied for security")
@@ -218,9 +216,9 @@ func (a *AuthRateLimiter) CanAttemptAuthWithProxy(ctx context.Context, conn net.
 	// Check if the real client IP is from a trusted network
 	if a.isFromTrustedNetwork(clientIP) {
 		if proxyIP != "" {
-			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting for trusted client %s via proxy %s", a.protocol, clientIP, proxyIP)
+			logger.Debug("Auth limiter: Skipping rate limiting for trusted client", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
 		} else {
-			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting for trusted client %s", a.protocol, clientIP)
+			logger.Debug("Auth limiter: Skipping rate limiting for trusted client", "protocol", a.protocol, "client", clientIP)
 		}
 		return nil
 	}
@@ -242,9 +240,9 @@ func (a *AuthRateLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn n
 	// Check if the real client IP is from a trusted network
 	if a.isFromTrustedNetwork(clientIP) {
 		if proxyIP != "" {
-			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting recording for trusted client %s via proxy %s", a.protocol, clientIP, proxyIP)
+			logger.Debug("Auth limiter: Skipping rate limiting recording for trusted client", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
 		} else {
-			log.Printf("[%s-AUTH-LIMITER] Skipping rate limiting recording for trusted client %s", a.protocol, clientIP)
+			logger.Debug("Auth limiter: Skipping rate limiting recording for trusted client", "protocol", a.protocol, "client", clientIP)
 		}
 		return
 	}
@@ -296,10 +294,10 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 
 	if !success {
 		a.updateFailureTracking(ip, now)
-		log.Printf("[%s-AUTH-LIMITER] Failed authentication attempt from %s for user '%s'", a.protocol, ip, username)
+		logger.Debug("Auth limiter: Failed authentication attempt", "protocol", a.protocol, "ip", ip, "user", username)
 	} else {
 		a.clearFailureTracking(ip)
-		log.Printf("[%s-AUTH-LIMITER] Successful authentication from %s for user '%s'", a.protocol, ip, username)
+		logger.Debug("Auth limiter: Successful authentication", "protocol", a.protocol, "ip", ip, "user", username)
 	}
 }
 
@@ -359,16 +357,14 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 			Protocol:     a.protocol,
 		}
 		a.blockMu.Unlock()
-		log.Printf("[%s-AUTH-LIMITER] FAST BLOCKED IP %s after %d failures (blocked until %v)",
-			a.protocol, ip, info.FailureCount, blockedUntil.Format("15:04:05"))
+		logger.Debug("Auth limiter: FAST BLOCKED IP", "protocol", a.protocol, "ip", ip, "failures", info.FailureCount, "blocked_until", blockedUntil.Format("15:04:05"))
 
 		// Broadcast to cluster
 		if a.clusterLimiter != nil {
 			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, a.protocol, info.FirstFailure)
 		}
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
-		log.Printf("[%s-AUTH-LIMITER] Progressive delay for IP %s: %v (failure %d)",
-			a.protocol, ip, info.LastDelay, info.FailureCount)
+		logger.Debug("Auth limiter: Progressive delay for IP", "protocol", a.protocol, "ip", ip, "delay", info.LastDelay, "failures", info.FailureCount)
 
 		// Broadcast failure count to cluster for progressive delays
 		if a.clusterLimiter != nil {
@@ -384,7 +380,7 @@ func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	a.blockMu.Lock()
 	delete(a.blockedIPs, ip)
 	a.blockMu.Unlock()
-	log.Printf("[%s-AUTH-LIMITER] Cleared failure tracking for IP %s after successful login", a.protocol, ip)
+	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
 }
 
 func (a *AuthRateLimiter) queueForDBSync(attempt AuthAttempt) {
@@ -441,7 +437,7 @@ func (a *AuthRateLimiter) syncPendingRecords() {
 
 	for i, record := range records {
 		if err := a.db.RecordAuthAttemptWithRetry(ctx, record.IP, record.Username, a.protocol, record.Success); err != nil {
-			log.Printf("[%s-AUTH-LIMITER] Warning: failed to sync auth attempt: %v", a.protocol, err)
+			logger.Debug("Auth limiter: Warning - failed to sync auth attempt", "protocol", a.protocol, "error", err)
 			a.markDBUnhealthy()
 			// Re-queue failed records
 			a.pendingMu.Lock()
@@ -450,7 +446,7 @@ func (a *AuthRateLimiter) syncPendingRecords() {
 			return
 		}
 	}
-	log.Printf("[%s-AUTH-LIMITER] Synced %d auth attempts to database", a.protocol, len(records))
+	logger.Debug("Auth limiter: Synced auth attempts to database", "protocol", a.protocol, "count", len(records))
 }
 
 func (a *AuthRateLimiter) cleanupRoutine(interval time.Duration) {
@@ -490,8 +486,7 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	a.delayMu.Unlock()
 
 	if expiredBlocks > 0 || expiredFailures > 0 {
-		log.Printf("[%s-AUTH-LIMITER] Cleaned up %d expired blocks and %d old failure records",
-			a.protocol, expiredBlocks, expiredFailures)
+		logger.Debug("Auth limiter: Cleaned up expired blocks and old failure records", "protocol", a.protocol, "expired_blocks", expiredBlocks, "expired_failures", expiredFailures)
 	}
 }
 

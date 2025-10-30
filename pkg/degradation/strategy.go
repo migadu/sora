@@ -86,7 +86,7 @@ func NewReadOnlyModeStrategy() *ReadOnlyModeStrategy {
 }
 
 func (ro *ReadOnlyModeStrategy) Activate(level DegradationLevel) error {
-	logger.Infof("Activating read-only mode at level %s", level)
+	logger.Info("Activating read-only mode", "level", level)
 	ro.setActive(true, level)
 	return nil
 }
@@ -110,7 +110,7 @@ func NewCachingStrategy() *CachingStrategy {
 }
 
 func (cs *CachingStrategy) Activate(level DegradationLevel) error {
-	logger.Infof("Activating extended caching strategy at level %s", level)
+	logger.Info("Activating extended caching strategy", "level", level)
 	cs.setActive(true, level)
 
 	switch level {
@@ -148,7 +148,7 @@ func NewRateLimitingStrategy(normalLimit int) *RateLimitingStrategy {
 }
 
 func (rl *RateLimitingStrategy) Activate(level DegradationLevel) error {
-	logger.Infof("Activating rate limiting strategy at level %s", level)
+	logger.Info("Activating rate limiting strategy", "level", level)
 	rl.setActive(true, level)
 
 	switch level {
@@ -162,7 +162,7 @@ func (rl *RateLimitingStrategy) Activate(level DegradationLevel) error {
 		rl.currentLimit = int(float64(rl.normalLimit) * 0.2)
 	}
 
-	logger.Infof("Reduced rate limit from %d to %d", rl.normalLimit, rl.currentLimit)
+	logger.Info("Reduced rate limit", "from", rl.normalLimit, "to", rl.currentLimit)
 	return nil
 }
 
@@ -192,7 +192,7 @@ func NewConnectionPoolStrategy(normalMaxConns int) *ConnectionPoolStrategy {
 }
 
 func (cp *ConnectionPoolStrategy) Activate(level DegradationLevel) error {
-	logger.Infof("Activating connection pool management strategy at level %s", level)
+	logger.Info("Activating connection pool management strategy", "level", level)
 	cp.setActive(true, level)
 
 	switch level {
@@ -285,7 +285,7 @@ func (dm *DegradationManager) evaluateLoop() {
 }
 
 func (dm *DegradationManager) onHealthStatusChange(componentName string, status health.ComponentStatus) {
-	logger.Infof("Health status change for %s: %s", componentName, status)
+	logger.Info("Health status change", "component", componentName, "status", status)
 
 	// Trigger immediate evaluation on health changes
 	go func() {
@@ -310,7 +310,7 @@ func (dm *DegradationManager) evaluateDegradationLevel() {
 	dm.mu.Unlock()
 
 	if oldLevel != newLevel {
-		logger.Infof("Degradation level changed: %s -> %s", oldLevel, newLevel)
+		logger.Info("Degradation level changed", "from", oldLevel, "to", newLevel)
 		dm.applyStrategies(newLevel, oldLevel)
 	}
 }
@@ -374,20 +374,20 @@ func (dm *DegradationManager) applyStrategies(newLevel, oldLevel DegradationLeve
 
 		if shouldActivate && !isActive {
 			if err := strategy.Activate(newLevel); err != nil {
-				logger.Errorf("Failed to activate strategy %s: %v", name, err)
+				logger.Error("Failed to activate strategy", "strategy", name, "error", err)
 			}
 		} else if !shouldActivate && isActive {
 			if err := strategy.Deactivate(); err != nil {
-				logger.Errorf("Failed to deactivate strategy %s: %v", name, err)
+				logger.Error("Failed to deactivate strategy", "strategy", name, "error", err)
 			}
 		} else if shouldActivate && isActive && strategy.Level() != newLevel {
 			// Reactivate with new level
 			if err := strategy.Deactivate(); err != nil {
-				logger.Errorf("Failed to deactivate strategy %s for reactivation: %v", name, err)
+				logger.Error("Failed to deactivate strategy for reactivation", "strategy", name, "error", err)
 				continue
 			}
 			if err := strategy.Activate(newLevel); err != nil {
-				logger.Errorf("Failed to reactivate strategy %s: %v", name, err)
+				logger.Error("Failed to reactivate strategy", "strategy", name, "error", err)
 			}
 		}
 	}

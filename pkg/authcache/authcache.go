@@ -65,8 +65,8 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	logger.Infof("[AuthCache] Initialized: positive_ttl=%s, negative_ttl=%s, max_size=%d, cleanup_interval=%s",
-		positiveTTL, negativeTTL, maxSize, cleanupInterval)
+	logger.Info("AuthCache: Initialized", "positive_ttl", positiveTTL,
+		"negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval)
 
 	return cache
 }
@@ -221,7 +221,7 @@ func (c *AuthCache) cleanup() {
 	}
 
 	if removed > 0 {
-		logger.Infof("[AuthCache] Cleanup removed %d expired entries, %d remaining", removed, len(c.entries))
+		logger.Info("AuthCache: Cleanup removed expired entries", "removed", removed, "remaining", len(c.entries))
 		metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
 	}
 
@@ -275,5 +275,5 @@ func (c *AuthCache) Clear() {
 	c.hits = 0
 	c.misses = 0
 
-	logger.Infof("[AuthCache] Cache cleared")
+	logger.Info("AuthCache: Cache cleared")
 }

@@ -148,7 +148,7 @@ func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, 
 	connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
 		user, password, host, port, dbname, sslMode)
 
-	log.Printf("[DB] connecting to database: postgres://%s@%s:%s/%s?sslmode=%s",
+	log.Printf("Database: connecting to database: postgres://%s@%s:%s/%s?sslmode=%s",
 		user, host, port, dbname, sslMode)
 
 	config, err := pgxpool.ParseConfig(connString)
@@ -207,14 +207,14 @@ func (db *Database) Close() {
 			if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
 				// 57P01 = admin_shutdown - connection terminated by administrator
 				// This is expected during graceful shutdown, lock is auto-released
-				log.Println("[DB] Advisory lock auto-released (connection terminated during shutdown).")
+				log.Println("Database: advisory lock auto-released (connection terminated during shutdown).")
 			} else {
-				log.Printf("[DB] Failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+				log.Printf("Database: failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
 			}
 		} else if unlocked {
-			log.Println("[DB] Released shared database advisory lock.")
+			log.Println("Database: feleased shared database advisory lock.")
 		} else {
-			log.Println("[DB] Advisory lock was not held at time of release (likely auto-released on connection close).")
+			log.Println("Database: advisory lock was not held at time of release (likely auto-released on connection close).")
 		}
 		db.lockConn.Release()
 	}
@@ -259,7 +259,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	err := db.WritePool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&currentVersion, &dirty)
 	if err != nil && err != pgx.ErrNoRows {
 		// If the table doesn't exist yet, we'll catch it below and run migrations
-		log.Printf("[DB] Could not query schema_migrations table (may not exist yet): %v", err)
+		log.Printf("Database: could not query schema_migrations table (may not exist yet): %v", err)
 	} else if err == nil {
 		// Table exists and we got a version
 		if dirty {
@@ -280,7 +280,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		firstVersion, err := sourceDriver.First()
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				log.Printf("[DB] No migration files found. Database is at version %d.", currentVersion)
+				log.Printf("Database: no migration files found. Database is at version %d.", currentVersion)
 				return nil
 			}
 			return fmt.Errorf("failed to get first migration version: %w", err)
@@ -303,11 +303,11 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 		// Fast exit if already up-to-date
 		if currentVersion >= latestVersion {
-			log.Printf("[DB] Migrations are up to date (database: %d, latest: %d). Skipping migration infrastructure setup.", currentVersion, latestVersion)
+			log.Printf("Database: migrations are up to date (database: %d, latest: %d). Skipping migration infrastructure setup.", currentVersion, latestVersion)
 			return nil
 		}
 
-		log.Printf("[DB] Migrations needed (database: %d, latest: %d). Proceeding with migration...", currentVersion, latestVersion)
+		log.Printf("Database: migrations needed (database: %d, latest: %d). Proceeding with migration...", currentVersion, latestVersion)
 	}
 
 	// SLOW PATH: Migrations are needed or schema_migrations doesn't exist yet.
@@ -327,7 +327,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	firstVersion, err := sourceDriver.First()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			log.Println("[DB] No migration files found. Skipping migrations.")
+			log.Println("Database: no migration files found. Skipping migrations.")
 			return nil
 		}
 		return fmt.Errorf("failed to get first migration version: %w", err)
@@ -380,18 +380,18 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
 	}
 
-	log.Printf("[DB] Current migration version: %d, running migrations...", currentVersion)
+	log.Printf("Database: current migration version: %d, running migrations...", currentVersion)
 
 	// Run migrations with timeout context to prevent hanging forever
 	// If another instance is running migrations, this will wait up to the configured timeout
-	log.Printf("[DB] Migration timeout configured: %v", migrationTimeout)
+	log.Printf("Database: migration timeout configured: %v", migrationTimeout)
 	migrateCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
 	defer cancel()
 
 	// Create a channel to run migrations asynchronously
 	errChan := make(chan error, 1)
 	go func() {
-		log.Println("[DB] Attempting to run migrations...")
+		log.Println("Database: attempting to run migrations...")
 		errChan <- m.Up()
 	}()
 
@@ -403,8 +403,8 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 			errStr := err.Error()
 			// If it's a lock acquisition error, verify migrations instead of failing
 			if strings.Contains(errStr, "can't acquire database lock") || strings.Contains(errStr, "Timeout on advisory lock") {
-				log.Println("[DB] Migration lock acquisition failed (another instance is running migrations)")
-				log.Println("[DB] Verifying current migration state...")
+				log.Println("Database: migration lock acquisition failed (another instance is running migrations)")
+				log.Println("Database: verifying current migration state...")
 
 				// Query schema_migrations directly to avoid lock contention
 				var newVersion uint
@@ -419,7 +419,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 				// Check if the version is now up-to-date (>= latest available migration)
 				if newVersion >= latestVersion {
-					log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+					log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
 				} else {
 					return fmt.Errorf("lock acquisition failed and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
 				}
@@ -427,14 +427,14 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 				return fmt.Errorf("failed to run migrations: %w", err)
 			}
 		} else if err == migrate.ErrNoChange {
-			log.Println("[DB] migrations are up to date")
+			log.Println("Database: migrations are up to date")
 		} else {
-			log.Println("[DB] migrations applied successfully")
+			log.Println("Database: migrations applied successfully")
 		}
 	case <-migrateCtx.Done():
 		// Timeout occurred - likely another instance is running migrations
-		log.Println("[DB] Migration attempt timed out (another instance may be running migrations)")
-		log.Println("[DB] Verifying current migration state...")
+		log.Println("Database: migration attempt timed out (another instance may be running migrations)")
+		log.Println("Database: verifying current migration state...")
 
 		// Query schema_migrations directly to avoid lock contention
 		var newVersion uint
@@ -449,7 +449,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 		// Check if the version is now up-to-date (>= latest available migration)
 		if newVersion >= latestVersion {
-			log.Printf("[DB] Migration version verified: %d (migrations completed by another instance)", newVersion)
+			log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
 		} else {
 			return fmt.Errorf("timeout waiting for migrations and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
 		}
@@ -464,7 +464,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
 	}
 
-	log.Printf("[DB] Migration complete. Current version: %d", version)
+	log.Printf("Database: migration complete, current version: %d", version)
 	return nil
 }
 
@@ -684,8 +684,8 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.GetDebug(), "read", readFailover)
 		if err != nil {
 			// If all read replicas are down, fall back to write pool instead of failing startup
-			log.Printf("[DB] WARNING: Failed to create read pool (all read replicas unreachable): %v", err)
-			log.Printf("[DB] Falling back to write pool for read operations")
+			log.Printf("Database: WARNING - failed to create read pool (all read replicas unreachable): %v", err)
+			log.Printf("Database: falling back to write pool for read operations")
 			readPool = writePool
 			readFailover = writeFailover // Share the same failover manager
 		}
@@ -716,7 +716,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 	if acquireLock {
 		// Acquire and hold an advisory lock to signal that the server is running.
-		log.Printf("[DB] Attempting to acquire connection from pool for advisory lock (pool stats: total=%d idle=%d acquired=%d max=%d)...",
+		log.Printf("Database: attempting to acquire connection from pool for advisory lock (pool stats: total=%d idle=%d acquired=%d max=%d)...",
 			db.WritePool.Stat().TotalConns(), db.WritePool.Stat().IdleConns(),
 			db.WritePool.Stat().AcquiredConns(), db.WritePool.Stat().MaxConns())
 
@@ -735,7 +735,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			}
 			return nil, fmt.Errorf("failed to acquire connection for advisory lock: %w", err)
 		}
-		log.Println("[DB] Connection acquired from pool for advisory lock attempt")
+		log.Println("Database: connection acquired from pool for advisory lock attempt")
 
 		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
 		// IMPORTANT: pg_try_advisory_lock_shared() returns immediately - it does NOT block.
@@ -751,7 +751,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 				jitter := time.Duration(attempt*10) * time.Millisecond
 				actualDelay := retryDelay + jitter
 
-				log.Printf("[DB] Retrying advisory lock acquisition (attempt %d/%d) after %v (previous attempt returned false - exclusive lock held)...", attempt+1, maxRetries, actualDelay)
+				log.Printf("Database: retrying advisory lock acquisition (attempt %d/%d) after %v (previous attempt returned false - exclusive lock held)...", attempt+1, maxRetries, actualDelay)
 				time.Sleep(actualDelay)
 
 				// Slower exponential backoff for shared locks (1.5x instead of 2x)
@@ -769,13 +769,13 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			}
 
 			if lockAcquired {
-				log.Printf("[DB] Acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
+				log.Printf("Database: acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
 				db.lockConn = lockConn // Store the *pgxpool.Conn
 				break
 			}
 
 			// Lock not acquired means an exclusive lock is currently held
-			log.Printf("[DB] Shared advisory lock not available (attempt %d/%d) - exclusive lock held by another process (possibly sora-admin migrate)", attempt+1, maxRetries)
+			log.Printf("Database: shared advisory lock not available (attempt %d/%d) - exclusive lock held by another process (possibly sora-admin migrate)", attempt+1, maxRetries)
 		}
 
 		if !lockAcquired {
@@ -906,7 +906,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 
 		// Connection successful
 		failoverManager.MarkHostHealthy(selectedHost)
-		log.Printf("[DB] %s pool created successfully with failover - host: %s", poolType, actualHost)
+		log.Printf("Database: %s pool created successfully with failover - host: %s", poolType, actualHost)
 		return dbPool, nil
 	}
 

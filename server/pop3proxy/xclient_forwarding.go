@@ -3,7 +3,7 @@ package pop3proxy
 import (
 	"bufio"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"math/rand"
 	"strings"
 	"time"
@@ -54,7 +54,7 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("POP3 Proxy [%s] Warning: failed to clear read deadline after XCLIENT response: %v", s.server.name, err)
+			logger.Debug("POP3 Proxy: Warning - failed to clear read deadline after XCLIENT response", "proxy", s.server.name, "error", err)
 		}
 	}()
 
@@ -68,13 +68,13 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 
 	if strings.HasPrefix(response, "+OK") {
 		if s.server.debug {
-			log.Printf("POP3 Proxy [%s] XCLIENT forwarding completed successfully for %s: %s", s.server.name, s.username, xclientParams)
+			logger.Debug("POP3 Proxy: XCLIENT forwarding completed successfully", "proxy", s.server.name, "user", s.username, "params", xclientParams)
 		}
 	} else if strings.HasPrefix(response, "-ERR") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {
 		// Unexpected response - log but don't fail
-		log.Printf("POP3 Proxy [%s] Unexpected XCLIENT response from backend: %s", s.server.name, response)
+		logger.Debug("POP3 Proxy: Unexpected XCLIENT response from backend", "proxy", s.server.name, "response", response)
 	}
 
 	return nil

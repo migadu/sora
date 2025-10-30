@@ -107,7 +107,7 @@ func (w *UploadWorker) Start(ctx context.Context) error {
 	w.wg.Add(1)
 	go w.run(ctx)
 
-	logger.Info("[UPLOADER] worker started")
+	logger.Info("Uploader: worker started")
 	return nil
 }
 
@@ -128,7 +128,7 @@ func (w *UploadWorker) run(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	logger.Info("[UPLOADER] worker processing every 30s, cleanup and monitoring every 5min")
+	logger.Info("Uploader: worker processing every 30s, cleanup and monitoring every 5min")
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -136,28 +136,28 @@ func (w *UploadWorker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("[UPLOADER] worker stopped due to context cancellation")
+			logger.Info("Uploader: worker stopped due to context cancellation")
 			return
 		case <-w.stopCh:
-			logger.Info("[UPLOADER] worker stopped due to stop signal")
+			logger.Info("Uploader: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("[UPLOADER] timer tick")
+			logger.Info("Uploader: timer tick")
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
 			}
 		case <-monitorTicker.C:
-			logger.Info("[UPLOADER] monitor tick")
+			logger.Info("Uploader: monitor tick")
 			if err := w.monitorStuckUploads(ctx); err != nil {
-				logger.Errorf("[UPLOADER] monitor error: %v", err)
+				logger.Error("Uploader: Monitor error", "error", err)
 			}
 		case <-cleanupTicker.C:
-			logger.Info("[UPLOADER] cleanup tick")
+			logger.Info("Uploader: cleanup tick")
 			if err := w.cleanupOrphanedFiles(ctx); err != nil {
-				logger.Errorf("[UPLOADER] cleanup error: %v", err)
+				logger.Error("Uploader: Cleanup error", "error", err)
 			}
 		case <-w.notifyCh:
-			logger.Info("[UPLOADER] worker notified")
+			logger.Info("Uploader: worker notified")
 			_ = w.processQueue(ctx)
 		}
 	}
@@ -177,7 +177,7 @@ func (w *UploadWorker) Stop() {
 	close(w.stopCh)
 	w.wg.Wait()
 
-	logger.Info("[UPLOADER] worker stopped")
+	logger.Info("Uploader: worker stopped")
 }
 
 func (w *UploadWorker) NotifyUploadQueued() {
@@ -213,13 +213,13 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 		for _, upload := range uploads {
 			// Check if this upload has exceeded max attempts before processing
 			if upload.Attempts >= w.maxAttempts {
-				logger.Infof("[UPLOADER] skipping upload for hash %s (ID %d) due to excessive failed attempts (%d)", upload.ContentHash, upload.ID, upload.Attempts)
+				logger.Info("Uploader: Skipping upload due to excessive failed attempts", "hash", upload.ContentHash, "id", upload.ID, "attempts", upload.Attempts)
 				continue // Skip this upload and move to the next one in the batch
 			}
 
 			select {
 			case <-ctx.Done():
-				logger.Info("[UPLOADER] request aborted, waiting for in-flight uploads")
+				logger.Info("Uploader: request aborted, waiting for in-flight uploads")
 				wg.Wait()
 				return nil
 			case sem <- struct{}{}:
@@ -239,19 +239,19 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) {
 	// Early validation of upload data
 	if !isValidContentHash(upload.ContentHash) {
-		logger.Errorf("[UPLOADER] invalid content hash in upload record: %s (account %d)", upload.ContentHash, upload.AccountID)
+		logger.Error("Uploader: Invalid content hash in upload record", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for invalid hash %s (account %d): %v", upload.ContentHash, upload.AccountID, err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt for invalid hash", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
 		return
 	}
 
-	logger.Infof("[UPLOADER] uploading hash %s for account %d", upload.ContentHash, upload.AccountID)
+	logger.Info("Uploader: Uploading hash", "hash", upload.ContentHash, "account", upload.AccountID)
 
 	// Check for context cancellation early
 	select {
 	case <-ctx.Done():
-		logger.Infof("[UPLOADER] request aborted during upload of hash %s", upload.ContentHash)
+		logger.Info("Uploader: Request aborted during upload", "hash", upload.ContentHash)
 		return
 	default:
 	}
@@ -259,9 +259,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Get primary address to construct S3 path
 	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
 	if err != nil {
-		logger.Errorf("[UPLOADER] failed to get primary address for account %d: %v", upload.AccountID, err)
+		logger.Error("Uploader: Failed to get primary address for account", "account_id", upload.AccountID, "error", err)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after email lookup failure: %v", upload.ContentHash, upload.AccountID, err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after email lookup failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
 		return
 	}
@@ -273,25 +273,25 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Check if this content hash is already marked as uploaded by another worker for this user
 	isUploaded, err := w.rdb.IsContentHashUploadedWithRetry(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
-		logger.Errorf("[UPLOADER] failed to check if content hash %s is already uploaded for account %d: %v", upload.ContentHash, upload.AccountID, err)
+		logger.Error("Uploader: Failed to check if content hash is already uploaded", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		// Mark attempt and let it be retried
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after upload check failure: %v", upload.ContentHash, upload.AccountID, err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after upload check failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
 		return
 	}
 
 	if isUploaded {
-		logger.Infof("[UPLOADER] content hash %s already uploaded for account %d, skipping S3 upload", upload.ContentHash, upload.AccountID)
+		logger.Info("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account", upload.AccountID)
 		// Content is already in S3. Mark this specific message instance as uploaded
 		// and delete the pending upload record.
 		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		if err != nil {
-			logger.Warnf("[UPLOADER] failed to finalize S3 upload for hash %s, account %d: %v - Keeping local file for retry.", upload.ContentHash, upload.AccountID, err)
+			logger.Warn("Uploader: Failed to finalize S3 upload - keeping local file for retry", "hash", upload.ContentHash, "account", upload.AccountID, "error", err)
 			return
 		}
 		// Only delete after successful DB update
-		logger.Infof("[UPLOADER] upload completed (already uploaded hash) for hash %s, account %d", upload.ContentHash, upload.AccountID)
+		logger.Info("Uploader: Upload completed (already uploaded hash)", "hash", upload.ContentHash, "account", upload.AccountID)
 
 		// The local file is unique to this upload task, so it can be safely removed.
 		if err := w.RemoveLocalFile(filePath); err != nil {
@@ -303,9 +303,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after file read failure: %v", upload.ContentHash, upload.AccountID, err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after file read failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
-		logger.Errorf("[UPLOADER] could not read file %s (account %d): %v", filePath, upload.AccountID, err)
+		logger.Error("Uploader: Could not read file", "path", filePath, "account_id", upload.AccountID, "error", err)
 		return // Cannot proceed without the file
 	}
 
@@ -315,9 +315,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Errorf("[UPLOADER] CRITICAL: failed to mark upload attempt for hash %s (account %d) after S3 failure: %v", upload.ContentHash, upload.AccountID, err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after S3 failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
-		logger.Errorf("[UPLOADER] upload failed for %s (account %d, key: %s): %v", upload.ContentHash, upload.AccountID, s3Key, err)
+		logger.Error("Uploader: Upload failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "key", s3Key, "error", err)
 
 		// Track upload failure
 		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
@@ -333,19 +333,19 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// If this fails, the S3 object might be orphaned temporarily, but the task is not lost.
 		// The task will be retried after the lease expires. Because the local file still
 		// exists, the retry can succeed.
-		logger.Errorf("[UPLOADER] CRITICAL: failed to finalize DB after S3 upload for hash %s, account %d: %v. Will retry.", upload.ContentHash, upload.AccountID, err)
+		logger.Error("Uploader: CRITICAL - Failed to finalize DB after S3 upload - will retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		return
 	}
 
 	// Move the uploaded file to the global cache. If the move fails (e.g., file
 	// already in cache from another user's upload), delete the local file.
 	if err := w.cache.MoveIn(filePath, upload.ContentHash); err != nil {
-		logger.Errorf("[UPLOADER] failed to move uploaded hash %s to cache: %v. Deleting local file.", upload.ContentHash, err)
+		logger.Error("Uploader: Failed to move uploaded hash to cache - deleting local file", "hash", upload.ContentHash, "error", err)
 		if removeErr := w.RemoveLocalFile(filePath); removeErr != nil {
 			// Log is inside RemoveLocalFile
 		}
 	} else {
-		logger.Infof("[UPLOADER] moved hash %s to cache after upload", upload.ContentHash)
+		logger.Info("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
 	}
 
 	// Track successful upload
@@ -353,7 +353,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	metrics.S3UploadAttempts.WithLabelValues("success").Inc()
 	metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
-	logger.Infof("[UPLOADER] upload completed for hash %s, account %d", upload.ContentHash, upload.AccountID)
+	logger.Info("Uploader: Upload completed", "hash", upload.ContentHash, "account", upload.AccountID)
 }
 
 // reportError sends an error to the error channel if configured, otherwise logs it
@@ -362,17 +362,17 @@ func (w *UploadWorker) reportError(err error) {
 		select {
 		case w.errCh <- err:
 		default:
-			logger.Errorf("[UPLOADER] worker error (no listener): %v", err)
+			logger.Error("Uploader: Worker error (no listener)", "error", err)
 		}
 	} else {
-		logger.Errorf("[UPLOADER] worker error: %v", err)
+		logger.Error("Uploader: Worker error", "error", err)
 	}
 }
 
 func (w *UploadWorker) FilePath(contentHash string, accountID int64) string {
 	// Validate content hash to prevent path traversal attacks
 	if !isValidContentHash(contentHash) {
-		logger.Warnf("[UPLOADER] invalid content hash attempted: %s", contentHash)
+		logger.Warn("Uploader: Invalid content hash attempted", "hash", contentHash)
 		// Return a safe fallback path that will fail cleanly
 		return filepath.Join(w.path, "invalid", "invalid")
 	}
@@ -408,7 +408,7 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 
 func (w *UploadWorker) RemoveLocalFile(path string) error {
 	if err := os.Remove(path); err != nil {
-		logger.Warnf("[UPLOADER] uploaded but could not delete file %s: %v", path, err)
+		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
 	} else {
 		stopAt, _ := filepath.Abs(w.path)
 		removeEmptyParents(path, stopAt)
@@ -430,24 +430,21 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 
 	// Log summary
 	if stats.TotalPending > 0 || stats.FailedUploads > 0 {
-		logger.Infof("[UPLOADER-MONITOR] Queue: %d pending (%d bytes), %d failed (max attempts reached)",
-			stats.TotalPending, stats.TotalPendingSize, stats.FailedUploads)
+		logger.Info("UploaderMonitor: Queue status", "pending", stats.TotalPending,
+			"pending_bytes", stats.TotalPendingSize, "failed", stats.FailedUploads)
 	}
 
 	// Alert if failed uploads exist
 	if stats.FailedUploads > 0 {
-		logger.Warnf("[UPLOADER-MONITOR] ALERT: %d uploads have failed after %d attempts and need attention",
-			stats.FailedUploads, w.maxAttempts)
+		logger.Warn("UploaderMonitor: ALERT - uploads have failed and need attention", "count", stats.FailedUploads, "max_attempts", w.maxAttempts)
 
 		// Get details of failed uploads
 		failed, err := w.rdb.GetFailedUploadsWithRetry(ctx, w.maxAttempts, 10)
 		if err != nil {
-			logger.Errorf("[UPLOADER-MONITOR] failed to get failed upload details: %v", err)
+			logger.Error("UploaderMonitor: Failed to get failed upload details", "error", err)
 		} else {
 			for _, upload := range failed {
-				logger.Warnf("[UPLOADER-MONITOR] Stuck upload: ID=%d Account=%d Hash=%s Attempts=%d Age=%s",
-					upload.ID, upload.AccountID, upload.ContentHash[:16], upload.Attempts,
-					time.Since(upload.CreatedAt).Round(time.Minute))
+				logger.Warn("UploaderMonitor: Stuck upload", "id", upload.ID, "account", upload.AccountID, "hash", upload.ContentHash[:16], "attempts", upload.Attempts, "age", time.Since(upload.CreatedAt).Round(time.Minute))
 			}
 		}
 	}
@@ -494,7 +491,7 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	// Walk the upload directory tree
 	err := filepath.Walk(w.path, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			logger.Warnf("[UPLOADER-CLEANUP] error accessing path %s: %v", path, err)
+			logger.Warn("UploaderCleanup: Error accessing path", "path", path, "error", err)
 			return nil // Continue walking despite errors
 		}
 
@@ -521,7 +518,7 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		// Path structure: /path/to/uploads/{accountID}/{contentHash}
 		relPath, err := filepath.Rel(w.path, path)
 		if err != nil {
-			logger.Warnf("[UPLOADER-CLEANUP] failed to get relative path for %s: %v", path, err)
+			logger.Warn("UploaderCleanup: Failed to get relative path", "path", path, "error", err)
 			return nil
 		}
 
@@ -533,7 +530,7 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		}
 
 		if len(parts) < 2 {
-			logger.Warnf("[UPLOADER-CLEANUP] unexpected path structure: %s", relPath)
+			logger.Warn("UploaderCleanup: Unexpected path structure", "path", relPath)
 			return nil
 		}
 
@@ -544,20 +541,20 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		// Parse account ID
 		var accountID int64
 		if _, err := fmt.Sscanf(accountIDStr, "%d", &accountID); err != nil {
-			logger.Warnf("[UPLOADER-CLEANUP] invalid account ID in path %s: %v", path, err)
+			logger.Warn("UploaderCleanup: Invalid account ID in path", "path", path, "error", err)
 			return nil
 		}
 
 		// Validate content hash
 		if !isValidContentHash(contentHash) {
-			logger.Warnf("[UPLOADER-CLEANUP] invalid content hash in path %s", path)
+			logger.Warn("UploaderCleanup: Invalid content hash in path", "path", path)
 			// Remove invalid files
 			if removeErr := os.Remove(path); removeErr != nil {
-				logger.Warnf("[UPLOADER-CLEANUP] failed to remove invalid file %s: %v", path, removeErr)
+				logger.Warn("UploaderCleanup: Failed to remove invalid file", "path", path, "error", removeErr)
 			} else {
 				filesRemoved++
 				totalSize += info.Size()
-				logger.Infof("[UPLOADER-CLEANUP] removed invalid file %s", path)
+				logger.Info("UploaderCleanup: Removed invalid file", "path", path)
 			}
 			return nil
 		}
@@ -565,18 +562,18 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		// Check if pending upload exists in database
 		exists, err := w.rdb.PendingUploadExistsWithRetry(ctx, contentHash, accountID)
 		if err != nil {
-			logger.Warnf("[UPLOADER-CLEANUP] failed to check pending upload for %s (account %d): %v", contentHash, accountID, err)
+			logger.Warn("UploaderCleanup: Failed to check pending upload", "hash", contentHash, "account", accountID, "error", err)
 			return nil // Don't delete if we can't verify
 		}
 
 		if !exists {
 			// File is orphaned - no pending upload record exists
 			if removeErr := os.Remove(path); removeErr != nil {
-				logger.Warnf("[UPLOADER-CLEANUP] failed to remove orphaned file %s: %v", path, removeErr)
+				logger.Warn("UploaderCleanup: Failed to remove orphaned file", "path", path, "error", removeErr)
 			} else {
 				filesRemoved++
 				totalSize += info.Size()
-				logger.Infof("[UPLOADER-CLEANUP] removed orphaned file %s (account %d, size %d bytes)", contentHash, accountID, info.Size())
+				logger.Info("UploaderCleanup: Removed orphaned file", "hash", contentHash, "account", accountID, "size", info.Size())
 
 				// Try to remove empty parent directories
 				stopAt, _ := filepath.Abs(w.path)
@@ -590,13 +587,13 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	duration := time.Since(start)
 
 	if err != nil && err != context.Canceled {
-		logger.Errorf("[UPLOADER-CLEANUP] walk error: %v", err)
+		logger.Error("UploaderCleanup: Walk error", "error", err)
 		return err
 	}
 
 	// Log cleanup summary
-	logger.Infof("[UPLOADER-CLEANUP] completed in %v: checked %d files, removed %d orphaned files (%d bytes freed)",
-		duration, filesChecked, filesRemoved, totalSize)
+	logger.Info("UploaderCleanup: Completed", "duration", duration,
+		"checked", filesChecked, "removed", filesRemoved, "bytes_freed", totalSize)
 
 	// Track metrics
 	metrics.UploadWorkerJobs.WithLabelValues("cleanup").Add(float64(filesRemoved))

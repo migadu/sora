@@ -6,8 +6,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -46,7 +46,7 @@ func (s *POP3ProxySession) handleConnection() {
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			log.Printf("POP3 Proxy [%s] TLS handshake failed for %s: %v", s.server.name, s.RemoteIP, err)
+			logger.Debug("POP3 Proxy: TLS handshake failed", "proxy", s.server.name, "remote", s.RemoteIP, "error", err)
 			return
 		}
 	}
@@ -62,7 +62,7 @@ func (s *POP3ProxySession) handleConnection() {
 		// Set a read deadline for the client command to prevent idle connections.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to set read deadline for %s: %v", s.server.name, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: Failed to set read deadline", "proxy", s.server.name, "remote", s.RemoteIP, "error", err)
 				return
 			}
 		}
@@ -70,15 +70,15 @@ func (s *POP3ProxySession) handleConnection() {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("POP3 Proxy [%s] client %s timed out waiting for command", s.server.name, s.RemoteIP)
+				logger.Debug("POP3 Proxy: Client timed out waiting for command", "proxy", s.server.name, "remote", s.RemoteIP)
 				writer.WriteString("-ERR Idle timeout, closing connection\r\n")
 				writer.Flush()
 				return
 			}
 			if err == io.EOF {
-				log.Printf("POP3 Proxy [%s] client %s dropped connection", s.server.name, s.RemoteIP)
+				logger.Debug("POP3 Proxy: Client dropped connection", "proxy", s.server.name, "remote", s.RemoteIP)
 			} else {
-				log.Printf("POP3 Proxy [%s] client %s read error: %v", s.server.name, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: Client read error", "proxy", s.server.name, "remote", s.RemoteIP, "error", err)
 			}
 			return
 		}
@@ -142,7 +142,7 @@ func (s *POP3ProxySession) handleConnection() {
 					writer.WriteString("-ERR Authentication failed\r\n")
 				}
 				writer.Flush()
-				log.Printf("POP3 Proxy [%s] authentication failed for user %s from %s: %v", s.server.name, s.username, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: Authentication failed", "proxy", s.server.name, "user", s.username, "remote", s.RemoteIP, "error", err)
 				continue
 			}
 
@@ -152,13 +152,13 @@ func (s *POP3ProxySession) handleConnection() {
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.sessionTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					log.Printf("POP3 Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, s.RemoteIP, err)
+					logger.Debug("POP3 Proxy: Warning - failed to clear read deadline", "proxy", s.server.name, "remote", s.RemoteIP, "error", err)
 				}
 			}
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to register connection for user %s from %s: %v", s.server.name, s.username, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: Failed to register connection", "proxy", s.server.name, "user", s.username, "remote", s.RemoteIP, "error", err)
 			}
 
 			// Start proxying
@@ -250,7 +250,7 @@ func (s *POP3ProxySession) handleConnection() {
 					writer.WriteString("-ERR Authentication failed\r\n")
 				}
 				writer.Flush()
-				log.Printf("POP3 Proxy [%s] SASL authentication failed for user %s from %s: %v", s.server.name, authnID, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: SASL authentication failed", "proxy", s.server.name, "user", authnID, "remote", s.RemoteIP, "error", err)
 				continue
 			}
 
@@ -260,13 +260,13 @@ func (s *POP3ProxySession) handleConnection() {
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.sessionTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					log.Printf("POP3 Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, authnID, err)
+					logger.Debug("POP3 Proxy: Warning - failed to clear read deadline", "proxy", s.server.name, "user", authnID, "error", err)
 				}
 			}
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to register connection for user %s from %s: %v", s.server.name, authnID, s.RemoteIP, err)
+				logger.Debug("POP3 Proxy: Failed to register connection for user %s from %s: %v", "name", s.server.name, "param", authnID, s.RemoteIP, err)
 			}
 
 			// Start proxying
@@ -294,7 +294,7 @@ func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string
 	writer.WriteString(response)
 	writer.Flush()
 	if s.errorCount >= maxAuthErrors {
-		log.Printf("POP3 Proxy [%s] Too many authentication errors from %s, dropping connection.", s.server.name, s.RemoteIP)
+		logger.Debug("POP3 Proxy: Too many authentication errors, dropping connection", "proxy", s.server.name, "remote", s.RemoteIP)
 		// Send a final error message before closing.
 		writer.WriteString("-ERR Too many invalid commands, closing connection\r\n")
 		writer.Flush()
@@ -331,7 +331,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
 		if s.server.debug {
-			log.Printf("POP3 Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+			logger.Debug("POP3 Proxy: Attempting authentication via prelookup", "proxy", s.server.name, "user", username)
 		}
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
@@ -339,7 +339,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
 				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				log.Printf("POP3 Proxy [%s] Prelookup returned invalid response for '%s': %v. This is a server bug - rejecting authentication.", s.server.name, username, err)
+				logger.Debug("POP3 Proxy: Prelookup returned invalid response - server bug, rejecting authentication", "proxy", s.server.name, "user", username, "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 				return fmt.Errorf("prelookup server error: invalid response")
@@ -349,11 +349,11 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					if s.server.debug {
-						log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+						logger.Debug("POP3 Proxy: Prelookup transient error, fallback enabled - attempting main DB", "proxy", s.server.name, "user", username, "error", err)
 					}
 					// Fallthrough to main DB auth
 				} else {
-					log.Printf("POP3 Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
+					logger.Debug("POP3 Proxy: Prelookup transient error, fallback disabled - rejecting authentication", "proxy", s.server.name, "user", username, "error", err)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
@@ -366,7 +366,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			case proxy.AuthSuccess:
 				// Prelookup auth was successful.
 				if s.server.debug {
-					log.Printf("POP3 Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+					logger.Debug("POP3 Proxy: Prelookup authentication successful", "proxy", s.server.name, "user", username, "account_id", routingInfo.AccountID)
 				}
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
@@ -377,6 +377,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				} else {
 					s.username = username // Fallback to original
 				}
+
+				// Set username on client connection for timeout logging
+				if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+					soraConn.SetUsername(s.username)
+				}
+
 				s.authenticated = true
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
@@ -394,14 +400,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
-				log.Printf("POP3 Proxy [%s] Prelookup authentication failed for user %s from %s (bad password)", s.server.name, username, s.RemoteIP)
+				logger.Debug("POP3 Proxy: Prelookup authentication failed - bad password", "proxy", s.server.name, "user", username, "remote", s.RemoteIP)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				log.Printf("POP3 Proxy [%s] Prelookup service temporarily unavailable for user %s", s.server.name, username)
+				logger.Debug("POP3 Proxy: Prelookup service temporarily unavailable", "proxy", s.server.name, "user", username)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
@@ -409,7 +415,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
 				if s.server.debug {
-					log.Printf("POP3 Proxy [%s] User '%s' not found in prelookup. Attempting main DB authentication.", s.server.name, username)
+					logger.Debug("POP3 Proxy: User not found in prelookup, attempting main DB", "proxy", s.server.name, "user", username)
 				}
 			}
 		}
@@ -422,7 +428,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	}
 
 	if s.server.debug {
-		log.Printf("POP3 Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+		logger.Debug("POP3 Proxy: Authenticating user via main database", "proxy", s.server.name, "user", username)
 	}
 	// Use base address (without +detail) for authentication
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
@@ -446,6 +452,11 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	s.accountID = accountID
 	s.isPrelookupAccount = false // Authenticated against the main DB
 
+	// Set username on client connection for timeout logging
+	if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+		soraConn.SetUsername(s.username)
+	}
+
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
 		return fmt.Errorf("failed to connect to backend: %w", err)
@@ -466,7 +477,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		ProxyName:          "POP3 Proxy",
 	})
 	if err != nil {
-		log.Printf("POP3 Proxy [%s] Error determining route for %s: %v", s.server.name, s.username, err)
+		logger.Debug("POP3 Proxy: Error determining route", "proxy", s.server.name, "user", s.username, "error", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -538,7 +549,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); err != nil {
-			log.Printf("POP3 Proxy [%s] Failed to send forwarding parameters to backend: %v", s.server.name, err)
+			logger.Debug("POP3 Proxy: Failed to send forwarding parameters to backend", "proxy", s.server.name, "error", err)
 			// Continue anyway - forwarding parameters are not critical for functionality
 		}
 	}
@@ -569,7 +580,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 
 	if s.server.debug {
-		log.Printf("POP3 Proxy [%s] authenticated to backend as %s", s.server.name, s.username)
+		logger.Debug("POP3 Proxy: Authenticated to backend", "proxy", s.server.name, "user", s.username)
 	}
 
 	return nil
@@ -577,14 +588,14 @@ func (s *POP3ProxySession) connectToBackend() error {
 
 func (s *POP3ProxySession) startProxying() {
 	if s.backendConn == nil {
-		log.Printf("POP3 Proxy [%s] backend connection not established for %s", s.server.name, s.username)
+		logger.Debug("POP3 Proxy: Backend connection not established", "proxy", s.server.name, "user", s.username)
 		return
 	}
 
 	defer s.backendConn.Close()
 
 	if s.server.debug {
-		log.Printf("POP3 Proxy [%s] starting bidirectional proxy for %s", s.server.name, s.username)
+		logger.Debug("POP3 Proxy: starting bidirectional proxy for %s", "name", s.server.name, "param", s.username)
 	}
 
 	var wg sync.WaitGroup
@@ -614,7 +625,7 @@ func (s *POP3ProxySession) startProxying() {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			log.Printf("POP3 Proxy [%s] error copying backend to client for %s: %v", s.server.name, s.username, err)
+			logger.Debug("POP3 Proxy: error copying backend to client for %s: %v", "name", s.server.name, "param", s.username, err)
 		}
 	}()
 
@@ -627,7 +638,7 @@ func (s *POP3ProxySession) startProxying() {
 
 	wg.Wait() // Wait for both copy operations to finish
 	if s.server.debug {
-		log.Printf("POP3 Proxy [%s] proxy session ended for %s", s.server.name, s.username)
+		logger.Debug("POP3 Proxy: proxy session ended for %s", "name", s.server.name, "param", s.username)
 	}
 }
 
@@ -665,7 +676,7 @@ func (s *POP3ProxySession) close() {
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "POP3", remoteIP); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
-				log.Printf("POP3 Proxy [%s] Failed to unregister connection for %s: %v", serverName, username, err)
+				logger.Debug("POP3 Proxy: Failed to unregister connection", "name", serverName, "user", username, "error", err)
 			}
 		}()
 	}
@@ -706,8 +717,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			log.Printf("POP3 Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)",
-				s.server.name, s.username, s.RemoteIP, s.serverAddr)
+			logger.Debug("POP3 Proxy: Connection kicked - disconnecting user: %s (client: %s, backend: %s)", "name", s.server.name, "param", s.username, s.RemoteIP, s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return
@@ -735,7 +745,7 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		// Set a read deadline to prevent idle authenticated connections.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				log.Printf("POP3 Proxy [%s] Failed to set read deadline for %s: %v", s.server.name, s.username, err)
+				logger.Debug("POP3 Proxy: Failed to set read deadline for %s: %v", "name", s.server.name, "param", s.username, err)
 				return
 			}
 		}
@@ -743,11 +753,11 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("POP3 Proxy [%s] Idle timeout for authenticated user %s, closing connection.", s.server.name, s.username)
+				logger.Debug("POP3 Proxy: Idle timeout for authenticated user, closing connection", "proxy", s.server.name, "user", s.username)
 				return
 			}
 			if err != io.EOF && !isClosingError(err) {
-				log.Printf("POP3 Proxy [%s] error reading from client for %s: %v", s.server.name, s.username, err)
+				logger.Debug("POP3 Proxy: error reading from client for %s: %v", "name", s.server.name, "param", s.username, err)
 			}
 			return
 		}
@@ -770,14 +780,14 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		totalBytesIn += int64(n)
 		if err != nil {
 			if !isClosingError(err) {
-				log.Printf("POP3 Proxy [%s] error writing to backend for %s: %v", s.server.name, s.username, err)
+				logger.Debug("POP3 Proxy: error writing to backend for %s: %v", "name", s.server.name, "param", s.username, err)
 			}
 			return
 		}
 
 		if err := writer.Flush(); err != nil {
 			if !isClosingError(err) {
-				log.Printf("POP3 Proxy [%s] error flushing to backend for %s: %v", s.server.name, s.username, err)
+				logger.Debug("POP3 Proxy: error flushing to backend for %s: %v", "name", s.server.name, "param", s.username, err)
 			}
 			return
 		}

@@ -51,7 +51,7 @@ func (r *SMTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			logger.Warnf("[SMTP Relay] Circuit breaker is OPEN, skipping delivery attempt to %s", r.SMTPHost)
+			logger.Warn("SMTP Relay: Circuit breaker is OPEN - skipping delivery", "host", r.SMTPHost)
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("SMTP relay circuit breaker is open: %w", err)
 		}
@@ -179,7 +179,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			logger.Warnf("[HTTP Relay] Circuit breaker is OPEN, skipping delivery attempt to %s", r.HTTPURL)
+			logger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("HTTP relay circuit breaker is open: %w", err)
 		}
@@ -242,30 +242,6 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
 	return nil
-}
-
-// StandardRelayHandler implements the standard external relay handling (backwards compatibility).
-// Deprecated: Use SMTPRelayHandler or HTTPRelayHandler instead.
-type StandardRelayHandler struct {
-	ExternalRelay string
-	MetricsLabel  string
-	Logger        Logger
-}
-
-// SendToExternalRelay sends a message to the external relay using TLS.
-// Deprecated: Use SMTPRelayHandler or HTTPRelayHandler instead.
-func (r *StandardRelayHandler) SendToExternalRelay(from string, to string, messageBytes []byte) error {
-	if r.ExternalRelay == "" {
-		return fmt.Errorf("external relay not configured")
-	}
-
-	// Use SMTP relay for backwards compatibility
-	smtpRelay := &SMTPRelayHandler{
-		SMTPHost:     r.ExternalRelay,
-		MetricsLabel: r.MetricsLabel,
-		Logger:       r.Logger,
-	}
-	return smtpRelay.SendToExternalRelay(from, to, messageBytes)
 }
 
 // CircuitBreakerConfig holds circuit breaker configuration

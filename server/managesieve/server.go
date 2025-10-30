@@ -6,7 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -86,7 +86,7 @@ type ManageSieveServerOptions struct {
 	AuthRateLimit          serverPkg.AuthRateLimiterConfig
 	CommandTimeout         time.Duration  // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
+	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	Config                 *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
@@ -122,7 +122,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
 	if !options.TLS && options.TLSUseStartTLS {
-		log.Printf("ManageSieve [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", name)
+		logger.Debug("ManageSieve: WARNING - tls_use_starttls ignored because tls=false", "name", name)
 		// Force TLSUseStartTLS to false to avoid confusion
 		options.TLSUseStartTLS = false
 	}
@@ -154,7 +154,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	// Use all supported extensions by default if none are configured
 	if len(serverInstance.supportedExtensions) == 0 {
 		serverInstance.supportedExtensions = GoSieveSupportedExtensions
-		log.Printf("ManageSieve [%s] No supported_extensions configured, using all available extensions: %v", name, GoSieveSupportedExtensions)
+		logger.Debug("ManageSieve: No supported_extensions configured - using all available", "name", name, "extensions", GoSieveSupportedExtensions)
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -199,7 +199,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		if !options.TLSVerify {
 			serverInstance.tlsConfig.InsecureSkipVerify = true
-			log.Printf("ManageSieve [%s] WARNING: TLS certificate verification disabled", name)
+			logger.Debug("ManageSieve: WARNING - TLS certificate verification disabled", "name", name)
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
@@ -233,11 +233,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			0,                             // queue size (not used in local mode)
 		)
 
-		log.Printf("ManageSieve [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)
+		logger.Debug("ManageSieve: Local connection tracking enabled", "name", name, "max_connections_per_user", options.MaxConnectionsPerUser)
 	} else {
 		// Connection tracking disabled (unlimited connections per user)
 		serverInstance.connTracker = nil
-		log.Printf("ManageSieve [%s] Local connection tracking disabled (max_connections_per_user not configured)", name)
+		logger.Debug("ManageSieve: Local connection tracking disabled", "name", name)
 	}
 
 	return serverInstance, nil
@@ -267,10 +267,10 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
-			log.Printf("ManageSieve [%s] listening with implicit TLS on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
-				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout",
+				s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
-			log.Printf("ManageSieve [%s] listening with implicit TLS on %s", s.name, s.addr)
+			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
 		tcpListener, err := net.Listen("tcp", s.addr)
@@ -281,10 +281,9 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
 		if connConfig.EnableTimeoutChecker {
-			log.Printf("ManageSieve [%s] listening on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
-				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
-			log.Printf("ManageSieve [%s] listening on %s", s.name, s.addr)
+			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false)
 		}
 	}
 	defer listener.Close()
@@ -300,7 +299,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("ManageSieve [%s] stopping", s.name)
+		logger.Debug("ManageSieve: stopping", "name", s.name)
 		listener.Close()
 	}()
 
@@ -309,14 +308,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		if err != nil {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				log.Printf("ManageSieve [%s] %v, rejecting connection", s.name, err)
+				logger.Debug("ManageSieve: %v, rejecting connection", "name", s.name, "param", err)
 				continue // Continue accepting other connections
 			}
 
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
-				log.Printf("ManageSieve [%s] server stopped gracefully", s.name)
+				logger.Info("ManageSieve server stopped gracefully", "name", s.name)
 				return
 			default:
 				// For other errors, this might be a fatal server error
@@ -338,7 +337,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			log.Printf("ManageSieve [%s] Connection rejected: %v", s.name, err)
+			logger.Debug("ManageSieve: Connection rejected: %v", "name", s.name, "param", err)
 			conn.Close()
 			continue
 		}
@@ -407,8 +406,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			remoteInfo = session.RemoteIP
 		}
 		// Log connection with connection counters
-		log.Printf("ManageSieve [%s] new connection from %s (connections: total=%d, authenticated=%d)",
-			s.name, remoteInfo, totalCount, authCount)
+		logger.Debug("ManageSieve: new connection from %s (connections: total=%d, authenticated=%d)", "name", s.name, "param", remoteInfo, totalCount, authCount)
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -456,9 +454,9 @@ func (s *ManageSieveServer) waitForSessionsDrain(timeout time.Duration) {
 
 	select {
 	case <-done:
-		log.Printf("ManageSieve [%s] All sessions drained gracefully", s.name)
+		logger.Debug("ManageSieve: All sessions drained gracefully", "name", s.name)
 	case <-time.After(timeout):
-		log.Printf("ManageSieve [%s] Session drain timeout after %v, forcing shutdown", s.name, timeout)
+		logger.Debug("ManageSieve: Session drain timeout after %v, forcing shutdown", "name", s.name, "param", timeout)
 	}
 }
 
@@ -489,7 +487,7 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 		return
 	}
 
-	log.Printf("ManageSieve [%s] Sending graceful shutdown message to %d active connection(s)", s.name, len(activeSessions))
+	logger.Debug("ManageSieve: Sending graceful shutdown message to %d active connection(s)", "name", s.name, "param", len(activeSessions))
 
 	// Send shutdown message to all active connections
 	// ManageSieve uses BYE response for clean disconnection
@@ -505,7 +503,7 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 	// Give clients a brief moment (1 second) to receive the message
 	time.Sleep(1 * time.Second)
 
-	log.Printf("ManageSieve [%s] Proceeding with connection cleanup", s.name)
+	logger.Debug("ManageSieve: Proceeding with connection cleanup", "name", s.name)
 }
 
 // GetTotalConnections returns the current total connection count
@@ -548,7 +546,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic ManageSieve
-			log.Printf("ManageSieve No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
+			logger.Debug("ManageSieve: No PROXY protocol header - treating as direct", "remote", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
@@ -556,7 +554,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
 		// Note: We don't have access to server name in this listener, use generic ManageSieve
-		log.Printf("ManageSieve PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+		logger.Debug("ManageSieve: PROXY protocol error - rejecting", "remote", conn.RemoteAddr(), "error", err)
 		continue
 	}
 }

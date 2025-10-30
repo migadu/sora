@@ -6,7 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -88,7 +88,7 @@ type POP3ServerOptions struct {
 	SessionMemoryLimit     int64          // Memory limit per session in bytes
 	CommandTimeout         time.Duration  // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 1KB/min)
+	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	Config                 *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
@@ -186,7 +186,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
 		if !options.TLSVerify {
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			log.Printf("POP3 [%s] WARNING: Client TLS certificate verification is not enforced (tls_verify=false)", name)
+			logger.Debug("POP3: WARNING - TLS certificate verification not enforced", "name", name)
 		}
 	}
 
@@ -213,11 +213,11 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			0,                             // queue size (not used in local mode)
 		)
 
-		log.Printf("POP3 [%s] Local connection tracking enabled: max_connections_per_user=%d", name, options.MaxConnectionsPerUser)
+		logger.Debug("POP3: Local connection tracking enabled", "name", name, "max", options.MaxConnectionsPerUser)
 	} else {
 		// Connection tracking disabled (unlimited connections per user)
 		server.connTracker = nil
-		log.Printf("POP3 [%s] Local connection tracking disabled (max_connections_per_user not configured)", name)
+		logger.Debug("POP3: Local connection tracking disabled", "name", name)
 	}
 
 	return server, nil
@@ -246,10 +246,9 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Use SoraTLSListener for TLS with timeout protection
 		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
-			log.Printf("POP3 [%s] listening with TLS on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
-				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
-			log.Printf("POP3 [%s] listening with TLS on %s", s.name, s.addr)
+			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
 		tcpListener, err := net.Listen("tcp", s.addr)
@@ -262,10 +261,9 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
 		if connConfig.EnableTimeoutChecker {
-			log.Printf("POP3 [%s] listening on %s (timeout protection enabled - idle: %v, session_max: %v, throughput: %d bytes/min)",
-				s.name, s.addr, s.commandTimeout, s.absoluteSessionTimeout, s.minBytesPerMinute)
+			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
-			log.Printf("POP3 [%s] listening on %s", s.name, s.addr)
+			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false)
 		}
 	}
 	defer listener.Close()
@@ -281,7 +279,7 @@ func (s *POP3Server) Start(errChan chan error) {
 	// Use a goroutine to monitor application context cancellation
 	go func() {
 		<-s.appCtx.Done()
-		log.Printf("POP3 [%s] stopping", s.name)
+		logger.Debug("POP3: stopping", "name", s.name)
 		listener.Close()
 	}()
 
@@ -290,14 +288,14 @@ func (s *POP3Server) Start(errChan chan error) {
 		if err != nil {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				log.Printf("POP3 [%s] %v, rejecting connection", s.name, err)
+				logger.Debug("POP3: %v, rejecting connection", "name", s.name, "param", err)
 				continue // Continue accepting other connections
 			}
 
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
-				log.Printf("POP3 [%s] server stopped gracefully", s.name)
+				logger.Info("POP3 server stopped gracefully", "name", s.name)
 				return
 			default:
 				// For other errors, this might be a fatal server error
@@ -319,7 +317,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			log.Printf("POP3 [%s] Connection rejected: %v", s.name, err)
+			logger.Debug("POP3: Connection rejected: %v", "name", s.name, "param", err)
 			conn.Close()
 			continue
 		}
@@ -383,8 +381,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		} else {
 			remoteInfo = session.RemoteIP
 		}
-		log.Printf("POP3 [%s] new connection from %s (connections: total=%d, authenticated=%d)",
-			s.name, remoteInfo, totalCount, authCount)
+		logger.Debug("POP3: new connection from %s (connections: total=%d, authenticated=%d)", "name", s.name, "param", remoteInfo, totalCount, authCount)
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -433,9 +430,9 @@ func (s *POP3Server) waitForSessionsDrain(timeout time.Duration) {
 
 	select {
 	case <-done:
-		log.Printf("POP3 [%s] All sessions drained gracefully", s.name)
+		logger.Debug("POP3: All sessions drained gracefully", "name", s.name)
 	case <-time.After(timeout):
-		log.Printf("POP3 [%s] Session drain timeout after %v, forcing shutdown", s.name, timeout)
+		logger.Debug("POP3: Session drain timeout after %v, forcing shutdown", "name", s.name, "param", timeout)
 	}
 }
 
@@ -466,7 +463,7 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 		return
 	}
 
-	log.Printf("POP3 [%s] Sending graceful shutdown message to %d active connection(s)", s.name, len(activeSessions))
+	logger.Debug("POP3: Sending graceful shutdown message to %d active connection(s)", "name", s.name, "param", len(activeSessions))
 
 	// Send shutdown message to all active connections
 	for _, session := range activeSessions {
@@ -482,7 +479,7 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 	// Give clients a brief moment (1 second) to receive the message
 	time.Sleep(1 * time.Second)
 
-	log.Printf("POP3 [%s] Proceeding with connection cleanup", s.name)
+	logger.Debug("POP3: Proceeding with connection cleanup", "name", s.name)
 }
 
 // GetTotalConnections returns the current total connection count
@@ -525,7 +522,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic POP3
-			log.Printf("[POP3] No PROXY protocol header from %s; treating as direct connection in optional mode", conn.RemoteAddr())
+			logger.Debug("POP3: No PROXY protocol header - treating as direct", "remote", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
@@ -533,7 +530,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
 		// Note: We don't have access to server name in this listener, use generic POP3
-		log.Printf("[POP3] PROXY protocol error, rejecting connection from %s: %v", conn.RemoteAddr(), err)
+		logger.Debug("POP3: PROXY protocol error - rejecting", "remote", conn.RemoteAddr(), "error", err)
 		continue
 	}
 }

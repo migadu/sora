@@ -335,26 +335,6 @@ func TestSMTPRelayHandlerConfiguration(t *testing.T) {
 	}
 }
 
-// TestStandardRelayHandlerDeprecated tests the deprecated StandardRelayHandler
-func TestStandardRelayHandlerDeprecated(t *testing.T) {
-	logger := &testLogger{}
-
-	// Test with empty relay (should error)
-	handler := &StandardRelayHandler{
-		ExternalRelay: "",
-		MetricsLabel:  "test",
-		Logger:        logger,
-	}
-
-	err := handler.SendToExternalRelay("from@example.com", "to@example.com", []byte("test"))
-	if err == nil {
-		t.Error("Expected error for empty external relay, got nil")
-	}
-	if !strings.Contains(err.Error(), "not configured") {
-		t.Errorf("Expected 'not configured' error, got: %v", err)
-	}
-}
-
 // Benchmark tests
 func BenchmarkNewRelayHandlerFromConfig(b *testing.B) {
 	logger := &testLogger{}

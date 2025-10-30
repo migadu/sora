@@ -5,8 +5,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -151,16 +151,16 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	if options.PreLookup != nil && options.PreLookup.Enabled {
 		prelookupClient, err := proxy.InitializePrelookup(options.PreLookup)
 		if err != nil {
-			log.Printf("[POP3 Proxy %s] Failed to initialize prelookup client: %v", options.Name, err)
+			logger.Debug("POP3 Proxy: Failed to initialize prelookup client", "proxy", options.Name, "error", err)
 			if !options.PreLookup.FallbackDefault {
 				serverCancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[POP3 Proxy %s] Continuing without prelookup due to fallback_to_default=true", options.Name)
+			logger.Debug("POP3 Proxy: Continuing without prelookup due to fallback_to_default=true", "proxy", options.Name)
 		} else {
 			routingLookup = prelookupClient
 			if options.Debug {
-				log.Printf("[POP3 Proxy %s] Prelookup client initialized successfully", options.Name)
+				logger.Debug("POP3 Proxy: Prelookup client initialized successfully", "proxy", options.Name)
 			}
 		}
 	}
@@ -186,13 +186,13 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("WARNING: Failed to resolve some addresses for POP3 proxy [%s]: %v", options.Name, err)
+		logger.Debug("WARNING: Failed to resolve some addresses for POP3 proxy", "proxy", options.Name, "error", err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := options.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid POP3 proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", options.Name, stickiness)
+		logger.Debug("WARNING: invalid POP3 proxy affinity_stickiness - using default 1.0", "proxy", options.Name, "value", stickiness)
 		stickiness = 1.0
 	}
 
@@ -285,6 +285,21 @@ func (s *POP3ProxyServer) Start() error {
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
 		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		OnTimeout: func(conn net.Conn, reason string) {
+			// Send POP3 error response before closing
+			var message string
+			switch reason {
+			case "idle":
+				message = "-ERR Idle timeout, please reconnect\r\n"
+			case "slow_throughput":
+				message = "-ERR Connection too slow, please reconnect\r\n"
+			case "session_max":
+				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
+			default:
+				message = "-ERR Connection timeout, please reconnect\r\n"
+			}
+			_, _ = fmt.Fprint(conn, message)
+		},
 	}
 
 	if s.tlsConfig != nil {
@@ -332,7 +347,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			}
 			// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
 			// They should be logged but not crash the server - the listener itself is still healthy
-			log.Printf("[POP3 Proxy %s] Failed to accept connection: %v", s.name, err)
+			logger.Debug("POP3 Proxy: Failed to accept connection", "proxy", s.name, "error", err)
 			continue // Continue accepting other connections
 		}
 
@@ -341,7 +356,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		if s.limiter != nil {
 			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
 			if err != nil {
-				log.Printf("[POP3 Proxy %s] Connection rejected: %v", s.name, err)
+				logger.Debug("POP3 Proxy: Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()
 				continue // Try to accept the next connection
 			}
@@ -359,7 +374,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 
 		session.RemoteIP = conn.RemoteAddr().String()
 		if s.debug {
-			log.Printf("POP3 proxy [%s] new connection from %s", s.name, session.RemoteIP)
+			logger.Debug("POP3 proxy: New connection", "proxy", s.name, "remote", session.RemoteIP)
 		}
 
 		// Track proxy connection
@@ -380,7 +395,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			}()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[POP3 Proxy %s] Session panic recovered: %v", s.name, r)
+					logger.Debug("POP3 Proxy: Session panic recovered", "proxy", s.name, "panic", r)
 					conn.Close()
 				}
 			}()
@@ -400,7 +415,7 @@ func (s *POP3ProxyServer) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 func (s *POP3ProxyServer) Stop() error {
-	log.Printf("POP3 Proxy [%s] stopping...", s.name)
+	logger.Debug("POP3 Proxy: Stopping", "proxy", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {
@@ -422,17 +437,17 @@ func (s *POP3ProxyServer) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("POP3 Proxy [%s] server stopped gracefully", s.name)
+		logger.Debug("POP3 Proxy: Server stopped gracefully", "name", s.name)
 	case <-time.After(30 * time.Second):
-		log.Printf("POP3 Proxy [%s] Server stop timeout", s.name)
+		logger.Debug("POP3 Proxy: Server stop timeout", "proxy", s.name)
 	}
 
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("POP3 Proxy [%s] closing prelookup client...", s.name)
+			logger.Debug("POP3 Proxy: Closing prelookup client", "proxy", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("POP3 Proxy [%s] error closing prelookup client: %v", s.name, err)
+				logger.Debug("POP3 Proxy: Error closing prelookup client", "proxy", s.name, "error", err)
 			}
 		}
 	}
@@ -468,7 +483,7 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 		return
 	}
 
-	log.Printf("POP3 Proxy [%s] Sending graceful shutdown messages to %d active connection(s)", s.name, len(activeSessions))
+	logger.Debug("POP3 Proxy: Sending graceful shutdown messages to active connections", "proxy", s.name, "count", len(activeSessions))
 
 	// Send shutdown messages to both client and backend
 	for _, session := range activeSessions {
@@ -490,5 +505,5 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	// Give both clients and backends a brief moment to process
 	time.Sleep(1 * time.Second)
 
-	log.Printf("POP3 Proxy [%s] Proceeding with connection cleanup", s.name)
+	logger.Debug("POP3 Proxy: Proceeding with connection cleanup", "proxy", s.name)
 }

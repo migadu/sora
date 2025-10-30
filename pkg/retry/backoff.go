@@ -164,10 +164,10 @@ func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConf
 			if IsStopError(err) {
 				var stopErr StopError
 				errors.As(err, &stopErr)
-				logger.Infof("[RETRY-DEBUG] StopError detected on attempt %d, stopping retries: %v", attempts, stopErr.Err)
+				logger.Info("RetryDebug: StopError detected - stopping retries", "attempt", attempts, "error", stopErr.Err)
 				return stopErr.Err
 			}
-			logger.Infof("[RETRY-DEBUG] Error on attempt %d (will retry if < %d): %v", attempts, config.MaxRetries+1, err)
+			logger.Info("RetryDebug: Error on attempt", "attempt", attempts, "max", config.MaxRetries+1, "error", err)
 			if attempt < config.MaxRetries {
 				continue
 			}

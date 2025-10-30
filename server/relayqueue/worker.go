@@ -101,7 +101,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.wg.Add(1)
 	go w.run(ctx)
 
-	logger.Info("[RELAY] worker started")
+	logger.Info("Relay: worker started")
 	return nil
 }
 
@@ -119,7 +119,7 @@ func (w *Worker) Stop() {
 	close(w.stopCh)
 	w.wg.Wait()
 
-	logger.Info("[RELAY] worker stopped")
+	logger.Info("Relay: worker stopped")
 }
 
 // NotifyQueued signals the worker to process the queue immediately without waiting for the interval.
@@ -145,7 +145,7 @@ func (w *Worker) run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	logger.Infof("[RELAY] worker processing every %s (batch size: %d, concurrency: %d)", w.interval, w.batchSize, w.concurrency)
+	logger.Info("Relay: Worker processing", "interval", w.interval, "batch_size", w.batchSize, "concurrency", w.concurrency)
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -153,18 +153,18 @@ func (w *Worker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("[RELAY] worker stopped due to context cancellation")
+			logger.Info("Relay: worker stopped due to context cancellation")
 			return
 		case <-w.stopCh:
-			logger.Info("[RELAY] worker stopped due to stop signal")
+			logger.Info("Relay: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("[RELAY] timer tick")
+			logger.Info("Relay: timer tick")
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
 			}
 		case <-w.notifyCh:
-			logger.Info("[RELAY] worker notified")
+			logger.Info("Relay: worker notified")
 			_ = w.processQueue(ctx)
 		}
 	}
@@ -192,7 +192,7 @@ func (w *Worker) processQueue(ctx context.Context) error {
 	// Check circuit breaker state for proactive recovery
 	hasCircuitBreaker, cbState := w.getCircuitBreakerState()
 	if hasCircuitBreaker && cbState != circuitbreaker.StateClosed {
-		logger.Infof("[RELAY] Circuit breaker is %s, attempting recovery delivery to restore service", cbState)
+		logger.Info("Relay: Circuit breaker attempting recovery delivery", "state", cbState)
 	}
 
 	sem := make(chan struct{}, w.concurrency)
@@ -203,7 +203,7 @@ func (w *Worker) processQueue(ctx context.Context) error {
 		// Check for context cancellation early
 		select {
 		case <-ctx.Done():
-			logger.Info("[RELAY] request aborted")
+			logger.Info("Relay: request aborted")
 			wg.Wait() // Wait for in-flight messages to complete
 			return nil
 		default:
@@ -224,7 +224,7 @@ func (w *Worker) processQueue(ctx context.Context) error {
 		// Process the message concurrently
 		select {
 		case <-ctx.Done():
-			logger.Info("[RELAY] request aborted during processing")
+			logger.Info("Relay: request aborted during processing")
 			wg.Wait()
 			return nil
 		case sem <- struct{}{}:
@@ -249,8 +249,8 @@ func (w *Worker) processQueue(ctx context.Context) error {
 			metrics.RelayQueueDepth.WithLabelValues("processing").Set(float64(processing))
 			metrics.RelayQueueDepth.WithLabelValues("failed").Set(float64(failed))
 
-			logger.Infof("[RELAY] processed %d messages (pending=%d, processing=%d, failed=%d)",
-				processed, pending, processing, failed)
+			logger.Info("Relay: Processed messages", "count", processed,
+				"pending", pending, "processing", processing, "failed", failed)
 		}
 	}
 
@@ -263,14 +263,14 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 	messageAge := time.Since(msg.QueuedAt)
 	metrics.RelayQueueAge.WithLabelValues(msg.Type).Observe(messageAge.Seconds())
 
-	logger.Infof("[RELAY] processing message id=%s type=%s from=%s to=%s (attempt %d, age=%s)",
-		msg.ID, msg.Type, msg.From, msg.To, msg.Attempts+1, messageAge)
+	logger.Info("Relay: Processing message", "id", msg.ID, "type", msg.Type,
+		"from", msg.From, "to", msg.To, "attempt", msg.Attempts+1, "age", messageAge)
 
 	// Check if relay handler is configured
 	if w.relayHandler == nil {
-		logger.Errorf("[RELAY] ERROR: relay handler not configured, marking as failed")
+		logger.Error("Relay: ERROR - Relay handler not configured, marking as failed")
 		if err := w.queue.MarkFailure(msg.ID, "Relay handler not configured"); err != nil {
-			logger.Errorf("[RELAY] CRITICAL: failed to mark failure for message id=%s: %v", msg.ID, err)
+			logger.Error("Relay: CRITICAL - Failed to mark failure for message", "id", msg.ID, "error", err)
 		}
 		metrics.RelayDelivery.WithLabelValues(msg.Type, "no_handler").Inc()
 		return
@@ -279,7 +279,7 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 	// Check for context cancellation before delivery
 	select {
 	case <-ctx.Done():
-		logger.Infof("[RELAY] request aborted during delivery of message id=%s", msg.ID)
+		logger.Info("Relay: Request aborted during delivery", "id", msg.ID)
 		return
 	default:
 	}
@@ -291,11 +291,10 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 
 	if err != nil {
 		// Delivery failed
-		logger.Errorf("[RELAY] delivery failed for message id=%s: %v (duration: %s)",
-			msg.ID, err, duration)
+		logger.Error("Relay: Delivery failed for message", "id", msg.ID, "error", err, "duration", duration)
 
 		if markErr := w.queue.MarkFailure(msg.ID, err.Error()); markErr != nil {
-			logger.Errorf("[RELAY] CRITICAL: failed to mark failure for message id=%s: %v", msg.ID, markErr)
+			logger.Error("Relay: CRITICAL - Failed to mark failure for message", "id", msg.ID, "error", markErr)
 		}
 
 		metrics.RelayDelivery.WithLabelValues(msg.Type, "failure").Inc()
@@ -304,10 +303,10 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 	}
 
 	// Delivery succeeded
-	logger.Infof("[RELAY] delivered message id=%s successfully (duration: %s)", msg.ID, duration)
+	logger.Info("Relay: Delivered message successfully", "id", msg.ID, "duration", duration)
 
 	if markErr := w.queue.MarkSuccess(msg.ID); markErr != nil {
-		logger.Errorf("[RELAY] CRITICAL: failed to mark success for message id=%s: %v", msg.ID, markErr)
+		logger.Error("Relay: CRITICAL - Failed to mark success for message", "id", msg.ID, "error", markErr)
 	}
 
 	metrics.RelayDelivery.WithLabelValues(msg.Type, "success").Inc()
@@ -320,10 +319,10 @@ func (w *Worker) reportError(err error) {
 		select {
 		case w.errCh <- err:
 		default:
-			logger.Errorf("[RELAY] worker error (no listener): %v", err)
+			logger.Error("Relay: Worker error (no listener)", "error", err)
 		}
 	} else {
-		logger.Errorf("[RELAY] worker error: %v", err)
+		logger.Error("Relay: Worker error", "error", err)
 	}
 }
 

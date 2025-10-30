@@ -217,7 +217,7 @@ func VerifyPassword(hashedPassword, password string) error {
 
 	default:
 		// No known scheme prefix
-		log.Printf("[DB] unknown password hash scheme: %s", hashedPassword[:min(10, len(hashedPassword))]) // Using built-in min
+		log.Printf("Database: unknown password hash scheme: %s", hashedPassword[:min(10, len(hashedPassword))]) // Using built-in min
 		return errors.New("unknown password hash scheme")
 	}
 }
@@ -263,7 +263,7 @@ func (db *Database) UpdatePassword(ctx context.Context, tx pgx.Tx, address strin
 		"UPDATE credentials SET password = $1 WHERE LOWER(address) = $2",
 		newHashedPassword, normalizedAddress)
 	if err != nil {
-		log.Printf("[DB] error updating password for address %s: %v", normalizedAddress, err)
+		log.Printf("Database: error updating password for address %s: %v", normalizedAddress, err)
 		return fmt.Errorf("database error updating password: %w", err)
 	}
 
@@ -291,7 +291,7 @@ func (db *Database) GetCredentialForAuth(ctx context.Context, address string) (a
 			return 0, "", consts.ErrUserNotFound
 		}
 		// Log other unexpected database errors
-		log.Printf("[DB] error fetching credentials for address %s: %v", normalizedAddress, err)
+		log.Printf("Database: error fetching credentials for address %s: %v", normalizedAddress, err)
 		return 0, "", fmt.Errorf("database error during authentication: %w", err)
 	}
 
@@ -315,7 +315,7 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 			// Identity (address) not found in the credentials table
 			return 0, consts.ErrUserNotFound
 		}
-		log.Printf("[DB] error fetching account ID for address %s: %v", normalizedAddress, err)
+		log.Printf("Database: error fetching account ID for address %s: %v", normalizedAddress, err)
 		return 0, fmt.Errorf("database error fetching account ID: %w", err)
 	}
 	return accountID, nil

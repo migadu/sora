@@ -105,7 +105,7 @@ All protocol servers support multi-layered timeout protection to defend against 
 
 *   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`). This protects against clients that connect but never send commands.
 *   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"30m"`). This ensures connections don't stay open indefinitely.
-*   `min_bytes_per_minute`: Minimum data throughput required (default: `1024` bytes/min). This protects against slowloris attacks where clients send data extremely slowly to tie up connections. Set to `0` to use the default; set to `-1` to disable throughput checking.
+*   `min_bytes_per_minute`: Minimum data throughput required (default: `512` bytes/min). This protects against slowloris attacks where clients send data extremely slowly to tie up connections. Set to `0` to use the default; set to `-1` to disable throughput checking.
 
 Example:
 ```toml
@@ -114,7 +114,7 @@ start = true
 addr = ":143"
 command_timeout = "5m"              # Close after 5 minutes of inactivity
 absolute_session_timeout = "30m"    # Maximum session duration
-min_bytes_per_minute = 1024         # Require at least 1KB/min throughput
+min_bytes_per_minute = 512          # Require at least 512 bytes/min throughput
 ```
 
 ### `[servers.*_proxy]`
@@ -133,7 +133,7 @@ Proxy servers also support the same multi-layered timeout protection as direct p
 
 *   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`).
 *   `absolute_session_timeout`: Maximum total session duration (default: `"30m"`).
-*   `min_bytes_per_minute`: Minimum throughput to prevent slowloris attacks (default: `1024` bytes/min).
+*   `min_bytes_per_minute`: Minimum throughput to prevent slowloris attacks (default: `512` bytes/min).
 
 **Important:** When configuring timeout values for proxies, ensure the proxy's `command_timeout` is **longer** than any backend timeout values (including `proxy_protocol_timeout` if PROXY protocol is enabled on backends). This prevents the proxy from timing out while waiting for backend responses.
 
@@ -145,7 +145,7 @@ addr = ":1143"
 remote_addrs = ["backend1:143", "backend2:143"]
 command_timeout = "10m"             # Longer than backend timeouts
 absolute_session_timeout = "30m"
-min_bytes_per_minute = 1024
+min_bytes_per_minute = 512
 ```
 
 ### `[servers.metrics]` and `[servers.http_api]`

@@ -3,7 +3,7 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net/http"
 	"net/url"
 
@@ -36,7 +36,7 @@ func (s *Server) handleListFilters(w http.ResponseWriter, r *http.Request) {
 	// Get all scripts
 	scripts, err := s.rdb.GetUserScriptsWithRetry(ctx, accountID)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error retrieving Sieve scripts: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving Sieve scripts: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve scripts")
 		return
 	}
@@ -87,7 +87,7 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error retrieving Sieve script: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve script")
 		return
 	}
@@ -146,7 +146,7 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	// Create or update script
 	script, err := s.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, req.Script)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error creating/updating Sieve script: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error creating/updating Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to save script")
 		return
 	}
@@ -190,7 +190,7 @@ func (s *Server) handleDeleteFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error deleting Sieve script: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error deleting Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete script")
 		return
 	}
@@ -230,7 +230,7 @@ func (s *Server) handleActivateFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error activating Sieve script: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error activating Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to activate script")
 		return
 	}

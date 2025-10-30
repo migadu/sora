@@ -3,7 +3,7 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net/http"
 	"strconv"
 
@@ -68,7 +68,7 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error updating message flags: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error updating message flags: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to update message flags")
 		return
 	}
@@ -115,7 +115,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error marking message as deleted: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error marking message as deleted: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete message")
 		return
 	}

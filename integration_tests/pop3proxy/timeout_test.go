@@ -105,21 +105,31 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 	t.Logf("Going completely idle for %v (timeout is %v)...", idleWait, idleTimeout)
 	time.Sleep(idleWait)
 
-	// Connection should be closed by now. Try to send a command.
-	// Note: Write may succeed (buffered), but read should fail with EOF
-	t.Logf("Attempting to send command after idle period...")
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	_, writeErr := fmt.Fprintf(conn, "NOOP\r\n")
-
-	// Try to read response
+	// After idle timeout, server should send error message and close connection
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
+	// Try to read - should get -ERR message or connection closed
 	response, readErr := reader.ReadString('\n')
 
-	// Either write or read should have failed (typically read fails with EOF)
-	if writeErr == nil && readErr == nil {
-		t.Fatalf("Expected connection to be closed after idle timeout, but both write and read succeeded. Response: %q", response)
+	// We should either get an error message or a connection error
+	if readErr == nil {
+		// Got a response - should be an -ERR message
+		if !contains(response, "-ERR") {
+			t.Fatalf("Expected -ERR message after idle timeout, got: %s", response)
+		}
+		t.Logf("✅ Received error message after idle timeout: %s", response)
+
+		// Now the connection should be closed - try to send command
+		fmt.Fprintf(conn, "NOOP\r\n")
+		_, readErr = reader.ReadString('\n')
+		if readErr == nil {
+			t.Fatalf("Connection should be closed after error, but command succeeded")
+		}
+		t.Logf("✅ Connection closed after error: %v", readErr)
+	} else {
+		// Got an error immediately - connection was closed without error message
+		t.Logf("✅ Connection closed after idle timeout: %v", readErr)
 	}
-	t.Logf("✅ Connection closed after idle timeout (write_err=%v, read_err=%v)", writeErr, readErr)
 
 	// Verify idle timeout metric increased
 	time.Sleep(500 * time.Millisecond) // Give metrics time to update

@@ -2,7 +2,7 @@ package imap
 
 import (
 	"context"
-	"log"
+	"github.com/migadu/sora/logger"
 	"sort"
 	"sync"
 
@@ -78,7 +78,7 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 		if err != nil {
 			// Log the error, but don't fail the SELECT/EXAMINE.
 			// The client will still get the base set of flags.
-			log.Printf("Error fetching custom flags for mailbox %d (%s): %v", dbMbox.ID, dbMbox.Name, err)
+			logger.Debug("Error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
 		} else {
 			for _, cf := range customFlagsFromDB {
 				flagsMap[imap.Flag(cf)] = struct{}{}

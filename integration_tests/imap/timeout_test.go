@@ -185,16 +185,31 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 	t.Logf("Going idle for 3 seconds (timeout is 2s)...")
 	time.Sleep(3 * time.Second)
 
-	// Try to send a command - connection should be closed
+	// After idle timeout, server should send BYE and close connection
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	fmt.Fprintf(conn, "a002 NOOP\r\n")
-	_, readErr := reader.ReadString('\n')
 
-	// Connection should be closed (either EOF or timeout on read)
+	// Try to read - should get BYE message or connection closed
+	response, readErr := reader.ReadString('\n')
+
+	// We should either get a BYE message or a connection error
 	if readErr == nil {
-		t.Fatalf("Expected connection to be closed after idle timeout, but command succeeded")
+		// Got a response - should be a BYE message
+		if !strings.HasPrefix(response, "* BYE") {
+			t.Fatalf("Expected BYE message after idle timeout, got: %s", response)
+		}
+		t.Logf("✅ Received BYE message after idle timeout: %s", strings.TrimSpace(response))
+
+		// Now the connection should be closed - try to send command
+		fmt.Fprintf(conn, "a002 NOOP\r\n")
+		_, readErr = reader.ReadString('\n')
+		if readErr == nil {
+			t.Fatalf("Connection should be closed after BYE, but command succeeded")
+		}
+		t.Logf("✅ Connection closed after BYE: %v", readErr)
+	} else {
+		// Got an error immediately - connection was closed without BYE
+		t.Logf("✅ Connection closed after idle timeout: %v", readErr)
 	}
-	t.Logf("✅ Connection closed after idle timeout: %v", readErr)
 
 	// Verify idle timeout metric increased
 	time.Sleep(500 * time.Millisecond) // Give metrics time to update

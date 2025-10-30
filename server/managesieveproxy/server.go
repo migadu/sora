@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"time"
@@ -130,7 +130,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
 	if !opts.TLS && opts.TLSUseStartTLS {
-		log.Printf("ManageSieve Proxy [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", opts.Name)
+		logger.Debug("ManageSieve Proxy: WARNING - tls_use_starttls ignored because tls=false", "name", opts.Name)
 		// Force TLSUseStartTLS to false to avoid confusion
 		opts.TLSUseStartTLS = false
 	}
@@ -138,12 +138,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize prelookup client if configured
 	routingLookup, err := proxy.InitializePrelookup(opts.PreLookup)
 	if err != nil {
-		log.Printf("[ManageSieve Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
+		logger.Debug("ManageSieve Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
 		if opts.PreLookup != nil && !opts.PreLookup.FallbackDefault {
 			cancel()
 			return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 		}
-		log.Printf("[ManageSieve Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
+		logger.Debug("ManageSieve Proxy: Continuing without prelookup - fallback enabled", "name", opts.Name)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)
@@ -157,13 +157,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[ManageSieve Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
+		logger.Debug("ManageSieve Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid ManageSieve proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
+		logger.Debug("ManageSieve Proxy: WARNING - invalid affinity_stickiness, using default 1.0", "name", opts.Name, "value", stickiness)
 		stickiness = 1.0
 	}
 
@@ -217,7 +217,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Use all supported extensions by default if none are configured
 	if len(s.supportedExtensions) == 0 {
 		s.supportedExtensions = managesieve.GoSieveSupportedExtensions
-		log.Printf("ManageSieve Proxy [%s] No supported_extensions configured, using all available extensions: %v", opts.Name, managesieve.GoSieveSupportedExtensions)
+		logger.Debug("ManageSieve Proxy: No supported_extensions configured - using all available", "name", opts.Name, "extensions", managesieve.GoSieveSupportedExtensions)
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
@@ -268,6 +268,21 @@ func (s *Server) Start() error {
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
 			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			OnTimeout: func(conn net.Conn, reason string) {
+				// Send BYE with TRYLATER before closing (RFC 5804)
+				var message string
+				switch reason {
+				case "idle":
+					message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
+				case "slow_throughput":
+					message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
+				case "session_max":
+					message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
+				default:
+					message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
+				}
+				_, _ = fmt.Fprint(conn, message)
+			},
 		}
 
 		s.listenerMu.Lock()
@@ -288,6 +303,21 @@ func (s *Server) Start() error {
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
 			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			OnTimeout: func(conn net.Conn, reason string) {
+				// Send BYE with TRYLATER before closing (RFC 5804)
+				var message string
+				switch reason {
+				case "idle":
+					message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
+				case "slow_throughput":
+					message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
+				case "session_max":
+					message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
+				default:
+					message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
+				}
+				_, _ = fmt.Fprint(conn, message)
+			},
 		}
 
 		s.listenerMu.Lock()
@@ -320,7 +350,7 @@ func (s *Server) acceptConnections() error {
 			default:
 				// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
 				// They should be logged but not crash the server - the listener itself is still healthy
-				log.Printf("[ManageSieve Proxy %s] Failed to accept connection: %v", s.name, err)
+				logger.Debug("ManageSieve Proxy: Failed to accept connection", "name", s.name, "error", err)
 				continue // Continue accepting other connections
 			}
 		}
@@ -330,7 +360,7 @@ func (s *Server) acceptConnections() error {
 		if s.limiter != nil {
 			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
 			if err != nil {
-				log.Printf("[ManageSieve Proxy %s] Connection rejected: %v", s.name, err)
+				logger.Debug("ManageSieve Proxy: Connection rejected", "name", s.name, "error", err)
 				conn.Close()
 				continue // Try to accept the next connection
 			}
@@ -347,7 +377,7 @@ func (s *Server) acceptConnections() error {
 			}()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[ManageSieve Proxy %s] Session panic recovered: %v", s.name, r)
+					logger.Debug("ManageSieve Proxy: Session panic recovered", "name", s.name, "panic", r)
 					conn.Close()
 				}
 			}()
@@ -375,7 +405,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the ManageSieve proxy server.
 func (s *Server) Stop() error {
-	log.Printf("ManageSieve Proxy [%s] stopping...", s.name)
+	logger.Debug("ManageSieve Proxy: Stopping", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {
@@ -403,17 +433,17 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("ManageSieve Proxy [%s] server stopped gracefully", s.name)
+		logger.Debug("ManageSieve Proxy: Server stopped gracefully", "name", s.name)
 	case <-time.After(30 * time.Second):
-		log.Printf("ManageSieve Proxy [%s] Server stop timeout", s.name)
+		logger.Debug("ManageSieve Proxy: Server stop timeout", "name", s.name)
 	}
 
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("ManageSieve Proxy [%s] closing prelookup client...", s.name)
+			logger.Debug("ManageSieve Proxy: Closing prelookup client", "name", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("ManageSieve Proxy [%s] error closing prelookup client: %v", s.name, err)
+				logger.Debug("ManageSieve Proxy: Error closing prelookup client", "name", s.name, "error", err)
 			}
 		}
 	}
@@ -449,7 +479,7 @@ func (s *Server) sendGracefulShutdownBye() {
 		return
 	}
 
-	log.Printf("ManageSieve Proxy [%s] Sending graceful shutdown messages to %d active connection(s)", s.name, len(activeSessions))
+	logger.Debug("ManageSieve Proxy: Sending graceful shutdown messages", "name", s.name, "active_sessions", len(activeSessions))
 
 	// Send shutdown messages to both client and backend
 	for _, session := range activeSessions {
@@ -472,5 +502,5 @@ func (s *Server) sendGracefulShutdownBye() {
 	// Give both clients and backends a brief moment to process
 	time.Sleep(1 * time.Second)
 
-	log.Printf("ManageSieve Proxy [%s] Proceeding with connection cleanup", s.name)
+	logger.Debug("ManageSieve Proxy: Proceeding with connection cleanup", "name", s.name)
 }

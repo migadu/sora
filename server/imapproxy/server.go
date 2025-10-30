@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -168,16 +168,16 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.InitializePrelookup(opts.PreLookup)
 		if err != nil {
-			log.Printf("[IMAP Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
+			logger.Error("Failed to initialize prelookup client", "proxy", opts.Name, "error", err)
 			if !opts.PreLookup.FallbackDefault {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[IMAP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
+			logger.Warn("Continuing without prelookup due to fallback_to_default=true", "proxy", opts.Name)
 		} else {
 			routingLookup = prelookupClient
 			if opts.Debug {
-				log.Printf("[IMAP Proxy %s] Prelookup client initialized successfully", opts.Name)
+				logger.Debug("Prelookup client initialized successfully", "proxy", opts.Name)
 			}
 		}
 	}
@@ -194,7 +194,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[IMAP Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
+		logger.Warn("Failed to resolve addresses", "proxy", opts.Name, "error", err)
 	}
 
 	// Initialize authentication rate limiter with trusted networks
@@ -286,6 +286,21 @@ func (s *Server) Start() error {
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
 			EnableTimeoutChecker: true,
+			OnTimeout: func(conn net.Conn, reason string) {
+				// Send BYE to client before closing
+				var message string
+				switch reason {
+				case "idle":
+					message = "* BYE Idle timeout, please reconnect\r\n"
+				case "slow_throughput":
+					message = "* BYE Connection too slow, please reconnect\r\n"
+				case "session_max":
+					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
+				default:
+					message = "* BYE Connection timeout, please reconnect\r\n"
+				}
+				_, _ = fmt.Fprint(conn, message)
+			},
 		}
 		s.listener = server.NewSoraTLSListener(tcpListener, tlsConfig, connConfig)
 		s.listenerMu.Unlock()
@@ -305,6 +320,21 @@ func (s *Server) Start() error {
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
 			EnableTimeoutChecker: true,
+			OnTimeout: func(conn net.Conn, reason string) {
+				// Send BYE to client before closing
+				var message string
+				switch reason {
+				case "idle":
+					message = "* BYE Idle timeout, please reconnect\r\n"
+				case "slow_throughput":
+					message = "* BYE Connection too slow, please reconnect\r\n"
+				case "session_max":
+					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
+				default:
+					message = "* BYE Connection timeout, please reconnect\r\n"
+				}
+				_, _ = fmt.Fprint(conn, message)
+			},
 		}
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
@@ -327,6 +357,21 @@ func (s *Server) Start() error {
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
 			EnableTimeoutChecker: true,
+			OnTimeout: func(conn net.Conn, reason string) {
+				// Send BYE to client before closing
+				var message string
+				switch reason {
+				case "idle":
+					message = "* BYE Idle timeout, please reconnect\r\n"
+				case "slow_throughput":
+					message = "* BYE Connection too slow, please reconnect\r\n"
+				case "session_max":
+					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
+				default:
+					message = "* BYE Connection timeout, please reconnect\r\n"
+				}
+				_, _ = fmt.Fprint(conn, message)
+			},
 		}
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
@@ -351,7 +396,7 @@ func (s *Server) acceptConnections() error {
 			default:
 				// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
 				// They should be logged but not crash the server - the listener itself is still healthy
-				log.Printf("[IMAP Proxy %s] Failed to accept connection: %v", s.name, err)
+				logger.Warn("Failed to accept connection", "proxy", s.name, "error", err)
 				continue // Continue accepting other connections
 			}
 		}
@@ -361,7 +406,7 @@ func (s *Server) acceptConnections() error {
 		if s.limiter != nil {
 			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
 			if err != nil {
-				log.Printf("[IMAP Proxy %s] Connection rejected: %v", s.name, err)
+				logger.Warn("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()
 				continue // Try to accept the next connection
 			}
@@ -378,7 +423,7 @@ func (s *Server) acceptConnections() error {
 			}()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[IMAP Proxy %s] Session panic recovered: %v", s.name, r)
+					logger.Error("Session panic recovered", "proxy", s.name, "error", r)
 					conn.Close()
 				}
 			}()
@@ -406,7 +451,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the IMAP proxy server.
 func (s *Server) Stop() error {
-	log.Printf("IMAP Proxy [%s] stopping...", s.name)
+	logger.Info("Stopping proxy server", "proxy", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {
@@ -434,17 +479,17 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("IMAP Proxy [%s] server stopped gracefully", s.name)
+		logger.Info("Proxy server stopped gracefully", "proxy", s.name)
 	case <-time.After(30 * time.Second):
-		log.Printf("IMAP Proxy [%s] Server stop timeout", s.name)
+		logger.Warn("Proxy server stop timeout", "proxy", s.name)
 	}
 
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("IMAP Proxy [%s] closing prelookup client...", s.name)
+			logger.Debug("Closing prelookup client", "proxy", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("IMAP Proxy [%s] error closing prelookup client: %v", s.name, err)
+				logger.Error("Error closing prelookup client", "proxy", s.name, "error", err)
 			}
 		}
 	}
@@ -480,7 +525,7 @@ func (s *Server) sendGracefulShutdownBye() {
 		return
 	}
 
-	log.Printf("IMAP Proxy [%s] Sending graceful shutdown messages to %d active connection(s)", s.name, len(activeSessions))
+	logger.Info("Sending graceful shutdown messages", "proxy", s.name, "count", len(activeSessions))
 
 	// Send shutdown messages to both client and backend
 	for _, session := range activeSessions {
@@ -501,5 +546,5 @@ func (s *Server) sendGracefulShutdownBye() {
 	// Give both clients and backends a brief moment to process
 	time.Sleep(1 * time.Second)
 
-	log.Printf("IMAP Proxy [%s] Proceeding with connection cleanup", s.name)
+	logger.Debug("Proceeding with connection cleanup", "proxy", s.name)
 }

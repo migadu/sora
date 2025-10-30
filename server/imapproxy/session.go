@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -65,20 +65,20 @@ func (s *Session) handleConnection() {
 
 	clientAddr := s.clientConn.RemoteAddr().String()
 	if s.server.debug {
-		log.Printf("IMAP Proxy [%s] New connection from %s", s.server.name, clientAddr)
+		logger.Debug("New connection", "proxy", s.server.name, "remote", clientAddr)
 	}
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			log.Printf("IMAP Proxy [%s] TLS handshake failed for %s: %v", s.server.name, clientAddr, err)
+			logger.Warn("TLS handshake failed", "proxy", s.server.name, "remote", clientAddr, "error", err)
 			return
 		}
 	}
 
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to send greeting to %s: %v", s.server.name, clientAddr, err)
+		logger.Error("Failed to send greeting", "proxy", s.server.name, "remote", clientAddr, "error", err)
 		return
 	}
 
@@ -89,7 +89,7 @@ func (s *Session) handleConnection() {
 		// from sitting in the authentication phase forever.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				log.Printf("IMAP Proxy [%s] Failed to set read deadline for %s: %v", s.server.name, clientAddr, err)
+				logger.Error("Failed to set read deadline", "proxy", s.server.name, "remote", clientAddr, "error", err)
 				return
 			}
 		}
@@ -98,12 +98,12 @@ func (s *Session) handleConnection() {
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("IMAP Proxy [%s] Client %s timed out waiting for command", s.server.name, clientAddr)
+				logger.Debug("Client timed out waiting for command", "proxy", s.server.name, "remote", clientAddr)
 				s.sendResponse("* BYE Idle timeout")
 				return
 			}
 			if err != io.EOF {
-				log.Printf("IMAP Proxy [%s] Error reading from client %s: %v", s.server.name, clientAddr, err)
+				logger.Debug("Error reading from client", "proxy", s.server.name, "remote", clientAddr, "error", err)
 			}
 			return
 		}
@@ -153,7 +153,7 @@ func (s *Session) handleConnection() {
 			password := server.UnquoteString(args[1])
 
 			if err := s.authenticateUser(username, password); err != nil {
-				log.Printf("IMAP Proxy [%s] Authentication failed for %s: %v", s.server.name, username, err)
+				logger.Info("Authentication failed", "proto", "imap_proxy", "user", username, "remote", clientAddr, "error", err)
 				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				continue
 			}
@@ -167,6 +167,12 @@ func (s *Session) handleConnection() {
 					s.username = username // Fallback if parsing fails
 				}
 			}
+
+			// Set username on client connection for timeout logging
+			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+				soraConn.SetUsername(s.username)
+			}
+
 			s.postAuthenticationSetup(tag)
 			authenticated = true
 
@@ -191,7 +197,7 @@ func (s *Session) handleConnection() {
 				saslLine, err = s.clientReader.ReadString('\n')
 				if err != nil {
 					if err != io.EOF {
-						log.Printf("IMAP Proxy [%s] Error reading SASL response: %v", s.server.name, err)
+						logger.Debug("Error reading SASL response", "proxy", s.server.name, "error", err)
 					}
 					return // Client connection error, can't continue
 				}
@@ -227,7 +233,7 @@ func (s *Session) handleConnection() {
 			password := parts[2]
 
 			if err := s.authenticateUser(authnID, password); err != nil {
-				log.Printf("IMAP Proxy [%s] Authentication failed for %s: %v", s.server.name, authnID, err)
+				logger.Info("Authentication failed", "proto", "imap_proxy", "user", authnID, "remote", clientAddr, "error", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
@@ -243,6 +249,12 @@ func (s *Session) handleConnection() {
 					s.username = authnID // Fallback if parsing fails
 				}
 			}
+
+			// Set username on client connection for timeout logging
+			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+				soraConn.SetUsername(s.username)
+			}
+
 			s.postAuthenticationSetup(tag)
 			authenticated = true
 
@@ -276,17 +288,17 @@ func (s *Session) handleConnection() {
 	// in proxy mode where idle is handled by the backend (e.g., IDLE command).
 	if s.server.sessionTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, clientAddr, err)
+			logger.Warn("Failed to clear read deadline", "proxy", s.server.name, "remote", clientAddr, "error", err)
 		}
 	}
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
 		if s.server.debug {
-			log.Printf("IMAP Proxy [%s] Starting proxy for user %s", s.server.name, s.username)
+			logger.Debug("Starting proxy for user", "proxy", s.server.name, "user", s.username)
 		}
 		s.startProxy()
 	} else {
-		log.Printf("IMAP Proxy [%s] Cannot start proxy for user %s: no backend connection", s.server.name, s.username)
+		logger.Error("Cannot start proxy - no backend connection", "proxy", s.server.name, "user", s.username)
 	}
 }
 
@@ -296,7 +308,7 @@ func (s *Session) handleAuthError(response string) bool {
 	s.errorCount++
 	s.sendResponse(response)
 	if s.errorCount >= maxAuthErrors {
-		log.Printf("IMAP Proxy [%s] Too many authentication errors from %s, dropping connection.", s.server.name, s.clientConn.RemoteAddr())
+		logger.Warn("Too many authentication errors, dropping connection", "proxy", s.server.name, "remote", s.clientConn.RemoteAddr().String())
 		// Send a final BYE message before closing.
 		s.sendResponse("* BYE Too many invalid commands")
 		return true
@@ -352,7 +364,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
 		if s.server.debug {
-			log.Printf("IMAP Proxy [%s] Attempting authentication for user %s via prelookup", s.server.name, username)
+			logger.Debug("Attempting authentication via prelookup", "proxy", s.server.name, "user", username)
 		}
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
@@ -360,7 +372,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
 				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				log.Printf("IMAP Proxy [%s] Prelookup returned invalid response for '%s': %v. This is a server bug - rejecting authentication.", s.server.name, username, err)
+				logger.Error("Prelookup returned invalid response - server bug", "proxy", s.server.name, "user", username, "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("prelookup server error: invalid response")
@@ -370,11 +382,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					if s.server.debug {
-						log.Printf("IMAP Proxy [%s] Prelookup transient error for '%s': %v. Fallback enabled - attempting main DB authentication.", s.server.name, username, err)
+						logger.Debug("Prelookup transient error, fallback enabled", "proxy", s.server.name, "user", username, "error", err)
 					}
 					// Fallthrough to main DB auth
 				} else {
-					log.Printf("IMAP Proxy [%s] Prelookup transient error for '%s': %v. Fallback disabled (fallback_to_default=false) - rejecting authentication.", s.server.name, username, err)
+					logger.Warn("Prelookup transient error, fallback disabled", "proxy", s.server.name, "user", username, "error", err)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
@@ -386,8 +398,9 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
+				logger.Info("Authenticated", "proto", "imap_proxy", "user", username, "remote", remoteAddr.String(), "backend", "prelookup")
 				if s.server.debug {
-					log.Printf("IMAP Proxy [%s] Prelookup authentication successful for %s, AccountID: %d (prelookup)", s.server.name, username, routingInfo.AccountID)
+					logger.Debug("Prelookup authentication successful", "proxy", s.server.name, "user", username, "account_id", routingInfo.AccountID)
 				}
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
@@ -409,14 +422,14 @@ func (s *Session) authenticateUser(username, password string) error {
 
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
-				log.Printf("IMAP Proxy [%s] Prelookup authentication failed for %s (bad password)", s.server.name, username)
+				logger.Debug("Prelookup authentication failed - bad password", "proxy", s.server.name, "user", username)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				log.Printf("IMAP Proxy [%s] Prelookup service temporarily unavailable for user %s", s.server.name, username)
+				logger.Warn("Prelookup service temporarily unavailable", "proxy", s.server.name, "user", username)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
@@ -424,7 +437,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
 				if s.server.debug {
-					log.Printf("IMAP Proxy [%s] User '%s' not found in prelookup. Attempting main DB authentication.", s.server.name, username)
+					logger.Debug("User not found in prelookup, attempting main DB", "proxy", s.server.name, "user", username)
 				}
 			}
 		}
@@ -436,7 +449,7 @@ func (s *Session) authenticateUser(username, password string) error {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
 	if s.server.debug {
-		log.Printf("IMAP Proxy [%s] Authenticating user %s via main database", s.server.name, username)
+		logger.Debug("Authenticating user via main database", "proxy", s.server.name, "user", username)
 	}
 	// Use base address (without +detail) for authentication
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
@@ -451,6 +464,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
+	logger.Info("Authenticated", "proto", "imap_proxy", "user", username, "remote", remoteAddr.String(), "backend", "main_db")
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
 
 	// Track domain and user connection activity for the login event.
@@ -473,7 +487,7 @@ func (s *Session) connectToBackend() error {
 		ProxyName:          "IMAP Proxy",
 	})
 	if err != nil {
-		log.Printf("IMAP Proxy [%s] Error determining route for %s: %v", s.server.name, s.username, err)
+		logger.Warn("Error determining route", "proxy", s.server.name, "user", s.username, "error", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -552,7 +566,7 @@ func (s *Session) connectToBackend() error {
 	readTimeout := s.server.connManager.GetConnectTimeout()
 	if err := s.backendConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		s.backendConn.Close()
-		log.Printf("IMAP Proxy [%s] Failed to set read deadline for backend greeting from %s: %v", s.server.name, s.serverAddr, err)
+		logger.Error("Failed to set read deadline for backend greeting", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 		return fmt.Errorf("failed to set read deadline for greeting: %w", err)
 	}
 
@@ -560,13 +574,13 @@ func (s *Session) connectToBackend() error {
 	_, err = s.backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
-		log.Printf("IMAP Proxy [%s] Failed to read backend greeting from %s for user %s: %v", s.server.name, s.serverAddr, s.username, err)
+		logger.Error("Failed to read backend greeting", "proxy", s.server.name, "backend", s.serverAddr, "user", s.username, "error", err)
 		return fmt.Errorf("failed to read backend greeting: %w", err)
 	}
 
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline for %s: %v", s.server.name, s.serverAddr, err)
+		logger.Warn("Failed to clear read deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 	}
 
 	return nil
@@ -582,7 +596,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	// Set a deadline for the authentication process
 	authTimeout := s.server.connManager.GetConnectTimeout()
 	if err := s.backendConn.SetDeadline(time.Now().Add(authTimeout)); err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to set auth deadline for %s: %v", s.server.name, s.serverAddr, err)
+		logger.Error("Failed to set auth deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("failed to set auth deadline: %w", err)
 	}
 
@@ -591,7 +605,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	authCmd := fmt.Sprintf("%s AUTHENTICATE PLAIN %s\r\n", tag, encoded)
 	_, err := s.backendWriter.WriteString(authCmd)
 	if err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to send AUTHENTICATE command to %s: %v", s.server.name, s.serverAddr, err)
+		logger.Error("Failed to send AUTHENTICATE command to backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
 	}
 	s.backendWriter.Flush()
@@ -599,13 +613,13 @@ func (s *Session) authenticateToBackend() (string, error) {
 	// Read authentication response
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to read auth response from %s: %v", s.server.name, s.serverAddr, err)
+		logger.Error("Failed to read auth response from backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("failed to read auth response: %w", err)
 	}
 
 	// Clear the deadline after successful authentication
 	if err := s.backendConn.SetDeadline(time.Time{}); err != nil {
-		log.Printf("IMAP Proxy [%s] Warning: failed to clear auth deadline for %s: %v", s.server.name, s.serverAddr, err)
+		logger.Warn("Failed to clear auth deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 	}
 
 	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
@@ -613,7 +627,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	}
 
 	if s.server.debug {
-		log.Printf("IMAP Proxy [%s] Backend authentication successful for user %s", s.server.name, s.username)
+		logger.Debug("Backend authentication successful", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr)
 	}
 
 	return strings.TrimRight(response, "\r\n"), nil
@@ -623,7 +637,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 func (s *Session) postAuthenticationSetup(clientTag string) {
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to connect to backend for %s: %v", s.server.name, s.username, err)
+		logger.Error("Failed to connect to backend", "proxy", s.server.name, "user", s.username, "error", err)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
 		return
 	}
@@ -638,7 +652,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 	}
 	if useIDCommand {
 		if err := s.sendForwardingParametersToBackend(); err != nil {
-			log.Printf("IMAP Proxy [%s] Failed to send forwarding parameters to backend: %v", s.server.name, err)
+			logger.Warn("Failed to send forwarding parameters to backend", "proxy", s.server.name, "error", err)
 			// Continue anyway - forwarding parameters are not critical
 		}
 	}
@@ -646,7 +660,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 	// Authenticate to backend with master credentials
 	backendResponse, err := s.authenticateToBackend()
 	if err != nil {
-		log.Printf("IMAP Proxy [%s] Backend authentication failed for %s: %v", s.server.name, s.username, err)
+		logger.Error("Backend authentication failed", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr, "error", err)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", clientTag))
 		// Close the backend connection since authentication failed
 		if s.backendConn != nil {
@@ -660,8 +674,12 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 
 	// Register connection
 	if err := s.registerConnection(); err != nil {
-		log.Printf("IMAP Proxy [%s] Failed to register connection for %s: %v", s.server.name, s.username, err)
+		logger.Warn("Failed to register connection", "proxy", s.server.name, "user", s.username, "error", err)
 	}
+
+	// Log successful proxy session establishment
+	remoteAddr := s.clientConn.RemoteAddr().String()
+	logger.Info("Proxy session established", "proto", "imap_proxy", "user", s.username, "remote", remoteAddr, "backend", s.serverAddr)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string
@@ -678,7 +696,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 // startProxy starts bidirectional proxying between client and backend.
 func (s *Session) startProxy() {
 	if s.backendConn == nil {
-		log.Printf("IMAP Proxy [%s] backend connection not established for %s", s.server.name, s.username)
+		logger.Error("Backend connection not established", "proxy", s.server.name, "user", s.username)
 		return
 	}
 
@@ -699,7 +717,7 @@ func (s *Session) startProxy() {
 		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
-			log.Printf("IMAP Proxy [%s] Error copying from client to backend: %v", s.server.name, err)
+			logger.Debug("Error copying from client to backend", "proxy", s.server.name, "error", err)
 		}
 	}()
 
@@ -713,7 +731,7 @@ func (s *Session) startProxy() {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			log.Printf("IMAP Proxy [%s] Error copying from backend to client: %v", s.server.name, err)
+			logger.Debug("Error copying from backend to client", "proxy", s.server.name, "error", err)
 		}
 	}()
 
@@ -760,7 +778,7 @@ func (s *Session) close() {
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "IMAP", clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
-				log.Printf("IMAP Proxy [%s] Failed to unregister connection for %s: %v", serverName, username, err)
+				logger.Warn("Failed to unregister connection", "proxy", serverName, "user", username, "error", err)
 			}
 		}()
 	}
@@ -805,8 +823,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			log.Printf("IMAP Proxy [%s] Connection kicked - disconnecting user: %s (client: %s, backend: %s)",
-				s.server.name, s.username, clientAddr, s.serverAddr)
+			logger.Info("Connection kicked - disconnecting user", "proto", "imap_proxy", "proxy", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

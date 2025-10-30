@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net"
 	"os"
 	"strconv"
@@ -783,7 +783,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			log.Printf("fetching message headers for UID %d", msg.UID)
+			logger.Debug("POP3: Fetching message headers", "uid", msg.UID)
 			bodyData, err := s.getMessageBody(&msg)
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
@@ -977,7 +977,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			log.Printf("fetching message body for UID %d", msg.UID)
+			logger.Debug("POP3: Fetching message body", "uid", msg.UID)
 			bodyData, err := s.getMessageBody(&msg)
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
@@ -1081,7 +1081,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if len(parts) < 2 {
-				log.Printf("missing message number")
+				logger.Debug("missing message number")
 				if s.handleClientError(writer, "-ERR Missing message number\r\n") {
 					return
 				}
@@ -1772,7 +1772,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		// Try cache first
 		data, err := s.server.cache.Get(msg.ContentHash)
 		if err == nil && data != nil {
-			log.Printf("[CACHE] hit for UID %d", msg.UID)
+			logger.Debug("POP3: Cache hit", "uid", msg.UID)
 			// Track memory usage for cached data
 			if s.memTracker != nil {
 				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
@@ -1784,7 +1784,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		}
 
 		// Fallback to S3
-		log.Printf("[CACHE] miss for UID %d, fetching from S3 (%s)", msg.UID, msg.ContentHash)
+		logger.Debug("POP3: Cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
 		address, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, msg.UserID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.UserID, err)
@@ -1809,18 +1809,18 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 			}
 		}
 		// Store in cache
-		log.Printf("[CACHE] storing UID %d in cache (%s)", msg.UID, msg.ContentHash)
+		logger.Debug("POP3: Storing in cache", "uid", msg.UID, "hash", msg.ContentHash)
 		_ = s.server.cache.Put(msg.ContentHash, data)
 		return data, nil
 	}
 
 	// If not uploaded to S3, try fetch from local disk
-	log.Printf("fetching not yet uploaded message UID %d from disk", msg.UID)
+	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.UserID)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("message UID %d (hash %s) not found locally and not marked as uploaded. Assuming pending remote processing.", msg.UID, msg.ContentHash)
+			logger.Debug("POP3: Message not found locally - assuming pending", "uid", msg.UID, "hash", msg.ContentHash)
 			return nil, consts.ErrMessageNotAvailable
 		}
 		// Other error trying to access the local file

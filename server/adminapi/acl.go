@@ -2,9 +2,9 @@ package adminapi
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/aclservice"
 )
 
@@ -61,7 +61,7 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 
 	// Grant ACL
 	if err := aclSvc.Grant(r.Context(), req.Owner, req.Mailbox, req.Identifier, req.Rights); err != nil {
-		log.Printf("[ADMIN-API] ACL grant failed: %v", err)
+		logger.Debug("Admin API: ACL grant failed", "error", err)
 		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
@@ -105,7 +105,7 @@ func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 
 	// Revoke ACL
 	if err := aclSvc.Revoke(r.Context(), req.Owner, req.Mailbox, req.Identifier); err != nil {
-		log.Printf("[ADMIN-API] ACL revoke failed: %v", err)
+		logger.Debug("Admin API: ACL revoke failed", "error", err)
 		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
@@ -143,7 +143,7 @@ func (s *Server) handleACLList(w http.ResponseWriter, r *http.Request) {
 	// List ACLs
 	acls, err := aclSvc.List(r.Context(), owner, mailbox)
 	if err != nil {
-		log.Printf("[ADMIN-API] ACL list failed: %v", err)
+		logger.Debug("Admin API: ACL list failed", "error", err)
 		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}

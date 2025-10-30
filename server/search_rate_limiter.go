@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"sync"
 	"time"
 
@@ -46,8 +46,7 @@ func NewSearchRateLimiter(protocol string, maxPerMinute int, window time.Duratio
 	// Start cleanup goroutine
 	go limiter.cleanupRoutine()
 
-	log.Printf("[%s-SEARCH-LIMITER] Initialized: max=%d searches per %v",
-		protocol, maxPerMinute, window)
+	logger.Debug("Search rate limiter: Initialized", "protocol", protocol, "max", maxPerMinute, "window", window)
 
 	return limiter
 }
@@ -91,8 +90,7 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 		oldestSearch := tracker.searches[0]
 		retryAfter := oldestSearch.Add(s.window).Sub(now)
 
-		log.Printf("[%s-SEARCH-LIMITER] Rate limit exceeded for account %d: %d searches in %v (retry after %v)",
-			s.protocol, accountID, len(tracker.searches), s.window, retryAfter)
+		logger.Debug("Search rate limiter: Rate limit exceeded", "protocol", s.protocol, "account", accountID, "searches", len(tracker.searches), "window", s.window, "retry_after", retryAfter)
 
 		return fmt.Errorf("search rate limit exceeded: %d searches in %v, please wait %v before trying again",
 			len(tracker.searches), s.window, retryAfter.Round(time.Second))
@@ -186,8 +184,7 @@ func (s *SearchRateLimiter) cleanup() {
 	}
 
 	if removed > 0 {
-		log.Printf("[%s-SEARCH-LIMITER] Cleaned up %d inactive user trackers",
-			s.protocol, removed)
+		logger.Debug("Search rate limiter: Cleaned up inactive trackers", "protocol", s.protocol, "count", removed)
 	}
 }
 

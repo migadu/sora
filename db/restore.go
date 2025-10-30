@@ -291,7 +291,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 		if existingCount > 0 {
 			// A non-expunged copy already exists in the target mailbox, skip restoration
-			log.Printf("[DB] Skipping message restoration: message already exists in target mailbox '%s'", msg.mailboxPath)
+			log.Printf("Database: skipping message restoration: message already exists in target mailbox '%s'", msg.mailboxPath)
 			skippedCount++
 			continue
 		}
@@ -311,7 +311,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to delete conflicting messages: %w", err)
 		}
 		if deleteResult.RowsAffected() > 0 {
-			log.Printf("[DB] Deleted %d conflicting message(s) with message_id='%s' from mailbox '%s' before restoration",
+			log.Printf("Database: deleted %d conflicting message(s) with message_id='%s' from mailbox '%s' before restoration",
 				deleteResult.RowsAffected(), messageIDToRestore, msg.mailboxPath)
 		}
 
@@ -349,7 +349,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	if skippedCount > 0 {
-		log.Printf("[DB] Skipped restoring %d messages that already exist in target mailboxes", skippedCount)
+		log.Printf("Database: skipped restoring %d messages that already exist in target mailboxes", skippedCount)
 	}
 
 	return restoredCount, nil

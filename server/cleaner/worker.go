@@ -109,7 +109,7 @@ func (w *CleanupWorker) Start(ctx context.Context) error {
 	w.wg.Add(1)
 	go w.run(ctx)
 
-	logger.Info("[CLEANUP] worker started")
+	logger.Info("Cleanup: worker started")
 	return nil
 }
 
@@ -131,12 +131,12 @@ func (w *CleanupWorker) run(ctx context.Context) {
 	logParts = append(logParts, fmt.Sprintf("auth attempts retention: %v", w.authAttemptsRetention))
 	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
 
-	logger.Infof("[CLEANUP] worker processing with %s", strings.Join(logParts, ", "))
+	logger.Info("Cleanup: Worker processing", "config", strings.Join(logParts, ", "))
 
 	interval := w.interval
 	const minAllowedInterval = time.Minute
 	if interval < minAllowedInterval {
-		logger.Warnf("[CLEANUP] configured interval %v is less than minimum allowed %v. Using minimum.", interval, minAllowedInterval)
+		logger.Warn("Cleanup: Configured interval less than minimum - using minimum", "interval", interval, "minimum", minAllowedInterval)
 		interval = minAllowedInterval
 	}
 
@@ -151,13 +151,13 @@ func (w *CleanupWorker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("[CLEANUP] worker stopped due to context cancellation")
+			logger.Info("Cleanup: worker stopped due to context cancellation")
 			return
 		case <-w.stopCh:
-			logger.Info("[CLEANUP] worker stopped due to stop signal")
+			logger.Info("Cleanup: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("[CLEANUP] running S3 cleanup")
+			logger.Info("Cleanup: running S3 cleanup")
 			if err := w.runOnce(ctx); err != nil {
 				w.reportError(err)
 			}
@@ -179,22 +179,22 @@ func (w *CleanupWorker) Stop() {
 	close(w.stopCh)
 	w.wg.Wait()
 
-	logger.Info("[CLEANUP] worker stopped")
+	logger.Info("Cleanup: worker stopped")
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	locked, err := w.rdb.AcquireCleanupLockWithRetry(ctx)
 	if err != nil {
-		logger.Error("[CLEANUP] failed to acquire advisory lock:", err)
+		logger.Error("Cleanup: failed to acquire advisory lock:", err)
 		return fmt.Errorf("failed to acquire advisory lock: %w", err)
 	}
 	if !locked {
-		logger.Info("[CLEANUP] skipped: another instance holds the cleanup lock")
+		logger.Info("Cleanup: skipped: another instance holds the cleanup lock")
 		return nil
 	}
 	defer func() {
 		if err := w.rdb.ReleaseCleanupLockWithRetry(ctx); err != nil {
-			logger.Warnf("[CLEANUP] failed to release advisory lock: %v", err)
+			logger.Warn("Cleanup: Failed to release advisory lock", "error", err)
 		}
 	}()
 
@@ -207,10 +207,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	if w.maxAgeRestriction > 0 {
 		count, err := w.rdb.ExpungeOldMessagesWithRetry(ctx, w.maxAgeRestriction)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to expunge old messages: %v", err)
+			logger.Error("Cleanup: Failed to expunge old messages", "error", err)
 			// Continue with other cleanup tasks even if this fails
 		} else if count > 0 {
-			logger.Infof("[CLEANUP] expunged %d messages older than %v", count, w.maxAgeRestriction)
+			logger.Info("Cleanup: Expunged old messages", "count", count, "max_age", w.maxAgeRestriction)
 		}
 	}
 
@@ -219,9 +219,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod)
 	if err != nil {
 		// Log the error but continue, as other cleanup tasks can still proceed.
-		logger.Errorf("[CLEANUP] failed to clean up failed uploads: %v", err)
+		logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
 	} else if failedUploadsCount > 0 {
-		logger.Infof("[CLEANUP] cleaned up %d messages that failed to upload within the grace period", failedUploadsCount)
+		logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
 	}
 
 	// --- Phase 0: Process soft-deleted accounts ---
@@ -229,27 +229,27 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// associated data, making them ready for the subsequent cleanup phases.
 	deletedAccountCount, err = w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
 	if err != nil {
-		logger.Errorf("[CLEANUP] failed to process soft-deleted accounts: %v", err)
+		logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
 	} else if deletedAccountCount > 0 {
-		logger.Infof("[CLEANUP] processed %d soft-deleted accounts for hard deletion", deletedAccountCount)
+		logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
 	}
 
 	// Clean up old vacation responses.
 	vacationCount, err = w.rdb.CleanupOldVacationResponsesWithRetry(ctx, w.gracePeriod)
 	if err != nil {
-		logger.Errorf("[CLEANUP] failed to clean up old vacation responses: %v", err)
+		logger.Error("Cleanup: Failed to clean up old vacation responses", "error", err)
 		// Continue with S3 cleanup even if vacation cleanup fails
 	} else if vacationCount > 0 {
-		logger.Infof("[CLEANUP] deleted %d old vacation responses", vacationCount)
+		logger.Info("Cleanup: Deleted old vacation responses", "count", vacationCount)
 	}
 
 	// --- Cleanup of old auth attempts ---
 	if w.authAttemptsRetention > 0 {
 		authCount, err = w.rdb.CleanupOldAuthAttemptsWithRetry(ctx, w.authAttemptsRetention)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to clean up old auth attempts: %v", err)
+			logger.Error("Cleanup: Failed to clean up old auth attempts", "error", err)
 		} else if authCount > 0 {
-			logger.Infof("[CLEANUP] deleted %d old auth attempts older than %v", authCount, w.authAttemptsRetention)
+			logger.Info("Cleanup: Deleted old auth attempts", "count", authCount, "retention", w.authAttemptsRetention)
 		}
 	}
 
@@ -257,9 +257,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	if w.healthStatusRetention > 0 {
 		healthCount, err = w.rdb.CleanupOldHealthStatusesWithRetry(ctx, w.healthStatusRetention)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to clean up old health statuses: %v", err)
+			logger.Error("Cleanup: Failed to clean up old health statuses", "error", err)
 		} else if healthCount > 0 {
-			logger.Infof("[CLEANUP] deleted %d old health statuses older than %v", healthCount, w.healthStatusRetention)
+			logger.Info("Cleanup: Deleted old health statuses", "count", healthCount, "retention", w.healthStatusRetention)
 		}
 	}
 
@@ -267,27 +267,26 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// Get objects to clean up, scoped by user, as S3 storage is user-scoped.
 	candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		logger.Errorf("[CLEANUP] failed to list user-scoped objects for cleanup: %v", err)
+		logger.Error("Cleanup: Failed to list user-scoped objects for cleanup", "error", err)
 		return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
 	}
 
 	if len(candidates) > 0 {
-		logger.Infof("[CLEANUP] found %d user-scoped object groups for S3 cleanup", len(candidates))
+		logger.Info("Cleanup: Found user-scoped object groups for S3 cleanup", "count", len(candidates))
 
 		var failedS3Keys []string
 
 		for _, candidate := range candidates {
 			// Validate candidate data before processing
 			if candidate.ContentHash == "" || candidate.S3Domain == "" || candidate.S3Localpart == "" {
-				logger.Warnf("[CLEANUP] invalid candidate data - hash:%s domain:%s localpart:%s",
-					candidate.ContentHash, candidate.S3Domain, candidate.S3Localpart)
+				logger.Warn("Cleanup: Invalid candidate data", "hash", candidate.ContentHash, "domain", candidate.S3Domain, "localpart", candidate.S3Localpart)
 				continue
 			}
 
 			// Check for context cancellation in the loop
 			select {
 			case <-ctx.Done():
-				logger.Info("[CLEANUP] request aborted during S3 cleanup")
+				logger.Info("Cleanup: request aborted during S3 cleanup")
 				return fmt.Errorf("request aborted during S3 cleanup")
 			default:
 			}
@@ -302,13 +301,13 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			}
 
 			if s3Err != nil && !isS3ObjectNotFoundError {
-				logger.Errorf("[CLEANUP] failed to delete S3 object %s: %v", s3Key, s3Err)
+				logger.Error("Cleanup: Failed to delete S3 object", "key", s3Key, "error", s3Err)
 				failedS3Keys = append(failedS3Keys, s3Key)
 				continue // Skip to the next candidate
 			}
 
 			if isS3ObjectNotFoundError {
-				logger.Infof("[CLEANUP] S3 object %s was not found. Proceeding with DB cleanup.", s3Key)
+				logger.Info("Cleanup: S3 object not found - proceeding with DB cleanup", "key", s3Key)
 			}
 			successfulDeletes = append(successfulDeletes, candidate)
 		}
@@ -316,13 +315,13 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		if len(successfulDeletes) > 0 {
 			deletedCount, err := w.rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, successfulDeletes)
 			if err != nil {
-				logger.Errorf("[CLEANUP] failed to batch delete DB message rows: %v", err)
+				logger.Error("Cleanup: Failed to batch delete DB message rows", "error", err)
 			} else {
-				logger.Infof("[CLEANUP] successfully cleaned up %d user-scoped message rows in the database.", deletedCount)
+				logger.Info("Cleanup: Successfully cleaned up user-scoped message rows", "count", deletedCount)
 			}
 		}
 	} else {
-		logger.Info("[CLEANUP] no user-scoped objects to clean up")
+		logger.Info("Cleanup: no user-scoped objects to clean up")
 	}
 
 	// --- Phase 2a: FTS Body Pruning (for old messages) ---
@@ -331,41 +330,41 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// text_body_tsv so that full-text search on the body continues to work.
 		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesWithRetry(ctx, w.ftsRetention)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to prune old message bodies: %v", err)
+			logger.Error("Cleanup: Failed to prune old message bodies", "error", err)
 			// Continue with other cleanup tasks even if this fails
 		} else if prunedBodiesCount > 0 {
-			logger.Infof("[CLEANUP] pruned text_body for %d message contents older than %v", prunedBodiesCount, w.ftsRetention)
+			logger.Info("Cleanup: Pruned text_body for old message contents", "count", prunedBodiesCount, "age", w.ftsRetention)
 		}
 	}
 
 	// --- Phase 2b: Global resource cleanup (message_contents and cache) ---
 	orphanHashes, err := w.rdb.GetUnusedContentHashesWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		logger.Errorf("[CLEANUP] failed to list unused content hashes for global cleanup: %v", err)
+		logger.Error("Cleanup: Failed to list unused content hashes for global cleanup", "error", err)
 		return fmt.Errorf("failed to list unused content hashes for global cleanup: %w", err)
 	}
 
 	orphanHashCount = int64(len(orphanHashes))
 	if len(orphanHashes) > 0 {
-		logger.Infof("[CLEANUP] found %d orphaned content hashes for global cleanup.", len(orphanHashes))
+		logger.Info("Cleanup: Found orphaned content hashes for global cleanup", "count", len(orphanHashes))
 
 		// Batch delete from message_contents table
 		deletedCount, err := w.rdb.DeleteMessageContentsByHashBatchWithRetry(ctx, orphanHashes)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to batch delete from message_contents: %v. Will be retried on next run.", err)
+			logger.Error("Cleanup: Failed to batch delete from message_contents - will be retried on next run", "error", err)
 		} else if deletedCount > 0 {
-			logger.Infof("[CLEANUP] deleted %d rows from message_contents.", deletedCount)
+			logger.Info("Cleanup: Deleted rows from message_contents", "count", deletedCount)
 		}
 
 		// Delete from local cache one by one. This is a local filesystem operation, so looping is fine.
 		for _, cHash := range orphanHashes {
 			if err := w.cache.Delete(cHash); err != nil {
 				// This is not critical, as the cache has its own TTL and eviction policies.
-				logger.Warnf("[CLEANUP] failed to delete from cache for hash %s: %v", cHash, err)
+				logger.Warn("Cleanup: Failed to delete from cache", "hash", cHash, "error", err)
 			}
 		}
 	} else {
-		logger.Info("[CLEANUP] no orphaned content hashes to clean up")
+		logger.Info("Cleanup: no orphaned content hashes to clean up")
 	}
 
 	// --- Phase 3: Final account deletion ---
@@ -373,25 +372,27 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// we can now safely delete the 'accounts' row itself.
 	danglingAccounts, err := w.rdb.GetDanglingAccountsForFinalDeletionWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		logger.Errorf("[CLEANUP] failed to list dangling accounts for final deletion: %v", err)
+		logger.Error("Cleanup: Failed to list dangling accounts for final deletion", "error", err)
 		return fmt.Errorf("failed to list dangling accounts for final deletion: %w", err)
 	}
 
 	finalizedAccountCount = int64(len(danglingAccounts))
 	if len(danglingAccounts) > 0 {
-		logger.Infof("[CLEANUP] found %d dangling accounts for final deletion", len(danglingAccounts))
+		logger.Info("Cleanup: Found dangling accounts for final deletion", "count", len(danglingAccounts))
 		deletedCount, err := w.rdb.FinalizeAccountDeletionsWithRetry(ctx, danglingAccounts)
 		if err != nil {
-			logger.Errorf("[CLEANUP] failed to finalize deletion of account batch: %v", err)
+			logger.Error("Cleanup: Failed to finalize deletion of account batch", "error", err)
 		} else if deletedCount > 0 {
-			logger.Infof("[CLEANUP] finalized deletion of %d dangling accounts", deletedCount)
+			logger.Info("Cleanup: Finalized deletion of dangling accounts", "count", deletedCount)
 			finalizedAccountCount = deletedCount
 		}
 	}
 
 	// Log cleanup cycle summary for observability
-	logger.Infof("[CLEANUP] cycle completed: failed_uploads=%d, soft_deleted_accounts=%d, vacation_responses=%d, auth_attempts=%d, health_statuses=%d, s3_objects=%d, pruned_bodies=%d, orphan_hashes=%d, finalized_accounts=%d",
-		failedUploadsCount, deletedAccountCount, vacationCount, authCount, healthCount, len(successfulDeletes), prunedBodiesCount, orphanHashCount, finalizedAccountCount)
+	logger.Info("Cleanup: Cycle completed", "failed_uploads", failedUploadsCount,
+		"soft_deleted_accounts", deletedAccountCount, "vacation_responses", vacationCount,
+		"auth_attempts", authCount, "health_statuses", healthCount, "s3_objects", len(successfulDeletes),
+		"pruned_bodies", prunedBodiesCount, "orphan_hashes", orphanHashCount, "finalized_accounts", finalizedAccountCount)
 
 	return nil
 }
@@ -402,9 +403,9 @@ func (w *CleanupWorker) reportError(err error) {
 		select {
 		case w.errCh <- err:
 		default:
-			logger.Errorf("[CLEANUP] worker error (no listener): %v", err)
+			logger.Error("Cleanup: Worker error (no listener)", "error", err)
 		}
 	} else {
-		logger.Errorf("[CLEANUP] worker error: %v", err)
+		logger.Error("Cleanup: Worker error", "error", err)
 	}
 }

@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net/http"
 	"net/mail"
 	"strconv"
@@ -39,7 +39,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error retrieving message: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving message", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")
 		return
 	}
@@ -73,7 +73,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error retrieving message metadata: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving message metadata", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")
 		return
 	}
@@ -91,7 +91,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 	if s.cache != nil {
 		bodyData, err = s.cache.Get(message.ContentHash)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Cache miss for message %d: %v", s.name, messageID, err)
+			logger.Debug("HTTP Mail API: Cache miss", "name", s.name, "message_id", messageID, "error", err)
 		}
 	}
 
@@ -100,7 +100,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
 		reader, err := s.storage.Get(s3Key)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Error retrieving message body from S3: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Error retrieving message body from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message body")
 			return
 		}
@@ -108,7 +108,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 
 		bodyData, err = io.ReadAll(reader)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Error reading message body from S3: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Error reading message body from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to read message body")
 			return
 		}
@@ -116,7 +116,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 		// Store in cache for future requests
 		if s.cache != nil {
 			if err := s.cache.Put(message.ContentHash, bodyData); err != nil {
-				log.Printf("HTTP Mail API [%s] Failed to cache message body: %v", s.name, err)
+				logger.Debug("HTTP Mail API: Failed to cache message body", "name", s.name, "error", err)
 			}
 		}
 	}
@@ -125,7 +125,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 	reader := bytes.NewReader(bodyData)
 	parsedMsg, err := mail.ReadMessage(reader)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error parsing RFC822 message: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error parsing RFC822 message", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to parse message")
 		return
 	}
@@ -133,7 +133,7 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 	// Read the body
 	body, err := io.ReadAll(parsedMsg.Body)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error reading message body: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error reading message body", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to read message body")
 		return
 	}
@@ -175,7 +175,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error retrieving message metadata: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving message metadata", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")
 		return
 	}
@@ -193,7 +193,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 	if s.cache != nil {
 		bodyData, err = s.cache.Get(message.ContentHash)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Cache miss for message %d: %v", s.name, messageID, err)
+			logger.Debug("HTTP Mail API: Cache miss", "name", s.name, "message_id", messageID, "error", err)
 		}
 	}
 
@@ -202,7 +202,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
 		reader, err := s.storage.Get(s3Key)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Error retrieving message from S3: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Error retrieving message from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")
 			return
 		}
@@ -210,7 +210,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 
 		bodyData, err = io.ReadAll(reader)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Error reading message from S3: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Error reading message from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to read message")
 			return
 		}
@@ -218,7 +218,7 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 		// Store in cache for future requests
 		if s.cache != nil {
 			if err := s.cache.Put(message.ContentHash, bodyData); err != nil {
-				log.Printf("HTTP Mail API [%s] Failed to cache message: %v", s.name, err)
+				logger.Debug("HTTP Mail API: Failed to cache message", "name", s.name, "error", err)
 			}
 		}
 	}

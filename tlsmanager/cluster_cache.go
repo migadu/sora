@@ -26,20 +26,19 @@ func NewClusterAwareCache(cache autocert.Cache, clusterMgr *cluster.Manager) *Cl
 
 // Get retrieves a certificate from the cache (all nodes can read)
 func (c *ClusterAwareCache) Get(ctx context.Context, name string) ([]byte, error) {
-	logger.Debugf("[ClusterCache] Get certificate: %s (node: %s, leader: %s)",
-		name, c.clusterManager.GetNodeID(), c.clusterManager.GetLeaderID())
+	logger.Debug("ClusterCache: Get certificate", "name", name, "node", c.clusterManager.GetNodeID(), "leader", c.clusterManager.GetLeaderID())
 
 	data, err := c.underlying.Get(ctx, name)
 	if err != nil {
 		if err == autocert.ErrCacheMiss {
-			logger.Debugf("[ClusterCache] Certificate not found: %s", name)
+			logger.Debug("ClusterCache: Certificate not found", "name", name)
 		} else {
-			logger.Debugf("[ClusterCache] Error getting certificate %s: %v", name, err)
+			logger.Debug("ClusterCache: Error getting certificate", "name", name, "error", err)
 		}
 		return nil, err
 	}
 
-	logger.Debugf("[ClusterCache] Certificate retrieved: %s", name)
+	logger.Debug("ClusterCache: Certificate retrieved", "name", name)
 	return data, nil
 }
 
@@ -48,27 +47,26 @@ func (c *ClusterAwareCache) Put(ctx context.Context, name string, data []byte) e
 	nodeID := c.clusterManager.GetNodeID()
 	leaderID := c.clusterManager.GetLeaderID()
 
-	logger.Infof("[ClusterCache] Put certificate request: %s (node: %s, leader: %s)",
-		name, nodeID, leaderID)
+	logger.Info("ClusterCache: Put certificate request", "name", name,
+		"node", nodeID, "leader", leaderID)
 
 	// Check if this node is the cluster leader
 	if !c.clusterManager.IsLeader() {
 		// Non-leader nodes should not write certificates
 		// This prevents race conditions with Let's Encrypt
-		logger.Warnf("[ClusterCache] Certificate request BLOCKED - not cluster leader: %s (leader %s will handle it)",
-			name, leaderID)
+		logger.Warn("ClusterCache: Certificate request BLOCKED - not cluster leader (leader will handle it)", "name", name, "leader", leaderID)
 		return fmt.Errorf("only cluster leader can request new certificates (current leader: %s, this node: %s)",
 			leaderID, nodeID)
 	}
 
-	logger.Infof("[ClusterCache] Cluster leader storing certificate: %s", name)
+	logger.Info("ClusterCache: Cluster leader storing certificate", "name", name)
 	err := c.underlying.Put(ctx, name, data)
 	if err != nil {
-		logger.Errorf("[ClusterCache] Failed to store certificate %s: %v", name, err)
+		logger.Error("ClusterCache: Failed to store certificate", "name", name, "error", err)
 		return err
 	}
 
-	logger.Infof("[ClusterCache] Certificate stored by leader: %s", name)
+	logger.Info("ClusterCache: Certificate stored by leader", "name", name)
 	return nil
 }
 
@@ -77,23 +75,21 @@ func (c *ClusterAwareCache) Delete(ctx context.Context, name string) error {
 	nodeID := c.clusterManager.GetNodeID()
 	leaderID := c.clusterManager.GetLeaderID()
 
-	logger.Debugf("[ClusterCache] Delete certificate request: %s (node: %s, leader: %s)",
-		name, nodeID, leaderID)
+	logger.Debug("ClusterCache: Delete certificate request", "name", name, "node", nodeID, "leader", leaderID)
 
 	// Check if this node is the cluster leader
 	if !c.clusterManager.IsLeader() {
-		logger.Debugf("[ClusterCache] Skipping certificate Delete (not cluster leader): %s (leader: %s)",
-			name, leaderID)
+		logger.Debug("ClusterCache: Skipping certificate delete (not cluster leader)", "name", name, "leader", leaderID)
 		return fmt.Errorf("only cluster leader can delete certificates (current leader: %s)", leaderID)
 	}
 
-	logger.Infof("[ClusterCache] Cluster leader deleting certificate: %s", name)
+	logger.Info("ClusterCache: Cluster leader deleting certificate", "name", name)
 	err := c.underlying.Delete(ctx, name)
 	if err != nil {
-		logger.Errorf("[ClusterCache] Failed to delete certificate %s: %v", name, err)
+		logger.Error("ClusterCache: Failed to delete certificate", "name", name, "error", err)
 		return err
 	}
 
-	logger.Infof("[ClusterCache] Certificate deleted by leader: %s", name)
+	logger.Info("ClusterCache: Certificate deleted by leader", "name", name)
 	return nil
 }

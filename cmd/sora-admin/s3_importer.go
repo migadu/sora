@@ -75,7 +75,7 @@ func NewS3Importer(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, opti
 	// Create temporary SQLite database to track S3 objects
 	tempDir := os.TempDir()
 	dbPath := filepath.Join(tempDir, fmt.Sprintf("sora-s3-import-%d.db", time.Now().Unix()))
-	logger.Infof("Using temporary database: %s", dbPath)
+	logger.Info("Using temporary database", "path", dbPath)
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -123,12 +123,12 @@ func (si *S3Importer) Close() error {
 			return fmt.Errorf("failed to close s3 importer database: %w", err)
 		}
 		if si.options.CleanupDB {
-			logger.Infof("Cleaning up temporary database: %s", si.dbPath)
+			logger.Info("Cleaning up temporary database", "path", si.dbPath)
 			if err := os.Remove(si.dbPath); err != nil {
 				return fmt.Errorf("failed to remove temporary database file: %w", err)
 			}
 		} else {
-			logger.Infof("Temporary database saved at: %s", si.dbPath)
+			logger.Info("Temporary database saved", "path", si.dbPath)
 		}
 	}
 	return nil
@@ -153,7 +153,7 @@ func (si *S3Importer) Run() error {
 	}
 
 	atomic.StoreInt64(&si.totalObjects, totalCount)
-	logger.Infof("Found %d S3 objects to process", totalCount)
+	logger.Info("Found S3 objects to process", "count", totalCount)
 
 	if totalCount == 0 {
 		logger.Info("No S3 objects found to import")
@@ -166,7 +166,7 @@ func (si *S3Importer) Run() error {
 	}
 
 	// Step 2: Process objects and import messages
-	logger.Infof("Starting import process for %d objects...", totalCount)
+	logger.Info("Starting import process", "count", totalCount)
 	if err := si.importFromS3(); err != nil {
 		return fmt.Errorf("failed to import from S3: %w", err)
 	}
@@ -184,7 +184,7 @@ func (si *S3Importer) scanS3Objects() error {
 
 	// Construct S3 prefix from email address (same format as helpers.NewS3Key)
 	s3Prefix := fmt.Sprintf("%s/%s/", address.Domain(), address.LocalPart())
-	logger.Infof("Scanning S3 bucket for user %s with prefix: '%s'", si.options.Email, s3Prefix)
+	logger.Info("Scanning S3 bucket for user", "email", si.options.Email, "prefix", s3Prefix)
 
 	ctx := context.Background()
 	opts := minio.ListObjectsOptions{
@@ -207,7 +207,7 @@ func (si *S3Importer) scanS3Objects() error {
 		// Expected format: domain/local_part/content_hash
 		parts := strings.Split(object.Key, "/")
 		if len(parts) != 3 {
-			logger.Infof("Skipping S3 object with unexpected key format: %s", object.Key)
+			logger.Info("Skipping S3 object with unexpected key format", "key", object.Key)
 			continue
 		}
 
@@ -219,18 +219,18 @@ func (si *S3Importer) scanS3Objects() error {
 		expectedDomain := address.Domain()
 		expectedLocalPart := address.LocalPart()
 		if domain != expectedDomain || localPart != expectedLocalPart {
-			logger.Infof("Skipping S3 object for different user: %s (expected %s@%s)",
-				object.Key, expectedLocalPart, expectedDomain)
+			logger.Info("Skipping S3 object for different user", "key", object.Key,
+				"expected_email", fmt.Sprintf("%s@%s", expectedLocalPart, expectedDomain))
 			continue
 		}
 
 		// Validate content hash format (should be hex)
 		if len(contentHash) != 64 { // SHA256 hex string length
-			logger.Infof("Skipping S3 object with invalid hash format: %s", object.Key)
+			logger.Info("Skipping S3 object with invalid hash format", "key", object.Key)
 			continue
 		}
 		if _, err := hex.DecodeString(contentHash); err != nil {
-			logger.Infof("Skipping S3 object with non-hex hash: %s", object.Key)
+			logger.Info("Skipping S3 object with non-hex hash", "key", object.Key)
 			continue
 		}
 
@@ -247,12 +247,12 @@ func (si *S3Importer) scanS3Objects() error {
 
 		objectCount++
 		if objectCount%1000 == 0 {
-			logger.Infof("Scanned %d S3 objects...", objectCount)
+			logger.Info("Scanned S3 objects", "count", objectCount)
 		}
 
 		// Check if we've reached the maximum object limit
 		if si.options.MaxObjects > 0 && objectCount >= si.options.MaxObjects {
-			logger.Infof("Reached maximum object limit: %d", si.options.MaxObjects)
+			logger.Info("Reached maximum object limit", "max", si.options.MaxObjects)
 			break
 		}
 
@@ -264,7 +264,7 @@ func (si *S3Importer) scanS3Objects() error {
 		}
 	}
 
-	logger.Infof("Completed S3 scan: found %d objects", objectCount)
+	logger.Info("Completed S3 scan", "count", objectCount)
 	return nil
 }
 
@@ -290,7 +290,7 @@ func (si *S3Importer) performDryRun() error {
 
 	// Ensure default mailboxes exist for this user
 	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", si.options.Email, err)
+		logger.Info("Warning: Failed to create default mailboxes", "email", si.options.Email, "error", err)
 		// Don't fail the dry run, as mailboxes might already exist
 	}
 
@@ -310,7 +310,7 @@ func (si *S3Importer) performDryRun() error {
 		var key, domain, localPart, contentHash, lastModified string
 		var size int64
 		if err := rows.Scan(&key, &size, &domain, &localPart, &contentHash, &lastModified); err != nil {
-			logger.Infof("Failed to scan row: %v", err)
+			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
 
@@ -373,7 +373,7 @@ func (si *S3Importer) importFromS3() error {
 		return nil
 	}
 
-	logger.Infof("Processing %d S3 objects with %d workers", si.totalObjects, si.options.Workers)
+	logger.Info("Processing S3 objects", "count", si.totalObjects, "workers", si.options.Workers)
 
 	rows, err := si.db.Query("SELECT key, size, domain, local_part, content_hash FROM s3_objects WHERE processed = FALSE")
 	if err != nil {
@@ -391,8 +391,8 @@ func (si *S3Importer) importFromS3() error {
 			defer wg.Done()
 			for obj := range jobs {
 				if err := si.importS3Object(obj); err != nil {
-					logger.Infof("[Worker-%d] %s Failed to import S3 object %s: %v",
-						workerID, si.getProgressPrefix(), obj.Key, err)
+					logger.Info("Failed to import S3 object", "worker", workerID,
+						"progress", si.getProgressPrefix(), "key", obj.Key, "error", err)
 					atomic.AddInt64(&si.failedMessages, 1)
 				}
 				atomic.AddInt64(&si.processedObjects, 1)
@@ -405,7 +405,7 @@ func (si *S3Importer) importFromS3() error {
 		var key, domain, localPart, contentHash string
 		var size int64
 		if err := rows.Scan(&key, &size, &domain, &localPart, &contentHash); err != nil {
-			logger.Infof("Failed to scan row: %v", err)
+			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
 
@@ -446,7 +446,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// Proactively ensure default mailboxes exist for this user
 	// This prevents "mailbox not found" errors during import
 	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
-		logger.Infof("Warning: Failed to create default mailboxes for %s: %v", si.options.Email, err)
+		logger.Info("Warning: Failed to create default mailboxes", "email", si.options.Email, "error", err)
 		// Don't fail the import, as mailboxes might already exist
 	}
 
@@ -457,7 +457,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			"SELECT COUNT(*) FROM messages WHERE content_hash = $1 AND account_id = $2 AND expunged_at IS NULL",
 			contentHash, accountID).Scan(&count)
 		if err == nil && count > 0 {
-			logger.Infof("%s Message already exists, skipping: %s", si.getProgressPrefix(), obj.Key)
+			logger.Info("Message already exists - skipping", "progress", si.getProgressPrefix(), "key", obj.Key)
 			atomic.AddInt64(&si.skippedMessages, 1)
 			si.markObjectProcessed(obj.Key, true, "already exists")
 			return nil
@@ -559,8 +559,8 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	atomic.AddInt64(&si.importedMessages, 1)
-	logger.Infof("%s Successfully imported message: msgID=%d, uid=%d, user=%s",
-		si.getProgressPrefix(), msgID, uid, address.FullAddress())
+	logger.Info("Successfully imported message", "progress", si.getProgressPrefix(),
+		"msg_id", msgID, "uid", uid, "user", address.FullAddress())
 
 	si.markObjectProcessed(obj.Key, true, "imported successfully")
 
@@ -577,7 +577,7 @@ func (si *S3Importer) markObjectProcessed(key string, success bool, errorMessage
 	_, err := si.db.Exec("UPDATE s3_objects SET processed = TRUE, success = ?, error_message = ? WHERE key = ?",
 		success, errorMessage, key)
 	if err != nil {
-		logger.Infof("Warning: failed to mark object as processed: %v", err)
+		logger.Info("Warning: Failed to mark object as processed", "error", err)
 	}
 }
 

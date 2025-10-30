@@ -116,22 +116,22 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	if err != nil {
 		// No local certificate, try to fetch from S3
 		if err == autocert.ErrCacheMiss {
-			logger.Debugf("[CertSync] No local certificate for %s, checking S3", domain)
+			logger.Debug("CertSync: No local certificate - checking S3", "domain", domain)
 			s3Data, s3Err := fallbackCache.primary.Get(ctx, domain)
 			if s3Err == nil {
 				// Found in S3, store locally
 				if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
-					logger.Warnf("[CertSync] Failed to sync certificate from S3 to local cache for %s: %v", domain, putErr)
+					logger.Warn("CertSync: Failed to sync certificate from S3 to local cache", "domain", domain, "error", putErr)
 					return putErr
 				}
-				logger.Infof("[CertSync] Synced certificate from S3 to local cache: %s", domain)
+				logger.Info("CertSync: Synced certificate from S3 to local cache", "domain", domain)
 				return nil
 			}
 			// Not in S3 either, skip
 			return nil
 		}
 		// Other error reading local cache
-		logger.Debugf("[CertSync] Error reading local cache for %s: %v", domain, err)
+		logger.Debug("CertSync: Error reading local cache", "domain", domain, "error", err)
 		return err
 	}
 
@@ -143,53 +143,53 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 			return nil
 		}
 		// S3 error, but local works, so not critical
-		logger.Debugf("[CertSync] Error reading S3 for %s: %v (local certificate still valid)", domain, err)
+		logger.Debug("CertSync: Error reading S3 (local certificate still valid)", "domain", domain, "error", err)
 		return err
 	}
 
 	// Parse both certificates for comparison
 	localInfo, err := parseCertificate(localData)
 	if err != nil {
-		logger.Warnf("[CertSync] Failed to parse local certificate for %s: %v (will update from S3)", domain, err)
+		logger.Warn("CertSync: Failed to parse local certificate (will update from S3)", "domain", domain, "error", err)
 		// Can't parse local, assume S3 is better
 		if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
-			logger.Warnf("[CertSync] Failed to update local certificate from S3 for %s: %v", domain, putErr)
+			logger.Warn("CertSync: Failed to update local certificate from S3", "domain", domain, "error", putErr)
 			return putErr
 		}
-		logger.Infof("[CertSync] Updated certificate from S3 (local parse failed): %s", domain)
+		logger.Info("CertSync: Updated certificate from S3 (local parse failed)", "domain", domain)
 		return nil
 	}
 
 	s3Info, err := parseCertificate(s3Data)
 	if err != nil {
-		logger.Warnf("[CertSync] Failed to parse S3 certificate for %s: %v (keeping local)", domain, err)
+		logger.Warn("CertSync: Failed to parse S3 certificate (keeping local)", "domain", domain, "error", err)
 		return err
 	}
 
 	// Compare certificates
 	if localInfo.SerialNumber == s3Info.SerialNumber {
 		// Same certificate, no update needed
-		logger.Debugf("[CertSync] Certificate up to date for %s (serial: %s)", domain, localInfo.SerialNumber)
+		logger.Debug("CertSync: Certificate up to date", "domain", domain, "serial", localInfo.SerialNumber)
 		return nil
 	}
 
 	// Different certificates, check if S3 is newer
 	if shouldUpdateCertificate(localInfo, s3Info) {
-		logger.Infof("[CertSync] Updating certificate from S3 for %s (local serial: %s, expiry: %s -> S3 serial: %s, expiry: %s)",
-			domain, localInfo.SerialNumber, localInfo.NotAfter.Format(time.RFC3339),
-			s3Info.SerialNumber, s3Info.NotAfter.Format(time.RFC3339))
+		logger.Info("CertSync: Updating certificate from S3", "domain", domain,
+			"local_serial", localInfo.SerialNumber, "local_expiry", localInfo.NotAfter.Format(time.RFC3339),
+			"s3_serial", s3Info.SerialNumber, "s3_expiry", s3Info.NotAfter.Format(time.RFC3339))
 
 		if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
-			logger.Warnf("[CertSync] Failed to update local certificate from S3 for %s: %v", domain, putErr)
+			logger.Warn("CertSync: Failed to update local certificate from S3", "domain", domain, "error", putErr)
 			return putErr
 		}
 
-		logger.Infof("[CertSync] Successfully updated certificate from S3: %s", domain)
+		logger.Info("CertSync: Successfully updated certificate from S3", "domain", domain)
 		return nil
 	}
 
 	// S3 certificate is older or same, keep local
-	logger.Debugf("[CertSync] Local certificate is newer for %s (keeping local)", domain)
+	logger.Debug("CertSync: Local certificate is newer (keeping local)", "domain", domain)
 	return nil
 }
 
@@ -199,7 +199,7 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 		return
 	}
 
-	logger.Infof("Starting certificate sync worker (interval: %v)", interval)
+	logger.Info("Starting certificate sync worker", "interval", interval)
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -210,7 +210,7 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 
 			for _, domain := range m.config.LetsEncrypt.Domains {
 				if err := m.syncCertificateFromS3(ctx, domain); err != nil {
-					logger.Debugf("[CertSync] Sync failed for %s: %v", domain, err)
+					logger.Debug("CertSync: Sync failed", "domain", domain, "error", err)
 				}
 			}
 

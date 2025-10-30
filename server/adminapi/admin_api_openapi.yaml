@@ -4,7 +4,7 @@ info:
   description: HTTP API for managing and monitoring the Sora mail server.
   version: v1
 servers:
-  - url: /admin/v1
+  - url: /admin
     description: Admin API version 1
 
 # Security scheme definition
@@ -739,12 +739,12 @@ paths:
       summary: Create a new account with one or more credentials
       description: |
         Creates a new account. This endpoint supports two modes:
-        
-        **1. Single Credential (Legacy):**
-        Provide `email` and `password` (or `password_hash`) at the top level of the request body. This creates an account with a single, primary credential.
-        
-        **2. Multiple Credentials:**
-        Provide a `credentials` array. Each object in the array defines a credential with its own email, password/hash, and primary status.
+
+        **1. Simple Format (Single Credential):**
+        Provide `email` and `password` (or `password_hash`) at the top level of the request body. This creates an account with a single, primary credential. Use this for the common case of creating a standard account.
+
+        **2. Multi-Credential Format:**
+        Provide a `credentials` array. Each object in the array defines a credential with its own email, password/hash, and primary status. Use this for advanced scenarios where an account needs multiple login credentials.
         - Exactly one credential in the array must have `is_primary: true`.
         - When using the `credentials` array, the top-level `email`, `password`, and `password_hash` fields must be omitted.
       requestBody:

@@ -2,7 +2,7 @@ package proxy
 
 import (
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
 )
@@ -42,12 +42,12 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 			if v != "" {
 				parsed, err := fmt.Sscanf(v, "%d", &remotePort)
 				if err != nil || parsed != 1 {
-					log.Printf("[Prelookup] Warning: failed to parse remote_port %q as integer, using default", v)
+					logger.Debug("Prelookup: Warning - failed to parse remote_port, using default", "value", v)
 					remotePort = 0
 				}
 			}
 		default:
-			log.Printf("[Prelookup] Warning: remote_port has unexpected type %T, using default", v)
+			logger.Debug("Prelookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
 		}
 	}
 
@@ -80,8 +80,7 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	log.Printf("[Prelookup] Initializing HTTP prelookup: url=%s, timeout=%s, remote_port=%d, cache_enabled=%v, auth_enabled=%v",
-		cfg.URL, timeout, remotePort, cacheEnabled, hasAuth)
+	logger.Debug("Prelookup: Initializing HTTP prelookup", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "cache_enabled", cacheEnabled, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings

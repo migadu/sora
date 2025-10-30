@@ -289,7 +289,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	)
 
 	if err != nil {
-		logger.Errorf("Failed to store health status for %s: %v", componentName, err)
+		logger.Error("Failed to store health status", "component", componentName, "error", err)
 	}
 }
 

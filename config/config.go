@@ -783,7 +783,7 @@ type IMAPServerConfig struct {
 	SearchRateLimitWindow  string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
 	CommandTimeout         string                `toml:"command_timeout"`           // Maximum idle time before disconnection (e.g., "5m", default: 5 minutes)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"`  // Maximum total session duration (e.g., "30m", default: 30 minutes)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
 }
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
@@ -839,7 +839,7 @@ type POP3ServerConfig struct {
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 2m)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
 }
 
 // GetCommandTimeout parses the command timeout duration for POP3
@@ -877,7 +877,7 @@ type ManageSieveServerConfig struct {
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 3m)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
 }
 
 // GetCommandTimeout parses the command timeout duration for ManageSieve
@@ -1087,7 +1087,7 @@ type ServerLimitsConfig struct {
 type ServerTimeoutsConfig struct {
 	CommandTimeout         string `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 1024 bytes/min, 0=use default)
+	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
 }
 
 // ServerConfig represents a single server instance
@@ -1737,7 +1737,7 @@ func (s *ServerConfig) GetMinBytesPerMinute() int64 {
 	if s.Timeouts != nil && s.Timeouts.MinBytesPerMinute > 0 {
 		return s.Timeouts.MinBytesPerMinute
 	}
-	return 1024 // Default: 1024 bytes/min
+	return 512 // Default: 512 bytes/min
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

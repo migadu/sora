@@ -131,24 +131,24 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 
 	if clusterMgr != nil {
 		// Cluster mode: register with cluster manager for gossip
-		logger.Debugf("[%s-GOSSIP-TRACKER] Registering handlers with cluster manager", name)
+		logger.Debug("Gossip tracker: Registering handlers with cluster manager", "name", name)
 		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
 		clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
-		logger.Debugf("[%s-GOSSIP-TRACKER] Handlers registered successfully", name)
+		logger.Debug("Gossip tracker: Handlers registered successfully", "name", name)
 
 		// Start background routines
 		go ct.broadcastRoutine()
 		go ct.cleanupRoutine()
 		go ct.stateSnapshotRoutine()
 
-		logger.Infof("[%s-GOSSIP-TRACKER] Initialized: instance=%s, max_per_user=%d, queue_size=%d (cluster mode)",
-			name, instanceID, maxConnectionsPerUser, maxEventQueueSize)
+		logger.Info("GossipTracker: Initialized (cluster mode)", "protocol", name,
+			"instance", instanceID, "max_per_user", maxConnectionsPerUser, "queue_size", maxEventQueueSize)
 	} else {
 		// Local mode: no gossip, just track connections locally
 		go ct.cleanupRoutine()
 
-		logger.Infof("[%s-LOCAL-TRACKER] Initialized: instance=%s, max_per_user=%d (local mode)",
-			name, instanceID, maxConnectionsPerUser)
+		logger.Info("LocalTracker: Initialized (local mode)", "protocol", name,
+			"instance", instanceID, "max_per_user", maxConnectionsPerUser)
 	}
 
 	return ct
@@ -157,9 +157,9 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 // trackerType returns the name of the tracker for logging purposes.
 func (ct *ConnectionTracker) trackerType() string {
 	if ct.clusterManager == nil {
-		return "LOCAL-TRACKER"
+		return "LocalTracker"
 	}
-	return "GOSSIP-TRACKER"
+	return "GossipTracker"
 }
 
 // RegisterConnection registers a new connection and broadcasts to cluster
@@ -211,7 +211,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		info.TotalCount = info.LocalCount // In local mode, total = local
 	}
 
-	logger.Debugf("[%s-%s] Registered: user=%s, local=%d, total=%d", ct.name, ct.trackerType(), username, info.LocalCount, info.TotalCount)
+	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.LocalCount, "total", info.TotalCount)
 
 	// Broadcast to cluster (only in cluster mode)
 	if ct.clusterManager != nil {
@@ -241,7 +241,7 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	info, exists := ct.connections[accountID]
 	if !exists {
-		logger.Debugf("[%s-%s] Unregister called for unknown accountID=%d", ct.name, ct.trackerType(), accountID)
+		logger.Debug("Connection tracker: Unregister called for unknown account", "name", ct.name, "type", ct.trackerType(), "account_id", accountID)
 		return nil
 	}
 
@@ -263,8 +263,7 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	info.LastUpdate = time.Now()
 
-	logger.Debugf("[%s-%s] Unregistered: user=%s, local=%d, total=%d",
-		ct.name, ct.trackerType(), info.Username, info.LocalCount, info.TotalCount)
+	logger.Debug("Connection tracker: Unregistered", "name", ct.name, "type", ct.trackerType(), "user", info.Username, "local", info.LocalCount, "total", info.TotalCount)
 
 	// Clean up if no local connections remain
 	cleanupThreshold := info.TotalCount
@@ -372,8 +371,7 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 
 	if ct.clusterManager != nil {
 		// Cluster mode: broadcast kick event via gossip
-		logger.Debugf("[%s-GOSSIP-TRACKER] Broadcasting kick for accountID=%d, protocol=%s",
-			ct.name, accountID, protocol)
+		logger.Debug("Gossip tracker: Broadcasting kick", "name", ct.name, "account_id", accountID, "protocol", protocol)
 
 		ct.queueEvent(ConnectionEvent{
 			Type:       ConnectionEventKick,
@@ -386,8 +384,8 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 		})
 	} else {
 		// Local mode: directly kick sessions on this server
-		logger.Infof("[%s-LOCAL-TRACKER] Kicking local sessions for accountID=%d, protocol=%s",
-			ct.name, accountID, protocol)
+		logger.Info("LocalTracker: Kicking local sessions", "protocol", ct.name,
+			"account_id", accountID, "target_protocol", protocol)
 
 		ct.kickSessionsMu.Lock()
 		sessions := ct.kickSessions[accountID]
@@ -402,11 +400,10 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 				}
 			}
 			delete(ct.kickSessions, accountID)
-			logger.Infof("[%s-LOCAL-TRACKER] Kicked %d local sessions for accountID=%d",
-				ct.name, len(sessions), accountID)
+			logger.Info("LocalTracker: Kicked local sessions", "protocol", ct.name,
+				"count", len(sessions), "account_id", accountID)
 		} else {
-			logger.Debugf("[%s-LOCAL-TRACKER] No active sessions to kick for accountID=%d",
-				ct.name, accountID)
+			logger.Debug("Local tracker: No active sessions to kick", "name", ct.name, "account_id", accountID)
 		}
 		ct.kickSessionsMu.Unlock()
 	}
@@ -430,7 +427,7 @@ func (ct *ConnectionTracker) RegisterSession(accountID int64) <-chan struct{} {
 
 	ct.kickSessions[accountID] = append(ct.kickSessions[accountID], ch)
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Registered session for accountID=%d", ct.name, accountID)
+	logger.Debug("Gossip tracker: Registered session", "name", ct.name, "account_id", accountID)
 
 	return ch
 }
@@ -468,8 +465,7 @@ func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
 	if len(ct.broadcastQueue) >= ct.maxEventQueueSize {
 		// Drop the oldest 10% of events to make room
 		dropCount := ct.maxEventQueueSize / 10
-		logger.Warnf("[%s-GOSSIP-TRACKER] Event queue overflow (%d/%d events), dropping %d oldest events",
-			ct.name, len(ct.broadcastQueue), ct.maxEventQueueSize, dropCount)
+		logger.Warn("Gossip tracker: Event queue overflow - dropping oldest events", "name", ct.name, "current", len(ct.broadcastQueue), "max", ct.maxEventQueueSize, "dropping", dropCount)
 		ct.broadcastQueue = ct.broadcastQueue[dropCount:]
 	}
 
@@ -486,8 +482,7 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 		return nil
 	}
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts called: queue_len=%d, overhead=%d, limit=%d",
-		ct.name, queueLen, overhead, limit)
+	logger.Debug("Gossip tracker: GetBroadcasts called", "name", ct.name, "queue_len", queueLen, "overhead", overhead, "limit", limit)
 
 	broadcasts := make([][]byte, 0, len(ct.broadcastQueue))
 	totalSize := 0
@@ -495,7 +490,7 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 	for i := 0; i < len(ct.broadcastQueue); i++ {
 		encoded, err := encodeConnectionEvent(ct.broadcastQueue[i])
 		if err != nil {
-			logger.Warnf("[%s-GOSSIP-TRACKER] Failed to encode event: %v", ct.name, err)
+			logger.Warn("Gossip tracker: Failed to encode event", "name", ct.name, "error", err)
 			continue
 		}
 
@@ -504,8 +499,7 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 		if totalSize+msgSize > limit && len(broadcasts) > 0 {
 			// Keep remaining events for next broadcast
 			ct.broadcastQueue = ct.broadcastQueue[i:]
-			logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts returning %d messages (limit reached, %d remain queued)",
-				ct.name, len(broadcasts), len(ct.broadcastQueue))
+			logger.Debug("Gossip tracker: GetBroadcasts limit reached", "name", ct.name, "returned", len(broadcasts), "queued", len(ct.broadcastQueue))
 			return broadcasts
 		}
 
@@ -515,35 +509,32 @@ func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
 
 	// All events broadcasted, clear queue
 	ct.broadcastQueue = ct.broadcastQueue[:0]
-	logger.Debugf("[%s-GOSSIP-TRACKER] GetBroadcasts returning %d messages (queue emptied)",
-		ct.name, len(broadcasts))
+	logger.Debug("Gossip tracker: GetBroadcasts queue emptied", "name", ct.name, "messages", len(broadcasts))
 	return broadcasts
 }
 
 // HandleClusterEvent processes a connection event from another node
 func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
-	logger.Debugf("[%s-GOSSIP-TRACKER] HandleClusterEvent called with data (len=%d)", ct.name, len(data))
+	logger.Debug("Gossip tracker: HandleClusterEvent called", "name", ct.name, "data_len", len(data))
 
 	event, err := decodeConnectionEvent(data)
 	if err != nil {
-		logger.Warnf("[%s-GOSSIP-TRACKER] Failed to decode event: %v", ct.name, err)
+		logger.Warn("Gossip tracker: Failed to decode event", "name", ct.name, "error", err)
 		return
 	}
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Decoded event: type=%s, user=%s, instance=%s",
-		ct.name, event.Type, event.Username, event.InstanceID)
+	logger.Debug("Gossip tracker: Decoded event", "name", ct.name, "type", event.Type, "user", event.Username, "instance", event.InstanceID)
 
 	// Skip events from this instance (we already applied them locally)
 	if event.InstanceID == ct.instanceID {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Skipping event from self (instance=%s)", ct.name, event.InstanceID)
+		logger.Debug("Gossip tracker: Skipping event from self", "name", ct.name, "instance", event.InstanceID)
 		return
 	}
 
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
 	if age > 5*time.Minute {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Ignoring stale event from %s (age: %v)",
-			ct.name, event.NodeID, age)
+		logger.Debug("Gossip tracker: Ignoring stale event", "name", ct.name, "node_id", event.NodeID, "age", age)
 		return
 	}
 
@@ -557,7 +548,7 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 	case ConnectionEventStateSnapshot:
 		ct.reconcileState(event.StateSnapshot)
 	default:
-		logger.Warnf("[%s-GOSSIP-TRACKER] Unknown event type: %s", ct.name, event.Type)
+		logger.Warn("Gossip tracker: Unknown event type", "name", ct.name, "type", event.Type)
 	}
 }
 
@@ -584,8 +575,7 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 	info.LastUpdate = time.Now()
 	info.LocalInstances[event.InstanceID]++
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Cluster register: user=%s, instance=%s, cluster_total=%d",
-		ct.name, event.Username, event.InstanceID, info.TotalCount)
+	logger.Debug("Gossip tracker: Cluster register", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
 }
 
 // handleUnregister processes an unregister event from another node
@@ -607,8 +597,7 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 	}
 	info.LastUpdate = time.Now()
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Cluster unregister: user=%s, instance=%s, cluster_total=%d",
-		ct.name, event.Username, event.InstanceID, info.TotalCount)
+	logger.Debug("Gossip tracker: Cluster unregister", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
 
 	// Clean up if no connections remain
 	if info.TotalCount <= 0 {
@@ -618,8 +607,7 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 
 // handleKick processes a kick event from another node
 func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
-	logger.Debugf("[%s-GOSSIP-TRACKER] Received kick for accountID=%d, protocol=%s from node=%s",
-		ct.name, event.AccountID, event.Protocol, event.NodeID)
+	logger.Debug("Gossip tracker: Received kick", "name", ct.name, "account_id", event.AccountID, "protocol", event.Protocol, "from_node", event.NodeID)
 
 	// Notify all sessions for this user
 	ct.kickSessionsMu.Lock()
@@ -638,8 +626,7 @@ func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
 	// Clear the sessions list
 	delete(ct.kickSessions, event.AccountID)
 
-	logger.Debugf("[%s-GOSSIP-TRACKER] Notified %d sessions for accountID=%d",
-		ct.name, len(sessions), event.AccountID)
+	logger.Debug("Gossip tracker: Notified sessions", "name", ct.name, "session_count", len(sessions), "account_id", event.AccountID)
 }
 
 // broadcastRoutine periodically triggers broadcasts
@@ -656,7 +643,7 @@ func (ct *ConnectionTracker) broadcastRoutine() {
 
 			if hasEvents {
 				// Cluster manager will call GetBroadcasts()
-				logger.Debugf("[%s-GOSSIP-TRACKER] Broadcasting %d queued events", ct.name, len(ct.broadcastQueue))
+				logger.Debug("Gossip tracker: Broadcasting queued events", "name", ct.name, "count", len(ct.broadcastQueue))
 			}
 
 		case <-ct.stopBroadcast:
@@ -697,7 +684,7 @@ func (ct *ConnectionTracker) cleanup() {
 	}
 
 	if cleaned > 0 {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Cleaned up %d stale entries", ct.name, cleaned)
+		logger.Debug("Gossip tracker: Cleaned up stale entries", "name", ct.name, "count", cleaned)
 	}
 }
 
@@ -758,8 +745,8 @@ func (ct *ConnectionTracker) broadcastStateSnapshot() {
 		return // Nothing meaningful to broadcast
 	}
 
-	logger.Infof("[%s-GOSSIP-TRACKER] Broadcasting state snapshot: %d users, instance=%s",
-		ct.name, len(snapshot.Connections), ct.instanceID)
+	logger.Info("GossipTracker: Broadcasting state snapshot", "protocol", ct.name,
+		"users", len(snapshot.Connections), "instance", ct.instanceID)
 
 	// Queue the snapshot event
 	ct.queueEvent(ConnectionEvent{
@@ -778,15 +765,14 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 
 	// Skip our own snapshots
 	if snapshot.InstanceID == ct.instanceID {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Skipping own state snapshot", ct.name)
+		logger.Debug("Gossip tracker: Skipping own state snapshot", "name", ct.name)
 		return
 	}
 
 	// Check if snapshot is too old (prevent stale reconciliation)
 	age := time.Since(snapshot.Timestamp)
 	if age > 5*time.Minute {
-		logger.Debugf("[%s-GOSSIP-TRACKER] Ignoring stale state snapshot from %s (age: %v)",
-			ct.name, snapshot.InstanceID, age)
+		logger.Debug("Gossip tracker: Ignoring stale state snapshot", "name", ct.name, "instance", snapshot.InstanceID, "age", age)
 		return
 	}
 
@@ -837,8 +823,8 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 		info.LastUpdate = time.Now()
 	}
 
-	logger.Infof("[%s-GOSSIP-TRACKER] Reconciled state from %s: %d users updated, %d new users added",
-		ct.name, snapshot.InstanceID, reconciledCount, addedCount)
+	logger.Info("GossipTracker: Reconciled state", "protocol", ct.name,
+		"from_node", snapshot.InstanceID, "updated", reconciledCount, "added", addedCount)
 }
 
 // Stop stops the gossip tracker (idempotent)

@@ -133,7 +133,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
 	`, userID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
-		log.Printf("[DB] failed to check for children of mailbox ID %d: %v", mailboxID, err)
+		log.Printf("Database: failed to check for children of mailbox ID %d: %v", mailboxID, err)
 		return nil, consts.ErrInternalError
 	}
 
@@ -177,7 +177,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 		if err == pgx.ErrNoRows {
 			return nil, consts.ErrMailboxNotFound
 		}
-		log.Printf("[DB] failed to find mailbox '%s': %v", name, err)
+		log.Printf("Database: failed to find mailbox '%s': %v", name, err)
 		return nil, consts.ErrInternalError
 	}
 
@@ -190,7 +190,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE LENGTH(path) = LENGTH($1) + 16 AND path LIKE $1 || '%')
 	`, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
-		log.Printf("[DB] failed to check for children of mailbox '%s': %v", name, err)
+		log.Printf("Database: failed to check for children of mailbox '%s': %v", name, err)
 		return nil, consts.ErrInternalError
 	}
 
@@ -200,7 +200,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
-		log.Printf("[DB] ERROR: attempted to create mailbox with invalid characters: %q for user %d", name, userID)
+		log.Printf("Database: ERROR - attempted to create mailbox with invalid characters: %q for user %d", name, userID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -266,11 +266,11 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			switch pgErr.Code {
 			case "23505": // Unique constraint violation
-				log.Printf("[DB] WARNING: mailbox named '%s' already exists for user %d", name, userID)
+				log.Printf("Database: WARNING - mailbox named '%s' already exists for user %d", name, userID)
 				return consts.ErrDBUniqueViolation
 			case "23503": // Foreign key violation
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
-					log.Printf("[DB] ERROR: user with ID %d does not exist", userID)
+					log.Printf("Database: ERROR - user with ID %d does not exist", userID)
 					return consts.ErrDBNotFound
 				}
 			}
@@ -303,7 +303,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 			if err != nil {
 				return fmt.Errorf("failed to inherit parent ACLs: %w", err)
 			}
-			log.Printf("[DB] Created shared mailbox '%s' (ID: %d) with inherited ACLs from parent (ID: %d)", name, mailboxID, *parentID)
+			log.Printf("Database: created shared mailbox '%s' (ID: %d) with inherited ACLs from parent (ID: %d)", name, mailboxID, *parentID)
 		} else {
 			// No parent, grant creator full rights (or configured default rights)
 			defaultRights := "lrswipkxtea" // Full rights by default
@@ -328,7 +328,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 			if err != nil {
 				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
 			}
-			log.Printf("[DB] Created shared mailbox '%s' (ID: %d) for user %d with domain %s", name, mailboxID, userID, *ownerDomain)
+			log.Printf("Database: created shared mailbox '%s' (ID: %d) for user %d with domain %s", name, mailboxID, userID, *ownerDomain)
 		}
 	}
 
@@ -338,7 +338,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
-		log.Printf("[DB] ERROR: attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
+		log.Printf("Database: ERROR - attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -378,7 +378,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 			switch pgErr.Code {
 			case "23503": // Foreign key violation
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
-					log.Printf("[DB] user with ID %d does not exist", userID)
+					log.Printf("Database: user with ID %d does not exist", userID)
 					return consts.ErrDBNotFound
 				}
 			}
@@ -480,7 +480,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
 	`, userID, mailboxID, mboxPath)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
+		log.Printf("Database: ERROR - failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
@@ -491,14 +491,14 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, userID, mailboxID, mboxPath)
 
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to delete mailbox %d and its children: %v", mailboxID, err)
+		log.Printf("Database: ERROR - failed to delete mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
 		// This should not happen if the initial SELECT succeeded, but it's a good safeguard.
-		log.Printf("[DB] ERROR: mailbox %d not found for deletion during the final delete step", mailboxID)
+		log.Printf("Database: ERROR - mailbox %d not found for deletion during the final delete step", mailboxID)
 		return consts.ErrMailboxNotFound
 	}
 
@@ -590,7 +590,7 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 		`, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
 
 		if err != nil && err != pgx.ErrNoRows {
-			log.Printf("[DB] ERROR: failed to get first unseen sequence number for mailbox %d: %v", mailboxID, err)
+			log.Printf("Database: ERROR - failed to get first unseen sequence number for mailbox %d: %v", mailboxID, err)
 			s.FirstUnseenSeqNum = 0 // Default to 0 on failure
 		}
 	} else {
@@ -637,7 +637,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 	// Prevent subscription changes for default mailboxes.
 	for _, rootFolder := range consts.DefaultMailboxes {
 		if strings.EqualFold(mboxName, rootFolder) {
-			log.Printf("[DB] WARNING: ignoring subscription status update for root folder %s", mboxName)
+			log.Printf("Database: WARNING - ignoring subscription status update for root folder %s", mboxName)
 			return nil
 		}
 	}
@@ -659,7 +659,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(newName, "\t\r\n\x00") {
-		log.Printf("[DB] ERROR: attempted to rename mailbox to name with invalid characters: %q for user %d", newName, userID)
+		log.Printf("Database: ERROR - attempted to rename mailbox to name with invalid characters: %q for user %d", newName, userID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -697,7 +697,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return consts.ErrMailboxAlreadyExists
 	} else if err != pgx.ErrNoRows {
 		// An actual error occurred during the check.
-		log.Printf("[DB] ERROR: failed to check for existing mailbox with name '%s': %v", newName, err)
+		log.Printf("Database: ERROR - failed to check for existing mailbox with name '%s': %v", newName, err)
 		return consts.ErrInternalError
 	}
 	// If err is pgx.ErrNoRows, we can proceed.
@@ -712,7 +712,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
-		log.Printf("[DB] ERROR: failed to fetch and lock mailbox to rename (ID: %d): %v", mailboxID, err)
+		log.Printf("Database: ERROR - failed to fetch and lock mailbox to rename (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
@@ -722,7 +722,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2)
 	`, userID, oldPath).Scan(&hasChildren)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
+		log.Printf("Database: ERROR - failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 
@@ -738,10 +738,10 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE", *newParentID, userID).Scan(&newParentPath)
 		if err != nil {
 			if err == pgx.ErrNoRows {
-				log.Printf("[DB] ERROR: new parent mailbox (ID: %d) not found for rename", *newParentID)
+				log.Printf("Database: ERROR - new parent mailbox (ID: %d) not found for rename", *newParentID)
 				return consts.ErrMailboxNotFound
 			}
-			log.Printf("[DB] ERROR: failed to fetch new parent path (ID: %d): %v", *newParentID, err)
+			log.Printf("Database: ERROR - failed to fetch new parent path (ID: %d): %v", *newParentID, err)
 			return consts.ErrInternalError
 		}
 

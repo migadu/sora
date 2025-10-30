@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -74,7 +74,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
 		}
-		log.Printf("HTTP Mail API [%s] Error retrieving credentials: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error retrieving credentials: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Authentication failed")
 		return
 	}
@@ -88,7 +88,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate JWT token
 	token, expiresAt, err := s.generateToken(req.Email, accountID)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error generating token: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error generating token: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
 		return
 	}
@@ -128,7 +128,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// Generate new token with extended expiration
 	newToken, expiresAt, err := s.generateToken(claims.Email, claims.AccountID)
 	if err != nil {
-		log.Printf("HTTP Mail API [%s] Error generating refresh token: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error generating refresh token: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
 		return
 	}
@@ -235,7 +235,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate token
 		claims, err := s.validateToken(tokenString)
 		if err != nil {
-			log.Printf("HTTP Mail API [%s] Token validation error: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Token validation error: %v", "name", s.name, "param", err)
 			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
 			return
 		}

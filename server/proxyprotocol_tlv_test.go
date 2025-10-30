@@ -62,7 +62,7 @@ func TestParseTLVs(t *testing.T) {
 				0x00, 0x00, // Length: 0
 			},
 			wantTLVs: map[byte][]byte{
-				0xE0: []byte{},
+				0xE0: {},
 			},
 			wantErr:     false,
 			description: "TLV with zero-length value",
@@ -170,7 +170,7 @@ func TestExtractJA4FromTLVs(t *testing.T) {
 		{
 			name: "empty JA4 value",
 			tlvs: map[byte][]byte{
-				0xE0: []byte{},
+				0xE0: {},
 			},
 			wantJA4:  "",
 			describe: "Empty string when JA4 TLV has zero-length value",

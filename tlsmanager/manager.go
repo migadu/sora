@@ -48,8 +48,8 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 
 	// Log cluster integration status
 	if clusterMgr != nil {
-		logger.Infof("TLS manager integrated with cluster (node: %s, leader: %v)",
-			clusterMgr.GetNodeID(), clusterMgr.IsLeader())
+		logger.Info("TLS manager integrated with cluster", "node",
+			clusterMgr.GetNodeID(), "is_leader", clusterMgr.IsLeader())
 	}
 
 	switch cfg.Provider {
@@ -65,7 +65,7 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 		return nil, fmt.Errorf("unknown TLS provider: %s (must be 'file' or 'letsencrypt')", cfg.Provider)
 	}
 
-	logger.Infof("TLS manager initialized with provider: %s", cfg.Provider)
+	logger.Info("TLS manager initialized", "provider", cfg.Provider)
 	return m, nil
 }
 
@@ -87,7 +87,7 @@ func (m *Manager) initFileProvider() error {
 		Renegotiation: tls.RenegotiateNever,
 	}
 
-	logger.Infof("Loaded TLS certificate from files: cert=%s, key=%s", m.config.CertFile, m.config.KeyFile)
+	logger.Info("Loaded TLS certificate from files", "cert", m.config.CertFile, "key", m.config.KeyFile)
 	return nil
 }
 
@@ -148,7 +148,7 @@ func (m *Manager) initLetsEncryptProvider() error {
 		cache = fallbackCache
 		// Note: Success message logged inside NewFallbackCache (or warning if fallback disabled)
 	} else {
-		logger.Infof("Certificate fallback cache disabled - using S3 only")
+		logger.Info("Certificate fallback cache disabled - using S3 only")
 		cache = s3cache
 	}
 
@@ -157,15 +157,15 @@ func (m *Manager) initLetsEncryptProvider() error {
 	if m.clusterManager != nil {
 		clusterCache := NewClusterAwareCache(cache, m.clusterManager)
 		finalCache = NewFailoverAwareCache(clusterCache)
-		logger.Infof("Cluster-aware certificate cache enabled - only leader %s can request certificates",
+		logger.Info("Cluster-aware certificate cache enabled - only leader can request certificates", "leader",
 			m.clusterManager.GetLeaderID())
 
 		// Register callback for leadership changes
 		m.clusterManager.OnLeaderChange(func(isLeader bool, newLeaderID string) {
 			if isLeader {
-				logger.Infof("TLS Manager: This node became the cluster leader - can now request certificates")
+				logger.Info("TLS Manager: This node became the cluster leader - can now request certificates")
 			} else {
-				logger.Infof("TLS Manager: This node is no longer the cluster leader - certificate requests will be handled by %s", newLeaderID)
+				logger.Info("TLS Manager: This node is no longer the cluster leader", "new_leader", newLeaderID)
 			}
 		})
 	}
@@ -178,9 +178,9 @@ func (m *Manager) initLetsEncryptProvider() error {
 		if err != nil {
 			return fmt.Errorf("invalid renew_before duration: %w", err)
 		}
-		logger.Infof("Certificates will be renewed %v before expiry", renewBefore)
+		logger.Info("Certificates will be renewed before expiry", "window", renewBefore)
 	} else {
-		logger.Infof("Using default renewal window (30 days before expiry)")
+		logger.Info("Using default renewal window (30 days before expiry)")
 	}
 
 	// Create autocert manager
@@ -212,10 +212,10 @@ func (m *Manager) initLetsEncryptProvider() error {
 			// Handle missing SNI by using default domain
 			if serverName == "" {
 				if defaultDomain != "" {
-					logger.Debugf("[TLS] Missing SNI - using default domain: %s", defaultDomain)
+					logger.Debug("TLS: Missing SNI - using default domain", "domain", defaultDomain)
 					serverName = defaultDomain
 				} else {
-					logger.Debugf("[TLS] Rejected certificate request: missing server name (SNI) and no default domain configured")
+					logger.Debug("TLS: Rejected certificate request - missing SNI and no default domain")
 					return nil, ErrMissingServerName
 				}
 			}
@@ -226,11 +226,11 @@ func (m *Manager) initLetsEncryptProvider() error {
 
 			// Check if the server name matches our configured domains using the HostPolicy
 			if err := m.autocertMgr.HostPolicy(nil, serverName); err != nil {
-				logger.Debugf("[TLS] Rejected certificate request for unconfigured domain: %s (error: %v)", serverName, err)
+				logger.Debug("TLS: Rejected certificate request for unconfigured domain", "domain", serverName, "error", err)
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
 
-			logger.Debugf("[TLS] Certificate request during handshake for: %s (SNI: %v)", serverName, hello.ServerName != "")
+			logger.Debug("TLS: Certificate request during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
 
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
@@ -241,10 +241,10 @@ func (m *Manager) initLetsEncryptProvider() error {
 				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
 				// This allows the server to continue serving cached certificates for other domains
-				logger.Errorf("[TLS] Failed to get certificate for %s: %v", serverName, err)
+				logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err)
 				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 			}
-			logger.Debugf("[TLS] Certificate provided for: %s", serverName)
+			logger.Debug("TLS: Certificate provided", "domain", serverName)
 			return cert, nil
 		},
 		MinVersion:    tls.VersionTLS12,
@@ -252,11 +252,11 @@ func (m *Manager) initLetsEncryptProvider() error {
 		Renegotiation: tls.RenegotiateNever,
 	}
 
-	logger.Infof("Let's Encrypt autocert initialized for domains: %v", leCfg.Domains)
+	logger.Info("Let's Encrypt autocert initialized", "domains", leCfg.Domains)
 	if defaultDomain != "" {
-		logger.Infof("Default domain for SNI-less connections: %s", defaultDomain)
+		logger.Info("Default domain for SNI-less connections", "domain", defaultDomain)
 	}
-	logger.Infof("Certificates will be stored in S3 bucket: %s", leCfg.S3.Bucket)
+	logger.Info("Certificates will be stored in S3 bucket", "bucket", leCfg.S3.Bucket)
 
 	// Start certificate sync worker if configured
 	if leCfg.SyncInterval != "" && leCfg.SyncInterval != "0" {
@@ -334,7 +334,7 @@ func WrapTLSConfigWithDefaultDomain(baseCfg *tls.Config, serverDefaultDomain str
 	wrapped.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		// If no SNI provided, use server-specific default domain
 		if hello.ServerName == "" {
-			logger.Debugf("[TLS] Missing SNI - using server-specific default domain: %s", serverDefaultDomain)
+			logger.Debug("TLS: Missing SNI - using server-specific default domain", "domain", serverDefaultDomain)
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverDefaultDomain
 			return originalGetCert(&modifiedHello)

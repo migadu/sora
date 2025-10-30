@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
@@ -48,7 +49,7 @@ type adminAPILogger struct {
 
 func (l *adminAPILogger) Log(format string, args ...interface{}) {
 	// Log with prefix to identify HTTP delivery path
-	log.Printf("["+l.prefix+"] "+format, args...)
+	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
 }
 
 // handleDeliverMail handles HTTP mail delivery (mimics LMTP flow exactly)
@@ -216,7 +217,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 }
 
 // deliverToRecipient delivers a message to a single recipient using the delivery package
-func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient string, messageBytes []byte, messageEntity *message.Entity) RecipientStatus {
+func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,

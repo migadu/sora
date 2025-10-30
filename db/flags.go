@@ -30,7 +30,7 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 			// Keywords MUST NOT contain control characters or non-ASCII characters.
 			// We assume valid keywords are passed from the IMAP layer.
 			if len(flagStr) > FlagsMaxKeywordLength {
-				log.Printf("[DB] custom keyword '%s' exceeds maximum length of %d, skipping.", flagStr, FlagsMaxKeywordLength)
+				log.Printf("Database: custom keyword '%s' exceeds maximum length of %d, skipping.", flagStr, FlagsMaxKeywordLength)
 				continue // Skip this keyword
 			}
 			customKeywords = append(customKeywords, flagStr)
@@ -71,7 +71,7 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	allFlags := BitwiseToFlags(bitwiseFlags)
 	var customKeywords []string
 	if err := json.Unmarshal(customFlagsJSON, &customKeywords); err != nil {
-		log.Printf("[DB] error unmarshalling custom_flags for UID %d (mailbox %d): %v. JSON: %s", messageUID, mailboxID, err, string(customFlagsJSON))
+		log.Printf("Database: error unmarshalling custom_flags for UID %d (mailbox %d): %v. JSON: %s", messageUID, mailboxID, err, string(customFlagsJSON))
 		return nil, fmt.Errorf("failed to unmarshal custom_flags for UID %d (mailbox %d): %w", messageUID, mailboxID, err)
 	}
 	for _, kw := range customKeywords {

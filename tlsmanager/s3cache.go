@@ -75,8 +75,8 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 		return nil, fmt.Errorf("failed to verify S3 bucket access: %w", err)
 	}
 
-	logger.Infof("S3 autocert cache initialized with bucket: %s (endpoint: %s, tls: %v, debug: %v)",
-		cfg.Bucket, endpoint, useSSL, cfg.Debug)
+	logger.Info("S3 autocert cache initialized", "bucket", cfg.Bucket,
+		"endpoint", endpoint, "tls", useSSL, "debug", cfg.Debug)
 	return cache, nil
 }
 
@@ -96,12 +96,12 @@ func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
 func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 	s3Key := c.prefix + hashKey(key)
 
-	logger.Debugf("[S3-Cache] Getting certificate for key: %s (S3 key: %s)", key, s3Key)
+	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
 
 	// Get object from S3
 	obj, err := c.client.GetObject(ctx, c.bucket, s3Key, minio.GetObjectOptions{})
 	if err != nil {
-		logger.Errorf("[S3-Cache] Failed to get object from S3: %v", err)
+		logger.Error("S3-Cache: Failed to get object from S3", "error", err)
 		return nil, autocert.ErrCacheMiss
 	}
 	defer obj.Close()
@@ -110,21 +110,21 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 	if _, err := obj.Stat(); err != nil {
 		// MinIO returns error on stat if object doesn't exist
 		if minio.ToErrorResponse(err).StatusCode == 404 {
-			logger.Debugf("[S3-Cache] Certificate not found in S3 (cache miss): %s", key)
+			logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
 			return nil, autocert.ErrCacheMiss
 		}
-		logger.Errorf("[S3-Cache] Failed to stat object: %v", err)
+		logger.Error("S3-Cache: Failed to stat object", "error", err)
 		return nil, fmt.Errorf("failed to stat object: %w", err)
 	}
 
 	// Read object data
 	data, err := io.ReadAll(obj)
 	if err != nil {
-		logger.Errorf("[S3-Cache] Failed to read object data: %v", err)
+		logger.Error("S3-Cache: Failed to read object data", "error", err)
 		return nil, fmt.Errorf("failed to read object: %w", err)
 	}
 
-	logger.Debugf("[S3-Cache] Successfully retrieved certificate from S3: %s (%d bytes)", key, len(data))
+	logger.Debug("S3-Cache: Successfully retrieved certificate", "key", key, "bytes", len(data))
 	return data, nil
 }
 
@@ -132,7 +132,7 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 	s3Key := c.prefix + hashKey(key)
 
-	logger.Debugf("[S3-Cache] Putting certificate for key: %s (S3 key: %s, %d bytes)", key, s3Key, len(data))
+	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
 
 	// Upload to S3
 	_, err := c.client.PutObject(
@@ -146,11 +146,11 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 		},
 	)
 	if err != nil {
-		logger.Errorf("[S3-Cache] Failed to upload certificate to S3: %v", err)
+		logger.Error("S3-Cache: Failed to upload certificate to S3", "error", err)
 		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
 
-	logger.Debugf("[S3-Cache] Successfully stored certificate in S3: %s", key)
+	logger.Debug("S3-Cache: Successfully stored certificate", "key", key)
 	return nil
 }
 
@@ -158,21 +158,21 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 func (c *S3Cache) Delete(ctx context.Context, key string) error {
 	s3Key := c.prefix + hashKey(key)
 
-	logger.Debugf("[S3-Cache] Deleting certificate for key: %s (S3 key: %s)", key, s3Key)
+	logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
 
 	// Delete from S3
 	err := c.client.RemoveObject(ctx, c.bucket, s3Key, minio.RemoveObjectOptions{})
 	if err != nil {
 		// Check if object doesn't exist (which is fine for Delete)
 		if minio.ToErrorResponse(err).StatusCode == 404 {
-			logger.Debugf("[S3-Cache] Certificate already deleted or doesn't exist: %s", key)
+			logger.Debug("S3-Cache: Certificate already deleted or doesn't exist", "key", key)
 			return nil
 		}
-		logger.Errorf("[S3-Cache] Failed to delete certificate from S3: %v", err)
+		logger.Error("S3-Cache: Failed to delete certificate from S3", "error", err)
 		return fmt.Errorf("failed to delete from S3: %w", err)
 	}
 
-	logger.Debugf("[S3-Cache] Successfully deleted certificate from S3: %s", key)
+	logger.Debug("S3-Cache: Successfully deleted certificate", "key", key)
 	return nil
 }
 

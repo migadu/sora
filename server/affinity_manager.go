@@ -101,7 +101,7 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 	go am.cleanupRoutine()
 	go am.broadcastRoutine()
 
-	logger.Infof("[AFFINITY] Initialized gossip affinity: ttl=%v, cleanup=%v", ttl, cleanupInterval)
+	logger.Debug("Affinity: Initialized gossip affinity", "ttl", ttl, "cleanup", cleanupInterval)
 
 	return am
 }
@@ -149,7 +149,7 @@ func (am *AffinityManager) SetBackend(username, backend, protocol string) {
 		NodeID:     am.clusterManager.GetNodeID(),
 	}
 
-	logger.Infof("[AFFINITY] Set affinity: %s → %s (broadcasting to cluster)", username, backend)
+	logger.Debug("Affinity: Set - broadcasting to cluster", "user", username, "backend", backend)
 
 	// Broadcast to cluster
 	am.queueEvent(AffinityEvent{
@@ -183,7 +183,7 @@ func (am *AffinityManager) UpdateBackend(username, oldBackend, newBackend, proto
 		NodeID:     am.clusterManager.GetNodeID(),
 	}
 
-	logger.Infof("[AFFINITY] Updated affinity: %s from %s to %s", username, oldBackend, newBackend)
+	logger.Debug("Affinity: Updated affinity", "user", username, "from", oldBackend, "to", newBackend)
 
 	// Broadcast to cluster
 	am.queueEvent(AffinityEvent{
@@ -212,7 +212,7 @@ func (am *AffinityManager) DeleteBackend(username, protocol string) {
 	// Remove from local map
 	delete(am.affinityMap, key)
 
-	logger.Debugf("[AFFINITY] Deleted affinity for %s:%s", username, protocol)
+	logger.Debug("Affinity: Deleted affinity", "user", username, "protocol", protocol)
 
 	// Broadcast deletion to cluster
 	am.queueEvent(AffinityEvent{
@@ -247,7 +247,7 @@ func (am *AffinityManager) GetBroadcasts(overhead, limit int) [][]byte {
 	for i := 0; i < len(am.broadcastQueue); i++ {
 		encoded, err := encodeAffinityEvent(am.broadcastQueue[i])
 		if err != nil {
-			logger.Warnf("[AFFINITY] Failed to encode affinity event: %v", err)
+			logger.Warn("Affinity: Failed to encode affinity event", "error", err)
 			continue
 		}
 
@@ -272,23 +272,22 @@ func (am *AffinityManager) GetBroadcasts(overhead, limit int) [][]byte {
 func (am *AffinityManager) HandleClusterEvent(data []byte) {
 	event, err := decodeAffinityEvent(data)
 	if err != nil {
-		logger.Warnf("[AFFINITY] Failed to decode affinity event: %v", err)
+		logger.Warn("Affinity: Failed to decode affinity event", "error", err)
 		return
 	}
 
-	logger.Debugf("[AFFINITY] Received gossip event: type=%s user=%s backend=%s from=%s",
-		event.Type, event.Username, event.Backend, event.NodeID)
+	logger.Debug("Affinity: Received gossip event", "type", event.Type, "user", event.Username, "backend", event.Backend, "from_node", event.NodeID)
 
 	// Skip events from this node (we already applied them locally)
 	if event.NodeID == am.clusterManager.GetNodeID() {
-		logger.Debugf("[AFFINITY] Skipping own event from node %s", event.NodeID)
+		logger.Debug("Affinity: Skipping own event", "node_id", event.NodeID)
 		return
 	}
 
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
 	if age > 5*time.Minute {
-		logger.Debugf("[AFFINITY] Ignoring stale event from %s (age: %v)", event.NodeID, age)
+		logger.Debug("Affinity: Ignoring stale event", "node_id", event.NodeID, "age", age)
 		return
 	}
 
@@ -300,7 +299,7 @@ func (am *AffinityManager) HandleClusterEvent(data []byte) {
 	case AffinityEventDelete:
 		am.handleAffinityDelete(event)
 	default:
-		logger.Warnf("[AFFINITY] Unknown event type: %s", event.Type)
+		logger.Warn("Affinity: Unknown event type", "type", event.Type)
 	}
 }
 
@@ -316,12 +315,13 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 	if exists {
 		// Only apply if event is newer than our local state
 		if existing.AssignedAt.After(event.Timestamp) {
-			logger.Infof("[AFFINITY] Ignoring older SET for %s from %s (existing: %s from %s, event: %s)",
-				event.Username, event.NodeID, existing.Backend, existing.NodeID, event.Backend)
+			logger.Info("Affinity: Ignoring older SET", "user", event.Username, "node", event.NodeID,
+				"existing_backend", existing.Backend, "existing_node", existing.NodeID, "event_backend", event.Backend)
 			return
 		}
-		logger.Infof("[AFFINITY] Overwriting existing affinity for %s: %s → %s (node %s → %s)",
-			event.Username, existing.Backend, event.Backend, existing.NodeID, event.NodeID)
+		logger.Info("Affinity: Overwriting existing affinity", "user", event.Username,
+			"old_backend", existing.Backend, "new_backend", event.Backend,
+			"old_node", existing.NodeID, "new_node", event.NodeID)
 	}
 
 	// Apply the affinity
@@ -333,8 +333,8 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 		NodeID:     event.NodeID,
 	}
 
-	logger.Infof("[AFFINITY] Applied cluster affinity: %s → %s (from node %s)",
-		event.Username, event.Backend, event.NodeID)
+	logger.Info("Affinity: Applied cluster affinity", "user", event.Username,
+		"backend", event.Backend, "node", event.NodeID)
 }
 
 // handleAffinityUpdate applies an affinity update from another node
@@ -349,15 +349,15 @@ func (am *AffinityManager) handleAffinityUpdate(event AffinityEvent) {
 	if exists {
 		// Only apply if event is newer than our local state (last-write-wins)
 		if existing.AssignedAt.After(event.Timestamp) {
-			logger.Debugf("[AFFINITY] Ignoring older UPDATE for %s from %s", event.Username, event.NodeID)
+			logger.Debug("Affinity: Ignoring older UPDATE", "user", event.Username, "from_node", event.NodeID)
 			return
 		}
 
-		logger.Infof("[AFFINITY] Received cluster update for %s: %s → %s (from node %s)",
-			event.Username, existing.Backend, event.Backend, event.NodeID)
+		logger.Info("Affinity: Received cluster update", "user", event.Username,
+			"old_backend", existing.Backend, "new_backend", event.Backend, "node", event.NodeID)
 	} else {
-		logger.Infof("[AFFINITY] Received cluster affinity for %s: → %s (from node %s)",
-			event.Username, event.Backend, event.NodeID)
+		logger.Info("Affinity: Received cluster affinity", "user", event.Username,
+			"backend", event.Backend, "node", event.NodeID)
 	}
 
 	// Apply update
@@ -379,8 +379,7 @@ func (am *AffinityManager) handleAffinityDelete(event AffinityEvent) {
 
 	if _, exists := am.affinityMap[key]; exists {
 		delete(am.affinityMap, key)
-		logger.Debugf("[AFFINITY] Applied cluster delete for %s:%s from node %s",
-			event.Username, event.Protocol, event.NodeID)
+		logger.Debug("Affinity: Applied cluster delete", "user", event.Username, "protocol", event.Protocol, "from_node", event.NodeID)
 	}
 }
 
@@ -415,7 +414,7 @@ func (am *AffinityManager) cleanup() {
 	}
 
 	if removed > 0 {
-		logger.Debugf("[AFFINITY] Cleaned up %d expired affinities", removed)
+		logger.Debug("Affinity: Cleaned up expired affinities", "count", removed)
 	}
 }
 
@@ -433,7 +432,7 @@ func (am *AffinityManager) broadcastRoutine() {
 			am.queueMu.Unlock()
 
 			if hasEvents {
-				logger.Debugf("[AFFINITY] Triggering broadcast of %d queued events", len(am.broadcastQueue))
+				logger.Debug("Affinity: Triggering broadcast", "queued_events", len(am.broadcastQueue))
 			}
 
 		case <-am.stopBroadcast:

@@ -319,15 +319,15 @@ allowed_hosts = ["127.0.0.1", "10.0.0.0/8"]
 ```bash
 # List accounts
 curl -H "Authorization: Bearer $API_KEY" \
-  http://localhost:8080/api/v1/accounts
+  http://localhost:8080/admin/accounts
 
 # Get health status
 curl -H "Authorization: Bearer $API_KEY" \
-  http://localhost:8080/api/v1/health/overview
+  http://localhost:8080/admin/health/overview
 
 # Kick user connections
 curl -X POST -H "Authorization: Bearer $API_KEY" \
-  http://localhost:8080/api/v1/connections/kick \
+  http://localhost:8080/admin/connections/kick \
   -d '{"email": "user@example.com"}'
 ```
 
@@ -566,7 +566,7 @@ Example development workflow:
 # Test API (in another terminal)
 export API_KEY="your-api-key"
 curl -H "Authorization: Bearer $API_KEY" \
-  http://localhost:8080/api/v1/health/overview
+  http://localhost:8080/adming/health/overview
 
 # Run integration tests
 go test -v -tags=integration ./integration_tests/httpapi
@@ -612,8 +612,8 @@ The codebase uses a custom logger package (`github.com/migadu/sora/logger`):
 ```go
 // Use logger, not log package
 logger.Info("Starting server")
-logger.Infof("Listening on %s", addr)
-logger.Error("Failed to connect", err)
+logger.Info("Listening on", "addr", addr)
+logger.Error("Failed to connect", "err", err)
 ```
 
 Do not use the standard `log` package - use `logger` instead.

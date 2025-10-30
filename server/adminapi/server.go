@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"net/http"
 	"net/url"
@@ -135,7 +135,7 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 	if serverName == "" {
 		serverName = "default"
 	}
-	log.Printf("HTTP API [%s] Starting %s server on %s", serverName, protocol, options.Addr)
+	logger.Debug("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 		errChan <- fmt.Errorf("HTTP API server failed: %w", err)
 	}
@@ -153,11 +153,11 @@ func (s *Server) start(ctx context.Context) error {
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		log.Printf("HTTP API [%s] Shutting down server...", s.name)
+		logger.Debug("HTTP API: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP API [%s] Error shutting down server: %v", s.name, err)
+			logger.Debug("HTTP API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
 
@@ -360,9 +360,9 @@ func (s *Server) handleHealthOperations(w http.ResponseWriter, r *http.Request) 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("HTTP API [%s] %s %s from %s", s.name, r.Method, r.URL.Path, r.RemoteAddr)
+		logger.Debug("HTTP API: Request", "name", s.name, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		next.ServeHTTP(w, r)
-		log.Printf("HTTP API [%s] %s %s completed in %v", s.name, r.Method, r.URL.Path, time.Since(start))
+		logger.Debug("HTTP API: Request completed", "name", s.name, "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
 	})
 }
 
@@ -450,7 +450,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("HTTP API [%s] Error encoding JSON response: %v", s.name, err)
+		logger.Debug("HTTP API: Error encoding JSON response", "name", s.name, "error", err)
 	}
 }
 
@@ -557,7 +557,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
 				return
 			}
-			log.Printf("HTTP API [%s] Error creating account with credentials: %v", s.name, err)
+			logger.Debug("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			return
 		}
@@ -604,7 +604,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusConflict, "Account already exists")
 				return
 			}
-			log.Printf("HTTP API [%s] Error creating account: %v", s.name, err)
+			logger.Debug("HTTP API: Error creating account", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			return
 		}
@@ -612,7 +612,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		// Get the created account ID
 		accountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, req.Email)
 		if err != nil {
-			log.Printf("HTTP API [%s] Error getting new account ID: %v", s.name, err)
+			logger.Debug("HTTP API: Error getting new account ID", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve new account ID")
 			return
 		}
@@ -630,7 +630,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 
 	accounts, err := s.rdb.ListAccountsWithRetry(ctx)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error listing accounts: %v", s.name, err)
+		logger.Debug("HTTP API: Error listing accounts", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error listing accounts")
 		return
 	}
@@ -649,7 +649,7 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 
 	exists, err := s.rdb.AccountExistsWithRetry(ctx, email)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error checking account existence: %v", s.name, err)
+		logger.Debug("HTTP API: Error checking account existence", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error checking account existence")
 		return
 	}
@@ -671,7 +671,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		log.Printf("HTTP API [%s] Error getting account details: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting account details", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get account details")
 		return
 	}
@@ -712,7 +712,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error updating account: %v", s.name, err)
+		logger.Debug("HTTP API: Error updating account", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to update account")
 		return
 	}
@@ -737,7 +737,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		} else {
-			log.Printf("HTTP API [%s] Error deleting account %s: %v", s.name, email, err)
+			logger.Debug("HTTP API: Error deleting account", "name", s.name, "email", email, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Error deleting account")
 			return
 		}
@@ -764,7 +764,7 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		} else {
-			log.Printf("HTTP API [%s] Error restoring account %s: %v", s.name, email, err)
+			logger.Debug("HTTP API: Error restoring account", "name", s.name, "email", email, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Error restoring account")
 			return
 		}
@@ -811,7 +811,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found for the specified primary email")
 			return
 		}
-		log.Printf("HTTP API [%s] Error getting account ID for '%s': %v", s.name, primaryEmail, err)
+		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", primaryEmail, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to find account")
 		return
 	}
@@ -832,7 +832,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Credential with this email already exists")
 			return
 		}
-		log.Printf("HTTP API [%s] Error adding credential: %v", s.name, err)
+		logger.Debug("HTTP API: Error adding credential", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to add credential")
 		return
 	}
@@ -855,7 +855,7 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		log.Printf("HTTP API [%s] Error listing credentials: %v", s.name, err)
+		logger.Debug("HTTP API: Error listing credentials", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to list credentials")
 		return
 	}
@@ -879,7 +879,7 @@ func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		log.Printf("HTTP API [%s] Error getting credential details: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting credential details", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get credential details")
 		return
 	}
@@ -905,7 +905,7 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		}
 
 		// Generic server error for other issues
-		log.Printf("HTTP API [%s] Error deleting credential %s: %v", s.name, email, err)
+		logger.Debug("HTTP API: Error deleting credential", "name", s.name, "email", email, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete credential")
 		return
 	}
@@ -972,7 +972,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	// Get account ID from email
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting account ID for %s: %v", s.name, req.UserEmail, err)
+		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", req.UserEmail, "error", err)
 		s.writeError(w, http.StatusNotFound, "User not found")
 		return
 	}
@@ -990,7 +990,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available (not running in cluster/proxy mode)
-		log.Printf("HTTP API [%s] No connection trackers available - gossip-based kick requires cluster mode", s.name)
+		logger.Debug("HTTP API: No connection trackers available - gossip-based kick requires cluster mode", "name", s.name)
 		s.writeError(w, http.StatusServiceUnavailable, "Connection tracking not available (requires cluster mode)")
 		return
 	}
@@ -1000,17 +1000,17 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	for _, protocol := range protocols {
 		tracker := s.connectionTrackers[protocol]
 		if tracker == nil {
-			log.Printf("HTTP API [%s] No tracker for protocol %s", s.name, protocol)
+			logger.Debug("HTTP API: No tracker for protocol", "name", s.name, "proto", protocol)
 			continue
 		}
 
 		if err := tracker.KickUser(accountID, protocol); err != nil {
-			log.Printf("HTTP API [%s] Error kicking user %s on protocol %s: %v", s.name, req.UserEmail, protocol, err)
+			logger.Debug("HTTP API: Error kicking user on protocol", "name", s.name, "email", req.UserEmail, "proto", protocol, "error", err)
 			continue
 		}
 
 		kickedProtocols = append(kickedProtocols, protocol)
-		log.Printf("HTTP API [%s] Kicked user %s (accountID=%d) on protocol %s", s.name, req.UserEmail, accountID, protocol)
+		logger.Debug("HTTP API: Kicked user on protocol", "name", s.name, "email", req.UserEmail, "account_id", accountID, "proto", protocol)
 	}
 
 	if len(kickedProtocols) == 0 {
@@ -1078,7 +1078,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Get account ID from email
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, email)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting account ID for %s: %v", s.name, email, err)
+		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", email, "error", err)
 		s.writeError(w, http.StatusNotFound, "User not found")
 		return
 	}
@@ -1120,7 +1120,7 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.cache.GetStats()
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting cache stats: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting cache stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats")
 		return
 	}
@@ -1147,7 +1147,7 @@ func (s *Server) handleCacheMetrics(w http.ResponseWriter, r *http.Request) {
 		// Get latest metrics
 		metrics, err := s.rdb.GetLatestCacheMetricsWithRetry(ctx)
 		if err != nil {
-			log.Printf("HTTP API [%s] Error getting latest cache metrics: %v", s.name, err)
+			logger.Debug("HTTP API: Error getting latest cache metrics", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get latest cache metrics")
 			return
 		}
@@ -1172,7 +1172,7 @@ func (s *Server) handleCacheMetrics(w http.ResponseWriter, r *http.Request) {
 
 		metrics, err := s.rdb.GetCacheMetricsWithRetry(ctx, instanceID, since, limit)
 		if err != nil {
-			log.Printf("HTTP API [%s] Error getting cache metrics: %v", s.name, err)
+			logger.Debug("HTTP API: Error getting cache metrics", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get cache metrics")
 			return
 		}
@@ -1197,7 +1197,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Get stats before purge
 	statsBefore, err := s.cache.GetStats()
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting cache stats before purge: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting cache stats before purge", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats before purge")
 		return
 	}
@@ -1205,7 +1205,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Purge cache
 	err = s.cache.PurgeAll(ctx)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error purging cache: %v", s.name, err)
+		logger.Debug("HTTP API: Error purging cache", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to purge cache")
 		return
 	}
@@ -1213,7 +1213,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Get stats after purge
 	statsAfter, err := s.cache.GetStats()
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting cache stats after purge: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting cache stats after purge", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats after purge")
 		return
 	}
@@ -1233,7 +1233,7 @@ func (s *Server) handleHealthOverview(w http.ResponseWriter, r *http.Request) {
 
 	overview, err := s.rdb.GetSystemHealthOverviewWithRetry(ctx, hostname)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting health overview: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting health overview", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get health overview")
 		return
 	}
@@ -1249,7 +1249,7 @@ func (s *Server) handleHealthStatusByHost(w http.ResponseWriter, r *http.Request
 
 	statuses, err := s.rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting health statuses for host %s: %v", s.name, hostname, err)
+		logger.Debug("HTTP API: Error getting health statuses for host", "name", s.name, "hostname", hostname, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get health statuses for host")
 		return
 	}
@@ -1305,7 +1305,7 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 
 		history, err := s.rdb.GetHealthHistoryWithRetry(ctx, hostname, component, since, limit)
 		if err != nil {
-			log.Printf("HTTP API [%s] Error getting health history: %v", s.name, err)
+			logger.Debug("HTTP API: Error getting health history", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get health history")
 			return
 		}
@@ -1346,7 +1346,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 	// Get uploader stats
 	stats, err := s.rdb.GetUploaderStatsWithRetry(ctx, maxAttempts)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting uploader stats: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting uploader stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get uploader stats")
 		return
 	}
@@ -1367,7 +1367,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 
 		failedUploads, err := s.rdb.GetFailedUploadsWithRetry(ctx, maxAttempts, failedLimit)
 		if err != nil {
-			log.Printf("HTTP API [%s] Error getting failed uploads: %v", s.name, err)
+			logger.Debug("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get failed uploads")
 			return
 		}
@@ -1402,7 +1402,7 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 
 	failedUploads, err := s.rdb.GetFailedUploadsWithRetry(ctx, maxAttempts, limit)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting failed uploads: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get failed uploads")
 		return
 	}
@@ -1433,7 +1433,7 @@ func (s *Server) handleAuthStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.rdb.GetAuthAttemptsStatsWithRetry(ctx, windowDuration)
 	if err != nil {
-		log.Printf("HTTP API [%s] Error getting auth stats: %v", s.name, err)
+		logger.Debug("HTTP API: Error getting auth stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get auth stats")
 		return
 	}
@@ -1503,7 +1503,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		log.Printf("HTTP API [%s] Error listing deleted messages: %v", s.name, err)
+		logger.Debug("HTTP API: Error listing deleted messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error listing deleted messages")
 		return
 	}
@@ -1573,7 +1573,7 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		log.Printf("HTTP API [%s] Error restoring messages: %v", s.name, err)
+		logger.Debug("HTTP API: Error restoring messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error restoring messages")
 		return
 	}

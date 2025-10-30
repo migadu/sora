@@ -172,7 +172,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		go func() {
 			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			if hashErr != nil {
-				logger.Errorf("[REHASH] Failed to generate new hash for %s: %v", address, hashErr)
+				logger.Error("Rehash: Failed to generate new hash", "address", address, "error", hashErr)
 				return
 			}
 
@@ -191,9 +191,9 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 			// Use a new resilient call for the update
 			if err := rd.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
-				logger.Errorf("[REHASH] Failed to update password for %s: %v", address, err)
+				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
 			} else {
-				logger.Infof("[REHASH] Successfully rehashed and updated password for %s", address)
+				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
 				// Invalidate cache entry since password hash changed
 				if rd.authCache != nil {
 					rd.authCache.Invalidate(address)

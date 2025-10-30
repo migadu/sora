@@ -83,7 +83,6 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, us
 		}
 		return err
 	} else if h.RelayHandler != nil {
-		// Legacy behavior: immediate relay without retry
 		return h.RelayHandler.SendToExternalRelay(vacationFrom, fromAddr.FullAddress(), vacationMessage.Bytes())
 	}
 

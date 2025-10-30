@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/server"
 )
@@ -106,11 +106,10 @@ func NewHTTPPreLookupClient(
 		return counts.Requests >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		log.Printf("[HTTP-PreLookup] Circuit breaker '%s' changed from %s to %s", name, from, to)
+		logger.Warn("Prelookup circuit breaker state changed", "name", name, "from", from, "to", to)
 	}
 	breaker := circuitbreaker.NewCircuitBreaker(settings)
-	log.Printf("[HTTP-PreLookup] Initialized circuit breaker: max_requests=%d, timeout=%v, failure_ratio=%.0f%%, min_requests=%d",
-		cbSettings.MaxRequests, cbSettings.Timeout, cbSettings.FailureRatio*100, cbSettings.MinRequests)
+	logger.Info("Initialized prelookup circuit breaker", "max_requests", cbSettings.MaxRequests, "timeout", cbSettings.Timeout, "failure_ratio", fmt.Sprintf("%.0f%%", cbSettings.FailureRatio*100), "min_requests", cbSettings.MinRequests)
 
 	// Apply defaults for transport settings if not provided
 	if transportSettings == nil {
@@ -133,8 +132,7 @@ func NewHTTPPreLookupClient(
 		ForceAttemptHTTP2:   true,  // Try HTTP/2 if available
 	}
 
-	log.Printf("[HTTP-PreLookup] Initialized HTTP transport: max_idle_conns=%d, max_idle_conns_per_host=%d, max_conns_per_host=%d, idle_conn_timeout=%v",
-		transportSettings.MaxIdleConns, transportSettings.MaxIdleConnsPerHost, transportSettings.MaxConnsPerHost, transportSettings.IdleConnTimeout)
+	logger.Debug("Prelookup: Initialized HTTP transport", "max_idle_conns", transportSettings.MaxIdleConns, "max_idle_conns_per_host", transportSettings.MaxIdleConnsPerHost, "max_conns_per_host", transportSettings.MaxConnsPerHost, "idle_conn_timeout", transportSettings.IdleConnTimeout)
 
 	return &HTTPPreLookupClient{
 		baseURL:   baseURL,
@@ -162,7 +160,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	// This also handles +detail addressing and validates format
 	addr, err := server.ParseAddressWithMasterToken(email)
 	if err != nil {
-		log.Printf("[HTTP-PreLookup] Invalid email format: %v", err)
+		logger.Debug("Prelookup: Invalid email format", "error", err)
 		return nil, AuthFailed, nil
 	}
 
@@ -178,7 +176,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 
 	// Log if we stripped +detail addressing
 	if addr.Detail() != "" {
-		log.Printf("[HTTP-PreLookup] Stripping +detail from '%s' -> '%s' for authentication", email, lookupEmail)
+		logger.Debug("Prelookup: Stripping +detail for authentication", "from", email, "to", lookupEmail)
 	}
 
 	// Build cache key from base email and password hash (for security, we hash the password)
@@ -187,10 +185,10 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	// Check cache first
 	if c.cache != nil {
 		if info, authResult, found := c.cache.Get(cacheKey); found {
-			log.Printf("[HTTP-PreLookup] Cache HIT for user '%s'", authEmail)
+			logger.Debug("Prelookup cache HIT", "user", authEmail)
 			return info, authResult, nil
 		}
-		log.Printf("[HTTP-PreLookup] Cache MISS for user '%s'", authEmail)
+		logger.Debug("Prelookup cache MISS", "user", authEmail)
 	}
 
 	// Execute HTTP request through circuit breaker
@@ -199,7 +197,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		// Use lookupEmail (MasterAddress) to include master token but not +detail
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
 
-		log.Printf("[HTTP-PreLookup] Requesting lookup for user '%s' from %s", lookupEmail, requestURL)
+		logger.Debug("Prelookup: Requesting lookup", "user", lookupEmail, "url", requestURL)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
@@ -222,60 +220,60 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		// Read response body first so we can log it
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			log.Printf("[HTTP-PreLookup] Failed to read response body for user '%s': %v", lookupEmail, readErr)
+			logger.Debug("Prelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
 			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
 		}
 
 		// Check status code
 		if resp.StatusCode == http.StatusNotFound {
-			log.Printf("[HTTP-PreLookup] User '%s' not found (404)", lookupEmail)
+			logger.Debug("Prelookup: User not found (404)", "user", lookupEmail)
 			return map[string]interface{}{"result": AuthUserNotFound}, nil
 		}
 
 		// 4xx errors (except 404) mean user lookup failed - allow fallback
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			log.Printf("[HTTP-PreLookup] Client error %d for user '%s': %s - treating as user not found", resp.StatusCode, lookupEmail, string(bodyBytes))
+			logger.Debug("Prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
 			return map[string]interface{}{"result": AuthUserNotFound}, nil
 		}
 
 		// 5xx errors are transient - fallback controlled by config
 		if resp.StatusCode >= 500 {
-			log.Printf("[HTTP-PreLookup] Server error %d for user '%s': %s", resp.StatusCode, lookupEmail, string(bodyBytes))
+			logger.Debug("Prelookup: Server error", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
 			return nil, fmt.Errorf("%w: server error %d", ErrPrelookupTransient, resp.StatusCode)
 		}
 
 		// Non-200 2xx responses - treat as transient
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("[HTTP-PreLookup] Unexpected status %d for user '%s': %s", resp.StatusCode, lookupEmail, string(bodyBytes))
+			logger.Debug("Prelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
 			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrPrelookupTransient, resp.StatusCode)
 		}
 
 		// Parse JSON response - if this fails on a 200 response, it's a server bug
 		var lookupResp HTTPPreLookupResponse
 		if err := json.Unmarshal(bodyBytes, &lookupResp); err != nil {
-			log.Printf("[HTTP-PreLookup] Failed to parse JSON for user '%s': %v, body: %s", lookupEmail, err, string(bodyBytes))
+			logger.Debug("Prelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
 		// If server is null/empty, treat as user not found (404)
 		if strings.TrimSpace(lookupResp.Server) == "" {
-			log.Printf("[HTTP-PreLookup] Server is null/empty for user '%s' - treating as user not found", lookupEmail)
+			logger.Debug("Prelookup: Server is null/empty - treating as user not found", "user", lookupEmail)
 			return map[string]interface{}{"result": AuthUserNotFound}, nil
 		}
 
 		// Validate other required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': address is empty", lookupEmail)
+			logger.Debug("Prelookup: Validation failed - address is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
 		}
 		if strings.TrimSpace(lookupResp.PasswordHash) == "" {
-			log.Printf("[HTTP-PreLookup] Validation failed for user '%s': password_hash is empty", lookupEmail)
+			logger.Debug("Prelookup: Validation failed - password_hash is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
 		}
 
 		// Derive account_id from the address field
 		lookupResp.AccountID = deriveAccountIDFromEmail(lookupResp.Address)
-		log.Printf("[HTTP-PreLookup] Derived account_id from address '%s': %d", lookupResp.Address, lookupResp.AccountID)
+		logger.Debug("Prelookup: Derived account_id from address", "address", lookupResp.Address, "account_id", lookupResp.AccountID)
 
 		return lookupResp, nil
 	})
@@ -283,12 +281,12 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	// Handle circuit breaker errors
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
-			log.Printf("[HTTP-PreLookup] Circuit breaker is open for %s", c.baseURL)
+			logger.Debug("Prelookup: Circuit breaker is open", "url", c.baseURL)
 			// Circuit breaker open is a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
 		}
 		if err == circuitbreaker.ErrTooManyRequests {
-			log.Printf("[HTTP-PreLookup] Circuit breaker is half-open (testing recovery) for %s - rate limiting requests", c.baseURL)
+			logger.Debug("Prelookup: Circuit breaker is half-open - rate limiting requests", "url", c.baseURL)
 			// Too many requests in half-open state is also a transient error - return temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrPrelookupTransient)
 		}
@@ -321,7 +319,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	// Use the address from response (required field, already validated)
 	actualEmail := strings.TrimSpace(lookupResp.Address)
 	if actualEmail != lookupEmail {
-		log.Printf("[HTTP-PreLookup] Using address from response: '%s' (differs from query: '%s')", actualEmail, lookupEmail)
+		logger.Debug("Prelookup: Using address from response", "response_email", actualEmail, "query_email", lookupEmail)
 	}
 
 	// Log authentication attempt
@@ -329,13 +327,12 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	if len(hashPrefix) > 30 {
 		hashPrefix = hashPrefix[:30] + "..."
 	}
-	log.Printf("[HTTP-PreLookup] Verifying credentials for user '%s' (password length: %d, hash: %s)",
-		authEmail, len(password), hashPrefix)
+	logger.Debug("Prelookup: Verifying credentials", "user", authEmail, "password_len", len(password), "hash_prefix", hashPrefix)
 
 	// Verify password against hash returned by HTTP endpoint
 	// Note: The HTTP endpoint handles all master token logic and returns the appropriate hash
 	if !c.verifyPassword(password, lookupResp.PasswordHash) {
-		log.Printf("[HTTP-PreLookup] Authentication failed for user: %s", authEmail)
+		logger.Debug("Prelookup: Authentication failed", "user", authEmail)
 		// Store failed auth in cache (negative caching)
 		if c.cache != nil {
 			c.cache.Set(cacheKey, nil, AuthFailed)
@@ -343,7 +340,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		return nil, AuthFailed, nil
 	}
 
-	log.Printf("[HTTP-PreLookup] Authentication successful for user '%s'", authEmail)
+	logger.Debug("Prelookup: Authentication successful", "user", authEmail)
 
 	// Normalize server address (add default port if missing)
 	normalizedServer := c.normalizeServerAddress(lookupResp.Server)
@@ -374,7 +371,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 func (c *HTTPPreLookupClient) verifyPassword(password, hash string) bool {
 	err := db.VerifyPassword(hash, password)
 	if err != nil {
-		log.Printf("[HTTP-PreLookup] Password verification failed for hash '%s': %v", hash, err)
+		logger.Debug("Prelookup: Password verification failed", "hash", hash, "error", err)
 		return false
 	}
 	return true
@@ -480,22 +477,21 @@ func (c *HTTPPreLookupClient) GetHealth() map[string]interface{} {
 
 // Close cleans up resources
 func (c *HTTPPreLookupClient) Close() error {
-	log.Printf("[HTTP-PreLookup] Closing HTTP prelookup client")
+	logger.Debug("Prelookup: Closing HTTP prelookup client")
 
 	// Stop cache cleanup goroutine
 	if c.cache != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := c.cache.Stop(ctx); err != nil {
-			log.Printf("[HTTP-PreLookup] Warning: cache cleanup stop error: %v", err)
+			logger.Debug("Prelookup: Cache cleanup stop error", "error", err)
 		}
 
 		// Log final cache stats
 		hits, misses, size := c.cache.GetStats()
 		if hits+misses > 0 {
 			hitRate := float64(hits) / float64(hits+misses) * 100
-			log.Printf("[HTTP-PreLookup-Cache] Final stats: hits=%d, misses=%d, hit_rate=%.2f%%, size=%d",
-				hits, misses, hitRate, size)
+			logger.Info("Prelookup cache final stats", "hits", hits, "misses", misses, "hit_rate", fmt.Sprintf("%.2f%%", hitRate), "size", size)
 		}
 	}
 

@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -114,7 +114,7 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 	if serverName == "" {
 		serverName = "default"
 	}
-	log.Printf("HTTP Mail API [%s] Starting %s server on %s", serverName, protocol, options.Addr)
+	logger.Debug("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 		errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 	}
@@ -135,11 +135,11 @@ func (s *Server) start(ctx context.Context) error {
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		log.Printf("HTTP Mail API [%s] Shutting down server...", s.name)
+		logger.Debug("HTTP Mail API: Shutting down server...", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("HTTP Mail API [%s] Error shutting down server: %v", s.name, err)
+			logger.Debug("HTTP Mail API: Error shutting down server: %v", "name", s.name, "param", err)
 		}
 	}()
 
@@ -333,9 +333,9 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		log.Printf("HTTP Mail API [%s] %s %s from %s", s.name, r.Method, r.URL.Path, r.RemoteAddr)
+		logger.Debug("HTTP Mail API: %s %s from %s", "name", s.name, "param", r.Method, r.URL.Path, r.RemoteAddr)
 		next.ServeHTTP(w, r)
-		log.Printf("HTTP Mail API [%s] %s %s completed in %v", s.name, r.Method, r.URL.Path, time.Since(start))
+		logger.Debug("HTTP Mail API: %s %s completed in %v", "name", s.name, "param", r.Method, r.URL.Path, time.Since(start))
 	})
 }
 
@@ -425,7 +425,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("HTTP Mail API [%s] Error encoding JSON response: %v", s.name, err)
+		logger.Debug("HTTP Mail API: Error encoding JSON response: %v", "name", s.name, "param", err)
 	}
 }
 

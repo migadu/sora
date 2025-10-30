@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -97,7 +97,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[User API Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
+		logger.Debug("User API Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
 	}
 
 	// Initialize connection limiter with trusted networks
@@ -177,11 +177,11 @@ func (s *Server) Start() error {
 	// Graceful shutdown
 	go func() {
 		<-s.ctx.Done()
-		log.Printf("[User API Proxy %s] Shutting down server...", s.name)
+		logger.Debug("User API Proxy: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[User API Proxy %s] Error shutting down server: %v", s.name, err)
+			logger.Debug("User API Proxy: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
 
@@ -190,7 +190,7 @@ func (s *Server) Start() error {
 	if s.tls {
 		protocol = "HTTPS"
 	}
-	log.Printf("[User API Proxy %s] Starting %s server on %s", s.name, protocol, s.addr)
+	logger.Debug("User API Proxy: Starting server", "name", s.name, "protocol", protocol, "addr", s.addr)
 
 	if s.tls {
 		if s.tlsCertFile != "" && s.tlsKeyFile != "" {
@@ -212,7 +212,7 @@ func (s *Server) setupHandler() http.Handler {
 		// Validate JWT token and extract claims
 		claims, err := s.extractAndValidateToken(r)
 		if err != nil {
-			log.Printf("[User API Proxy %s] Authentication failed for request %s: %v", s.name, r.URL.Path, err)
+			logger.Debug("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -220,7 +220,7 @@ func (s *Server) setupHandler() http.Handler {
 		// Get backend for this user using consistent hash
 		backendAddr := s.connManager.GetBackendByConsistentHash(claims.Email)
 		if backendAddr == "" {
-			log.Printf("[User API Proxy %s] Failed to get backend for user %s", s.name, claims.Email)
+			logger.Debug("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email)
 			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -233,7 +233,7 @@ func (s *Server) setupHandler() http.Handler {
 
 		target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, backendAddr))
 		if err != nil {
-			log.Printf("[User API Proxy %s] Failed to parse backend URL: %v", s.name, err)
+			logger.Debug("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -330,7 +330,7 @@ func (s *Server) connStateHandler(conn net.Conn, state http.ConnState) {
 		// Check connection limits
 		if s.limiter != nil {
 			if _, err := s.limiter.Accept(conn.RemoteAddr()); err != nil {
-				log.Printf("[User API Proxy %s] Connection rejected: %v", s.name, err)
+				logger.Debug("User API Proxy: Connection rejected", "name", s.name, "error", err)
 				conn.Close()
 			}
 		}
@@ -346,7 +346,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the User API proxy server
 func (s *Server) Stop() error {
-	log.Printf("[User API Proxy %s] stopping...", s.name)
+	logger.Debug("User API Proxy: Stopping", "name", s.name)
 
 	s.cancel()
 
@@ -360,9 +360,9 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("[User API Proxy %s] server stopped gracefully", s.name)
+		logger.Debug("User API Proxy: Server stopped gracefully", "name", s.name)
 	case <-time.After(30 * time.Second):
-		log.Printf("[User API Proxy %s] Server stop timeout", s.name)
+		logger.Debug("User API Proxy: Server stop timeout", "name", s.name)
 	}
 
 	return nil

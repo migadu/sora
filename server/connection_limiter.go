@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -38,7 +38,7 @@ func NewConnectionLimiter(protocol string, maxConnections, maxPerIP int) *Connec
 func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPerIP int, trustedProxies []string) *ConnectionLimiter {
 	trustedNets, err := ParseTrustedNetworks(trustedProxies)
 	if err != nil {
-		log.Printf("[%s-LIMITER] WARNING: failed to parse trusted networks (%v), proceeding without trusted network exemptions", protocol, err)
+		logger.Debug("Connection limiter: WARNING - failed to parse trusted networks", "protocol", protocol, "error", err)
 		trustedNets = []*net.IPNet{}
 	}
 
@@ -176,24 +176,19 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		perIP = ipCounter.Add(1)
 
 		if realClientIP != "" {
-			log.Printf("[%s-LIMITER] Connection accepted from %s (real client: %s) - Active connections: %d/%d total, %d/%d from client IP",
-				cl.protocol, remoteAddr.String(), realClientIP, total, cl.maxConnections, perIP, cl.maxPerIP)
+			logger.Debug("Connection limiter: Connection accepted", "protocol", cl.protocol, "remote", remoteAddr.String(), "real_client", realClientIP, "total", total, "max_total", cl.maxConnections, "per_ip", perIP, "max_per_ip", cl.maxPerIP)
 		} else {
-			log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, %d/%d from this IP",
-				cl.protocol, trackingIP, total, cl.maxConnections, perIP, cl.maxPerIP)
+			logger.Debug("Connection limiter: Connection accepted", "protocol", cl.protocol, "ip", trackingIP, "total", total, "max_total", cl.maxConnections, "per_ip", perIP, "max_per_ip", cl.maxPerIP)
 		}
 	} else if isTrusted {
 		proxyIP, _, _ := net.SplitHostPort(remoteAddr.String())
 		if realClientIP != "" {
-			log.Printf("[%s-LIMITER] Connection accepted from %s (trusted proxy, real client: %s) - Active connections: %d/%d total, unlimited from trusted proxy",
-				cl.protocol, proxyIP, realClientIP, total, cl.maxConnections)
+			logger.Debug("Connection limiter: Connection accepted from trusted proxy", "protocol", cl.protocol, "proxy", proxyIP, "real_client", realClientIP, "total", total, "max_total", cl.maxConnections)
 		} else {
-			log.Printf("[%s-LIMITER] Connection accepted from %s (trusted network) - Active connections: %d/%d total, unlimited from trusted IP",
-				cl.protocol, proxyIP, total, cl.maxConnections)
+			logger.Debug("Connection limiter: Connection accepted from trusted network", "protocol", cl.protocol, "ip", proxyIP, "total", total, "max_total", cl.maxConnections)
 		}
 	} else {
-		log.Printf("[%s-LIMITER] Connection accepted from %s - Active connections: %d/%d total, unlimited from this IP",
-			cl.protocol, trackingIP, total, cl.maxConnections)
+		logger.Debug("Connection limiter: Connection accepted - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", total, "max_total", cl.maxConnections)
 	}
 
 	// Return cleanup function
@@ -213,19 +208,15 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 			}
 
 			if realClientIP != "" {
-				log.Printf("[%s-LIMITER] Connection released from %s (real client: %s) - Active connections remaining: %d total, %d from client IP",
-					cl.protocol, remoteAddr.String(), realClientIP, cl.currentTotal.Load(), remaining)
+				logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "remote", remoteAddr.String(), "real_client", realClientIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
 			} else {
-				log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, %d from this IP",
-					cl.protocol, trackingIP, cl.currentTotal.Load(), remaining)
+				logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
 			}
 		} else {
 			if realClientIP != "" {
-				log.Printf("[%s-LIMITER] Connection released from %s (real client: %s) - Active connections remaining: %d total, unlimited from this connection",
-					cl.protocol, remoteAddr.String(), realClientIP, cl.currentTotal.Load())
+				logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "remote", remoteAddr.String(), "real_client", realClientIP, "total", cl.currentTotal.Load())
 			} else {
-				log.Printf("[%s-LIMITER] Connection released from %s - Active connections remaining: %d total, unlimited from this IP",
-					cl.protocol, trackingIP, cl.currentTotal.Load())
+				logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load())
 			}
 		}
 	}, nil
@@ -340,7 +331,7 @@ func (cl *ConnectionLimiter) cleanup() {
 	}
 
 	if cleaned > 0 {
-		log.Printf("[%s-LIMITER] Cleaned up %d stale IP entries", cl.protocol, cleaned)
+		logger.Debug("Connection limiter: Cleaned up stale IP entries", "protocol", cl.protocol, "count", cleaned)
 	}
 }
 

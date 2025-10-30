@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -59,8 +59,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		reader.config.Mode = "required" // Default to "required"
 	}
 
-	log.Printf("[%s-PROXY] Initializing PROXY protocol reader: enabled=%t, mode=%s, trusted_proxies=%v, timeout=%v",
-		protocol, config.Enabled, reader.config.Mode, config.TrustedProxies, reader.timeout)
+	logger.Debug("PROXY protocol: Initializing reader", "protocol", protocol, "enabled", config.Enabled, "mode", reader.config.Mode, "trusted_proxies", config.TrustedProxies, "timeout", reader.timeout)
 
 	// Parse timeout
 	if config.Timeout != "" {
@@ -68,7 +67,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 		reader.timeout, err = time.ParseDuration(config.Timeout)
 		if err != nil {
 			// Log the error and use default timeout to prevent server crash
-			log.Printf("WARNING: invalid proxy protocol timeout '%s' for %s (%v), using default timeout of 5s", config.Timeout, protocol, err)
+			logger.Debug("PROXY protocol: WARNING - invalid timeout, using default 5s", "protocol", protocol, "timeout", config.Timeout, "error", err)
 			reader.timeout = 5 * time.Second
 		}
 	}
@@ -77,7 +76,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 	trustedNets, err := ParseTrustedNetworks(config.TrustedProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
-		log.Printf("WARNING: failed to parse trusted proxy networks for %s (%v), using empty trusted networks (PROXY protocol will be disabled)", protocol, err)
+		logger.Debug("PROXY protocol: WARNING - failed to parse trusted networks, PROXY will be disabled", "protocol", protocol, "error", err)
 		trustedNets = []*net.IPNet{}
 	}
 	reader.trustedNets = trustedNets
@@ -148,10 +147,10 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	if !r.isTrustedConnection(conn) {
 		// If PROXY protocol is enabled, we MUST only accept connections from trusted proxies.
 		// This is a critical security boundary.
-		log.Printf("[PROXY] REJECTING connection from untrusted source %s. Add to trusted_proxies if this is a valid proxy.", conn.RemoteAddr())
+		logger.Debug("PROXY protocol: REJECTING untrusted connection", "remote", conn.RemoteAddr())
 		return nil, conn, fmt.Errorf("connection from untrusted source %s", conn.RemoteAddr())
 	}
-	log.Printf("[PROXY] Processing connection from trusted proxy %s", conn.RemoteAddr())
+	logger.Debug("PROXY protocol: Processing connection from trusted proxy", "remote", conn.RemoteAddr())
 
 	// Set read deadline for PROXY header
 	if err := conn.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
@@ -177,13 +176,13 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 
 	// Check for PROXY v1 signature
 	if len(peek) >= 5 && string(peek[:5]) == "PROXY" {
-		log.Printf("[PROXY] Detected PROXY v1 protocol from %s", conn.RemoteAddr())
+		logger.Debug("PROXY protocol: Detected v1", "remote", conn.RemoteAddr())
 		info, err := r.parseProxyV1(reader)
 		if err != nil {
 			return nil, conn, fmt.Errorf("failed to parse PROXY v1 header: %w", err)
 		}
 
-		log.Printf("[PROXY] Parsed PROXY v1: client=%s:%d -> server=%s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+		logger.Debug("PROXY protocol: Parsed v1", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
 
 		// Clear read deadline
 		conn.SetReadDeadline(time.Time{})
@@ -210,16 +209,16 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 				}
 			}
 			if match {
-				log.Printf("[PROXY] Detected PROXY v2 protocol from %s", conn.RemoteAddr())
+				logger.Debug("PROXY protocol: Detected v2", "remote", conn.RemoteAddr())
 				info, err := r.parseProxyV2(reader)
 				if err != nil {
 					return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
 				}
 
 				if info.SrcIP != "" {
-					log.Printf("[PROXY] Parsed PROXY v2: client=%s:%d -> server=%s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+					logger.Debug("PROXY protocol: Parsed v2", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
 				} else {
-					log.Printf("[PROXY] Parsed PROXY v2: %s command", info.Command)
+					logger.Debug("PROXY protocol: Parsed v2 command", "command", info.Command)
 				}
 
 				// Clear read deadline
@@ -627,12 +626,12 @@ func GetConnectionIPs(conn net.Conn, proxyInfo *ProxyProtocolInfo) (clientIP, pr
 
 	// If we have PROXY protocol info, use it for client IP
 	if proxyInfo != nil && proxyInfo.SrcIP != "" {
-		log.Printf("[PROXY] Using PROXY protocol IPs: client=%s, proxy=%s", proxyInfo.SrcIP, directIP)
+		logger.Debug("PROXY protocol: Using PROXY IPs", "client", proxyInfo.SrcIP, "proxy", directIP)
 		return proxyInfo.SrcIP, directIP
 	}
 
 	// No proxy, direct connection
-	log.Printf("[PROXY] Direct connection from %s (no proxy)", directIP)
+	logger.Debug("PROXY protocol: Direct connection (no proxy)", "ip", directIP)
 	return directIP, ""
 }
 
@@ -718,11 +717,9 @@ func GenerateProxyV2HeaderWithTLVs(clientIP string, clientPort int, serverIP str
 	result = append(result, tlvData...)
 
 	if len(tlvData) > 0 {
-		log.Printf("[PROXY] Generated PROXY v2 header with TLVs: client=%s:%d -> server=%s:%d (family=%d, addr_len=%d, tlv_len=%d)",
-			clientIP, clientPort, serverIP, serverPort, addressFamily, len(addressData), len(tlvData))
+		logger.Debug("PROXY protocol: Generated v2 header with TLVs", "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort, "family", addressFamily, "addr_len", len(addressData), "tlv_len", len(tlvData))
 	} else {
-		log.Printf("[PROXY] Generated PROXY v2 header: client=%s:%d -> server=%s:%d (family=%d, len=%d)",
-			clientIP, clientPort, serverIP, serverPort, addressFamily, len(addressData))
+		logger.Debug("PROXY protocol: Generated v2 header", "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort, "family", addressFamily, "addr_len", len(addressData))
 	}
 
 	return result, nil
@@ -745,6 +742,6 @@ func WriteProxyV2Header(conn net.Conn, clientIP string, clientPort int, serverIP
 		return fmt.Errorf("failed to write PROXY v2 header: %w", err)
 	}
 
-	log.Printf("[PROXY] Sent PROXY v2 header to %s", conn.RemoteAddr())
+	logger.Debug("PROXY protocol: Sent v2 header", "remote", conn.RemoteAddr())
 	return nil
 }

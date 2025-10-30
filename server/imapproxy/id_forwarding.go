@@ -2,11 +2,11 @@ package imapproxy
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server"
 )
 
@@ -43,7 +43,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		if err == nil && fingerprint != "" {
 			forwardingParams.Variables["ja4-fingerprint"] = fingerprint
 			if s.server.debug {
-				log.Printf("IMAP Proxy [%s] Forwarding JA4 fingerprint for %s: %s", s.server.name, s.username, fingerprint)
+				logger.Debug("Forwarding JA4 fingerprint", "proxy", s.server.name, "user", s.username, "fingerprint", fingerprint)
 			}
 		}
 	}
@@ -85,7 +85,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			log.Printf("IMAP Proxy [%s] Warning: failed to clear read deadline after ID response: %v", s.server.name, err)
+			logger.Warn("Failed to clear read deadline after ID response", "proxy", s.server.name, "error", err)
 		}
 	}()
 
@@ -101,11 +101,11 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		if strings.HasPrefix(response, "* ID") {
 			// Backend sent ID response, continue reading
 			if s.server.debug {
-				log.Printf("IMAP Proxy [%s] Backend ID response: %s", s.server.name, response)
+				logger.Debug("Backend ID response", "proxy", s.server.name, "response", response)
 			}
 		} else if strings.HasPrefix(response, tag+" OK") {
 			if s.server.debug {
-				log.Printf("IMAP Proxy [%s] ID forwarding completed successfully for %s", s.server.name, s.username)
+				logger.Debug("ID forwarding completed successfully", "proxy", s.server.name, "user", s.username)
 			}
 			break
 		} else if strings.HasPrefix(response, tag+" NO") || strings.HasPrefix(response, tag+" BAD") {

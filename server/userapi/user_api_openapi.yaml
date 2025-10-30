@@ -10,7 +10,7 @@ info:
     url: https://github.com/migadu/sora
 
 servers:
-  - url: /user/v1
+  - url: /user
     description: User API version 1
 
 tags:

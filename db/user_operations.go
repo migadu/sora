@@ -158,7 +158,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		// Parse custom flags
 		if len(customFlagsJSON) > 0 {
 			if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-				log.Printf("[DB] failed to unmarshal custom flags: %v", err)
+				log.Printf("Database: failed to unmarshal custom flags: %v", err)
 				msg.CustomFlags = []string{}
 			}
 		}
@@ -167,7 +167,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		if len(recipientsJSON) > 0 {
 			var recipients map[string][]RecipientInfo
 			if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
-				log.Printf("[DB] failed to unmarshal recipients: %v", err)
+				log.Printf("Database: failed to unmarshal recipients: %v", err)
 			} else {
 				if from, ok := recipients["from"]; ok && len(from) > 0 {
 					msg.From = from[0].Address

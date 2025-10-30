@@ -79,8 +79,8 @@ HTTP Status: `401 Unauthorized`
 
 The default base URL depends on your configuration:
 
-- **Development**: `http://localhost:8080/admin/v1`
-- **Production**: `https://your-domain.com/admin/v1`
+- **Development**: `http://localhost:8080/admin`
+- **Production**: `https://your-domain.com/admin`
 
 All endpoints are prefixed with `/admin/`.
 

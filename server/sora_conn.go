@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/exaring/ja4plus"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -50,6 +50,9 @@ type SoraConn struct {
 	protocol string // "imap", "pop3", "lmtp", "managesieve", "imap_proxy", etc.
 	username string // Set after authentication
 
+	// Timeout callback
+	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
+
 	// Lifecycle management
 	closed     bool
 	closeMutex sync.Mutex
@@ -66,6 +69,13 @@ type SoraConnConfig struct {
 	InitialJA4           string        // Pre-captured JA4 fingerprint
 	InitialProxyInfo     *ProxyProtocolInfo
 	EnableTimeoutChecker bool // If false, caller must handle timeouts
+
+	// OnTimeout is called before closing connection due to timeout.
+	// The reason will be one of: "idle", "slow_throughput", or "session_max".
+	// The handler should send a protocol-specific goodbye message and return quickly.
+	// If nil, the connection will be closed without sending any message.
+	// The conn parameter is the underlying net.Conn for writing goodbye messages.
+	OnTimeout func(conn net.Conn, reason string)
 }
 
 // NewSoraConn creates a new SoraConn wrapping the given connection
@@ -74,7 +84,7 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 
 	// Apply defaults
 	if config.MinBytesPerMinute == 0 {
-		config.MinBytesPerMinute = 1024 // Default: 1KB/minute (very lenient)
+		config.MinBytesPerMinute = 512 // Default: 512 bytes/minute (balanced slowloris protection)
 	}
 	if config.AbsoluteTimeout == 0 {
 		config.AbsoluteTimeout = 30 * time.Minute // Default: 30 minutes
@@ -96,6 +106,7 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 		proxyInfo:           config.InitialProxyInfo,
 		protocol:            config.Protocol,
 		username:            "",
+		onTimeout:           config.OnTimeout,
 		closed:              false,
 		cancelIdle:          make(chan struct{}),
 	}
@@ -141,9 +152,14 @@ func (c *SoraConn) timeoutChecker() {
 			// Check absolute session timeout (highest priority)
 			if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
 				remoteAddr := c.Conn.RemoteAddr().String()
-				log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=session_max duration=%v: Connection closed - exceeded maximum session duration (%v)",
-					c.protocol, remoteAddr, username, sessionDuration.Round(time.Second), c.absoluteTimeout)
+				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
+
+				// Call timeout handler before closing (if provided)
+				if c.onTimeout != nil {
+					c.onTimeout(c.Conn, "session_max")
+				}
+
 				c.Close()
 				return
 			}
@@ -161,9 +177,14 @@ func (c *SoraConn) timeoutChecker() {
 
 					if bytesPerMinute < float64(c.minBytesPerMinute) {
 						remoteAddr := c.Conn.RemoteAddr().String()
-						log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=slow_throughput bytes_per_min=%.0f required=%d: Connection closed - throughput too slow",
-							c.protocol, remoteAddr, username, bytesPerMinute, c.minBytesPerMinute)
+						logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min", int(bytesPerMinute), "required", c.minBytesPerMinute)
 						metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
+
+						// Call timeout handler before closing (if provided)
+						if c.onTimeout != nil {
+							c.onTimeout(c.Conn, "slow_throughput")
+						}
+
 						c.Close()
 						return
 					}
@@ -179,9 +200,14 @@ func (c *SoraConn) timeoutChecker() {
 			// Check idle timeout
 			if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
 				remoteAddr := c.Conn.RemoteAddr().String()
-				log.Printf("[%s-TIMEOUT] remote=%s user=%s reason=idle idle_time=%v max_idle=%v: Connection closed - no activity",
-					c.protocol, remoteAddr, username, idleTime.Round(time.Second), c.idleTimeout)
+				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
+
+				// Call timeout handler before closing (if provided)
+				if c.onTimeout != nil {
+					c.onTimeout(c.Conn, "idle")
+				}
+
 				c.Close()
 				return
 			}
@@ -321,7 +347,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 	originalDeadline := time.Now().Add(100 * time.Millisecond)
 	if err := c.Conn.SetReadDeadline(originalDeadline); err != nil {
 		// If we can't set deadline, skip detection (better to proceed than fail)
-		log.Printf("[%s] TLS detection: cannot set read deadline: %v", c.protocol, err)
+		logger.Warn("TLS detection: cannot set read deadline", "proto", c.protocol, "error", err)
 		c.Conn.SetReadDeadline(time.Time{}) // Clear deadline
 		return nil
 	}
@@ -368,7 +394,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 	if peekBuf[0] == 0x16 && peekBuf[1] == 0x03 {
 		// This is very likely a TLS Client Hello
 		remoteAddr := c.Conn.RemoteAddr().String()
-		log.Printf("[%s-SECURITY] remote=%s TLS handshake detected on plain-text port - rejecting connection", c.protocol, remoteAddr)
+		logger.Warn("TLS handshake detected on plain-text port - rejecting", "proto", c.protocol, "remote", remoteAddr)
 
 		// Write a helpful error message
 		// Note: The client's TLS stack won't display this, but it helps with debugging
@@ -494,7 +520,7 @@ func (c *SoraTLSConn) PerformHandshake() error {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[%s] JA4 fingerprinting panic recovered (likely malformed ClientHello): %v", c.connConfig.Protocol, r)
+					logger.Warn("JA4 fingerprinting panic recovered (likely malformed ClientHello)", "proto", c.connConfig.Protocol, "error", r)
 					// Set empty fingerprint on panic
 					c.SetJA4Fingerprint("")
 				}
@@ -516,7 +542,7 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	// Set a deadline for the TLS handshake (10 seconds should be more than enough)
 	handshakeDeadline := time.Now().Add(10 * time.Second)
 	if err := c.tcpConn.SetDeadline(handshakeDeadline); err != nil {
-		log.Printf("[%s] Failed to set handshake deadline: %v", c.connConfig.Protocol, err)
+		logger.Warn("Failed to set handshake deadline", "proto", c.connConfig.Protocol, "error", err)
 		c.handshakeErr = fmt.Errorf("failed to set handshake deadline: %w", err)
 		return c.handshakeErr
 	}
@@ -525,14 +551,14 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	handshakeStart := time.Now()
 	if err := c.tlsConn.Handshake(); err != nil {
 		handshakeDuration := time.Since(handshakeStart)
-		log.Printf("[%s] TLS handshake failed from %s after %v: %v", c.connConfig.Protocol, remoteAddr, handshakeDuration, err)
+		logger.Info("TLS handshake failed", "proto", c.connConfig.Protocol, "remote", remoteAddr, "duration", handshakeDuration, "error", err)
 		c.handshakeErr = err
 		return err
 	}
 
 	// Clear the deadline after successful handshake
 	if err := c.tlsConn.SetDeadline(time.Time{}); err != nil {
-		log.Printf("[%s] Warning: failed to clear handshake deadline: %v", c.connConfig.Protocol, err)
+		logger.Warn("Failed to clear handshake deadline", "proto", c.connConfig.Protocol, "error", err)
 	}
 
 	// Replace the underlying connection in SoraConn with the TLS connection

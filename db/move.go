@@ -16,7 +16,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 
 	// Check if source and destination mailboxes are the same
 	if srcMailboxID == destMailboxID {
-		log.Printf("[DB] WARNING: source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
+		log.Printf("Database: WARNING - source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
 		return nil, fmt.Errorf("cannot move messages within the same mailbox")
 	}
 
@@ -43,7 +43,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		ORDER BY uid
 	`, srcMailboxID, ids)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to query source messages: %v", err)
+		log.Printf("Database: ERROR - failed to query source messages: %v", err)
 		return nil, consts.ErrInternalError
 	}
 	defer rows.Close()
@@ -65,7 +65,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	}
 
 	if len(messageIDs) == 0 {
-		log.Printf("[DB] WARNING: no messages found to move from mailbox %d", srcMailboxID)
+		log.Printf("Database: WARNING - no messages found to move from mailbox %d", srcMailboxID)
 		return messageUIDMap, nil
 	}
 
@@ -74,7 +74,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	numToMove := int64(len(messageIDs))
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToMove, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to update highest UID: %v", err)
+		log.Printf("Database: ERROR - failed to update highest UID: %v", err)
 		return nil, consts.ErrDBUpdateFailed
 	}
 
@@ -104,11 +104,11 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		  AND message_id IN (SELECT message_id FROM messages WHERE id = ANY($2))
 	`, destMailboxID, messageIDs)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to delete conflicting tombstones in destination mailbox: %v", err)
+		log.Printf("Database: ERROR - failed to delete conflicting tombstones in destination mailbox: %v", err)
 		return nil, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
 	}
 	if deleteResult.RowsAffected() > 0 {
-		log.Printf("[DB] Deleted %d conflicting message(s) from destination mailbox before move", deleteResult.RowsAffected())
+		log.Printf("Database: deleted %d conflicting message(s) from destination mailbox before move", deleteResult.RowsAffected())
 	}
 
 	// Batch insert the moved messages into the destination mailbox.
@@ -137,7 +137,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
 	`, destMailboxID, destMailboxName, messageIDs, newUIDs)
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to batch insert messages into destination mailbox: %v", err)
+		log.Printf("Database: ERROR - failed to batch insert messages into destination mailbox: %v", err)
 		return nil, fmt.Errorf("failed to move messages: %w", err)
 	}
 
@@ -149,7 +149,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	`, srcMailboxID, messageIDs)
 
 	if err != nil {
-		log.Printf("[DB] ERROR: failed to mark original messages as expunged: %v", err)
+		log.Printf("Database: ERROR - failed to mark original messages as expunged: %v", err)
 		return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
 	}
 

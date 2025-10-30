@@ -467,7 +467,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	metrics.DBQueriesTotal.WithLabelValues(metricsLabel, status, "read").Inc()
 
 	if err != nil {
-		log.Printf("[DB] ERROR: failed executing query: %s\nArgs: %#v\nError: %v", finalQueryString, whereArgs, err)
+		log.Printf("Database: ERROR - failed executing query: %s\nArgs: %#v\nERROR - %v", finalQueryString, whereArgs, err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
@@ -479,7 +479,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	// Log warning if we hit the result limit (may indicate client needs to refine search)
 	if len(messages) >= resultLimit {
-		log.Printf("[DB] WARNING: Search query hit result limit (%d) for mailbox %d. "+
+		log.Printf("Database: WARNING - search query hit result limit (%d) for mailbox %d. "+
 			"Client may need to use more specific search criteria. Complex: %v",
 			resultLimit, mailboxID, isComplexQuery)
 	}

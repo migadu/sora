@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -121,7 +120,7 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		routingLookup:          routingLookup,
 	}
 
-	log.Printf("%s Initialized consistent hash ring with %d backends", cm.logPrefix(), len(normalizedAddrs))
+	logger.Debug("Connection manager: Initialized consistent hash ring", "prefix", cm.logPrefix(), "backends", len(normalizedAddrs))
 
 	return cm, nil
 }
@@ -129,9 +128,9 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 // logPrefix returns a consistent log prefix for this connection manager
 func (cm *ConnectionManager) logPrefix() string {
 	if cm.serverName != "" {
-		return fmt.Sprintf("[ConnectionManager] [%s]", cm.serverName)
+		return fmt.Sprintf("ConnectionManager: %s:", cm.serverName)
 	}
-	return "[ConnectionManager]"
+	return "ConnectionManager:"
 }
 
 // SetAffinityManager sets the affinity manager for cluster-wide affinity
@@ -195,7 +194,7 @@ func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 		health.IsHealthy = true
 		health.ConsecutiveFails = 0 // Reset consecutive failures
 		cm.healthMu.Unlock()
-		logger.Infof("[ConnectionManager] Auto-recovered backend %s after 1 minute", backend)
+		logger.Info("ConnectionManager: Auto-recovered backend after 1 minute", "backend", backend)
 		return true
 	}
 
@@ -224,7 +223,7 @@ func (cm *ConnectionManager) RecordConnectionSuccess(backend string) {
 	health.IsHealthy = true
 
 	if wasUnhealthy {
-		logger.Infof("[ConnectionManager] Backend %s recovered (consecutive failures reset)", backend)
+		logger.Info("ConnectionManager: Backend recovered (consecutive failures reset)", "backend", backend)
 	}
 }
 
@@ -244,7 +243,7 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 			ConsecutiveFails: 1,
 		}
 		cm.backendHealth[backend] = health
-		logger.Warnf("[ConnectionManager] Backend %s marked unhealthy after first failure", backend)
+		logger.Warn("ConnectionManager: Backend marked unhealthy after first failure", "backend", backend)
 		return true
 	}
 
@@ -257,7 +256,7 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 	if health.ConsecutiveFails >= 3 {
 		health.IsHealthy = false
 		if wasHealthy {
-			logger.Warnf("[ConnectionManager] Backend %s marked unhealthy after %d consecutive failures", backend, health.ConsecutiveFails)
+			logger.Warn("ConnectionManager: Backend marked unhealthy after consecutive failures", "backend", backend, "count", health.ConsecutiveFails)
 			return true // Just became unhealthy
 		}
 	}
@@ -341,7 +340,7 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 
 		// Mark as unhealthy if connection failed (legacy tracking)
 		cm.markUnhealthy(addr)
-		log.Printf("[ConnectionManager] Failed to connect to %s: %v", addr, err)
+		logger.Debug("Failed to connect to backend", "addr", addr, "error", err)
 	}
 
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
@@ -365,12 +364,12 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 	if isInList && !cm.isHealthy(preferredAddr) {
 		if isPrelookupRoute {
 			// Prelookup routes are definitive; if the server is unhealthy, we fail hard.
-			log.Printf("[ConnectionManager] Prelookup-designated server %s is marked as unhealthy. NOT falling back to round-robin.", preferredAddr)
+			logger.Debug("ConnectionManager: Prelookup-designated server is marked as unhealthy. NOT falling back to round-robin.", "server", preferredAddr)
 			err = fmt.Errorf("prelookup-designated server %s is marked as unhealthy", preferredAddr)
 			return nil, "", err, false // No fallback
 		}
 		// For affinity, if the server is unhealthy, we just fall back to round-robin.
-		log.Printf("[ConnectionManager] Preferred (affinity) server %s is marked as unhealthy. Falling back to round-robin.", preferredAddr)
+		logger.Debug("ConnectionManager: Preferred (affinity) server is marked as unhealthy. Falling back to round-robin.", "server", preferredAddr)
 		return nil, "", nil, true // Fallback
 	}
 
@@ -392,13 +391,13 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	if isPrelookupRoute {
 		// For prelookup routes, do NOT fall back to round-robin.
-		log.Printf("[ConnectionManager] Failed to connect to prelookup-designated server %s: %v. NOT falling back to round-robin.", preferredAddr, err)
+		logger.Debug("ConnectionManager: Failed to connect to prelookup-designated server. NOT falling back to round-robin.", "server", preferredAddr, "error", err)
 		err = fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
 		return nil, "", err, false // No fallback
 	}
 
 	// For affinity-based connections, log the failure and indicate that we should fall back.
-	log.Printf("[ConnectionManager] Failed to connect to preferred address %s: %v. Falling back to round-robin.", preferredAddr, err)
+	logger.Debug("ConnectionManager: Failed to connect to preferred address. Falling back to round-robin.", "addr", preferredAddr, "error", err)
 	return nil, "", err, true // Fallback
 }
 
@@ -464,10 +463,10 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	// Resolve the address to ensure proper IPv6 formatting
 	resolvedAddr := cm.resolveAddress(addr)
 	if resolvedAddr != addr {
-		log.Printf("[ConnectionManager] Resolved %s to %s", addr, resolvedAddr)
+		logger.Debug("ConnectionManager: Resolved address", "addr", addr, "resolved", resolvedAddr)
 	}
 
-	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", resolvedAddr)
+	logger.Debug("Attempting to connect to backend", "addr", resolvedAddr)
 
 	var conn net.Conn
 	var err error
@@ -492,13 +491,12 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	}
 
 	if err != nil {
-		log.Printf("[ConnectionManager] Failed to connect to %s: %v", resolvedAddr, err)
+		logger.Debug("ConnectionManager: Failed to connect", "addr", resolvedAddr, "error", err)
 		return nil, err
 	}
 
 	// Log the actual local and remote addresses of the established connection
-	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
-		resolvedAddr, conn.LocalAddr(), conn.RemoteAddr())
+	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
 
 	return conn, nil
 }
@@ -535,20 +533,19 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Resolve the address to ensure proper IPv6 formatting
 	resolvedAddr := cm.resolveAddress(addr)
 	if resolvedAddr != addr {
-		log.Printf("[ConnectionManager] Resolved %s to %s", addr, resolvedAddr)
+		logger.Debug("ConnectionManager: Resolved address", "addr", addr, "resolved", resolvedAddr)
 	}
 
-	log.Printf("[ConnectionManager] Attempting to connect to backend: %s", resolvedAddr)
+	logger.Debug("Attempting to connect to backend", "addr", resolvedAddr)
 
 	// Always establish plain TCP connection first
 	conn, err := dialer.DialContext(ctx, "tcp", resolvedAddr)
 	if err != nil {
-		log.Printf("[ConnectionManager] Failed to connect to %s: %v", resolvedAddr, err)
+		logger.Debug("ConnectionManager: Failed to connect", "addr", resolvedAddr, "error", err)
 		return nil, err
 	}
 
-	log.Printf("[ConnectionManager] Connected to %s - Local: %s -> Remote: %s",
-		resolvedAddr, conn.LocalAddr(), conn.RemoteAddr())
+	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
 
 	// Determine effective settings for this connection.
 	// Default to the connection manager's global settings.
@@ -564,15 +561,14 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		remoteTLS = routingInfo.RemoteTLS
 		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
 		remoteTLSVerify = routingInfo.RemoteTLSVerify
-		log.Printf("[ConnectionManager] Using prelookup settings for %s: remoteTLS=%t, remoteTLSUseStartTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, useProxyProtocol)
+		logger.Debug("Using prelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	} else {
-		log.Printf("[ConnectionManager] Using global settings for %s: remoteTLS=%t, remoteTLSUseStartTLS=%t, remoteTLSVerify=%t, useProxyProtocol=%t", addr, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, useProxyProtocol)
+		logger.Debug("Using global settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	}
 
 	// If we have client IP information and PROXY protocol is enabled, send PROXY protocol header
 	if useProxyProtocol && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
-		log.Printf("[ConnectionManager] Sending PROXY v2 header: client=%s:%d -> server=%s:%d",
-			clientIP, clientPort, serverIP, serverPort)
+		logger.Debug("ConnectionManager: Sending PROXY v2 header", "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
 
 		// Extract JA4 fingerprint and session ID from routingInfo if available
 		var ja4Fingerprint, proxySessionID string
@@ -584,26 +580,25 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 					fingerprint, err := ja4Conn.GetJA4Fingerprint()
 					if err == nil && fingerprint != "" {
 						ja4Fingerprint = fingerprint
-						log.Printf("[ConnectionManager] Extracted JA4 fingerprint for PROXY v2 TLV: %s", fingerprint)
+						logger.Debug("ConnectionManager: Extracted JA4 fingerprint for PROXY v2 TLV", "ja4", fingerprint)
 					}
 				}
 			}
 			// Extract proxy session ID for end-to-end tracing
 			if routingInfo.ProxySessionID != "" {
 				proxySessionID = routingInfo.ProxySessionID
-				log.Printf("[ConnectionManager] Including proxy session ID in PROXY v2 TLV: %s", proxySessionID)
+				logger.Debug("ConnectionManager: Including proxy session ID in PROXY v2 TLV", "session_id", proxySessionID)
 			}
 		}
 
 		err = cm.writeProxyV2HeaderWithTLVs(conn, clientIP, clientPort, serverIP, serverPort, ja4Fingerprint, proxySessionID)
 		if err != nil {
 			conn.Close()
-			log.Printf("[ConnectionManager] Failed to send PROXY protocol header to %s: %v", addr, err)
+			logger.Debug("ConnectionManager: Failed to send PROXY protocol header", "addr", addr, "error", err)
 			return nil, fmt.Errorf("failed to send PROXY protocol header: %w", err)
 		}
 	} else if useProxyProtocol {
-		log.Printf("[ConnectionManager] PROXY protocol enabled but not sent (missing client/server info): client=%s:%d server=%s:%d",
-			clientIP, clientPort, serverIP, serverPort)
+		logger.Debug("ConnectionManager: PROXY protocol enabled but not sent (missing client/server info)", "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
 	}
 
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
@@ -620,27 +615,27 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			// Disable renegotiation (not supported in TLS 1.3, causes errors)
 			Renegotiation: tls.RenegotiateNever,
 		}
-		log.Printf("[ConnectionManager] Starting TLS handshake to %s (InsecureSkipVerify=%t)", addr, !remoteTLSVerify)
+		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify)
 		tlsConn := tls.Client(conn, tlsConfig)
 
 		// Set a deadline for the TLS handshake
 		if err := conn.SetDeadline(time.Now().Add(cm.connectTimeout)); err != nil {
 			conn.Close()
-			log.Printf("[ConnectionManager] Failed to set TLS handshake deadline for %s: %v", addr, err)
+			logger.Debug("ConnectionManager: Failed to set TLS handshake deadline", "addr", addr, "error", err)
 			return nil, fmt.Errorf("failed to set TLS deadline: %w", err)
 		}
 
 		err = tlsConn.Handshake()
 		if err != nil {
 			conn.Close()
-			log.Printf("[ConnectionManager] TLS handshake failed for %s: %v", addr, err)
-			log.Printf("[ConnectionManager] TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
+			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err)
+			logger.Debug("ConnectionManager: TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
 
 		// Clear the deadline after successful handshake
 		if err := conn.SetDeadline(time.Time{}); err != nil {
-			log.Printf("[ConnectionManager] Warning: failed to clear TLS deadline for %s: %v", addr, err)
+			logger.Debug("ConnectionManager: Warning: failed to clear TLS deadline", "addr", addr, "error", err)
 		}
 
 		return tlsConn, nil
@@ -657,11 +652,11 @@ func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP 
 		tlvs = make(map[byte][]byte)
 		if ja4Fingerprint != "" {
 			tlvs[0xE0] = []byte(ja4Fingerprint) // TLVTypeJA4Fingerprint
-			log.Printf("[PROXY] Including JA4 fingerprint in PROXY v2 TLV: %s", ja4Fingerprint)
+			logger.Debug("PROXY: Including JA4 fingerprint in PROXY v2 TLV", "ja4", ja4Fingerprint)
 		}
 		if proxySessionID != "" {
 			tlvs[0xE1] = []byte(proxySessionID) // TLVTypeProxySessionID
-			log.Printf("[PROXY] Including proxy session ID in PROXY v2 TLV: %s", proxySessionID)
+			logger.Debug("PROXY: Including proxy session ID in PROXY v2 TLV", "session_id", proxySessionID)
 		}
 	}
 
@@ -748,11 +743,9 @@ func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP 
 	}
 
 	if ja4Fingerprint != "" {
-		log.Printf("[PROXY] Sent PROXY v2 header with JA4 TLV to backend %s: client=%s:%d -> server=%s:%d, ja4=%s",
-			conn.RemoteAddr(), clientIP, clientPort, serverIP, serverPort, ja4Fingerprint)
+		logger.Debug("PROXY: Sent PROXY v2 header with JA4 TLV to backend", "backend", conn.RemoteAddr().String(), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort, "ja4", ja4Fingerprint)
 	} else {
-		log.Printf("[PROXY] Sent PROXY v2 header to backend %s: client=%s:%d -> server=%s:%d",
-			conn.RemoteAddr(), clientIP, clientPort, serverIP, serverPort)
+		logger.Debug("PROXY: Sent PROXY v2 header to backend", "backend", conn.RemoteAddr().String(), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
 	}
 
 	return nil
@@ -880,14 +873,14 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		result.RoutingInfo, lookupErr = params.ConnManager.LookupUserRoute(routingCtx, params.Username)
 		routingCancel()
 		if lookupErr != nil {
-			log.Printf("[%s] Routing lookup failed for %s: %v, falling back to affinity", params.ProxyName, params.Username, lookupErr)
+			logger.Debug("Routing lookup failed, falling back to affinity", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
 		}
 	}
 
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
 		// Use server address from routing info
 		result.PreferredAddr = result.RoutingInfo.ServerAddress
-		log.Printf("[%s] Using routing lookup for %s: server_address=%s", params.ProxyName, params.Username, result.PreferredAddr)
+		logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
 		result.RoutingMethod = "prelookup"
 		result.IsPrelookupRoute = true
 	}
@@ -902,9 +895,9 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 				if params.ConnManager.IsBackendHealthy(lastAddr) {
 					result.PreferredAddr = lastAddr
 					result.RoutingMethod = "affinity"
-					logger.Infof("[%s] Using cluster affinity for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+					logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", result.PreferredAddr)
 				} else {
-					logger.Infof("[%s] Cluster affinity backend %s for %s is unhealthy, deleting affinity", params.ProxyName, lastAddr, params.Username)
+					logger.Info("Cluster affinity backend unhealthy - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username)
 					// Delete unhealthy affinity
 					affinityMgr.DeleteBackend(params.Username, params.Protocol)
 				}
@@ -917,11 +910,11 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		if backend := params.ConnManager.GetBackendByConsistentHash(params.Username); backend != "" {
 			result.PreferredAddr = backend
 			result.RoutingMethod = "consistent_hash"
-			logger.Infof("[%s] Using consistent hash for %s: %s", params.ProxyName, params.Username, result.PreferredAddr)
+			logger.Info("Using consistent hash", "proxy", params.ProxyName, "user", params.Username, "backend", result.PreferredAddr)
 		} else {
 			// All backends unhealthy in consistent hash, fall back to round-robin
 			result.RoutingMethod = "roundrobin"
-			logger.Infof("[%s] All consistent hash backends unhealthy for %s, falling back to round-robin", params.ProxyName, params.Username)
+			logger.Info("All consistent hash backends unhealthy - falling back to round-robin", "proxy", params.ProxyName, "user", params.Username)
 		}
 	}
 
@@ -958,32 +951,29 @@ func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, 
 			// User connected to different backend than consistent hash suggests
 			// This means failover occurred - set affinity to track this
 			affinityMgr.SetBackend(params.Username, connectedBackend, params.Protocol)
-			logger.Infof("[%s] Set failover affinity for %s: %s (consistent hash: %s)",
-				params.ProxyName, params.Username, connectedBackend, consistentHashBackend)
+			logger.Info("Set failover affinity", "proxy", params.ProxyName, "user", params.Username,
+				"backend", connectedBackend, "consistent_hash", consistentHashBackend)
 		} else {
 			// User on consistent hash backend - no affinity needed (deterministic)
-			logger.Debugf("[%s] User %s on consistent hash backend %s, no affinity needed",
-				params.ProxyName, params.Username, connectedBackend)
+			logger.Debug("Connection manager: User on consistent hash backend - no affinity needed", "proxy", params.ProxyName, "user", params.Username, "backend", connectedBackend)
 		}
 	} else if currentBackend != connectedBackend {
 		// Affinity exists but we connected to a different backend
 		if wasAffinityRoute {
 			// We tried to use affinity but ended up on different backend (another failover)
 			affinityMgr.UpdateBackend(params.Username, currentBackend, connectedBackend, params.Protocol)
-			logger.Infof("[%s] Updated affinity for %s after failover: %s → %s", params.ProxyName, params.Username, currentBackend, connectedBackend)
+			logger.Info("Updated affinity after failover", "proxy", params.ProxyName, "user", params.Username, "old", currentBackend, "new", connectedBackend)
 		} else {
 			// We used consistent hash but affinity exists pointing elsewhere
 			// Check if we're back on consistent hash backend - if so, clear affinity
 			if connectedBackend == consistentHashBackend {
 				// User is back on consistent hash backend, clear affinity
 				affinityMgr.DeleteBackend(params.Username, params.Protocol)
-				logger.Infof("[%s] Cleared affinity for %s: reconnected to consistent hash backend %s",
-					params.ProxyName, params.Username, connectedBackend)
+				logger.Info("Cleared affinity - reconnected to consistent hash backend", "proxy", params.ProxyName, "user", params.Username, "backend", connectedBackend)
 			} else {
 				// Connected to different backend via consistent hash, keep existing affinity
 				// This can happen if consistent hash changed (backend added/removed)
-				logger.Infof("[%s] Affinity exists for %s: %s (connected via consistent hash to %s, keeping affinity)",
-					params.ProxyName, params.Username, currentBackend, connectedBackend)
+				logger.Info("Affinity exists - keeping affinity", "proxy", params.ProxyName, "user", params.Username, "affinity", currentBackend, "connected", connectedBackend)
 			}
 		}
 	} else {
@@ -991,8 +981,7 @@ func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, 
 		if connectedBackend == consistentHashBackend {
 			// User is back on consistent hash backend, clear affinity
 			affinityMgr.DeleteBackend(params.Username, params.Protocol)
-			logger.Infof("[%s] Cleared affinity for %s: back on consistent hash backend %s",
-				params.ProxyName, params.Username, connectedBackend)
+			logger.Info("Cleared affinity - back on consistent hash backend", "proxy", params.ProxyName, "user", params.Username, "backend", connectedBackend)
 		}
 		// Otherwise keep affinity (still in failover state)
 	}

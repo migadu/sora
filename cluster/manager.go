@@ -89,7 +89,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		meta:    []byte(nodeID),
 		manager: m,
 	}
-	logger.Infof("Cluster delegate created: %p", m.delegate)
+	logger.Info("Cluster delegate created", "delegate", fmt.Sprintf("%p", m.delegate))
 
 	// Configure memberlist
 	mlConfig := memberlist.DefaultLANConfig()
@@ -104,26 +104,26 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 
 	// Warn if both addr contains port AND port field is set (port field will be ignored)
 	if cfg.Addr != "" && strings.Contains(cfg.Addr, ":") && cfg.Port > 0 {
-		logger.Warnf("Cluster configuration: 'addr' contains port (%s) and 'port' field is also set (%d)", cfg.Addr, cfg.Port)
-		logger.Warnf("The port from 'addr' (%d) will be used, and 'port' field (%d) will be ignored", bindPort, cfg.Port)
-		logger.Warnf("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
+		logger.Warn("Cluster configuration: 'addr' contains port and 'port' field is also set", "addr", cfg.Addr, "port", cfg.Port)
+		logger.Warn("The port from 'addr' will be used - 'port' field will be ignored", "addr_port", bindPort, "port_field", cfg.Port)
+		logger.Warn("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
 	}
 
 	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost hostname
 	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" || bindAddr == "localhost" {
-		logger.Errorf("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
-		logger.Errorf("Current value: '%s' is not valid for cluster gossip", bindAddr)
-		logger.Errorf("The gossip protocol requires advertising a real IP address that other nodes can reach")
-		logger.Errorf("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
-		logger.Errorf("Cannot use: 0.0.0.0, localhost, or ::")
+		logger.Error("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
+		logger.Error("Current value is not valid for cluster gossip", "addr", bindAddr)
+		logger.Error("The gossip protocol requires advertising a real IP address that other nodes can reach")
+		logger.Error("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
+		logger.Error("Cannot use: 0.0.0.0, localhost, or ::")
 		cancel()
 		return nil, fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes", bindAddr)
 	}
 
 	// Warn about loopback addresses (allowed for testing but not recommended for production)
 	if bindAddr == "127.0.0.1" || bindAddr == "::1" {
-		logger.Warnf("Cluster mode: Using loopback address '%s' - this only works for single-machine testing", bindAddr)
-		logger.Warnf("For production clusters across multiple machines, use a real network IP address")
+		logger.Warn("Cluster mode: Using loopback address - this only works for single-machine testing", "addr", bindAddr)
+		logger.Warn("For production clusters across multiple machines, use a real network IP address")
 	}
 
 	// Use bind address as advertise address (they should be the same)
@@ -131,9 +131,8 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	mlConfig.AdvertisePort = bindPort
 
 	// Log memberlist configuration
-	logger.Infof("Memberlist config: Name=%s, BindAddr=%s, BindPort=%d, AdvertiseAddr=%s, AdvertisePort=%d, GossipInterval=%v, GossipNodes=%d",
-		mlConfig.Name, mlConfig.BindAddr, mlConfig.BindPort, mlConfig.AdvertiseAddr, mlConfig.AdvertisePort, mlConfig.GossipInterval, mlConfig.GossipNodes)
-	logger.Infof("Cluster delegate attached to memberlist config: %p", mlConfig.Delegate)
+	logger.Info("Memberlist config", "name", mlConfig.Name, "bind_addr", mlConfig.BindAddr, "bind_port", mlConfig.BindPort, "advertise_addr", mlConfig.AdvertiseAddr, "advertise_port", mlConfig.AdvertisePort, "gossip_interval", mlConfig.GossipInterval, "gossip_nodes", mlConfig.GossipNodes)
+	logger.Info("Cluster delegate attached to memberlist config", "delegate", fmt.Sprintf("%p", mlConfig.Delegate))
 
 	// Enable more verbose memberlist logging to debug gossip
 	mlConfig.LogOutput = &memberlistLogger{prefix: "[Memberlist] "}
@@ -150,14 +149,13 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 			return nil, fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(keyBytes))
 		}
 		mlConfig.SecretKey = keyBytes
-		logger.Infof("Cluster encryption enabled with secret key")
+		logger.Info("Cluster encryption enabled with secret key")
 	} else {
 		logger.Warn("Cluster encryption disabled - secret_key not configured (NOT recommended for production)")
 	}
 
 	// Create memberlist
-	logger.Infof("Creating memberlist with config: node=%s, bind=%s:%d, delegate=%p",
-		mlConfig.Name, mlConfig.BindAddr, mlConfig.BindPort, mlConfig.Delegate)
+	logger.Info("Creating memberlist with config", "node", mlConfig.Name, "bind_addr", mlConfig.BindAddr, "bind_port", mlConfig.BindPort, "delegate", fmt.Sprintf("%p", mlConfig.Delegate))
 	ml, err := memberlist.Create(mlConfig)
 	if err != nil {
 		cancel()
@@ -165,44 +163,44 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	}
 
 	m.memberlist = ml
-	logger.Infof("Memberlist created successfully, instance=%p", ml)
+	logger.Info("Memberlist created successfully", "instance", fmt.Sprintf("%p", ml))
 
 	// Filter out self-references from peers list
 	// A node should never list itself in the peers array as this causes gossip issues
-	logger.Infof("Filtering peers: nodeID='%s', configured peers=%v", nodeID, cfg.Peers)
+	logger.Info("Filtering peers", "node_id", nodeID, "configured_peers", cfg.Peers)
 	filteredPeers := make([]string, 0, len(cfg.Peers))
 	selfReferenceFound := false
 	for _, peer := range cfg.Peers {
-		logger.Infof("Checking peer '%s' against nodeID '%s'", peer, nodeID)
+		logger.Info("Checking peer against nodeID", "peer", peer, "node_id", nodeID)
 		if peer == nodeID {
 			selfReferenceFound = true
-			logger.Warnf("Cluster configuration WARNING: node_id '%s' found in peers list - ignoring self-reference", nodeID)
-			logger.Warnf("The peers list should only contain OTHER nodes in the cluster, not this node itself")
+			logger.Warn("Cluster configuration: node_id found in peers list - ignoring self-reference", "node_id", nodeID)
+			logger.Warn("The peers list should only contain OTHER nodes in the cluster, not this node itself")
 		} else {
-			logger.Infof("Peer '%s' accepted (not self)", peer)
+			logger.Info("Peer accepted (not self)", "peer", peer)
 			filteredPeers = append(filteredPeers, peer)
 		}
 	}
-	logger.Infof("Peer filtering complete: %d peers remain: %v", len(filteredPeers), filteredPeers)
+	logger.Info("Peer filtering complete", "count", len(filteredPeers), "peers", filteredPeers)
 
 	// Join cluster if peers are specified (after filtering)
 	if len(filteredPeers) > 0 {
-		logger.Infof("Attempting to join cluster with peers: %v", filteredPeers)
+		logger.Info("Attempting to join cluster with peers", "peers", filteredPeers)
 		n, err := ml.Join(filteredPeers)
 		if err != nil {
-			logger.Warnf("Failed to join cluster peers %v: %v (will retry in background)", filteredPeers, err)
+			logger.Warn("Failed to join cluster peers (will retry in background)", "peers", filteredPeers, "error", err)
 		} else {
-			logger.Infof("Join returned: contacted %d peers from %v", n, filteredPeers)
+			logger.Info("Join returned - contacted peers", "count", n, "peers", filteredPeers)
 			// Check actual member count after join
 			actualMembers := ml.NumMembers()
-			logger.Infof("Cluster members after join: %d (expected 2+)", actualMembers)
+			logger.Info("Cluster members after join (expected 2+)", "members", actualMembers)
 			if actualMembers < 2 {
-				logger.Warnf("WARNING: Join succeeded but cluster only has %d member(s) - peer may have rejected us", actualMembers)
-				logger.Warnf("Common causes: encryption key mismatch, network issues, or peer not running")
+				logger.Warn("Join succeeded but cluster only has few members - peer may have rejected us", "members", actualMembers)
+				logger.Warn("Common causes: encryption key mismatch, network issues, or peer not running")
 			}
 		}
 	} else {
-		logger.Warnf("No peers to join - running as standalone single-node cluster")
+		logger.Warn("No peers to join - running as standalone single-node cluster")
 	}
 
 	// Start leader election loop
@@ -216,23 +214,20 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Start a test routine to verify GetBroadcasts is being called
 	go func() {
 		time.Sleep(5 * time.Second)
-		logger.Infof("[Cluster] Testing if GetBroadcasts is being called by memberlist...")
+		logger.Info("Cluster: Testing if GetBroadcasts is being called by memberlist")
 		for i := 0; i < 6; i++ {
 			time.Sleep(10 * time.Second)
 			m.connectionBroadcastMu.RLock()
 			broadcasterCount := len(m.connectionBroadcasts)
 			m.connectionBroadcastMu.RUnlock()
-			logger.Infof("[Cluster] After %d seconds: %d connection broadcasters registered, memberlist members=%d",
-				(i+1)*10, broadcasterCount, m.memberlist.NumMembers())
+			logger.Info("Cluster: Connection broadcasters status", "seconds", (i+1)*10, "broadcasters", broadcasterCount, "members", m.memberlist.NumMembers())
 		}
 	}()
 
 	if selfReferenceFound {
-		logger.Infof("Cluster manager started: node_id=%s, addr=%s, original_peers=%v, filtered_peers=%v",
-			nodeID, cfg.Addr, cfg.Peers, filteredPeers)
+		logger.Info("Cluster manager started", "node_id", nodeID, "addr", cfg.Addr, "original_peers", cfg.Peers, "filtered_peers", filteredPeers)
 	} else {
-		logger.Infof("Cluster manager started: node_id=%s, addr=%s, peers=%v",
-			nodeID, cfg.Addr, filteredPeers)
+		logger.Info("Cluster manager started", "node_id", nodeID, "addr", cfg.Addr, "peers", filteredPeers)
 	}
 
 	return m, nil
@@ -253,22 +248,21 @@ func (m *Manager) joinRetryLoop(peers []string) {
 		case <-ticker.C:
 			currentMembers := m.memberlist.NumMembers()
 			if currentMembers < expectedMembers {
-				logger.Infof("[Cluster] Retry join: have %d members, expected %d - attempting to rejoin %v",
-					currentMembers, expectedMembers, peers)
+				logger.Info("Cluster: Retry join - attempting to rejoin", "current", currentMembers, "expected", expectedMembers, "peers", peers)
 				n, err := m.memberlist.Join(peers)
 				if err != nil {
-					logger.Warnf("[Cluster] Retry join failed for %v: %v", peers, err)
+					logger.Warn("Cluster: Retry join failed", "peers", peers, "error", err)
 				} else {
 					newMembers := m.memberlist.NumMembers()
-					logger.Infof("[Cluster] Retry join contacted %d peers, now have %d members", n, newMembers)
+					logger.Info("Cluster: Retry join contacted peers", "contacted", n, "members", newMembers)
 					if newMembers >= expectedMembers {
-						logger.Infof("[Cluster] Successfully joined all peers - stopping retry loop")
+						logger.Info("Cluster: Successfully joined all peers - stopping retry loop")
 						return
 					}
 				}
 			} else {
 				// We have all expected members, stop retrying
-				logger.Debugf("[Cluster] Join retry: have %d/%d members - cluster complete", currentMembers, expectedMembers)
+				logger.Debug("Cluster: Join retry - cluster complete", "current", currentMembers, "expected", expectedMembers)
 				return
 			}
 		}
@@ -329,12 +323,11 @@ func (m *Manager) electLeader() {
 
 	// Log leadership changes
 	if oldLeader != newLeaderID {
-		logger.Infof("Cluster leader changed: %s -> %s (this node is leader: %v)",
-			oldLeader, newLeaderID, newIsLeader)
+		logger.Info("Cluster leader changed", "old", oldLeader, "new", newLeaderID, "is_leader", newIsLeader)
 	} else if !oldIsLeader && newIsLeader {
-		logger.Infof("This node became the cluster leader: %s", m.nodeID)
+		logger.Info("This node became the cluster leader", "node_id", m.nodeID)
 	} else if oldIsLeader && !newIsLeader {
-		logger.Infof("This node is no longer the cluster leader (new leader: %s)", newLeaderID)
+		logger.Info("This node is no longer the cluster leader", "new_leader", newLeaderID)
 	}
 
 	// Notify callbacks if leadership changed
@@ -410,7 +403,7 @@ func (m *Manager) RegisterConnectionHandler(handler func([]byte)) {
 	m.connectionMu.Lock()
 	defer m.connectionMu.Unlock()
 	m.connectionHandlers = append(m.connectionHandlers, handler)
-	logger.Infof("[Cluster] RegisterConnectionHandler: now have %d handlers", len(m.connectionHandlers))
+	logger.Info("Cluster: RegisterConnectionHandler", "handlers", len(m.connectionHandlers))
 }
 
 // notifyConnectionHandlers calls all registered connection handlers
@@ -421,7 +414,7 @@ func (m *Manager) notifyConnectionHandlers(data []byte) {
 	handlerCount := len(m.connectionHandlers)
 	m.connectionMu.RUnlock()
 
-	logger.Debugf("[Cluster] Notifying %d connection handlers with data (len=%d)", handlerCount, len(data))
+	logger.Debug("Cluster: Notifying connection handlers", "handlers", handlerCount, "data_len", len(data))
 
 	// Call handlers asynchronously to avoid blocking gossip receive
 	for _, handler := range handlers {
@@ -434,7 +427,7 @@ func (m *Manager) RegisterConnectionBroadcaster(broadcaster func(int, int) [][]b
 	m.connectionBroadcastMu.Lock()
 	defer m.connectionBroadcastMu.Unlock()
 	m.connectionBroadcasts = append(m.connectionBroadcasts, broadcaster)
-	logger.Debugf("[Cluster] RegisterConnectionBroadcaster: now have %d broadcasters", len(m.connectionBroadcasts))
+	logger.Debug("Cluster: RegisterConnectionBroadcaster", "count", len(m.connectionBroadcasts))
 }
 
 // getConnectionBroadcasts collects broadcasts from all registered connection broadcasters
@@ -445,14 +438,14 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 	broadcasterCount := len(m.connectionBroadcasts)
 	m.connectionBroadcastMu.RUnlock()
 
-	logger.Debugf("[Cluster] getConnectionBroadcasts called: %d broadcasters registered", broadcasterCount)
+	logger.Debug("Cluster: getConnectionBroadcasts called", "broadcasters", broadcasterCount)
 
 	var allBroadcasts [][]byte
 	totalSize := 0
 
 	for idx, broadcaster := range broadcasters {
 		broadcasts := broadcaster(overhead, limit-totalSize)
-		logger.Debugf("[Cluster] Broadcaster %d returned %d messages", idx, len(broadcasts))
+		logger.Debug("Cluster: Broadcaster returned messages", "idx", idx, "count", len(broadcasts))
 		for _, msg := range broadcasts {
 			// Add 'CN' magic marker to identify connection messages
 			marked := make([]byte, len(msg)+2)
@@ -462,7 +455,7 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 
 			msgSize := overhead + len(marked)
 			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-				logger.Debugf("[Cluster] Connection broadcast limit reached: returning %d messages", len(allBroadcasts))
+				logger.Debug("Cluster: Connection broadcast limit reached", "count", len(allBroadcasts))
 				return allBroadcasts
 			}
 
@@ -471,7 +464,7 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 		}
 	}
 
-	logger.Debugf("[Cluster] getConnectionBroadcasts returning %d total messages", len(allBroadcasts))
+	logger.Debug("Cluster: getConnectionBroadcasts returning messages", "total", len(allBroadcasts))
 	return allBroadcasts
 }
 
@@ -615,7 +608,7 @@ func (m *memberlistLogger) Write(p []byte) (n int, err error) {
 	if bytes.Contains(p, []byte("broadcasting")) ||
 		bytes.Contains(p, []byte("GetBroadcasts")) ||
 		bytes.Contains(p, []byte("gossip")) {
-		logger.Debugf("%s%s", m.prefix, msg)
+		logger.Debug("Cluster", "prefix", m.prefix, "msg", msg)
 	}
 	return len(p), nil
 }
@@ -648,33 +641,33 @@ func (d *clusterDelegate) NodeMeta(limit int) []byte {
 }
 
 func (d *clusterDelegate) NotifyMsg(msg []byte) {
-	logger.Debugf("[Cluster] NotifyMsg called with message (len=%d)", len(msg))
+	logger.Debug("Cluster: NotifyMsg called", "len", len(msg))
 
 	if len(msg) < 2 {
-		logger.Warnf("[Cluster] Received invalid message (len=%d)", len(msg))
+		logger.Warn("Cluster: Received invalid message", "len", len(msg))
 		return // Invalid message
 	}
 
 	// Check message type by magic marker
 	if msg[0] == 0x52 && msg[1] == 0x4C { // 'R' 'L' - Rate Limit
-		logger.Debugf("[Cluster] Received rate limit message (len=%d)", len(msg))
+		logger.Debug("Cluster: Received rate limit message", "len", len(msg))
 		// Strip marker and forward to rate limit handlers
 		d.manager.notifyRateLimitHandlers(msg[2:])
 	} else if msg[0] == 0x41 && msg[1] == 0x46 { // 'A' 'F' - Affinity
-		logger.Debugf("[Cluster] Received affinity message (len=%d)", len(msg))
+		logger.Debug("Cluster: Received affinity message", "len", len(msg))
 		// Strip marker and forward to affinity handlers
 		d.manager.notifyAffinityHandlers(msg[2:])
 	} else if msg[0] == 0x43 && msg[1] == 0x4E { // 'C' 'N' - Connection
-		logger.Debugf("[Cluster] Received connection tracking message (len=%d)", len(msg))
+		logger.Debug("Cluster: Received connection tracking message", "len", len(msg))
 		// Strip marker and forward to connection handlers
 		d.manager.notifyConnectionHandlers(msg[2:])
 	} else {
-		logger.Warnf("[Cluster] Received unknown message type: 0x%02x%02x (len=%d)", msg[0], msg[1], len(msg))
+		logger.Warn("Cluster: Received unknown message type", "type", fmt.Sprintf("0x%02x%02x", msg[0], msg[1]), "len", len(msg))
 	}
 }
 
 func (d *clusterDelegate) GetBroadcasts(overhead, limit int) [][]byte {
-	logger.Debugf("[Cluster] GetBroadcasts called by memberlist: overhead=%d, limit=%d", overhead, limit)
+	logger.Debug("Cluster: GetBroadcasts called by memberlist", "overhead", overhead, "limit", limit)
 
 	// Collect broadcasts from all registered broadcasters
 	var allBroadcasts [][]byte

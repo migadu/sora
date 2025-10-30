@@ -67,15 +67,15 @@ func (c *Collector) Start(ctx context.Context) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	logger.Infof("[METRICS-COLLECTOR] Started with interval %v", c.interval)
+	logger.Info("MetricsCollector started", "interval", c.interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Infof("[METRICS-COLLECTOR] Stopping due to context cancellation")
+			logger.Info("MetricsCollector stopping due to context cancellation")
 			return
 		case <-c.stopCh:
-			logger.Infof("[METRICS-COLLECTOR] Stopping due to stop signal")
+			logger.Info("MetricsCollector stopping due to stop signal")
 			return
 		case <-ticker.C:
 			c.collect(ctx)
@@ -92,7 +92,7 @@ func (c *Collector) Stop() {
 func (c *Collector) collect(ctx context.Context) {
 	stats, err := c.provider.GetMetricsStatsWithRetry(ctx)
 	if err != nil {
-		logger.Errorf("[METRICS-COLLECTOR] Error collecting metrics: %v", err)
+		logger.Error("MetricsCollector: error collecting metrics", "error", err)
 		return
 	}
 
@@ -103,19 +103,19 @@ func (c *Collector) collect(ctx context.Context) {
 	// Individual mailbox metrics would require more complex queries
 	// For now, we'll skip the per-mailbox metric
 
-	logger.Infof("[METRICS-COLLECTOR] Updated DB metrics: accounts=%d, mailboxes=%d, messages=%d",
-		stats.TotalAccounts, stats.TotalMailboxes, stats.TotalMessages)
+	logger.Info("MetricsCollector: updated DB metrics", "accounts", stats.TotalAccounts,
+		"mailboxes", stats.TotalMailboxes, "messages", stats.TotalMessages)
 
 	// Update cache metrics if cache provider is available
 	if c.cacheProvider != nil {
 		objectCount, totalSize, err := c.cacheProvider.GetStats()
 		if err != nil {
-			logger.Errorf("[METRICS-COLLECTOR] Error collecting cache metrics: %v", err)
+			logger.Error("MetricsCollector: error collecting cache metrics", "error", err)
 		} else {
 			CacheObjectsTotal.Set(float64(objectCount))
 			CacheSizeBytes.Set(float64(totalSize))
-			logger.Infof("[METRICS-COLLECTOR] Updated cache metrics: objects=%d, size_bytes=%d",
-				objectCount, totalSize)
+			logger.Info("MetricsCollector: updated cache metrics", "objects", objectCount,
+				"size_bytes", totalSize)
 		}
 	}
 }

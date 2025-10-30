@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"time"
 )
@@ -26,7 +26,7 @@ func ApplyAuthenticationDelay(ctx context.Context, limiter interface{}, remoteAd
 			ip = remoteAddr.String()
 		}
 
-		log.Printf("[%s-AUTH-DELAY] Applying %v delay for IP %s", protocol, delay, ip)
+		logger.Debug("Auth delay: Applying delay", "protocol", protocol, "delay", delay, "ip", ip)
 
 		// Use context-aware delay to allow cancellation
 		timer := time.NewTimer(delay)
@@ -35,10 +35,10 @@ func ApplyAuthenticationDelay(ctx context.Context, limiter interface{}, remoteAd
 		select {
 		case <-timer.C:
 			// Delay completed normally
-			log.Printf("[%s-AUTH-DELAY] Delay completed for IP %s", protocol, ip)
+			logger.Debug("Auth delay: Delay completed", "protocol", protocol, "ip", ip)
 		case <-ctx.Done():
 			// Context cancelled (connection closed, server shutdown, etc.)
-			log.Printf("[%s-AUTH-DELAY] Delay cancelled for IP %s: %v", protocol, ip, ctx.Err())
+			logger.Debug("Auth delay: Delay cancelled", "protocol", protocol, "ip", ip, "error", ctx.Err())
 			return
 		}
 	}

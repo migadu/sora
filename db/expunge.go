@@ -10,11 +10,11 @@ import (
 
 func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID int64, uids ...imap.UID) (int64, error) {
 	if len(uids) == 0 {
-		log.Printf("[DB] no UIDs to expunge for mailbox %d", mailboxID)
+		log.Printf("Database: no UIDs to expunge for mailbox %d", mailboxID)
 		return 0, nil
 	}
 
-	log.Printf("[DB] expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
+	log.Printf("Database: expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
 
 	var currentModSeq int64
 	var rowsAffected int64
@@ -30,10 +30,10 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 	`, mailboxID, uids).Scan(&rowsAffected, &currentModSeq)
 
 	if err != nil {
-		log.Printf("[DB] error executing expunge update: %v", err)
+		log.Printf("Database: error executing expunge update: %v", err)
 		return 0, err
 	}
 
-	log.Printf("[DB] successfully expunged %d messages from mailbox %d, current modseq: %d", rowsAffected, mailboxID, currentModSeq)
+	log.Printf("Database: successfully expunged %d messages from mailbox %d, current modseq: %d", rowsAffected, mailboxID, currentModSeq)
 	return currentModSeq, nil
 }

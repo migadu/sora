@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -34,10 +35,11 @@ func (w *LMTPProxyWrapper) Close() error {
 
 // LogCapture captures log output for verification
 type LogCapture struct {
-	buffer *bytes.Buffer
-	writer io.Writer
-	oldLog *log.Logger
-	oldOut io.Writer
+	buffer         *bytes.Buffer
+	writer         io.Writer
+	oldLog         *log.Logger
+	oldOut         io.Writer
+	oldSlogHandler *slog.Logger
 }
 
 func NewLogCapture() *LogCapture {
@@ -47,15 +49,24 @@ func NewLogCapture() *LogCapture {
 	// Save old settings
 	oldOut := log.Writer()
 	oldLog := log.New(oldOut, "", log.LstdFlags)
+	oldSlogHandler := slog.Default()
 
 	// Set new logger to capture output
 	log.SetOutput(writer)
 
+	// Set up slog to capture output at DEBUG level
+	handler := slog.NewTextHandler(writer, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})
+	newLogger := slog.New(handler)
+	slog.SetDefault(newLogger)
+
 	return &LogCapture{
-		buffer: buffer,
-		writer: writer,
-		oldLog: oldLog,
-		oldOut: oldOut,
+		buffer:         buffer,
+		writer:         writer,
+		oldLog:         oldLog,
+		oldOut:         oldOut,
+		oldSlogHandler: oldSlogHandler,
 	}
 }
 
@@ -64,7 +75,9 @@ func (lc *LogCapture) GetOutput() string {
 }
 
 func (lc *LogCapture) Close() {
+	// Restore original log settings
 	log.SetOutput(lc.oldOut)
+	slog.SetDefault(lc.oldSlogHandler)
 }
 
 // LMTPClient provides a simple LMTP client for testing
@@ -425,12 +438,9 @@ func TestLMTPProxyWithXCLIENT(t *testing.T) {
 	t.Logf("LMTP XCLIENT proxy test completed - proxy functionality verified")
 }
 
-// TestLMTPProxyXCLIENTShouldWork tests what XCLIENT behavior should be when go-smtp library is fixed
-// This test currently fails due to go-smtp library limitations but demonstrates expected behavior
+// TestLMTPProxyXCLIENTShouldWork tests XCLIENT behavior with the patched go-smtp library
+// This test verifies that XCLIENT forwarding works correctly after patching the go-smtp library
 func TestLMTPProxyXCLIENTShouldWork(t *testing.T) {
-	// This test demonstrates what XCLIENT behavior should be when go-smtp library is fixed
-	// Currently fails due to go-smtp library limitations - will pass when library is fixed
-
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Start capture to verify XCLIENT forwarding works
@@ -537,7 +547,7 @@ func TestLMTPProxyXCLIENTShouldWork(t *testing.T) {
 	}
 
 	// Verify XCLIENT success logging from proxy
-	if !strings.Contains(logOutput, "XCLIENT forwarding and session reset completed successfully") {
+	if !strings.Contains(logOutput, "XCLIENT and session reset completed") {
 		t.Errorf("Expected XCLIENT forwarding success message in logs")
 	}
 

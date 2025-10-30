@@ -3,7 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
-	"log"
+	"github.com/migadu/sora/logger"
 	"net"
 	"strconv"
 	"strings"
@@ -85,7 +85,7 @@ func normalizeHostPort(addr string, defaultPort int) string {
 				if _, pErr := strconv.Atoi(portPart); pErr == nil {
 					// This looks like a valid but malformed IPv6:port. Fix it.
 					fixedAddr := net.JoinHostPort(hostPart, portPart)
-					log.Printf("[Proxy] Corrected malformed IPv6 address '%s' to '%s'", addr, fixedAddr)
+					logger.Debug("Proxy: Corrected malformed IPv6 address", "original", addr, "corrected", fixedAddr)
 					return fixedAddr
 				}
 			}

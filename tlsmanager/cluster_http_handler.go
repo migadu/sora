@@ -39,8 +39,7 @@ func (h *ClusterHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		isLeader := h.clusterManager.IsLeader()
 		leaderID := h.clusterManager.GetLeaderID()
 
-		logger.Debugf("HTTP-01 challenge request received: %s (this node is leader: %v, leader: %s)",
-			r.URL.Path, isLeader, leaderID)
+		logger.Debug("HTTP-01 challenge request received", "path", r.URL.Path, "is_leader", isLeader, "leader", leaderID)
 
 		// Note: autocert.Manager's HTTPHandler already handles the challenge
 		// It retrieves the challenge token from the cache (S3)

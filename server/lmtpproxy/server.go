@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/migadu/sora/logger"
 	"io"
-	"log"
 	"net"
 	"os"
 	"sync"
@@ -112,7 +112,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
 	if !opts.TLS && opts.TLSUseStartTLS {
-		log.Printf("LMTP Proxy [%s] WARNING: tls_use_starttls=true is ignored because tls=false. Set tls=true to enable STARTTLS.", opts.Name)
+		logger.Debug("LMTP Proxy: WARNING - tls_use_starttls ignored because tls=false", "name", opts.Name)
 		// Force TLSUseStartTLS to false to avoid confusion
 		opts.TLSUseStartTLS = false
 	}
@@ -122,16 +122,16 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.PreLookup.Enabled {
 		prelookupClient, err := proxy.InitializePrelookup(opts.PreLookup)
 		if err != nil {
-			log.Printf("[LMTP Proxy %s] Failed to initialize prelookup client: %v", opts.Name, err)
+			logger.Debug("LMTP Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
 			if !opts.PreLookup.FallbackDefault {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
 			}
-			log.Printf("[LMTP Proxy %s] Continuing without prelookup due to fallback_to_default=true", opts.Name)
+			logger.Debug("LMTP Proxy: Continuing without prelookup - fallback enabled", "name", opts.Name)
 		} else {
 			routingLookup = prelookupClient
 			if opts.Debug {
-				log.Printf("[LMTP Proxy %s] Prelookup client initialized successfully", opts.Name)
+				logger.Debug("LMTP Proxy: Prelookup client initialized successfully", "name", opts.Name)
 			}
 		}
 	}
@@ -148,13 +148,13 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
-		log.Printf("[LMTP Proxy %s] Failed to resolve addresses: %v", opts.Name, err)
+		logger.Debug("LMTP Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
 	}
 
 	// Validate affinity stickiness
 	stickiness := opts.AffinityStickiness
 	if stickiness < 0.0 || stickiness > 1.0 {
-		log.Printf("WARNING: invalid LMTP proxy [%s] affinity_stickiness '%.2f': value must be between 0.0 and 1.0. Using default of 1.0.", opts.Name, stickiness)
+		logger.Debug("LMTP Proxy: WARNING - invalid affinity_stickiness, using default 1.0", "name", opts.Name, "value", stickiness)
 		stickiness = 1.0
 	}
 
@@ -162,7 +162,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	trustedNets, err := server.ParseTrustedNetworks(opts.TrustedProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
-		log.Printf("WARNING: failed to parse trusted networks for LMTP proxy (%v), using empty trusted networks (proxy connections will be restricted)", err)
+		logger.Debug("LMTP Proxy: WARNING - failed to parse trusted networks, proxy connections will be restricted", "error", err)
 		trustedNets = []*net.IPNet{}
 	}
 
@@ -310,7 +310,7 @@ func (s *Server) acceptConnections() error {
 			default:
 				// All Accept() errors are connection-level issues (TLS handshake failures, client disconnects, etc.)
 				// They should be logged but not crash the server - the listener itself is still healthy
-				log.Printf("[LMTP Proxy %s] Failed to accept connection: %v", s.name, err)
+				logger.Debug("LMTP Proxy: Failed to accept connection", "name", s.name, "error", err)
 				continue // Continue accepting other connections
 			}
 		}
@@ -327,20 +327,20 @@ func (s *Server) acceptConnections() error {
 			// Try to parse as string
 			host, _, err := net.SplitHostPort(remoteAddr.String())
 			if err != nil {
-				log.Printf("[LMTP Proxy %s] Connection rejected from %s: invalid address format", s.name, remoteAddr)
+				logger.Debug("LMTP Proxy: Connection rejected - invalid address format", "name", s.name, "remote", remoteAddr)
 				conn.Close()
 				continue
 			}
 			ip = net.ParseIP(host)
 			if ip == nil {
-				log.Printf("[LMTP Proxy %s] Connection rejected from %s: could not parse IP", s.name, remoteAddr)
+				logger.Debug("LMTP Proxy: Connection rejected - could not parse IP", "name", s.name, "remote", remoteAddr)
 				conn.Close()
 				continue
 			}
 		}
 
 		if !s.isFromTrustedNetwork(ip) {
-			log.Printf("[LMTP Proxy %s] Connection rejected from %s: not from trusted network", s.name, ip)
+			logger.Debug("LMTP Proxy: Connection rejected - not from trusted network", "name", s.name, "ip", ip)
 			conn.Close()
 			continue
 		}
@@ -350,7 +350,7 @@ func (s *Server) acceptConnections() error {
 		if s.limiter != nil {
 			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
 			if err != nil {
-				log.Printf("[LMTP Proxy %s] Connection rejected from %s: %v", s.name, ip, err)
+				logger.Debug("LMTP Proxy: Connection rejected", "name", s.name, "ip", ip, "error", err)
 				conn.Close()
 				continue // Try to accept the next connection
 			}
@@ -367,7 +367,7 @@ func (s *Server) acceptConnections() error {
 			}()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[LMTP Proxy %s] Session panic recovered: %v", s.name, r)
+					logger.Debug("LMTP Proxy: Session panic recovered", "name", s.name, "panic", r)
 					conn.Close()
 				}
 			}()
@@ -394,7 +394,7 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 
 // Stop stops the LMTP proxy server.
 func (s *Server) Stop() error {
-	log.Printf("LMTP Proxy [%s] stopping...", s.name)
+	logger.Debug("LMTP Proxy: Stopping", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {
@@ -419,17 +419,17 @@ func (s *Server) Stop() error {
 
 	select {
 	case <-done:
-		log.Printf("LMTP Proxy [%s] server stopped gracefully", s.name)
+		logger.Debug("LMTP Proxy: Server stopped gracefully", "name", s.name)
 	case <-time.After(30 * time.Second):
-		log.Printf("LMTP Proxy [%s] Server stop timeout", s.name)
+		logger.Debug("LMTP Proxy: Server stop timeout", "name", s.name)
 	}
 
 	// Close prelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			log.Printf("LMTP Proxy [%s] closing prelookup client...", s.name)
+			logger.Debug("LMTP Proxy: Closing prelookup client", "name", s.name)
 			if err := routingLookup.Close(); err != nil {
-				log.Printf("LMTP Proxy [%s] error closing prelookup client: %v", s.name, err)
+				logger.Debug("LMTP Proxy: Error closing prelookup client", "name", s.name, "error", err)
 			}
 		}
 	}

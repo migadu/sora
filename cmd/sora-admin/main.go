@@ -647,7 +647,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -763,7 +763,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -859,7 +859,7 @@ func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credenti
 		return err
 	}
 
-	logger.Infof("Created account with ID %d and %d credentials", accountID, len(credentials))
+	logger.Info("Created account", "account_id", accountID, "credentials", len(credentials))
 	return nil
 }
 
@@ -916,7 +916,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1158,7 +1158,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1385,7 +1385,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1467,7 +1467,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1573,7 +1573,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1673,7 +1673,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1751,7 +1751,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1862,7 +1862,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -1933,7 +1933,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -2076,7 +2076,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -2261,7 +2261,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -2377,7 +2377,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -2784,7 +2784,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3000,7 +3000,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3096,7 +3096,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3154,7 +3154,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3311,7 +3311,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3474,7 +3474,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults and command-line flags.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults and command-line flags", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
@@ -3703,7 +3703,7 @@ Examples:
 	if *showStats {
 		stats, err := rdb.GetAuthAttemptsStatsWithRetry(ctx, window)
 		if err != nil {
-			logger.Infof("Failed to get auth statistics: %v", err)
+			logger.Info("Failed to get auth statistics", "error", err)
 		} else {
 			fmt.Printf("Overall Statistics (last %s):\n", window)
 			fmt.Printf("  Total Attempts:     %v\n", stats["total_attempts"])
@@ -3720,7 +3720,7 @@ Examples:
 	if *showBlocked {
 		blocked, err := rdb.GetBlockedIPsWithRetry(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
 		if err != nil {
-			logger.Infof("Failed to get blocked IPs: %v", err)
+			logger.Info("Failed to get blocked IPs", "error", err)
 		} else {
 			if len(blocked) > 0 {
 				fmt.Printf("Currently Blocked (exceeding thresholds):\n")
@@ -3875,7 +3875,7 @@ Examples:
 		if isFlagSet(fs, "config") {
 			logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 		} else {
-			logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+			logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 		}
 	}
 
@@ -4274,7 +4274,7 @@ Examples:
 			if isFlagSet(fs, "config") {
 				logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
 			} else {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using defaults.", *configPath)
+				logger.Info("WARNING: Default configuration file not found - using defaults", "config", *configPath)
 			}
 		} else {
 			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)

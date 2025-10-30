@@ -453,7 +453,7 @@ Sora provides a comprehensive REST API for administration and monitoring:
 ```bash
 # Set your API key
 export API_KEY="your-api-key"
-export BASE_URL="http://localhost:8080/api/v1"
+export BASE_URL="http://localhost:8080/admin"
 
 # List accounts
 curl -H "Authorization: Bearer $API_KEY" $BASE_URL/accounts
@@ -545,7 +545,7 @@ Access health status via:
 
 Or via HTTP API:
 ```bash
-curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/api/v1/health/overview
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/adnin/health/overview
 ```
 
 ### Prometheus Metrics

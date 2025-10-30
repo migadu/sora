@@ -120,7 +120,7 @@ func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) e
 
 	metrics.RelayQueueOperations.WithLabelValues("enqueue", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
-	logger.Infof("[RelayQueue] Enqueued %s message id=%s from=%s to=%s", messageType, id, from, to)
+	logger.Info("RelayQueue: Enqueued message", "type", messageType, "id", id, "from", from, "to", to)
 	return nil
 }
 
@@ -150,7 +150,7 @@ func (q *DiskQueue) AcquireNext() (*QueuedMessage, []byte, error) {
 		metadataPath := filepath.Join(q.pendingDir, entry.Name())
 		var metadata QueuedMessage
 		if err := q.readMetadata(metadataPath, &metadata); err != nil {
-			logger.Errorf("[RelayQueue] Failed to read metadata %s: %v", entry.Name(), err)
+			logger.Error("RelayQueue: Failed to read metadata", "entry", entry.Name(), "error", err)
 			continue
 		}
 
@@ -164,7 +164,7 @@ func (q *DiskQueue) AcquireNext() (*QueuedMessage, []byte, error) {
 		messagePath := filepath.Join(q.pendingDir, messageID+".msg")
 		messageBytes, err := os.ReadFile(messagePath)
 		if err != nil {
-			logger.Errorf("[RelayQueue] Failed to read message %s: %v", messageID, err)
+			logger.Error("RelayQueue: Failed to read message", "message_id", messageID, "error", err)
 			continue
 		}
 
@@ -174,7 +174,7 @@ func (q *DiskQueue) AcquireNext() (*QueuedMessage, []byte, error) {
 
 		// Move metadata
 		if err := os.Rename(metadataPath, processingMetadataPath); err != nil {
-			logger.Errorf("[RelayQueue] Failed to move metadata to processing: %v", err)
+			logger.Error("RelayQueue: Failed to move metadata to processing", "error", err)
 			continue
 		}
 
@@ -182,7 +182,7 @@ func (q *DiskQueue) AcquireNext() (*QueuedMessage, []byte, error) {
 		if err := os.Rename(messagePath, processingMessagePath); err != nil {
 			// Try to move metadata back
 			os.Rename(processingMetadataPath, metadataPath)
-			logger.Errorf("[RelayQueue] Failed to move message to processing: %v", err)
+			logger.Error("RelayQueue: Failed to move message to processing", "error", err)
 			continue
 		}
 
@@ -219,7 +219,7 @@ func (q *DiskQueue) MarkSuccess(messageID string) error {
 
 	metrics.RelayQueueOperations.WithLabelValues("mark_success", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("mark_success").Observe(time.Since(start).Seconds())
-	logger.Infof("[RelayQueue] Successfully delivered message id=%s", messageID)
+	logger.Info("RelayQueue: Successfully delivered message", "id", messageID)
 	return nil
 }
 
@@ -247,7 +247,7 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 
 	// Check if max attempts exceeded
 	if metadata.Attempts >= q.maxAttempts {
-		logger.Errorf("[RelayQueue] Message id=%s exceeded max attempts (%d), moving to failed", messageID, q.maxAttempts)
+		logger.Error("RelayQueue: Message exceeded max attempts, moving to failed", "id", messageID, "max_attempts", q.maxAttempts)
 
 		// Move to failed directory
 		failedMetadataPath := filepath.Join(q.failedDir, messageID+".json")
@@ -279,8 +279,9 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 	}
 	metadata.NextRetry = time.Now().Add(q.retryBackoff[backoffIndex])
 
-	logger.Infof("[RelayQueue] Message id=%s delivery failed (attempt %d/%d), retry at %s: %s",
-		messageID, metadata.Attempts, q.maxAttempts, metadata.NextRetry.Format(time.RFC3339), errorMsg)
+	logger.Info("RelayQueue: Message delivery failed", "id", messageID,
+		"attempt", metadata.Attempts, "max_attempts", q.maxAttempts,
+		"retry_at", metadata.NextRetry.Format(time.RFC3339), "error", errorMsg)
 
 	// Move back to pending directory for retry
 	pendingMetadataPath := filepath.Join(q.pendingDir, messageID+".json")

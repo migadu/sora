@@ -186,7 +186,7 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet) ([]Message, error) {
 	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
-		log.Printf("[DB] SeqSet includes all messages (1:*) for mailbox %d", mailboxID)
+		log.Printf("Database: SeqSet includes all messages (1:*) for mailbox %d", mailboxID)
 		return db.fetchAllActiveMessagesRaw(ctx, mailboxID)
 	}
 
@@ -270,7 +270,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 
 		// If deserialization failed or data was empty, create a safe default
 		if bodyStructure == nil {
-			log.Printf("[DB] WARNING: UID %d has invalid or empty body_structure, using default", msg.UID)
+			log.Printf("Database: WARNING - UID %d has invalid or empty body_structure, using default", msg.UID)
 			defaultBS := &imap.BodyStructureSinglePart{
 				Type:    "text",
 				Subtype: "plain",
@@ -280,7 +280,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 			bodyStructure = &bs
 		}
 		if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-			log.Printf("[DB] ERROR: failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))
+			log.Printf("Database: ERROR - failed unmarshalling custom_flags for UID %d: %v. JSON: %s", msg.UID, err, string(customFlagsJSON))
 		}
 		msg.RecipientsJSON = recipientsJSON
 		msg.BodyStructure = *bodyStructure

@@ -135,8 +135,8 @@ func main() {
 	logger.Println(" ▝▀▚▖▐▌ ▐▌▐▛▀▚▖▐▛▀▜▌ ")
 	logger.Println("▗▄▄▞▘▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌ ")
 	logger.Println("")
-	logger.Infof("SORA application starting (version %s, commit: %s, built: %s)", version, commit, date)
-	logger.Infof("Logging format: %s, level: %s", cfg.Logging.Format, cfg.Logging.Level)
+	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
+	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
 
 	// Set up context and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,7 +146,7 @@ func main() {
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-signalChan
-		logger.Infof("Received signal: %s, shutting down...", sig)
+		logger.Info("Received signal - shutting down", "signal", sig)
 		cancel()
 	}()
 
@@ -191,7 +191,7 @@ func main() {
 	case <-ctx.Done():
 		errorHandler.Shutdown(ctx)
 		// Wait for all servers to finish shutting down gracefully before releasing resources
-		logger.Infof("Waiting for all servers to stop gracefully...")
+		logger.Info("Waiting for all servers to stop gracefully")
 
 		// Wait for server functions to return (listeners closed, Serve() calls returned)
 		done := make(chan struct{})
@@ -202,16 +202,16 @@ func main() {
 
 		select {
 		case <-done:
-			logger.Infof("All server listeners closed")
+			logger.Info("All server listeners closed")
 		case <-time.After(10 * time.Second):
 			logger.Warn("Server shutdown timeout reached after 10 seconds")
 		}
 
 		// Give additional time for connection goroutines to finish and release database resources
 		// This ensures advisory locks are released and no goroutines are accessing the database
-		logger.Infof("Waiting for active connections to finish...")
+		logger.Info("Waiting for active connections to finish")
 		time.Sleep(3 * time.Second)
-		logger.Infof("Shutdown grace period complete, releasing database resources...")
+		logger.Info("Shutdown grace period complete - releasing database resources")
 	case err := <-errChan:
 		errorHandler.FatalError("server operation", err)
 		os.Exit(errorHandler.WaitForExit())
@@ -225,7 +225,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
 			if configPath == "config.toml" {
-				logger.Infof("WARNING: default configuration file '%s' not found. Using application defaults.", configPath)
+				logger.Info("Default configuration file not found - using application defaults", "path", configPath)
 			} else {
 				// User specified a config file that doesn't exist - that's an error
 				errorHandler.ConfigError(configPath, err)
@@ -236,7 +236,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 			os.Exit(errorHandler.WaitForExit())
 		}
 	} else {
-		logger.Infof("loaded configuration from %s", configPath)
+		logger.Info("Loaded configuration", "path", configPath)
 	}
 
 	// Get all configured servers
@@ -274,7 +274,7 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
-	logger.Infof("Found %d configured servers", len(allServers))
+	logger.Info("Found configured servers", "count", len(allServers))
 }
 
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
@@ -312,7 +312,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.ValidationError("S3 endpoint", fmt.Errorf("S3 endpoint not specified"))
 			os.Exit(errorHandler.WaitForExit())
 		}
-		logger.Infof("Connecting to S3 endpoint '%s', bucket '%s'", s3EndpointToUse, cfg.S3.Bucket)
+		logger.Info("Connecting to S3", "endpoint", s3EndpointToUse, "bucket", cfg.S3.Bucket)
 		var err error
 		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug())
 		if err != nil {
@@ -330,18 +330,18 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	}
 
 	// Initialize the resilient database with runtime failover
-	logger.Infof("Connecting to database with resilient failover configuration")
+	logger.Info("Connecting to database with resilient failover configuration")
 	var err error
 	deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 	if err != nil {
-		logger.Infof("Failed to initialize resilient database: %v", err)
+		logger.Info("Failed to initialize resilient database", "error", err)
 		os.Exit(1)
 	}
 
 	// Start the new aggregated metrics and health monitoring for all managed pools
 	deps.resilientDB.StartPoolMetrics(ctx)
 	deps.resilientDB.StartPoolHealthMonitoring(ctx)
-	logger.Infof("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+	logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
 
 	// Initialize authentication cache if enabled
 	if cfg.AuthCache.Enabled {
@@ -349,33 +349,32 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		positiveTTL, err := time.ParseDuration(cfg.AuthCache.PositiveTTL)
 		if err != nil {
-			logger.Errorf("Invalid auth_cache.positive_ttl: %v, using default 30s", err)
+			logger.Error("Invalid auth_cache.positive_ttl - using default 30s", "error", err)
 			positiveTTL = 30 * time.Second
 		}
 
 		negativeTTL, err := time.ParseDuration(cfg.AuthCache.NegativeTTL)
 		if err != nil {
-			logger.Errorf("Invalid auth_cache.negative_ttl: %v, using default 5m", err)
+			logger.Error("Invalid auth_cache.negative_ttl - using default 5m", "error", err)
 			negativeTTL = 5 * time.Minute
 		}
 
 		cleanupInterval, err := time.ParseDuration(cfg.AuthCache.CleanupInterval)
 		if err != nil {
-			logger.Errorf("Invalid auth_cache.cleanup_interval: %v, using default 5m", err)
+			logger.Error("Invalid auth_cache.cleanup_interval - using default 5m", "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
 
 		authCache := authcache.New(positiveTTL, negativeTTL, cfg.AuthCache.MaxSize, cleanupInterval)
 		deps.resilientDB.SetAuthCache(authCache)
 
-		logger.Infof("Authentication cache enabled: positive_ttl=%s, negative_ttl=%s, max_size=%d",
-			positiveTTL, negativeTTL, cfg.AuthCache.MaxSize)
+		logger.Info("Authentication cache enabled", "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", cfg.AuthCache.MaxSize)
 	} else {
 		logger.Info("Authentication cache is disabled")
 	}
 
 	// Initialize health monitoring
-	logger.Infof("Initializing health monitoring...")
+	logger.Info("Initializing health monitoring")
 	deps.healthIntegration = health.NewHealthIntegration(deps.resilientDB)
 
 	if storageServicesNeeded {
@@ -443,7 +442,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		metricsInterval := cfg.LocalCache.GetMetricsIntervalWithDefault()
 		metricsRetention := cfg.LocalCache.GetMetricsRetentionWithDefault()
 
-		logger.Infof("[CACHE] starting metrics collection with interval: %v", metricsInterval)
+		logger.Info("Cache: Starting metrics collection", "interval", metricsInterval)
 		go func() {
 			metricsTicker := time.NewTicker(metricsInterval)
 			cleanupTicker := time.NewTicker(24 * time.Hour)
@@ -459,13 +458,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					uptimeSeconds := int64(time.Since(metrics.StartTime).Seconds())
 
 					if err := deps.resilientDB.StoreCacheMetricsWithRetry(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
-						logger.Infof("[CACHE] WARNING: failed to store metrics: %v", err)
+						logger.Info("Cache: Failed to store metrics", "error", err)
 					}
 				case <-cleanupTicker.C:
 					if deleted, err := deps.resilientDB.CleanupOldCacheMetricsWithRetry(ctx, metricsRetention); err != nil {
-						logger.Infof("[CACHE] WARNING: failed to cleanup old metrics: %v", err)
+						logger.Info("Cache: Failed to cleanup old metrics", "error", err)
 					} else if deleted > 0 {
-						logger.Infof("[CACHE] cleaned up %d old cache metrics records", deleted)
+						logger.Info("Cache: Cleaned up old metrics records", "count", deleted)
 					}
 				}
 			}
@@ -485,7 +484,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Start error listener for cleanup worker
 		go func() {
 			for err := range cleanupErrChan {
-				logger.Errorf("Cleanup worker error: %v", err)
+				logger.Error("Cleanup worker error", "error", err)
 			}
 		}()
 
@@ -506,7 +505,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Start error listener for upload worker
 		go func() {
 			for err := range uploadErrChan {
-				logger.Errorf("Upload worker error: %v", err)
+				logger.Error("Upload worker error", "error", err)
 			}
 		}()
 
@@ -525,13 +524,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Parse configuration
 		backoff, err := cfg.Relay.Queue.GetRetryBackoff()
 		if err != nil {
-			logger.Warnf("Invalid relay queue backoff configuration, using defaults: %v", err)
+			logger.Warn("Invalid relay queue backoff configuration - using defaults", "error", err)
 			backoff = nil // Will use defaults in NewDiskQueue
 		}
 
 		workerInterval, err := cfg.Relay.Queue.GetWorkerInterval()
 		if err != nil {
-			logger.Warnf("Invalid relay queue worker interval, using default (1m): %v", err)
+			logger.Warn("Invalid relay queue worker interval - using default (1m)", "error", err)
 			workerInterval = 1 * time.Minute
 		}
 
@@ -547,8 +546,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 
-		logger.Infof("Relay queue initialized: path=%s, max_attempts=%d",
-			queuePath, cfg.Relay.Queue.MaxAttempts)
+		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", cfg.Relay.Queue.MaxAttempts)
 
 		// Create relay handler from global relay config if configured
 		if cfg.Relay.IsConfigured() {
@@ -586,8 +584,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Infof("Relay handler configured: type=smtp, host=%s, tls=%v, starttls=%v, circuit_breaker=enabled (threshold=%d, timeout=%s, max_requests=%d)",
-					cfg.Relay.SMTPHost, cfg.Relay.SMTPTLS, cfg.Relay.SMTPUseStartTLS, cbThreshold, cbTimeout, cbMaxRequests)
+				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "tls", cfg.Relay.SMTPTLS, "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			} else if cfg.Relay.IsHTTP() {
 				relayType = "http"
 				relayHandler = delivery.NewRelayHandlerFromConfig(
@@ -604,8 +601,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Infof("Relay handler configured: type=http, url=%s, circuit_breaker=enabled (threshold=%d, timeout=%s, max_requests=%d)",
-					cfg.Relay.HTTPURL, cbThreshold, cbTimeout, cbMaxRequests)
+				logger.Info("Relay handler configured: type=http", "url", cfg.Relay.HTTPURL, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			}
 
 			if relayHandler != nil {
@@ -624,7 +620,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				// Start error listener
 				go func() {
 					for err := range errCh {
-						logger.Errorf("Relay worker error: %v", err)
+						logger.Error("Relay worker error", "error", err)
 					}
 				}()
 
@@ -642,8 +638,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					os.Exit(errorHandler.WaitForExit())
 				}
 
-				logger.Infof("Relay worker started: interval=%s, batch_size=%d, concurrency=%d",
-					workerInterval, batchSize, concurrency)
+				logger.Info("Relay worker started", "interval", workerInterval, "batch_size", batchSize, "concurrency", concurrency)
 
 				// Register relay queue health check
 				deps.healthIntegration.RegisterRelayQueueCheck(deps.relayQueue)
@@ -671,37 +666,34 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize cluster manager if enabled
 	if cfg.Cluster.Enabled {
-		logger.Infof("Initializing cluster manager")
+		logger.Info("Initializing cluster manager")
 		deps.clusterManager, err = cluster.New(cfg.Cluster)
 		if err != nil {
 			errorHandler.FatalError("initialize cluster manager", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		logger.Infof("Cluster manager initialized: node_id=%s, members=%d, leader=%s",
-			deps.clusterManager.GetNodeID(),
-			deps.clusterManager.GetMemberCount(),
-			deps.clusterManager.GetLeaderID())
+		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
 		// Initialize affinity manager for cluster-wide user-to-backend affinity
 		// Default TTL: 1 hour, Cleanup interval: 10 minutes
 		deps.affinityManager = serverPkg.NewAffinityManager(deps.clusterManager, true, 1*time.Hour, 10*time.Minute)
-		logger.Infof("Affinity manager initialized for cluster-wide user routing")
+		logger.Info("Affinity manager initialized for cluster-wide user routing")
 	}
 
 	// Initialize TLS manager if TLS is enabled
 	if cfg.TLS.Enabled {
-		logger.Infof("Initializing TLS manager with provider: %s", cfg.TLS.Provider)
+		logger.Info("Initializing TLS manager", "provider", cfg.TLS.Provider)
 		deps.tlsManager, err = tlsmanager.New(cfg.TLS, deps.clusterManager)
 		if err != nil {
 			errorHandler.FatalError("initialize TLS manager", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		logger.Infof("TLS manager initialized successfully")
+		logger.Info("TLS manager initialized successfully")
 	}
 
 	// Start health monitoring
 	deps.healthIntegration.Start(ctx)
-	logger.Infof("Health monitoring started - collecting metrics every 30-60 seconds")
+	logger.Info("Health monitoring started - collecting metrics every 30-60 seconds")
 
 	// Start metrics collector for database statistics
 	deps.metricsCollector = metrics.NewCollector(deps.resilientDB, 60*time.Second)
@@ -720,7 +712,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		handler := deps.tlsManager.HTTPHandler()
 		if handler != nil {
 			go func() {
-				logger.Infof("Starting HTTP-01 challenge server on :80 for Let's Encrypt")
+				logger.Info("Starting HTTP-01 challenge server on :80 for Let's Encrypt")
 				httpServer := &http.Server{
 					Addr:    ":80",
 					Handler: handler,
@@ -747,7 +739,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	// Start all configured servers dynamically
 	for _, server := range allServers {
 		// Warn about unused config options
-		server.WarnUnusedConfigOptions(logger.Infof)
+		server.WarnUnusedConfigOptions(func(format string, args ...interface{}) { logger.Info(fmt.Sprintf(format, args...)) })
 
 		switch server.Type {
 		case "imap":
@@ -783,7 +775,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		case "user_api_proxy":
 			go startDynamicUserAPIProxyServer(ctx, deps, server, errChan)
 		default:
-			logger.Infof("WARNING: Unknown server type '%s' for server '%s', skipping", server.Type, server.Name)
+			logger.Info("Unknown server type - skipping", "type", server.Type, "name", server.Name)
 		}
 	}
 
@@ -795,7 +787,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
 	if clusterMgr == nil {
-		logger.Debugf("%s Proxy [%s] Connection tracking disabled (requires cluster mode).", protocol, serverName)
+		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
 		return nil
 	}
 
@@ -807,8 +799,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		maxEventQueueSize = clusterCfg.GetMaxEventQueueSize()
 	}
 
-	logger.Infof("%s Proxy [%s] Starting gossip connection tracker: instance=%s, max_per_user=%d",
-		protocol, serverName, instanceID, maxConnectionsPerUser)
+	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser)
 
 	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxEventQueueSize)
 	if tracker != nil {
@@ -835,28 +826,28 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Parse search rate limit window
 	searchRateLimitWindow, err := serverConfig.GetSearchRateLimitWindow()
 	if err != nil {
-		logger.Infof("IMAP [%s] Invalid search rate limit window: %v, using default (1 minute)", serverConfig.Name, err)
+		logger.Info("IMAP: Invalid search rate limit window - using default (1 minute)", "name", serverConfig.Name, "error", err)
 		searchRateLimitWindow = time.Minute
 	}
 
 	// Parse session memory limit
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Infof("IMAP [%s] Invalid session memory limit: %v, using default (100MB)", serverConfig.Name, err)
+		logger.Info("IMAP: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
 	// Parse command timeout
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("IMAP [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		logger.Info("IMAP: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		commandTimeout = 5 * time.Minute
 	}
 
 	// Parse absolute session timeout
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("IMAP [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("IMAP: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -937,7 +928,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	maxMessageSize, err := serverConfig.GetMaxMessageSize()
 	if err != nil {
-		logger.Infof("LMTP [%s] Invalid max_message_size: %v, using default (50MB)",
+		logger.Info("LMTP: Invalid max_message_size - using default (50MB)", "name",
 			serverConfig.Name, err)
 		maxMessageSize = 50 * 1024 * 1024
 	}
@@ -976,9 +967,9 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down LMTP server %s...", serverConfig.Name)
+		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
 		if err := lmtpServer.Close(); err != nil {
-			logger.Infof("Error closing LMTP server: %v", err)
+			logger.Info("Error closing LMTP server", "error", err)
 		}
 	}()
 
@@ -998,14 +989,14 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Infof("POP3 [%s] Invalid session memory limit: %v, using default (100MB)",
+		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name",
 			serverConfig.Name, err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("POP3 [%s] Invalid command timeout: %v, using default (2 minutes)",
+		logger.Info("POP3: Invalid command timeout - using default (2 minutes)", "name",
 			serverConfig.Name, err)
 		commandTimeout = 2 * time.Minute
 	}
@@ -1013,7 +1004,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	// Parse absolute session timeout
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("POP3 [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("POP3: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -1059,7 +1050,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down POP3 server %s...", serverConfig.Name)
+		logger.Info("Shutting down POP3 server", "name", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -1081,7 +1072,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("ManageSieve [%s] Invalid command timeout: %v, using default (3 minutes)",
+		logger.Info("ManageSieve: Invalid command timeout - using default (3 minutes)", "name",
 			serverConfig.Name, err)
 		commandTimeout = 3 * time.Minute
 	}
@@ -1089,7 +1080,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	// Parse absolute session timeout
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("ManageSieve [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("ManageSieve: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -1147,7 +1138,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down ManageSieve server %s...", serverConfig.Name)
+		logger.Info("Shutting down ManageSieve server", "name", serverConfig.Name)
 		s.Close()
 	}()
 
@@ -1168,11 +1159,11 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down metrics server %s...", serverConfig.Name)
+		logger.Info("Shutting down metrics server", "name", serverConfig.Name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Infof("Error shutting down metrics server: %v", err)
+			logger.Info("Error shutting down metrics server", "error", err)
 		}
 	}()
 
@@ -1202,13 +1193,13 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("IMAP proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		logger.Info("IMAP proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		commandTimeout = 5 * time.Minute
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("IMAP proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("IMAP proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -1259,14 +1250,14 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
 		if deps.affinityManager != nil {
 			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Infof("IMAP Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+			logger.Info("IMAP Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
 		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Infof("Registered prelookup health check for IMAP proxy %s", serverConfig.Name)
+				logger.Info("Registered prelookup health check for IMAP proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1279,7 +1270,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down IMAP proxy server %s...", serverConfig.Name)
+		logger.Info("Shutting down IMAP proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1309,13 +1300,13 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("POP3 proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		logger.Info("POP3 proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		commandTimeout = 5 * time.Minute
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("POP3 proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("POP3 proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -1365,14 +1356,14 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
 		if deps.affinityManager != nil {
 			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Infof("POP3 Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+			logger.Info("POP3 Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
 		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Infof("Registered prelookup health check for POP3 proxy %s", serverConfig.Name)
+				logger.Info("Registered prelookup health check for POP3 proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1385,7 +1376,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down POP3 proxy server %s...", serverConfig.Name)
+		logger.Info("Shutting down POP3 proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1413,13 +1404,13 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Infof("ManageSieve proxy [%s] Invalid command timeout: %v, using default (5 minutes)", serverConfig.Name, err)
+		logger.Info("ManageSieve proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		commandTimeout = 5 * time.Minute
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
-		logger.Infof("ManageSieve proxy [%s] Invalid absolute session timeout: %v, using default (30 minutes)", serverConfig.Name, err)
+		logger.Info("ManageSieve proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
@@ -1473,14 +1464,14 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
 		if deps.affinityManager != nil {
 			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Infof("ManageSieve Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+			logger.Info("ManageSieve Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
 		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Infof("Registered prelookup health check for ManageSieve proxy %s", serverConfig.Name)
+				logger.Info("Registered prelookup health check for ManageSieve proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1493,7 +1484,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down ManageSieve proxy server %s...", serverConfig.Name)
+		logger.Info("Shutting down ManageSieve proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1556,14 +1547,14 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
 		if deps.affinityManager != nil {
 			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Infof("LMTP Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+			logger.Info("LMTP Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
 		// Register prelookup health check if prelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
 			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
 				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Infof("Registered prelookup health check for LMTP proxy %s", serverConfig.Name)
+				logger.Info("Registered prelookup health check for LMTP proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1576,7 +1567,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down LMTP proxy server %s...", serverConfig.Name)
+		logger.Info("Shutting down LMTP proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1588,7 +1579,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	defer deps.serverManager.Done()
 
 	if serverConfig.APIKey == "" {
-		logger.Infof("WARNING: HTTP Admin API server '%s' enabled but no API key configured, skipping", serverConfig.Name)
+		logger.Info("HTTP Admin API server enabled but no API key configured - skipping", "name", serverConfig.Name)
 		return
 	}
 
@@ -1650,7 +1641,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 	defer deps.serverManager.Done()
 
 	if serverConfig.JWTSecret == "" {
-		logger.Infof("WARNING: HTTP User API server '%s' enabled but no JWT secret configured, skipping", serverConfig.Name)
+		logger.Info("HTTP User API server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
 	}
 
@@ -1660,7 +1651,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		if dur, err := time.ParseDuration(serverConfig.TokenDuration); err == nil {
 			tokenDuration = dur
 		} else {
-			logger.Infof("WARNING: Invalid token_duration '%s' for HTTP User API server '%s', using default 24h", serverConfig.TokenDuration, serverConfig.Name)
+			logger.Info("Invalid token_duration for HTTP User API server - using default 24h", "duration", serverConfig.TokenDuration, "name", serverConfig.Name)
 		}
 	}
 
@@ -1698,7 +1689,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	defer deps.serverManager.Done()
 
 	if serverConfig.JWTSecret == "" {
-		logger.Infof("WARNING: User API proxy server '%s' enabled but no JWT secret configured, skipping", serverConfig.Name)
+		logger.Info("User API proxy server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
 	}
 
@@ -1746,13 +1737,13 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	if connMgr := server.GetConnectionManager(); connMgr != nil {
 		if deps.affinityManager != nil {
 			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Infof("User API Proxy [%s] Affinity manager attached to connection manager", serverConfig.Name)
+			logger.Info("User API Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 	}
 
 	go func() {
 		<-ctx.Done()
-		logger.Infof("Shutting down User API proxy server %s...", serverConfig.Name)
+		logger.Info("Shutting down User API proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
 
@@ -1765,5 +1756,5 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 type serverLogger struct{}
 
 func (l *serverLogger) Log(format string, args ...interface{}) {
-	logger.Infof(format, args...)
+	logger.Info(fmt.Sprintf(format, args...))
 }

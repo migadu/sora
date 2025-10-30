@@ -84,8 +84,8 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 	// Start broadcast routine
 	go crl.broadcastRoutine()
 
-	logger.Infof("[%s-CLUSTER-LIMITER] Initialized cluster rate limiting: blocks=%v, failure_counts=%v",
-		limiter.protocol, syncBlocks, syncFailureCounts)
+	logger.Info("CLUSTER-LIMITER: initialized cluster rate limiting", "protocol", limiter.protocol,
+		"sync_blocks", syncBlocks, "sync_failure_counts", syncFailureCounts)
 
 	return crl
 }
@@ -168,7 +168,7 @@ func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
 	for i := 0; i < len(crl.broadcastQueue); i++ {
 		encoded, err := encodeRateLimitEvent(crl.broadcastQueue[i])
 		if err != nil {
-			logger.Warnf("[CLUSTER-LIMITER] Failed to encode rate limit event: %v", err)
+			logger.Warn("Cluster limiter: Failed to encode rate limit event", "error", err)
 			continue
 		}
 
@@ -193,7 +193,7 @@ func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
 func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 	event, err := decodeRateLimitEvent(data)
 	if err != nil {
-		logger.Warnf("[CLUSTER-LIMITER] Failed to decode rate limit event: %v", err)
+		logger.Warn("Cluster limiter: Failed to decode rate limit event", "error", err)
 		return
 	}
 
@@ -205,7 +205,7 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
 	if age > 5*time.Minute {
-		logger.Debugf("[CLUSTER-LIMITER] Ignoring stale rate limit event from %s (age: %v)", event.NodeID, age)
+		logger.Debug("Cluster limiter: Ignoring stale rate limit event", "node_id", event.NodeID, "age", age)
 		return
 	}
 
@@ -217,7 +217,7 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 	case RateLimitEventFailureCount:
 		crl.handleFailureCount(event)
 	default:
-		logger.Warnf("[CLUSTER-LIMITER] Unknown rate limit event type: %s", event.Type)
+		logger.Warn("Cluster limiter: Unknown rate limit event type", "type", event.Type)
 	}
 }
 
@@ -229,7 +229,7 @@ func (crl *ClusterRateLimiter) handleBlockIP(event RateLimitEvent) {
 
 	// Check if block is still valid (not expired)
 	if time.Now().After(event.BlockedUntil) {
-		logger.Debugf("[CLUSTER-LIMITER] Ignoring expired block for IP %s from node %s", event.IP, event.NodeID)
+		logger.Debug("Cluster limiter: Ignoring expired block", "ip", event.IP, "from_node", event.NodeID)
 		return
 	}
 
@@ -239,7 +239,7 @@ func (crl *ClusterRateLimiter) handleBlockIP(event RateLimitEvent) {
 	// Check if we already have a more recent block for this IP
 	existing, exists := crl.limiter.blockedIPs[event.IP]
 	if exists && existing.BlockedUntil.After(event.BlockedUntil) {
-		logger.Debugf("[CLUSTER-LIMITER] Ignoring older block for IP %s from node %s", event.IP, event.NodeID)
+		logger.Debug("Cluster limiter: Ignoring older block", "ip", event.IP, "from_node", event.NodeID)
 		return
 	}
 
@@ -252,8 +252,8 @@ func (crl *ClusterRateLimiter) handleBlockIP(event RateLimitEvent) {
 		Protocol:     event.Protocol,
 	}
 
-	logger.Infof("[%s-CLUSTER-LIMITER] Applied cluster block for IP %s from node %s (until %v, %d failures)",
-		crl.limiter.protocol, event.IP, event.NodeID, event.BlockedUntil, event.FailureCount)
+	logger.Info("CLUSTER-LIMITER: Applied cluster block for IP", "protocol", crl.limiter.protocol,
+		"ip", event.IP, "node", event.NodeID, "until", event.BlockedUntil, "failures", event.FailureCount)
 }
 
 // handleUnblockIP removes an IP block from another node
@@ -267,8 +267,7 @@ func (crl *ClusterRateLimiter) handleUnblockIP(event RateLimitEvent) {
 
 	if _, exists := crl.limiter.blockedIPs[event.IP]; exists {
 		delete(crl.limiter.blockedIPs, event.IP)
-		logger.Debugf("[%s-CLUSTER-LIMITER] Applied cluster unblock for IP %s from node %s",
-			crl.limiter.protocol, event.IP, event.NodeID)
+		logger.Debug("Cluster limiter: Applied cluster unblock", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID)
 	}
 }
 
@@ -295,8 +294,7 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 		LastDelay:    event.LastDelay,
 	}
 
-	logger.Debugf("[%s-CLUSTER-LIMITER] Updated failure count for IP %s from node %s: %d failures, delay %v",
-		crl.limiter.protocol, event.IP, event.NodeID, event.FailureCount, event.LastDelay)
+	logger.Debug("Cluster limiter: Updated failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID, "failures", event.FailureCount, "delay", event.LastDelay)
 }
 
 // broadcastRoutine periodically triggers broadcasts
@@ -315,7 +313,7 @@ func (crl *ClusterRateLimiter) broadcastRoutine() {
 
 			if hasEvents {
 				// Cluster manager will call GetBroadcasts()
-				logger.Debugf("[CLUSTER-LIMITER] Triggering broadcast of %d queued events", len(crl.broadcastQueue))
+				logger.Debug("Cluster limiter: Triggering broadcast", "queued_events", len(crl.broadcastQueue))
 			}
 
 		case <-crl.stopBroadcast:
