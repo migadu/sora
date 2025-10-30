@@ -46,13 +46,36 @@ func ParseLine(line string, hasTag bool) (tag, command string, args []string, er
 
 		var arg string
 		if rem[0] == '"' {
-			// Quoted string
-			end := strings.Index(rem[1:], `"`)
-			if end == -1 {
+			// Quoted string - find closing quote, respecting escape sequences
+			// RFC 3501: quoted-specials = DQUOTE / "\"
+			// Characters inside quotes can be escaped with backslash
+			i := 1
+			escaped := false
+			found := false
+			for i < len(rem) {
+				if escaped {
+					// Previous character was backslash, skip this character
+					escaped = false
+					i++
+					continue
+				}
+				if rem[i] == '\\' {
+					escaped = true
+					i++
+					continue
+				}
+				if rem[i] == '"' {
+					// Found unescaped closing quote
+					arg = rem[:i+1]
+					rem = rem[i+1:]
+					found = true
+					break
+				}
+				i++
+			}
+			if !found {
 				return tag, command, nil, fmt.Errorf("unclosed quote in command arguments")
 			}
-			arg = rem[:end+2]
-			rem = rem[end+2:]
 		} else {
 			// Atom
 			end := strings.Index(rem, " ")
@@ -70,10 +93,35 @@ func ParseLine(line string, hasTag bool) (tag, command string, args []string, er
 	return tag, command, args, nil
 }
 
-// UnquoteString removes surrounding double quotes from a string if present.
+// UnquoteString removes surrounding double quotes from a string if present
+// and processes escape sequences according to RFC 3501.
+// RFC 3501: quoted-specials = DQUOTE / "\"
+// Inside quoted strings, backslash is used to escape double-quote and backslash itself.
 func UnquoteString(str string) string {
-	if len(str) >= 2 && str[0] == '"' && str[len(str)-1] == '"' {
-		return str[1 : len(str)-1]
+	if len(str) < 2 || str[0] != '"' || str[len(str)-1] != '"' {
+		return str
 	}
-	return str
+
+	// Remove surrounding quotes
+	inner := str[1 : len(str)-1]
+
+	// Process escape sequences
+	var result strings.Builder
+	result.Grow(len(inner)) // Pre-allocate to avoid reallocations
+	escaped := false
+	for i := 0; i < len(inner); i++ {
+		if escaped {
+			// Previous character was backslash, add this character literally
+			result.WriteByte(inner[i])
+			escaped = false
+		} else if inner[i] == '\\' {
+			// Start escape sequence
+			escaped = true
+		} else {
+			// Regular character
+			result.WriteByte(inner[i])
+		}
+	}
+
+	return result.String()
 }
