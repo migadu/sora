@@ -51,6 +51,7 @@ type BackoffConfig struct {
 	Multiplier      float64
 	Jitter          bool
 	MaxRetries      int
+	OperationName   string // Optional: name of the operation being retried (for logging context)
 }
 
 func DefaultBackoffConfig() BackoffConfig {
@@ -164,10 +165,18 @@ func WithRetryAdvanced(ctx context.Context, fn RetryableFunc, config BackoffConf
 			if IsStopError(err) {
 				var stopErr StopError
 				errors.As(err, &stopErr)
-				logger.Info("RetryDebug: StopError detected - stopping retries", "attempt", attempts, "error", stopErr.Err)
+				if config.OperationName != "" {
+					logger.Debug("Retry: non-retryable error - stopping", "operation", config.OperationName, "attempt", attempts, "error", stopErr.Err)
+				} else {
+					logger.Debug("Retry: non-retryable error - stopping", "attempt", attempts, "error", stopErr.Err)
+				}
 				return stopErr.Err
 			}
-			logger.Info("RetryDebug: Error on attempt", "attempt", attempts, "max", config.MaxRetries+1, "error", err)
+			if config.OperationName != "" {
+				logger.Debug("Retry: error on attempt - will retry", "operation", config.OperationName, "attempt", attempts, "max", config.MaxRetries+1, "error", err)
+			} else {
+				logger.Debug("Retry: error on attempt - will retry", "attempt", attempts, "max", config.MaxRetries+1, "error", err)
+			}
 			if attempt < config.MaxRetries {
 				continue
 			}

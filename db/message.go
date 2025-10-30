@@ -354,7 +354,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64
 	for _, mailboxName := range mailboxNames {
 		mailbox, err := db.GetMailboxByName(ctx, userID, mailboxName)
 		if err != nil {
-			log.Printf("[WARMUP] failed to get mailbox '%s' for user %d: %v", mailboxName, userID, err)
+			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, userID, err)
 			continue // Skip this mailbox if not found
 		}
 
@@ -371,7 +371,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64
 		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria)
 		if err != nil {
 
-			log.Printf("[WARMUP] failed to get recent messages for mailbox '%s': %v", mailboxName, err)
+			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)
 			continue
 		}
 
@@ -388,7 +388,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64
 
 		if len(contentHashes) > 0 {
 			result[mailboxName] = contentHashes
-			log.Printf("[WARMUP] prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
+			log.Printf("WarmUp: prepared %d content hashes for mailbox '%s'", len(contentHashes), mailboxName)
 		}
 	}
 

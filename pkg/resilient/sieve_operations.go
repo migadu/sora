@@ -16,6 +16,7 @@ var sieveReadRetryConfig = retry.BackoffConfig{
 	Multiplier:      1.5,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_sieve_read",
 }
 
 var sieveWriteRetryConfig = retry.BackoffConfig{
@@ -24,6 +25,7 @@ var sieveWriteRetryConfig = retry.BackoffConfig{
 	Multiplier:      2.0,
 	Jitter:          true,
 	MaxRetries:      2,
+	OperationName:   "db_sieve_write",
 }
 
 // GetUserScriptsWithRetry retrieves all Sieve scripts for a user with retry logic

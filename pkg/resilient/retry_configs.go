@@ -13,6 +13,7 @@ var readRetryConfig = retry.BackoffConfig{
 	Multiplier:      1.8,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_read",
 }
 
 // writeRetryConfig provides a default retry strategy for write operations.
@@ -22,6 +23,7 @@ var writeRetryConfig = retry.BackoffConfig{
 	Multiplier:      1.8,
 	Jitter:          true,
 	MaxRetries:      2, // Writes are less safe to retry automatically
+	OperationName:   "db_write",
 }
 
 // cleanupRetryConfig provides a default retry strategy for background cleanup tasks.
@@ -31,6 +33,7 @@ var cleanupRetryConfig = retry.BackoffConfig{
 	Multiplier:      2.0,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_cleanup",
 }
 
 // apiRetryConfig provides a default retry strategy for HTTP API handlers.
@@ -40,4 +43,5 @@ var apiRetryConfig = retry.BackoffConfig{
 	Multiplier:      1.8,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_api",
 }

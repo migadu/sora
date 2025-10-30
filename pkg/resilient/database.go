@@ -390,6 +390,7 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "db_query",
 	}
 
 	var rows pgx.Rows
@@ -459,6 +460,7 @@ func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, 
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "db_query_row",
 	}
 	return &resilientRow{ctx: ctx, rd: rd, sql: sql, args: args, config: config}
 }
@@ -471,6 +473,7 @@ func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      2, // Writes are less safe to retry.
+		OperationName:   "db_exec",
 	}
 
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
@@ -491,6 +494,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      2,
+		OperationName:   "db_begin_tx",
 	}
 
 	var tx pgx.Tx
@@ -527,6 +531,7 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		Multiplier:      1.5,
 		Jitter:          true,
 		MaxRetries:      2,
+		OperationName:   "db_update_password",
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(ctx, tx, address, newHashedPassword)
@@ -600,6 +605,7 @@ var importExportRetryConfig = retry.BackoffConfig{
 	Multiplier:      2.0,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_import_export",
 }
 
 func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, userID, mailboxID int64, hash string) (int64, error) {
@@ -630,6 +636,7 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 		Multiplier:      1.5,
 		Jitter:          true,
 		MaxRetries:      2,
+		OperationName:   "db_store_health_status",
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(ctx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)

@@ -101,6 +101,7 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      4,
+		OperationName:   "s3_get",
 	}
 
 	op := func() (interface{}, error) {
@@ -123,6 +124,7 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "s3_put",
 	}
 
 	op := func() (interface{}, error) {
@@ -139,6 +141,7 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "s3_delete",
 	}
 
 	op := func() (interface{}, error) {
@@ -155,6 +158,7 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "s3_put_object",
 	}
 
 	op := func() (interface{}, error) {
@@ -175,6 +179,7 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      4,
+		OperationName:   "s3_get_object",
 	}
 
 	op := func() (interface{}, error) {
@@ -198,6 +203,7 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 		Multiplier:      2.0,
 		Jitter:          true,
 		MaxRetries:      3,
+		OperationName:   "s3_stat_object",
 	}
 
 	op := func() (interface{}, error) {

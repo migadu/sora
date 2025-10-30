@@ -60,6 +60,7 @@ var adminRetryConfig = retry.BackoffConfig{
 	Multiplier:      1.8,
 	Jitter:          true,
 	MaxRetries:      3,
+	OperationName:   "db_admin",
 }
 
 func (rd *ResilientDatabase) CreateAccountWithRetry(ctx context.Context, req db.CreateAccountRequest) error {
@@ -152,6 +153,7 @@ func (rd *ResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.Cont
 		Multiplier:      1.8,
 		Jitter:          true,
 		MaxRetries:      2,
+		OperationName:   "db_importer_insert_message",
 	}
 
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {

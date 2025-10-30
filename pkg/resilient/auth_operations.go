@@ -20,6 +20,7 @@ func (rd *ResilientDatabase) RecordAuthAttemptWithRetry(ctx context.Context, ipA
 		InitialInterval: 100 * time.Millisecond,
 		MaxInterval:     500 * time.Millisecond,
 		MaxRetries:      2,
+		OperationName:   "db_auth_record",
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).RecordAuthAttempt(ctx, tx, ipAddress, username, protocol, success)
@@ -33,6 +34,7 @@ func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx 
 		InitialInterval: 100 * time.Millisecond,
 		MaxInterval:     500 * time.Millisecond,
 		MaxRetries:      2,
+		OperationName:   "db_auth_check",
 	}
 	op := func(ctx context.Context) (interface{}, error) {
 		ip, user, dbErr := rd.getOperationalDatabaseForOperation(false).GetFailedAttemptsCountSeparateWindows(ctx, ipAddress, username, ipWindowDuration, usernameWindowDuration)
@@ -61,7 +63,10 @@ func (rd *ResilientDatabase) GetAuthAttemptsStats(ctx context.Context, windowDur
 
 func (rd *ResilientDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error) {
 	// This is a background cleanup task, low priority, limited retries.
-	config := retry.BackoffConfig{MaxRetries: 1}
+	config := retry.BackoffConfig{
+		MaxRetries:    1,
+		OperationName: "db_auth_cleanup",
+	}
 	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupOldAuthAttempts(ctx, tx, maxAge)
 	}
@@ -80,6 +85,7 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 		Multiplier:      1.5,
 		Jitter:          true,
 		MaxRetries:      2,
+		OperationName:   "db_auth_credential",
 	}
 
 	type credResult struct {
@@ -123,6 +129,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		Multiplier:      1.5,
 		Jitter:          true,
 		MaxRetries:      2, // Auth retries should be limited
+		OperationName:   "db_authenticate",
 	}
 
 	type credResult struct {
