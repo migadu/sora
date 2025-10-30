@@ -25,6 +25,11 @@ import (
 func TestSlowlorisImprovedProtection(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
+	// Skip in short mode - this test takes ~7 minutes to complete
+	if testing.Short() {
+		t.Skip("Skipping long-running slowloris test in short mode")
+	}
+
 	// Server with 2-minute idle timeout and 512 bytes/min slowloris protection
 	// (Idle timeout must be longer than command spacing to avoid disconnecting during slow periods)
 	server, account := common.SetupIMAPServerWithSlowloris(t, 2*time.Minute, 512)

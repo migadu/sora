@@ -212,7 +212,7 @@ func (db *Database) Close() {
 				log.Printf("Database: failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
 			}
 		} else if unlocked {
-			log.Println("Database: feleased shared database advisory lock.")
+			log.Println("Database: released shared database advisory lock.")
 		} else {
 			log.Println("Database: advisory lock was not held at time of release (likely auto-released on connection close).")
 		}

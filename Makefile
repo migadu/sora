@@ -60,7 +60,8 @@ tests-race:
 	go test -v -race ./...
 
 # Helper variables for integration tests
-TEST_TIMEOUT = 10m
+# Timeout set to 20m to accommodate long-running tests like slowloris (takes ~7 minutes)
+TEST_TIMEOUT = 20m
 TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT)
 DB_NAME = sora_mail_db
 DB_USER = postgres
@@ -96,10 +97,23 @@ integration-tests: integration-tests-imap integration-tests-lmtp integration-tes
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
 	integration-tests-config integration-tests-sora-admin integration-tests-relay
 
+# Run integration tests in quick mode (skip long-running tests like slowloris)
+integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp integration-tests-pop3 \
+	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
+	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
+	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
+	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
+	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
+	integration-tests-config integration-tests-sora-admin integration-tests-relay
+
 # Core protocol integration tests
 integration-tests-imap: reset-test-db
 	@echo "Running IMAP integration tests..."
 	@cd integration_tests/imap && go test $(TEST_FLAGS) .
+
+integration-tests-imap-quick: reset-test-db
+	@echo "Running IMAP integration tests (quick mode, skipping long tests)..."
+	@cd integration_tests/imap && go test -short $(TEST_FLAGS) .
 
 integration-tests-lmtp: reset-test-db
 	@echo "Running LMTP integration tests..."
@@ -227,9 +241,11 @@ help:
 	@echo "  performance-tests       - Run comprehensive search performance tests"
 	@echo "  performance-tests-short - Run quick performance validation tests"
 	@echo "  integration-tests       - Run all integration tests (requires PostgreSQL)"
+	@echo "  integration-tests-quick - Run integration tests, skip long tests (e.g., slowloris)"
 	@echo ""
 	@echo "Core protocol integration tests:"
-	@echo "  integration-tests-imap          - IMAP protocol tests"
+	@echo "  integration-tests-imap          - IMAP protocol tests (includes long tests)"
+	@echo "  integration-tests-imap-quick    - IMAP protocol tests (quick, skip long tests)"
 	@echo "  integration-tests-lmtp          - LMTP delivery tests"
 	@echo "  integration-tests-pop3          - POP3 protocol tests"
 	@echo "  integration-tests-managesieve   - ManageSieve tests"

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -70,10 +71,14 @@ func TestManageSieveSpecialCharacterPasswords(t *testing.T) {
 			defer server.Close()
 
 			// Update account password to the test password
+			hashedPassword, err := db.GenerateBcryptHash(tc.password)
+			if err != nil {
+				t.Fatalf("Failed to hash password: %v", err)
+			}
 			if err := server.ResilientDB.UpdatePasswordWithRetry(
 				context.Background(),
 				account.Email,
-				tc.password,
+				hashedPassword,
 			); err != nil {
 				t.Fatalf("Failed to update account password: %v", err)
 			}
@@ -98,10 +103,14 @@ func TestManageSieveAUTHENTICATEPLAIN(t *testing.T) {
 
 	// Set password with special characters
 	testPassword := `test\pass"word`
+	hashedPassword, err := db.GenerateBcryptHash(testPassword)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
 	if err := server.ResilientDB.UpdatePasswordWithRetry(
 		context.Background(),
 		account.Email,
-		testPassword,
+		hashedPassword,
 	); err != nil {
 		t.Fatalf("Failed to update account password: %v", err)
 	}
@@ -122,10 +131,14 @@ func TestManageSieveAuthQuoting(t *testing.T) {
 
 	// Set password to a known value with special characters
 	testPassword := `my\pass"word`
+	hashedPassword, err := db.GenerateBcryptHash(testPassword)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
 	if err := server.ResilientDB.UpdatePasswordWithRetry(
 		context.Background(),
 		account.Email,
-		testPassword,
+		hashedPassword,
 	); err != nil {
 		t.Fatalf("Failed to update account password: %v", err)
 	}

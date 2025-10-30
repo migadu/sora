@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -79,15 +80,19 @@ func TestIMAPProxySpecialCharacterPasswords(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Create backend IMAP server
-			backendServer, account := common.SetupIMAPServerWithMaster(t)
+			// Create backend IMAP server WITH PROXY protocol support
+			backendServer, account := common.SetupIMAPServerWithPROXY(t)
 			defer backendServer.Close()
 
 			// Update account password to the test password
+			hashedPassword, err := db.GenerateBcryptHash(tc.password)
+			if err != nil {
+				t.Fatalf("Failed to hash password: %v", err)
+			}
 			if err := backendServer.ResilientDB.UpdatePasswordWithRetry(
 				context.Background(),
 				account.Email,
-				tc.password,
+				hashedPassword,
 			); err != nil {
 				t.Fatalf("Failed to update account password: %v", err)
 			}
@@ -113,16 +118,20 @@ func TestIMAPProxySpecialCharacterPasswords(t *testing.T) {
 func TestIMAPProxyLOGINCommandParsing(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Create backend IMAP server and account
-	backendServer, account := common.SetupIMAPServerWithMaster(t)
+	// Create backend IMAP server and account WITH PROXY protocol support
+	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
 	// Set password to a known value with special characters
 	testPassword := `my\pass"word`
+	hashedPassword, err := db.GenerateBcryptHash(testPassword)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
 	if err := backendServer.ResilientDB.UpdatePasswordWithRetry(
 		context.Background(),
 		account.Email,
-		testPassword,
+		hashedPassword,
 	); err != nil {
 		t.Fatalf("Failed to update account password: %v", err)
 	}
@@ -213,16 +222,20 @@ func TestIMAPProxyLOGINCommandParsing(t *testing.T) {
 func TestIMAPProxyAUTHENTICATEPLAIN(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Create backend IMAP server
-	backendServer, account := common.SetupIMAPServerWithMaster(t)
+	// Create backend IMAP server WITH PROXY protocol support
+	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
 	// Set password with special characters
 	testPassword := `test\pass"word`
+	hashedPassword, err := db.GenerateBcryptHash(testPassword)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
 	if err := backendServer.ResilientDB.UpdatePasswordWithRetry(
 		context.Background(),
 		account.Email,
-		testPassword,
+		hashedPassword,
 	); err != nil {
 		t.Fatalf("Failed to update account password: %v", err)
 	}
