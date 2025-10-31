@@ -175,3 +175,33 @@ func (rdb *ResilientDatabase) UnsubscribeFromMailboxWithRetry(ctx context.Contex
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
+
+// GetAllMessagesForUserVerificationWithRetry retrieves S3 info for all messages with retry logic
+func (rdb *ResilientDatabase) GetAllMessagesForUserVerificationWithRetry(ctx context.Context, accountID int64) ([]db.MessageS3Info, error) {
+	config := readRetryConfig
+
+	op := func(ctx context.Context) (interface{}, error) {
+		return rdb.getOperationalDatabaseForOperation(false).GetAllMessagesForUserVerification(ctx, accountID)
+	}
+
+	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.MessageS3Info), nil
+}
+
+// MarkMessagesAsNotUploadedWithRetry marks messages as not uploaded with retry logic
+func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Context, s3Keys []string) (int64, error) {
+	config := writeRetryConfig
+
+	op := func(ctx context.Context) (interface{}, error) {
+		return rdb.getOperationalDatabaseForOperation(true).MarkMessagesAsNotUploaded(ctx, s3Keys)
+	}
+
+	result, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}

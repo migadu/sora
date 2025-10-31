@@ -208,6 +208,8 @@ func main() {
 		handleMessagesCommand(ctx)
 	case "relay":
 		handleRelayCommand(ctx)
+	case "verify":
+		handleVerifyCommand(ctx)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -405,6 +407,7 @@ Commands:
   uploader      Upload queue management
   messages      List and restore deleted messages
   relay         Relay queue management (stats, list, show, delete, requeue)
+  verify        Verify data integrity (S3 storage, etc.)
   import        Import maildir data
   export        Export maildir data
   version       Show version information

@@ -278,6 +278,73 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 	return messages, rows.Err()
 }
 
+// MessageS3Info represents minimal message info needed for S3 verification
+type MessageS3Info struct {
+	ID          int64
+	ContentHash string
+	S3Domain    string
+	S3Localpart string
+	S3Key       string
+}
+
+// GetAllMessagesForUserVerification retrieves S3 info for all non-expunged messages for a user
+func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accountID int64) ([]MessageS3Info, error) {
+	query := `
+		SELECT id, content_hash, s3_domain, s3_localpart
+		FROM messages
+		WHERE account_id = $1 AND expunged_at IS NULL
+		ORDER BY id
+	`
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages for verification: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []MessageS3Info
+	for rows.Next() {
+		var msg MessageS3Info
+		err := rows.Scan(&msg.ID, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan message: %w", err)
+		}
+		// Construct S3 key
+		msg.S3Key = fmt.Sprintf("%s/%s/%s", msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+		messages = append(messages, msg)
+	}
+
+	return messages, rows.Err()
+}
+
+// MarkMessagesAsNotUploaded marks messages as not uploaded by their S3 keys
+func (db *Database) MarkMessagesAsNotUploaded(ctx context.Context, s3Keys []string) (int64, error) {
+	if len(s3Keys) == 0 {
+		return 0, nil
+	}
+
+	// Extract content hashes from S3 keys (format: domain/localpart/hash)
+	// We'll match on content_hash, s3_domain, and s3_localpart
+	query := `
+		UPDATE messages
+		SET uploaded = FALSE
+		WHERE (s3_domain, s3_localpart, content_hash) IN (
+			SELECT
+				split_part(unnest($1::text[]), '/', 1),
+				split_part(unnest($1::text[]), '/', 2),
+				split_part(unnest($1::text[]), '/', 3)
+		)
+		AND expunged_at IS NULL
+	`
+
+	result, err := db.GetWritePool().Exec(ctx, query, s3Keys)
+	if err != nil {
+		return 0, fmt.Errorf("failed to mark messages as not uploaded: %w", err)
+	}
+
+	return result.RowsAffected(), nil
+}
+
 // GetMessageByID retrieves a single message
 func (db *Database) GetMessageByID(ctx context.Context, accountID int64, messageID int64) (*DBMessage, error) {
 	query := `

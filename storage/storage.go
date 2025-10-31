@@ -397,3 +397,43 @@ func (s *S3Storage) Copy(sourcePath, destPath string) error {
 	}
 	return nil
 }
+
+// S3Object represents an S3 object in list results
+type S3Object struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+	ETag         string
+}
+
+// ListObjects lists objects in S3 with the given prefix
+func (s *S3Storage) ListObjects(ctx context.Context, prefix string, recursive bool) (<-chan S3Object, <-chan error) {
+	objectCh := make(chan S3Object)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(objectCh)
+		defer close(errCh)
+
+		opts := minio.ListObjectsOptions{
+			Prefix:    prefix,
+			Recursive: recursive,
+		}
+
+		for object := range s.Client.ListObjects(ctx, s.BucketName, opts) {
+			if object.Err != nil {
+				errCh <- object.Err
+				return
+			}
+
+			objectCh <- S3Object{
+				Key:          object.Key,
+				Size:         object.Size,
+				LastModified: object.LastModified,
+				ETag:         object.ETag,
+			}
+		}
+	}()
+
+	return objectCh, errCh
+}
