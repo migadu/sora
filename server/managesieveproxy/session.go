@@ -251,13 +251,6 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Parse and use base address (without +detail) for backend impersonation
-			if addr, err := server.NewAddress(authnID); err == nil {
-				s.username = addr.BaseAddress()
-			} else {
-				s.username = authnID // Fallback if parsing fails
-			}
-
 			// Connect to backend and authenticate
 			if err := s.connectToBackendAndAuth(); err != nil {
 				logger.Debug("ManageSieve Proxy: Backend connection/auth failed", "name", s.server.name, "user", authnID, "error", err)
@@ -553,7 +546,8 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	s.accountID = accountID
-	s.isPrelookupAccount = false // Authenticated against the main DB
+	s.isPrelookupAccount = false       // Authenticated against the main DB
+	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
