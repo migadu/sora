@@ -484,8 +484,8 @@ func (m *MockAffinityManager) DeleteBackend(username, protocol string) {
 
 func (m *MockAffinityManager) Stop() {}
 
-func (m *MockAffinityManager) GetStats(ctx context.Context) map[string]interface{} {
-	return map[string]interface{}{
+func (m *MockAffinityManager) GetStats(ctx context.Context) map[string]any {
+	return map[string]any{
 		"enabled":       true,
 		"total_entries": len(m.backends),
 	}

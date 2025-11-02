@@ -10,8 +10,8 @@ type ProtocolSession interface {
 	// GetID returns the unique identifier for this session
 	GetID() string
 
-	// GetUserID returns the user ID associated with this session, or 0 if not authenticated
-	GetUserID() int64
+	// GetAccountID returns the user ID associated with this session, or 0 if not authenticated
+	GetAccountID() int64
 
 	// GetProtocol returns the protocol name (e.g., "IMAP", "LMTP", "ManageSieve")
 	GetProtocol() string
@@ -29,7 +29,7 @@ type ProtocolSession interface {
 	Close() error
 
 	// Log logs a message with the given format and arguments
-	Log(format string, args ...interface{})
+	Log(format string, args ...any)
 }
 
 // BaseProtocolSession provides default implementations for the ProtocolSession interface
@@ -43,12 +43,12 @@ func (s *BaseProtocolSession) GetID() string {
 	return s.Id
 }
 
-// GetUserID returns the user ID associated with this session, or 0 if not authenticated
-func (s *BaseProtocolSession) GetUserID() int64 {
+// GetAccountID returns the user ID associated with this session, or 0 if not authenticated
+func (s *BaseProtocolSession) GetAccountID() int64 {
 	if s.User == nil {
 		return 0
 	}
-	return s.User.UserID()
+	return s.User.AccountID()
 }
 
 // GetProtocol returns the protocol name

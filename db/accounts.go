@@ -316,7 +316,7 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	var credentials []Credential
 	for rows.Next() {
 		var cred Credential
-		var createdAt, updatedAt interface{}
+		var createdAt, updatedAt any
 
 		err := rows.Scan(&cred.Address, &cred.PrimaryIdentity, &createdAt, &updatedAt)
 		if err != nil {
@@ -410,7 +410,7 @@ func (db *Database) AccountExists(ctx context.Context, email string) (bool, erro
 
 	// Check if account exists and is not soft-deleted
 	var accountID int64
-	var deletedAt interface{}
+	var deletedAt any
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.deleted_at 
 		FROM accounts a
@@ -727,7 +727,7 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 	var accounts []AccountSummary
 	for rows.Next() {
 		var account AccountSummary
-		var createdAt interface{}
+		var createdAt any
 		err := rows.Scan(&account.AccountID, &createdAt, &account.PrimaryEmail,
 			&account.CredentialCount, &account.MailboxCount, &account.MessageCount)
 		if err != nil {

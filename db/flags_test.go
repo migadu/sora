@@ -64,7 +64,7 @@ func setupFlagTestDatabase(t *testing.T) (*Database, int64, int64, imap.UID) {
 
 	now := time.Now()
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     mailbox.ID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",

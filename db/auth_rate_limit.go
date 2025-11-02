@@ -14,7 +14,7 @@ func (d *Database) RecordAuthAttempt(ctx context.Context, tx pgx.Tx, ipAddress, 
 		INSERT INTO auth_attempts (ip_address, username, protocol, success, attempted_at)
 		VALUES ($1, $2, $3, $4, now())`
 
-	var usernameParam interface{}
+	var usernameParam any
 	if username == "" {
 		usernameParam = nil
 	} else {
@@ -93,7 +93,7 @@ func (d *Database) GetFailedAttemptsCountSeparateWindows(ctx context.Context, ip
 }
 
 // GetAuthAttemptsStats returns statistics about authentication attempts
-func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
+func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]any, error) {
 	cutoffTime := time.Now().Add(-windowDuration)
 
 	query := `
@@ -128,7 +128,7 @@ func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time
 		return nil, fmt.Errorf("failed to get auth attempts stats: %w", err)
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"total_attempts":      stats.TotalAttempts,
 		"successful_attempts": stats.SuccessfulAttempts,
 		"failed_attempts":     stats.FailedAttempts,
@@ -140,7 +140,7 @@ func (d *Database) GetAuthAttemptsStats(ctx context.Context, windowDuration time
 }
 
 // GetBlockedIPs returns IPs that are currently blocked based on rate limiting
-func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, usernameWindowDuration time.Duration, maxAttemptsPerIP, maxAttemptsPerUsername int) ([]map[string]interface{}, error) {
+func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, usernameWindowDuration time.Duration, maxAttemptsPerIP, maxAttemptsPerUsername int) ([]map[string]any, error) {
 	query := `
 		WITH ip_failures AS (
 			SELECT 
@@ -196,7 +196,7 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
+	var results []map[string]any
 	for rows.Next() {
 		var blockType, identifier string
 		var username *string
@@ -208,7 +208,7 @@ func (d *Database) GetBlockedIPs(ctx context.Context, ipWindowDuration, username
 			return nil, fmt.Errorf("failed to scan blocked IP row: %w", err)
 		}
 
-		result := map[string]interface{}{
+		result := map[string]any{
 			"block_type":    blockType,
 			"identifier":    identifier,
 			"failure_count": failureCount,

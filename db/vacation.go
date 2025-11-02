@@ -10,25 +10,25 @@ import (
 // VacationResponse represents a record of a vacation auto-response sent to a sender
 type VacationResponse struct {
 	ID            int64
-	UserID        int64
+	AccountID     int64
 	SenderAddress string
 	ResponseDate  time.Time
 	CreatedAt     time.Time
 }
 
 // RecordVacationResponse records that a vacation response was sent to a specific sender
-func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, userID int64, senderAddress string) error {
+func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, AccountID int64, senderAddress string) error {
 	now := time.Now()
 	_, err := tx.Exec(ctx, `
 		INSERT INTO vacation_responses (account_id, sender_address, response_date, created_at)
 		VALUES ($1, $2, $3, $4)
-	`, userID, senderAddress, now, now)
+	`, AccountID, senderAddress, now, now)
 
 	return err
 }
 
 // HasRecentVacationResponse checks if a vacation response was sent to this sender within the specified duration
-func (db *Database) HasRecentVacationResponse(ctx context.Context, userID int64, senderAddress string, duration time.Duration) (bool, error) {
+func (db *Database) HasRecentVacationResponse(ctx context.Context, AccountID int64, senderAddress string, duration time.Duration) (bool, error) {
 	cutoffTime := time.Now().Add(-duration)
 
 	var exists bool
@@ -39,7 +39,7 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, userID int64,
 			AND sender_address = $2 
 			AND response_date > $3
 		)
-	`, userID, senderAddress, cutoffTime).Scan(&exists)
+	`, AccountID, senderAddress, cutoffTime).Scan(&exists)
 
 	return exists, err
 }

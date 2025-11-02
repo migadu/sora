@@ -79,7 +79,7 @@
 //	}
 //	`
 //
-//	env := sieveengine.NewEnv(userID, messageData)
+//	env := sieveengine.NewEnv(AccountID, messageData)
 //	result, err := sieveengine.Execute(script, env)
 //	if err != nil {
 //		// Script error

@@ -16,11 +16,15 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()
 
-	// Reset throughput counter when entering IDLE to avoid false positives
-	// for slowloris detection. IDLE is expected to have minimal traffic.
+	// Suspend throughput checking when entering IDLE
+	// IDLE is expected to have minimal traffic (just periodic "still here" responses)
+	// and legitimate clients may stay idle for 29 minutes waiting for new mail.
+	// The slowloris protection would incorrectly flag these as attacks.
 	if netConn := s.conn.NetConn(); netConn != nil {
 		if tc, ok := netConn.(*serverPkg.SoraConn); ok {
-			tc.ResetThroughputCounter()
+			tc.SuspendThroughputChecking()
+			// Resume when exiting IDLE
+			defer tc.ResumeThroughputChecking()
 		}
 	}
 

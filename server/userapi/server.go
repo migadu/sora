@@ -5,10 +5,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/pkg/resilient"
@@ -114,7 +115,7 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 	if serverName == "" {
 		serverName = "default"
 	}
-	logger.Debug("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
+	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 		errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
 	}
@@ -135,11 +136,11 @@ func (s *Server) start(ctx context.Context) error {
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		logger.Debug("HTTP Mail API: Shutting down server...", "name", s.name)
+		logger.Info("HTTP Mail API: Shutting down server...", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			logger.Debug("HTTP Mail API: Error shutting down server: %v", "name", s.name, "param", err)
+			logger.Warn("HTTP Mail API: Error shutting down server: %v", "name", s.name, "param", err)
 		}
 	}()
 
@@ -421,11 +422,11 @@ func isIPAllowed(clientIP string, allowedHosts []string) bool {
 	return false
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		logger.Debug("HTTP Mail API: Error encoding JSON response: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error encoding JSON response: %v", "name", s.name, "param", err)
 	}
 }
 

@@ -11,7 +11,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	// First phase: Read session state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[COPY] Failed to acquire read lock within timeout")
+		s.DebugLog("[COPY] Failed to acquire read lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -21,7 +21,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 
 	if s.selectedMailbox == nil {
 		release()
-		s.Log("[COPY] copy failed: no mailbox selected")
+		s.DebugLog("[COPY] copy failed: no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -30,17 +30,17 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	}
 	selectedMailboxID := s.selectedMailbox.ID
 	selectedMailboxName := s.selectedMailbox.Name
-	userID := s.UserID()
+	AccountID := s.AccountID()
 	release()
 
 	// Use decoded numSet - this safely acquires its own read lock
 	decodedNumSet := s.decodeNumSet(numSet)
 
 	// Middle phase: Database operations outside lock
-	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.Log("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
+			s.DebugLog("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeTryCreate,
@@ -51,12 +51,12 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	}
 
 	// Check ACL permissions - requires 'i' (insert) right on destination mailbox
-	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, userID, 'i')
+	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, AccountID, 'i')
 	if err != nil {
 		return nil, s.internalError("failed to check insert permission on destination: %v", err)
 	}
 	if !hasInsertRight {
-		s.Log("[COPY] user does not have insert permission on destination mailbox '%s'", mboxName)
+		s.DebugLog("[COPY] user does not have insert permission on destination mailbox '%s'", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -81,7 +81,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	}
 
 	// Perform the batch copy operation
-	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, userID)
+	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, AccountID)
 	if err != nil {
 		return nil, s.internalError("failed to copy messages: %v", err)
 	}
@@ -100,7 +100,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		DestUIDs:    destUIDSet,
 	}
 
-	s.Log("[COPY] messages copied from %s to %s", selectedMailboxName, mboxName)
+	s.DebugLog("[COPY] messages copied from %s to %s", selectedMailboxName, mboxName)
 
 	return copyData, nil
 }

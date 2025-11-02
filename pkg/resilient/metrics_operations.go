@@ -10,7 +10,7 @@ import (
 func (rdb *ResilientDatabase) GetMetricsStatsWithRetry(ctx context.Context) (*metrics.MetricsStats, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		dbStats, err := rdb.getOperationalDatabaseForOperation(false).GetMetricsStats(ctx)
 		if err != nil {
 			return nil, err

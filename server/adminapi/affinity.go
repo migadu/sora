@@ -73,7 +73,7 @@ func (s *Server) handleAffinitySet(w http.ResponseWriter, r *http.Request) {
 
 	// Return success
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":  true,
 		"message":  fmt.Sprintf("Affinity set for %s (%s) -> %s and gossiped to cluster", req.User, req.Protocol, req.Backend),
 		"user":     req.User,
@@ -106,7 +106,7 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"user":     user,
 		"protocol": protocol,
 		"backend":  backend,
@@ -137,7 +137,7 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Return success
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":  true,
 		"message":  fmt.Sprintf("Affinity deleted for %s (%s) and gossiped to cluster", user, protocol),
 		"user":     user,

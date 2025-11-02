@@ -23,8 +23,8 @@ type VacationOracle struct {
 }
 
 // IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and handle.
-func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, userID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, userID, originalSender, duration)
+func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
+	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, AccountID, originalSender, duration)
 	if err != nil {
 		return false, fmt.Errorf("checking db for recent vacation response: %w", err)
 	}
@@ -32,8 +32,8 @@ func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, userID i
 }
 
 // RecordVacationResponseSent records that a vacation response has been sent.
-func (o *VacationOracle) RecordVacationResponseSent(ctx context.Context, userID int64, originalSender string, handle string) error {
-	return o.RDB.RecordVacationResponseWithRetry(ctx, userID, originalSender)
+func (o *VacationOracle) RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error {
+	return o.RDB.RecordVacationResponseWithRetry(ctx, AccountID, originalSender)
 }
 
 // RelayQueue interface defines operations for queuing relay messages
@@ -70,7 +70,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	}
 
 	// Get user's active script
-	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.UserID)
+	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
 	if err != nil && err != consts.ErrDBNotFound {
 		// Non-critical error, continue with INBOX delivery
 		return mailboxName, false, nil
@@ -79,7 +79,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	var result sieveengine.Result
 	if activeScript != nil {
 		// Execute user script
-		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.UserID, s.VacationOracle)
+		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle)
 		if err != nil {
 			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
 			return mailboxName, false, nil
@@ -142,7 +142,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	case sieveengine.ActionVacation:
 		// Handle vacation response
 		if s.VacationHandler != nil && recipient.FromAddress != nil {
-			_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.UserID, result, recipient.FromAddress, recipient.Address, messageEntity)
+			_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.AccountID, result, recipient.FromAddress, recipient.Address, messageEntity)
 		}
 		mailboxName = consts.MailboxInbox
 

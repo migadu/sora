@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -289,7 +290,7 @@ func (si *S3Importer) performDryRun() error {
 	user := server.NewUser(address, accountID)
 
 	// Ensure default mailboxes exist for this user
-	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.AccountID()); err != nil {
 		logger.Info("Warning: Failed to create default mailboxes", "email", si.options.Email, "error", err)
 		// Don't fail the dry run, as mailboxes might already exist
 	}
@@ -445,7 +446,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	// Proactively ensure default mailboxes exist for this user
 	// This prevents "mailbox not found" errors during import
-	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID()); err != nil {
+	if err := si.rdb.CreateDefaultMailboxesWithRetry(ctx, user.AccountID()); err != nil {
 		logger.Info("Warning: Failed to create default mailboxes", "email", si.options.Email, "error", err)
 		// Don't fail the import, as mailboxes might already exist
 	}
@@ -514,7 +515,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	// Import into INBOX by default (since we don't have mailbox information from S3)
 	// Default mailboxes should already be created at this point
-	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
+	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 	if err != nil {
 		return fmt.Errorf("failed to get INBOX mailbox: %w", err)
 	}
@@ -523,7 +524,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	hostname, _ := os.Hostname()
 	msgID, uid, err := si.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			UserID:        user.UserID(),
+			AccountID:     user.AccountID(),
 			MailboxID:     mailbox.ID,
 			S3Domain:      address.Domain(),
 			S3Localpart:   address.LocalPart(),
@@ -545,7 +546,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			InstanceID:  hostname,
 			ContentHash: contentHash,
 			Size:        obj.Size,
-			AccountID:   user.UserID(),
+			AccountID:   user.AccountID(),
 		})
 
 	if err != nil {
@@ -553,7 +554,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.UserID())
+	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID())
 	if err != nil {
 		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}

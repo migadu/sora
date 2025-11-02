@@ -298,7 +298,7 @@ func showVersion(m *migrate.Migrate) {
 // migrationLogger is a copy from db/db.go for admin tool use
 type migrationLogger struct{}
 
-func (l *migrationLogger) Printf(format string, v ...interface{}) {
+func (l *migrationLogger) Printf(format string, v ...any) {
 	logger.Info("MIGRATE", "msg", fmt.Sprintf(format, v...))
 }
 

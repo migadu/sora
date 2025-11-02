@@ -45,7 +45,7 @@ func NewSearchCriteriaValidator() *SearchCriteriaValidator {
 type ValidationError struct {
 	Field   string
 	Message string
-	Value   interface{}
+	Value   any
 }
 
 func (e *ValidationError) Error() string {
@@ -329,7 +329,7 @@ func (v *SearchCriteriaValidator) calculateComplexity(score int, criteria *imap.
 }
 
 // Helper methods for ValidationResult
-func (r *ValidationResult) addError(field, message string, value interface{}) {
+func (r *ValidationResult) addError(field, message string, value any) {
 	r.Valid = false
 	r.Errors = append(r.Errors, &ValidationError{
 		Field:   field,
@@ -338,7 +338,7 @@ func (r *ValidationResult) addError(field, message string, value interface{}) {
 	})
 }
 
-func (r *ValidationResult) addWarning(field, message string, value interface{}) {
+func (r *ValidationResult) addWarning(field, message string, value any) {
 	r.Warnings = append(r.Warnings, &ValidationError{
 		Field:   field,
 		Message: message,

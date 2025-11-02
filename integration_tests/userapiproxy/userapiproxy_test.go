@@ -122,7 +122,7 @@ func setupTestEnvironment(t *testing.T) *TestContext {
 }
 
 // makeProxyRequest makes an HTTP request through the proxy
-func (tc *TestContext) makeProxyRequest(t *testing.T, method, path string, body interface{}) *http.Response {
+func (tc *TestContext) makeProxyRequest(t *testing.T, method, path string, body any) *http.Response {
 	t.Helper()
 
 	var reqBody io.Reader
@@ -157,7 +157,7 @@ func (tc *TestContext) makeProxyRequest(t *testing.T, method, path string, body 
 }
 
 // parseJSON parses JSON response into target
-func parseJSON(t *testing.T, resp *http.Response, target interface{}) {
+func parseJSON(t *testing.T, resp *http.Response, target any) {
 	t.Helper()
 
 	defer resp.Body.Close()
@@ -204,7 +204,7 @@ func TestProxyAuthentication(t *testing.T) {
 			t.Fatalf("Failed to login: %v", err)
 		}
 
-		var loginResp map[string]interface{}
+		var loginResp map[string]any
 		parseJSON(t, resp, &loginResp)
 		tc.JWTToken = loginResp["token"].(string)
 
@@ -236,7 +236,7 @@ func TestProxyForwardsHeaders(t *testing.T) {
 		t.Fatalf("Failed to login: %v", err)
 	}
 
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -368,7 +368,7 @@ func loginAndGetToken(t *testing.T, baseURL, email, password string) string {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	json.Unmarshal(body, &loginResp)
 
 	return loginResp["token"].(string)

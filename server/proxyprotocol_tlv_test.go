@@ -564,7 +564,7 @@ func TestJA4ExtractionFromClientConn(t *testing.T) {
 	}
 
 	// Test JA4 extraction via type assertion
-	if ja4Conn, ok := interface{}(mockConn).(interface{ GetJA4Fingerprint() (string, error) }); ok {
+	if ja4Conn, ok := any(mockConn).(interface{ GetJA4Fingerprint() (string, error) }); ok {
 		fingerprint, err := ja4Conn.GetJA4Fingerprint()
 		if err != nil {
 			t.Errorf("GetJA4Fingerprint() error = %v", err)

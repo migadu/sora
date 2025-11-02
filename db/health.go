@@ -19,15 +19,15 @@ const (
 )
 
 type HealthStatus struct {
-	ComponentName  string                 `json:"component_name"`
-	Status         ComponentStatus        `json:"status"`
-	LastCheck      time.Time              `json:"last_check"`
-	LastError      *string                `json:"last_error,omitempty"`
-	CheckCount     int                    `json:"check_count"`
-	FailCount      int                    `json:"fail_count"`
-	Metadata       map[string]interface{} `json:"metadata,omitempty"`
-	ServerHostname string                 `json:"server_hostname"`
-	UpdatedAt      time.Time              `json:"updated_at"`
+	ComponentName  string          `json:"component_name"`
+	Status         ComponentStatus `json:"status"`
+	LastCheck      time.Time       `json:"last_check"`
+	LastError      *string         `json:"last_error,omitempty"`
+	CheckCount     int             `json:"check_count"`
+	FailCount      int             `json:"fail_count"`
+	Metadata       map[string]any  `json:"metadata,omitempty"`
+	ServerHostname string          `json:"server_hostname"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 type SystemHealthOverview struct {
@@ -41,7 +41,7 @@ type SystemHealthOverview struct {
 }
 
 // StoreHealthStatus stores or updates the health status for a component
-func (db *Database) StoreHealthStatus(ctx context.Context, tx pgx.Tx, hostname string, componentName string, status ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]interface{}) error {
+func (db *Database) StoreHealthStatus(ctx context.Context, tx pgx.Tx, hostname string, componentName string, status ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]any) error {
 	var errorStr *string
 	if lastError != nil {
 		errStr := lastError.Error()
@@ -135,7 +135,7 @@ func (db *Database) GetHealthStatus(ctx context.Context, hostname, componentName
 // GetAllHealthStatuses retrieves health status for all components
 func (db *Database) GetAllHealthStatuses(ctx context.Context, hostname string) ([]*HealthStatus, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	if hostname != "" {
 		query = `
@@ -200,7 +200,7 @@ func (db *Database) GetAllHealthStatuses(ctx context.Context, hostname string) (
 // GetSystemHealthOverview provides a high-level overview of system health
 func (db *Database) GetSystemHealthOverview(ctx context.Context, hostname string) (*SystemHealthOverview, error) {
 	var query string
-	var args []interface{}
+	var args []any
 
 	if hostname != "" {
 		query = `

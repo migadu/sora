@@ -36,17 +36,17 @@ type DatabaseEndpointConfig struct {
 	//   - Service discovery endpoints (Consul, K8s services)
 	//
 	// READ HOSTS: Multiple hosts are common for read replica load balancing
-	Hosts           []string    `toml:"hosts"`
-	Port            interface{} `toml:"port"` // Database port (default: "5432"), can be string or integer
-	User            string      `toml:"user"`
-	Password        string      `toml:"password"`
-	Name            string      `toml:"name"`
-	TLSMode         bool        `toml:"tls"`
-	MaxConns        int         `toml:"max_conns"`          // Maximum number of connections in the pool
-	MinConns        int         `toml:"min_conns"`          // Minimum number of connections in the pool
-	MaxConnLifetime string      `toml:"max_conn_lifetime"`  // Maximum lifetime of a connection
-	MaxConnIdleTime string      `toml:"max_conn_idle_time"` // Maximum idle time before a connection is closed
-	QueryTimeout    string      `toml:"query_timeout"`      // Per-endpoint timeout for individual database queries (e.g., "30s")
+	Hosts           []string `toml:"hosts"`
+	Port            any      `toml:"port"` // Database port (default: "5432"), can be string or integer
+	User            string   `toml:"user"`
+	Password        string   `toml:"password"`
+	Name            string   `toml:"name"`
+	TLSMode         bool     `toml:"tls"`
+	MaxConns        int      `toml:"max_conns"`          // Maximum number of connections in the pool
+	MinConns        int      `toml:"min_conns"`          // Minimum number of connections in the pool
+	MaxConnLifetime string   `toml:"max_conn_lifetime"`  // Maximum lifetime of a connection
+	MaxConnIdleTime string   `toml:"max_conn_idle_time"` // Maximum idle time before a connection is closed
+	QueryTimeout    string   `toml:"query_timeout"`      // Per-endpoint timeout for individual database queries (e.g., "30s")
 }
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
@@ -471,14 +471,14 @@ type PreLookupConfig struct {
 	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	FallbackDefault        bool        `toml:"fallback_to_default"`       // Fallback to default routing if lookup fails
-	RemoteTLS              bool        `toml:"remote_tls"`                // Use TLS for backend connections
-	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
-	RemoteTLSVerify        *bool       `toml:"remote_tls_verify"`         // Verify backend TLS certificate
-	RemotePort             interface{} `toml:"remote_port"`               // Default port for routed backends if not in address
-	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseIDCommand     bool        `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
+	FallbackDefault        bool  `toml:"fallback_to_default"`       // Fallback to default routing if lookup fails
+	RemoteTLS              bool  `toml:"remote_tls"`                // Use TLS for backend connections
+	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
+	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`         // Verify backend TLS certificate
+	RemotePort             any   `toml:"remote_port"`               // Default port for routed backends if not in address
+	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
+	RemoteUseXCLIENT       bool  `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
 
 	// Cache configuration
 	Cache *PreLookupCacheConfig `toml:"cache"` // Caching configuration
@@ -901,7 +901,7 @@ type IMAPProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
+	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
@@ -929,7 +929,7 @@ type POP3ProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
+	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
@@ -957,7 +957,7 @@ type ManageSieveProxyServerConfig struct {
 	Start                  bool                  `toml:"start"`
 	Addr                   string                `toml:"addr"`
 	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             interface{}           `toml:"remote_port"`            // Default port for backends if not in address
+	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	InsecureAuth           bool                  `toml:"insecure_auth"`
@@ -989,7 +989,7 @@ type LMTPProxyServerConfig struct {
 	Start                  bool             `toml:"start"`
 	Addr                   string           `toml:"addr"`
 	RemoteAddrs            []string         `toml:"remote_addrs"`
-	RemotePort             interface{}      `toml:"remote_port"`            // Default port for backends if not in address
+	RemotePort             any              `toml:"remote_port"`            // Default port for backends if not in address
 	MaxConnections         int              `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int              `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	TLS                    bool             `toml:"tls"`
@@ -1059,21 +1059,21 @@ type UserAPIServerConfig struct {
 
 // UserAPIProxyServerConfig holds User API proxy server configuration
 type UserAPIProxyServerConfig struct {
-	Start               bool        `toml:"start"`
-	Addr                string      `toml:"addr"`
-	RemoteAddrs         []string    `toml:"remote_addrs"`
-	RemotePort          interface{} `toml:"remote_port"`            // Default port for backends if not in address
-	JWTSecret           string      `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
-	MaxConnections      int         `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int         `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                 bool        `toml:"tls"`
-	TLSCertFile         string      `toml:"tls_cert_file"`
-	TLSKeyFile          string      `toml:"tls_key_file"`
-	TLSVerify           bool        `toml:"tls_verify"`
-	RemoteTLS           bool        `toml:"remote_tls"`
-	RemoteTLSVerify     bool        `toml:"remote_tls_verify"`
-	ConnectTimeout      string      `toml:"connect_timeout"`
-	EnableAffinity      bool        `toml:"enable_affinity"`
+	Start               bool     `toml:"start"`
+	Addr                string   `toml:"addr"`
+	RemoteAddrs         []string `toml:"remote_addrs"`
+	RemotePort          any      `toml:"remote_port"`            // Default port for backends if not in address
+	JWTSecret           string   `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
+	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                 bool     `toml:"tls"`
+	TLSCertFile         string   `toml:"tls_cert_file"`
+	TLSKeyFile          string   `toml:"tls_key_file"`
+	TLSVerify           bool     `toml:"tls_verify"`
+	RemoteTLS           bool     `toml:"remote_tls"`
+	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
+	ConnectTimeout      string   `toml:"connect_timeout"`
+	EnableAffinity      bool     `toml:"enable_affinity"`
 }
 
 // ServerLimitsConfig holds resource limits for a server
@@ -1131,19 +1131,19 @@ type ServerConfig struct {
 	InsecureAuth        bool     `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific
-	RemoteAddrs            []string    `toml:"remote_addrs,omitempty"`
-	RemotePort             interface{} `toml:"remote_port,omitempty"` // Default port for backends if not in address
-	RemoteTLS              bool        `toml:"remote_tls,omitempty"`
-	RemoteTLSUseStartTLS   bool        `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool        `toml:"remote_tls_verify,omitempty"`
-	RemoteUseProxyProtocol bool        `toml:"remote_use_proxy_protocol,omitempty"`
-	RemoteUseIDCommand     bool        `toml:"remote_use_id_command,omitempty"`
-	RemoteUseXCLIENT       bool        `toml:"remote_use_xclient,omitempty"`
-	ConnectTimeout         string      `toml:"connect_timeout,omitempty"`
-	SessionTimeout         string      `toml:"session_timeout,omitempty"`
-	EnableAffinity         bool        `toml:"enable_affinity,omitempty"`
-	AffinityStickiness     float64     `toml:"affinity_stickiness,omitempty"`
-	AffinityValidity       string      `toml:"affinity_validity,omitempty"`
+	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
+	RemotePort             any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
+	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
+	RemoteTLSUseStartTLS   bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
+	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
+	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
+	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
+	SessionTimeout         string   `toml:"session_timeout,omitempty"`
+	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
+	AffinityStickiness     float64  `toml:"affinity_stickiness,omitempty"`
+	AffinityValidity       string   `toml:"affinity_validity,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`
@@ -1993,7 +1993,7 @@ func (s *ServerConfig) Validate() error {
 }
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
-func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...interface{})) {
+func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
@@ -2342,7 +2342,7 @@ func trimStringFields(v reflect.Value) {
 		}
 
 	case reflect.Interface:
-		// Handle interface{} values (like the Port field which can be string or int)
+		// Handle any values (like the Port field which can be string or int)
 		if !v.IsNil() {
 			elem := v.Elem()
 			if elem.Kind() == reflect.String {

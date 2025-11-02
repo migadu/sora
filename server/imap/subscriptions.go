@@ -22,11 +22,11 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 		s.Log("[SUBSCRIBE/UNSUBSCRIBE] Failed to acquire read lock")
 		return s.internalError("failed to acquire lock for subscription update")
 	}
-	userID := s.UserID()
+	AccountID := s.AccountID()
 	release()
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mailboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.Log("Mailbox '%s' does not exist", mailboxName)
@@ -36,7 +36,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	}
 
 	// Final phase: Update subscription - no locks needed as it's a DB operation
-	err = s.server.rdb.SetMailboxSubscribedWithRetry(s.ctx, mailbox.ID, userID, subscribe)
+	err = s.server.rdb.SetMailboxSubscribedWithRetry(s.ctx, mailbox.ID, AccountID, subscribe)
 	if err != nil {
 		return s.internalError("failed to set subscription status for mailbox '%s': %v", mailboxName, err)
 	}
@@ -45,7 +45,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	if !subscribe {
 		action = "unsubscribed"
 	}
-	s.Log("[SUBSCRIBE] mailbox '%s' %s", mailboxName, action)
+	s.DebugLog("[SUBSCRIBE] mailbox '%s' %s", mailboxName, action)
 
 	return nil
 }

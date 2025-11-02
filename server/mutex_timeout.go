@@ -15,12 +15,12 @@ const MutexTimeout = 5 * time.Second
 type MutexTimeoutHelper struct {
 	mutex *sync.RWMutex
 	ctx   context.Context
-	log   func(format string, args ...interface{})
+	log   func(format string, args ...any)
 	name  string // Protocol name for logging
 }
 
 // NewMutexTimeoutHelper creates a new helper for mutex timeout operations
-func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string, log func(format string, args ...interface{})) *MutexTimeoutHelper {
+func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string, log func(format string, args ...any)) *MutexTimeoutHelper {
 	return &MutexTimeoutHelper{
 		mutex: mutex,
 		ctx:   ctx,

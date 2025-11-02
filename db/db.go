@@ -540,7 +540,7 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 }
 
 // GetWriteFailoverStats returns failover statistics for write operations
-func (db *Database) GetWriteFailoverStats() []map[string]interface{} {
+func (db *Database) GetWriteFailoverStats() []map[string]any {
 	if db.WriteFailover == nil {
 		return nil
 	}
@@ -548,7 +548,7 @@ func (db *Database) GetWriteFailoverStats() []map[string]interface{} {
 }
 
 // GetReadFailoverStats returns failover statistics for read operations
-func (db *Database) GetReadFailoverStats() []map[string]interface{} {
+func (db *Database) GetReadFailoverStats() []map[string]any {
 	if db.ReadFailover == nil {
 		return nil
 	}
@@ -1021,11 +1021,11 @@ func (fm *FailoverManager) MarkHostUnhealthy(host string, err error) {
 }
 
 // GetHostStats returns health statistics for all hosts
-func (fm *FailoverManager) GetHostStats() []map[string]interface{} {
-	stats := make([]map[string]interface{}, len(fm.hosts))
+func (fm *FailoverManager) GetHostStats() []map[string]any {
+	stats := make([]map[string]any, len(fm.hosts))
 	for i, h := range fm.hosts {
 		h.mu.RLock()
-		stats[i] = map[string]interface{}{
+		stats[i] = map[string]any{
 			"host":              h.Host,
 			"healthy":           h.IsHealthy.Load(),
 			"last_health_check": h.LastHealthCheck,
@@ -1075,7 +1075,7 @@ func (mtx *measuredTx) Commit(ctx context.Context) error {
 // migrationLogger implements migrate.Logger interface
 type migrationLogger struct{}
 
-func (l *migrationLogger) Printf(format string, v ...interface{}) {
+func (l *migrationLogger) Printf(format string, v ...any) {
 	// Prepend a prefix to all migration logs for clarity
 	log.Printf("[DB-MIGRATE] "+format, v...)
 }

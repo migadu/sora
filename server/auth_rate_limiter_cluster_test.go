@@ -250,6 +250,6 @@ func (m *mockAuthDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context, 
 	return 0, nil
 }
 
-func (m *mockAuthDatabase) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) {
+func (m *mockAuthDatabase) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]any, error) {
 	return nil, nil
 }

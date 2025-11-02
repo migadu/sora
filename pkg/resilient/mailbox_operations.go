@@ -13,9 +13,9 @@ import (
 
 // --- Mailbox and Message Wrappers ---
 
-func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, userID int64, name string) (*db.DBMailbox, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMailboxByName(ctx, userID, name)
+func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, AccountID int64, name string) (*db.DBMailbox, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetMailboxByName(ctx, AccountID, name)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
 	if err != nil {
@@ -25,7 +25,7 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, user
 }
 
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		id, u, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessage(ctx, tx, options, upload)
 		if opErr != nil {
 			return nil, opErr
@@ -41,7 +41,7 @@ func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options
 }
 
 func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet) ([]db.Message, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessagesByNumSet(ctx, mailboxID, numSet)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
@@ -55,7 +55,7 @@ func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, m
 }
 
 func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mailboxID int64) (*db.MailboxSummary, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMailboxSummary(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -65,9 +65,9 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
-func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, userID int64, subscribed bool) ([]*db.DBMailbox, error) {
-	op := func(ctx context.Context) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMailboxes(ctx, userID, subscribed)
+func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetMailboxes(ctx, AccountID, subscribed)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -80,7 +80,7 @@ func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, userID i
 }
 
 func (rd *ResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetAccountIDByAddress(ctx, address)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrUserNotFound)
@@ -90,16 +90,16 @@ func (rd *ResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context,
 	return result.(int64), nil
 }
 
-func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, userID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).CreateDefaultMailboxes(ctx, tx, userID)
+func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).CreateDefaultMailboxes(ctx, tx, AccountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	return err
 }
 
 func (rd *ResilientDatabase) PollMailboxWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*db.MailboxPoll, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).PollMailbox(ctx, mailboxID, sinceModSeq)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -110,7 +110,7 @@ func (rd *ResilientDatabase) PollMailboxWithRetry(ctx context.Context, mailboxID
 }
 
 func (rd *ResilientDatabase) GetMessagesByFlagWithRetry(ctx context.Context, mailboxID int64, flag imap.Flag) ([]db.Message, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessagesByFlag(ctx, mailboxID, flag)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -124,7 +124,7 @@ func (rd *ResilientDatabase) GetMessagesByFlagWithRetry(ctx context.Context, mai
 }
 
 func (rd *ResilientDatabase) ExpungeMessageUIDsWithRetry(ctx context.Context, mailboxID int64, uids ...imap.UID) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).ExpungeMessageUIDs(ctx, tx, mailboxID, uids...)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -135,7 +135,7 @@ func (rd *ResilientDatabase) ExpungeMessageUIDsWithRetry(ctx context.Context, ma
 }
 
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetPrimaryEmailForAccount(ctx, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrUserNotFound)
@@ -147,9 +147,9 @@ func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Cont
 
 // --- Mailbox Management Wrappers ---
 
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, userID)
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, AccountID)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -158,40 +158,40 @@ func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]
 	return result.(map[imap.UID]imap.UID), nil
 }
 
-func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, userID int64, name string, parentID *int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).CreateMailbox(ctx, tx, userID, name, parentID)
+func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, AccountID int64, name string, parentID *int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).CreateMailbox(ctx, tx, AccountID, name, parentID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, consts.ErrDBUniqueViolation, consts.ErrMailboxInvalidName)
 	return err
 }
 
-func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailboxID int64, userID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).DeleteMailbox(ctx, tx, mailboxID, userID)
+func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).DeleteMailbox(ctx, tx, mailboxID, AccountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	return err
 }
 
-func (rd *ResilientDatabase) RenameMailboxWithRetry(ctx context.Context, mailboxID int64, userID int64, newName string, newParentID *int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).RenameMailbox(ctx, tx, mailboxID, userID, newName, newParentID)
+func (rd *ResilientDatabase) RenameMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).RenameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, consts.ErrMailboxAlreadyExists, consts.ErrMailboxInvalidName)
 	return err
 }
 
-func (rd *ResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, mailboxID int64, userID int64, subscribed bool) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).SetMailboxSubscribed(ctx, tx, mailboxID, userID, subscribed)
+func (rd *ResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, mailboxID int64, AccountID int64, subscribed bool) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).SetMailboxSubscribed(ctx, tx, mailboxID, AccountID, subscribed)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	return err
 }
 
 func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).CountMessagesGreaterThanUID(ctx, mailboxID, minUID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -202,7 +202,7 @@ func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Co
 }
 
 func (rd *ResilientDatabase) GetUniqueCustomFlagsForMailboxWithRetry(ctx context.Context, mailboxID int64) ([]string, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetUniqueCustomFlagsForMailbox(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -256,7 +256,7 @@ func (rd *ResilientDatabase) RevokeMailboxAccessByIdentifierWithRetry(ctx contex
 }
 
 func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailboxID int64) ([]db.ACLEntry, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMailboxACLs(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -270,7 +270,7 @@ func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailbo
 }
 
 func (rd *ResilientDatabase) CheckMailboxPermissionWithRetry(ctx context.Context, mailboxID, accountID int64, right db.ACLRight) (bool, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).CheckMailboxPermission(ctx, mailboxID, accountID, right)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
@@ -281,7 +281,7 @@ func (rd *ResilientDatabase) CheckMailboxPermissionWithRetry(ctx context.Context
 }
 
 func (rd *ResilientDatabase) GetUserMailboxRightsWithRetry(ctx context.Context, mailboxID, accountID int64) (string, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetUserMailboxRights(ctx, mailboxID, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
@@ -292,7 +292,7 @@ func (rd *ResilientDatabase) GetUserMailboxRightsWithRetry(ctx context.Context, 
 }
 
 func (rd *ResilientDatabase) GetAccessibleMailboxesWithRetry(ctx context.Context, accountID int64) ([]*db.DBMailbox, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetAccessibleMailboxes(ctx, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)

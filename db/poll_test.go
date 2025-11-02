@@ -26,7 +26,7 @@ func insertTestMessageWithUIDForPoll(t *testing.T, db *Database, ctx context.Con
 	var bs imap.BodyStructure = defaultBodyStructure
 	now := time.Now()
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   mailboxName,
 		S3Domain:      "example.com",

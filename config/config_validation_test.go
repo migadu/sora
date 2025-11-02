@@ -152,7 +152,7 @@ func TestWarnUnusedConfigOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var warnings []string
-			mockLogger := func(format string, args ...interface{}) {
+			mockLogger := func(format string, args ...any) {
 				warning := format
 				if len(args) > 0 {
 					// Simple sprintf - just for testing
@@ -202,7 +202,7 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 	}
 
 	var warningCount int
-	mockLogger := func(format string, args ...interface{}) {
+	mockLogger := func(format string, args ...any) {
 		warningCount++
 	}
 

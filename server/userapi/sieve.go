@@ -3,9 +3,10 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"net/url"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
 )
@@ -36,7 +37,7 @@ func (s *Server) handleListFilters(w http.ResponseWriter, r *http.Request) {
 	// Get all scripts
 	scripts, err := s.rdb.GetUserScriptsWithRetry(ctx, accountID)
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error retrieving Sieve scripts: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving Sieve scripts: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve scripts")
 		return
 	}
@@ -51,7 +52,7 @@ func (s *Server) handleListFilters(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"scripts": scriptResponses,
 		"count":   len(scriptResponses),
 	})
@@ -87,7 +88,7 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error retrieving Sieve script: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve script")
 		return
 	}
@@ -146,7 +147,7 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	// Create or update script
 	script, err := s.rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, name, req.Script)
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error creating/updating Sieve script: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error creating/updating Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to save script")
 		return
 	}
@@ -190,12 +191,12 @@ func (s *Server) handleDeleteFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error deleting Sieve script: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error deleting Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete script")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "Script deleted successfully",
 		"name":    name,
 	})
@@ -230,12 +231,12 @@ func (s *Server) handleActivateFilter(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Script not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error activating Sieve script: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error activating Sieve script: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to activate script")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "Script activated successfully",
 		"name":    name,
 		"active":  true,
@@ -277,7 +278,7 @@ func containsInvalidChars(s string) bool {
 func (s *Server) handleGetCapabilities(w http.ResponseWriter, _ *http.Request) {
 	// Return the Sieve capabilities
 	// These are the extensions supported by the server
-	capabilities := map[string]interface{}{
+	capabilities := map[string]any{
 		"implementation": "Sora Mail Server",
 		"version":        "1.0",
 		"extensions": []string{

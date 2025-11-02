@@ -70,7 +70,7 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 
 				// Return valid response
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
 					"server":        "backend:143",
@@ -146,7 +146,7 @@ func TestHTTPPrelookupURLEncoding(t *testing.T) {
 
 				// Return valid response
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
 					"server":        "backend:143",

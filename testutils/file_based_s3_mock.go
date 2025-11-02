@@ -33,24 +33,30 @@ func NewFileBasedS3Mock(baseDir string) (*FileBasedS3Mock, error) {
 
 // Put stores an object in the mock storage (as a file on disk)
 func (m *FileBasedS3Mock) Put(key string, reader io.Reader, size int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Check for simulated error (with lock)
+	m.mu.RLock()
+	err, hasError := m.errors[key]
+	m.mu.RUnlock()
 
-	// Check if we should simulate an error for this key
-	if err, exists := m.errors[key]; exists {
+	if hasError {
 		return err
 	}
 
 	// Create the file path
 	filePath := m.keyToFilePath(key)
+	dirPath := filepath.Dir(filePath)
 
-	// Create parent directories
-	err := os.MkdirAll(filepath.Dir(filePath), 0755)
+	// Use write lock for directory creation to prevent race conditions
+	// when multiple threads try to create the same parent directory
+	m.mu.Lock()
+	err = os.MkdirAll(dirPath, 0755)
+	m.mu.Unlock()
+
 	if err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Create the file
+	// Create the file (different keys write to different files, so no lock needed here)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
@@ -73,22 +79,23 @@ func (m *FileBasedS3Mock) Put(key string, reader io.Reader, size int64) error {
 
 // Get retrieves an object from the mock storage
 func (m *FileBasedS3Mock) Get(key string) (io.ReadCloser, error) {
+	// Check for simulated error (with lock)
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	err, hasError := m.errors[key]
+	m.mu.RUnlock()
 
-	// Check if we should simulate an error for this key
-	if err, exists := m.errors[key]; exists {
+	if hasError {
 		return nil, err
 	}
 
 	filePath := m.keyToFilePath(key)
 
-	// Check if file exists
+	// Check if file exists (no lock needed - file system handles this)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("object not found: %s", key)
 	}
 
-	// Open the file
+	// Open the file (no lock needed - OS handles concurrent reads)
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -99,17 +106,18 @@ func (m *FileBasedS3Mock) Get(key string) (io.ReadCloser, error) {
 
 // Exists checks if an object exists in the mock storage
 func (m *FileBasedS3Mock) Exists(key string) (bool, string, error) {
+	// Check for simulated error (with lock)
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	err, hasError := m.errors[key]
+	m.mu.RUnlock()
 
-	// Check if we should simulate an error for this key
-	if err, exists := m.errors[key]; exists {
+	if hasError {
 		return false, "", err
 	}
 
 	filePath := m.keyToFilePath(key)
 
-	// Check if file exists
+	// Check if file exists (no lock needed - file system handles this)
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return false, "", nil
 	} else if err != nil {
@@ -122,18 +130,19 @@ func (m *FileBasedS3Mock) Exists(key string) (bool, string, error) {
 
 // Delete removes an object from the mock storage
 func (m *FileBasedS3Mock) Delete(key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Check for simulated error (with lock)
+	m.mu.RLock()
+	err, hasError := m.errors[key]
+	m.mu.RUnlock()
 
-	// Check if we should simulate an error for this key
-	if err, exists := m.errors[key]; exists {
+	if hasError {
 		return err
 	}
 
 	filePath := m.keyToFilePath(key)
 
-	// Remove the file (ignore if it doesn't exist)
-	err := os.Remove(filePath)
+	// Remove the file (ignore if it doesn't exist, no lock needed - OS handles this)
+	err = os.Remove(filePath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
@@ -143,29 +152,30 @@ func (m *FileBasedS3Mock) Delete(key string) error {
 
 // Copy copies an object within the mock storage
 func (m *FileBasedS3Mock) Copy(sourcePath, destPath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Check for simulated error (with lock)
+	m.mu.RLock()
+	err, hasError := m.errors[sourcePath]
+	m.mu.RUnlock()
 
-	// Check if we should simulate an error for the source
-	if err, exists := m.errors[sourcePath]; exists {
+	if hasError {
 		return err
 	}
 
 	sourceFilePath := m.keyToFilePath(sourcePath)
 	destFilePath := m.keyToFilePath(destPath)
 
-	// Check if source exists
+	// Check if source exists (no lock needed - file system handles this)
 	if _, err := os.Stat(sourceFilePath); os.IsNotExist(err) {
 		return fmt.Errorf("source object not found: %s", sourcePath)
 	}
 
-	// Create destination directory
-	err := os.MkdirAll(filepath.Dir(destFilePath), 0755)
+	// Create destination directory (no lock needed - OS handles concurrency)
+	err = os.MkdirAll(filepath.Dir(destFilePath), 0755)
 	if err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	// Copy file
+	// Copy file (no lock needed - different files)
 	sourceFile, err := os.Open(sourceFilePath)
 	if err != nil {
 		return fmt.Errorf("failed to open source file: %w", err)

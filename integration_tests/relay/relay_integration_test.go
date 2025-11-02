@@ -27,7 +27,7 @@ type integrationLogger struct {
 	mu   sync.Mutex
 }
 
-func (l *integrationLogger) Log(format string, args ...interface{}) {
+func (l *integrationLogger) Log(format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	msg := fmt.Sprintf(format, args...)
@@ -308,7 +308,7 @@ func TestSMTPRelayStartTLS(t *testing.T) {
 
 // TestHTTPRelayIntegration tests HTTP relay with a real HTTP server
 func TestHTTPRelayIntegration(t *testing.T) {
-	receivedMessages := []map[string]interface{}{}
+	receivedMessages := []map[string]any{}
 	var mu sync.Mutex
 
 	// Create test HTTP server
@@ -329,7 +329,7 @@ func TestHTTPRelayIntegration(t *testing.T) {
 		}
 
 		// Parse request body
-		var req map[string]interface{}
+		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid json"})
@@ -379,7 +379,7 @@ func TestHTTPRelayIntegration(t *testing.T) {
 	}
 
 	// Check recipients array
-	recipients, ok := msg["recipients"].([]interface{})
+	recipients, ok := msg["recipients"].([]any)
 	if !ok {
 		t.Fatalf("Expected recipients to be an array, got %T", msg["recipients"])
 	}

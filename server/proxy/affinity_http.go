@@ -95,7 +95,7 @@ func (h *AffinityHTTPHandler) handleSet(w http.ResponseWriter, r *http.Request) 
 
 	// Return success
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":  true,
 		"message":  fmt.Sprintf("Affinity set for %s (%s) -> %s", req.User, req.Protocol, req.Backend),
 		"user":     req.User,
@@ -170,7 +170,7 @@ func (h *AffinityHTTPHandler) handleDelete(w http.ResponseWriter, r *http.Reques
 
 	// Return success
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"success":  true,
 		"message":  fmt.Sprintf("Affinity deleted for %s (%s)", user, protocol),
 		"user":     user,

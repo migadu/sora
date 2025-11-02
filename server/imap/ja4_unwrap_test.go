@@ -150,7 +150,7 @@ func TestSoraConnUnwrap(t *testing.T) {
 	soraConn := serverPkg.NewSoraConn(baseConn, connConfig)
 
 	// Verify SoraConn implements Unwrap
-	if unwrapper, ok := interface{}(soraConn).(interface{ Unwrap() net.Conn }); ok {
+	if unwrapper, ok := any(soraConn).(interface{ Unwrap() net.Conn }); ok {
 		unwrapped := unwrapper.Unwrap()
 		if unwrapped != baseConn {
 			t.Error("SoraConn.Unwrap() should return the base connection")

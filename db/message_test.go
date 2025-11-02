@@ -173,7 +173,7 @@ func TestMessageStruct(t *testing.T) {
 
 	msg := Message{
 		ID:             1,
-		UserID:         100,
+		AccountID:      100,
 		UID:            imap.UID(12345),
 		ContentHash:    "abc123hash",
 		S3Domain:       "example.com",
@@ -196,7 +196,7 @@ func TestMessageStruct(t *testing.T) {
 
 	// Verify all fields are set correctly
 	assert.Equal(t, int64(1), msg.ID)
-	assert.Equal(t, int64(100), msg.UserID)
+	assert.Equal(t, int64(100), msg.AccountID)
 	assert.Equal(t, imap.UID(12345), msg.UID)
 	assert.Equal(t, "abc123hash", msg.ContentHash)
 	assert.Equal(t, "example.com", msg.S3Domain)
@@ -504,7 +504,7 @@ func TestInsertMessage(t *testing.T) {
 	var bs imap.BodyStructure = bodyStructure
 
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",
@@ -580,7 +580,7 @@ func TestInsertMessageFromImporter(t *testing.T) {
 	var bs imap.BodyStructure = bodyStructure
 
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",

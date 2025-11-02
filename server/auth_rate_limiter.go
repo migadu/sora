@@ -3,10 +3,11 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
 )
@@ -45,7 +46,7 @@ type AuthDatabase interface {
 	RecordAuthAttemptWithRetry(ctx context.Context, ipAddress, username, protocol string, success bool) error
 	GetFailedAttemptsCountSeparateWindowsWithRetry(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error)
 	CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error)
-	GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error)
+	GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]any, error)
 }
 
 // AuthLimiter interface that both AuthRateLimiter and EnhancedAuthRateLimiter implement
@@ -55,7 +56,7 @@ type AuthLimiter interface {
 	// New methods with proxy awareness
 	CanAttemptAuthWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string) error
 	RecordAuthAttemptWithProxy(ctx context.Context, conn net.Conn, proxyInfo *ProxyProtocolInfo, username string, success bool)
-	GetStats(ctx context.Context, windowDuration time.Duration) map[string]interface{}
+	GetStats(ctx context.Context, windowDuration time.Duration) map[string]any
 	Stop()
 }
 
@@ -490,9 +491,9 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	}
 }
 
-func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Duration) map[string]interface{} {
+func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Duration) map[string]any {
 	if a == nil {
-		return map[string]interface{}{"enabled": false}
+		return map[string]any{"enabled": false}
 	}
 	a.blockMu.RLock()
 	blockedCount := len(a.blockedIPs)
@@ -504,13 +505,13 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 	pendingCount := len(a.pendingRecords)
 	a.pendingMu.Unlock()
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"enabled":      true,
 		"blocked_ips":  blockedCount,
 		"tracked_ips":  trackedIPs,
 		"pending_sync": pendingCount,
 		"db_healthy":   a.dbHealthy,
-		"config": map[string]interface{}{
+		"config": map[string]any{
 			"max_attempts_per_ip":       a.config.MaxAttemptsPerIP,
 			"max_attempts_per_username": a.config.MaxAttemptsPerUsername,
 			"ip_window_duration":        a.config.IPWindowDuration.String(),

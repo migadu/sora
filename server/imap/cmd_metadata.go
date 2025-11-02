@@ -27,12 +27,12 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	if mailbox != "" {
 		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 		if !acquired {
-			s.Log("[GETMETADATA] failed to acquire read lock")
+			s.DebugLog("[GETMETADATA] failed to acquire read lock")
 			return nil, fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
 
-		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.UserID(), mailbox)
+		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return nil, fmt.Errorf("mailbox not found: %s", mailbox)
@@ -41,12 +41,12 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 		}
 
 		// Check ACL permissions - requires 'r' (read) right for mailbox metadata
-		hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'r')
+		hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'r')
 		if err != nil {
 			return nil, fmt.Errorf("failed to check read permission: %w", err)
 		}
 		if !hasReadRight {
-			s.Log("[GETMETADATA] user does not have read permission on mailbox '%s'", mailbox)
+			s.DebugLog("[GETMETADATA] user does not have read permission on mailbox '%s'", mailbox)
 			return nil, fmt.Errorf("you do not have permission to get metadata for this mailbox")
 		}
 
@@ -55,9 +55,9 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	}
 
 	// Fetch metadata from database
-	result, err := s.server.rdb.GetMetadataWithRetry(s.ctx, s.UserID(), mailboxID, entries, options)
+	result, err := s.server.rdb.GetMetadataWithRetry(s.ctx, s.AccountID(), mailboxID, entries, options)
 	if err != nil {
-		s.Log("[GETMETADATA] failed to get metadata: %v", err)
+		s.DebugLog("[GETMETADATA] failed to get metadata: %v", err)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -94,12 +94,12 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 	if mailbox != "" {
 		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 		if !acquired {
-			s.Log("[SETMETADATA] failed to acquire read lock")
+			s.DebugLog("[SETMETADATA] failed to acquire read lock")
 			return fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
 
-		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.UserID(), mailbox)
+		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return fmt.Errorf("mailbox not found: %s", mailbox)
@@ -119,22 +119,22 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 		}
 
 		if needsWrite {
-			hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'w')
+			hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'w')
 			if err != nil {
 				return fmt.Errorf("failed to check write permission: %w", err)
 			}
 			if !hasWriteRight {
-				s.Log("[SETMETADATA] user does not have write permission on mailbox '%s'", mailbox)
+				s.DebugLog("[SETMETADATA] user does not have write permission on mailbox '%s'", mailbox)
 				return fmt.Errorf("you do not have permission to set shared metadata for this mailbox")
 			}
 		} else {
 			// For /private entries, just verify user has lookup permission (already verified by GetMailboxByName)
-			hasLookupRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.UserID(), 'l')
+			hasLookupRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'l')
 			if err != nil {
 				return fmt.Errorf("failed to check lookup permission: %w", err)
 			}
 			if !hasLookupRight {
-				s.Log("[SETMETADATA] user does not have lookup permission on mailbox '%s'", mailbox)
+				s.DebugLog("[SETMETADATA] user does not have lookup permission on mailbox '%s'", mailbox)
 				return fmt.Errorf("you do not have permission to set metadata for this mailbox")
 			}
 		}
@@ -151,12 +151,12 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 	}
 
 	// Set metadata in database with limit enforcement
-	err := s.server.rdb.SetMetadataWithRetry(s.ctx, s.UserID(), mailboxID, entries, limits)
+	err := s.server.rdb.SetMetadataWithRetry(s.ctx, s.AccountID(), mailboxID, entries, limits)
 	if err != nil {
 		// Check if it's a metadata-specific error
 		var metaErr *db.MetadataError
 		if errors.As(err, &metaErr) {
-			s.Log("[SETMETADATA] metadata limit exceeded: %v", metaErr)
+			s.DebugLog("[SETMETADATA] metadata limit exceeded: %v", metaErr)
 
 			// Map MetadataError types to proper IMAP response codes
 			var responseCode imap.ResponseCode
@@ -179,7 +179,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 		}
 
-		s.Log("[SETMETADATA] failed to set metadata: %v", err)
+		s.DebugLog("[SETMETADATA] failed to set metadata: %v", err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,

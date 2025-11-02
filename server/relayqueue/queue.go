@@ -332,7 +332,7 @@ func (q *DiskQueue) GetStats() (pending, processing, failed int, err error) {
 }
 
 // writeFileAtomic writes data to a file atomically using temp file + rename
-func (q *DiskQueue) writeFileAtomic(path string, data interface{}) error {
+func (q *DiskQueue) writeFileAtomic(path string, data any) error {
 	jsonBytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err

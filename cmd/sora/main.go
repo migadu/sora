@@ -739,7 +739,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	// Start all configured servers dynamically
 	for _, server := range allServers {
 		// Warn about unused config options
-		server.WarnUnusedConfigOptions(func(format string, args ...interface{}) { logger.Info(fmt.Sprintf(format, args...)) })
+		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) })
 
 		switch server.Type {
 		case "imap":
@@ -1755,6 +1755,6 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 // serverLogger implements delivery.Logger interface using the global logger
 type serverLogger struct{}
 
-func (l *serverLogger) Log(format string, args ...interface{}) {
+func (l *serverLogger) Log(format string, args ...any) {
 	logger.Info(fmt.Sprintf(format, args...))
 }

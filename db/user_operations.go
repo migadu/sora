@@ -111,7 +111,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 	`
 
-	args := []interface{}{mailbox.ID}
+	args := []any{mailbox.ID}
 	argPos := 2
 
 	if unseenOnly {
@@ -556,7 +556,7 @@ func (db *Database) UnsubscribeFromMailbox(ctx context.Context, accountID int64,
 
 // Helper functions
 
-func bitwiseFlagsToStrings(flags interface{}) []string {
+func bitwiseFlagsToStrings(flags any) []string {
 	var bitwiseFlags int
 
 	switch v := flags.(type) {

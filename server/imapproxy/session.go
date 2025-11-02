@@ -42,6 +42,7 @@ type Session struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	errorCount         int
+	startTime          time.Time
 }
 
 // newSession creates a new IMAP proxy session.
@@ -55,6 +56,7 @@ func newSession(server *Server, conn net.Conn) *Session {
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		errorCount:   0,
+		startTime:    time.Now(),
 	}
 }
 
@@ -63,19 +65,17 @@ func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 
-	clientAddr := s.clientConn.RemoteAddr().String()
-	if s.server.debug {
-		logger.Debug("New connection", "proxy", s.server.name, "remote", clientAddr)
-	}
+	s.Log("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			logger.Warn("TLS handshake failed", "proxy", s.server.name, "remote", clientAddr, "error", err)
+			s.WarnLog("TLS handshake failed: %v", err)
 			return
 		}
 	}
 
+	clientAddr := s.clientConn.RemoteAddr().String()
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
 		logger.Error("Failed to send greeting", "proxy", s.server.name, "remote", clientAddr, "error", err)
@@ -98,12 +98,12 @@ func (s *Session) handleConnection() {
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				logger.Debug("Client timed out waiting for command", "proxy", s.server.name, "remote", clientAddr)
+				s.DebugLog("client timed out waiting for command")
 				s.sendResponse("* BYE Idle timeout")
 				return
 			}
 			if err != io.EOF {
-				logger.Debug("Error reading from client", "proxy", s.server.name, "remote", clientAddr, "error", err)
+				s.DebugLog("error reading from client: %v", err)
 			}
 			return
 		}
@@ -111,7 +111,7 @@ func (s *Session) handleConnection() {
 		line = strings.TrimRight(line, "\r\n")
 
 		// Log client command with password masking if debug is enabled
-		s.Log("C: %s\r\n", line)
+		s.DebugLog("C: %s", line)
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
@@ -153,7 +153,7 @@ func (s *Session) handleConnection() {
 			password := server.UnquoteString(args[1])
 
 			if err := s.authenticateUser(username, password); err != nil {
-				logger.Info("Authentication failed", "proto", "imap_proxy", "user", username, "remote", clientAddr, "error", err)
+				s.DebugLog("authentication failed: %v", err)
 				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				continue
 			}
@@ -197,7 +197,7 @@ func (s *Session) handleConnection() {
 				saslLine, err = s.clientReader.ReadString('\n')
 				if err != nil {
 					if err != io.EOF {
-						logger.Debug("Error reading SASL response", "proxy", s.server.name, "error", err)
+						s.DebugLog("error reading SASL response: %v", err)
 					}
 					return // Client connection error, can't continue
 				}
@@ -233,7 +233,7 @@ func (s *Session) handleConnection() {
 			password := parts[2]
 
 			if err := s.authenticateUser(authnID, password); err != nil {
-				logger.Info("Authentication failed", "proto", "imap_proxy", "user", authnID, "remote", clientAddr, "error", err)
+				s.DebugLog("authentication failed: %v", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
@@ -288,14 +288,12 @@ func (s *Session) handleConnection() {
 	// in proxy mode where idle is handled by the backend (e.g., IDLE command).
 	if s.server.sessionTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-			logger.Warn("Failed to clear read deadline", "proxy", s.server.name, "remote", clientAddr, "error", err)
+			s.WarnLog("failed to clear read deadline: %v", err)
 		}
 	}
 	// Start proxying only if backend connection was successful
 	if s.backendConn != nil {
-		if s.server.debug {
-			logger.Debug("Starting proxy for user", "proxy", s.server.name, "user", s.username)
-		}
+		s.DebugLog("starting proxy for user")
 		s.startProxy()
 	} else {
 		logger.Error("Cannot start proxy - no backend connection", "proxy", s.server.name, "user", s.username)
@@ -308,7 +306,7 @@ func (s *Session) handleAuthError(response string) bool {
 	s.errorCount++
 	s.sendResponse(response)
 	if s.errorCount >= maxAuthErrors {
-		logger.Warn("Too many authentication errors, dropping connection", "proxy", s.server.name, "remote", s.clientConn.RemoteAddr().String())
+		s.WarnLog("too many authentication errors, dropping connection")
 		// Send a final BYE message before closing.
 		s.sendResponse("* BYE Too many invalid commands")
 		return true
@@ -335,12 +333,45 @@ func (s *Session) sendResponse(response string) error {
 	return s.clientWriter.Flush()
 }
 
-// Log logs a client command with password masking if debug is enabled.
-func (s *Session) Log(format string, args ...interface{}) {
-	if s.server.debug {
-		message := fmt.Sprintf(format, args...)
-		s.server.debugWriter.Write([]byte(message))
+// Log logs at INFO level with session context
+func (s *Session) Log(format string, args ...any) {
+	remoteAddr := s.clientConn.RemoteAddr().String()
+	user := "none"
+	if s.username != "" && s.accountID > 0 {
+		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+	} else if s.username != "" {
+		user = s.username
 	}
+
+	logger.Info("Session", "proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
+}
+
+// DebugLog logs at DEBUG level with session context
+func (s *Session) DebugLog(format string, args ...any) {
+	if s.server.debug {
+		remoteAddr := s.clientConn.RemoteAddr().String()
+		user := "none"
+		if s.username != "" && s.accountID > 0 {
+			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		} else if s.username != "" {
+			user = s.username
+		}
+
+		logger.Debug("Session", "proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
+	}
+}
+
+// WarnLog logs at WARN level with session context
+func (s *Session) WarnLog(format string, args ...any) {
+	remoteAddr := s.clientConn.RemoteAddr().String()
+	user := "none"
+	if s.username != "" && s.accountID > 0 {
+		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+	} else if s.username != "" {
+		user = s.username
+	}
+
+	logger.Warn("Session", "proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
 }
 
 // authenticateUser authenticates the user against the database.
@@ -363,9 +394,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Skip strict address validation if prelookup is enabled, as it may support master tokens
 	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
 	if s.server.connManager.HasRouting() {
-		if s.server.debug {
-			logger.Debug("Attempting authentication via prelookup", "proxy", s.server.name, "user", username)
-		}
+		s.DebugLog("attempting authentication via prelookup for user: %s", username)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
 
 		if err != nil {
@@ -381,12 +410,10 @@ func (s *Session) authenticateUser(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					if s.server.debug {
-						logger.Debug("Prelookup transient error, fallback enabled", "proxy", s.server.name, "user", username, "error", err)
-					}
+					s.DebugLog("prelookup transient error, fallback enabled: %v", err)
 					// Fallthrough to main DB auth
 				} else {
-					logger.Warn("Prelookup transient error, fallback disabled", "proxy", s.server.name, "user", username, "error", err)
+					s.WarnLog("prelookup transient error, fallback disabled: %v", err)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
@@ -398,10 +425,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
-				logger.Info("Authenticated", "proto", "imap_proxy", "user", username, "remote", remoteAddr.String(), "backend", "prelookup")
-				if s.server.debug {
-					logger.Debug("Prelookup authentication successful", "proxy", s.server.name, "user", username, "account_id", routingInfo.AccountID)
-				}
+				s.DebugLog("prelookup auth successful (account_id: %d)", routingInfo.AccountID)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -422,23 +446,21 @@ func (s *Session) authenticateUser(username, password string) error {
 
 			case proxy.AuthFailed:
 				// User found in prelookup, but password was wrong. Reject immediately.
-				logger.Debug("Prelookup authentication failed - bad password", "proxy", s.server.name, "user", username)
+				s.DebugLog("prelookup authentication failed - bad password")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				logger.Warn("Prelookup service temporarily unavailable", "proxy", s.server.name, "user", username)
+				s.WarnLog("prelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				if s.server.debug {
-					logger.Debug("User not found in prelookup, attempting main DB", "proxy", s.server.name, "user", username)
-				}
+				s.DebugLog("user not found in prelookup, attempting main DB")
 			}
 		}
 	}
@@ -448,9 +470,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	if err != nil {
 		return fmt.Errorf("invalid address format: %w", err)
 	}
-	if s.server.debug {
-		logger.Debug("Authenticating user via main database", "proxy", s.server.name, "user", username)
-	}
+	s.DebugLog("authenticating user via main database")
 	// Use base address (without +detail) for authentication
 	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 	if err != nil {
@@ -464,7 +484,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
-	logger.Info("Authenticated", "proto", "imap_proxy", "user", username, "remote", remoteAddr.String(), "backend", "main_db")
+	s.DebugLog("main DB auth successful (account_id: %d)", accountID)
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
 
 	// Track domain and user connection activity for the login event.
@@ -487,7 +507,7 @@ func (s *Session) connectToBackend() error {
 		ProxyName:          "IMAP Proxy",
 	})
 	if err != nil {
-		logger.Warn("Error determining route", "proxy", s.server.name, "user", s.username, "error", err)
+		s.WarnLog("error determining route: %v", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -580,7 +600,7 @@ func (s *Session) connectToBackend() error {
 
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-		logger.Warn("Failed to clear read deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.WarnLog("failed to clear read deadline: %v", err)
 	}
 
 	return nil
@@ -619,16 +639,14 @@ func (s *Session) authenticateToBackend() (string, error) {
 
 	// Clear the deadline after successful authentication
 	if err := s.backendConn.SetDeadline(time.Time{}); err != nil {
-		logger.Warn("Failed to clear auth deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.WarnLog("failed to clear auth deadline: %v", err)
 	}
 
 	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
 		return "", fmt.Errorf("backend authentication failed: %s", response)
 	}
 
-	if s.server.debug {
-		logger.Debug("Backend authentication successful", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr)
-	}
+	s.DebugLog("backend authentication successful")
 
 	return strings.TrimRight(response, "\r\n"), nil
 }
@@ -652,7 +670,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 	}
 	if useIDCommand {
 		if err := s.sendForwardingParametersToBackend(); err != nil {
-			logger.Warn("Failed to send forwarding parameters to backend", "proxy", s.server.name, "error", err)
+			s.WarnLog("failed to send forwarding parameters to backend: %v", err)
 			// Continue anyway - forwarding parameters are not critical
 		}
 	}
@@ -674,12 +692,11 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 
 	// Register connection
 	if err := s.registerConnection(); err != nil {
-		logger.Warn("Failed to register connection", "proxy", s.server.name, "user", s.username, "error", err)
+		s.WarnLog("failed to register connection: %v", err)
 	}
 
-	// Log successful proxy session establishment
-	remoteAddr := s.clientConn.RemoteAddr().String()
-	logger.Info("Proxy session established", "proto", "imap_proxy", "user", s.username, "remote", remoteAddr, "backend", s.serverAddr)
+	// Log authentication at INFO level
+	s.Log("authenticated (backend: %s)", s.serverAddr)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string
@@ -717,7 +734,7 @@ func (s *Session) startProxy() {
 		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
-			logger.Debug("Error copying from client to backend", "proxy", s.server.name, "error", err)
+			s.DebugLog("error copying from client to backend: %v", err)
 		}
 	}()
 
@@ -731,7 +748,7 @@ func (s *Session) startProxy() {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			logger.Debug("Error copying from backend to client", "proxy", s.server.name, "error", err)
+			s.DebugLog("error copying from backend to client: %v", err)
 		}
 	}()
 
@@ -751,6 +768,14 @@ func (s *Session) close() {
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
+
+	// Log disconnection at INFO level
+	duration := time.Since(s.startTime).Round(time.Second)
+	if s.username != "" {
+		s.Log("disconnected (duration: %v, backend: %s)", duration, s.serverAddr)
+	} else {
+		s.Log("disconnected (duration: %v)", duration)
+	}
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Dec()
@@ -778,7 +803,7 @@ func (s *Session) close() {
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "IMAP", clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
-				logger.Warn("Failed to unregister connection", "proxy", serverName, "user", username, "error", err)
+				logger.Warn("Failed to unregister connection", "proto", "imap_proxy", "name", serverName, "user", username, "error", err)
 			}
 		}()
 	}
@@ -813,8 +838,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		return
 	}
 
-	clientAddr := s.clientConn.RemoteAddr().String()
-
 	// Register for kick notifications
 	kickChan := s.server.connTracker.RegisterSession(s.accountID)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
@@ -823,7 +846,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			logger.Info("Connection kicked - disconnecting user", "proto", "imap_proxy", "proxy", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
+			s.Log("connection kicked - disconnecting user")
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

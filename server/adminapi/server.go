@@ -7,13 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/consts"
@@ -135,7 +136,7 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 	if serverName == "" {
 		serverName = "default"
 	}
-	logger.Debug("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
+	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
 	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 		errChan <- fmt.Errorf("HTTP API server failed: %w", err)
 	}
@@ -153,11 +154,11 @@ func (s *Server) start(ctx context.Context) error {
 	// Graceful shutdown
 	go func() {
 		<-ctx.Done()
-		logger.Debug("HTTP API: Shutting down server", "name", s.name)
+		logger.Info("HTTP API: Shutting down server", "name", s.name)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			logger.Debug("HTTP API: Error shutting down server", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
 
@@ -446,11 +447,11 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, data interface{}) {
+func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		logger.Debug("HTTP API: Error encoding JSON response", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error encoding JSON response", "name", s.name, "error", err)
 	}
 }
 
@@ -557,7 +558,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
 				return
 			}
-			logger.Debug("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			return
 		}
@@ -568,7 +569,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			createdCredentials = append(createdCredentials, cred.Email)
 		}
 
-		s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+		s.writeJSON(w, http.StatusCreated, map[string]any{
 			"account_id":  accountID,
 			"credentials": createdCredentials,
 			"message":     "Account created successfully with multiple credentials",
@@ -604,7 +605,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusConflict, "Account already exists")
 				return
 			}
-			logger.Debug("HTTP API: Error creating account", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			return
 		}
@@ -612,12 +613,12 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		// Get the created account ID
 		accountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, req.Email)
 		if err != nil {
-			logger.Debug("HTTP API: Error getting new account ID", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error getting new account ID", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve new account ID")
 			return
 		}
 
-		s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+		s.writeJSON(w, http.StatusCreated, map[string]any{
 			"account_id": accountID,
 			"email":      req.Email,
 			"message":    "Account created successfully",
@@ -630,12 +631,12 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 
 	accounts, err := s.rdb.ListAccountsWithRetry(ctx)
 	if err != nil {
-		logger.Debug("HTTP API: Error listing accounts", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error listing accounts", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error listing accounts")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": accounts,
 		"total":    len(accounts),
 	})
@@ -649,12 +650,12 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 
 	exists, err := s.rdb.AccountExistsWithRetry(ctx, email)
 	if err != nil {
-		logger.Debug("HTTP API: Error checking account existence", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error checking account existence", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error checking account existence")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":  email,
 		"exists": exists,
 	})
@@ -671,7 +672,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		logger.Debug("HTTP API: Error getting account details", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting account details", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get account details")
 		return
 	}
@@ -712,7 +713,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
 	if err != nil {
-		logger.Debug("HTTP API: Error updating account", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to update account")
 		return
 	}
@@ -737,13 +738,13 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		} else {
-			logger.Debug("HTTP API: Error deleting account", "name", s.name, "email", email, "error", err)
+			logger.Warn("HTTP API: Error deleting account", "name", s.name, "email", email, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Error deleting account")
 			return
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
 		"message": "Account soft-deleted successfully. It will be permanently removed after the grace period.",
 	})
@@ -764,13 +765,13 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		} else {
-			logger.Debug("HTTP API: Error restoring account", "name", s.name, "email", email, "error", err)
+			logger.Warn("HTTP API: Error restoring account", "name", s.name, "email", email, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Error restoring account")
 			return
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
 		"message": "Account restored successfully.",
 	})
@@ -811,7 +812,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found for the specified primary email")
 			return
 		}
-		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", primaryEmail, "error", err)
+		logger.Warn("HTTP API: Error getting account ID", "name", s.name, "email", primaryEmail, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to find account")
 		return
 	}
@@ -832,12 +833,12 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Credential with this email already exists")
 			return
 		}
-		logger.Debug("HTTP API: Error adding credential", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error adding credential", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to add credential")
 		return
 	}
 
-	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"new_email": req.Email,
 		"message":   "Credential added successfully",
 	})
@@ -855,12 +856,12 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		logger.Debug("HTTP API: Error listing credentials", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error listing credentials", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to list credentials")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":       email,
 		"credentials": credentials,
 		"count":       len(credentials),
@@ -879,7 +880,7 @@ func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		logger.Debug("HTTP API: Error getting credential details", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting credential details", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get credential details")
 		return
 	}
@@ -905,12 +906,12 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		}
 
 		// Generic server error for other issues
-		logger.Debug("HTTP API: Error deleting credential", "name", s.name, "email", email, "error", err)
+		logger.Warn("HTTP API: Error deleting credential", "name", s.name, "email", email, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete credential")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
 		"message": "Credential deleted successfully",
 	})
@@ -919,8 +920,8 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
-			"connections": []interface{}{},
+		s.writeJSON(w, http.StatusOK, map[string]any{
+			"connections": []any{},
 			"count":       0,
 			"note":        "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
 		})
@@ -928,14 +929,14 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect connections from all trackers
-	allConnections := make([]map[string]interface{}, 0)
+	allConnections := make([]map[string]any, 0)
 	for protocol, tracker := range s.connectionTrackers {
 		if tracker == nil {
 			continue
 		}
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			allConnections = append(allConnections, map[string]interface{}{
+			allConnections = append(allConnections, map[string]any{
 				"protocol":    protocol,
 				"account_id":  connInfo.AccountID,
 				"local_count": connInfo.LocalCount,
@@ -946,7 +947,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"connections": allConnections,
 		"count":       len(allConnections),
 		"source":      "in-memory connection tracker",
@@ -972,7 +973,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	// Get account ID from email
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", req.UserEmail, "error", err)
+		logger.Warn("HTTP API: Error getting account ID", "name", s.name, "email", req.UserEmail, "error", err)
 		s.writeError(w, http.StatusNotFound, "User not found")
 		return
 	}
@@ -1005,7 +1006,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := tracker.KickUser(accountID, protocol); err != nil {
-			logger.Debug("HTTP API: Error kicking user on protocol", "name", s.name, "email", req.UserEmail, "proto", protocol, "error", err)
+			logger.Warn("HTTP API: Error kicking user on protocol", "name", s.name, "email", req.UserEmail, "proto", protocol, "error", err)
 			continue
 		}
 
@@ -1018,7 +1019,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message":   "User kicked successfully via gossip protocol",
 		"user":      req.UserEmail,
 		"protocols": kickedProtocols,
@@ -1029,7 +1030,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"total_connections":       0,
 			"connections_by_protocol": map[string]int{},
 			"note":                    "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
@@ -1051,7 +1052,7 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 		byProtocol[protocol] = count
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"total_connections":       totalConnections,
 		"connections_by_protocol": byProtocol,
 		"source":                  "in-memory connection tracker",
@@ -1064,9 +1065,9 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"email":       email,
-			"connections": []interface{}{},
+			"connections": []any{},
 			"count":       0,
 			"note":        "Connection tracking not available (requires cluster mode or backend server with tracking enabled)",
 		})
@@ -1078,13 +1079,13 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Get account ID from email
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, email)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting account ID", "name", s.name, "email", email, "error", err)
+		logger.Warn("HTTP API: Error getting account ID", "name", s.name, "email", email, "error", err)
 		s.writeError(w, http.StatusNotFound, "User not found")
 		return
 	}
 
 	// Collect connections for this user from all trackers
-	userConnections := make([]map[string]interface{}, 0)
+	userConnections := make([]map[string]any, 0)
 	for protocol, tracker := range s.connectionTrackers {
 		if tracker == nil {
 			continue
@@ -1092,7 +1093,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
 			if connInfo.AccountID == accountID {
-				userConnections = append(userConnections, map[string]interface{}{
+				userConnections = append(userConnections, map[string]any{
 					"protocol":    protocol,
 					"account_id":  accountID,
 					"email":       connInfo.Username,
@@ -1104,7 +1105,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":       email,
 		"connections": userConnections,
 		"count":       len(userConnections),
@@ -1120,7 +1121,7 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.cache.GetStats()
 	if err != nil {
-		logger.Debug("HTTP API: Error getting cache stats", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting cache stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats")
 		return
 	}
@@ -1147,12 +1148,12 @@ func (s *Server) handleCacheMetrics(w http.ResponseWriter, r *http.Request) {
 		// Get latest metrics
 		metrics, err := s.rdb.GetLatestCacheMetricsWithRetry(ctx)
 		if err != nil {
-			logger.Debug("HTTP API: Error getting latest cache metrics", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error getting latest cache metrics", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get latest cache metrics")
 			return
 		}
 
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"metrics": metrics,
 			"count":   len(metrics),
 		})
@@ -1172,12 +1173,12 @@ func (s *Server) handleCacheMetrics(w http.ResponseWriter, r *http.Request) {
 
 		metrics, err := s.rdb.GetCacheMetricsWithRetry(ctx, instanceID, since, limit)
 		if err != nil {
-			logger.Debug("HTTP API: Error getting cache metrics", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error getting cache metrics", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get cache metrics")
 			return
 		}
 
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"metrics":     metrics,
 			"count":       len(metrics),
 			"instance_id": instanceID,
@@ -1197,7 +1198,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Get stats before purge
 	statsBefore, err := s.cache.GetStats()
 	if err != nil {
-		logger.Debug("HTTP API: Error getting cache stats before purge", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting cache stats before purge", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats before purge")
 		return
 	}
@@ -1205,7 +1206,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Purge cache
 	err = s.cache.PurgeAll(ctx)
 	if err != nil {
-		logger.Debug("HTTP API: Error purging cache", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error purging cache", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to purge cache")
 		return
 	}
@@ -1213,12 +1214,12 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	// Get stats after purge
 	statsAfter, err := s.cache.GetStats()
 	if err != nil {
-		logger.Debug("HTTP API: Error getting cache stats after purge", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting cache stats after purge", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get cache stats after purge")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message":      "Cache purged successfully",
 		"stats_before": statsBefore,
 		"stats_after":  statsAfter,
@@ -1233,7 +1234,7 @@ func (s *Server) handleHealthOverview(w http.ResponseWriter, r *http.Request) {
 
 	overview, err := s.rdb.GetSystemHealthOverviewWithRetry(ctx, hostname)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting health overview", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting health overview", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get health overview")
 		return
 	}
@@ -1249,12 +1250,12 @@ func (s *Server) handleHealthStatusByHost(w http.ResponseWriter, r *http.Request
 
 	statuses, err := s.rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting health statuses for host", "name", s.name, "hostname", hostname, "error", err)
+		logger.Warn("HTTP API: Error getting health statuses for host", "name", s.name, "hostname", hostname, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get health statuses for host")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"hostname": hostname,
 		"statuses": statuses,
 		"count":    len(statuses),
@@ -1305,12 +1306,12 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 
 		history, err := s.rdb.GetHealthHistoryWithRetry(ctx, hostname, component, since, limit)
 		if err != nil {
-			logger.Debug("HTTP API: Error getting health history", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error getting health history", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get health history")
 			return
 		}
 
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"hostname":  hostname,
 			"component": component,
 			"history":   history,
@@ -1346,12 +1347,12 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 	// Get uploader stats
 	stats, err := s.rdb.GetUploaderStatsWithRetry(ctx, maxAttempts)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting uploader stats", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting uploader stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get uploader stats")
 		return
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"stats": stats,
 	}
 
@@ -1367,7 +1368,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 
 		failedUploads, err := s.rdb.GetFailedUploadsWithRetry(ctx, maxAttempts, failedLimit)
 		if err != nil {
-			logger.Debug("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
+			logger.Warn("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to get failed uploads")
 			return
 		}
@@ -1402,12 +1403,12 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 
 	failedUploads, err := s.rdb.GetFailedUploadsWithRetry(ctx, maxAttempts, limit)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting failed uploads", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get failed uploads")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"failed_uploads": failedUploads,
 		"count":          len(failedUploads),
 		"max_attempts":   maxAttempts,
@@ -1433,12 +1434,12 @@ func (s *Server) handleAuthStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.rdb.GetAuthAttemptsStatsWithRetry(ctx, windowDuration)
 	if err != nil {
-		logger.Debug("HTTP API: Error getting auth stats", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error getting auth stats", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to get auth stats")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"stats":          stats,
 		"window":         windowDuration.String(),
 		"window_seconds": int64(windowDuration.Seconds()),
@@ -1503,12 +1504,12 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		logger.Debug("HTTP API: Error listing deleted messages", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error listing deleted messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error listing deleted messages")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":    email,
 		"messages": messages,
 		"total":    len(messages),
@@ -1573,12 +1574,12 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		logger.Debug("HTTP API: Error restoring messages", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error restoring messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error restoring messages")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":    email,
 		"restored": count,
 		"message":  fmt.Sprintf("Successfully restored %d message(s)", count),
@@ -1602,7 +1603,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 	// Return basic configuration information (non-sensitive)
 	// This is useful for debugging and system information
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"server_type": "sora-http-api",
 		"features_enabled": map[string]bool{
 			"account_management":    true,

@@ -13,14 +13,14 @@ func TestWarmupInterval(t *testing.T) {
 		warmupInterval: 100 * time.Millisecond,
 	}
 
-	userID := int64(123)
+	AccountID := int64(123)
 	now := time.Now()
 
 	// Simulate first warmup - record timestamp
-	server.lastWarmupTimes.Store(userID, now)
+	server.lastWarmupTimes.Store(AccountID, now)
 
 	// Check immediately - should be within interval
-	if lastWarmupRaw, ok := server.lastWarmupTimes.Load(userID); ok {
+	if lastWarmupRaw, ok := server.lastWarmupTimes.Load(AccountID); ok {
 		lastWarmup := lastWarmupRaw.(time.Time)
 		timeSinceLastWarmup := time.Since(lastWarmup)
 		if timeSinceLastWarmup >= server.warmupInterval {
@@ -34,7 +34,7 @@ func TestWarmupInterval(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Check after interval - should allow warmup
-	if lastWarmupRaw, ok := server.lastWarmupTimes.Load(userID); ok {
+	if lastWarmupRaw, ok := server.lastWarmupTimes.Load(AccountID); ok {
 		lastWarmup := lastWarmupRaw.(time.Time)
 		timeSinceLastWarmup := time.Since(lastWarmup)
 		if timeSinceLastWarmup < server.warmupInterval {
@@ -98,14 +98,14 @@ func TestWarmupIntervalConcurrentAccess(t *testing.T) {
 		warmupInterval: 1 * time.Hour,
 	}
 
-	userID := int64(123)
+	AccountID := int64(123)
 	now := time.Now()
 
 	// Simulate concurrent stores
 	done := make(chan bool, 10)
 	for i := 0; i < 10; i++ {
 		go func(offset time.Duration) {
-			server.lastWarmupTimes.Store(userID, now.Add(offset))
+			server.lastWarmupTimes.Store(AccountID, now.Add(offset))
 			done <- true
 		}(time.Duration(i) * time.Millisecond)
 	}
@@ -116,7 +116,7 @@ func TestWarmupIntervalConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify we can load without panic
-	if _, ok := server.lastWarmupTimes.Load(userID); !ok {
+	if _, ok := server.lastWarmupTimes.Load(AccountID); !ok {
 		t.Error("Expected timestamp to be stored after concurrent access")
 	}
 }

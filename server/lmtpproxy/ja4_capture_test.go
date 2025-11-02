@@ -32,7 +32,7 @@ func TestLMTPProxyJA4ForwardingCode(t *testing.T) {
 	t.Log("✓ Backend receives JA4 for mail delivery filtering")
 
 	// Verify Session type exists (compile-time check)
-	var _ interface{} = (*Session)(nil)
+	var _ any = (*Session)(nil)
 
 	t.Log("✓ LMTP proxy Session type exists")
 }

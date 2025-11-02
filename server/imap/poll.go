@@ -12,14 +12,14 @@ import (
 func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	// If the session is closing, don't try to poll.
 	if s.ctx.Err() != nil {
-		s.Log("[POLL] Session context is cancelled, skipping poll.")
+		s.DebugLog("[POLL] Session context is cancelled, skipping poll.")
 		return nil
 	}
 
 	// First phase: Read state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[POLL] Failed to acquire read lock within timeout")
+		s.DebugLog("[POLL] Failed to acquire read lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -48,7 +48,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.Log("[POLL] Failed to acquire write lock within timeout")
+		s.DebugLog("[POLL] Failed to acquire write lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -82,7 +82,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	currentCount := s.currentNumMessages.Load()
 	messageCountChanged := false
 	if poll.NumMessages > currentCount {
-		s.Log("[POLL] Updating message count from %d to %d", currentCount, poll.NumMessages)
+		s.DebugLog("[POLL] Updating message count from %d to %d", currentCount, poll.NumMessages)
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
 		messageCountChanged = true
@@ -99,18 +99,18 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 		// Check if we've already processed an expunge for this sequence number
 		if expungedSeqNums[update.SeqNum] {
-			s.Log("[POLL] Skipping duplicate expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
+			s.DebugLog("[POLL] Skipping duplicate expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
 			continue
 		}
 
 		// Validate sequence number is within range
 		currentMessages := s.currentNumMessages.Load()
 		if update.SeqNum > currentMessages {
-			s.Log("[POLL] WARNING: Expunge sequence number %d out of range (mailbox has %d messages), skipping", update.SeqNum, currentMessages)
+			s.DebugLog("[POLL] WARNING: Expunge sequence number %d out of range (mailbox has %d messages), skipping", update.SeqNum, currentMessages)
 			continue
 		}
 
-		s.Log("[POLL] Processing expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
+		s.DebugLog("[POLL] Processing expunge update for seq %d (UID %d)", update.SeqNum, update.UID)
 		s.mailboxTracker.QueueExpunge(update.SeqNum)
 		// Atomically decrement the current number of messages
 		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
@@ -122,7 +122,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// Update message count again if it has decreased (after expunges)
 	finalCount := s.currentNumMessages.Load()
 	if poll.NumMessages < finalCount {
-		s.Log("[POLL] Adjusting message count from %d to %d after expunges", finalCount, poll.NumMessages)
+		s.DebugLog("[POLL] Adjusting message count from %d to %d after expunges", finalCount, poll.NumMessages)
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
 	}

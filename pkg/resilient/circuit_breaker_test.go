@@ -119,7 +119,7 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 				breaker := circuitbreaker.NewCircuitBreaker(querySettings)
 
 				// Execute operation through circuit breaker
-				_, err := breaker.Execute(func() (interface{}, error) {
+				_, err := breaker.Execute(func() (any, error) {
 					return nil, tt.err
 				})
 
@@ -188,7 +188,7 @@ func TestCircuitBreakerBusinessLogicErrors(t *testing.T) {
 
 				breaker := circuitbreaker.NewCircuitBreaker(writeSettings)
 
-				_, execErr := breaker.Execute(func() (interface{}, error) {
+				_, execErr := breaker.Execute(func() (any, error) {
 					return nil, tt.err
 				})
 
@@ -248,7 +248,7 @@ func TestCircuitBreakerAuthenticationFailures(t *testing.T) {
 
 	// Simulate 20 consecutive authentication failures (user not found)
 	for i := 0; i < 20; i++ {
-		_, err := breaker.Execute(func() (interface{}, error) {
+		_, err := breaker.Execute(func() (any, error) {
 			// Simulate database query returning "user not found"
 			return nil, consts.ErrUserNotFound
 		})
@@ -305,7 +305,7 @@ func TestCircuitBreakerSystemFailures(t *testing.T) {
 	// Simulate 3 system failures (database connection errors)
 	systemError := errors.New("database connection failed")
 	for i := 0; i < 2; i++ {
-		_, execErr := breaker.Execute(func() (interface{}, error) {
+		_, execErr := breaker.Execute(func() (any, error) {
 			return nil, systemError
 		})
 
@@ -326,7 +326,7 @@ func TestCircuitBreakerSystemFailures(t *testing.T) {
 	}
 
 	// Execute third failure which should open the circuit
-	_, execErr := breaker.Execute(func() (interface{}, error) {
+	_, execErr := breaker.Execute(func() (any, error) {
 		return nil, systemError
 	})
 
@@ -340,7 +340,7 @@ func TestCircuitBreakerSystemFailures(t *testing.T) {
 	}
 
 	// Verify subsequent requests are rejected with circuit breaker error
-	_, err := breaker.Execute(func() (interface{}, error) {
+	_, err := breaker.Execute(func() (any, error) {
 		return nil, nil
 	})
 
@@ -391,7 +391,7 @@ func TestCircuitBreakerMixedErrors(t *testing.T) {
 
 	var successCount, failureCount int64
 	for _, testErr := range testErrors {
-		breaker.Execute(func() (interface{}, error) {
+		breaker.Execute(func() (any, error) {
 			return nil, testErr
 		})
 
@@ -419,7 +419,7 @@ func TestCircuitBreakerMixedErrors(t *testing.T) {
 	}
 
 	// Add one more system failure to cross the 60% threshold
-	breaker.Execute(func() (interface{}, error) {
+	breaker.Execute(func() (any, error) {
 		return nil, errors.New("timeout")
 	})
 

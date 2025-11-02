@@ -3,10 +3,11 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
 )
@@ -42,7 +43,7 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// Get mailboxes from database
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, subscribedOnly)
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error retrieving mailboxes: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving mailboxes: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
 		return
 	}
@@ -53,13 +54,13 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		// Get message counts
 		total, err := s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
 		if err != nil {
-			logger.Debug("HTTP Mail API: Error getting message count for %s: %v", "name", s.name, "param", mb.Name, err)
+			logger.Warn("HTTP Mail API: Error getting message count for %s: %v", "name", s.name, "param", mb.Name, err)
 			total = 0 // Continue with zero count on error
 		}
 
 		unseen, err := s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
 		if err != nil {
-			logger.Debug("HTTP Mail API: Error getting unseen count for %s: %v", "name", s.name, "param", mb.Name, err)
+			logger.Warn("HTTP Mail API: Error getting unseen count for %s: %v", "name", s.name, "param", mb.Name, err)
 			unseen = 0 // Continue with zero count on error
 		}
 
@@ -73,7 +74,7 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"mailboxes": mailboxInfos,
 		"count":     len(mailboxInfos),
 	})
@@ -113,12 +114,12 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Mailbox already exists")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error creating mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error creating mailbox: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to create mailbox")
 		return
 	}
 
-	s.writeJSON(w, http.StatusCreated, map[string]interface{}{
+	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"message": "Mailbox created successfully",
 		"name":    req.Name,
 	})
@@ -154,12 +155,12 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error deleting mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error deleting mailbox: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete mailbox")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "Mailbox deleted successfully",
 		"name":    name,
 	})
@@ -189,12 +190,12 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error subscribing to mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error subscribing to mailbox: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to subscribe to mailbox")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message":    "Subscribed to mailbox successfully",
 		"name":       name,
 		"subscribed": true,
@@ -225,12 +226,12 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error unsubscribing from mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error unsubscribing from mailbox: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to unsubscribe from mailbox")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message":    "Unsubscribed from mailbox successfully",
 		"name":       name,
 		"subscribed": false,

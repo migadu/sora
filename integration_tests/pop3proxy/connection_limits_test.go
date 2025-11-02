@@ -45,7 +45,7 @@ func TestPOP3ProxyPerIPConnectionLimiting(t *testing.T) {
 	// Test 1: Connections from localhost (NOT in trusted networks) should be limited
 	t.Log("\n--- Test 1: Non-trusted IP (localhost) should be limited to maxPerIP ---")
 
-	var connections []interface{} // We'll use net.Conn for TCP-level testing
+	var connections []any // We'll use net.Conn for TCP-level testing
 	defer func() {
 		for _, c := range connections {
 			if c != nil {

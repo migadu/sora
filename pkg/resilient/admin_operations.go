@@ -14,7 +14,7 @@ import (
 // --- Admin Credentials Wrappers ---
 
 func (rd *ResilientDatabase) AddCredentialWithRetry(ctx context.Context, req db.AddCredentialRequest) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).AddCredential(ctx, tx, req)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -22,7 +22,7 @@ func (rd *ResilientDatabase) AddCredentialWithRetry(ctx context.Context, req db.
 }
 
 func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email string) ([]db.Credential, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).ListCredentials(ctx, email)
 	}
 	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -33,7 +33,7 @@ func (rd *ResilientDatabase) ListCredentialsWithRetry(ctx context.Context, email
 }
 
 func (rd *ResilientDatabase) DeleteCredentialWithRetry(ctx context.Context, email string) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).DeleteCredential(ctx, tx, email)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -41,7 +41,7 @@ func (rd *ResilientDatabase) DeleteCredentialWithRetry(ctx context.Context, emai
 }
 
 func (rd *ResilientDatabase) GetCredentialDetailsWithRetry(ctx context.Context, email string) (*db.CredentialDetails, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetCredentialDetails(ctx, email)
 	}
 	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op, consts.ErrUserNotFound)
@@ -64,7 +64,7 @@ var adminRetryConfig = retry.BackoffConfig{
 }
 
 func (rd *ResilientDatabase) CreateAccountWithRetry(ctx context.Context, req db.CreateAccountRequest) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).CreateAccount(ctx, tx, req)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -72,7 +72,7 @@ func (rd *ResilientDatabase) CreateAccountWithRetry(ctx context.Context, req db.
 }
 
 func (rd *ResilientDatabase) CreateAccountWithCredentialsWithRetry(ctx context.Context, req db.CreateAccountWithCredentialsRequest) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CreateAccountWithCredentials(ctx, tx, req)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -83,7 +83,7 @@ func (rd *ResilientDatabase) CreateAccountWithCredentialsWithRetry(ctx context.C
 }
 
 func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.AccountSummary, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).ListAccounts(ctx)
 	}
 	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -100,7 +100,7 @@ func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.A
 }
 
 func (rd *ResilientDatabase) GetAccountDetailsWithRetry(ctx context.Context, email string) (*db.AccountDetails, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetAccountDetails(ctx, email)
 	}
 	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op, consts.ErrUserNotFound)
@@ -111,7 +111,7 @@ func (rd *ResilientDatabase) GetAccountDetailsWithRetry(ctx context.Context, ema
 }
 
 func (rd *ResilientDatabase) UpdateAccountWithRetry(ctx context.Context, req db.UpdateAccountRequest) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).UpdateAccount(ctx, tx, req)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -119,7 +119,7 @@ func (rd *ResilientDatabase) UpdateAccountWithRetry(ctx context.Context, req db.
 }
 
 func (rd *ResilientDatabase) DeleteAccountWithRetry(ctx context.Context, email string) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).DeleteAccount(ctx, tx, email)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -127,7 +127,7 @@ func (rd *ResilientDatabase) DeleteAccountWithRetry(ctx context.Context, email s
 }
 
 func (rd *ResilientDatabase) RestoreAccountWithRetry(ctx context.Context, email string) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).RestoreAccount(ctx, tx, email)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
@@ -135,7 +135,7 @@ func (rd *ResilientDatabase) RestoreAccountWithRetry(ctx context.Context, email 
 }
 
 func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupFailedUploads(ctx, tx, gracePeriod)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -156,7 +156,7 @@ func (rd *ResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.Cont
 		OperationName:   "db_importer_insert_message",
 	}
 
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		id, u, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessageFromImporter(ctx, tx, options)
 		if opErr != nil {
 			return nil, opErr
@@ -178,7 +178,7 @@ func (rd *ResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.Cont
 }
 
 func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupSoftDeletedAccounts(ctx, tx, gracePeriod)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -189,7 +189,7 @@ func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Con
 }
 
 func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupOldVacationResponses(ctx, tx, gracePeriod)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -200,7 +200,7 @@ func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Co
 }
 
 func (rd *ResilientDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupOldHealthStatuses(ctx, tx, retention)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -211,7 +211,7 @@ func (rd *ResilientDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Conte
 }
 
 func (rd *ResilientDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, batchSize int) ([]db.UserScopedObjectForCleanup, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetUserScopedObjectsForCleanup(ctx, gracePeriod, batchSize)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
@@ -222,7 +222,7 @@ func (rd *ResilientDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context
 }
 
 func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).PruneOldMessageBodies(ctx, tx, retention)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -233,7 +233,7 @@ func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context,
 }
 
 func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetUnusedContentHashes(ctx, batchSize)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
@@ -244,7 +244,7 @@ func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context
 }
 
 func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int) ([]int64, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetDanglingAccountsForFinalDeletion(ctx, batchSize)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
@@ -255,7 +255,7 @@ func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx co
 }
 
 func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).DeleteExpungedMessagesByS3KeyPartsBatch(ctx, tx, candidates)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -266,7 +266,7 @@ func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ct
 }
 
 func (rd *ResilientDatabase) DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).DeleteMessageContentsByHashBatch(ctx, tx, hashes)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -277,7 +277,7 @@ func (rd *ResilientDatabase) DeleteMessageContentsByHashBatchWithRetry(ctx conte
 }
 
 func (rd *ResilientDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).FinalizeAccountDeletions(ctx, tx, accountIDs)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -290,8 +290,8 @@ func (rd *ResilientDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Conte
 // --- Resilient Execution Helpers ---
 
 // executeWriteInTxWithRetry provides a generic wrapper for executing a write operation within a resilient, retriable transaction.
-func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (interface{}, error), nonRetryableErrors ...error) (interface{}, error) {
-	var result interface{}
+func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
+	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
 		if err != nil {
@@ -305,7 +305,7 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 		opCtx, cancel := rd.withTimeout(ctx, opType)
 		defer cancel()
 
-		res, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+		res, cbErr := rd.writeBreaker.Execute(func() (any, error) {
 			return op(opCtx, tx)
 		})
 		if cbErr != nil {
@@ -334,13 +334,13 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 }
 
 // executeReadWithRetry provides a generic wrapper for executing a read operation with retries and circuit breaker protection.
-func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (interface{}, error), nonRetryableErrors ...error) (interface{}, error) {
-	var result interface{}
+func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		opCtx, cancel := rd.withTimeout(ctx, opType)
 		defer cancel()
 
-		res, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
+		res, cbErr := rd.queryBreaker.Execute(func() (any, error) {
 			return op(opCtx)
 		})
 		if cbErr != nil {

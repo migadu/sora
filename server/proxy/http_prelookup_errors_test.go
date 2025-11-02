@@ -70,7 +70,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_MissingAddress",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
 					"server":        "backend:143",
 					// address is missing (required)
@@ -84,7 +84,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_EmptyAddress",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "",
 					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
 					"server":        "backend:143",
@@ -98,7 +98,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_MissingHashedPassword",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address": "user@example.com",
 					"server":  "backend:143",
 					// password_hash is missing
@@ -112,7 +112,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_EmptyHashedPassword",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "",
 					"server":        "backend:143",
@@ -126,7 +126,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_MissingServerIP",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
 					// server is missing - should be treated as 404
@@ -140,7 +140,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			name: "200_ValidResponse",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
+				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash of "password"
 					"server":        "backend:143",
@@ -332,7 +332,7 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 		} else {
 			// Return success to allow half-open transition
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			json.NewEncoder(w).Encode(map[string]any{
 				"address":       "user@example.com",
 				"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
 				"server":        "backend:143",
@@ -391,7 +391,7 @@ func TestHTTPPrelookupInvalidEmail(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
 			"address":       "user@example.com",
 			"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
 			"server":        "backend:143",

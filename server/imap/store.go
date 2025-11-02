@@ -13,7 +13,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	// Acquire read mutex to safely read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[STORE] Failed to acquire read lock within timeout")
+		s.DebugLog("[STORE] Failed to acquire read lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -23,7 +23,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	if s.selectedMailbox == nil {
 		release()
-		s.Log("[STORE] store failed: no mailbox selected")
+		s.DebugLog("[STORE] store failed: no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -56,12 +56,12 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Check required permissions
 	if needsWrite {
-		hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 'w')
+		hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 'w')
 		if err != nil {
 			return s.internalError("failed to check write permission: %v", err)
 		}
 		if !hasWriteRight {
-			s.Log("[STORE] user does not have write permission")
+			s.DebugLog("[STORE] user does not have write permission")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
@@ -70,12 +70,12 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 	if needsSeen {
-		hasSeenRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 's')
+		hasSeenRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 's')
 		if err != nil {
 			return s.internalError("failed to check seen permission: %v", err)
 		}
 		if !hasSeenRight {
-			s.Log("[STORE] user does not have seen permission")
+			s.DebugLog("[STORE] user does not have seen permission")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
@@ -84,12 +84,12 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 	if needsDelete {
-		hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 't')
+		hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 't')
 		if err != nil {
 			return s.internalError("failed to check delete permission: %v", err)
 		}
 		if !hasDeleteRight {
-			s.Log("[STORE] user does not have delete permission")
+			s.DebugLog("[STORE] user does not have delete permission")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
@@ -106,7 +106,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Check if mailbox changed during our operation
 	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.Log("[STORE] WARNING: Mailbox changed during STORE operation (modseq %d -> %d)",
+		s.DebugLog("[STORE] WARNING: Mailbox changed during STORE operation (modseq %d -> %d)",
 			modSeqSnapshot, s.currentHighestModSeq.Load())
 		// For sequence sets, this could mean we're updating wrong messages
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
@@ -128,7 +128,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Check if the context is still valid before proceeding with flag updates
 	if s.ctx.Err() != nil {
-		s.Log("[STORE] request aborted before flag updates, aborting operation")
+		s.DebugLog("[STORE] request aborted before flag updates, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during store operation",
@@ -150,7 +150,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			}
 
 			if uint64(currentModSeq) > options.UnchangedSince {
-				s.Log("[STORE] CONDSTORE: Skipping message UID %d with MODSEQ %d > UNCHANGEDSINCE %d",
+				s.DebugLog("[STORE] CONDSTORE: Skipping message UID %d with MODSEQ %d > UNCHANGEDSINCE %d",
 					msg.UID, currentModSeq, options.UnchangedSince)
 				continue
 			}
@@ -172,10 +172,10 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 
 		if newModSeq == 0 { // Should not happen if DB functions are correct
-			s.Log("[STORE] WARNING: message UID %d received zero MODSEQ after flag update", msg.UID)
+			s.DebugLog("[STORE] WARNING: message UID %d received zero MODSEQ after flag update", msg.UID)
 		}
 
-		s.Log("[STORE] operation updated message UID %d, new MODSEQ: %d", msg.UID, newModSeq)
+		s.DebugLog("[STORE] operation updated message UID %d, new MODSEQ: %d", msg.UID, newModSeq)
 
 		modifiedMessages = append(modifiedMessages, struct {
 			seq    uint32
@@ -192,14 +192,14 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// Before responding with fetches, check if context is still valid
 	if s.ctx.Err() != nil {
-		s.Log("[STORE] request aborted after flag updates, response will be incomplete")
+		s.DebugLog("[STORE] request aborted after flag updates, response will be incomplete")
 		return nil
 	}
 
 	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
 	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[STORE] Failed to acquire second read lock within timeout")
+		s.DebugLog("[STORE] Failed to acquire second read lock within timeout")
 		return nil // Continue without sending responses since we already updated the flags
 	}
 	currentSessionTracker := s.sessionTracker // Get the current session tracker
@@ -217,7 +217,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			}
 
 			if err := m.Close(); err != nil {
-				s.Log("[STORE] WARNING: failed to close fetch response for message UID %d: %v",
+				s.DebugLog("[STORE] WARNING: failed to close fetch response for message UID %d: %v",
 					modified.uid, err)
 			}
 		}

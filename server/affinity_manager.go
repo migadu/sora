@@ -451,7 +451,7 @@ func (am *AffinityManager) Stop() {
 }
 
 // GetStats returns affinity statistics
-func (am *AffinityManager) GetStats(ctx context.Context) map[string]interface{} {
+func (am *AffinityManager) GetStats(ctx context.Context) map[string]any {
 	if am == nil {
 		return nil
 	}
@@ -459,7 +459,7 @@ func (am *AffinityManager) GetStats(ctx context.Context) map[string]interface{} 
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"enabled":          am.enabled,
 		"total_entries":    len(am.affinityMap),
 		"ttl":              am.defaultTTL.String(),

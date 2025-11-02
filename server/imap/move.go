@@ -17,7 +17,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	// Acquire read mutex to safely read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[MOVE] Failed to acquire read lock within timeout")
+		s.DebugLog("[MOVE] Failed to acquire read lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -27,7 +27,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	if s.selectedMailbox == nil {
 		release() // Release read lock
-		s.Log("[MOVE] no mailbox selected")
+		s.DebugLog("[MOVE] no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -41,9 +41,9 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	release() // Release read lock
 
 	// Perform database operations outside of lock
-	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.UserID(), dest)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), dest)
 	if err != nil {
-		s.Log("[MOVE] destination mailbox '%s' not found: %v", dest, err)
+		s.DebugLog("[MOVE] destination mailbox '%s' not found: %v", dest, err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTryCreate,
@@ -52,12 +52,12 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	// Check ACL permissions on destination - requires 'i' (insert) right
-	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, s.UserID(), 'i')
+	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, s.AccountID(), 'i')
 	if err != nil {
 		return s.internalError("failed to check insert permission on destination: %v", err)
 	}
 	if !hasInsertRight {
-		s.Log("[MOVE] user does not have insert permission on destination mailbox '%s'", dest)
+		s.DebugLog("[MOVE] user does not have insert permission on destination mailbox '%s'", dest)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -66,16 +66,16 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	// Check ACL permissions on source - requires 't' (delete-msg) and 'e' (expunge) rights
-	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 't')
+	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 't')
 	if err != nil {
 		return s.internalError("failed to check delete permission on source: %v", err)
 	}
-	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.UserID(), 'e')
+	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 'e')
 	if err != nil {
 		return s.internalError("failed to check expunge permission on source: %v", err)
 	}
 	if !hasDeleteRight || !hasExpungeRight {
-		s.Log("[MOVE] user does not have delete/expunge permission on source mailbox")
+		s.DebugLog("[MOVE] user does not have delete/expunge permission on source mailbox")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -85,7 +85,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before proceeding
 	if s.ctx.Err() != nil {
-		s.Log("[MOVE] request aborted before message retrieval, aborting operation")
+		s.DebugLog("[MOVE] request aborted before message retrieval, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",
@@ -104,14 +104,14 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before attempting the move
 	if s.ctx.Err() != nil {
-		s.Log("[MOVE] request aborted before moving messages, aborting operation")
+		s.DebugLog("[MOVE] request aborted before moving messages, aborting operation")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",
 		}
 	}
 
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, s.UserID())
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, s.AccountID())
 	if err != nil {
 		return s.internalError("failed to move messages: %v", err)
 	}
@@ -135,17 +135,17 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			return s.internalError("failed to write COPYUID: %v", err)
 		}
 	} else {
-		s.Log("[MOVE] no messages were moved (potentially already expunged), skipping COPYUID response")
+		s.DebugLog("[MOVE] no messages were moved (potentially already expunged), skipping COPYUID response")
 	}
 
 	isTrashFolder := strings.EqualFold(dest, "Trash") || dest == consts.MailboxTrash
 	if isTrashFolder && len(mappedDestUIDs) > 0 {
-		s.Log("[MOVE] automatically marking %d moved messages as seen in Trash folder", len(mappedDestUIDs))
+		s.DebugLog("[MOVE] automatically marking %d moved messages as seen in Trash folder", len(mappedDestUIDs))
 
 		for _, uid := range mappedDestUIDs {
 			_, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
 			if err != nil {
-				s.Log("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
+				s.DebugLog("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
 				// Continue with other messages even if one fails
 			}
 		}

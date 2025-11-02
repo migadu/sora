@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/consts"
@@ -74,7 +75,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error retrieving credentials: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving credentials: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Authentication failed")
 		return
 	}
@@ -88,7 +89,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate JWT token
 	token, expiresAt, err := s.generateToken(req.Email, accountID)
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error generating token: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error generating token: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
 		return
 	}
@@ -128,7 +129,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// Generate new token with extended expiration
 	newToken, expiresAt, err := s.generateToken(claims.Email, claims.AccountID)
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error generating refresh token: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error generating refresh token: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
 		return
 	}
@@ -169,7 +170,7 @@ func (s *Server) generateToken(email string, accountID int64) (string, time.Time
 
 // validateToken validates a JWT token and returns the claims
 func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (any, error) {
 		// Verify signing method
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -197,10 +198,10 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 			clientIP := getClientIP(r)
 			if isIPAllowed(clientIP, s.allowedHosts) {
 				// Trust the proxy's authentication - extract user info from headers
-				forwardedUserIDStr := r.Header.Get("X-Forwarded-User-ID")
+				forwardedAccountIDStr := r.Header.Get("X-Forwarded-User-ID")
 				var accountID int64
-				if forwardedUserIDStr != "" {
-					if id, err := fmt.Sscanf(forwardedUserIDStr, "%d", &accountID); err == nil && id == 1 {
+				if forwardedAccountIDStr != "" {
+					if id, err := fmt.Sscanf(forwardedAccountIDStr, "%d", &accountID); err == nil && id == 1 {
 						// Successfully parsed account ID
 						ctx := context.WithValue(r.Context(), contextKeyEmail, forwardedUser)
 						ctx = context.WithValue(ctx, contextKeyAccountID, accountID)
@@ -235,7 +236,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		// Validate token
 		claims, err := s.validateToken(tokenString)
 		if err != nil {
-			logger.Debug("HTTP Mail API: Token validation error: %v", "name", s.name, "param", err)
+			logger.Warn("HTTP Mail API: Token validation error: %v", "name", s.name, "param", err)
 			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
 			return
 		}

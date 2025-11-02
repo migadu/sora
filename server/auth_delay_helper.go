@@ -2,9 +2,10 @@ package server
 
 import (
 	"context"
-	"github.com/migadu/sora/logger"
 	"net"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 // AuthDelayHelper provides delay functionality for authentication rate limiting
@@ -13,7 +14,7 @@ type AuthDelayHelper interface {
 }
 
 // ApplyAuthenticationDelay applies progressive delays before authentication attempts
-func ApplyAuthenticationDelay(ctx context.Context, limiter interface{}, remoteAddr net.Addr, protocol string) {
+func ApplyAuthenticationDelay(ctx context.Context, limiter any, remoteAddr net.Addr, protocol string) {
 	delayHelper, ok := limiter.(AuthDelayHelper)
 	if !ok || delayHelper == nil {
 		return

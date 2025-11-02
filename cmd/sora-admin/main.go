@@ -42,7 +42,7 @@ type AdminConfig struct {
 	Uploader                  config.UploaderConfig        `toml:"uploader"`
 	Cleanup                   config.CleanupConfig         `toml:"cleanup"`
 	SharedMailboxes           config.SharedMailboxesConfig `toml:"shared_mailboxes"`
-	Server                    []map[string]interface{}     `toml:"server"`                        // Ignore server config array, not needed for admin commands
+	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
 	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
 	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
@@ -1252,13 +1252,13 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		return fmt.Errorf("kick failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	fmt.Printf("\n✅ %s\n", result["message"])
-	if protocols, ok := result["protocols"].([]interface{}); ok {
+	if protocols, ok := result["protocols"].([]any); ok {
 		fmt.Printf("   Protocols: %v\n", protocols)
 	}
 	if note, ok := result["note"].(string); ok {
@@ -2659,6 +2659,8 @@ func handleImportMaildir(ctx context.Context) {
 	email := fs.String("email", "", "Email address for the account to import mail to (required)")
 	maildirPath := fs.String("maildir-path", "", "Path to the maildir to import (required)")
 	jobs := fs.Int("jobs", 4, "Number of parallel import jobs")
+	batchSize := fs.Int("batch-size", 20, "Number of messages to process in each batch (default: 20)")
+	batchTxMode := fs.Bool("batch-transaction", false, "Use single transaction per batch (20x faster but less resilient)")
 	dryRun := fs.Bool("dry-run", false, "Preview what would be imported without making changes")
 	preserveFlags := fs.Bool("preserve-flags", true, "Preserve maildir flags (Seen, Answered, etc)")
 	showProgress := fs.Bool("progress", true, "Show import progress")
@@ -2682,6 +2684,8 @@ Options:
   --email string          Email address for the account to import mail to (required)
   --maildir-path string   Path to the maildir root directory (must contain cur/, new/, tmp/) (required)
   --jobs int              Number of parallel import jobs (default: 4)
+  --batch-size int        Number of messages to process in each batch (default: 20)
+  --batch-transaction     Use single transaction per batch (20x faster but less resilient, default: false)
   --dry-run               Preview what would be imported without making changes
   --preserve-flags        Preserve maildir flags (default: true)  
   --progress              Show import progress (default: true)
@@ -2820,19 +2824,21 @@ Examples:
 
 	// Create importer options
 	options := ImporterOptions{
-		DryRun:        *dryRun,
-		StartDate:     startDateParsed,
-		EndDate:       endDateParsed,
-		MailboxFilter: mailboxList,
-		PreserveFlags: *preserveFlags,
-		ShowProgress:  *showProgress,
-		ForceReimport: *forceReimport,
-		CleanupDB:     *cleanupDB,
-		Dovecot:       *dovecot,
-		ImportDelay:   *delay,
-		SievePath:     *sievePath,
-		PreserveUIDs:  *preserveUIDs || *dovecot,
-		FTSRetention:  ftsRetention,
+		DryRun:               *dryRun,
+		StartDate:            startDateParsed,
+		EndDate:              endDateParsed,
+		MailboxFilter:        mailboxList,
+		PreserveFlags:        *preserveFlags,
+		ShowProgress:         *showProgress,
+		ForceReimport:        *forceReimport,
+		CleanupDB:            *cleanupDB,
+		Dovecot:              *dovecot,
+		ImportDelay:          *delay,
+		SievePath:            *sievePath,
+		PreserveUIDs:         *preserveUIDs || *dovecot,
+		FTSRetention:         ftsRetention,
+		BatchSize:            *batchSize,
+		BatchTransactionMode: *batchTxMode,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)
@@ -4325,7 +4331,7 @@ func showLatestCacheMetrics(ctx context.Context, rdb *resilient.ResilientDatabas
 	if jsonOutput {
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
-		return encoder.Encode(map[string]interface{}{
+		return encoder.Encode(map[string]any{
 			"metrics":   metrics,
 			"timestamp": time.Now(),
 		})
@@ -4393,7 +4399,7 @@ func showHistoricalCacheMetrics(ctx context.Context, rdb *resilient.ResilientDat
 	if jsonOutput {
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
-		return encoder.Encode(map[string]interface{}{
+		return encoder.Encode(map[string]any{
 			"metrics":   metrics,
 			"since":     since,
 			"timestamp": time.Now(),
@@ -4894,7 +4900,7 @@ Use 'sora-admin affinity <subcommand> --help' for detailed help.
 }
 
 // callAdminAPI makes an HTTP request to the admin API server
-func callAdminAPI(ctx context.Context, addr, apiKey, method, path string, body interface{}) (map[string]interface{}, error) {
+func callAdminAPI(ctx context.Context, addr, apiKey, method, path string, body any) (map[string]any, error) {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -4935,7 +4941,7 @@ func callAdminAPI(ctx context.Context, addr, apiKey, method, path string, body i
 		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}

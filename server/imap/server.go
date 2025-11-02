@@ -695,6 +695,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Stats = s
 	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
 
+	// Log connection at INFO level
+	session.Log("connected")
+
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
 	}
@@ -962,33 +965,33 @@ func (c *proxyProtocolConn) Unwrap() net.Conn {
 // WarmupCache pre-fetches recent messages for a user to improve performance when they reconnect
 // This method fetches message content from S3 and stores it in the local cache
 // It only runs if enough time has passed since the last warmup for this user (controlled by warmupInterval)
-func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames []string, messageCount int, async bool) error {
+func (s *IMAPServer) WarmupCache(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int, async bool) error {
 	if messageCount <= 0 || len(mailboxNames) == 0 || s.cache == nil {
 		return nil
 	}
 
 	// Check if enough time has passed since last warmup for this user
 	now := time.Now()
-	if lastWarmupRaw, ok := s.lastWarmupTimes.Load(userID); ok {
+	if lastWarmupRaw, ok := s.lastWarmupTimes.Load(AccountID); ok {
 		lastWarmup := lastWarmupRaw.(time.Time)
 		timeSinceLastWarmup := now.Sub(lastWarmup)
 		if timeSinceLastWarmup < s.warmupInterval {
-			logger.Debug("IMAP: Skipping cache warmup - too soon since last warmup", "name", s.name, "user_id", userID, "time_since_last", timeSinceLastWarmup.Round(time.Second), "min_interval", s.warmupInterval)
+			logger.Debug("IMAP: Skipping cache warmup - too soon since last warmup", "name", s.name, "account_id", AccountID, "time_since_last", timeSinceLastWarmup.Round(time.Second), "min_interval", s.warmupInterval)
 			return nil
 		}
 	}
 
 	// Update last warmup time immediately to prevent concurrent warmups
-	s.lastWarmupTimes.Store(userID, now)
+	s.lastWarmupTimes.Store(AccountID, now)
 
-	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "user_id", userID, "message_count", messageCount, "mailboxes", mailboxNames, "async", async, "timeout", s.warmupTimeout, "interval", s.warmupInterval)
+	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "account_id", AccountID, "message_count", messageCount, "mailboxes", mailboxNames, "async", async, "timeout", s.warmupTimeout, "interval", s.warmupInterval)
 
 	warmupFunc := func() {
 		// Add timeout to prevent runaway warmup operations
 		warmupCtx, cancel := context.WithTimeout(ctx, s.warmupTimeout)
 		defer cancel()
 		// Get recent message content hashes from database through cache
-		messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, userID, mailboxNames, messageCount)
+		messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, AccountID, mailboxNames, messageCount)
 		if err != nil {
 			logger.Debug("IMAP: Failed to get recent messages for warmup", "name", s.name, "error", err)
 			return
@@ -1006,9 +1009,9 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 		}
 
 		// Get user's primary email for S3 key construction
-		address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, userID)
+		address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, AccountID)
 		if err != nil {
-			logger.Debug("IMAP: Warmup - failed to get primary address", "name", s.name, "user_id", userID, "error", err)
+			logger.Debug("IMAP: Warmup - failed to get primary address", "name", s.name, "account_id", AccountID, "error", err)
 			return
 		}
 
@@ -1021,7 +1024,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 				// Check for context cancellation
 				select {
 				case <-warmupCtx.Done():
-					logger.Debug("IMAP: Warmup cancelled", "name", s.name, "user_id", userID, "error", warmupCtx.Err())
+					logger.Debug("IMAP: Warmup cancelled", "name", s.name, "account_id", AccountID, "error", warmupCtx.Err())
 					return
 				default:
 					// Continue processing
@@ -1074,7 +1077,7 @@ func (s *IMAPServer) WarmupCache(ctx context.Context, userID int64, mailboxNames
 			}
 		}
 
-		logger.Debug("IMAP: Warmup completed", "name", s.name, "user_id", userID, "cached", warmedCount, "skipped", skippedCount)
+		logger.Debug("IMAP: Warmup completed", "name", s.name, "account_id", AccountID, "cached", warmedCount, "skipped", skippedCount)
 	}
 
 	if async {

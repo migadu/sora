@@ -480,7 +480,7 @@ func TestIMAP_MetadataJSONValues(t *testing.T) {
 
 	t.Run("ComplexNestedJSON", func(t *testing.T) {
 		// Test with complex nested JSON (like the failing case)
-		complexJSON := []byte(`{"challenge":"{\"challenge\":\"55XnJr9ImtuqjE11sccap49AwO4aPROZk_OmyGYdkS0\",\"rpId\":\"localhost\",\"user_id\":\"m63y6cNGMgx6kCb01T/S8w7HxbwLcLIjwiCMuZCF/Hw=\",\"allowed_credentials\":[\"8KPfe60lAoSt1iTGJ7jBMvWxrWQ=\"],\"expires\":\"0001-01-01T00:00:00Z\",\"userVerification\":\"\"}"}`)
+		complexJSON := []byte(`{"challenge":"{\"challenge\":\"55XnJr9ImtuqjE11sccap49AwO4aPROZk_OmyGYdkS0\",\"rpId\":\"localhost\",\"account_id\":\"m63y6cNGMgx6kCb01T/S8w7HxbwLcLIjwiCMuZCF/Hw=\",\"allowed_credentials\":[\"8KPfe60lAoSt1iTGJ7jBMvWxrWQ=\"],\"expires\":\"0001-01-01T00:00:00Z\",\"userVerification\":\"\"}"}`)
 		entryName := "/private/vendor/alps/webauthn_session"
 
 		entries := map[string]*[]byte{

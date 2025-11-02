@@ -32,7 +32,7 @@ func TestPOP3ProxyJA4ForwardingCode(t *testing.T) {
 	t.Log("✓ Backend receives JA4 and can apply capability filtering")
 
 	// Verify POP3ProxySession type exists (compile-time check)
-	var _ interface{} = (*POP3ProxySession)(nil)
+	var _ any = (*POP3ProxySession)(nil)
 
 	t.Log("✓ POP3 proxy POP3ProxySession type exists")
 }

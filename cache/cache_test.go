@@ -42,7 +42,7 @@ func (m *mockSourceDatabase) FindExistingContentHashesWithRetry(ctx context.Cont
 	return existing, nil
 }
 
-func (m *mockSourceDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+func (m *mockSourceDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.warmupError != nil {

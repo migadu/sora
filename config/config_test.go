@@ -198,7 +198,7 @@ func TestDatabaseEndpointConfig_HostsWithPorts(t *testing.T) {
 	tests := []struct {
 		name     string
 		hosts    []string
-		port     interface{}
+		port     any
 		expected map[string]string // host -> expected host:port
 	}{
 		{

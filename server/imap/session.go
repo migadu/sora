@@ -113,12 +113,12 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		} else {
 			clientInfo = "unknown client"
 		}
-		s.Log("[CAPS] Applied capability filters for %s: disabled %v, %d/%d capabilities enabled",
+		s.Log("Applied capability filters for %s: disabled %v, %d/%d capabilities enabled",
 			clientInfo, disabledCaps, len(s.sessionCaps), originalCapCount)
 	}
 }
 
-func (s *IMAPSession) internalError(format string, a ...interface{}) *imap.Error {
+func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
 	s.Log(format, a...)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
@@ -338,14 +338,14 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	// Acquire read mutex with timeout to protect access to session state
 	if s.ctx.Err() != nil {
-		s.Log("[DECODE] Session context is cancelled, skipping decodeNumSet.")
+		s.DebugLog("[DECODE] Session context is cancelled, skipping decodeNumSet.")
 		// Return unmodified set if context is cancelled
 		return numSet
 	}
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[DECODE] Failed to acquire read lock for decodeNumSet within timeout")
+		s.DebugLog("[DECODE] Failed to acquire read lock for decodeNumSet within timeout")
 		// Return unmodified set if we can't acquire the lock
 		return numSet
 	}
@@ -375,7 +375,7 @@ func (s *IMAPSession) triggerCacheWarmup() {
 
 	// Call the server's main warmup logic, which handles async execution
 	// Use server appCtx instead of session ctx so warmup continues even if connection drops
-	err := s.server.WarmupCache(s.server.appCtx, s.UserID(), s.server.warmupMailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
+	err := s.server.WarmupCache(s.server.appCtx, s.AccountID(), s.server.warmupMailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
 	if err != nil {
 		// The WarmupCache method already logs its own errors, so just log a generic failure here.
 		s.Log("cache warmup trigger failed: %v", err)
@@ -390,7 +390,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 
 		clientAddr := s.conn.NetConn().RemoteAddr().String()
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), email, "IMAP", clientAddr); err != nil {
+		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
 			s.Log("Failed to register connection: %v", err)
 			return err
 		}
@@ -406,7 +406,7 @@ func (s *IMAPSession) unregisterConnection() {
 
 		clientAddr := s.conn.NetConn().RemoteAddr().String()
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.UserID(), "IMAP", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
 			s.Log("Failed to unregister connection: %v", err)
 		}
 	}
@@ -419,11 +419,11 @@ func (s *IMAPSession) startTerminationPoller() {
 	}
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(s.UserID())
+	kickChan := s.server.connTracker.RegisterSession(s.AccountID())
 
 	go func() {
 		// Unregister when done
-		defer s.server.connTracker.UnregisterSession(s.UserID(), kickChan)
+		defer s.server.connTracker.UnregisterSession(s.AccountID(), kickChan)
 
 		select {
 		case <-kickChan:

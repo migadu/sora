@@ -2,10 +2,11 @@ package userapi
 
 import (
 	"errors"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"net/url"
 	"strconv"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -75,7 +76,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error retrieving messages: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving messages: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve messages")
 		return
 	}
@@ -88,7 +89,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		total, err = s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mailboxName)
 	}
 	if err != nil {
-		logger.Debug("HTTP Mail API: Error getting message count: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error getting message count: %v", "name", s.name, "param", err)
 		total = len(messages) // Fallback to returned count
 	}
 
@@ -135,12 +136,12 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error searching messages: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error searching messages: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to search messages")
 		return
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"messages": messages,
 		"total":    len(messages),
 		"query":    searchQuery,

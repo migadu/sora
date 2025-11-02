@@ -89,14 +89,14 @@ func setupHTTPAdminAPIWithTLS(t *testing.T) (string, func()) {
 
 // testSourceDB implements cache.SourceDatabase for testing
 type testSourceDB struct {
-	rdb interface{}
+	rdb any
 }
 
 func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error) {
 	return nil, nil
 }
 
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	return nil, nil
 }
 
@@ -137,7 +137,7 @@ func TestInsecureSkipVerify_Enabled(t *testing.T) {
 	}
 
 	// Verify the response is valid JSON
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}

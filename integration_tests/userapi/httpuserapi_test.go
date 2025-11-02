@@ -81,7 +81,7 @@ func setupTestServer(t *testing.T) *TestContext {
 }
 
 // makeRequest makes an HTTP request and returns the response
-func (tc *TestContext) makeRequest(t *testing.T, method, path string, body interface{}) *http.Response {
+func (tc *TestContext) makeRequest(t *testing.T, method, path string, body any) *http.Response {
 	t.Helper()
 
 	var reqBody io.Reader
@@ -115,7 +115,7 @@ func (tc *TestContext) makeRequest(t *testing.T, method, path string, body inter
 }
 
 // parseJSON parses JSON response into target
-func parseJSON(t *testing.T, resp *http.Response, target interface{}) {
+func parseJSON(t *testing.T, resp *http.Response, target any) {
 	t.Helper()
 
 	defer resp.Body.Close()
@@ -144,7 +144,7 @@ func TestAuthentication(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var loginResp map[string]interface{}
+		var loginResp map[string]any
 		parseJSON(t, resp, &loginResp)
 
 		token, ok := loginResp["token"].(string)
@@ -188,7 +188,7 @@ func TestAuthentication(t *testing.T) {
 		}
 
 		resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-		var loginResp map[string]interface{}
+		var loginResp map[string]any
 		parseJSON(t, resp, &loginResp)
 		oldToken := loginResp["token"].(string)
 
@@ -205,7 +205,7 @@ func TestAuthentication(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var refreshResp map[string]interface{}
+		var refreshResp map[string]any
 		parseJSON(t, resp, &refreshResp)
 
 		newToken, ok := refreshResp["token"].(string)
@@ -231,7 +231,7 @@ func TestMailboxOperations(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -241,10 +241,10 @@ func TestMailboxOperations(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
-		mailboxes, ok := result["mailboxes"].([]interface{})
+		mailboxes, ok := result["mailboxes"].([]any)
 		if !ok {
 			t.Fatal("Expected mailboxes array in response")
 		}
@@ -265,7 +265,7 @@ func TestMailboxOperations(t *testing.T) {
 			t.Fatalf("Expected status 201, got %d: %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		if result["name"] != createReq["name"] {
@@ -305,7 +305,7 @@ func TestMessageOperations(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -319,14 +319,14 @@ func TestMessageOperations(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		// messages can be nil (null in JSON) for empty mailboxes
-		var messages []interface{}
+		var messages []any
 		if result["messages"] != nil {
 			var ok bool
-			messages, ok = result["messages"].([]interface{})
+			messages, ok = result["messages"].([]any)
 			if !ok {
 				t.Fatalf("Expected messages to be array or null, got %T", result["messages"])
 			}
@@ -349,7 +349,7 @@ func TestMessageOperations(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		if result["limit"].(float64) != 10 {
@@ -369,7 +369,7 @@ func TestMessageOperations(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		if result["query"] != "test" {
@@ -397,7 +397,7 @@ func TestMailboxSubscriptions(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -440,10 +440,10 @@ func TestMailboxSubscriptions(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
-		mailboxes, ok := result["mailboxes"].([]interface{})
+		mailboxes, ok := result["mailboxes"].([]any)
 		if !ok {
 			t.Fatal("Expected mailboxes array in response")
 		}
@@ -517,7 +517,7 @@ func TestMailboxEdgeCases(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -582,7 +582,7 @@ func TestMessageRetrieval(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -597,7 +597,7 @@ func TestMessageRetrieval(t *testing.T) {
 			t.Fatalf("Expected status 200 or 404, got %d", resp.StatusCode)
 		}
 		if resp.StatusCode == http.StatusOK {
-			var result map[string]interface{}
+			var result map[string]any
 			parseJSON(t, resp, &result)
 			if result["id"] == nil {
 				t.Fatal("Expected id in response")
@@ -655,7 +655,7 @@ func TestMessageFlags(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -663,7 +663,7 @@ func TestMessageFlags(t *testing.T) {
 	// Testing against non-existent messages to verify error handling
 
 	t.Run("UpdateFlags_AddFlags", func(t *testing.T) {
-		updateReq := map[string]interface{}{
+		updateReq := map[string]any{
 			"add_flags": []string{"Seen", "Flagged"},
 		}
 		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
@@ -673,7 +673,7 @@ func TestMessageFlags(t *testing.T) {
 	})
 
 	t.Run("UpdateFlags_RemoveFlags", func(t *testing.T) {
-		updateReq := map[string]interface{}{
+		updateReq := map[string]any{
 			"remove_flags": []string{"Draft"},
 		}
 		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
@@ -683,7 +683,7 @@ func TestMessageFlags(t *testing.T) {
 	})
 
 	t.Run("UpdateFlags_BothAddAndRemove", func(t *testing.T) {
-		updateReq := map[string]interface{}{
+		updateReq := map[string]any{
 			"add_flags":    []string{"Seen"},
 			"remove_flags": []string{"Draft"},
 		}
@@ -711,7 +711,7 @@ func TestSieveFilters(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -727,10 +727,10 @@ if header :contains "Subject" "[SPAM]" {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
-		scripts, ok := result["scripts"].([]interface{})
+		scripts, ok := result["scripts"].([]any)
 		if !ok {
 			t.Fatal("Expected scripts array in response")
 		}
@@ -759,7 +759,7 @@ if header :contains "Subject" "[SPAM]" {
 			t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		if result["name"] != filterName {
@@ -808,10 +808,10 @@ if header :contains "Subject" "[SPAM]" {
 			t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
-		extensions, ok := result["extensions"].([]interface{})
+		extensions, ok := result["extensions"].([]any)
 		if !ok {
 			t.Fatal("Expected extensions array in response")
 		}
@@ -847,7 +847,7 @@ func TestSearchFunctionality(t *testing.T) {
 		"password": tc.TestUser.Password,
 	}
 	resp := tc.makeRequest(t, "POST", "/user/auth/login", loginReq)
-	var loginResp map[string]interface{}
+	var loginResp map[string]any
 	parseJSON(t, resp, &loginResp)
 	tc.JWTToken = loginResp["token"].(string)
 
@@ -861,7 +861,7 @@ func TestSearchFunctionality(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 
 		if result["query"] != "test" {
@@ -875,7 +875,7 @@ func TestSearchFunctionality(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 		t.Logf("Search with from filter returned %v results", result["total"])
 	})
@@ -886,7 +886,7 @@ func TestSearchFunctionality(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 		t.Logf("Search with subject filter returned %v results", result["total"])
 	})
@@ -897,7 +897,7 @@ func TestSearchFunctionality(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d", resp.StatusCode)
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		parseJSON(t, resp, &result)
 		t.Logf("Search for unseen messages returned %v results", result["total"])
 	})

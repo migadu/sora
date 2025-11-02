@@ -46,10 +46,10 @@ type VacationOracle interface {
 	// IsVacationResponseAllowed checks if a vacation response is allowed to be sent
 	// to the given originalSender for the specified user and handle,
 	// considering the duration since the last response.
-	IsVacationResponseAllowed(ctx context.Context, userID int64, originalSender string, handle string, duration time.Duration) (bool, error)
+	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error)
 	// RecordVacationResponseSent records that a vacation response has been sent
 	// to the originalSender for the specified user and handle.
-	RecordVacationResponseSent(ctx context.Context, userID int64, originalSender string, handle string) error
+	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error
 }
 
 type Executor interface {
@@ -59,12 +59,12 @@ type Executor interface {
 // SieveExecutor implements the Executor interface using the go-sieve library
 type SieveExecutor struct {
 	script *sieve.Script
-	// policy is now initialized with userID and vacationOracle
+	// policy is now initialized with AccountID and vacationOracle
 	policy *SievePolicy
 }
 
 // NewSieveExecutor creates a new SieveExecutor with the given script content.
-// This version initializes a SievePolicy without a VacationOracle or a specific userID.
+// This version initializes a SievePolicy without a VacationOracle or a specific AccountID.
 // It's suitable for scripts that do not use vacation actions requiring persistent state,
 // or for contexts like syntax validation where policy interaction is minimal or doesn't require user context.
 // For scripts that may use vacation with persistence, use NewSieveExecutorWithOracle.
@@ -84,7 +84,7 @@ func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []st
 		return nil, err
 	}
 
-	policy := &SievePolicy{} // Basic policy, no oracle, no userID by default.
+	policy := &SievePolicy{} // Basic policy, no oracle, no AccountID by default.
 
 	return &SieveExecutor{
 		script: script,
@@ -92,13 +92,13 @@ func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []st
 	}, nil
 }
 
-// NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, userID, and vacation oracle.
-func NewSieveExecutorWithOracle(scriptContent string, userID int64, oracle VacationOracle) (Executor, error) {
-	return NewSieveExecutorWithOracleAndExtensions(scriptContent, userID, oracle, nil)
+// NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, AccountID, and vacation oracle.
+func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, oracle VacationOracle) (Executor, error) {
+	return NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, nil)
 }
 
-// NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, userID, vacation oracle, and enabled extensions.
-func NewSieveExecutorWithOracleAndExtensions(scriptContent string, userID int64, oracle VacationOracle, enabledExtensions []string) (Executor, error) {
+// NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, AccountID, vacation oracle, and enabled extensions.
+func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, oracle VacationOracle, enabledExtensions []string) (Executor, error) {
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
@@ -108,7 +108,7 @@ func NewSieveExecutorWithOracleAndExtensions(scriptContent string, userID int64,
 	}
 
 	policy := &SievePolicy{
-		userID:         userID,
+		AccountID:      AccountID,
 		vacationOracle: oracle,
 	}
 
@@ -205,7 +205,7 @@ type SievePolicy struct {
 	lastVacationHandle string // Stores the handle of the currently allowed vacation
 	vacationTriggered  bool
 
-	userID         int64
+	AccountID      int64
 	vacationOracle VacationOracle
 }
 
@@ -227,7 +227,7 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 
 	if p.vacationOracle != nil {
 		// Use the oracle for the persistent check (this is the main :days check)
-		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.userID, originalSender, handle, duration)
+		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.AccountID, originalSender, handle, duration)
 		if err != nil {
 			return false, fmt.Errorf("checking persistent vacation allowance via oracle: %w", err)
 		}
@@ -271,7 +271,7 @@ func (p *SievePolicy) SendVacationResponse(ctx context.Context, d *interp.Runtim
 	p.vacationTriggered = true
 
 	if p.vacationOracle != nil {
-		if err := p.vacationOracle.RecordVacationResponseSent(ctx, p.userID, recipient, p.lastVacationHandle); err != nil {
+		if err := p.vacationOracle.RecordVacationResponseSent(ctx, p.AccountID, recipient, p.lastVacationHandle); err != nil {
 			return fmt.Errorf("failed to record vacation response sent via oracle: %w", err)
 		}
 	}

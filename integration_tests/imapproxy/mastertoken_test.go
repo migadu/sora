@@ -242,7 +242,7 @@ func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"address":       actualEmail,
 		"password_hash": hashToReturn,
 		"server":        h.backendAddr,

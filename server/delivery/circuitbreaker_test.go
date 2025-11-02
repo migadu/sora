@@ -371,7 +371,7 @@ type testLoggerWithFunc struct {
 	logFunc func(string)
 }
 
-func (l *testLoggerWithFunc) Log(format string, args ...interface{}) {
+func (l *testLoggerWithFunc) Log(format string, args ...any) {
 	if l.logFunc != nil {
 		msg := format
 		if len(args) > 0 {

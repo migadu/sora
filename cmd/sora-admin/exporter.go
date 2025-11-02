@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,12 +12,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/migadu/sora/logger"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
 )
 
@@ -44,7 +44,7 @@ type Exporter struct {
 	db          *sql.DB
 	dbPath      string // Path to the SQLite database file
 	rdb         *resilient.ResilientDatabase
-	s3          *storage.S3Storage
+	s3          objectStorage
 	options     ExporterOptions
 
 	totalMessages    int64
@@ -59,7 +59,7 @@ type Exporter struct {
 }
 
 // NewExporter creates a new Exporter instance.
-func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options ExporterOptions) (*Exporter, error) {
+func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
@@ -69,10 +69,18 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	logger.Info("Using maildir database", "path", dbPath)
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Open SQLite with proper settings for concurrent access
+	// WAL mode enables concurrent readers and writers
+	// _busy_timeout=5000 means wait up to 5 seconds if database is locked
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
+
+	// Configure connection pool for better concurrency
+	// SQLite works best with a single writer connection
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Create the same table structure as importer uses
 	// s3_uploaded tracks whether the message has been successfully uploaded to S3
@@ -180,7 +188,7 @@ func (exporter *Exporter) Run() error {
 	logger.Info("Exporting messages for user", "email", address.FullAddress(), "account_id", accountID)
 
 	// Get mailboxes to export
-	mailboxes, err := exporter.getMailboxesToExport(exporter.ctx, user.UserID())
+	mailboxes, err := exporter.getMailboxesToExport(exporter.ctx, user.AccountID())
 	if err != nil {
 		return fmt.Errorf("failed to get mailboxes: %w", err)
 	}
@@ -194,7 +202,7 @@ func (exporter *Exporter) Run() error {
 
 	if exporter.options.DryRun {
 		logger.Info("DRY RUN: Analyzing what would be exported...")
-		return exporter.performDryRun(exporter.ctx, user.UserID(), mailboxes)
+		return exporter.performDryRun(exporter.ctx, user.AccountID(), mailboxes)
 	}
 
 	// Create mailbox directories
@@ -231,9 +239,9 @@ func (exporter *Exporter) Run() error {
 }
 
 // performDryRun analyzes what would be exported without making changes
-func (exporter *Exporter) performDryRun(ctx context.Context, userID int64, mailboxes []*db.DBMailbox) error {
+func (exporter *Exporter) performDryRun(ctx context.Context, AccountID int64, mailboxes []*db.DBMailbox) error {
 	fmt.Printf("\n=== DRY RUN: Export Analysis ===\n\n")
-	fmt.Printf("User: %d\n", userID)
+	fmt.Printf("User: %d\n", AccountID)
 
 	var totalWouldExport, totalWouldSkip int64
 
@@ -362,9 +370,9 @@ func formatSize(bytes int) string {
 }
 
 // getMailboxesToExport returns the list of mailboxes to export based on filters
-func (exporter *Exporter) getMailboxesToExport(ctx context.Context, userID int64) ([]*db.DBMailbox, error) {
+func (exporter *Exporter) getMailboxesToExport(ctx context.Context, AccountID int64) ([]*db.DBMailbox, error) {
 	// Get all mailboxes for the user
-	allMailboxes, err := exporter.rdb.GetMailboxesWithRetry(ctx, userID, false)
+	allMailboxes, err := exporter.rdb.GetMailboxesWithRetry(ctx, AccountID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +463,13 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 
 	// Process messages in parallel
 	var wg sync.WaitGroup
-	jobs := make(chan db.Message, 100)
+	// Make channel buffer large enough to hold all messages to prevent deadlock
+	// when workers are blocked on SQLite access
+	bufferSize := len(messages)
+	if bufferSize < 100 {
+		bufferSize = 100 // Maintain minimum buffer
+	}
+	jobs := make(chan db.Message, bufferSize)
 
 	// No need for progress reporter - we'll prefix each log message
 
@@ -497,16 +511,6 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 
 	// Feed jobs to workers
 	for _, msg := range messages {
-		// Check for cancellation
-		select {
-		case <-exporter.ctx.Done():
-			logger.Info("Export job submission cancelled by user")
-			close(jobs)
-			wg.Wait()
-			return exporter.ctx.Err()
-		default:
-		}
-
 		// Apply date filter if specified
 		if exporter.options.StartDate != nil && msg.InternalDate.Before(*exporter.options.StartDate) {
 			atomic.AddInt64(&exporter.skippedMessages, 1)
@@ -517,7 +521,16 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 			continue
 		}
 
-		jobs <- msg
+		// Use non-blocking send with context cancellation to prevent deadlock
+		select {
+		case <-exporter.ctx.Done():
+			logger.Info("Export job submission cancelled by user")
+			close(jobs)
+			wg.Wait()
+			return exporter.ctx.Err()
+		case jobs <- msg:
+			// Message sent successfully
+		}
 	}
 
 	close(jobs)

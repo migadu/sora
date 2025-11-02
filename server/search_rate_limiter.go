@@ -3,9 +3,10 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -114,9 +115,9 @@ func (s *SearchRateLimiter) RecordSearch(accountID int64) {
 }
 
 // GetStats returns statistics about the search rate limiter
-func (s *SearchRateLimiter) GetStats() map[string]interface{} {
+func (s *SearchRateLimiter) GetStats() map[string]any {
 	if s == nil {
-		return map[string]interface{}{"enabled": false}
+		return map[string]any{"enabled": false}
 	}
 
 	s.mu.RLock()
@@ -142,7 +143,7 @@ func (s *SearchRateLimiter) GetStats() map[string]interface{} {
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"enabled":              true,
 		"max_searches_per_min": s.maxPerMinute,
 		"window":               s.window.String(),

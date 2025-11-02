@@ -46,7 +46,7 @@
 //	defer rdb.Close()
 //
 //	// Operations automatically retry on transient failures
-//	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, userID, "INBOX")
+//	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, AccountID, "INBOX")
 //
 // # Retry Configuration
 //
@@ -370,7 +370,7 @@ func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	return false
 }
 
-func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	// Determine if this should go to write or read pools
 	var pool *pgxpool.Pool
 
@@ -398,7 +398,7 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
 		defer cancel()
 
-		result, cbErr := rd.queryBreaker.Execute(func() (interface{}, error) {
+		result, cbErr := rd.queryBreaker.Execute(func() (any, error) {
 			r, queryErr := pool.Query(queryCtx, sql, args...)
 			return r, queryErr
 		})
@@ -426,14 +426,14 @@ type resilientRow struct {
 	ctx    context.Context
 	rd     *ResilientDatabase
 	sql    string
-	args   []interface{}
+	args   []any
 	config retry.BackoffConfig
 }
 
 // Scan executes the query and scans the result. This is where the retry and
 // circuit breaker logic is actually applied for the query.
-func (r *resilientRow) Scan(dest ...interface{}) error {
-	op := func(ctx context.Context) (interface{}, error) {
+func (r *resilientRow) Scan(dest ...any) error {
+	op := func(ctx context.Context) (any, error) {
 		var pool *pgxpool.Pool
 		if useMaster, ok := r.ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
 			db := r.rd.getOperationalDatabaseForOperation(true)
@@ -453,7 +453,7 @@ func (r *resilientRow) Scan(dest ...interface{}) error {
 	return err
 }
 
-func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, args ...any) pgx.Row {
 	config := retry.BackoffConfig{
 		InitialInterval: 500 * time.Millisecond,
 		MaxInterval:     3 * time.Second,
@@ -465,7 +465,7 @@ func (rd *ResilientDatabase) QueryRowWithRetry(ctx context.Context, sql string, 
 	return &resilientRow{ctx: ctx, rd: rd, sql: sql, args: args, config: config}
 }
 
-func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args ...interface{}) (pgconn.CommandTag, error) {
+func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	// This operation is now transactional, which is an improvement.
 	config := retry.BackoffConfig{
 		InitialInterval: 1 * time.Second,
@@ -476,7 +476,7 @@ func (rd *ResilientDatabase) ExecWithRetry(ctx context.Context, sql string, args
 		OperationName:   "db_exec",
 	}
 
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return tx.Exec(ctx, sql, args...)
 	}
 
@@ -502,7 +502,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
 		defer cancel()
 
-		result, cbErr := rd.writeBreaker.Execute(func() (interface{}, error) {
+		result, cbErr := rd.writeBreaker.Execute(func() (any, error) {
 			t, txErr := rd.getOperationalDatabaseForOperation(true).BeginTx(writeCtx, txOptions)
 			return t, txErr
 		})
@@ -533,7 +533,7 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		MaxRetries:      2,
 		OperationName:   "db_update_password",
 	}
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(ctx, tx, address, newHashedPassword)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
@@ -608,9 +608,9 @@ var importExportRetryConfig = retry.BackoffConfig{
 	OperationName:   "db_import_export",
 }
 
-func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, userID, mailboxID int64, hash string) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(ctx, tx, userID, mailboxID, hash)
+func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, AccountID, mailboxID int64, hash string) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(ctx, tx, AccountID, mailboxID, hash)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -620,7 +620,7 @@ func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.
 }
 
 func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).CompleteS3Upload(ctx, tx, hash, accountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
@@ -629,7 +629,7 @@ func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash
 
 // --- Health Status Wrappers ---
 
-func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hostname string, componentName string, status db.ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]interface{}) error {
+func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hostname string, componentName string, status db.ComponentStatus, lastError error, checkCount, failCount int, metadata map[string]any) error {
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -638,7 +638,7 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 		MaxRetries:      2,
 		OperationName:   "db_store_health_status",
 	}
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(ctx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
@@ -851,6 +851,12 @@ func (rd *ResilientDatabase) getOperationalDatabaseForOperation(isWrite bool) *d
 
 	// Try to get a healthy database, with failover if needed
 	return rd.getHealthyDatabaseWithFailover(isWrite)
+}
+
+// GetOperationalDatabase returns the underlying database instance for write operations
+// This is used by the importer for batch transaction mode
+func (rd *ResilientDatabase) GetOperationalDatabase() *db.Database {
+	return rd.getOperationalDatabaseForOperation(true)
 }
 
 // getHealthyDatabaseWithFailover attempts to get a healthy database, failing over if necessary
@@ -1259,4 +1265,51 @@ func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType st
 	}
 
 	logger.Info("Pools health status", "component", "RESILIENT-FAILOVER", "type", poolType, "total_conns", totalConns, "idle", idleConns, "in_use", acquiredConns, "pools", len(pools))
+}
+
+// GetOrCreateMailboxByNameWithRetry retrieves a mailbox by name, creating it if it doesn't exist.
+// This is more efficient than separate get and create calls as it aims to do it in a single transaction.
+func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Context, AccountID int64, name string) (*db.DBMailbox, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		// First, try to get the mailbox within the transaction.
+		var mb db.DBMailbox
+		err := tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
+		if err == nil {
+			return &mb, nil // Found it, we're done.
+		}
+
+		// If it's not found, create it.
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Generate a new UID validity value (using current time in nanoseconds)
+			uidValidity := uint32(time.Now().UnixNano())
+
+			// Use INSERT ... ON CONFLICT to handle race conditions.
+			// We use RETURNING to get the created (or existing) row in one go.
+			// This is more efficient than a separate SELECT.
+			err := tx.QueryRow(ctx, `
+				INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
+				VALUES ($1, $2, $3, TRUE, '')
+				ON CONFLICT (account_id, name) DO UPDATE SET subscribed = TRUE
+				RETURNING id, account_id, name
+			`, AccountID, name, int64(uidValidity)).Scan(&mb.ID, &mb.AccountID, &mb.Name)
+
+			if err != nil {
+				return nil, fmt.Errorf("failed during insert-on-conflict-returning: %w", err)
+			}
+
+			logger.Info("Created or found mailbox via upsert", "name", name)
+			return &mb, nil
+		}
+
+		// A different, unexpected error occurred.
+		return nil, fmt.Errorf("failed to get mailbox: %w", err)
+	}
+
+	// Use the existing resilient transaction helper.
+	result, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.(*db.DBMailbox), nil
 }

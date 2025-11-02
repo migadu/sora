@@ -117,12 +117,12 @@ func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, h
 	return nil, nil // Not needed for HTTP API tests
 }
 
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	return nil, nil // Not needed for HTTP API tests
 }
 
 // HTTP client helpers
-func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, body interface{}) (*http.Response, []byte) {
+func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, body any) (*http.Response, []byte) {
 	t.Helper()
 
 	var reqBody []byte
@@ -158,7 +158,7 @@ func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, b
 	return resp, respBody
 }
 
-func (h *HTTPAPITestServer) expectJSON(t *testing.T, respBody []byte, target interface{}) {
+func (h *HTTPAPITestServer) expectJSON(t *testing.T, respBody []byte, target any) {
 	t.Helper()
 
 	if err := json.Unmarshal(respBody, target); err != nil {
@@ -197,7 +197,7 @@ func TestAccountCRUD(t *testing.T) {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	server.expectJSON(t, body, &result)
 
 	if result["email"] != testEmail {
@@ -274,7 +274,7 @@ func TestAccountCRUD(t *testing.T) {
 
 	server.expectJSON(t, body, &result)
 
-	accounts, ok := result["accounts"].([]interface{})
+	accounts, ok := result["accounts"].([]any)
 	if !ok {
 		t.Errorf("Expected accounts to be an array, got %T", result["accounts"])
 	}
@@ -355,14 +355,14 @@ func TestMultiCredentialAccount(t *testing.T) {
 		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusCreated, resp.StatusCode, string(body))
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	server.expectJSON(t, body, &result)
 
 	if result["message"] != "Account created successfully with multiple credentials" {
 		t.Errorf("Expected multi-credential success message, got %v", result["message"])
 	}
 
-	credentials, ok := result["credentials"].([]interface{})
+	credentials, ok := result["credentials"].([]any)
 	if !ok || len(credentials) != 2 {
 		t.Errorf("Expected 2 credentials, got %v", result["credentials"])
 	}
@@ -376,7 +376,7 @@ func TestMultiCredentialAccount(t *testing.T) {
 
 	server.expectJSON(t, body, &result)
 
-	credentials, ok = result["credentials"].([]interface{})
+	credentials, ok = result["credentials"].([]any)
 	if !ok || len(credentials) < 2 {
 		t.Errorf("Expected at least 2 credentials, got %v", result["credentials"])
 	}
@@ -446,13 +446,13 @@ func TestConnectionManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		connections := []interface{}{}
+		connections := []any{}
 		if result["connections"] != nil {
 			var ok bool
-			connections, ok = result["connections"].([]interface{})
+			connections, ok = result["connections"].([]any)
 			if !ok {
 				t.Errorf("Expected connections to be an array, got %T", result["connections"])
 			}
@@ -471,7 +471,7 @@ func TestConnectionManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		// Should contain some stats fields - just verify we get a valid JSON response
@@ -501,7 +501,7 @@ func TestConnectionManagement(t *testing.T) {
 				http.StatusOK, http.StatusServiceUnavailable, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if resp.StatusCode == http.StatusOK {
@@ -529,7 +529,7 @@ func TestConnectionManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if !strings.Contains(result["error"].(string), "user_email is required") {
@@ -544,17 +544,17 @@ func TestConnectionManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["email"] != testEmail {
 			t.Errorf("Expected email %s, got %v", testEmail, result["email"])
 		}
 
-		connections := []interface{}{}
+		connections := []any{}
 		if result["connections"] != nil {
 			var ok bool
-			connections, ok = result["connections"].([]interface{})
+			connections, ok = result["connections"].([]any)
 			if !ok {
 				t.Errorf("Expected connections to be an array, got %T", result["connections"])
 			}
@@ -580,7 +580,7 @@ func TestCacheManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		// Should return valid JSON response with cache stats
@@ -594,13 +594,13 @@ func TestCacheManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		metrics := []interface{}{}
+		metrics := []any{}
 		if result["metrics"] != nil {
 			var ok bool
-			metrics, ok = result["metrics"].([]interface{})
+			metrics, ok = result["metrics"].([]any)
 			if !ok {
 				t.Errorf("Expected metrics to be an array, got %T", result["metrics"])
 			}
@@ -619,12 +619,12 @@ func TestCacheManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		// Check that metrics field is an array if present
 		if result["metrics"] != nil {
-			if _, ok := result["metrics"].([]interface{}); !ok {
+			if _, ok := result["metrics"].([]any); !ok {
 				t.Errorf("Expected metrics to be an array, got %T", result["metrics"])
 			}
 		}
@@ -639,7 +639,7 @@ func TestCacheManagement(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if !strings.Contains(result["message"].(string), "purged successfully") {
@@ -669,7 +669,7 @@ func TestHealthMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		// Health overview should contain system-wide health information
@@ -683,7 +683,7 @@ func TestHealthMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 	})
 
@@ -694,17 +694,17 @@ func TestHealthMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["hostname"] != "test-host" {
 			t.Errorf("Expected hostname test-host, got %v", result["hostname"])
 		}
 
-		statuses := []interface{}{}
+		statuses := []any{}
 		if result["statuses"] != nil {
 			var ok bool
-			statuses, ok = result["statuses"].([]interface{})
+			statuses, ok = result["statuses"].([]any)
 			if !ok {
 				t.Errorf("Expected statuses to be an array, got %T", result["statuses"])
 			}
@@ -725,7 +725,7 @@ func TestHealthMonitoring(t *testing.T) {
 		}
 
 		if resp.StatusCode == http.StatusOK {
-			var result map[string]interface{}
+			var result map[string]any
 			server.expectJSON(t, body, &result)
 			// Should contain health status details
 		}
@@ -738,7 +738,7 @@ func TestHealthMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["hostname"] != "test-host" {
@@ -749,10 +749,10 @@ func TestHealthMonitoring(t *testing.T) {
 			t.Errorf("Expected component database, got %v", result["component"])
 		}
 
-		history := []interface{}{}
+		history := []any{}
 		if result["history"] != nil {
 			var ok bool
-			history, ok = result["history"].([]interface{})
+			history, ok = result["history"].([]any)
 			if !ok {
 				t.Errorf("Expected history to be an array, got %T", result["history"])
 			}
@@ -778,7 +778,7 @@ func TestUploaderMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if _, ok := result["stats"]; !ok {
@@ -793,17 +793,17 @@ func TestUploaderMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if _, ok := result["stats"]; !ok {
 			t.Error("Expected stats field")
 		}
 
-		failedUploads := []interface{}{}
+		failedUploads := []any{}
 		if result["failed_uploads"] != nil {
 			var ok bool
-			failedUploads, ok = result["failed_uploads"].([]interface{})
+			failedUploads, ok = result["failed_uploads"].([]any)
 			if !ok {
 				t.Errorf("Expected failed_uploads to be an array, got %T", result["failed_uploads"])
 			}
@@ -822,13 +822,13 @@ func TestUploaderMonitoring(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		failedUploads := []interface{}{}
+		failedUploads := []any{}
 		if result["failed_uploads"] != nil {
 			var ok bool
-			failedUploads, ok = result["failed_uploads"].([]interface{})
+			failedUploads, ok = result["failed_uploads"].([]any)
 			if !ok {
 				t.Errorf("Expected failed_uploads to be an array, got %T", result["failed_uploads"])
 			}
@@ -862,7 +862,7 @@ func TestAuthStatistics(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if _, ok := result["stats"]; !ok {
@@ -885,7 +885,7 @@ func TestAuthStatistics(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["window"] != "1h0m0s" {
@@ -912,14 +912,14 @@ func TestSystemConfiguration(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["server_type"] != "sora-http-api" {
 			t.Errorf("Expected server_type sora-http-api, got %v", result["server_type"])
 		}
 
-		featuresEnabled, ok := result["features_enabled"].(map[string]interface{})
+		featuresEnabled, ok := result["features_enabled"].(map[string]any)
 		if !ok {
 			t.Errorf("Expected features_enabled to be an object, got %T", result["features_enabled"])
 		}
@@ -929,13 +929,13 @@ func TestSystemConfiguration(t *testing.T) {
 			t.Errorf("Expected cache_management to be enabled, got %v", featuresEnabled["cache_management"])
 		}
 
-		endpoints, ok := result["endpoints"].(map[string]interface{})
+		endpoints, ok := result["endpoints"].(map[string]any)
 		if !ok {
 			t.Errorf("Expected endpoints to be an object, got %T", result["endpoints"])
 		}
 
 		// Check that account management endpoints are listed
-		accountMgmt, ok := endpoints["account_management"].([]interface{})
+		accountMgmt, ok := endpoints["account_management"].([]any)
 		if !ok || len(accountMgmt) == 0 {
 			t.Errorf("Expected account_management endpoints, got %v", endpoints["account_management"])
 		}
@@ -1216,7 +1216,7 @@ func TestCredentialManagementEdgeCases(t *testing.T) {
 			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		if result["email"] != secondaryEmail {
@@ -1275,7 +1275,7 @@ func TestAccountLifecycle(t *testing.T) {
 			t.Fatalf("Failed to check account existence: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var existsResult map[string]interface{}
+		var existsResult map[string]any
 		server.expectJSON(t, body, &existsResult)
 		if existsResult["exists"] != true {
 			t.Errorf("Account should exist, got %v", existsResult["exists"])
@@ -1308,9 +1308,9 @@ func TestAccountLifecycle(t *testing.T) {
 			t.Fatalf("Failed to list credentials: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var credsResult map[string]interface{}
+		var credsResult map[string]any
 		server.expectJSON(t, body, &credsResult)
-		credentials := credsResult["credentials"].([]interface{})
+		credentials := credsResult["credentials"].([]any)
 		if len(credentials) < 2 {
 			t.Errorf("Expected at least 2 credentials, got %d", len(credentials))
 		}
@@ -1430,10 +1430,10 @@ func TestMessageRestoration(t *testing.T) {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		messages := result["messages"].([]interface{})
+		messages := result["messages"].([]any)
 		total := int(result["total"].(float64))
 
 		if total != 3 {
@@ -1444,7 +1444,7 @@ func TestMessageRestoration(t *testing.T) {
 		}
 
 		// Verify message structure (Go structs are serialized with capital letter field names)
-		msg := messages[0].(map[string]interface{})
+		msg := messages[0].(map[string]any)
 		if msg["ID"] == nil {
 			t.Error("Message should have ID")
 		}
@@ -1467,7 +1467,7 @@ func TestMessageRestoration(t *testing.T) {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		total := int(result["total"].(float64))
@@ -1484,10 +1484,10 @@ func TestMessageRestoration(t *testing.T) {
 			t.Fatalf("Failed to list deleted messages: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		messages := result["messages"].([]interface{})
+		messages := result["messages"].([]any)
 		if len(messages) != 1 {
 			t.Errorf("Expected 1 message with limit=1, got %d", len(messages))
 		}
@@ -1495,7 +1495,7 @@ func TestMessageRestoration(t *testing.T) {
 
 	// 8. Restore specific messages by ID
 	t.Run("RestoreMessagesByID", func(t *testing.T) {
-		restoreReq := map[string]interface{}{
+		restoreReq := map[string]any{
 			"message_ids": []int64{msgID1, msgID2},
 		}
 
@@ -1505,7 +1505,7 @@ func TestMessageRestoration(t *testing.T) {
 			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		restored := int(result["restored"].(float64))
@@ -1542,7 +1542,7 @@ func TestMessageRestoration(t *testing.T) {
 		}
 
 		// Now we have msg3 and msg4 deleted in Archive
-		restoreReq := map[string]interface{}{
+		restoreReq := map[string]any{
 			"mailbox": "INBOX/Archive",
 		}
 
@@ -1552,7 +1552,7 @@ func TestMessageRestoration(t *testing.T) {
 			t.Fatalf("Failed to restore messages: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		server.expectJSON(t, body, &result)
 
 		restored := int(result["restored"].(float64))
@@ -1563,7 +1563,7 @@ func TestMessageRestoration(t *testing.T) {
 
 	// 10. Test error cases
 	t.Run("RestoreWithoutCriteria", func(t *testing.T) {
-		restoreReq := map[string]interface{}{}
+		restoreReq := map[string]any{}
 
 		endpoint := fmt.Sprintf("/admin/accounts/%s/messages/restore", testEmail)
 		resp, body := server.makeRequest(t, "POST", endpoint, restoreReq)
@@ -1582,7 +1582,7 @@ func TestMessageRestoration(t *testing.T) {
 	})
 
 	t.Run("RestoreForNonExistentAccount", func(t *testing.T) {
-		restoreReq := map[string]interface{}{
+		restoreReq := map[string]any{
 			"message_ids": []int64{999999},
 		}
 
@@ -1609,12 +1609,12 @@ func TestMailDelivery(t *testing.T) {
 		t.Fatalf("Failed to create test account: %d - %s", resp.StatusCode, string(body))
 	}
 
-	var createResp map[string]interface{}
+	var createResp map[string]any
 	server.expectJSON(t, body, &createResp)
 	testEmail := createResp["email"].(string)
 
 	t.Run("DeliverMail_JSONFormat", func(t *testing.T) {
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail},
 			"message": fmt.Sprintf(`From: sender@example.com
 To: %s
@@ -1631,7 +1631,7 @@ This is a test message delivered via HTTP API.
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var deliveryResp map[string]interface{}
+		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
 
 		if success, ok := deliveryResp["success"].(bool); !ok || !success {
@@ -1642,7 +1642,7 @@ This is a test message delivered via HTTP API.
 			t.Errorf("Expected message_id, got %v", deliveryResp["message_id"])
 		}
 
-		recipients, ok := deliveryResp["recipients"].([]interface{})
+		recipients, ok := deliveryResp["recipients"].([]any)
 		if !ok {
 			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
 		}
@@ -1651,7 +1651,7 @@ This is a test message delivered via HTTP API.
 			t.Errorf("Expected 1 recipient, got %d", len(recipients))
 		}
 
-		recipientStatus := recipients[0].(map[string]interface{})
+		recipientStatus := recipients[0].(map[string]any)
 		if email, ok := recipientStatus["email"].(string); !ok || email != testEmail {
 			t.Errorf("Expected email %s, got %v", testEmail, recipientStatus["email"])
 		}
@@ -1674,11 +1674,11 @@ This is a test message delivered via HTTP API.
 			t.Fatalf("Failed to create second test account: %d - %s", resp.StatusCode, string(body))
 		}
 
-		var createResp2 map[string]interface{}
+		var createResp2 map[string]any
 		server.expectJSON(t, body, &createResp2)
 		testEmail2 := createResp2["email"].(string)
 
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail, testEmail2},
 			"message": fmt.Sprintf(`From: sender@example.com
 To: %s, %s
@@ -1695,10 +1695,10 @@ This message is delivered to multiple recipients.
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var deliveryResp map[string]interface{}
+		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
 
-		recipients, ok := deliveryResp["recipients"].([]interface{})
+		recipients, ok := deliveryResp["recipients"].([]any)
 		if !ok {
 			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
 		}
@@ -1709,7 +1709,7 @@ This message is delivered to multiple recipients.
 
 		// Check both recipients were accepted
 		for _, r := range recipients {
-			recipientStatus := r.(map[string]interface{})
+			recipientStatus := r.(map[string]any)
 			if accepted, ok := recipientStatus["accepted"].(bool); !ok || !accepted {
 				t.Errorf("Expected all recipients accepted, got %v for %v", recipientStatus["accepted"], recipientStatus["email"])
 			}
@@ -1719,7 +1719,7 @@ This message is delivered to multiple recipients.
 	})
 
 	t.Run("DeliverMail_PartialFailure", func(t *testing.T) {
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail, "nonexistent-user-12345@example.com"},
 			"message": fmt.Sprintf(`From: sender@example.com
 To: %s, nonexistent-user-12345@example.com
@@ -1737,10 +1737,10 @@ This message has one valid and one invalid recipient.
 			t.Fatalf("Expected status 207 or 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var deliveryResp map[string]interface{}
+		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
 
-		recipients, ok := deliveryResp["recipients"].([]interface{})
+		recipients, ok := deliveryResp["recipients"].([]any)
 		if !ok {
 			t.Fatalf("Expected recipients array, got %T", deliveryResp["recipients"])
 		}
@@ -1753,7 +1753,7 @@ This message has one valid and one invalid recipient.
 		acceptedCount := 0
 		rejectedCount := 0
 		for _, r := range recipients {
-			recipientStatus := r.(map[string]interface{})
+			recipientStatus := r.(map[string]any)
 			if accepted, ok := recipientStatus["accepted"].(bool); ok && accepted {
 				acceptedCount++
 			} else {
@@ -1769,7 +1769,7 @@ This message has one valid and one invalid recipient.
 	})
 
 	t.Run("DeliverMail_InvalidFormat", func(t *testing.T) {
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail},
 			"message":    "This is not a valid RFC822 message", // Missing headers
 		}
@@ -1783,7 +1783,7 @@ This message has one valid and one invalid recipient.
 	})
 
 	t.Run("DeliverMail_NoRecipients", func(t *testing.T) {
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{},
 			"message": `From: sender@example.com
 Subject: No Recipients
@@ -1800,7 +1800,7 @@ This message has no recipients.
 	})
 
 	t.Run("DeliverMail_MissingMessage", func(t *testing.T) {
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail},
 			// message field missing
 		}
@@ -1816,7 +1816,7 @@ This message has no recipients.
 		// First, we'd need to set up a Sieve filter for the account, but that's
 		// beyond the scope of this basic test. Just verify delivery works.
 
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail},
 			"message": fmt.Sprintf(`From: sender@example.com
 To: %s
@@ -1833,7 +1833,7 @@ Testing Sieve filter integration with HTTP delivery.
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var deliveryResp map[string]interface{}
+		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
 
 		if success, ok := deliveryResp["success"].(bool); !ok || !success {
@@ -1847,7 +1847,7 @@ Testing Sieve filter integration with HTTP delivery.
 		// Create a larger message (100KB body)
 		largeBody := strings.Repeat("This is a test line.\n", 5000)
 
-		deliveryReq := map[string]interface{}{
+		deliveryReq := map[string]any{
 			"recipients": []string{testEmail},
 			"message": fmt.Sprintf(`From: sender@example.com
 To: %s
@@ -1863,7 +1863,7 @@ Date: %s
 			t.Fatalf("Expected status 200 for large message, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var deliveryResp map[string]interface{}
+		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
 
 		if success, ok := deliveryResp["success"].(bool); !ok || !success {
@@ -1907,7 +1907,7 @@ func TestACLManagement(t *testing.T) {
 	}
 
 	t.Run("GrantACL_Success", func(t *testing.T) {
-		grantReq := map[string]interface{}{
+		grantReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
 			"identifier": user2.Email,
@@ -1919,7 +1919,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var grantResp map[string]interface{}
+		var grantResp map[string]any
 		server.expectJSON(t, body, &grantResp)
 
 		if status, ok := grantResp["status"].(string); !ok || status != "success" {
@@ -1934,7 +1934,7 @@ func TestACLManagement(t *testing.T) {
 	})
 
 	t.Run("GrantACL_AnyoneIdentifier", func(t *testing.T) {
-		grantReq := map[string]interface{}{
+		grantReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
 			"identifier": "anyone",
@@ -1946,7 +1946,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var grantResp map[string]interface{}
+		var grantResp map[string]any
 		server.expectJSON(t, body, &grantResp)
 
 		if identifier, ok := grantResp["identifier"].(string); !ok || identifier != "anyone" {
@@ -1964,14 +1964,14 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var listResp map[string]interface{}
+		var listResp map[string]any
 		server.expectJSON(t, body, &listResp)
 
 		if mbox, ok := listResp["mailbox"].(string); !ok || mbox != mailboxName {
 			t.Errorf("Expected mailbox='%s', got %v", mailboxName, listResp["mailbox"])
 		}
 
-		acls, ok := listResp["acls"].([]interface{})
+		acls, ok := listResp["acls"].([]any)
 		if !ok {
 			t.Fatalf("Expected acls array, got %T", listResp["acls"])
 		}
@@ -1984,7 +1984,7 @@ func TestACLManagement(t *testing.T) {
 		foundUser2 := false
 		foundAnyone := false
 		for _, acl := range acls {
-			aclMap := acl.(map[string]interface{})
+			aclMap := acl.(map[string]any)
 			identifier := aclMap["identifier"].(string)
 			rights := aclMap["rights"].(string)
 
@@ -2007,7 +2007,7 @@ func TestACLManagement(t *testing.T) {
 	})
 
 	t.Run("RevokeACL_Success", func(t *testing.T) {
-		revokeReq := map[string]interface{}{
+		revokeReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
 			"identifier": user2.Email,
@@ -2018,7 +2018,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var revokeResp map[string]interface{}
+		var revokeResp map[string]any
 		server.expectJSON(t, body, &revokeResp)
 
 		if status, ok := revokeResp["status"].(string); !ok || status != "success" {
@@ -2029,12 +2029,12 @@ func TestACLManagement(t *testing.T) {
 		url := fmt.Sprintf("/admin/mailboxes/acl?owner=%s&mailbox=%s", owner.Email, mailboxName)
 		resp, body = server.makeRequest(t, "GET", url, nil)
 
-		var listResp map[string]interface{}
+		var listResp map[string]any
 		server.expectJSON(t, body, &listResp)
 
-		acls := listResp["acls"].([]interface{})
+		acls := listResp["acls"].([]any)
 		for _, acl := range acls {
-			aclMap := acl.(map[string]interface{})
+			aclMap := acl.(map[string]any)
 			if identifier := aclMap["identifier"].(string); identifier == user2.Email {
 				t.Errorf("User2 still has ACL entry after revocation: %v", aclMap)
 			}
@@ -2044,7 +2044,7 @@ func TestACLManagement(t *testing.T) {
 	})
 
 	t.Run("GrantACL_InvalidRights", func(t *testing.T) {
-		grantReq := map[string]interface{}{
+		grantReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
 			"identifier": user3.Email,
@@ -2056,7 +2056,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected error for invalid rights, got status 200 - %s", string(body))
 		}
 
-		var errResp map[string]interface{}
+		var errResp map[string]any
 		server.expectJSON(t, body, &errResp)
 
 		if _, ok := errResp["error"]; !ok {
@@ -2067,7 +2067,7 @@ func TestACLManagement(t *testing.T) {
 	})
 
 	t.Run("GrantACL_MissingOwner", func(t *testing.T) {
-		grantReq := map[string]interface{}{
+		grantReq := map[string]any{
 			"mailbox":    mailboxName,
 			"identifier": user3.Email,
 			"rights":     "lrs",
@@ -2078,7 +2078,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 400 for missing owner, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var errResp map[string]interface{}
+		var errResp map[string]any
 		server.expectJSON(t, body, &errResp)
 
 		if _, ok := errResp["error"]; !ok {
@@ -2097,7 +2097,7 @@ func TestACLManagement(t *testing.T) {
 			t.Fatalf("Expected status 400 for missing mailbox, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var errResp map[string]interface{}
+		var errResp map[string]any
 		server.expectJSON(t, body, &errResp)
 
 		if _, ok := errResp["error"]; !ok {
@@ -2108,7 +2108,7 @@ func TestACLManagement(t *testing.T) {
 	})
 
 	t.Run("RevokeACL_NonexistentUser", func(t *testing.T) {
-		revokeReq := map[string]interface{}{
+		revokeReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
 			"identifier": "nonexistent@example.com",
@@ -2215,7 +2215,7 @@ func TestAffinityManagement(t *testing.T) {
 
 	baseURL := fmt.Sprintf("http://%s", addr)
 
-	makeRequest := func(t *testing.T, method, endpoint string, body interface{}) (*http.Response, []byte) {
+	makeRequest := func(t *testing.T, method, endpoint string, body any) (*http.Response, []byte) {
 		t.Helper()
 
 		var reqBody []byte
@@ -2252,7 +2252,7 @@ func TestAffinityManagement(t *testing.T) {
 	}
 
 	t.Run("SetAffinity_Success", func(t *testing.T) {
-		setReq := map[string]interface{}{
+		setReq := map[string]any{
 			"user":     "user@example.com",
 			"protocol": "imap",
 			"backend":  "192.168.1.10:993",
@@ -2263,7 +2263,7 @@ func TestAffinityManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
@@ -2293,7 +2293,7 @@ func TestAffinityManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
@@ -2315,7 +2315,7 @@ func TestAffinityManagement(t *testing.T) {
 	})
 
 	t.Run("SetAffinity_InvalidBackend", func(t *testing.T) {
-		setReq := map[string]interface{}{
+		setReq := map[string]any{
 			"user":     "user@example.com",
 			"protocol": "imap",
 			"backend":  "192.168.1.99:993", // Not in ValidBackends
@@ -2326,7 +2326,7 @@ func TestAffinityManagement(t *testing.T) {
 			t.Fatalf("Expected status 400, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var errorResp map[string]interface{}
+		var errorResp map[string]any
 		if err := json.Unmarshal(body, &errorResp); err != nil {
 			t.Fatalf("Failed to unmarshal error response: %v", err)
 		}
@@ -2339,7 +2339,7 @@ func TestAffinityManagement(t *testing.T) {
 	})
 
 	t.Run("SetAffinity_InvalidProtocol", func(t *testing.T) {
-		setReq := map[string]interface{}{
+		setReq := map[string]any{
 			"user":     "user@example.com",
 			"protocol": "smtp", // Invalid protocol
 			"backend":  "192.168.1.10:25",
@@ -2350,7 +2350,7 @@ func TestAffinityManagement(t *testing.T) {
 			t.Fatalf("Expected status 400, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var errorResp map[string]interface{}
+		var errorResp map[string]any
 		if err := json.Unmarshal(body, &errorResp); err != nil {
 			t.Fatalf("Failed to unmarshal error response: %v", err)
 		}
@@ -2363,7 +2363,7 @@ func TestAffinityManagement(t *testing.T) {
 	})
 
 	t.Run("SetAffinity_MissingFields", func(t *testing.T) {
-		setReq := map[string]interface{}{
+		setReq := map[string]any{
 			"user":     "user@example.com",
 			"protocol": "imap",
 			// Missing backend
@@ -2393,7 +2393,7 @@ func TestAffinityManagement(t *testing.T) {
 			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
-		var result map[string]interface{}
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			t.Fatalf("Failed to unmarshal response: %v", err)
 		}
@@ -2425,7 +2425,7 @@ func TestAffinityManagement(t *testing.T) {
 		user := "multiproto@example.com"
 
 		// Set affinity for IMAP
-		setReq := map[string]interface{}{
+		setReq := map[string]any{
 			"user":     user,
 			"protocol": "imap",
 			"backend":  "192.168.1.10:993",
@@ -2436,7 +2436,7 @@ func TestAffinityManagement(t *testing.T) {
 		}
 
 		// Set affinity for POP3 (different backend)
-		setReq = map[string]interface{}{
+		setReq = map[string]any{
 			"user":     user,
 			"protocol": "pop3",
 			"backend":  "192.168.1.20:995",

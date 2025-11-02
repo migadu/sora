@@ -252,7 +252,7 @@ func TestWriteJSON(t *testing.T) {
 	tests := []struct {
 		name           string
 		status         int
-		data           interface{}
+		data           any
 		expectedStatus int
 		expectedBody   string
 	}{
@@ -348,7 +348,7 @@ func TestWriteError(t *testing.T) {
 func TestCreateAccountRequestValidation(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedError  string
 	}{
@@ -471,7 +471,7 @@ func TestCreateAccountRequestValidation(t *testing.T) {
 func TestUpdateAccountRequestValidation(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedError  string
 	}{
@@ -538,7 +538,7 @@ func TestUpdateAccountRequestValidation(t *testing.T) {
 func TestAddCredentialRequestValidation(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedError  string
 	}{
@@ -616,7 +616,7 @@ func TestAddCredentialRequestValidation(t *testing.T) {
 func TestACLGrantRequestValidation(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedError  string
 	}{
@@ -628,7 +628,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing owner",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
 				"rights":     "lrs",
@@ -638,7 +638,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing mailbox",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"identifier": "user@example.com",
 				"rights":     "lrs",
@@ -648,7 +648,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing identifier",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":   "owner@example.com",
 				"mailbox": "Shared/Sales",
 				"rights":  "lrs",
@@ -658,7 +658,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing rights",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
@@ -668,7 +668,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty owner",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "",
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
@@ -679,7 +679,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty mailbox",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "",
 				"identifier": "user@example.com",
@@ -690,7 +690,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty identifier",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "Shared/Sales",
 				"identifier": "",
@@ -701,7 +701,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty rights",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
@@ -751,7 +751,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 func TestACLRevokeRequestValidation(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedError  string
 	}{
@@ -763,7 +763,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing owner",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
 			},
@@ -772,7 +772,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing mailbox",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"identifier": "user@example.com",
 			},
@@ -781,7 +781,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "missing identifier",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":   "owner@example.com",
 				"mailbox": "Shared/Sales",
 			},
@@ -790,7 +790,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty owner",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "",
 				"mailbox":    "Shared/Sales",
 				"identifier": "user@example.com",
@@ -800,7 +800,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty mailbox",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "",
 				"identifier": "user@example.com",
@@ -810,7 +810,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 		},
 		{
 			name: "empty identifier",
-			requestBody: map[string]interface{}{
+			requestBody: map[string]any{
 				"owner":      "owner@example.com",
 				"mailbox":    "Shared/Sales",
 				"identifier": "",

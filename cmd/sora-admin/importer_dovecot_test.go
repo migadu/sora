@@ -118,7 +118,7 @@ func TestImporter_DovecotUIDPreservation(t *testing.T) {
 	user := server.NewUser(address, accountID)
 
 	// Get INBOX mailbox
-	inboxMailbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
+	inboxMailbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 	if err != nil {
 		t.Fatalf("Failed to get INBOX mailbox: %v", err)
 	}
@@ -374,16 +374,16 @@ func TestImporter_PendingUploads(t *testing.T) {
 	user := server.NewUser(address, accountID)
 
 	// Try to get INBOX mailbox, create if it doesn't exist
-	inboxMailbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
+	inboxMailbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 	if err != nil {
 		// Create INBOX mailbox
-		err = rdb.CreateMailboxWithRetry(ctx, user.UserID(), "INBOX", nil)
+		err = rdb.CreateMailboxWithRetry(ctx, user.AccountID(), "INBOX", nil)
 		if err != nil {
 			t.Fatalf("Failed to create INBOX mailbox: %v", err)
 		}
 
 		// Now get the created mailbox
-		inboxMailbox, err = rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
+		inboxMailbox, err = rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 		if err != nil {
 			t.Fatalf("Failed to get INBOX mailbox after creation: %v", err)
 		}
@@ -416,7 +416,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 
 	// Insert message with PendingUpload using the resilient database wrapper
 	insertOptions := &db.InsertMessageOptions{
-		UserID:        user.UserID(),
+		AccountID:     user.AccountID(),
 		MailboxID:     inboxMailbox.ID,
 		MailboxName:   inboxMailbox.Name,
 		MessageID:     messageID,
@@ -438,7 +438,7 @@ func TestImporter_PendingUploads(t *testing.T) {
 		InstanceID:  hostname,
 		ContentHash: hash,
 		Size:        size,
-		AccountID:   user.UserID(),
+		AccountID:   user.AccountID(),
 	}
 
 	// Insert the message with PendingUpload

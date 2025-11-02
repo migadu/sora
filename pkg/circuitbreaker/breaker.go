@@ -201,7 +201,7 @@ func (cb *CircuitBreaker) Counts() Counts {
 	return cb.counts
 }
 
-func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
+func (cb *CircuitBreaker) Execute(req func() (any, error)) (any, error) {
 	generation, err := cb.beforeRequest()
 	if err != nil {
 		return nil, err
@@ -220,7 +220,7 @@ func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{},
 	return result, err
 }
 
-func (cb *CircuitBreaker) ExecuteWithFallback(req func() (interface{}, error), fallback func(error) (interface{}, error)) (interface{}, error) {
+func (cb *CircuitBreaker) ExecuteWithFallback(req func() (any, error), fallback func(error) (any, error)) (any, error) {
 	result, err := cb.Execute(req)
 	if err != nil {
 		if errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrTooManyRequests) {
@@ -348,7 +348,7 @@ func DefaultSettings(name string) Settings {
 }
 
 func WrapWithContext(ctx context.Context, cb *CircuitBreaker, fn func(context.Context) error) error {
-	_, err := cb.Execute(func() (interface{}, error) {
+	_, err := cb.Execute(func() (any, error) {
 		return nil, fn(ctx)
 	})
 	return err

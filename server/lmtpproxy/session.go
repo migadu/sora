@@ -40,6 +40,7 @@ type Session struct {
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
+	startTime          time.Time
 }
 
 // newSession creates a new LMTP proxy session.
@@ -52,6 +53,7 @@ func newSession(server *Server, conn net.Conn) *Session {
 		clientWriter: bufio.NewWriter(conn),
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
+		startTime:    time.Now(),
 	}
 }
 
@@ -61,22 +63,20 @@ func (s *Session) handleConnection() {
 	defer s.close()
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
-	clientAddr := s.clientConn.RemoteAddr().String()
-	if s.server.debug {
-		logger.Debug("LMTP Proxy: New connection", "name", s.server.name, "remote", clientAddr)
-	}
+	// Log connection at INFO level
+	s.InfoLog("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			logger.Debug("LMTP Proxy: TLS handshake failed", "name", s.server.name, "remote", clientAddr, "error", err)
+			s.DebugLog("TLS handshake failed", "error", err)
 			return
 		}
 	}
 
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
-		logger.Debug("LMTP Proxy: Failed to send greeting", "name", s.server.name, "remote", clientAddr, "error", err)
+		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
 
@@ -85,7 +85,7 @@ func (s *Session) handleConnection() {
 		// Set a read deadline for the client command to prevent idle connections.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				logger.Debug("LMTP Proxy: Failed to set read deadline", "name", s.server.name, "remote", clientAddr, "error", err)
+				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
 		}
@@ -94,23 +94,18 @@ func (s *Session) handleConnection() {
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				logger.Debug("LMTP Proxy: Client timed out waiting for command", "name", s.server.name, "remote", clientAddr)
+				s.DebugLog("Client timed out waiting for command")
 				s.sendResponse("421 4.4.2 Idle timeout, closing connection")
 				return
 			}
 			if !isClosingError(err) {
-				logger.Debug("LMTP Proxy: Error reading from client", "name", s.server.name, "remote", clientAddr, "error", err)
+				s.DebugLog("Error reading from client", "error", err)
 			}
 			return
 		}
 
 		line = strings.TrimRight(line, "\r\n")
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: Client command", "name", s.server.name, "remote", clientAddr, "line", line)
-		}
-
-		// Log client command if debug is enabled
-		s.Log("C: %s\r\n", line)
+		s.DebugLog("Client command", "line", line)
 
 		// Use the shared command parser. LMTP commands do not have tags.
 		_, command, args, err := server.ParseLine(line, false)
@@ -177,7 +172,7 @@ func (s *Session) handleConnection() {
 			}
 
 			if err := s.handleRecipient(to); err != nil {
-				logger.Debug("LMTP Proxy: Recipient rejected", "name", s.server.name, "recipient", to, "error", err)
+				s.DebugLog("Recipient rejected", "recipient", to, "error", err)
 				s.sendResponse("550 5.1.1 User unknown")
 				continue
 			}
@@ -186,29 +181,27 @@ func (s *Session) handleConnection() {
 			// The proxy loop will manage its own deadlines.
 			if s.server.sessionTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					logger.Debug("LMTP Proxy: Failed to clear read deadline", "name", s.server.name, "remote", clientAddr, "error", err)
+					s.DebugLog("Failed to clear read deadline", "error", err)
 				}
 			}
 			// Now connect to backend
 			if err := s.connectToBackend(); err != nil {
-				logger.Debug("LMTP Proxy: Failed to connect to backend", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Failed to connect to backend", "error", err)
 				s.sendResponse("451 4.4.1 Backend connection failed")
 				return
 			}
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				logger.Debug("LMTP Proxy: Failed to register connection", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Failed to register connection", "error", err)
 			}
 
 			// Start proxying only if backend connection was successful
 			if s.backendConn != nil {
-				if s.server.debug {
-					logger.Debug("LMTP Proxy: Starting proxy", "name", s.server.name, "recipient", s.to, "account_id", s.accountID)
-				}
+				s.DebugLog("Starting proxy", "recipient", s.to, "account_id", s.accountID)
 				s.startProxy(line)
 			} else {
-				logger.Debug("LMTP Proxy: Cannot start proxy - no backend connection", "name", s.server.name, "recipient", s.to)
+				s.DebugLog("Cannot start proxy - no backend connection", "recipient", s.to)
 			}
 			return
 
@@ -227,7 +220,7 @@ func (s *Session) handleConnection() {
 
 			// Send OK response
 			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
-				logger.Debug("LMTP Proxy: Failed to send STARTTLS response", "name", s.server.name, "error", err)
+				s.DebugLog("Failed to send STARTTLS response", "error", err)
 				return
 			}
 
@@ -240,7 +233,7 @@ func (s *Session) handleConnection() {
 				// Load from cert files
 				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
 				if err != nil {
-					logger.Debug("LMTP Proxy: Failed to load TLS certificate", "name", s.server.name, "error", err)
+					s.DebugLog("Failed to load TLS certificate", "error", err)
 					return
 				}
 
@@ -253,7 +246,7 @@ func (s *Session) handleConnection() {
 					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 				}
 			} else {
-				logger.Debug("LMTP Proxy: STARTTLS config error", "name", s.server.name)
+				s.DebugLog("STARTTLS config error")
 				s.sendResponse("454 4.3.0 TLS not available due to configuration error")
 				continue
 			}
@@ -261,7 +254,7 @@ func (s *Session) handleConnection() {
 			// Upgrade connection to TLS
 			tlsConn := tls.Server(s.clientConn, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				logger.Debug("LMTP Proxy: TLS handshake failed", "name", s.server.name, "error", err)
+				s.DebugLog("TLS handshake failed", "error", err)
 				return
 			}
 
@@ -270,9 +263,7 @@ func (s *Session) handleConnection() {
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
 
-			if s.server.debug {
-				logger.Debug("LMTP Proxy: STARTTLS negotiation successful", "name", s.server.name, "remote", clientAddr)
-			}
+			s.DebugLog("STARTTLS negotiation successful")
 
 			// Client must send EHLO/LHLO again after STARTTLS (RFC 3207)
 			// Continue to next iteration to wait for new EHLO/LHLO
@@ -316,11 +307,57 @@ func (s *Session) sendResponse(response string) error {
 }
 
 // Log logs a client command if debug is enabled.
-func (s *Session) Log(format string, args ...interface{}) {
+// This is for debug output only, not session logging.
+func (s *Session) Log(format string, args ...any) {
 	if s.server.debugWriter != nil {
 		message := fmt.Sprintf(format, args...)
 		s.server.debugWriter.Write([]byte(message))
 	}
+}
+
+// InfoLog logs at INFO level with session context
+func (s *Session) InfoLog(format string, args ...any) {
+	remoteAddr := s.clientConn.RemoteAddr().String()
+	user := "none"
+	if s.username != "" && s.accountID > 0 {
+		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+	} else if s.username != "" {
+		user = s.username
+	}
+
+	logger.Info("Session", "proto", "lmtp_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
+}
+
+// DebugLog logs at DEBUG level with session context
+func (s *Session) DebugLog(msg string, keyvals ...any) {
+	if s.server.debug {
+		user := "none"
+		if s.username != "" && s.accountID > 0 {
+			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		} else if s.username != "" {
+			user = s.username
+		}
+
+		// Build the keyvals array with user field
+		allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
+		allKeyvals = append(allKeyvals, keyvals...)
+		logger.Debug(msg, allKeyvals...)
+	}
+}
+
+// WarnLog logs at WARN level with session context
+func (s *Session) WarnLog(msg string, keyvals ...any) {
+	user := "none"
+	if s.username != "" && s.accountID > 0 {
+		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+	} else if s.username != "" {
+		user = s.username
+	}
+
+	// Build the keyvals array with user field
+	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
+	allKeyvals = append(allKeyvals, keyvals...)
+	logger.Warn(msg, allKeyvals...)
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -372,13 +409,9 @@ func (s *Session) handleRecipient(to string) error {
 
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			if s.server.debug {
-				logger.Debug("LMTP Proxy: Prelookup failed - falling back to main DB", "name", s.server.name, "user", s.username, "error", lookupErr)
-			}
+			s.DebugLog("Prelookup failed - falling back to main DB", "error", lookupErr)
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			if s.server.debug {
-				logger.Debug("LMTP Proxy: Routing via prelookup", "name", s.server.name, "user", s.username, "server", routingInfo.ServerAddress)
-			}
+			s.DebugLog("Routing via prelookup", "server", routingInfo.ServerAddress)
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
@@ -411,7 +444,7 @@ func (s *Session) connectToBackend() error {
 		ProxyName:          "LMTP Proxy",
 	})
 	if err != nil {
-		logger.Debug("LMTP Proxy: Error determining route", "name", s.server.name, "user", s.username, "error", err)
+		s.DebugLog("Error determining route", "error", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -419,11 +452,9 @@ func (s *Session) connectToBackend() error {
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 
-	if s.server.debug {
-		logger.Debug("LMTP Proxy: Routing", "name", s.server.name, "user", s.username, "method", routeResult.RoutingMethod, "preferred_addr", preferredAddr, "is_prelookup", isPrelookupRoute)
-		if s.routingInfo != nil {
-			logger.Debug("LMTP Proxy: Routing info", "name", s.server.name, "server", s.routingInfo.ServerAddress, "tls", s.routingInfo.RemoteTLS, "starttls", s.routingInfo.RemoteTLSUseStartTLS, "tls_verify", s.routingInfo.RemoteTLSVerify, "xclient", s.routingInfo.RemoteUseXCLIENT)
-		}
+	s.DebugLog("Routing", "method", routeResult.RoutingMethod, "preferred_addr", preferredAddr, "is_prelookup", isPrelookupRoute)
+	if s.routingInfo != nil {
+		s.DebugLog("Routing info", "server", s.routingInfo.ServerAddress, "tls", s.routingInfo.RemoteTLS, "starttls", s.routingInfo.RemoteTLSUseStartTLS, "tls_verify", s.routingInfo.RemoteTLSVerify, "xclient", s.routingInfo.RemoteUseXCLIENT)
 	}
 
 	// 4. Connect using the determined address (or round-robin if empty)
@@ -495,9 +526,7 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("failed to read LHLO response: %w", err)
 		}
 
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: Backend LHLO response", "name", s.server.name, "response", strings.TrimRight(response, "\r"))
-		}
+		s.DebugLog("Backend LHLO response", "response", strings.TrimRight(response, "\r"))
 
 		// Check if this is the last line (no hyphen after status code)
 		if len(response) >= 4 && response[3] != '-' {
@@ -521,22 +550,16 @@ func (s *Session) connectToBackend() error {
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
 			Renegotiation:      tls.RenegotiateNever,
 		}
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: Using prelookup StartTLS settings", "name", s.server.name, "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-		}
+		s.DebugLog("Using prelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
 	} else if s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS
 		shouldUseStartTLS = true
 		tlsConfig = s.server.connManager.GetTLSConfig()
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: Using global StartTLS settings", "name", s.server.name)
-		}
+		s.DebugLog("Using global StartTLS settings")
 	}
 
 	if shouldUseStartTLS && tlsConfig != nil {
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: Negotiating StartTLS with backend", "name", s.server.name, "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
-		}
+		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
 		// Send STARTTLS command
 		_, err := s.backendWriter.WriteString("STARTTLS\r\n")
@@ -566,9 +589,7 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
 		}
 
-		if s.server.debug {
-			logger.Debug("LMTP Proxy: StartTLS negotiation successful with backend", "name", s.server.name, "backend", actualAddr)
-		}
+		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
 		s.backendConn = tlsConn
 		s.backendReader = bufio.NewReader(tlsConn)
 		s.backendWriter = bufio.NewWriter(tlsConn)
@@ -590,9 +611,7 @@ func (s *Session) connectToBackend() error {
 				return fmt.Errorf("failed to read LHLO response after STARTTLS: %w", err)
 			}
 
-			if s.server.debug {
-				logger.Debug("LMTP Proxy: Backend LHLO response after STARTTLS", "name", s.server.name, "response", strings.TrimRight(response, "\r"))
-			}
+			s.DebugLog("Backend LHLO response after STARTTLS", "response", strings.TrimRight(response, "\r"))
 
 			// Check if this is the last line
 			if len(response) >= 4 && response[3] != '-' {
@@ -618,7 +637,7 @@ func (s *Session) connectToBackend() error {
 	// needs to validate if the client connecting to it is another trusted proxy.
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); err != nil {
-			logger.Debug("LMTP Proxy: Failed to send forwarding parameters", "name", s.server.name, "user", s.username, "error", err)
+			s.DebugLog("Failed to send forwarding parameters", "error", err)
 			// Continue without forwarding parameters rather than failing
 		}
 	}
@@ -645,7 +664,7 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("backend MAIL FROM failed: %s", response)
 		}
 
-		logger.Debug("LMTP Proxy: Backend MAIL FROM accepted", "name", s.server.name)
+		s.DebugLog("Backend MAIL FROM accepted")
 	}
 
 	return nil
@@ -655,7 +674,7 @@ func (s *Session) connectToBackend() error {
 // initialCommand is the RCPT TO command that triggered the proxy.
 func (s *Session) startProxy(initialCommand string) {
 	if s.backendConn == nil {
-		logger.Debug("LMTP Proxy: Backend connection not established", "name", s.server.name, "user", s.username)
+		s.DebugLog("Backend connection not established")
 		s.sendResponse("451 4.4.2 Backend connection not available")
 		return
 	}
@@ -663,7 +682,7 @@ func (s *Session) startProxy(initialCommand string) {
 	// First, send the RCPT TO command that triggered proxying
 	_, err := s.backendWriter.WriteString(initialCommand + "\r\n")
 	if err != nil {
-		logger.Debug("LMTP Proxy: Failed to send initial RCPT TO", "name", s.server.name, "error", err)
+		s.DebugLog("Failed to send initial RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
 		return
 	}
@@ -672,7 +691,7 @@ func (s *Session) startProxy(initialCommand string) {
 	// Read and forward the response
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
-		logger.Debug("LMTP Proxy: Failed to read RCPT TO response", "name", s.server.name, "error", err)
+		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
 		return
 	}
@@ -704,7 +723,7 @@ func (s *Session) startProxy(initialCommand string) {
 		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
 		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
-			logger.Debug("LMTP Proxy: Error copying from backend to client", "name", s.server.name, "error", err)
+			s.DebugLog("Error copying from backend to client", "error", err)
 		}
 	}()
 
@@ -730,7 +749,7 @@ func (s *Session) proxyClientToBackend() {
 		// Set a read deadline to prevent idle connections between commands.
 		if s.server.sessionTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
-				logger.Debug("LMTP Proxy: Failed to set read deadline", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
 		}
@@ -738,11 +757,11 @@ func (s *Session) proxyClientToBackend() {
 		line, err := s.clientReader.ReadString('\n')
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				logger.Debug("LMTP Proxy: Idle timeout - closing connection", "name", s.server.name, "user", s.username)
+				s.DebugLog("Idle timeout - closing connection")
 				return
 			}
 			if !isClosingError(err) {
-				logger.Debug("LMTP Proxy: Error reading from client", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Error reading from client", "error", err)
 			}
 			return
 		}
@@ -752,13 +771,13 @@ func (s *Session) proxyClientToBackend() {
 		totalBytesIn += int64(n)
 		if err != nil {
 			if !isClosingError(err) {
-				logger.Debug("LMTP Proxy: Error writing to backend", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Error writing to backend", "error", err)
 			}
 			return
 		}
 		if err := s.backendWriter.Flush(); err != nil {
 			if !isClosingError(err) {
-				logger.Debug("LMTP Proxy: Error flushing to backend", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Error flushing to backend", "error", err)
 			}
 			return
 		}
@@ -771,7 +790,7 @@ func (s *Session) proxyClientToBackend() {
 			// The idle timeout is suspended during active data transfer.
 			if s.server.sessionTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					logger.Debug("LMTP Proxy: Failed to clear read deadline for DATA transfer", "name", s.server.name, "error", err)
+					s.DebugLog("Failed to clear read deadline for DATA transfer", "error", err)
 				}
 			}
 
@@ -783,11 +802,11 @@ func (s *Session) proxyClientToBackend() {
 			bytesCopied, err := io.Copy(s.backendWriter, dr)
 			totalBytesIn += bytesCopied
 			if err != nil {
-				logger.Debug("LMTP Proxy: Error proxying DATA content", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Error proxying DATA content", "error", err)
 				return
 			}
 			if err := s.backendWriter.Flush(); err != nil {
-				logger.Debug("LMTP Proxy: Error flushing after DATA content", "name", s.server.name, "user", s.username, "error", err)
+				s.DebugLog("Error flushing after DATA content", "error", err)
 				return
 			}
 		}
@@ -799,13 +818,15 @@ func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Log disconnection at INFO level
+	duration := time.Since(s.startTime).Round(time.Second)
+	s.InfoLog("disconnected (duration: %v)", duration)
+
 	// Unregister connection asynchronously - don't block session cleanup
 	if s.accountID > 0 {
 		accountID := s.accountID
 		clientAddr := s.clientConn.RemoteAddr().String()
-		username := s.username
 		connTracker := s.server.connTracker
-		serverName := s.server.name
 
 		// Fire-and-forget: unregister in background to avoid blocking session teardown
 		go func() {
@@ -822,7 +843,7 @@ func (s *Session) close() {
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "LMTP", clientAddr); err != nil {
 				// Connection tracking is non-critical monitoring data, so log but continue
-				logger.Debug("LMTP Proxy: Failed to unregister connection", "name", serverName, "user", username, "error", err)
+				s.DebugLog("Failed to unregister connection", "error", err)
 			}
 		}()
 	}
@@ -857,8 +878,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		return
 	}
 
-	clientAddr := s.clientConn.RemoteAddr().String()
-
 	// Register for kick notifications
 	kickChan := s.server.connTracker.RegisterSession(s.accountID)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
@@ -867,7 +886,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			logger.Info("LMTP Proxy: Connection kicked", "name", s.server.name, "user", s.username, "client", clientAddr, "backend", s.serverAddr)
+			s.InfoLog("connection kicked")
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

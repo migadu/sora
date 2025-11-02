@@ -14,7 +14,7 @@ func (s *IMAPSession) AuthenticateMechanisms() []string {
 
 // Authenticate handles SASL authentication for the IMAPSession
 func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
-	s.Log("[AUTH] authentication attempt with mechanism %s", mechanism)
+	s.DebugLog("Authentication: attempt with mechanism %s", mechanism)
 
 	switch mechanism {
 	case "PLAIN":
@@ -47,7 +47,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					targetUser = identity // Use authorization identity if provided
 				}
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, targetUser); err != nil {
-					s.Log("[SASL PLAIN] rate limited: %v", err)
+					s.DebugLog("Authentication: SASL PLAIN rate limited: %v", err)
 					return &imap.Error{
 						Type: imap.StatusResponseTypeNo,
 						Code: imap.ResponseCodeAuthenticationFailed,
@@ -56,7 +56,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				}
 			}
 
-			s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", identity, username)
+			s.DebugLog("Authentication: SASL PLAIN AuthorizationID: '%s', AuthenticationID: '%s'", identity, username)
 
 			// 1. Check for Master SASL Authentication
 			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
@@ -67,7 +67,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Master SASL credentials match. The user to log in as is the authorization-identity.
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {
-						s.Log("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity (target user to impersonate) provided.", username)
+						s.DebugLog("Authentication: Master SASL authentication for '%s' successful, but no authorization identity (target user to impersonate) provided.", username)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -76,13 +76,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					s.Log("[AUTH] Master SASL user '%s' authenticated. Attempting to impersonate '%s'.", username, targetUserToImpersonate)
+					s.DebugLog("Authentication: master SASL user '%s' authenticated. Attempting to impersonate '%s'.", username, targetUserToImpersonate)
 
 					// Log in as the targetUserToImpersonate.
 					// For master impersonation, we directly establish the session for them.
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						s.Log("[AUTH] Failed to parse impersonation target user '%s' as address: %v", targetUserToImpersonate, err)
+						s.DebugLog("Authentication: failed to parse impersonation target user '%s' as address: %v", targetUserToImpersonate, err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -91,9 +91,9 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					userID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
+					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 					if err != nil {
-						s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+						s.DebugLog("Authentication: failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -102,16 +102,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					s.IMAPUser = NewIMAPUser(address, userID)
+					s.IMAPUser = NewIMAPUser(address, AccountID)
 					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
-					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, userID); dbErr != nil {
+					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
 					authCount := s.server.authenticatedConnections.Add(1)
 					totalCount := s.server.totalConnections.Load()
-					s.Log("[AUTH] Session established for impersonated user '%s' (ID: %d) via master SASL login. (connections: total=%d, authenticated=%d)", targetUserToImpersonate, userID, totalCount, authCount)
+					s.Log("Authentication: session established for impersonated user '%s' (ID: %d) via master SASL login (connections: total=%d, authenticated=%d)", targetUserToImpersonate, AccountID, totalCount, authCount)
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -128,7 +128,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// If `identity` (authorization-identity) is provided and is different from `username`,
 			// it's a proxy request by a non-master user. This is typically disallowed.
 			if identity != "" && identity != username {
-				s.Log("[AUTH] Attempt by '%s' to authorize as '%s' is not allowed for non-master users.", username, identity)
+				s.DebugLog("Authentication: attempt by '%s' to authorize as '%s' is not allowed for non-master users.", username, identity)
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeAuthorizationFailed,
@@ -137,11 +137,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			}
 
 			// Authenticate as `username` (authentication-identity).
-			s.Log("[AUTH] Proceeding with regular authentication for user '%s'", username)
+			s.DebugLog("Authentication: proceeding with regular authentication for user '%s'", username)
 			return s.Login(username, password)
 		}), nil
 	default:
-		s.Log("[AUTH] unsupported authentication mechanism: %s", mechanism)
+		s.DebugLog("Authentication: unsupported authentication mechanism: %s", mechanism)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthenticationFailed,

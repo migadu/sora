@@ -18,7 +18,7 @@ import (
 
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
 // It returns a map of old UIDs to new UIDs.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, userID int64) (map[imap.UID]imap.UID, error) {
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if srcMailboxID == destMailboxID {
 		return nil, fmt.Errorf("source and destination mailboxes cannot be the same")
@@ -120,7 +120,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 }
 
 type InsertMessageOptions struct {
-	UserID      int64
+	AccountID   int64
 	MailboxID   int64
 	MailboxName string
 	S3Domain    string
@@ -281,7 +281,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_email_sort, @cc_email_sort)
 		RETURNING id
 	`, pgx.NamedArgs{
-		"account_id":      options.UserID,
+		"account_id":      options.AccountID,
 		"mailbox_id":      options.MailboxID,
 		"mailbox_path":    options.MailboxName,
 		"s3_domain":       options.S3Domain,
@@ -320,7 +320,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			queryErr := tx.QueryRow(ctx,
 				`SELECT id, uid FROM messages 
 					 WHERE account_id = $1 AND mailbox_id = $2 AND message_id = $3 AND expunged_at IS NULL`,
-				options.UserID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
+				options.AccountID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
 
 			if queryErr == nil {
 				log.Printf("Database: found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
@@ -502,7 +502,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @flags, @custom_flags, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_email_sort, @cc_email_sort)
 		RETURNING id
 	`, pgx.NamedArgs{
-		"account_id":      options.UserID,
+		"account_id":      options.AccountID,
 		"mailbox_id":      options.MailboxID,
 		"mailbox_path":    options.MailboxName,
 		"s3_domain":       options.S3Domain,
@@ -541,7 +541,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			queryErr := tx.QueryRow(ctx,
 				`SELECT id, uid FROM messages 
 					 WHERE account_id = $1 AND mailbox_id = $2 AND message_id = $3 AND expunged_at IS NULL`,
-				options.UserID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
+				options.AccountID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
 
 			if queryErr == nil {
 				log.Printf("Database: found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
@@ -566,7 +566,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
 	// We always store headers for FTS. For the body, if the message is older than the FTS
 	// retention period, we store NULL to save space but still generate the TSV for searching.
-	var textBodyArg interface{} = sanePlaintextBody
+	var textBodyArg any = sanePlaintextBody
 	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		textBodyArg = nil
 	}

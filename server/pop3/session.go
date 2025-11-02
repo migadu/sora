@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"os"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
@@ -56,7 +57,7 @@ func (s *POP3Session) handleConnection() {
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := (*s.conn).(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			s.Log("TLS handshake failed: %v", err)
+			s.WarnLog("TLS handshake failed: %v", err)
 			return
 		}
 	}
@@ -81,12 +82,12 @@ func (s *POP3Session) handleConnection() {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				writer.WriteString("-ERR Connection timed out due to inactivity\r\n")
 				writer.Flush()
-				s.Log("timed out - connection closed WITHOUT calling QUIT (messages not expunged)")
+				s.WarnLog("timed out - connection closed WITHOUT calling QUIT (messages not expunged)")
 			} else if err == io.EOF {
 				// Client closed connection without QUIT
-				s.Log("CLIENT DROPPED CONNECTION WITHOUT CALLING QUIT - messages marked for deletion will NOT be expunged!")
+				s.WarnLog("CLIENT DROPPED CONNECTION WITHOUT CALLING QUIT - messages marked for deletion will NOT be expunged!")
 			} else {
-				s.Log("error: %v", err)
+				s.DebugLog("error: %v", err)
 			}
 			return
 		}
@@ -101,7 +102,7 @@ func (s *POP3Session) handleConnection() {
 		parts := strings.Split(line, " ")
 		cmd := strings.ToUpper(parts[0])
 
-		s.Log("C: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
+		s.DebugLog("C: %s", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
 
 		// Set command execution deadline
 		// Clear any previous deadline, then set command timeout
@@ -154,14 +155,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting USER command")
+				s.WarnLog(" request aborted, aborting USER command")
 				return
 			}
 
 			// Acquire read lock to check authentication state
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -183,7 +184,7 @@ func (s *POP3Session) handleConnection() {
 			username := server.UnquoteString(parts[1])
 			newUserAddress, err := server.NewAddress(username)
 			if err != nil {
-				s.Log("error: %v", err)
+				s.DebugLog("error: %v", err)
 				if s.handleClientError(writer, fmt.Sprintf("-ERR %s\r\n", err.Error())) {
 					return
 				}
@@ -207,14 +208,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting PASS command")
+				s.WarnLog(" request aborted, aborting PASS command")
 				return
 			}
 
 			// Acquire read lock to check authentication state
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -230,13 +231,13 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if userAddress == nil {
-				s.Log("PASS without USER")
+				s.DebugLog("PASS without USER")
 				writer.WriteString("-ERR Must provide USER first\r\n")
 				writer.Flush()
 				continue
 			}
 
-			s.Log("authentication attempt for %s", userAddress.FullAddress())
+			s.DebugLog("authentication attempt for %s", userAddress.FullAddress())
 
 			// Remove quotes from password if present for compatibility
 			password := server.UnquoteString(parts[1])
@@ -257,7 +258,7 @@ func (s *POP3Session) handleConnection() {
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress()); err != nil {
-					s.Log("[PASS] rate limited: %v", err)
+					s.DebugLog("[PASS] rate limited: %v", err)
 					// Track rate limiting
 					metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
 					if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
@@ -269,21 +270,21 @@ func (s *POP3Session) handleConnection() {
 
 			// Try master password authentication first
 			authSuccess := false
-			var userID int64
+			var accountID int64
 			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				if userAddress.FullAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
-					s.Log("[PASS] Master password authentication successful for '%s'", userAddress.FullAddress())
+					s.DebugLog("[PASS] Master password authentication successful for '%s'", userAddress.FullAddress())
 					authSuccess = true
 					// For master password, we need to get the user ID
-					userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.FullAddress())
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.FullAddress())
 					if err != nil {
-						s.Log("[PASS] Failed to get account ID for master user '%s': %v", userAddress.FullAddress(), err)
+						s.DebugLog("[PASS] Failed to get account ID for master user '%s': %v", userAddress.FullAddress(), err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
 						}
 						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							s.Log("authentication failed")
+							s.DebugLog("authentication failed")
 							return
 						}
 						continue
@@ -294,7 +295,7 @@ func (s *POP3Session) handleConnection() {
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
 				// Use base address (without +detail) for authentication
-				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.BaseAddress(), password)
+				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.BaseAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
@@ -304,7 +305,7 @@ func (s *POP3Session) handleConnection() {
 					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
 					metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
 					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-						s.Log("authentication failed")
+						s.DebugLog("authentication failed")
 						return
 					}
 					continue
@@ -319,9 +320,9 @@ func (s *POP3Session) handleConnection() {
 
 			// This is a potential write operation.
 			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, userID)
+			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
 			if err != nil {
-				s.Log("USER error creating default mailboxes: %v", err)
+				s.DebugLog("USER error creating default mailboxes: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -330,9 +331,9 @@ func (s *POP3Session) handleConnection() {
 			// We will set useMasterDB later under the write lock.
 			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 
-			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, userID, consts.MailboxInbox)
+			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 			if err != nil {
-				s.Log("USER error getting INBOX: %v", err)
+				s.DebugLog("USER error getting INBOX: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -341,7 +342,7 @@ func (s *POP3Session) handleConnection() {
 			// Acquire write lock to update session state
 			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock within timeout")
+				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -349,9 +350,9 @@ func (s *POP3Session) handleConnection() {
 
 			s.inboxMailboxID = inboxMailboxID.ID
 			s.authenticated = true
-			s.User = server.NewUser(*userAddress, userID) // Initialize User for connection tracking
-			s.deleted = make(map[int]bool)                // Initialize deletion map on authentication
-			s.useMasterDB = true                          // Pin session to master DB after a write to ensure consistency
+			s.User = server.NewUser(*userAddress, accountID) // Initialize User for connection tracking
+			s.deleted = make(map[int]bool)                   // Initialize deletion map on authentication
+			s.useMasterDB = true                             // Pin session to master DB after a write to ensure consistency
 			release()
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
@@ -391,14 +392,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting STAT command")
+				s.WarnLog(" request aborted, aborting STAT command")
 				return
 			}
 
 			// Acquire read lock to check inbox mailbox ID
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -414,7 +415,7 @@ func (s *POP3Session) handleConnection() {
 			release()
 			messagesCount, size, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(readCtx, mailboxID)
 			if err != nil {
-				s.Log("STAT error: %v", err)
+				s.DebugLog("STAT error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -436,14 +437,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting LIST command")
+				s.WarnLog(" request aborted, aborting LIST command")
 				return
 			}
 
 			// Acquire read lock to check authentication state
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -468,7 +469,7 @@ func (s *POP3Session) handleConnection() {
 
 			messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 			if err != nil {
-				s.Log("LIST error: %v", err)
+				s.DebugLog("LIST error: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -477,13 +478,13 @@ func (s *POP3Session) handleConnection() {
 			// Acquire write lock to update session state and read the data
 			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock within timeout")
+				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
 			}
 			s.messages = messages
-			s.Log("LIST: Loaded %d messages from database for mailbox %d", len(messages), mailboxID)
+			s.DebugLog("LIST: Loaded %d messages from database for mailbox %d", len(messages), mailboxID)
 
 			// Copy the data needed for the response.
 			type listInfo struct {
@@ -505,7 +506,7 @@ func (s *POP3Session) handleConnection() {
 				}
 			}
 			writer.WriteString(".\r\n")
-			s.Log("listed %d messages", len(s.messages))
+			s.DebugLog("listed %d messages", len(s.messages))
 
 			success = true
 
@@ -523,14 +524,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting UIDL command")
+				s.WarnLog(" request aborted, aborting UIDL command")
 				return
 			}
 
 			// Acquire read lock to check authentication state and loading needs
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -556,7 +557,7 @@ func (s *POP3Session) handleConnection() {
 				}
 				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
-					s.Log("UIDL error: %v", err)
+					s.DebugLog("UIDL error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 					writer.Flush()
 					continue
@@ -565,7 +566,7 @@ func (s *POP3Session) handleConnection() {
 				// Acquire write lock to update session state
 				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 				if !acquired {
-					s.Log("WARNING: failed to acquire write lock within timeout")
+					s.WarnLog(" failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
 					writer.Flush()
 					continue
@@ -587,7 +588,7 @@ func (s *POP3Session) handleConnection() {
 				// Acquire read lock to access messages
 				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
 				if !acquired {
-					s.Log("WARNING: failed to acquire read lock within timeout")
+					s.WarnLog(" failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
 					writer.Flush()
 					continue
@@ -618,7 +619,7 @@ func (s *POP3Session) handleConnection() {
 				// Acquire read lock to access messages and deleted status
 				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
 				if !acquired {
-					s.Log("WARNING: failed to acquire read lock within timeout")
+					s.WarnLog(" failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
 					writer.Flush()
 					continue
@@ -645,7 +646,7 @@ func (s *POP3Session) handleConnection() {
 				}
 				writer.WriteString(".\r\n")
 			}
-			s.Log("UIDL command executed")
+			s.DebugLog("UIDL command executed")
 			success = true
 
 		case "TOP":
@@ -662,7 +663,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting TOP command")
+				s.WarnLog(" request aborted, aborting TOP command")
 				return
 			}
 
@@ -692,7 +693,7 @@ func (s *POP3Session) handleConnection() {
 			// Phase 1: Read session state to determine if messages need loading.
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -719,7 +720,7 @@ func (s *POP3Session) handleConnection() {
 				}
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
-					s.Log("TOP error: %v", err)
+					s.DebugLog("TOP error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 					writer.Flush()
 					continue
@@ -739,7 +740,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if !acquired {
-				s.Log("WARNING: failed to acquire lock for TOP command")
+				s.WarnLog(" failed to acquire lock for TOP command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -748,7 +749,7 @@ func (s *POP3Session) handleConnection() {
 			// If we loaded messages, update the session state.
 			if needsLoading {
 				s.messages = loadedMessages
-				s.Log("TOP: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
+				s.DebugLog("TOP: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
 			}
 
 			// Now check message bounds and status under the lock.
@@ -789,7 +790,7 @@ func (s *POP3Session) handleConnection() {
 				if err == consts.ErrMessageNotAvailable {
 					writer.WriteString("-ERR Message not available\r\n")
 				} else {
-					s.Log("TOP internal error: %v", err)
+					s.DebugLog("TOP internal error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 				}
 				writer.Flush()
@@ -813,7 +814,7 @@ func (s *POP3Session) handleConnection() {
 				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
 				writer.WriteString(result)
 				writer.WriteString("\r\n.\r\n")
-				s.Log("retrieved headers for message %d", msg.UID)
+				s.DebugLog("retrieved headers for message %d", msg.UID)
 				continue
 			}
 
@@ -851,7 +852,7 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
 			writer.WriteString(result)
 			writer.WriteString("\r\n.\r\n")
-			s.Log("retrieved top %d lines of message %d", lines, msg.UID)
+			s.DebugLog("retrieved top %d lines of message %d", lines, msg.UID)
 			success = true
 
 		case "RETR":
@@ -868,14 +869,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting RETR command")
+				s.WarnLog(" request aborted, aborting RETR command")
 				return
 			}
 
 			// Phase 1: Read session state to determine if messages need loading.
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -916,7 +917,7 @@ func (s *POP3Session) handleConnection() {
 				}
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
-					s.Log("RETR error: %v", err)
+					s.DebugLog("RETR error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 					writer.Flush()
 					continue
@@ -935,7 +936,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if !acquired {
-				s.Log("WARNING: failed to acquire lock for RETR command")
+				s.WarnLog(" failed to acquire lock for RETR command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -943,7 +944,7 @@ func (s *POP3Session) handleConnection() {
 
 			if needsLoading {
 				s.messages = loadedMessages
-				s.Log("RETR: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
+				s.DebugLog("RETR: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
 			}
 
 			if msgNumber > len(s.messages) {
@@ -983,7 +984,7 @@ func (s *POP3Session) handleConnection() {
 				if err == consts.ErrMessageNotAvailable {
 					writer.WriteString("-ERR Message not available\r\n")
 				} else {
-					s.Log("RETR internal error: %v", err)
+					s.DebugLog("RETR internal error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 				}
 				writer.Flush()
@@ -993,12 +994,12 @@ func (s *POP3Session) handleConnection() {
 			if s.memTracker != nil && bodyData != nil {
 				defer s.memTracker.Free(int64(len(bodyData)))
 			}
-			s.Log("retrieved message body for UID %d", msg.UID)
+			s.DebugLog("retrieved message body for UID %d", msg.UID)
 
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
 			writer.WriteString(string(bodyData))
 			writer.WriteString("\r\n.\r\n")
-			s.Log("retrieved message %d", msg.UID)
+			s.DebugLog("retrieved message %d", msg.UID)
 
 			// Track successful message retrieval
 			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
@@ -1043,14 +1044,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting RSET command")
+				s.WarnLog(" request aborted, aborting RSET command")
 				return
 			}
 
 			// Acquire write lock to update deleted map
 			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock within timeout")
+				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1059,7 +1060,7 @@ func (s *POP3Session) handleConnection() {
 			s.deleted = make(map[int]bool)
 
 			writer.WriteString("+OK\r\n")
-			s.Log("reset")
+			s.DebugLog("reset")
 			success = true
 
 		case "DELE":
@@ -1076,7 +1077,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting DELE command")
+				s.WarnLog(" request aborted, aborting DELE command")
 				return
 			}
 
@@ -1090,7 +1091,7 @@ func (s *POP3Session) handleConnection() {
 
 			msgNumber, err := strconv.Atoi(parts[1])
 			if err != nil || msgNumber < 1 {
-				s.Log("DELE error: %v", err)
+				s.DebugLog("DELE error: %v", err)
 				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
 					return
 				}
@@ -1100,7 +1101,7 @@ func (s *POP3Session) handleConnection() {
 			// Phase 1: Read session state to determine if messages need loading.
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock for DELE command")
+				s.WarnLog(" failed to acquire read lock for DELE command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1126,7 +1127,7 @@ func (s *POP3Session) handleConnection() {
 				}
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
-					s.Log("DELE error: %v", err)
+					s.DebugLog("DELE error: %v", err)
 					writer.WriteString("-ERR Internal server error\r\n")
 					writer.Flush()
 					continue
@@ -1136,7 +1137,7 @@ func (s *POP3Session) handleConnection() {
 			// Phase 3: Acquire write lock to update session state.
 			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock for DELE command")
+				s.WarnLog(" failed to acquire write lock for DELE command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1145,13 +1146,13 @@ func (s *POP3Session) handleConnection() {
 			// If we loaded messages, update the session state.
 			if needsLoading {
 				s.messages = loadedMessages
-				s.Log("DELE: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
+				s.DebugLog("DELE: Loaded %d messages from database for mailbox %d", len(s.messages), mailboxID)
 			}
 
 			// Validate message bounds and perform deletion
 			if msgNumber > len(s.messages) {
 				release()
-				s.Log("DELE error: no such message %d", msgNumber)
+				s.DebugLog("DELE error: no such message %d", msgNumber)
 				if s.handleClientError(writer, "-ERR No such message\r\n") {
 					return
 				}
@@ -1161,7 +1162,7 @@ func (s *POP3Session) handleConnection() {
 			msg := s.messages[msgNumber-1]
 			if msg.UID == 0 {
 				release()
-				s.Log("DELE error: no such message %d", msgNumber)
+				s.DebugLog("DELE error: no such message %d", msgNumber)
 				if s.handleClientError(writer, "-ERR No such message\r\n") {
 					return
 				}
@@ -1172,7 +1173,7 @@ func (s *POP3Session) handleConnection() {
 			release()
 
 			writer.WriteString("+OK Message deleted\r\n")
-			s.Log("DELE: marked message %d (UID %d) for deletion in mailbox %d. Total deleted: %d", msgNumber, msg.UID, mailboxID, len(s.deleted))
+			s.DebugLog("DELE: marked message %d (UID %d) for deletion in mailbox %d. Total deleted: %d", msgNumber, msg.UID, mailboxID, len(s.deleted))
 
 			metrics.MessageThroughput.WithLabelValues("pop3", "deleted", "success").Inc()
 			success = true
@@ -1191,14 +1192,14 @@ func (s *POP3Session) handleConnection() {
 
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting AUTH command")
+				s.WarnLog(" request aborted, aborting AUTH command")
 				return
 			}
 
 			// Acquire read lock to check authentication state
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1243,7 +1244,7 @@ func (s *POP3Session) handleConnection() {
 				// Read the authentication data
 				authLine, err := reader.ReadString('\n')
 				if err != nil {
-					s.Log("error reading auth data: %v", err)
+					s.DebugLog("error reading auth data: %v", err)
 					if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
 						return
 					}
@@ -1264,7 +1265,7 @@ func (s *POP3Session) handleConnection() {
 			// Decode base64
 			decoded, err := base64.StdEncoding.DecodeString(authData)
 			if err != nil {
-				s.Log("error decoding auth data: %v", err)
+				s.DebugLog("error decoding auth data: %v", err)
 				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication data\r\n") {
 					return
 				}
@@ -1274,7 +1275,7 @@ func (s *POP3Session) handleConnection() {
 			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
 			parts := strings.Split(string(decoded), "\x00")
 			if len(parts) != 3 {
-				s.Log("invalid SASL PLAIN format")
+				s.DebugLog("invalid SASL PLAIN format")
 				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication format\r\n") {
 					return
 				}
@@ -1285,10 +1286,10 @@ func (s *POP3Session) handleConnection() {
 			authnID := parts[1]  // Authentication identity (who is authenticating)
 			password := parts[2] // Password
 
-			s.Log("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
+			s.DebugLog("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
 
 			// Check for Master SASL Authentication
-			var userID int64
+			var accountID int64
 			var impersonating bool
 
 			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
@@ -1296,28 +1297,28 @@ func (s *POP3Session) handleConnection() {
 				if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
 					// Master SASL authentication successful
 					if authzID == "" {
-						s.Log("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity provided.", authnID)
+						s.DebugLog("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity provided.", authnID)
 						if s.handleClientError(writer, "-ERR [AUTH] Master SASL login requires an authorization identity.\r\n") {
 							return
 						}
 						continue
 					}
 
-					s.Log("[AUTH] Master SASL user '%s' authenticated. Attempting to impersonate '%s'.", authnID, authzID)
+					s.DebugLog("[AUTH] Master SASL user '%s' authenticated. Attempting to impersonate '%s'.", authnID, authzID)
 
 					// Log in as the authzID without a password check
 					address, err := server.NewAddress(authzID)
 					if err != nil {
-						s.Log("[AUTH] Failed to parse impersonation target user '%s': %v", authzID, err)
+						s.DebugLog("[AUTH] Failed to parse impersonation target user '%s': %v", authzID, err)
 						if s.handleClientError(writer, "-ERR [AUTH] Invalid impersonation target user format\r\n") {
 							return
 						}
 						continue
 					}
 
-					userID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 					if err != nil {
-						s.Log("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
+						s.DebugLog("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
 						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
 							return
 						}
@@ -1332,7 +1333,7 @@ func (s *POP3Session) handleConnection() {
 			if !impersonating {
 				// For regular POP3, we don't support proxy authentication
 				if authzID != "" && authzID != authnID {
-					s.Log("proxy authentication requires master credentials: authz='%s', authn='%s'", authzID, authnID)
+					s.DebugLog("proxy authentication requires master credentials: authz='%s', authn='%s'", authzID, authnID)
 					if s.handleClientError(writer, "-ERR [AUTH] Proxy authentication requires master_sasl_username and master_sasl_password to be configured\r\n") {
 						return
 					}
@@ -1342,14 +1343,14 @@ func (s *POP3Session) handleConnection() {
 				// Authenticate the user
 				address, err := server.NewAddress(authnID)
 				if err != nil {
-					s.Log("invalid address format: %v", err)
+					s.DebugLog("invalid address format: %v", err)
 					if s.handleClientError(writer, "-ERR [AUTH] Invalid username format\r\n") {
 						return
 					}
 					continue
 				}
 
-				s.Log("authentication attempt for %s", address.FullAddress())
+				s.DebugLog("authentication attempt for %s", address.FullAddress())
 
 				// Get connection and proxy info for rate limiting
 				netConn := *s.conn
@@ -1367,7 +1368,7 @@ func (s *POP3Session) handleConnection() {
 				// Check authentication rate limiting after delay
 				if s.server.authLimiter != nil {
 					if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
-						s.Log("[SASL PLAIN] rate limited: %v", err)
+						s.DebugLog("[SASL PLAIN] rate limited: %v", err)
 						if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
 							return
 						}
@@ -1375,14 +1376,14 @@ func (s *POP3Session) handleConnection() {
 					}
 				}
 
-				userID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 				if err != nil {
 					// Record failed attempt
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)
 					}
 					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-						s.Log("authentication failed")
+						s.DebugLog("authentication failed")
 						return
 					}
 					continue
@@ -1396,9 +1397,9 @@ func (s *POP3Session) handleConnection() {
 
 			// This is a potential write operation.
 			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, userID)
+			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
 			if err != nil {
-				s.Log("AUTH error creating default mailboxes: %v", err)
+				s.DebugLog("AUTH error creating default mailboxes: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -1407,9 +1408,9 @@ func (s *POP3Session) handleConnection() {
 			// We will set useMasterDB later under the write lock.
 			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 
-			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, userID, consts.MailboxInbox)
+			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 			if err != nil {
-				s.Log("AUTH error getting INBOX: %v", err)
+				s.DebugLog("AUTH error getting INBOX: %v", err)
 				writer.WriteString("-ERR Internal server error\r\n")
 				writer.Flush()
 				continue
@@ -1418,7 +1419,7 @@ func (s *POP3Session) handleConnection() {
 			// Acquire write lock to update session state
 			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock within timeout")
+				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1435,7 +1436,7 @@ func (s *POP3Session) handleConnection() {
 				userEmail = authnID
 			}
 			userAddr, _ := server.NewAddress(userEmail)
-			s.User = server.NewUser(userAddr, userID)
+			s.User = server.NewUser(userAddr, accountID)
 			s.deleted = make(map[int]bool) // Initialize deletion map on authentication
 			s.useMasterDB = true           // Pin session to master DB after a write to ensure consistency
 			release()
@@ -1474,7 +1475,7 @@ func (s *POP3Session) handleConnection() {
 			// Acquire read lock to access current language
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire read lock within timeout")
+				s.WarnLog(" failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1501,7 +1502,7 @@ func (s *POP3Session) handleConnection() {
 				// Acquire write lock to update language
 				acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 				if !acquired {
-					s.Log("WARNING: failed to acquire write lock within timeout")
+					s.WarnLog(" failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
 					writer.Flush()
 					continue
@@ -1516,7 +1517,7 @@ func (s *POP3Session) handleConnection() {
 
 				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", s.language))
 			}
-			s.Log("LANG command: current=%s", currentLang)
+			s.DebugLog("LANG command: current=%s", currentLang)
 			success = true
 
 		case "UTF8":
@@ -1535,7 +1536,7 @@ func (s *POP3Session) handleConnection() {
 			// Acquire write lock to update UTF8 mode
 			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.Log("WARNING: failed to acquire write lock within timeout")
+				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				continue
@@ -1545,7 +1546,7 @@ func (s *POP3Session) handleConnection() {
 			release()
 
 			writer.WriteString("+OK UTF8 enabled\r\n")
-			s.Log("UTF8 mode enabled")
+			s.DebugLog("UTF8 mode enabled")
 			success = true
 
 		case "QUIT":
@@ -1560,10 +1561,10 @@ func (s *POP3Session) handleConnection() {
 				metrics.CommandDuration.WithLabelValues("pop3", "QUIT").Observe(time.Since(start).Seconds())
 			}()
 
-			s.Log("QUIT: Command received, starting message expunge process")
+			s.DebugLog("QUIT: Command received, starting message expunge process")
 			// Check context before processing command
 			if s.ctx.Err() != nil {
-				s.Log("WARNING: request aborted, aborting QUIT command")
+				s.WarnLog(" request aborted, aborting QUIT command")
 				return
 			}
 
@@ -1587,24 +1588,24 @@ func (s *POP3Session) handleConnection() {
 			// Phase 2: Perform cache and database operations outside the lock.
 			var expungeUIDs []imap.UID
 			for _, msg := range messagesToExpunge {
-				s.Log("QUIT: Will expunge message UID %d", msg.UID)
+				s.DebugLog("QUIT: Will expunge message UID %d", msg.UID)
 				// Delete from cache before expunging
 				if err := s.server.cache.Delete(msg.ContentHash); err != nil && !isNotExist(err) {
-					s.Log("[CACHE] WARNING: failed to delete message %s from cache: %v", msg.ContentHash, err)
+					s.WarnLog("[CACHE] WARNING: failed to delete message %s from cache: %v", msg.ContentHash, err)
 				}
 				expungeUIDs = append(expungeUIDs, msg.UID)
 			}
 
 			if len(expungeUIDs) > 0 {
-				s.Log("expunging %d messages from mailbox %d: %v", len(expungeUIDs), mailboxID, expungeUIDs)
+				s.DebugLog("expunging %d messages from mailbox %d: %v", len(expungeUIDs), mailboxID, expungeUIDs)
 				_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, expungeUIDs...)
 				if err != nil {
-					s.Log("error expunging messages from mailbox %d: %v", mailboxID, err)
+					s.DebugLog("error expunging messages from mailbox %d: %v", mailboxID, err)
 				} else {
-					s.Log("successfully expunged %d messages from mailbox %d", len(expungeUIDs), mailboxID)
+					s.DebugLog("successfully expunged %d messages from mailbox %d", len(expungeUIDs), mailboxID)
 				}
 			} else {
-				s.Log("no messages to expunge from mailbox %d", mailboxID)
+				s.DebugLog("no messages to expunge from mailbox %d", mailboxID)
 			}
 
 			userAddress = nil
@@ -1642,13 +1643,13 @@ func (s *POP3Session) handleConnection() {
 
 		default:
 			writer.WriteString(fmt.Sprintf("-ERR Unknown command: %s\r\n", cmd))
-			s.Log("unknown command: %s", cmd)
+			s.DebugLog("unknown command: %s", cmd)
 		}
 
 		// Flush response and check for timeout
 		if err := writer.Flush(); err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.Log("command %s exceeded timeout (%v)", cmd, s.server.commandTimeout)
+				s.WarnLog("command %s timeout (%v)", cmd, s.server.commandTimeout)
 
 				// Track timeout event in metrics
 				metrics.CommandTimeoutsTotal.WithLabelValues("pop3", cmd).Inc()
@@ -1659,7 +1660,7 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				return
 			}
-			s.Log("error flushing response for %s: %v", cmd, err)
+			s.DebugLog("error flushing response for %s: %v", cmd, err)
 			return
 		}
 
@@ -1699,7 +1700,7 @@ func (s *POP3Session) closeWithoutLock() error {
 		peak := s.memTracker.Peak()
 		metrics.SessionMemoryPeakBytes.WithLabelValues("pop3").Observe(float64(peak))
 		if peak > 0 {
-			s.Log("session memory - peak: %s", server.FormatBytes(peak))
+			s.DebugLog("session memory - peak: %s", server.FormatBytes(peak))
 		}
 	}
 
@@ -1744,7 +1745,7 @@ func (s *POP3Session) closeWithoutLock() error {
 		}
 	} else {
 		authCount = s.server.authenticatedConnections.Load()
-		s.Log("closed unauthenticated connection (connections: total=%d, authenticated=%d)",
+		s.DebugLog("closed unauthenticated connection (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 
@@ -1754,7 +1755,7 @@ func (s *POP3Session) closeWithoutLock() error {
 func (s *POP3Session) Close() error {
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.Log("failed to acquire write lock within timeout")
+		s.WarnLog("failed to acquire write lock within timeout")
 		// Still close the connection even if we can't acquire the lock
 		return s.closeWithoutLock()
 	}
@@ -1764,7 +1765,7 @@ func (s *POP3Session) Close() error {
 
 func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	if s.ctx.Err() != nil {
-		s.Log("request aborted, aborting message body fetch")
+		s.DebugLog("request aborted, aborting message body fetch")
 		return nil, fmt.Errorf("request aborted")
 	}
 
@@ -1785,9 +1786,9 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3
 		logger.Debug("POP3: Cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
-		address, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, msg.UserID)
+		address, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, msg.AccountID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.UserID, err)
+			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.AccountID, err)
 		}
 
 		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
@@ -1816,7 +1817,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 	// If not uploaded to S3, try fetch from local disk
 	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
-	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.UserID)
+	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1847,8 +1848,8 @@ func (s *POP3Session) registerConnection(email string) {
 
 		clientAddr := (*s.conn).RemoteAddr().String()
 
-		if err := s.server.connTracker.RegisterConnection(ctx, s.UserID(), email, "POP3", clientAddr); err != nil {
-			s.Log("Failed to register connection: %v", err)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
+			s.DebugLog("Failed to register connection: %v", err)
 		}
 	}
 }
@@ -1861,8 +1862,8 @@ func (s *POP3Session) unregisterConnection() {
 
 		clientAddr := (*s.conn).RemoteAddr().String()
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.UserID(), "POP3", clientAddr); err != nil {
-			s.Log("Failed to unregister connection: %v", err)
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
+			s.DebugLog("Failed to unregister connection: %v", err)
 		}
 	}
 }
@@ -1874,11 +1875,11 @@ func (s *POP3Session) startTerminationPoller() {
 	}
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(s.UserID())
+	kickChan := s.server.connTracker.RegisterSession(s.AccountID())
 
 	go func() {
 		// Unregister when done
-		defer s.server.connTracker.UnregisterSession(s.UserID(), kickChan)
+		defer s.server.connTracker.UnregisterSession(s.AccountID(), kickChan)
 
 		select {
 		case <-kickChan:

@@ -14,12 +14,12 @@ import (
 // backend authentication when prelookup resolved an alias to a canonical address.
 func TestPrelookupUsernameAssignment(t *testing.T) {
 	tests := []struct {
-		name                   string
-		authMethod             string // "prelookup" or "maindb"
-		loginEmail             string // What user logs in with
-		prelookupReturnEmail   string // What prelookup returns (if prelookup)
-		expectedUsername       string // What s.username should be after auth
-		description            string
+		name                 string
+		authMethod           string // "prelookup" or "maindb"
+		loginEmail           string // What user logs in with
+		prelookupReturnEmail string // What prelookup returns (if prelookup)
+		expectedUsername     string // What s.username should be after auth
+		description          string
 	}{
 		{
 			name:                 "prelookup_alias_to_canonical",
@@ -132,22 +132,22 @@ func TestMainDBAliasHandling(t *testing.T) {
 	// (not just the prelookup path)
 
 	tests := []struct {
-		name           string
-		loginEmail     string
+		name             string
+		loginEmail       string
 		expectedUsername string
-		description    string
+		description      string
 	}{
 		{
-			name:           "base_address",
-			loginEmail:     "user@example.com",
+			name:             "base_address",
+			loginEmail:       "user@example.com",
 			expectedUsername: "user@example.com",
-			description:    "Base address should remain unchanged",
+			description:      "Base address should remain unchanged",
 		},
 		{
-			name:           "plus_detail",
-			loginEmail:     "user+tag@example.com",
+			name:             "plus_detail",
+			loginEmail:       "user+tag@example.com",
 			expectedUsername: "user@example.com",
-			description:    "+detail should be stripped for backend auth",
+			description:      "+detail should be stripped for backend auth",
 		},
 	}
 
@@ -226,31 +226,31 @@ func TestSASLPlainImpersonation(t *testing.T) {
 	// authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, masterUsername, masterPassword)
 
 	tests := []struct {
-		name               string
-		impersonateAs      string // s.username (the user to impersonate)
-		masterUsername     string
-		masterPassword     string
-		expectedAuthzID    string
-		expectedAuthnID    string
-		expectedPassword   string
+		name             string
+		impersonateAs    string // s.username (the user to impersonate)
+		masterUsername   string
+		masterPassword   string
+		expectedAuthzID  string
+		expectedAuthnID  string
+		expectedPassword string
 	}{
 		{
-			name:               "canonical_user",
-			impersonateAs:      "user@example.com",
-			masterUsername:     "master@example.com",
-			masterPassword:     "masterpass",
-			expectedAuthzID:    "user@example.com",
-			expectedAuthnID:    "master@example.com",
-			expectedPassword:   "masterpass",
+			name:             "canonical_user",
+			impersonateAs:    "user@example.com",
+			masterUsername:   "master@example.com",
+			masterPassword:   "masterpass",
+			expectedAuthzID:  "user@example.com",
+			expectedAuthnID:  "master@example.com",
+			expectedPassword: "masterpass",
 		},
 		{
-			name:               "alias_resolved",
-			impersonateAs:      "canonical@example.com",
-			masterUsername:     "master@example.com",
-			masterPassword:     "masterpass",
-			expectedAuthzID:    "canonical@example.com",
-			expectedAuthnID:    "master@example.com",
-			expectedPassword:   "masterpass",
+			name:             "alias_resolved",
+			impersonateAs:    "canonical@example.com",
+			masterUsername:   "master@example.com",
+			masterPassword:   "masterpass",
+			expectedAuthzID:  "canonical@example.com",
+			expectedAuthnID:  "master@example.com",
+			expectedPassword: "masterpass",
 		},
 	}
 

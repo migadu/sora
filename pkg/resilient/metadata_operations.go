@@ -9,13 +9,13 @@ import (
 )
 
 // GetMetadataWithRetry retrieves metadata entries with retry logic.
-func (rd *ResilientDatabase) GetMetadataWithRetry(ctx context.Context, userID int64, mailboxID *int64, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+func (rd *ResilientDatabase) GetMetadataWithRetry(ctx context.Context, AccountID int64, mailboxID *int64, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
 	type result struct {
 		data *imap.GetMetadataData
 	}
 
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		data, err := rd.getOperationalDatabaseForOperation(false).GetMetadata(ctx, tx, userID, mailboxID, entries, options)
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		data, err := rd.getOperationalDatabaseForOperation(false).GetMetadata(ctx, tx, AccountID, mailboxID, entries, options)
 		if err != nil {
 			return nil, err
 		}
@@ -31,9 +31,9 @@ func (rd *ResilientDatabase) GetMetadataWithRetry(ctx context.Context, userID in
 }
 
 // SetMetadataWithRetry sets metadata entries with retry logic and enforces configured limits.
-func (rd *ResilientDatabase) SetMetadataWithRetry(ctx context.Context, userID int64, mailboxID *int64, entries map[string]*[]byte, limits *db.MetadataLimits) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
-		err := rd.getOperationalDatabaseForOperation(true).SetMetadata(ctx, tx, userID, mailboxID, entries, limits)
+func (rd *ResilientDatabase) SetMetadataWithRetry(ctx context.Context, AccountID int64, mailboxID *int64, entries map[string]*[]byte, limits *db.MetadataLimits) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		err := rd.getOperationalDatabaseForOperation(true).SetMetadata(ctx, tx, AccountID, mailboxID, entries, limits)
 		return nil, err
 	}
 

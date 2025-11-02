@@ -91,12 +91,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/pkg/metrics"
@@ -477,7 +478,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	s.Stats = b // Set the server as the Stats provider
 
 	// Create logging function for the mutex helper
-	logFunc := func(format string, args ...interface{}) {
+	logFunc := func(format string, args ...any) {
 		s.Log(format, args...)
 	}
 

@@ -69,7 +69,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		  AND m.expunged_at IS NOT NULL
 	`
 
-	args := []interface{}{accountID}
+	args := []any{accountID}
 	argPos := 2
 
 	if params.MailboxPath != nil {
@@ -163,7 +163,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		  AND expunged_at IS NOT NULL
 	`
 
-	args := []interface{}{accountID}
+	args := []any{accountID}
 	argPos := 2
 
 	if len(params.MessageIDs) > 0 {

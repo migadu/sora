@@ -325,7 +325,7 @@ func TestUserStatsDataStructures(t *testing.T) {
 
 		// Count tracked users manually
 		manualCount := 0
-		trackedUsers.Range(func(key, value interface{}) bool {
+		trackedUsers.Range(func(key, value any) bool {
 			manualCount++
 			return true
 		})

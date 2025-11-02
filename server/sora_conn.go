@@ -38,9 +38,10 @@ type SoraConn struct {
 	lastThroughputCheck time.Time
 	bytesTransferred    int64
 	// Slowloris protection: rolling window tracking
-	throughputHistory      [3]int64 // Last 3 minutes of throughput measurements
-	throughputHistoryIndex int      // Current position in ring buffer
-	consecutiveSlowMinutes int      // Counter for consecutive slow periods
+	throughputHistory           [3]int64 // Last 3 minutes of throughput measurements
+	throughputHistoryIndex      int      // Current position in ring buffer
+	consecutiveSlowMinutes      int      // Counter for consecutive slow periods
+	throughputCheckingSuspended bool     // True when in IDLE mode (IMAP)
 
 	// JA4 TLS fingerprinting
 	ja4Fingerprint string
@@ -170,7 +171,12 @@ func (c *SoraConn) timeoutChecker() {
 
 			// Check minimum throughput (protects against slowloris attacks)
 			// IMPROVED: Uses 3-minute rolling average and requires 2 consecutive slow periods
-			if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
+			// Skip if throughput checking is suspended (e.g., during IMAP IDLE)
+			c.mu.RLock()
+			suspended := c.throughputCheckingSuspended
+			c.mu.RUnlock()
+
+			if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute && !suspended {
 				sessionDurationSinceStart := time.Since(c.sessionStart)
 
 				// Only enforce throughput after the first 2 minutes of the session
@@ -331,11 +337,26 @@ func (c *SoraConn) SetProxyInfo(info *ProxyProtocolInfo) {
 	c.proxyInfoMutex.Unlock()
 }
 
-// ResetThroughputCounter resets the bytes transferred counter
-// Used when entering IDLE mode to avoid false positives for slowloris detection
-func (c *SoraConn) ResetThroughputCounter() {
+// SuspendThroughputChecking disables slowloris throughput checks
+// Used when entering IDLE mode where low throughput is expected and legitimate
+func (c *SoraConn) SuspendThroughputChecking() {
 	c.mu.Lock()
-	c.bytesTransferred = 0
+	c.throughputCheckingSuspended = true
+	c.bytesTransferred = 0 // Reset counter as well
+	c.mu.Unlock()
+}
+
+// ResumeThroughputChecking re-enables slowloris throughput checks
+// Used when exiting IDLE mode to restore normal protection
+func (c *SoraConn) ResumeThroughputChecking() {
+	c.mu.Lock()
+	c.throughputCheckingSuspended = false
+	c.bytesTransferred = 0             // Reset counter for fresh start
+	c.lastThroughputCheck = time.Now() // Reset timing
+	c.consecutiveSlowMinutes = 0       // Clear slow minute counter
+	// Clear throughput history
+	c.throughputHistory = [3]int64{}
+	c.throughputHistoryIndex = 0
 	c.mu.Unlock()
 }
 

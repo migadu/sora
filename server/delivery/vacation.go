@@ -14,7 +14,7 @@ import (
 
 // VacationHandler interface defines the contract for handling vacation responses.
 type VacationHandler interface {
-	HandleVacationResponse(ctx context.Context, userID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error
+	HandleVacationResponse(ctx context.Context, AccountID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error
 }
 
 // StandardVacationHandler implements the standard vacation response handling.
@@ -26,7 +26,7 @@ type StandardVacationHandler struct {
 }
 
 // HandleVacationResponse handles vacation auto-response.
-func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, userID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
+func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, AccountID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
 	if h.RelayHandler == nil && h.RelayQueue == nil {
 		if h.Logger != nil {
 			h.Logger.Log("[VACATION] external relay not configured, cannot send vacation response")

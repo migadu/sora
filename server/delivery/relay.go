@@ -46,7 +46,7 @@ func (r *SMTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 
 	// Wrap delivery in circuit breaker if available
 	if r.CircuitBreaker != nil {
-		_, err := r.CircuitBreaker.Execute(func() (interface{}, error) {
+		_, err := r.CircuitBreaker.Execute(func() (any, error) {
 			return nil, r.sendToSMTPRelay(from, to, messageBytes)
 		})
 		// Check if circuit breaker is open
@@ -174,7 +174,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 
 	// Wrap delivery in circuit breaker if available
 	if r.CircuitBreaker != nil {
-		_, err := r.CircuitBreaker.Execute(func() (interface{}, error) {
+		_, err := r.CircuitBreaker.Execute(func() (any, error) {
 			return nil, r.sendToHTTPRelay(from, to, messageBytes)
 		})
 		// Check if circuit breaker is open

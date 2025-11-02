@@ -245,7 +245,7 @@ func (hi *HealthIntegration) storeHealthStatus(componentName string, status Comp
 	check.mu.RUnlock()
 
 	// Create metadata with additional information
-	metadata := make(map[string]interface{})
+	metadata := make(map[string]any)
 	metadata["interval"] = interval.String()
 	metadata["critical"] = critical
 	metadata["enabled"] = enabled

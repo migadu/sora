@@ -141,7 +141,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 		defer server.Server.(*imap.IMAPServer).Close()
 		defer server.Close()
 
-		userID := getAccountID(server, account.Email)
+		AccountID := getAccountID(server, account.Email)
 
 		// Connect first client
 		client1, err := connectClient(server.Address, account.Email, account.Password)
@@ -152,7 +152,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 
 		// Check tracker has 1 connection
 		time.Sleep(200 * time.Millisecond) // Give time for registration
-		count := tracker.GetConnectionCount(userID)
+		count := tracker.GetConnectionCount(AccountID)
 		if count != 1 {
 			t.Errorf("Expected 1 connection, got %d", count)
 		}
@@ -166,7 +166,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 
 		// Check tracker has 2 connections
 		time.Sleep(200 * time.Millisecond)
-		count = tracker.GetConnectionCount(userID)
+		count = tracker.GetConnectionCount(AccountID)
 		if count != 2 {
 			t.Errorf("Expected 2 connections, got %d", count)
 		}
@@ -176,7 +176,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 
 		// Check tracker has 1 connection
-		count = tracker.GetConnectionCount(userID)
+		count = tracker.GetConnectionCount(AccountID)
 		if count != 1 {
 			t.Errorf("Expected 1 connection after disconnect, got %d", count)
 		}
@@ -190,7 +190,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 		defer server.Server.(*imap.IMAPServer).Close()
 		defer server.Close()
 
-		userID := getAccountID(server, account.Email)
+		AccountID := getAccountID(server, account.Email)
 
 		// Connect 2 clients (should succeed)
 		client1, err := connectClient(server.Address, account.Email, account.Password)
@@ -208,7 +208,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 
 		// Verify we have 2 connections
-		count := tracker.GetConnectionCount(userID)
+		count := tracker.GetConnectionCount(AccountID)
 		if count != 2 {
 			t.Errorf("Expected 2 connections, got %d", count)
 		}
@@ -229,7 +229,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 
 			// Verify count didn't increase
 			time.Sleep(100 * time.Millisecond)
-			count = tracker.GetConnectionCount(userID)
+			count = tracker.GetConnectionCount(AccountID)
 			if count > 2 {
 				t.Errorf("Connection count should not exceed 2, got %d", count)
 			}
@@ -244,7 +244,7 @@ func TestBackendConnectionTracking(t *testing.T) {
 		defer server.Server.(*imap.IMAPServer).Close()
 		defer server.Close()
 
-		userID := getAccountID(server, account.Email)
+		AccountID := getAccountID(server, account.Email)
 
 		// Connect 2 clients
 		client1, err := connectClient(server.Address, account.Email, account.Password)
@@ -262,13 +262,13 @@ func TestBackendConnectionTracking(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 
 		// Verify both connected
-		count := tracker.GetConnectionCount(userID)
+		count := tracker.GetConnectionCount(AccountID)
 		if count != 2 {
 			t.Errorf("Expected 2 connections before kick, got %d", count)
 		}
 
 		// Kick the user
-		err = tracker.KickUser(userID, "IMAP")
+		err = tracker.KickUser(AccountID, "IMAP")
 		if err != nil {
 			t.Fatalf("Failed to kick user: %v", err)
 		}

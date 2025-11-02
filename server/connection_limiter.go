@@ -15,8 +15,7 @@ type ConnectionLimiter struct {
 	maxConnections   int
 	maxPerIP         int
 	currentTotal     atomic.Int64
-	perIPConnections map[string]*atomic.Int64
-	mu               sync.RWMutex
+	perIPConnections sync.Map // map[string]*atomic.Int64 - lock-free for better concurrency
 	cleanupInterval  time.Duration
 	protocol         string
 	trustedNets      []*net.IPNet // Trusted networks that bypass per-IP limits
@@ -25,12 +24,11 @@ type ConnectionLimiter struct {
 // NewConnectionLimiter creates a new connection limiter
 func NewConnectionLimiter(protocol string, maxConnections, maxPerIP int) *ConnectionLimiter {
 	return &ConnectionLimiter{
-		maxConnections:   maxConnections,
-		maxPerIP:         maxPerIP,
-		perIPConnections: make(map[string]*atomic.Int64),
-		cleanupInterval:  5 * time.Minute, // Clean up stale IP entries
-		protocol:         protocol,
-		trustedNets:      []*net.IPNet{},
+		maxConnections:  maxConnections,
+		maxPerIP:        maxPerIP,
+		cleanupInterval: 5 * time.Minute, // Clean up stale IP entries
+		protocol:        protocol,
+		trustedNets:     []*net.IPNet{},
 	}
 }
 
@@ -43,12 +41,11 @@ func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPer
 	}
 
 	return &ConnectionLimiter{
-		maxConnections:   maxConnections,
-		maxPerIP:         maxPerIP,
-		perIPConnections: make(map[string]*atomic.Int64),
-		cleanupInterval:  5 * time.Minute, // Clean up stale IP entries
-		protocol:         protocol,
-		trustedNets:      trustedNets,
+		maxConnections:  maxConnections,
+		maxPerIP:        maxPerIP,
+		cleanupInterval: 5 * time.Minute, // Clean up stale IP entries
+		protocol:        protocol,
+		trustedNets:     trustedNets,
 	}
 }
 
@@ -100,6 +97,7 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 	if cl.maxConnections > 0 {
 		current := cl.currentTotal.Load()
 		if current >= int64(cl.maxConnections) {
+			logger.Info("Connection limiter: Maximum total connections reached", "protocol", cl.protocol, "current", current, "max", cl.maxConnections, "remote_addr", remoteAddr.String())
 			return fmt.Errorf("maximum connections reached (%d/%d)", current, cl.maxConnections)
 		}
 	}
@@ -114,13 +112,11 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 			ip = remoteAddr.String()
 		}
 
-		cl.mu.RLock()
-		ipCounter, exists := cl.perIPConnections[ip]
-		cl.mu.RUnlock()
-
-		if exists {
+		if value, exists := cl.perIPConnections.Load(ip); exists {
+			ipCounter := value.(*atomic.Int64)
 			current := ipCounter.Load()
 			if current >= int64(cl.maxPerIP) {
+				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", ip, "current", current, "max", cl.maxPerIP)
 				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", ip, current, cl.maxPerIP)
 			}
 		}
@@ -163,16 +159,9 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 
 	// Only track per-IP if limits are enabled (maxPerIP > 0) and not from trusted network
 	if cl.maxPerIP > 0 && !isTrusted {
-		// Increment per-IP counter
-		cl.mu.Lock()
-		var exists bool
-		ipCounter, exists = cl.perIPConnections[trackingIP]
-		if !exists {
-			ipCounter = &atomic.Int64{}
-			cl.perIPConnections[trackingIP] = ipCounter
-		}
-		cl.mu.Unlock()
-
+		// Increment per-IP counter using lock-free LoadOrStore
+		value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
+		ipCounter = value.(*atomic.Int64)
 		perIP = ipCounter.Add(1)
 
 		if realClientIP != "" {
@@ -198,13 +187,12 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		if cl.maxPerIP > 0 && !isTrusted && ipCounter != nil {
 			remaining := ipCounter.Add(-1)
 
-			// Clean up IP entry if no connections remain
+			// Clean up IP entry if no connections remain (lazy cleanup)
 			if remaining <= 0 {
-				cl.mu.Lock()
+				// Use sync.Map's CompareAndDelete for lock-free cleanup
 				if ipCounter.Load() <= 0 {
-					delete(cl.perIPConnections, trackingIP)
+					cl.perIPConnections.CompareAndDelete(trackingIP, ipCounter)
 				}
-				cl.mu.Unlock()
 			}
 
 			if realClientIP != "" {
@@ -232,6 +220,11 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 	if cl.maxConnections > 0 {
 		current := cl.currentTotal.Load()
 		if current >= int64(cl.maxConnections) {
+			if realClientIP != "" {
+				logger.Info("Connection limiter: Maximum total connections reached", "protocol", cl.protocol, "current", current, "max", cl.maxConnections, "proxy_addr", remoteAddr.String(), "real_client", realClientIP)
+			} else {
+				logger.Info("Connection limiter: Maximum total connections reached", "protocol", cl.protocol, "current", current, "max", cl.maxConnections, "remote_addr", remoteAddr.String())
+			}
 			return fmt.Errorf("maximum connections reached (%d/%d)", current, cl.maxConnections)
 		}
 	}
@@ -255,13 +248,11 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 			}
 		}
 
-		cl.mu.RLock()
-		ipCounter, exists := cl.perIPConnections[checkIP]
-		cl.mu.RUnlock()
-
-		if exists {
+		if value, exists := cl.perIPConnections.Load(checkIP); exists {
+			ipCounter := value.(*atomic.Int64)
 			current := ipCounter.Load()
 			if current >= int64(cl.maxPerIP) {
+				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", checkIP, "current", current, "max", cl.maxPerIP)
 				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
 			}
 		}
@@ -278,9 +269,6 @@ func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
 
 // GetStats returns current connection statistics
 func (cl *ConnectionLimiter) GetStats() ConnectionStats {
-	cl.mu.RLock()
-	defer cl.mu.RUnlock()
-
 	stats := ConnectionStats{
 		Protocol:         cl.protocol,
 		TotalConnections: cl.currentTotal.Load(),
@@ -289,9 +277,12 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 		IPConnections:    make(map[string]int64),
 	}
 
-	for ip, counter := range cl.perIPConnections {
+	cl.perIPConnections.Range(func(key, value interface{}) bool {
+		ip := key.(string)
+		counter := value.(*atomic.Int64)
 		stats.IPConnections[ip] = counter.Load()
-	}
+		return true
+	})
 
 	return stats
 }
@@ -319,16 +310,16 @@ func (cl *ConnectionLimiter) StartCleanup(ctx context.Context) {
 
 // cleanup removes IP entries with zero connections
 func (cl *ConnectionLimiter) cleanup() {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-
 	cleaned := 0
-	for ip, counter := range cl.perIPConnections {
+	cl.perIPConnections.Range(func(key, value interface{}) bool {
+		ip := key.(string)
+		counter := value.(*atomic.Int64)
 		if counter.Load() <= 0 {
-			delete(cl.perIPConnections, ip)
+			cl.perIPConnections.Delete(ip)
 			cleaned++
 		}
-	}
+		return true
+	})
 
 	if cleaned > 0 {
 		logger.Debug("Connection limiter: Cleaned up stale IP entries", "protocol", cl.protocol, "count", cleaned)

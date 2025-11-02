@@ -21,21 +21,21 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 	forwardingParams, err := server.ParsePOP3XCLIENT(args)
 	if err != nil {
 		writer.WriteString("-ERR Invalid XCLIENT parameters\r\n")
-		s.Log("[XCLIENT] Failed to parse parameters: %v", err)
+		s.DebugLog("[XCLIENT] Failed to parse parameters: %v", err)
 		return
 	}
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {
 		writer.WriteString("-ERR Invalid forwarding parameters\r\n")
-		s.Log("[XCLIENT] Invalid parameters: %v", err)
+		s.DebugLog("[XCLIENT] Invalid parameters: %v", err)
 		return
 	}
 
 	// Check TTL to prevent loops
 	if !forwardingParams.DecrementTTL() {
 		writer.WriteString("-ERR Proxy TTL expired\r\n")
-		s.Log("[XCLIENT] TTL expired, possible forwarding loop")
+		s.DebugLog("[XCLIENT] TTL expired, possible forwarding loop")
 		return
 	}
 
@@ -45,7 +45,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 	// Update session's RemoteIP if forwarding parameters provide it
 	if forwardingParams.OriginatingIP != "" {
 		s.RemoteIP = forwardingParams.OriginatingIP
-		s.Log("[XCLIENT] Updated client IP from forwarding parameters: %s", forwardingParams.OriginatingIP)
+		s.DebugLog("[XCLIENT] Updated client IP from forwarding parameters: %s", forwardingParams.OriginatingIP)
 	}
 
 	// The proxy might also send its own source IP. Let's check for that.
@@ -56,7 +56,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 		}
 	}
 
-	s.Log("[XCLIENT] Processed forwarding parameters: client=%s:%d session=%s ttl=%d variables=%d",
+	s.DebugLog("[XCLIENT] Processed forwarding parameters: client=%s:%d session=%s ttl=%d variables=%d",
 		forwardingParams.OriginatingIP, forwardingParams.OriginatingPort,
 		forwardingParams.SessionID, forwardingParams.ProxyTTL, len(forwardingParams.Variables))
 

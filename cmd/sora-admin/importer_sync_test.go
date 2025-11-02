@@ -145,13 +145,13 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 
 		// Create default mailboxes
 		user := server.NewUser(address, accountID)
-		err := rdb.CreateDefaultMailboxesWithRetry(ctx, user.UserID())
+		err := rdb.CreateDefaultMailboxesWithRetry(ctx, user.AccountID())
 		if err != nil {
 			t.Fatalf("Failed to create default mailboxes: %v", err)
 		}
 
 		// Get INBOX mailbox
-		inbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.UserID(), "INBOX")
+		inbox, err := rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
 		if err != nil {
 			t.Fatalf("Failed to get INBOX: %v", err)
 		}
@@ -169,7 +169,7 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 		var bodyStructure imap.BodyStructure = bodyStructurePart
 
 		msgID, uid, err := rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{
-			UserID:        user.UserID(),
+			AccountID:     user.AccountID(),
 			MailboxID:     inbox.ID,
 			MailboxName:   inbox.Name,
 			S3Domain:      address.Domain(),
@@ -187,7 +187,7 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 			InstanceID:  hostname,
 			ContentHash: testHash,
 			Size:        1000,
-			AccountID:   user.UserID(),
+			AccountID:   user.AccountID(),
 		})
 		if err != nil {
 			t.Fatalf("Failed to insert with APPEND flow: %v", err)

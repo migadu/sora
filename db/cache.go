@@ -68,7 +68,7 @@ func (d *Database) GetCacheMetrics(ctx context.Context, instanceID string, since
 		FROM cache_metrics
 		WHERE recorded_at >= $1`
 
-	args := []interface{}{since}
+	args := []any{since}
 	argIndex := 2
 
 	if instanceID != "" {

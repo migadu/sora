@@ -47,7 +47,7 @@ type adminAPILogger struct {
 	prefix string // e.g., "HTTP-DELIVERY [recipient@example.com]"
 }
 
-func (l *adminAPILogger) Log(format string, args ...interface{}) {
+func (l *adminAPILogger) Log(format string, args ...any) {
 	// Log with prefix to identify HTTP delivery path
 	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
 }
@@ -271,7 +271,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient 
 		return status
 	}
 
-	logger.Log("recipient found userID=%d", recipientInfo.UserID)
+	logger.Log("recipient found AccountID=%d", recipientInfo.AccountID)
 
 	// Set from address if provided
 	if from != "" {

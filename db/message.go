@@ -16,7 +16,7 @@ import (
 // Message struct to represent an email message
 type Message struct {
 	ID             int64      // ID of the message
-	UserID         int64      // ID of the user who owns the message
+	AccountID      int64      // ID of the user who owns the message
 	UID            imap.UID   // Unique identifier for the message
 	ContentHash    string     // Hash of the message content
 	S3Domain       string     // S3 domain for the message
@@ -252,7 +252,7 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		var customFlagsJSON []byte
 		var recipientsJSON []byte
 
-		if err := rows.Scan(&msg.ID, &msg.UserID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
+		if err := rows.Scan(&msg.ID, &msg.AccountID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
 			&msg.S3Domain, &msg.S3Localpart, &msg.IsUploaded, &msg.BitwiseFlags, &customFlagsJSON,
 			&msg.InternalDate, &msg.Size, &bodyStructureBytes, &msg.CreatedModSeq, &msg.UpdatedModSeq,
 			&msg.ExpungedModSeq, &msg.Seq, &msg.FlagsChangedAt, &msg.Subject, &msg.SentDate, &msg.MessageID,
@@ -344,7 +344,7 @@ func (db *Database) GetMessageHeaders(ctx context.Context, messageUID imap.UID, 
 
 // GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming
 // Returns a map of mailboxName -> []contentHash for the most recent messages
-func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	if messageCount <= 0 {
 		return make(map[string][]string), nil
 	}
@@ -352,9 +352,9 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, userID int64
 	result := make(map[string][]string)
 
 	for _, mailboxName := range mailboxNames {
-		mailbox, err := db.GetMailboxByName(ctx, userID, mailboxName)
+		mailbox, err := db.GetMailboxByName(ctx, AccountID, mailboxName)
 		if err != nil {
-			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, userID, err)
+			log.Printf("WarmUp: failed to get mailbox '%s' for user %d: %v", mailboxName, AccountID, err)
 			continue // Skip this mailbox if not found
 		}
 

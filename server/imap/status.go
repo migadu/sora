@@ -11,17 +11,17 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[STATUS] Failed to acquire read lock")
+		s.WarnLog("[STATUS] Failed to acquire read lock")
 		return nil, s.internalError("failed to acquire lock for status")
 	}
-	userID := s.UserID()
+	AccountID := s.AccountID()
 	release()
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, userID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.Log("[STATUS] mailbox '%s' does not exist", mboxName)
+			s.DebugLog("[STATUS] mailbox '%s' does not exist", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -32,12 +32,12 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	}
 
 	// Check ACL permissions - requires 'r' (read) right
-	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, userID, 'r')
+	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, AccountID, 'r')
 	if err != nil {
 		return nil, s.internalError("failed to check read permission: %v", err)
 	}
 	if !hasReadRight {
-		s.Log("[STATUS] user does not have read permission on mailbox '%s'", mboxName)
+		s.DebugLog("[STATUS] user does not have read permission on mailbox '%s'", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -87,7 +87,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		numMessagesStr = fmt.Sprint(*statusData.NumMessages)
 	}
 
-	s.Log("[STATUS] mailbox '%s': NumMessages=%s, UIDNext=%v, HighestModSeq=%v",
+	s.DebugLog("[STATUS] mailbox '%s': NumMessages=%s, UIDNext=%v, HighestModSeq=%v",
 		mboxName,
 		numMessagesStr,
 		statusData.UIDNext,

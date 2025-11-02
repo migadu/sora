@@ -35,7 +35,7 @@ func TestIMAPProxyJA4ForwardingCode(t *testing.T) {
 	t.Log("✓ Backend receives JA4 via ID command for capability filtering")
 
 	// Verify Session type exists (compile-time check)
-	var _ interface{} = (*Session)(nil)
+	var _ any = (*Session)(nil)
 
 	t.Log("✓ IMAP proxy Session type exists with sendForwardingParametersToBackend method")
 }
@@ -52,7 +52,7 @@ func TestJA4ExtractionPattern(t *testing.T) {
 	mockJA4Conn1 := &mockJA4Conn{fingerprint: "t13d411100_6be44479b708_d41ae481755e"}
 
 	// Test the type assertion pattern
-	if ja4Conn, ok := interface{}(mockJA4Conn1).(interface{ GetJA4Fingerprint() (string, error) }); ok {
+	if ja4Conn, ok := any(mockJA4Conn1).(interface{ GetJA4Fingerprint() (string, error) }); ok {
 		// This branch would be taken in real code with proper interface implementation
 		t.Logf("Type assertion pattern works (would need GetJA4Fingerprint method): %T", ja4Conn)
 	} else {

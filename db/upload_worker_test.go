@@ -92,7 +92,7 @@ func createTestMailbox(t *testing.T, db *Database, accountID int64, name string)
 func createPendingUpload(t *testing.T, db *Database, accountID int64, instanceID, contentHash string, attempts int, lastAttempt time.Time, size int64) int64 {
 	t.Helper()
 	var id int64
-	var lastAttemptArg interface{} = lastAttempt
+	var lastAttemptArg any = lastAttempt
 	if lastAttempt.IsZero() {
 		lastAttemptArg = nil
 	}

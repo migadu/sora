@@ -32,7 +32,7 @@ func TestManageSieveProxyJA4ForwardingCode(t *testing.T) {
 	t.Log("✓ Backend receives JA4 for SIEVE script management filtering")
 
 	// Verify Session type exists (compile-time check)
-	var _ interface{} = (*Session)(nil)
+	var _ any = (*Session)(nil)
 
 	t.Log("✓ ManageSieve proxy Session type exists")
 }

@@ -3,9 +3,10 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
-	"github.com/migadu/sora/logger"
 	"net/http"
 	"strconv"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
 )
@@ -68,7 +69,7 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error updating message flags: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error updating message flags: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to update message flags")
 		return
 	}
@@ -77,14 +78,14 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	message, err := s.rdb.GetMessageByIDWithRetry(ctx, accountID, messageID)
 	if err != nil {
 		// Even if we can't retrieve the updated message, the update succeeded
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		s.writeJSON(w, http.StatusOK, map[string]any{
 			"message": "Message flags updated successfully",
 			"id":      messageID,
 		})
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "Message flags updated successfully",
 		"data":    message,
 	})
@@ -115,12 +116,12 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		logger.Debug("HTTP Mail API: Error marking message as deleted: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error marking message as deleted: %v", "name", s.name, "param", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete message")
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"message": "Message marked as deleted successfully",
 		"id":      messageID,
 	})

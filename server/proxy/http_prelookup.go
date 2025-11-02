@@ -227,13 +227,13 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		// Check status code
 		if resp.StatusCode == http.StatusNotFound {
 			logger.Debug("Prelookup: User not found (404)", "user", lookupEmail)
-			return map[string]interface{}{"result": AuthUserNotFound}, nil
+			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
 		// 4xx errors (except 404) mean user lookup failed - allow fallback
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			logger.Debug("Prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
-			return map[string]interface{}{"result": AuthUserNotFound}, nil
+			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
 		// 5xx errors are transient - fallback controlled by config
@@ -258,7 +258,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		// If server is null/empty, treat as user not found (404)
 		if strings.TrimSpace(lookupResp.Server) == "" {
 			logger.Debug("Prelookup: Server is null/empty - treating as user not found", "user", lookupEmail)
-			return map[string]interface{}{"result": AuthUserNotFound}, nil
+			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
 		// Validate other required fields - invalid 200 response is a server bug
@@ -300,7 +300,7 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 	}
 
 	// Handle user not found case
-	if resultMap, ok := result.(map[string]interface{}); ok {
+	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok && authResult == AuthUserNotFound {
 			// Store user not found in cache (negative caching)
 			if c.cache != nil {
@@ -451,8 +451,8 @@ func (c *HTTPPreLookupClient) GetCircuitBreaker() *circuitbreaker.CircuitBreaker
 }
 
 // GetHealth returns the health status of the HTTP prelookup service
-func (c *HTTPPreLookupClient) GetHealth() map[string]interface{} {
-	health := make(map[string]interface{})
+func (c *HTTPPreLookupClient) GetHealth() map[string]any {
+	health := make(map[string]any)
 	health["endpoint"] = c.baseURL
 	health["timeout"] = c.timeout.String()
 

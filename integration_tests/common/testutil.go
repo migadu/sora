@@ -25,7 +25,7 @@ import (
 
 type TestServer struct {
 	Address     string
-	Server      interface{}
+	Server      any
 	cleanup     func()
 	ResilientDB *resilient.ResilientDatabase
 }

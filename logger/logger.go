@@ -37,7 +37,7 @@
 // Use key-value pairs for structured fields:
 //
 //	logger.Info("Mailbox access",
-//		"user_id", 123,
+//		"account_id", 123,
 //		"mailbox", "INBOX",
 //		"message_count", 42,
 //	)

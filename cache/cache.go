@@ -42,7 +42,7 @@
 //	err = cache.Put(ctx, contentHash, messageBody)
 //
 //	// Warm cache for a mailbox
-//	err = cache.WarmCache(ctx, userID, []string{"INBOX"}, 100)
+//	err = cache.WarmCache(ctx, AccountID, []string{"INBOX"}, 100)
 //
 // # Metrics
 //
@@ -61,7 +61,7 @@
 //
 // For better performance, warm the cache when a user logs in:
 //
-//	cache.WarmCache(ctx, userID, []string{"INBOX", "Sent"}, 50)
+//	cache.WarmCache(ctx, AccountID, []string{"INBOX", "Sent"}, 50)
 //
 // This pre-loads the 50 most recent messages from specified mailboxes.
 package cache
@@ -90,7 +90,7 @@ import (
 // This allows for mocking in tests.
 type SourceDatabase interface {
 	FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error)
-	GetRecentMessagesForWarmupWithRetry(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error)
+	GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error)
 }
 
 const DataDir = "data"
@@ -639,7 +639,7 @@ func (c *Cache) removeIndexEntries(ctx context.Context, paths []string) error {
 		return nil
 	}
 	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(paths)-1) + `)`
-	args := make([]interface{}, len(paths))
+	args := make([]any, len(paths))
 	for i, p := range paths {
 		args[i] = p
 	}
@@ -774,7 +774,7 @@ func (c *Cache) purgeHashBatch(ctx context.Context, contentHashes []string, path
 	// SQLite doesn't support array parameters, so we build a query with placeholders.
 	// This is safe as paths are generated internally, not from user input.
 	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(successfullyRemovedPaths)-1) + `)`
-	args := make([]interface{}, len(successfullyRemovedPaths))
+	args := make([]any, len(successfullyRemovedPaths))
 	for i, p := range successfullyRemovedPaths {
 		args[i] = p
 	}
@@ -840,7 +840,7 @@ func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
 
 	// Use the same batch delete pattern as other purge functions.
 	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(stalePaths)-1) + `)`
-	args := make([]interface{}, len(stalePaths))
+	args := make([]any, len(stalePaths))
 	for i, p := range stalePaths {
 		args[i] = p
 	}
@@ -1027,6 +1027,6 @@ func (c *Cache) PurgeAll(ctx context.Context) error {
 
 // GetRecentMessagesForWarmup is a helper method that delegates to the source database
 // This provides a convenient way for higher-level services to get warmup data through the cache
-func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, userID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, userID, mailboxNames, messageCount)
+func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
+	return c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, AccountID, mailboxNames, messageCount)
 }

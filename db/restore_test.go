@@ -74,7 +74,7 @@ func insertTestMessage(t *testing.T, db *Database, accountID, mailboxID int64, m
 
 	now := time.Now()
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   mailboxName,
 		S3Domain:      "example.com",
@@ -585,7 +585,7 @@ func TestRestoreMessages_PreservesFlags(t *testing.T) {
 
 	now := time.Now()
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     inboxID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",
@@ -710,7 +710,7 @@ func TestRestoreMessages_PreservesMessageMetadata(t *testing.T) {
 	internalDate := time.Date(2024, 1, 15, 11, 0, 0, 0, time.UTC)
 
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     inboxID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",
@@ -831,7 +831,7 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	// Insert a message in INBOX
 	now := time.Now()
 	msgOpts := &InsertMessageOptions{
-		UserID:       accountID,
+		AccountID:    accountID,
 		MailboxID:    inboxID,
 		MailboxName:  "INBOX",
 		MessageID:    "<test@example.com>",

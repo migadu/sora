@@ -13,7 +13,7 @@ type testLogger struct {
 	logs []string
 }
 
-func (l *testLogger) Log(format string, args ...interface{}) {
+func (l *testLogger) Log(format string, args ...any) {
 	l.logs = append(l.logs, fmt.Sprintf(format, args...))
 }
 

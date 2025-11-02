@@ -38,7 +38,7 @@ type DeliveryContext struct {
 
 // Logger interface for logging delivery operations.
 type Logger interface {
-	Log(format string, args ...interface{})
+	Log(format string, args ...any)
 }
 
 // DeliveryResult contains the result of a delivery attempt.
@@ -52,7 +52,7 @@ type DeliveryResult struct {
 
 // RecipientInfo contains information about the recipient.
 type RecipientInfo struct {
-	UserID      int64
+	AccountID   int64
 	Address     *server.Address
 	FromAddress *server.Address // Optional sender address
 }
@@ -114,7 +114,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
 	// Store message locally
-	filePath, err := d.Uploader.StoreLocally(contentHash, recipient.UserID, messageBytes)
+	filePath, err := d.Uploader.StoreLocally(contentHash, recipient.AccountID, messageBytes)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to save message to disk: %v", err)
 		return result, err
@@ -143,7 +143,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	size := int64(len(messageBytes))
 	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
 		&db.InsertMessageOptions{
-			UserID:        recipient.UserID,
+			AccountID:     recipient.AccountID,
 			MailboxID:     0, // Will be set by InsertMessage based on mailboxName
 			S3Domain:      recipient.Address.Domain(),
 			S3Localpart:   recipient.Address.LocalPart(),
@@ -166,7 +166,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			ContentHash: contentHash,
 			InstanceID:  d.Hostname,
 			Size:        size,
-			AccountID:   recipient.UserID,
+			AccountID:   recipient.AccountID,
 		})
 
 	if err != nil {
@@ -208,13 +208,13 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 	lookupAddress := toAddress.BaseAddress()
 
 	// Lookup user account
-	var userID int64
+	var AccountID int64
 	err = d.RDB.QueryRowWithRetry(ctx, `
 		SELECT c.account_id
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
 		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
-	`, lookupAddress).Scan(&userID)
+	`, lookupAddress).Scan(&AccountID)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -224,24 +224,24 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 	}
 
 	// Create default mailboxes if needed
-	err = d.RDB.CreateDefaultMailboxesWithRetry(ctx, userID)
+	err = d.RDB.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create default mailboxes: %w", err)
 	}
 
 	return &RecipientInfo{
-		UserID:  userID,
-		Address: &toAddress,
+		AccountID: AccountID,
+		Address:   &toAddress,
 	}, nil
 }
 
 // SaveMessageToMailbox saves a message to a specific mailbox (helper for Sieve :copy).
 func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string) error {
-	mailbox, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.UserID, mailboxName)
+	mailbox, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			// Fallback to INBOX
-			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.UserID, consts.MailboxInbox)
+			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox)
 			if err != nil {
 				return err
 			}
@@ -276,7 +276,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 
 	_, _, err = d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			UserID:        recipient.UserID,
+			AccountID:     recipient.AccountID,
 			MailboxID:     mailbox.ID,
 			S3Domain:      recipient.Address.Domain(),
 			S3Localpart:   recipient.Address.LocalPart(),
@@ -299,7 +299,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			ContentHash: contentHash,
 			InstanceID:  d.Hostname,
 			Size:        size,
-			AccountID:   recipient.UserID,
+			AccountID:   recipient.AccountID,
 		})
 
 	return err

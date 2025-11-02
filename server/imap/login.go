@@ -35,7 +35,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Check authentication rate limiting after delay using proxy-aware method
 	if s.server.authLimiter != nil {
 		if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
-			s.Log("[LOGIN] rate limited: %v", err)
+			s.DebugLog("[LOGIN] rate limited: %v", err)
 			// Track rate limiting as a specific error type
 			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
 			return &imap.Error{
@@ -52,7 +52,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	if len(s.server.masterUsername) > 0 && proxyUser != "" && checkMasterCredential(proxyUser, s.server.masterUsername) {
 		address, err := server.NewAddress(authAddress)
 		if err != nil {
-			s.Log("[LOGIN] failed to parse address: %v", err)
+			s.DebugLog("[LOGIN] failed to parse address: %v", err)
 			// Track invalid address format as client error
 			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
 			return &imap.Error{
@@ -63,12 +63,12 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 
 		if checkMasterCredential(password, s.server.masterPassword) {
-			userID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
+			AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 			if err != nil {
 				return err
 			}
 
-			s.IMAPUser = NewIMAPUser(address, userID)
+			s.IMAPUser = NewIMAPUser(address, AccountID)
 			s.Session.User = &s.IMAPUser.User
 
 			authCount := s.server.authenticatedConnections.Add(1)
@@ -113,7 +113,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	addressSt, err := server.NewAddress(address)
 	if err != nil {
-		s.Log("[LOGIN] failed to parse address: %v", err)
+		s.DebugLog("[LOGIN] failed to parse address: %v", err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthenticationFailed,
@@ -121,12 +121,12 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	s.Log("[LOGIN] authentication attempt with address %s", addressSt.FullAddress())
+	s.DebugLog("[LOGIN] authentication attempt with address %s", addressSt.FullAddress())
 
 	// Use base address (without +detail) for authentication
-	userID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.BaseAddress(), password)
+	AccountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.BaseAddress(), password)
 	if err != nil {
-		s.Log("[LOGIN] authentication failed: %v", err)
+		s.DebugLog("[LOGIN] authentication failed: %v", err)
 
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
@@ -142,12 +142,12 @@ func (s *IMAPSession) Login(address, password string) error {
 	}
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-	err = s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, userID)
+	err = s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
-	s.IMAPUser = NewIMAPUser(addressSt, userID)
+	s.IMAPUser = NewIMAPUser(addressSt, AccountID)
 	s.Session.User = &s.IMAPUser.User
 
 	authCount := s.server.authenticatedConnections.Add(1)

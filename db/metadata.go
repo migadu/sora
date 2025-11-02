@@ -64,7 +64,7 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 
 	// Build query based on depth
 	var query string
-	var args []interface{}
+	var args []any
 
 	switch depth {
 	case imap.GetMetadataDepthZero:
@@ -77,13 +77,13 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			  AND entry_name = ANY($3)
 			ORDER BY entry_name
 		`
-		args = []interface{}{accountID, mailboxID, entryNames}
+		args = []any{accountID, mailboxID, entryNames}
 
 	case imap.GetMetadataDepthOne:
 		// Match exact entries and their immediate children
 		var conditions []string
 		argIdx := 3
-		args = []interface{}{accountID, mailboxID}
+		args = []any{accountID, mailboxID}
 
 		for _, name := range entryNames {
 			// Exact match
@@ -110,7 +110,7 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		// Match exact entries and all descendants
 		var conditions []string
 		argIdx := 3
-		args = []interface{}{accountID, mailboxID}
+		args = []any{accountID, mailboxID}
 
 		for _, name := range entryNames {
 			// Exact match or any descendant

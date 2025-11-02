@@ -42,7 +42,7 @@ func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, su
 	}
 }
 
-func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed bool) ([]*DBMailbox, error) {
+func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribed bool) ([]*DBMailbox, error) {
 	// Modified query to include both personal mailboxes and shared mailboxes with ACL access
 	query := `
 		SELECT DISTINCT
@@ -77,7 +77,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 	query += " ORDER BY m.name"
 
 	// Prepare the query to fetch all mailboxes for the given user
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, userID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, AccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +106,7 @@ func (db *Database) GetMailboxes(ctx context.Context, userID int64, subscribed b
 }
 
 // GetMailbox fetches the mailbox
-func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int64) (*DBMailbox, error) {
+func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID int64) (*DBMailbox, error) {
 	var mailbox DBMailbox
 	var uidValidityInt64 int64
 
@@ -115,7 +115,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
 		FROM mailboxes
 		WHERE id = $1 AND account_id = $2
-	`, mailboxID, userID).Scan(
+	`, mailboxID, AccountID).Scan(
 		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
 	)
 
@@ -131,7 +131,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
-	`, userID, mailbox.Path).Scan(&mailbox.HasChildren)
+	`, AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		log.Printf("Database: failed to check for children of mailbox ID %d: %v", mailboxID, err)
 		return nil, consts.ErrInternalError
@@ -141,7 +141,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, userID int6
 }
 
 // GetMailboxByName fetches the mailbox for a specific user by name
-func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name string) (*DBMailbox, error) {
+func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
 	var mailbox DBMailbox
 	var uidValidityInt64 int64
 	var accountID int64
@@ -171,7 +171,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 		     ))
 		  )
 		LIMIT 1
-	`, userID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	`, AccountID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -197,10 +197,10 @@ func (db *Database) GetMailboxByName(ctx context.Context, userID int64, name str
 	return &mailbox, nil
 }
 
-func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
+func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
-		log.Printf("Database: ERROR - attempted to create mailbox with invalid characters: %q for user %d", name, userID)
+		log.Printf("Database: ERROR - attempted to create mailbox with invalid characters: %q for user %d", name, AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -228,7 +228,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 				SELECT SPLIT_PART(address, '@', 2)
 				FROM credentials
 				WHERE account_id = $1 AND primary_identity = TRUE
-			`, userID).Scan(&domain)
+			`, AccountID).Scan(&domain)
 			if err != nil {
 				return fmt.Errorf("failed to get user domain for shared mailbox: %w", err)
 			}
@@ -242,7 +242,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		// Fetch the parent mailbox to get its path
 		err := tx.QueryRow(ctx, `
 			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
-		`, *parentID, userID).Scan(&parentPath)
+		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
 			if err == pgx.ErrNoRows {
@@ -258,7 +258,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain)
 		VALUES ($1, $2, $3, $4, '', $5, $6)
 		RETURNING id
-	`, userID, name, int64(uidValidity), false, isShared, ownerDomain).Scan(&mailboxID)
+	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -266,11 +266,11 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			switch pgErr.Code {
 			case "23505": // Unique constraint violation
-				log.Printf("Database: WARNING - mailbox named '%s' already exists for user %d", name, userID)
+				log.Printf("Database: WARNING - mailbox named '%s' already exists for user %d", name, AccountID)
 				return consts.ErrDBUniqueViolation
 			case "23503": // Foreign key violation
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
-					log.Printf("Database: ERROR - user with ID %d does not exist", userID)
+					log.Printf("Database: ERROR - user with ID %d does not exist", AccountID)
 					return consts.ErrDBNotFound
 				}
 			}
@@ -316,7 +316,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 			err = tx.QueryRow(ctx, `
 				SELECT address FROM credentials
 				WHERE account_id = $1 AND primary_identity = TRUE
-			`, userID).Scan(&creatorEmail)
+			`, AccountID).Scan(&creatorEmail)
 			if err != nil {
 				return fmt.Errorf("failed to get creator email: %w", err)
 			}
@@ -324,21 +324,21 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, userID int64, 
 			_, err = tx.Exec(ctx, `
 				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, now(), now())
-			`, mailboxID, userID, creatorEmail, defaultRights)
+			`, mailboxID, AccountID, creatorEmail, defaultRights)
 			if err != nil {
 				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
 			}
-			log.Printf("Database: created shared mailbox '%s' (ID: %d) for user %d with domain %s", name, mailboxID, userID, *ownerDomain)
+			log.Printf("Database: created shared mailbox '%s' (ID: %d) for user %d with domain %s", name, mailboxID, AccountID, *ownerDomain)
 		}
 	}
 
 	return nil
 }
 
-func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID int64, name string, parentID *int64) error {
+func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
-		log.Printf("Database: ERROR - attempted to create default mailbox with invalid characters: %q for user %d", name, userID)
+		log.Printf("Database: ERROR - attempted to create default mailbox with invalid characters: %q for user %d", name, AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -352,7 +352,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 		// Fetch the parent mailbox to get its path
 		err := tx.QueryRow(ctx, `
 			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
-		`, *parentID, userID).Scan(&parentPath)
+		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -369,7 +369,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 		VALUES ($1, $2, $3, $4, '')
 		ON CONFLICT (account_id, name) DO NOTHING
 		RETURNING id
-	`, userID, name, int64(uidValidity), true).Scan(&mailboxID)
+	`, AccountID, name, int64(uidValidity), true).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -378,7 +378,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 			switch pgErr.Code {
 			case "23503": // Foreign key violation
 				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
-					log.Printf("Database: user with ID %d does not exist", userID)
+					log.Printf("Database: user with ID %d does not exist", AccountID)
 					return consts.ErrDBNotFound
 				}
 			}
@@ -389,7 +389,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 			err := tx.QueryRow(ctx, `
 				SELECT id FROM mailboxes 
 				WHERE account_id = $1 AND name = $2
-			`, userID, name).Scan(&mailboxID)
+			`, AccountID, name).Scan(&mailboxID)
 
 			if err != nil {
 				return fmt.Errorf("failed to get existing mailbox ID: %w", err)
@@ -416,7 +416,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, userID 
 }
 
 // DeleteMailbox deletes a mailbox for a specific user by id
-func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64) error {
+func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
 	// Check if user has delete permission (ACL 'x' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
 	var mboxPath string
@@ -425,7 +425,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		SELECT path, COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
-	`, mailboxID, userID).Scan(&mboxPath, &isShared)
+	`, mailboxID, AccountID).Scan(&mboxPath, &isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
@@ -435,7 +435,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// If it's a shared mailbox, check ACL permissions
 	if isShared {
-		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, userID, ACLRightDelete)
+		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, AccountID, ACLRightDelete)
 		if err != nil {
 			return fmt.Errorf("failed to check delete permission: %w", err)
 		}
@@ -447,7 +447,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Find all mailboxes that will be deleted (the target and its children)
 	// to acquire locks in a consistent order and prevent deadlocks.
 	var mailboxesToDelete []int64
-	rows, err := tx.Query(ctx, `SELECT id FROM mailboxes WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')`, userID, mailboxID, mboxPath)
+	rows, err := tx.Query(ctx, `SELECT id FROM mailboxes WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')`, AccountID, mailboxID, mboxPath)
 	if err != nil {
 		return fmt.Errorf("failed to query mailboxes for deletion lock: %w", err)
 	}
@@ -478,7 +478,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		WHERE m.mailbox_id = mb.id
 		  AND mb.account_id = $1 
 		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
-	`, userID, mailboxID, mboxPath)
+	`, AccountID, mailboxID, mboxPath)
 	if err != nil {
 		log.Printf("Database: ERROR - failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
@@ -488,7 +488,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	result, err := tx.Exec(ctx, `
 		DELETE FROM mailboxes
 		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')
-	`, userID, mailboxID, mboxPath)
+	`, AccountID, mailboxID, mboxPath)
 
 	if err != nil {
 		log.Printf("Database: ERROR - failed to delete mailbox %d and its children: %v", mailboxID, err)
@@ -505,7 +505,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	return nil
 }
 
-func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, userId int64) error {
+func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
 	// Use a base timestamp and an increment to guarantee unique UIDVALIDITY values
 	// for all default mailboxes created in this single transaction.
 	baseUidValidity := time.Now().Unix()
@@ -520,7 +520,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, userI
 			ON CONFLICT (account_id, name) DO UPDATE 
 			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
 			RETURNING id
-		`, userId, mailboxName, int64(uidValidity)).Scan(&mailboxID)
+		`, AccountID, mailboxName, int64(uidValidity)).Scan(&mailboxID)
 
 		if err != nil {
 			return fmt.Errorf("failed to create or find default mailbox '%s': %w", mailboxName, err)
@@ -623,10 +623,10 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 }
 
 // SetSubscribed updates the subscription status of a mailbox, but ignores unsubscribing for root folders.
-func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64, subscribed bool) error {
+func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, subscribed bool) error {
 	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
-	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, userID).Scan(&mboxName)
+	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, AccountID).Scan(&mboxName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return consts.ErrMailboxNotFound
@@ -644,7 +644,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 
 	_, err = tx.Exec(ctx, `
 		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2 AND account_id = $3
-	`, subscribed, mailboxID, userID)
+	`, subscribed, mailboxID, AccountID)
 	if err != nil {
 		return fmt.Errorf("failed to update subscription status for mailbox %d: %v", mailboxID, err)
 	}
@@ -652,14 +652,14 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 	return nil
 }
 
-func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, userID int64, newName string, newParentID *int64) error {
+func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
 	if newName == "" {
 		return consts.ErrMailboxInvalidName
 	}
 
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(newName, "\t\r\n\x00") {
-		log.Printf("Database: ERROR - attempted to rename mailbox to name with invalid characters: %q for user %d", newName, userID)
+		log.Printf("Database: ERROR - attempted to rename mailbox to name with invalid characters: %q for user %d", newName, AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 
@@ -670,7 +670,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		SELECT COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
-	`, mailboxID, userID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
@@ -680,7 +680,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// If it's a shared mailbox, check ACL permissions
 	if isShared {
-		hasAdminRight, err := db.CheckMailboxPermission(ctx, mailboxID, userID, ACLRightAdmin)
+		hasAdminRight, err := db.CheckMailboxPermission(ctx, mailboxID, AccountID, ACLRightAdmin)
 		if err != nil {
 			return fmt.Errorf("failed to check admin permission: %w", err)
 		}
@@ -691,7 +691,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Check if the new name already exists within the same transaction to prevent race conditions.
 	var existingID int64
-	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", userID, strings.ToLower(newName)).Scan(&existingID)
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", AccountID, strings.ToLower(newName)).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists
@@ -707,7 +707,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	var oldName, oldPath string
 	err = tx.QueryRow(ctx, `
 		SELECT name, path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE
-	`, mailboxID, userID).Scan(&oldName, &oldPath)
+	`, mailboxID, AccountID).Scan(&oldName, &oldPath)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
@@ -720,7 +720,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	var hasChildren bool
 	err = tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2)
-	`, userID, oldPath).Scan(&hasChildren)
+	`, AccountID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		log.Printf("Database: ERROR - failed to check for children of mailbox (ID: %d): %v", mailboxID, err)
 		return consts.ErrInternalError
@@ -735,7 +735,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 
 		// Lock the parent row as well to prevent it from being deleted/moved during this transaction.
-		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE", *newParentID, userID).Scan(&newParentPath)
+		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE", *newParentID, AccountID).Scan(&newParentPath)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				log.Printf("Database: ERROR - new parent mailbox (ID: %d) not found for rename", *newParentID)
@@ -787,7 +787,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			WHERE 
 				account_id = $5 AND
 				path LIKE $4 || '%' AND path != $4
-		`, newPrefix, oldPrefix, newPath, oldPath, userID)
+		`, newPrefix, oldPrefix, newPath, oldPath, AccountID)
 
 		if err != nil {
 			return fmt.Errorf("failed to update child mailboxes: %w", err)

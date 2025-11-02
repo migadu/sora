@@ -6,11 +6,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/metrics"
@@ -391,7 +392,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		session.Stats = s // Set the server as the Stats provider
 
 		// Create logging function for the mutex helper
-		logFunc := func(format string, args ...interface{}) {
+		logFunc := func(format string, args ...any) {
 			session.Log(format, args...)
 		}
 

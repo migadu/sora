@@ -14,10 +14,10 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	// First phase: validation and mailbox lookup using read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[CREATE] Failed to acquire read lock")
+		s.DebugLog("[CREATE] Failed to acquire read lock")
 		return s.internalError("failed to acquire lock for create")
 	}
-	userID := s.UserID()
+	AccountID := s.AccountID()
 	release()
 
 	// Add config to context for shared mailbox detection
@@ -31,7 +31,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
 		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
 		if name == sharedPrefix {
-			s.Log("[CREATE] cannot create shared namespace root '%s' explicitly", name)
+			s.DebugLog("[CREATE] cannot create shared namespace root '%s' explicitly", name)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeCannot,
@@ -41,9 +41,9 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 
 	// Check if mailbox already exists
-	_, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, name)
+	_, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, name)
 	if err == nil {
-		s.Log("[CREATE] mailbox '%s' already exists", name)
+		s.DebugLog("[CREATE] mailbox '%s' already exists", name)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
@@ -74,16 +74,16 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 				var parentMailbox *db.DBMailbox
 
 				// Check if parent mailbox exists. If not, create it.
-				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, parentPathWithoutDelim)
+				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, parentPathWithoutDelim)
 				if err == consts.ErrMailboxNotFound {
 					// If parent doesn't exist and we have a grandparent, check 'k' right on grandparent
 					if currentParentID != nil {
-						hasCreateRight, checkErr := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *currentParentID, userID, 'k')
+						hasCreateRight, checkErr := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *currentParentID, AccountID, 'k')
 						if checkErr != nil {
 							return s.internalError("failed to check create permission on parent: %v", checkErr)
 						}
 						if !hasCreateRight {
-							s.Log("[CREATE] user does not have create permission on parent mailbox")
+							s.DebugLog("[CREATE] user does not have create permission on parent mailbox")
 							return &imap.Error{
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeNoPerm,
@@ -92,13 +92,13 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 						}
 					}
 
-					s.Log("[CREATE] auto-creating parent mailbox '%s'", parentPathWithoutDelim)
-					err = s.server.rdb.CreateMailboxWithRetry(ctx, userID, parentPathWithoutDelim, currentParentID)
+					s.DebugLog("[CREATE] auto-creating parent mailbox '%s'", parentPathWithoutDelim)
+					err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, parentPathWithoutDelim, currentParentID)
 					if err != nil {
 						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
 
-					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, userID, parentPathWithoutDelim)
+					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, parentPathWithoutDelim)
 					if err != nil {
 						return s.internalError("failed to fetch auto-created parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
@@ -117,12 +117,12 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 
 	// Check ACL permission on final parent - requires 'k' (create) right for creating child mailbox
 	if parentMailboxID != nil {
-		hasCreateRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *parentMailboxID, userID, 'k')
+		hasCreateRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, *parentMailboxID, AccountID, 'k')
 		if err != nil {
 			return s.internalError("failed to check create permission: %v", err)
 		}
 		if !hasCreateRight {
-			s.Log("[CREATE] user does not have create permission on parent mailbox")
+			s.DebugLog("[CREATE] user does not have create permission on parent mailbox")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
@@ -132,11 +132,11 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 
 	// Final phase: actual creation - no locks needed as it's a DB operation
-	err = s.server.rdb.CreateMailboxWithRetry(ctx, userID, name, parentMailboxID)
+	err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, name, parentMailboxID)
 	if err != nil {
 		return s.internalError("failed to create mailbox '%s': %v", name, err)
 	}
 
-	s.Log("[CREATE] mailbox created: %s", name)
+	s.DebugLog("[CREATE] mailbox created: %s", name)
 	return nil
 }

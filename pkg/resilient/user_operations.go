@@ -10,7 +10,7 @@ import (
 func (rdb *ResilientDatabase) GetAccountIDByEmailWithRetry(ctx context.Context, email string) (int64, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetAccountIDByEmail(ctx, email)
 	}
 
@@ -25,7 +25,7 @@ func (rdb *ResilientDatabase) GetAccountIDByEmailWithRetry(ctx context.Context, 
 func (rdb *ResilientDatabase) GetMailboxesForUserWithRetry(ctx context.Context, accountID int64, subscribed bool) ([]*db.DBMailbox, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetMailboxesForUser(ctx, accountID, subscribed)
 	}
 
@@ -40,7 +40,7 @@ func (rdb *ResilientDatabase) GetMailboxesForUserWithRetry(ctx context.Context, 
 func (rdb *ResilientDatabase) GetMessageCountForMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string) (int, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetMessageCountForMailbox(ctx, accountID, mailboxPath)
 	}
 
@@ -55,7 +55,7 @@ func (rdb *ResilientDatabase) GetMessageCountForMailboxWithRetry(ctx context.Con
 func (rdb *ResilientDatabase) GetUnseenCountForMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string) (int, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetUnseenCountForMailbox(ctx, accountID, mailboxPath)
 	}
 
@@ -70,7 +70,7 @@ func (rdb *ResilientDatabase) GetUnseenCountForMailboxWithRetry(ctx context.Cont
 func (rdb *ResilientDatabase) GetMessagesForMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string, limit, offset int, unseenOnly bool) ([]*db.DBMessage, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetMessagesForMailbox(ctx, accountID, mailboxPath, limit, offset, unseenOnly)
 	}
 
@@ -85,7 +85,7 @@ func (rdb *ResilientDatabase) GetMessagesForMailboxWithRetry(ctx context.Context
 func (rdb *ResilientDatabase) SearchMessagesInMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*db.DBMessage, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).SearchMessagesInMailbox(ctx, accountID, mailboxPath, query)
 	}
 
@@ -100,7 +100,7 @@ func (rdb *ResilientDatabase) SearchMessagesInMailboxWithRetry(ctx context.Conte
 func (rdb *ResilientDatabase) GetMessageByIDWithRetry(ctx context.Context, accountID int64, messageID int64) (*db.DBMessage, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetMessageByID(ctx, accountID, messageID)
 	}
 
@@ -115,7 +115,7 @@ func (rdb *ResilientDatabase) GetMessageByIDWithRetry(ctx context.Context, accou
 func (rdb *ResilientDatabase) UpdateMessageFlagsWithRetry(ctx context.Context, accountID int64, messageID int64, addFlags, removeFlags []string) error {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		// UpdateMessageFlags handles its own transaction internally
 		return nil, rdb.getOperationalDatabaseForOperation(true).UpdateMessageFlags(ctx, accountID, messageID, addFlags, removeFlags)
 	}
@@ -128,7 +128,7 @@ func (rdb *ResilientDatabase) UpdateMessageFlagsWithRetry(ctx context.Context, a
 func (rdb *ResilientDatabase) CreateMailboxForUserWithRetry(ctx context.Context, accountID int64, mailboxPath string) error {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		// CreateMailboxForUser handles its own transaction internally
 		return nil, rdb.getOperationalDatabaseForOperation(true).CreateMailboxForUser(ctx, accountID, mailboxPath)
 	}
@@ -141,7 +141,7 @@ func (rdb *ResilientDatabase) CreateMailboxForUserWithRetry(ctx context.Context,
 func (rdb *ResilientDatabase) DeleteMailboxForUserWithRetry(ctx context.Context, accountID int64, mailboxPath string) error {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		// DeleteMailboxForUser handles its own transaction internally
 		return nil, rdb.getOperationalDatabaseForOperation(true).DeleteMailboxForUser(ctx, accountID, mailboxPath)
 	}
@@ -154,7 +154,7 @@ func (rdb *ResilientDatabase) DeleteMailboxForUserWithRetry(ctx context.Context,
 func (rdb *ResilientDatabase) SubscribeToMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string) error {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		// SubscribeToMailbox handles its own transaction internally
 		return nil, rdb.getOperationalDatabaseForOperation(true).SubscribeToMailbox(ctx, accountID, mailboxPath)
 	}
@@ -167,7 +167,7 @@ func (rdb *ResilientDatabase) SubscribeToMailboxWithRetry(ctx context.Context, a
 func (rdb *ResilientDatabase) UnsubscribeFromMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string) error {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		// UnsubscribeFromMailbox handles its own transaction internally
 		return nil, rdb.getOperationalDatabaseForOperation(true).UnsubscribeFromMailbox(ctx, accountID, mailboxPath)
 	}
@@ -180,7 +180,7 @@ func (rdb *ResilientDatabase) UnsubscribeFromMailboxWithRetry(ctx context.Contex
 func (rdb *ResilientDatabase) GetAllMessagesForUserVerificationWithRetry(ctx context.Context, accountID int64) ([]db.MessageS3Info, error) {
 	config := readRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(false).GetAllMessagesForUserVerification(ctx, accountID)
 	}
 
@@ -195,7 +195,7 @@ func (rdb *ResilientDatabase) GetAllMessagesForUserVerificationWithRetry(ctx con
 func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Context, s3Keys []string) (int64, error) {
 	config := writeRetryConfig
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(true).MarkMessagesAsNotUploaded(ctx, s3Keys)
 	}
 

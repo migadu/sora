@@ -22,7 +22,7 @@ func (rd *ResilientDatabase) RecordAuthAttemptWithRetry(ctx context.Context, ipA
 		MaxRetries:      2,
 		OperationName:   "db_auth_record",
 	}
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).RecordAuthAttempt(ctx, tx, ipAddress, username, protocol, success)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutAuth, op)
@@ -36,7 +36,7 @@ func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx 
 		MaxRetries:      2,
 		OperationName:   "db_auth_check",
 	}
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		ip, user, dbErr := rd.getOperationalDatabaseForOperation(false).GetFailedAttemptsCountSeparateWindows(ctx, ipAddress, username, ipWindowDuration, usernameWindowDuration)
 		if dbErr != nil {
 			return nil, dbErr
@@ -55,7 +55,7 @@ func (rd *ResilientDatabase) GetFailedAttemptsCountSeparateWindowsWithRetry(ctx 
 
 // GetAuthAttemptsStats is not performance-critical and can be called directly for now.
 // If it were used in a hot path, it would also be wrapped.
-func (rd *ResilientDatabase) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]interface{}, error) { // This is a direct call, not wrapped in retry logic.
+func (rd *ResilientDatabase) GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]any, error) { // This is a direct call, not wrapped in retry logic.
 	readCtx, cancel := rd.withTimeout(ctx, timeoutRead)
 	defer cancel()
 	return rd.getOperationalDatabaseForOperation(false).GetAuthAttemptsStats(readCtx, windowDuration)
@@ -67,7 +67,7 @@ func (rd *ResilientDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context
 		MaxRetries:    1,
 		OperationName: "db_auth_cleanup",
 	}
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupOldAuthAttempts(ctx, tx, maxAge)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
@@ -93,7 +93,7 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 		Hash string
 	}
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
@@ -137,7 +137,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		Hash string
 	}
 
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr

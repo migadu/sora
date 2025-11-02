@@ -11,7 +11,7 @@ import (
 // --- Uploader Worker Wrappers ---
 
 func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).AcquireAndLeasePendingUploads(ctx, tx, instanceId, limit, retryInterval, maxAttempts)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -25,7 +25,7 @@ func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.
 }
 
 func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (interface{}, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).MarkUploadAttempt(ctx, tx, contentHash, accountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
@@ -33,7 +33,7 @@ func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, con
 }
 
 func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).IsContentHashUploaded(ctx, contentHash, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
@@ -44,7 +44,7 @@ func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context,
 }
 
 func (rd *ResilientDatabase) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
-	op := func(ctx context.Context) (interface{}, error) {
+	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).PendingUploadExists(ctx, contentHash, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)

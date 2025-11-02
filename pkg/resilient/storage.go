@@ -104,7 +104,7 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 		OperationName:   "s3_get",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return rs.storage.Get(key)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
@@ -127,7 +127,7 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 		OperationName:   "s3_put",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return nil, rs.storage.Put(key, body, size)
 	}
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, op)
@@ -144,7 +144,7 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 		OperationName:   "s3_delete",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return nil, rs.storage.Delete(key)
 	}
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, op)
@@ -161,7 +161,7 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 		OperationName:   "s3_put_object",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return rs.storage.Client.PutObject(ctx, rs.storage.BucketName, key, reader, objectSize, opts)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, op)
@@ -182,7 +182,7 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 		OperationName:   "s3_get_object",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return rs.storage.Client.GetObject(ctx, rs.storage.BucketName, key, opts)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
@@ -206,7 +206,7 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 		OperationName:   "s3_stat_object",
 	}
 
-	op := func() (interface{}, error) {
+	op := func() (any, error) {
 		return rs.storage.Client.StatObject(ctx, rs.storage.BucketName, key, opts)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
@@ -218,8 +218,8 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 }
 
 // executeS3OperationWithRetry provides a generic wrapper for executing an S3 operation with retries and a circuit breaker.
-func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, op func() (interface{}, error)) (interface{}, error) {
-	var result interface{}
+func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, op func() (any, error)) (any, error) {
+	var result any
 	err := retry.WithRetry(ctx, func() error {
 		res, cbErr := breaker.Execute(op)
 		if cbErr != nil {

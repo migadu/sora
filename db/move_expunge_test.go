@@ -68,7 +68,7 @@ func setupMoveExpungeTestDatabase(t *testing.T) (*Database, int64, int64, int64,
 
 	now := time.Now()
 	options := &InsertMessageOptions{
-		UserID:        accountID,
+		AccountID:     accountID,
 		MailboxID:     srcMailbox.ID,
 		MailboxName:   "INBOX",
 		S3Domain:      "example.com",

@@ -246,13 +246,3 @@ func TestAbsoluteSessionTimeoutConfiguration(t *testing.T) {
 	t.Log("   - Shared timeout mechanism with idle timeout (TestIdleTimeoutTrigger)")
 	t.Log("   - Log output showing session_max value")
 }
-
-// TestSlowThroughputProtection verifies that slow connections (slowloris attacks) are detected and closed
-func TestSlowThroughputProtection(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	// This test would require sending data very slowly (less than 1KB/min)
-	// which would take over 1 minute to test properly.
-	// For now, we'll just verify the configuration is in place.
-	t.Skip("Slowloris protection requires >1 minute test time - verified via unit tests and manual testing")
-}

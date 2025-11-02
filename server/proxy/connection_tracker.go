@@ -197,6 +197,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		if ct.clusterManager == nil {
 			scope = "on this server"
 		}
+		logger.Info("Connection tracker: Maximum connections per user reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "current", checkCount, "max", ct.maxConnectionsPerUser, "scope", scope, "client_addr", clientAddr)
 		return fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
 			username, checkCount, ct.maxConnectionsPerUser, scope)
 	}

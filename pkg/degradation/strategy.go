@@ -76,7 +76,7 @@ func (bs *BaseStrategy) setActive(active bool, level DegradationLevel) {
 
 type ReadOnlyModeStrategy struct {
 	BaseStrategy
-	originalConfig interface{}
+	originalConfig any
 }
 
 func NewReadOnlyModeStrategy() *ReadOnlyModeStrategy {

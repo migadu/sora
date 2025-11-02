@@ -13,11 +13,27 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/storage"
+	"github.com/migadu/sora/testutils"
 )
+
+// createTestS3Storage creates a file-based S3 mock for testing
+func createTestS3Storage(t *testing.T) objectStorage {
+	t.Helper()
+
+	// Create temporary directory for mock S3 storage
+	tmpDir := t.TempDir()
+	s3Dir := filepath.Join(tmpDir, "mock-s3")
+
+	mock, err := testutils.NewFileBasedS3Mock(s3Dir)
+	if err != nil {
+		t.Fatalf("Failed to create file-based S3 mock: %v", err)
+	}
+
+	t.Logf("Created file-based S3 mock in %s", s3Dir)
+	return mock
+}
 
 // TestDovecotUIDListRoundTrip verifies that importing and exporting messages
 // with Dovecot UID preservation produces identical dovecot-uidlist files
@@ -39,11 +55,8 @@ func TestDovecotUIDListRoundTrip(t *testing.T) {
 	// Create test account
 	createCacheTestAccount(t, rdb, testEmail, "test-password")
 
-	// Setup S3 storage (use mock for testing)
-	mockS3, err := storage.New("mock:9000", "test", "test", "test", false, false)
-	if err != nil {
-		t.Skipf("Cannot create mock S3 storage: %v", err)
-	}
+	// Create file-based S3 mock for testing
+	s3Storage := createTestS3Storage(t)
 
 	t.Run("ImportOnly", func(t *testing.T) {
 		// Create temporary directory
@@ -58,9 +71,8 @@ func TestDovecotUIDListRoundTrip(t *testing.T) {
 		importOpts := ImporterOptions{
 			Dovecot:      true,
 			PreserveUIDs: true,
-			TestMode:     true, // Skip actual S3 uploads for testing
 		}
-		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, mockS3, importOpts)
+		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, s3Storage, importOpts)
 		if err != nil {
 			t.Fatalf("Failed to create importer: %v", err)
 		}
@@ -81,21 +93,15 @@ func TestDovecotUIDListRoundTrip(t *testing.T) {
 // TestDovecotUIDListCompleteRoundTrip tests importing, then exporting, and verifies
 // that the exported dovecot-uidlist files match the originals
 //
-// NOTE: This test requires working S3 storage configured in ../../config-test.toml
-// By default it uses MinIO on localhost:9000
+// NOTE: This test uses FileBasedS3Mock for testing without requiring real S3/MinIO
 //
 // To run:
-//  1. Start MinIO: docker run -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ":9001"
-//  2. Run test without SKIP_S3_TESTS: go test -v -tags=integration ./cmd/sora-admin -run TestDovecotUIDListCompleteRoundTrip
+//
+//	go test -v -tags=integration ./cmd/sora-admin -run TestDovecotUIDListCompleteRoundTrip
 func TestDovecotUIDListCompleteRoundTrip(t *testing.T) {
 	// Skip if database is not available
 	if os.Getenv("SKIP_DB_TESTS") == "true" {
 		t.Skip("Skipping database tests")
-	}
-
-	// Skip by default - S3 is required for this test
-	if os.Getenv("SKIP_S3_TESTS") == "true" {
-		t.Skip("Skipping S3-dependent tests (unset SKIP_S3_TESTS and ensure S3 is configured in config-test.toml)")
 	}
 
 	ctx := context.Background()
@@ -110,8 +116,8 @@ func TestDovecotUIDListCompleteRoundTrip(t *testing.T) {
 	// Create test account
 	createCacheTestAccount(t, rdb, testEmail, "test-password")
 
-	// Create S3 storage from config-test.toml
-	s3Storage := createTestS3StorageFromConfig(t)
+	// Create file-based S3 mock for testing
+	s3Storage := createTestS3Storage(t)
 
 	t.Run("RoundTripWithSyntheticData", func(t *testing.T) {
 		// Create temporary directories
@@ -127,7 +133,6 @@ func TestDovecotUIDListCompleteRoundTrip(t *testing.T) {
 		importOpts := ImporterOptions{
 			Dovecot:      true,
 			PreserveUIDs: true,
-			TestMode:     false, // Need real S3 for export
 		}
 		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, s3Storage, importOpts)
 		if err != nil {
@@ -213,7 +218,6 @@ func TestDovecotUIDListCompleteRoundTrip(t *testing.T) {
 		importOpts := ImporterOptions{
 			Dovecot:      true,
 			PreserveUIDs: true,
-			TestMode:     false, // Need real S3 for export
 		}
 		importer, err := NewImporter(ctx, originalMaildir, testEmailReal, 4, rdb, s3Storage, importOpts)
 		if err != nil {
@@ -298,23 +302,23 @@ func verifyPreservedUIDs(t *testing.T, ctx context.Context, rdb *resilient.Resil
 	user := server.NewUser(address, accountID)
 
 	// Verify INBOX
-	verifyMailboxUIDs(t, ctx, rdb, user.UserID(), "INBOX", maildirPath, []uint32{1, 2, 5})
+	verifyMailboxUIDs(t, ctx, rdb, user.AccountID(), "INBOX", maildirPath, []uint32{1, 2, 5})
 
 	// Verify Sent
 	sentPath := filepath.Join(maildirPath, ".Sent")
-	verifyMailboxUIDs(t, ctx, rdb, user.UserID(), "Sent", sentPath, []uint32{10, 11})
+	verifyMailboxUIDs(t, ctx, rdb, user.AccountID(), "Sent", sentPath, []uint32{10, 11})
 
 	// Verify Drafts
 	draftsPath := filepath.Join(maildirPath, ".Drafts")
-	verifyMailboxUIDs(t, ctx, rdb, user.UserID(), "Drafts", draftsPath, []uint32{100})
+	verifyMailboxUIDs(t, ctx, rdb, user.AccountID(), "Drafts", draftsPath, []uint32{100})
 }
 
 // verifyMailboxUIDs verifies that a mailbox has messages with the expected UIDs
-func verifyMailboxUIDs(t *testing.T, ctx context.Context, rdb *resilient.ResilientDatabase, userID int64, mailboxName, maildirPath string, expectedUIDs []uint32) {
+func verifyMailboxUIDs(t *testing.T, ctx context.Context, rdb *resilient.ResilientDatabase, AccountID int64, mailboxName, maildirPath string, expectedUIDs []uint32) {
 	t.Helper()
 
 	// Get mailbox
-	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, userID, mailboxName)
+	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, AccountID, mailboxName)
 	if err != nil {
 		t.Fatalf("Failed to get mailbox %s: %v", mailboxName, err)
 	}
@@ -615,11 +619,8 @@ func TestDovecotUIDListRoundTripWithFlags(t *testing.T) {
 	// Create test account
 	createCacheTestAccount(t, rdb, testEmail, "test-password")
 
-	// Setup S3 storage (use mock for testing)
-	mockS3, err := storage.New("mock:9000", "test", "test", "test", false, false)
-	if err != nil {
-		t.Skipf("Cannot create mock S3 storage: %v", err)
-	}
+	// Create file-based S3 mock for testing
+	s3Storage := createTestS3Storage(t)
 
 	t.Run("FlagsPreservation", func(t *testing.T) {
 		// Create temporary directory
@@ -676,9 +677,8 @@ func TestDovecotUIDListRoundTripWithFlags(t *testing.T) {
 			Dovecot:       true,
 			PreserveUIDs:  true,
 			PreserveFlags: true,
-			TestMode:      true, // Skip S3 uploads for testing
 		}
-		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, mockS3, importOpts)
+		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, s3Storage, importOpts)
 		if err != nil {
 			t.Fatalf("Failed to create importer: %v", err)
 		}
@@ -700,7 +700,7 @@ func TestDovecotUIDListRoundTripWithFlags(t *testing.T) {
 		user := server.NewUser(address, accountID)
 
 		// Verify UIDs and flags
-		verifyMailboxUIDs(t, ctx, rdb, user.UserID(), "INBOX", originalMaildir, []uint32{1, 2, 3, 4})
+		verifyMailboxUIDs(t, ctx, rdb, user.AccountID(), "INBOX", originalMaildir, []uint32{1, 2, 3, 4})
 
 		t.Logf("✓ Flags and UIDs preserved correctly through import")
 	})
@@ -725,11 +725,8 @@ func TestDovecotUIDListWithMultipleMailboxes(t *testing.T) {
 	// Create test account
 	createCacheTestAccount(t, rdb, testEmail, "test-password")
 
-	// Setup S3 storage (use mock for testing)
-	mockS3, err := storage.New("mock:9000", "test", "test", "test", false, false)
-	if err != nil {
-		t.Skipf("Cannot create mock S3 storage: %v", err)
-	}
+	// Create file-based S3 mock for testing
+	s3Storage := createTestS3Storage(t)
 
 	t.Run("MultipleMailboxes", func(t *testing.T) {
 		// Create temporary directory
@@ -742,9 +739,8 @@ func TestDovecotUIDListWithMultipleMailboxes(t *testing.T) {
 		importOpts := ImporterOptions{
 			Dovecot:      true,
 			PreserveUIDs: true,
-			TestMode:     true, // Skip S3 uploads for testing
 		}
-		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, mockS3, importOpts)
+		importer, err := NewImporter(ctx, originalMaildir, testEmail, 4, rdb, s3Storage, importOpts)
 		if err != nil {
 			t.Fatalf("Failed to create importer: %v", err)
 		}
@@ -759,34 +755,6 @@ func TestDovecotUIDListWithMultipleMailboxes(t *testing.T) {
 
 		t.Logf("✓ All mailbox UID lists preserved correctly")
 	})
-}
-
-// createTestS3StorageFromConfig creates S3 storage using config-test.toml
-func createTestS3StorageFromConfig(t *testing.T) *storage.S3Storage {
-	t.Helper()
-
-	// Load S3 configuration from config-test.toml
-	// Start with default config to avoid TOML parsing issues with server sections
-	cfg := config.NewDefaultConfig()
-	err := config.LoadConfigFromFile("../../config-test.toml", &cfg)
-	if err != nil {
-		t.Skipf("Failed to load config-test.toml: %v", err)
-	}
-
-	// Create S3 storage using the loaded config
-	// storage.New(endpoint, accessKey, secretKey, bucket, useSSL, debug)
-	useSSL := !cfg.S3.DisableTLS
-	debug := cfg.S3.GetDebug()
-	s3Storage, err := storage.New(cfg.S3.Endpoint, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, useSSL, debug)
-	if err != nil {
-		t.Skipf("Failed to create S3 storage from config: %v\n"+
-			"Ensure S3/MinIO is running and configured in config-test.toml\n"+
-			"Config: endpoint=%s, bucket=%s, useSSL=%v\n"+
-			"Start MinIO with: docker run -p 9000:9000 minio/minio server /data",
-			err, cfg.S3.Endpoint, cfg.S3.Bucket, useSSL)
-	}
-
-	return s3Storage
 }
 
 // compareDovecotUIDLists compares dovecot-uidlist files from original and exported maildirs

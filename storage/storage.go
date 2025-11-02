@@ -158,17 +158,6 @@ func (s *S3Storage) Exists(key string) (bool, string, error) {
 func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	start := time.Now()
 
-	exists, _, err := s.Exists(key)
-	if err != nil {
-		logger.Error("STORAGE: Error checking existence of object", "key", key, "error", err)
-		metrics.StorageOperationErrors.WithLabelValues("HEAD", classifyS3Error(err)).Inc()
-		return err
-	}
-	if exists {
-		logger.Info("STORAGE: Object already exists in S3 - skipping upload", "key", key)
-		return nil // Object already exists, no need to upload
-	}
-
 	// If encryption is enabled, encrypt the data before uploading
 	if s.Encrypt {
 		data, err := io.ReadAll(body)
@@ -202,7 +191,7 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	}
 
 	// No encryption, upload as-is
-	_, err = s.Client.PutObject(
+	_, err := s.Client.PutObject(
 		context.Background(),
 		s.BucketName,
 		key,
