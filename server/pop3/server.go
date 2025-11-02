@@ -34,6 +34,8 @@ type POP3Server struct {
 	uploader           *uploader.UploadWorker
 	cache              *cache.Cache
 	tlsConfig          *tls.Config
+	masterUsername     []byte
+	masterPassword     []byte
 	masterSASLUsername []byte
 	masterSASLPassword []byte
 
@@ -76,6 +78,8 @@ type POP3ServerOptions struct {
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSVerify              bool
+	MasterUsername         string
+	MasterPassword         string
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	MaxConnections         int
@@ -133,6 +137,8 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		cancel:                 serverCancel,
 		uploader:               uploadWorker,
 		cache:                  cache,
+		masterUsername:         []byte(options.MasterUsername),
+		masterPassword:         []byte(options.MasterPassword),
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
 		proxyReader:            proxyReader,

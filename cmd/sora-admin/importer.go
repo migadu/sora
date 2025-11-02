@@ -1344,50 +1344,81 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	}, nil
 }
 
-// uploadBatchToS3 uploads messages to S3 (sequentially to avoid concurrency issues)
+// uploadBatchToS3 uploads messages to S3 in parallel using a worker pool
 func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
-	var uploaded []uploadedMsg
+	var (
+		uploaded []uploadedMsg
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+	)
 
-	// Process sequentially to avoid any concurrency issues with S3 mock or database
+	// Use semaphore to limit concurrent uploads
+	sem := make(chan struct{}, i.jobs) // Reuse jobs config
+
 	for _, msg := range batch {
-		// Check for cancellation
-		select {
-		case <-i.ctx.Done():
-			return uploaded
-		default:
-		}
+		wg.Add(1)
+		sem <- struct{}{} // Acquire
 
-		// Read file
-		content, err := os.ReadFile(msg.path)
-		if err != nil {
-			logger.Warn("Failed to read file", "path", msg.path, "error", err)
-			continue
-		}
+		go func(msg msgInfo) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release
 
-		// Parse message
-		metadata, err := i.parseMessageMetadata(content, msg.filename, msg.path)
-		if err != nil {
-			logger.Warn("Failed to parse message", "path", msg.path, "error", err)
-			continue
-		}
-
-		// Upload to S3
-		if !i.options.TestMode && i.s3 != nil {
-			s3Key := helpers.NewS3Key(metadata.domain, metadata.localpart, msg.hash)
-			if err := i.s3.Put(s3Key, bytes.NewReader(content), msg.size); err != nil {
-				logger.Warn("S3 upload failed", "path", msg.path, "error", err)
-				continue
+			// Check for cancellation before starting work
+			select {
+			case <-i.ctx.Done():
+				return
+			default:
 			}
-		}
 
-		// Success - add to uploaded list
-		uploaded = append(uploaded, uploadedMsg{
-			msg:      msg,
-			content:  content,
-			metadata: metadata,
-		})
+			// Read file
+			content, err := os.ReadFile(msg.path)
+			if err != nil {
+				logger.Warn("Failed to read file", "path", msg.path, "error", err)
+				return
+			}
+
+			// Check for cancellation after I/O
+			select {
+			case <-i.ctx.Done():
+				return
+			default:
+			}
+
+			// Parse message
+			metadata, err := i.parseMessageMetadata(content, msg.filename, msg.path)
+			if err != nil {
+				logger.Warn("Failed to parse message", "path", msg.path, "error", err)
+				return
+			}
+
+			// Check for cancellation before S3 upload
+			select {
+			case <-i.ctx.Done():
+				return
+			default:
+			}
+
+			// Upload to S3 (FileBasedS3Mock now has proper locking for directory creation)
+			if !i.options.TestMode && i.s3 != nil {
+				s3Key := helpers.NewS3Key(metadata.domain, metadata.localpart, msg.hash)
+				if err := i.s3.Put(s3Key, bytes.NewReader(content), msg.size); err != nil {
+					logger.Warn("S3 upload failed", "path", msg.path, "error", err)
+					return
+				}
+			}
+
+			// Success - add to uploaded list
+			mu.Lock()
+			uploaded = append(uploaded, uploadedMsg{
+				msg:      msg,
+				content:  content,
+				metadata: metadata,
+			})
+			mu.Unlock()
+		}(msg)
 	}
 
+	wg.Wait()
 	return uploaded
 }
 

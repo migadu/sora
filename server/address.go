@@ -16,7 +16,7 @@ type Address struct {
 	localPart   string
 	domain      string
 	detail      string
-	masterToken string // Master token from syntax like user@domain.com@TOKEN
+	suffix      string // Suffix after second @ (can be master username or prelookup token): user@domain.com@SUFFIX
 }
 
 func NewAddress(address string) (Address, error) {
@@ -54,31 +54,50 @@ func (a Address) BaseAddress() string {
 	return a.BaseLocalPart() + "@" + a.domain
 }
 
-// MasterAddress returns the base address with master token (without +detail)
+// MasterAddress returns the base address with suffix (without +detail)
+// The suffix can be a master username or prelookup token
 // Examples:
 //   - "user+tag@domain.com@TOKEN" -> "user@domain.com@TOKEN"
 //   - "user+tag@domain.com" -> "user@domain.com"
 //   - "user@domain.com@TOKEN" -> "user@domain.com@TOKEN"
 func (a Address) MasterAddress() string {
 	baseAddr := a.BaseAddress()
-	if a.masterToken != "" {
-		return baseAddr + "@" + a.masterToken
+	if a.suffix != "" {
+		return baseAddr + "@" + a.suffix
 	}
 	return baseAddr
 }
 
-// MasterToken returns the master token if present (from syntax like user@domain.com@TOKEN)
+// MasterToken returns the suffix if present (from syntax like user@domain.com@SUFFIX)
+// Note: This is kept for backward compatibility. The suffix can be either:
+// - A master username (for master password authentication)
+// - A prelookup token (for HTTP prelookup authentication)
 func (a Address) MasterToken() string {
-	return a.masterToken
+	return a.suffix
 }
 
-// HasMasterToken returns true if the address contains a master token
+// Suffix returns the suffix after the second @ if present (from syntax like user@domain.com@SUFFIX)
+// The suffix can be either a master username or a prelookup token depending on context
+func (a Address) Suffix() string {
+	return a.suffix
+}
+
+// HasMasterToken returns true if the address contains a suffix
+// Note: Kept for backward compatibility, use HasSuffix() for new code
 func (a Address) HasMasterToken() bool {
-	return a.masterToken != ""
+	return a.suffix != ""
 }
 
-// ParseAddressWithMasterToken parses an email address that may contain a master token
-// Master tokens use the syntax: user@domain.com@TOKEN
+// HasSuffix returns true if the address contains a suffix after the second @
+func (a Address) HasSuffix() bool {
+	return a.suffix != ""
+}
+
+// ParseAddressWithMasterToken parses an email address that may contain a suffix
+// The suffix uses the syntax: user@domain.com@SUFFIX
+// The SUFFIX can be either:
+// - A master username (for master password authentication)
+// - A prelookup token (for HTTP prelookup authentication)
 // Returns the parsed Address with proper validation, stripping +detail for authentication
 func ParseAddressWithMasterToken(input string) (Address, error) {
 	// Normalize: trim and lowercase
@@ -94,8 +113,8 @@ func ParseAddressWithMasterToken(input string) (Address, error) {
 		return Address{}, fmt.Errorf("address is empty")
 	}
 
-	// Split on @ to check for master token
-	// Format: localpart@domain or localpart@domain@token
+	// Split on @ to check for suffix (master username or prelookup token)
+	// Format: localpart@domain or localpart@domain@suffix
 	parts := strings.Split(input, "@")
 
 	// Need at least 2 parts (localpart@domain)
@@ -103,23 +122,23 @@ func ParseAddressWithMasterToken(input string) (Address, error) {
 		return Address{}, fmt.Errorf("address missing @: '%s'", input)
 	}
 
-	var masterToken string
+	var suffix string
 	var emailPart string
 
 	if len(parts) == 2 {
 		// Standard format: user@domain.com
 		emailPart = input
-		masterToken = ""
+		suffix = ""
 	} else if len(parts) == 3 {
-		// Master token format: user@domain.com@TOKEN
+		// Suffix format: user@domain.com@SUFFIX (master username or token)
 		emailPart = parts[0] + "@" + parts[1]
-		masterToken = parts[2]
+		suffix = parts[2]
 	} else {
 		// Too many @ symbols (more than 2)
 		return Address{}, fmt.Errorf("too many @ symbols in address: '%s'", input)
 	}
 
-	// Validate the email part (without master token)
+	// Validate the email part (without suffix)
 	emailParts := strings.Split(emailPart, "@")
 	if len(emailParts) != 2 {
 		return Address{}, fmt.Errorf("invalid email format: '%s'", emailPart)
@@ -145,10 +164,10 @@ func ParseAddressWithMasterToken(input string) (Address, error) {
 	}
 
 	return Address{
-		fullAddress: input, // Store original input with master token
+		fullAddress: input, // Store original input with suffix
 		localPart:   localPart,
 		domain:      domain,
 		detail:      detail,
-		masterToken: masterToken,
+		suffix:      suffix,
 	}, nil
 }

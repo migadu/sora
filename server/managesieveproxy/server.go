@@ -27,6 +27,8 @@ type Server struct {
 	addr                   string
 	hostname               string
 	insecureAuth           bool
+	masterUsername         []byte
+	masterPassword         []byte
 	masterSASLUsername     []byte
 	masterSASLPassword     []byte
 	tls                    bool
@@ -72,6 +74,8 @@ type ServerOptions struct {
 	RemoteAddrs            []string
 	RemotePort             int // Default port for backends if not in address
 	InsecureAuth           bool
+	MasterUsername         string
+	MasterPassword         string
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	TLS                    bool
@@ -188,6 +192,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		addr:                   opts.Addr,
 		hostname:               hostname,
 		insecureAuth:           opts.InsecureAuth,
+		masterUsername:         []byte(opts.MasterUsername),
+		masterPassword:         []byte(opts.MasterPassword),
 		masterSASLUsername:     []byte(opts.MasterSASLUsername),
 		masterSASLPassword:     []byte(opts.MasterSASLPassword),
 		tls:                    opts.TLS,

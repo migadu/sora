@@ -30,6 +30,8 @@ type Server struct {
 	hostname               string
 	connManager            *proxy.ConnectionManager
 	connTracker            *proxy.ConnectionTracker
+	masterUsername         []byte
+	masterPassword         []byte
 	masterSASLUsername     []byte
 	masterSASLPassword     []byte
 	tls                    bool
@@ -113,6 +115,8 @@ type ServerOptions struct {
 	Addr                   string
 	RemoteAddrs            []string
 	RemotePort             int // Default port for backends if not in address
+	MasterUsername         string
+	MasterPassword         string
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	TLS                    bool
@@ -218,6 +222,8 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		addr:                   opts.Addr,
 		hostname:               hostname,
 		connManager:            connManager,
+		masterUsername:         []byte(opts.MasterUsername),
+		masterPassword:         []byte(opts.MasterPassword),
 		masterSASLUsername:     []byte(opts.MasterSASLUsername),
 		masterSASLPassword:     []byte(opts.MasterSASLPassword),
 		tls:                    opts.TLS,

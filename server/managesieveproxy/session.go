@@ -3,6 +3,7 @@ package managesieveproxy
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -473,11 +474,39 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	// Try prelookup authentication/routing first if configured
-	// Skip strict address validation if prelookup is enabled, as it may support master tokens
-	// with syntax like user@domain.com@TOKEN (multiple @ symbols)
-	s.DebugLog("Attempting prelookup auth")
-	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, username, password)
+	// Parse username to check for master username suffix
+	// Master username authentication validates credentials locally, but still uses prelookup for routing
+	parsedAddr, parseErr := server.NewAddress(username)
+
+	// Check for Master Username suffix: user@domain.com@MASTER_USERNAME
+	// If present, validate master credentials locally, then use base address for prelookup/routing
+	var usernameForPrelookup string
+	var masterAuthValidated bool
+
+	if parseErr == nil && len(s.server.masterUsername) > 0 && parsedAddr.HasSuffix() && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
+		// Suffix matches MasterUsername - validate master password
+		if !checkMasterCredential(password, s.server.masterPassword) {
+			// Wrong master password - fail immediately
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			return fmt.Errorf("authentication failed")
+		}
+		// Master credentials validated - use base address (without suffix) for prelookup
+		s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
+		usernameForPrelookup = parsedAddr.BaseAddress()
+		masterAuthValidated = true
+	} else {
+		// No master username suffix, or suffix doesn't match - use full username for prelookup
+		// This allows prelookup to handle master tokens like user@domain@TOKEN
+		usernameForPrelookup = username
+		masterAuthValidated = false
+	}
+
+	// Try prelookup authentication/routing if configured
+	// - For master username: sends base address to get routing info (password already validated)
+	// - For others: sends full username (may contain token) for prelookup authentication
+	s.DebugLog("Attempting prelookup auth for user: %s", usernameForPrelookup)
+	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, usernameForPrelookup, password)
 
 	if err != nil {
 		// Categorize the error type to determine fallback behavior
@@ -508,8 +537,8 @@ func (s *Session) authenticateUser(username, password string) error {
 	} else {
 		switch authResult {
 		case proxy.AuthSuccess:
-			// Prelookup auth was successful. Use the accountID and flag from the prelookup result.
-			s.DebugLog("Prelookup auth successful", "account_id", routingInfo.AccountID)
+			// Prelookup returned success - use routing info
+			s.DebugLog("Prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 			s.DebugLog("Prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
 			s.accountID = routingInfo.AccountID
 			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
@@ -517,6 +546,8 @@ func (s *Session) authenticateUser(username, password string) error {
 			// Use the actual email (without token) for backend impersonation
 			if routingInfo.ActualEmail != "" {
 				s.username = routingInfo.ActualEmail
+			} else if masterAuthValidated {
+				s.username = usernameForPrelookup // Base address already
 			} else {
 				s.username = username // Fallback to original
 			}
@@ -530,7 +561,12 @@ func (s *Session) authenticateUser(username, password string) error {
 			return nil // Authentication complete
 
 		case proxy.AuthFailed:
-			// User found in prelookup, but password was wrong. Reject immediately.
+			// User found in prelookup, but password was wrong
+			// For master username, this shouldn't happen (password already validated)
+			// For others, reject immediately
+			if masterAuthValidated {
+				s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
+			}
 			s.DebugLog("Prelookup auth failed - bad password")
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
@@ -549,24 +585,44 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 	}
 
-	// Fallback to main DB - validate address format for normal email
-	address, err := server.NewAddress(username)
-	if err != nil {
-		return fmt.Errorf("invalid address format: %w", err)
+	// Fallback to main DB
+	// If master auth was already validated, just get account ID and continue
+	// Otherwise, authenticate via main DB
+	var address server.Address
+	if parseErr == nil {
+		address = parsedAddr
+	} else {
+		var parseErr2 error
+		address, parseErr2 = server.NewAddress(username)
+		if parseErr2 != nil {
+			return fmt.Errorf("invalid address format: %w", parseErr2)
+		}
 	}
 
-	// Fallback/default: Authenticate against the main database.
-	s.DebugLog("Authenticating via main DB")
-	// Use base address (without +detail) for authentication
-	accountID, err := s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
-	if err != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-		return fmt.Errorf("authentication failed: %w", err)
+	var accountID int64
+	if masterAuthValidated {
+		// Master authentication already validated - just get account ID
+		s.DebugLog("master auth already validated, getting account ID from main database")
+		accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		if err != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, address.BaseAddress(), false)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			return fmt.Errorf("account not found: %w", err)
+		}
+	} else {
+		// Regular authentication via main DB
+		s.DebugLog("Authenticating via main DB")
+		// Use base address (without +detail) for authentication
+		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+		if err != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			return fmt.Errorf("authentication failed: %w", err)
+		}
 	}
 
 	s.accountID = accountID
-	s.isPrelookupAccount = false       // Authenticated against the main DB
+	s.isPrelookupAccount = false
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
@@ -949,4 +1005,9 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 func isClosingError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
+}
+
+// checkMasterCredential compares two credentials using constant-time comparison.
+func checkMasterCredential(provided string, expected []byte) bool {
+	return subtle.ConstantTimeCompare([]byte(provided), expected) == 1
 }

@@ -35,6 +35,8 @@ type ManageSieveServer struct {
 	insecureAuth        bool
 	maxScriptSize       int64
 	supportedExtensions []string // List of supported Sieve extensions
+	masterUsername      []byte
+	masterPassword      []byte
 	masterSASLUsername  []byte
 	masterSASLPassword  []byte
 
@@ -76,6 +78,8 @@ type ManageSieveServerOptions struct {
 	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	MaxScriptSize          int64
 	SupportedExtensions    []string // List of supported Sieve extensions
+	MasterUsername         string
+	MasterPassword         string
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	MaxConnections         int
@@ -142,6 +146,8 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		insecureAuth:           options.InsecureAuth,
 		maxScriptSize:          options.MaxScriptSize,
 		supportedExtensions:    options.SupportedExtensions,
+		masterUsername:         []byte(options.MasterUsername),
+		masterPassword:         []byte(options.MasterPassword),
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
 		proxyReader:            proxyReader,

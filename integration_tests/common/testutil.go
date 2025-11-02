@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
@@ -84,6 +85,27 @@ func CreateTestAccount(t *testing.T, rdb *resilient.ResilientDatabase) TestAccou
 		t.Fatalf("Failed to create test account: %v", err)
 	}
 
+	// Get account ID and create default mailboxes
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(context.Background(), email)
+	if err != nil {
+		t.Fatalf("Failed to get account ID: %v", err)
+	}
+
+	// Create default mailboxes (INBOX, Sent, Drafts, etc.)
+	tx, err := rdb.BeginTxWithRetry(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	if err := rdb.GetDatabase().CreateDefaultMailboxes(context.Background(), tx, accountID); err != nil {
+		t.Fatalf("Failed to create default mailboxes: %v", err)
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
 	return TestAccount{Email: email, Password: password}
 }
 
@@ -100,6 +122,27 @@ func CreateTestAccountWithEmail(t *testing.T, rdb *resilient.ResilientDatabase, 
 
 	if err := rdb.CreateAccountWithRetry(context.Background(), req); err != nil {
 		t.Fatalf("Failed to create test account: %v", err)
+	}
+
+	// Get account ID and create default mailboxes
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(context.Background(), email)
+	if err != nil {
+		t.Fatalf("Failed to get account ID: %v", err)
+	}
+
+	// Create default mailboxes (INBOX, Sent, Drafts, etc.)
+	tx, err := rdb.BeginTxWithRetry(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	if err := rdb.GetDatabase().CreateDefaultMailboxes(context.Background(), tx, accountID); err != nil {
+		t.Fatalf("Failed to create default mailboxes: %v", err)
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
 	}
 
 	return TestAccount{Email: email, Password: password}
@@ -1105,6 +1148,61 @@ func SetupIMAPServerWithSlowloris(t *testing.T, commandTimeout time.Duration, mi
 	}
 
 	t.Cleanup(cleanup)
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}
+
+// SetupManageSieveServerWithMaster sets up a ManageSieve server with master credentials
+func SetupManageSieveServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	server, err := managesieve.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth:       true,
+			MasterUsername:     "master_admin",
+			MasterPassword:     "master_secret_789",
+			MasterSASLUsername: "master_sasl",
+			MasterSASLPassword: "master_sasl_secret",
+			// Test with a subset of supported extensions
+			SupportedExtensions: []string{"fileinto", "vacation", "envelope", "variables"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server with master auth: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("ManageSieve server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+		}
+	}
 
 	return &TestServer{
 		Address:     address,

@@ -29,6 +29,8 @@ type POP3ProxyServer struct {
 	appCtx                 context.Context
 	cancel                 context.CancelFunc
 	tlsConfig              *tls.Config
+	masterUsername         string
+	masterPassword         string
 	masterSASLUsername     string
 	masterSASLPassword     string
 	connManager            *proxy.ConnectionManager
@@ -116,6 +118,8 @@ type POP3ProxyServerOptions struct {
 	RemoteTLS              bool
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
+	MasterUsername         string
+	MasterPassword         string
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	ConnectTimeout         time.Duration
@@ -218,6 +222,8 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		rdb:                    rdb,
 		appCtx:                 serverCtx,
 		cancel:                 serverCancel,
+		masterUsername:         options.MasterUsername,
+		masterPassword:         options.MasterPassword,
 		masterSASLUsername:     options.MasterSASLUsername,
 		masterSASLPassword:     options.MasterSASLPassword,
 		connManager:            connManager,

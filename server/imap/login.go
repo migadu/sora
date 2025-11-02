@@ -2,15 +2,11 @@ package imap
 
 import (
 	"crypto/subtle"
-	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
-
-// Tilde is default separator for master password
-const MasterUsernameSeparator = "~"
 
 func (s *IMAPSession) Login(address, password string) error {
 	// Get the underlying net.Conn for proxy-aware rate limiting
@@ -46,35 +42,37 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	authAddress, proxyUser := parseMasterLogin(address)
-
-	// Master password login
-	if len(s.server.masterUsername) > 0 && proxyUser != "" && checkMasterCredential(proxyUser, s.server.masterUsername) {
-		address, err := server.NewAddress(authAddress)
-		if err != nil {
-			s.DebugLog("[LOGIN] failed to parse address: %v", err)
-			// Track invalid address format as client error
-			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeAuthenticationFailed,
-				Text: "Address not in the correct format",
-			}
+	// Parse address with potential suffix (master username or prelookup token)
+	addressParsed, err := server.NewAddress(address)
+	if err != nil {
+		s.DebugLog("[LOGIN] failed to parse address: %v", err)
+		// Track invalid address format as client error
+		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAuthenticationFailed,
+			Text: "Address not in the correct format",
 		}
+	}
 
+	// Master username authentication: user@domain.com@MASTER_USERNAME
+	// Check if suffix matches configured MasterUsername
+	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
+		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if checkMasterCredential(password, s.server.masterPassword) {
-			AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
+			// Use base address (without suffix) to get account
+			AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, addressParsed.BaseAddress())
 			if err != nil {
 				return err
 			}
 
-			s.IMAPUser = NewIMAPUser(address, AccountID)
+			s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
 			s.Session.User = &s.IMAPUser.User
 
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("[LOGIN] user %s/%s authenticated with master password (connections: total=%d, authenticated=%d)",
-				address, proxyUser, totalCount, authCount)
+			s.Log("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
+				addressParsed.BaseAddress(), addressParsed.Suffix(), totalCount, authCount)
 
 			// Prometheus metrics - successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
@@ -82,11 +80,11 @@ func (s *IMAPSession) Login(address, password string) error {
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
 			}
 
 			// Register connection for tracking
-			if err := s.registerConnection(address.FullAddress()); err != nil {
+			if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
 				// Connection limit reached - undo authentication and reject
 				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
 				s.IMAPUser = nil
@@ -107,31 +105,32 @@ func (s *IMAPSession) Login(address, password string) error {
 		// Record failed master password authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authAddress, false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
-	}
 
-	addressSt, err := server.NewAddress(address)
-	if err != nil {
-		s.DebugLog("[LOGIN] failed to parse address: %v", err)
+		// Master username suffix was provided but master password was wrong - fail immediately
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Address not in the correct format",
+			Text: "Invalid master credentials",
 		}
 	}
 
-	s.DebugLog("[LOGIN] authentication attempt with address %s", addressSt.FullAddress())
+	// Regular authentication - use the already parsed address
+	// If it has a suffix but didn't match MasterUsername, fall through to regular auth
+	// (this allows the suffix to be used for prelookup in proxy scenarios)
 
-	// Use base address (without +detail) for authentication
-	AccountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressSt.BaseAddress(), password)
+	s.DebugLog("[LOGIN] authentication attempt with address %s", addressParsed.BaseAddress())
+
+	// Use base address (without +detail and without suffix) for authentication
+	AccountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressParsed.BaseAddress(), password)
 	if err != nil {
 		s.DebugLog("[LOGIN] authentication failed: %v", err)
 
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressSt.FullAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
 
 		return &imap.Error{
@@ -147,29 +146,29 @@ func (s *IMAPSession) Login(address, password string) error {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
-	s.IMAPUser = NewIMAPUser(addressSt, AccountID)
+	s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
 	s.Session.User = &s.IMAPUser.User
 
 	authCount := s.server.authenticatedConnections.Add(1)
 	totalCount := s.server.totalConnections.Load()
 	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
-		address, totalCount, authCount)
+		addressParsed.BaseAddress(), totalCount, authCount)
 
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
 
 	// Domain and user tracking
-	metrics.TrackDomainConnection("imap", addressSt.Domain())
-	metrics.TrackUserActivity("imap", addressSt.FullAddress(), "connection", 1)
+	metrics.TrackDomainConnection("imap", addressParsed.Domain())
+	metrics.TrackUserActivity("imap", addressParsed.BaseAddress(), "connection", 1)
 
 	// Record successful authentication
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressSt.FullAddress(), true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
 	}
 
 	// Register connection for tracking
-	if err := s.registerConnection(addressSt.FullAddress()); err != nil {
+	if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
 		// Connection limit reached - undo authentication and reject
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
 		s.IMAPUser = nil
@@ -188,14 +187,6 @@ func (s *IMAPSession) Login(address, password string) error {
 	s.triggerCacheWarmup()
 
 	return nil
-}
-
-func parseMasterLogin(username string) (realuser, authuser string) {
-	parts := strings.SplitN(username, MasterUsernameSeparator, 2)
-	if len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return username, ""
 }
 
 func checkMasterCredential(provided string, actual []byte) bool {

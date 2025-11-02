@@ -3,6 +3,7 @@ package pop3
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -268,20 +269,57 @@ func (s *POP3Session) handleConnection() {
 				}
 			}
 
-			// Try master password authentication first
+			// Master username authentication: user@domain.com@MASTER_USERNAME
+			// Check if suffix matches configured MasterUsername
 			authSuccess := false
 			var accountID int64
-			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				if userAddress.FullAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
-					s.DebugLog("[PASS] Master password authentication successful for '%s'", userAddress.FullAddress())
+			if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
+				// Suffix matches MasterUsername, authenticate with MasterPassword
+				if checkMasterCredential(password, s.server.masterPassword) {
+					s.DebugLog("[PASS] Master username authentication successful for '%s' with master username '%s'", userAddress.BaseAddress(), userAddress.Suffix())
 					authSuccess = true
-					// For master password, we need to get the user ID
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.FullAddress())
+					// Use base address (without suffix) to get account
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
 					if err != nil {
-						s.DebugLog("[PASS] Failed to get account ID for master user '%s': %v", userAddress.FullAddress(), err)
+						s.DebugLog("[PASS] Failed to get account ID for user '%s': %v", userAddress.BaseAddress(), err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
+							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
+						}
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+							s.DebugLog("authentication failed")
+							return
+						}
+						continue
+					}
+				} else {
+					// Record failed master password authentication
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+					if s.server.authLimiter != nil {
+						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
+					}
+
+					// Master username suffix was provided but master password was wrong - fail immediately
+					if s.handleClientError(writer, "-ERR [AUTH] Invalid master credentials\r\n") {
+						s.DebugLog("authentication failed - invalid master credentials")
+						return
+					}
+					continue
+				}
+			}
+
+			// Try master SASL password authentication (traditional)
+			if !authSuccess && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+				if userAddress.BaseAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+					s.DebugLog("[PASS] Master SASL password authentication successful for '%s'", userAddress.BaseAddress())
+					authSuccess = true
+					// For master password, we need to get the user ID
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
+					if err != nil {
+						s.DebugLog("[PASS] Failed to get account ID for master user '%s': %v", userAddress.BaseAddress(), err)
+						// Record failed attempt
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
 						}
 						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 							s.DebugLog("authentication failed")
@@ -1288,11 +1326,60 @@ func (s *POP3Session) handleConnection() {
 
 			s.DebugLog("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
 
-			// Check for Master SASL Authentication
+			// Parse authentication-identity to check for suffix (master username or prelookup token)
+			authnParsed, parseErr := server.NewAddress(authnID)
+
 			var accountID int64
 			var impersonating bool
 
-			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+			// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
+			if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
+				// Suffix matches MasterUsername, authenticate with MasterPassword
+				if checkMasterCredential(password, s.server.masterPassword) {
+					// Determine target user to impersonate
+					targetUserToImpersonate := authzID
+					if targetUserToImpersonate == "" {
+						// No authorization identity provided, use base address from authnID
+						targetUserToImpersonate = authnParsed.BaseAddress()
+					}
+
+					s.DebugLog("[AUTH] Master username '%s' authenticated. Attempting to impersonate '%s'.", authnParsed.Suffix(), targetUserToImpersonate)
+
+					// Parse target user address
+					address, err := server.NewAddress(targetUserToImpersonate)
+					if err != nil {
+						s.DebugLog("[AUTH] Failed to parse impersonation target user '%s': %v", targetUserToImpersonate, err)
+						if s.handleClientError(writer, "-ERR [AUTH] Invalid impersonation target user format\r\n") {
+							return
+						}
+						continue
+					}
+
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+					if err != nil {
+						s.DebugLog("[AUTH] Failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
+							return
+						}
+						continue
+					}
+
+					impersonating = true
+				} else {
+					// Record failed master password authentication
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+
+					// Master username suffix was provided but master password was wrong - fail immediately
+					if s.handleClientError(writer, "-ERR [AUTH] Invalid master credentials\r\n") {
+						s.DebugLog("authentication failed - invalid master credentials")
+						return
+					}
+					continue
+				}
+			}
+
+			// 2. Check for Master SASL Authentication (traditional)
+			if !impersonating && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				// Check if this is a master SASL login
 				if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
 					// Master SASL authentication successful
@@ -1316,7 +1403,7 @@ func (s *POP3Session) handleConnection() {
 						continue
 					}
 
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
 						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
@@ -1890,4 +1977,8 @@ func (s *POP3Session) startTerminationPoller() {
 			// Session ended normally
 		}
 	}()
+}
+
+func checkMasterCredential(provided string, actual []byte) bool {
+	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
 }
