@@ -375,10 +375,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	}
 
 	// Parse username to check for master username suffix
+	// Proxies use * separator for master username: user@domain.com*MASTER_USERNAME
 	// Master username authentication validates credentials locally, but still uses prelookup for routing
-	parsedAddr, parseErr := server.NewAddress(username)
+	parsedAddr, parseErr := server.ParseAddressWithProxySeparator(username)
 
-	// Check for Master Username suffix: user@domain.com@MASTER_USERNAME
+	// Check for Master Username suffix: user@domain.com*MASTER_USERNAME
+	// Proxies use * separator to avoid confusion with @ in email addresses
 	// If present, validate master credentials locally, then use base address for prelookup/routing
 	var usernameForPrelookup string
 	var masterAuthValidated bool

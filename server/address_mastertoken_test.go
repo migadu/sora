@@ -86,9 +86,16 @@ func TestParseAddressWithMasterToken(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "invalid - too many @",
-			input:       "user@example.com@token@extra",
-			expectError: true,
+			name:         "suffix with @ character",
+			input:        "user@example.com@token@extra",
+			expectError:  false,
+			expectAddr:   "user@example.com@token@extra",
+			expectDomain: "example.com",
+			expectLocal:  "user",
+			expectDetail: "",
+			expectToken:  "token@extra", // Suffix can contain @ characters
+			expectBase:   "user@example.com",
+			expectMaster: "user@example.com@token@extra",
 		},
 		{
 			name:         "trimming spaces",

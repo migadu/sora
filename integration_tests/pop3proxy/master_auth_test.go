@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	// Master credentials for CLIENT→PROXY authentication (@ suffix format)
+	// Master credentials for CLIENT→PROXY authentication (* separator format)
+	// Proxies use * separator to distinguish from @ in email addresses
 	proxyMasterUsername = "proxy_admin"
 	proxyMasterPassword = "proxy_master_123"
 
@@ -89,7 +90,7 @@ func setupPOP3ProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, proxyAdd
 		Name:        "test-pop3-proxy-master",
 		RemoteAddrs: backendAddrs,
 		RemotePort:  110,
-		// Master credentials for CLIENT→PROXY authentication (@ suffix format)
+		// Master credentials for CLIENT→PROXY authentication (* separator format)
 		MasterUsername: proxyMasterUsername,
 		MasterPassword: proxyMasterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
@@ -175,8 +176,8 @@ func TestPOP3Proxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		// USER format: user@domain.com@PROXY_MASTER_USERNAME
-		username := account.Email + "@" + proxyMasterUsername
+		// USER format: user@domain.com*PROXY_MASTER_USERNAME (proxies use * separator)
+		username := account.Email + "*" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		response, _ := client.ReadResponse()
 		if !strings.HasPrefix(response, "+OK") {
@@ -207,7 +208,7 @@ func TestPOP3Proxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "@wrongmaster"
+		username := account.Email + "*wrongmaster"
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 
@@ -226,7 +227,7 @@ func TestPOP3Proxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 
@@ -270,7 +271,7 @@ func TestPOP3Proxy_MasterSASLAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// AUTH PLAIN with master username suffix at proxy level
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + proxyMasterPassword
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -326,7 +327,7 @@ func TestPOP3Proxy_MasterAuthenticationPriority(t *testing.T) {
 		defer client.Close()
 
 		// Try proxy master username suffix with account password (should fail)
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 

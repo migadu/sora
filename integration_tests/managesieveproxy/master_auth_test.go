@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// Master credentials for CLIENT→PROXY authentication (@ suffix format)
+	// Master credentials for CLIENT→PROXY authentication (* separator format)
 	proxyMasterUsername = "proxy_admin"
 	proxyMasterPassword = "proxy_master_123"
 
@@ -95,7 +95,7 @@ func setupManageSieveProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, p
 		Addr:        proxyAddr,
 		RemoteAddrs: backendAddrs,
 		RemotePort:  4190,
-		// Master credentials for CLIENT→PROXY authentication (@ suffix format)
+		// Master credentials for CLIENT→PROXY authentication (* separator format)
 		MasterUsername: proxyMasterUsername,
 		MasterPassword: proxyMasterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
@@ -175,7 +175,7 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// AUTHENTICATE PLAIN with master username suffix at proxy level
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + proxyMasterPassword
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -212,7 +212,7 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "@wrongmaster"
+		username := account.Email + "*wrongmaster"
 		authString := "\x00" + username + "\x00" + proxyMasterPassword
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -231,7 +231,7 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + "wrong_password"
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -275,7 +275,7 @@ func TestManageSieveProxy_MasterAuthenticationPriority(t *testing.T) {
 		defer client.Close()
 
 		// Try proxy master username suffix with account password (should fail)
-		username := account.Email + "@" + proxyMasterUsername
+		username := account.Email + "*" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + account.Password
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 

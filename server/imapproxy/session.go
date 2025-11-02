@@ -392,10 +392,11 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	// Parse username to check for master username suffix
+	// Proxies use * separator for master username: user@domain.com*MASTER_USERNAME
 	// Master username authentication validates credentials locally, but still uses prelookup for routing
-	parsedAddr, parseErr := server.NewAddress(username)
+	parsedAddr, parseErr := server.ParseAddressWithProxySeparator(username)
 
-	// Check for Master Username suffix: user@domain.com@MASTER_USERNAME
+	// Check for Master Username suffix: user@domain.com*MASTER_USERNAME
 	// If present, validate master credentials locally, then use base address for prelookup/routing
 	var usernameForPrelookup string
 	var masterAuthValidated bool
@@ -539,6 +540,9 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	s.accountID = accountID
 	s.isPrelookupAccount = false
+	// Set username to base address (without master username suffix or +detail)
+	// This is what gets sent to the backend for impersonation
+	s.username = address.BaseAddress()
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
