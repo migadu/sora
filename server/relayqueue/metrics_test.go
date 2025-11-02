@@ -114,7 +114,7 @@ func TestMetricsOnError(t *testing.T) {
 	}
 
 	// Try to mark success for non-existent message
-	err = queue.MarkSuccess("non-existent-id")
+	_ = queue.MarkSuccess("non-existent-id")
 	// This should complete (not error) because files don't exist, but metrics should be recorded
 
 	// Try to mark failure for non-existent message (this should error)
