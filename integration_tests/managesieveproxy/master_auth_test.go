@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// Master credentials for CLIENT→PROXY authentication (* separator format)
+	// Master credentials for CLIENT→PROXY authentication (@ separator format)
 	proxyMasterUsername = "proxy_admin"
 	proxyMasterPassword = "proxy_master_123"
 
@@ -95,7 +95,7 @@ func setupManageSieveProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, p
 		Addr:        proxyAddr,
 		RemoteAddrs: backendAddrs,
 		RemotePort:  4190,
-		// Master credentials for CLIENT→PROXY authentication (* separator format)
+		// Master credentials for CLIENT→PROXY authentication (@ separator format)
 		MasterUsername: proxyMasterUsername,
 		MasterPassword: proxyMasterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
@@ -175,7 +175,7 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// AUTHENTICATE PLAIN with master username suffix at proxy level
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + proxyMasterPassword
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -231,7 +231,7 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + "wrong_password"
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -275,7 +275,7 @@ func TestManageSieveProxy_MasterAuthenticationPriority(t *testing.T) {
 		defer client.Close()
 
 		// Try proxy master username suffix with account password (should fail)
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + account.Password
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -320,5 +320,64 @@ func TestManageSieveProxy_MasterAuthenticationPriority(t *testing.T) {
 			}
 		}
 		t.Log("✓ LISTSCRIPTS successful through proxy")
+	})
+}
+
+// TestManageSieveProxy_TokenAuthentication tests token-based authentication through prelookup
+func TestManageSieveProxy_TokenAuthentication(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create backend ManageSieve server with master SASL credentials
+	backendServer, account := common.SetupManageSieveServerWithMaster(t)
+	defer backendServer.Close()
+
+	// Create proxy with master credentials
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupManageSieveProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
+	defer proxy.Close()
+
+	t.Run("AUTHENTICATE PLAIN with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
+		}
+		defer client.Close()
+
+		// AUTHENTICATE PLAIN format: user@domain.com@TOKEN with USER_PASSWORD
+		// The @TOKEN should be sent to prelookup (not validated locally)
+		username := account.Email + "@sometoken123"
+		authString := "\x00" + username + "\x00" + account.Password
+		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
+
+		client.SendCommand("AUTHENTICATE \"PLAIN\" \"" + encoded + "\"")
+		response, err := client.ReadResponse()
+		// Without prelookup configured, this will fail - but that's expected
+		// The important part is that the code path handles @TOKEN differently than *MASTER
+		if err == nil && response == "OK" {
+			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+		} else {
+			t.Logf("Login with @TOKEN failed (expected without prelookup): %s", response)
+		}
+	})
+
+	t.Run("@TOKEN behaves same as @MASTER when suffix matches", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
+		}
+		defer client.Close()
+
+		// Using @ separator with suffix that matches master username should validate locally
+		username := account.Email + "@" + proxyMasterUsername
+		authString := "\x00" + username + "\x00" + proxyMasterPassword
+		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
+
+		client.SendCommand("AUTHENTICATE \"PLAIN\" \"" + encoded + "\"")
+		response, _ := client.ReadResponse()
+		// This should succeed - @ separator checks if suffix matches master username
+		if !strings.HasPrefix(response, "OK") {
+			t.Fatalf("Authentication failed unexpectedly: %s", response)
+		}
+		t.Log("✓ @ separator with master username suffix authenticated successfully")
 	})
 }

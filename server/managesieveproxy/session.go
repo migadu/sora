@@ -474,32 +474,39 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	// Parse username to check for master username suffix
-	// Proxies use * separator for master username: user@domain.com*MASTER_USERNAME
-	// Master username authentication validates credentials locally, but still uses prelookup for routing
-	parsedAddr, parseErr := server.ParseAddressWithProxySeparator(username)
-
-	// Check for Master Username suffix: user@domain.com*MASTER_USERNAME
-	// Proxies use * separator to avoid confusion with @ in email addresses
-	// If present, validate master credentials locally, then use base address for prelookup/routing
+	// Parse username to check for master username or token suffix
+	// Format: user@domain.com@SUFFIX
+	// If SUFFIX matches configured master username: validate locally, send base address to prelookup
+	// Otherwise: treat as token, send full username (including @SUFFIX) to prelookup
 	var usernameForPrelookup string
 	var masterAuthValidated bool
 
-	if parseErr == nil && len(s.server.masterUsername) > 0 && parsedAddr.HasSuffix() && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
-		// Suffix matches MasterUsername - validate master password
-		if !checkMasterCredential(password, s.server.masterPassword) {
-			// Wrong master password - fail immediately
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-			return fmt.Errorf("authentication failed")
+	// Parse username (handles both regular addresses and addresses with @SUFFIX)
+	parsedAddr, parseErr := server.NewAddress(username)
+
+	if parseErr == nil && parsedAddr.HasSuffix() {
+		// Has suffix - check if it matches configured master username
+		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
+			// Suffix matches master username - validate master password locally
+			if !checkMasterCredential(password, s.server.masterPassword) {
+				// Wrong master password - fail immediately
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				return fmt.Errorf("authentication failed")
+			}
+			// Master credentials validated - use base address (without @MASTER suffix) for prelookup
+			s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
+			usernameForPrelookup = parsedAddr.BaseAddress()
+			masterAuthValidated = true
+		} else {
+			// Suffix doesn't match master username - treat as token
+			// Send FULL username (including @TOKEN) to prelookup for validation
+			s.DebugLog("token detected in username, sending full username to prelookup: %s", username)
+			usernameForPrelookup = username
+			masterAuthValidated = false
 		}
-		// Master credentials validated - use base address (without suffix) for prelookup
-		s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
-		usernameForPrelookup = parsedAddr.BaseAddress()
-		masterAuthValidated = true
 	} else {
-		// No master username suffix, or suffix doesn't match - use full username for prelookup
-		// This allows prelookup to handle master tokens like user@domain@TOKEN
+		// No suffix - regular username
 		usernameForPrelookup = username
 		masterAuthValidated = false
 	}
@@ -507,83 +514,85 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Try prelookup authentication/routing if configured
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
-	s.DebugLog("Attempting prelookup auth for user: %s", usernameForPrelookup)
-	routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, usernameForPrelookup, password)
+	if s.server.connManager.HasRouting() {
+		s.DebugLog("Attempting prelookup auth for user: %s", usernameForPrelookup)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
-	if err != nil {
-		// Categorize the error type to determine fallback behavior
-		if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
-			// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-			s.DebugLog("Prelookup invalid response - server bug", "error", err)
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-			return fmt.Errorf("prelookup server error: invalid response")
-		}
-
-		if errors.Is(err, proxy.ErrPrelookupTransient) {
-			// Transient error (network, 5xx, circuit breaker) - check fallback config
-			if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-				s.DebugLog("Prelookup transient error - fallback enabled", "error", err)
-				// Fallthrough to main DB auth
-			} else {
-				s.DebugLog("Prelookup transient error - fallback disabled", "error", err)
+		if err != nil {
+			// Categorize the error type to determine fallback behavior
+			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
+				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
+				s.DebugLog("Prelookup invalid response - server bug", "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-				return fmt.Errorf("prelookup service unavailable")
+				return fmt.Errorf("prelookup server error: invalid response")
+			}
+
+			if errors.Is(err, proxy.ErrPrelookupTransient) {
+				// Transient error (network, 5xx, circuit breaker) - check fallback config
+				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
+					s.DebugLog("Prelookup transient error - fallback enabled", "error", err)
+					// Fallthrough to main DB auth
+				} else {
+					s.DebugLog("Prelookup transient error - fallback disabled", "error", err)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+					return fmt.Errorf("prelookup service unavailable")
+				}
+			} else {
+				// Unknown error type - log and fallthrough
+				s.DebugLog("Prelookup unknown error - attempting fallback", "error", err)
+				// Fallthrough to main DB auth
 			}
 		} else {
-			// Unknown error type - log and fallthrough
-			s.DebugLog("Prelookup unknown error - attempting fallback", "error", err)
-			// Fallthrough to main DB auth
-		}
-	} else {
-		switch authResult {
-		case proxy.AuthSuccess:
-			// Prelookup returned success - use routing info
-			s.DebugLog("Prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-			s.DebugLog("Prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
-			s.accountID = routingInfo.AccountID
-			s.isPrelookupAccount = routingInfo.IsPrelookupAccount
-			s.routingInfo = routingInfo
-			// Use the actual email (without token) for backend impersonation
-			if routingInfo.ActualEmail != "" {
-				s.username = routingInfo.ActualEmail
-			} else if masterAuthValidated {
-				s.username = usernameForPrelookup // Base address already
-			} else {
-				s.username = username // Fallback to original
-			}
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
-			// For metrics, use username as-is (may contain token, but that's ok for tracking)
-			if addr, err := server.NewAddress(username); err == nil {
-				metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
-				metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
-			}
-			return nil // Authentication complete
+			switch authResult {
+			case proxy.AuthSuccess:
+				// Prelookup returned success - use routing info
+				s.DebugLog("Prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("Prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
+				s.accountID = routingInfo.AccountID
+				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
+				s.routingInfo = routingInfo
+				// Use the actual email (without token) for backend impersonation
+				if routingInfo.ActualEmail != "" {
+					s.username = routingInfo.ActualEmail
+				} else if masterAuthValidated {
+					s.username = usernameForPrelookup // Base address already
+				} else {
+					s.username = username // Fallback to original
+				}
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+				// For metrics, use username as-is (may contain token, but that's ok for tracking)
+				if addr, err := server.NewAddress(username); err == nil {
+					metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
+					metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
+				}
+				return nil // Authentication complete
 
-		case proxy.AuthFailed:
-			// User found in prelookup, but password was wrong
-			// For master username, this shouldn't happen (password already validated)
-			// For others, reject immediately
-			if masterAuthValidated {
-				s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
+			case proxy.AuthFailed:
+				// User found in prelookup, but password was wrong
+				// For master username, this shouldn't happen (password already validated)
+				// For others, reject immediately
+				if masterAuthValidated {
+					s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
+				}
+				s.DebugLog("Prelookup auth failed - bad password")
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				return fmt.Errorf("authentication failed")
+
+			case proxy.AuthTemporarilyUnavailable:
+				// Prelookup service is temporarily unavailable - tell user to retry later
+				s.DebugLog("Prelookup service temporarily unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
+				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+
+			case proxy.AuthUserNotFound:
+				// User not found in prelookup (404). This means the user is NOT in the other system.
+				// Always fall through to main DB auth - this is the expected behavior for partitioning.
+				s.DebugLog("User not found in prelookup - trying main DB")
 			}
-			s.DebugLog("Prelookup auth failed - bad password")
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-			return fmt.Errorf("authentication failed")
-
-		case proxy.AuthTemporarilyUnavailable:
-			// Prelookup service is temporarily unavailable - tell user to retry later
-			s.DebugLog("Prelookup service temporarily unavailable")
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
-			return fmt.Errorf("authentication service temporarily unavailable, please try again later")
-
-		case proxy.AuthUserNotFound:
-			// User not found in prelookup (404). This means the user is NOT in the other system.
-			// Always fall through to main DB auth - this is the expected behavior for partitioning.
-			s.DebugLog("User not found in prelookup - trying main DB")
 		}
 	}
 
@@ -591,9 +600,11 @@ func (s *Session) authenticateUser(username, password string) error {
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
 	var address server.Address
+	// Use already parsed address if available
 	if parseErr == nil {
 		address = parsedAddr
 	} else {
+		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
 		var parseErr2 error
 		address, parseErr2 = server.NewAddress(username)
 		if parseErr2 != nil {
@@ -602,6 +613,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	var accountID int64
+	var err error
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")

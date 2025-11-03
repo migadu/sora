@@ -156,9 +156,15 @@ func NewHTTPPreLookupClient(
 
 // LookupUserRoute performs an HTTP GET request to lookup user routing information
 func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
+	return c.LookupUserRouteWithOptions(ctx, email, password, false)
+}
+
+// LookupUserRouteWithOptions performs prelookup with optional route-only mode
+// routeOnly: if true, adds ?route_only=true to skip password validation (for master username auth)
+func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	// Parse and validate email address with master token support
 	// This also handles +detail addressing and validates format
-	addr, err := server.ParseAddressWithMasterToken(email)
+	addr, err := server.NewAddress(email)
 	if err != nil {
 		logger.Debug("Prelookup: Invalid email format", "error", err)
 		return nil, AuthFailed, nil
@@ -197,7 +203,17 @@ func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, passwo
 		// Use lookupEmail (MasterAddress) to include master token but not +detail
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
 
-		logger.Debug("Prelookup: Requesting lookup", "user", lookupEmail, "url", requestURL)
+		// Add route_only parameter if requested (for master username authentication)
+		if routeOnly {
+			// Check if URL already has query parameters
+			if strings.Contains(requestURL, "?") {
+				requestURL += "&route_only=true"
+			} else {
+				requestURL += "?route_only=true"
+			}
+		}
+
+		logger.Debug("Prelookup: Requesting lookup", "user", lookupEmail, "url", requestURL, "route_only", routeOnly)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)

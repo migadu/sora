@@ -374,32 +374,39 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		return err
 	}
 
-	// Parse username to check for master username suffix
-	// Proxies use * separator for master username: user@domain.com*MASTER_USERNAME
-	// Master username authentication validates credentials locally, but still uses prelookup for routing
-	parsedAddr, parseErr := server.ParseAddressWithProxySeparator(username)
-
-	// Check for Master Username suffix: user@domain.com*MASTER_USERNAME
-	// Proxies use * separator to avoid confusion with @ in email addresses
-	// If present, validate master credentials locally, then use base address for prelookup/routing
+	// Parse username to check for master username or token suffix
+	// Format: user@domain.com@SUFFIX
+	// If SUFFIX matches configured master username: validate locally, send base address to prelookup
+	// Otherwise: treat as token, send full username (including @SUFFIX) to prelookup
 	var usernameForPrelookup string
 	var masterAuthValidated bool
 
-	if parseErr == nil && len(s.server.masterUsername) > 0 && parsedAddr.HasSuffix() && checkMasterCredential(parsedAddr.Suffix(), []byte(s.server.masterUsername)) {
-		// Suffix matches MasterUsername - validate master password
-		if !checkMasterCredential(password, []byte(s.server.masterPassword)) {
-			// Wrong master password - fail immediately
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
-			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
-			return fmt.Errorf("authentication failed")
+	// Parse username (handles both regular addresses and addresses with @SUFFIX)
+	parsedAddr, parseErr := server.NewAddress(username)
+
+	if parseErr == nil && parsedAddr.HasSuffix() {
+		// Has suffix - check if it matches configured master username
+		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), []byte(s.server.masterUsername)) {
+			// Suffix matches master username - validate master password locally
+			if !checkMasterCredential(password, []byte(s.server.masterPassword)) {
+				// Wrong master password - fail immediately
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+				return fmt.Errorf("authentication failed")
+			}
+			// Master credentials validated - use base address (without @MASTER suffix) for prelookup
+			s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
+			usernameForPrelookup = parsedAddr.BaseAddress()
+			masterAuthValidated = true
+		} else {
+			// Suffix doesn't match master username - treat as token
+			// Send FULL username (including @TOKEN) to prelookup for validation
+			s.DebugLog("token detected in username, sending full username to prelookup: %s", username)
+			usernameForPrelookup = username
+			masterAuthValidated = false
 		}
-		// Master credentials validated - use base address (without suffix) for prelookup
-		s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
-		usernameForPrelookup = parsedAddr.BaseAddress()
-		masterAuthValidated = true
 	} else {
-		// No master username suffix, or suffix doesn't match - use full username for prelookup
-		// This allows prelookup to handle master tokens like user@domain@TOKEN
+		// No suffix - regular username
 		usernameForPrelookup = username
 		masterAuthValidated = false
 	}
@@ -409,7 +416,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
 		s.DebugLog("Attempting authentication via prelookup for user: %s", usernameForPrelookup)
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRoute(ctx, usernameForPrelookup, password)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
@@ -503,9 +510,11 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Otherwise, authenticate via main DB
 	var address server.Address
 	var err error
+	// Use already parsed address if available
 	if parseErr == nil {
 		address = parsedAddr
 	} else {
+		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
 		address, err = server.NewAddress(username)
 		if err != nil {
 			return fmt.Errorf("invalid address format: %w", err)

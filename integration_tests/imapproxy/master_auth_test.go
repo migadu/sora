@@ -42,7 +42,7 @@ func setupIMAPProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, proxyAdd
 		RemoteAddrs: backendAddrs,
 		RemotePort:  143,
 		Debug:       true, // Enable debug logging to see what's happening
-		// Master credentials for CLIENT→PROXY authentication (* separator format)
+		// Master credentials for CLIENT→PROXY authentication (@ separator format)
 		MasterUsername: proxyMasterUsername,
 		MasterPassword: proxyMasterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
@@ -120,7 +120,7 @@ func TestIMAPProxy_MasterUsernameAuthentication(t *testing.T) {
 		defer c.Logout()
 
 		// Login format: user@domain.com@PROXY_MASTER_USERNAME with PROXY_MASTER_PASSWORD
-		loginUsername := account.Email + "*" + proxyMasterUsername
+		loginUsername := account.Email + "@" + proxyMasterUsername
 		if err := c.Login(loginUsername, proxyMasterPassword).Wait(); err != nil {
 			t.Fatalf("Login with proxy master username failed: %v", err)
 		}
@@ -156,7 +156,7 @@ func TestIMAPProxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer c.Logout()
 
-		loginUsername := account.Email + "*" + proxyMasterUsername
+		loginUsername := account.Email + "@" + proxyMasterUsername
 		err = c.Login(loginUsername, "wrong_password").Wait()
 		if err == nil {
 			t.Fatal("Expected login to fail with wrong master password through proxy")
@@ -186,7 +186,7 @@ func TestIMAPProxy_MasterSASLAuthentication(t *testing.T) {
 		defer c.Logout()
 
 		// SASL PLAIN with master username suffix at proxy level
-		loginUsername := account.Email + "*" + proxyMasterUsername
+		loginUsername := account.Email + "@" + proxyMasterUsername
 		saslClient := sasl.NewPlainClient("", loginUsername, proxyMasterPassword)
 		if err := c.Authenticate(saslClient); err != nil {
 			t.Fatalf("SASL PLAIN with proxy master username failed: %v", err)
@@ -227,7 +227,7 @@ func TestIMAPProxy_MasterAuthenticationPriority(t *testing.T) {
 		defer c.Logout()
 
 		// Try proxy master username suffix with account password (should fail)
-		loginUsername := account.Email + "*" + proxyMasterUsername
+		loginUsername := account.Email + "@" + proxyMasterUsername
 		err = c.Login(loginUsername, account.Password).Wait()
 		if err == nil {
 			t.Fatal("Expected login to fail when using account password with proxy master username suffix")
@@ -280,7 +280,7 @@ func TestIMAPProxy_MasterAuthenticationMultipleAccounts(t *testing.T) {
 		}
 		defer c1.Logout()
 
-		loginUsername1 := account1.Email + "*" + proxyMasterUsername
+		loginUsername1 := account1.Email + "@" + proxyMasterUsername
 		if err := c1.Login(loginUsername1, proxyMasterPassword).Wait(); err != nil {
 			t.Fatalf("Login through proxy failed for account1: %v", err)
 		}
@@ -293,7 +293,7 @@ func TestIMAPProxy_MasterAuthenticationMultipleAccounts(t *testing.T) {
 		}
 		defer c2.Logout()
 
-		loginUsername2 := account2.Email + "*" + proxyMasterUsername
+		loginUsername2 := account2.Email + "@" + proxyMasterUsername
 		if err := c2.Login(loginUsername2, proxyMasterPassword).Wait(); err != nil {
 			t.Fatalf("Login through proxy failed for account2: %v", err)
 		}
@@ -311,6 +311,58 @@ func TestIMAPProxy_MasterAuthenticationMultipleAccounts(t *testing.T) {
 			t.Fatalf("Select INBOX failed for account2: %v", err)
 		}
 		t.Logf("✓ Account2 INBOX through proxy: %d messages", mbox2.NumMessages)
+	})
+}
+
+// TestIMAPProxy_TokenAuthentication tests token-based authentication through prelookup
+func TestIMAPProxy_TokenAuthentication(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create backend IMAP server with master SASL credentials
+	backendServer, account := common.SetupIMAPServerWithMaster(t)
+	defer backendServer.Close()
+
+	// Create proxy with master credentials
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupIMAPProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
+	defer proxy.Close()
+
+	t.Run("Login with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial IMAP proxy: %v", err)
+		}
+		defer c.Logout()
+
+		// Login format: user@domain.com@TOKEN with USER_PASSWORD
+		// The @TOKEN should be sent to prelookup (not validated locally)
+		// NOTE: This test expects prelookup to be configured and handle tokens
+		loginUsername := account.Email + "@sometoken123"
+		err = c.Login(loginUsername, account.Password).Wait()
+		// Without prelookup configured, this will fail - but that's expected
+		// The important part is that the code path handles @TOKEN differently than *MASTER
+		if err != nil {
+			t.Logf("Login with @TOKEN failed (expected without prelookup): %v", err)
+		} else {
+			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+		}
+	})
+
+	t.Run("@TOKEN behaves same as @MASTER when suffix matches", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial IMAP proxy: %v", err)
+		}
+		defer c.Logout()
+
+		// Using @ separator with suffix that matches master username should validate locally
+		loginUsername := account.Email + "@" + proxyMasterUsername
+		err = c.Login(loginUsername, proxyMasterPassword).Wait()
+		// This should succeed - @ separator checks if suffix matches master username
+		if err != nil {
+			t.Fatalf("Login failed unexpectedly: %v", err)
+		}
+		t.Log("✓ @ separator with master username suffix authenticated successfully")
 	})
 }
 

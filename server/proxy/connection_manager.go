@@ -266,10 +266,16 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 
 // AuthenticateAndRoute delegates to the routing lookup if available
 func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
+	return cm.AuthenticateAndRouteWithOptions(ctx, email, password, false)
+}
+
+// AuthenticateAndRouteWithOptions performs authentication and routing with additional options
+// routeOnly: if true, skip password validation and only return routing info (for master username auth)
+func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
 		return nil, AuthUserNotFound, fmt.Errorf("no routing lookup configured")
 	}
-	return cm.routingLookup.LookupUserRoute(ctx, email, password)
+	return cm.routingLookup.LookupUserRouteWithOptions(ctx, email, password, routeOnly)
 }
 
 // GetRoutingLookup returns the routing lookup client (may be nil)

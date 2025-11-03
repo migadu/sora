@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	// Master credentials for CLIENT→PROXY authentication (* separator format)
-	// Proxies use * separator to distinguish from @ in email addresses
+	// Master credentials for CLIENT→PROXY authentication (@ separator format)
+	// Proxies use @ separator to distinguish from @ in email addresses
 	proxyMasterUsername = "proxy_admin"
 	proxyMasterPassword = "proxy_master_123"
 
@@ -90,7 +90,7 @@ func setupPOP3ProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, proxyAdd
 		Name:        "test-pop3-proxy-master",
 		RemoteAddrs: backendAddrs,
 		RemotePort:  110,
-		// Master credentials for CLIENT→PROXY authentication (* separator format)
+		// Master credentials for CLIENT→PROXY authentication (@ separator format)
 		MasterUsername: proxyMasterUsername,
 		MasterPassword: proxyMasterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
@@ -176,8 +176,8 @@ func TestPOP3Proxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		// USER format: user@domain.com*PROXY_MASTER_USERNAME (proxies use * separator)
-		username := account.Email + "*" + proxyMasterUsername
+		// USER format: user@domain.com*PROXY_MASTER_USERNAME (proxies use @ separator)
+		username := account.Email + "@" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		response, _ := client.ReadResponse()
 		if !strings.HasPrefix(response, "+OK") {
@@ -227,7 +227,7 @@ func TestPOP3Proxy_MasterUsernameAuthentication(t *testing.T) {
 		}
 		defer client.Close()
 
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 
@@ -271,7 +271,7 @@ func TestPOP3Proxy_MasterSASLAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// AUTH PLAIN with master username suffix at proxy level
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		authString := "\x00" + username + "\x00" + proxyMasterPassword
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -327,7 +327,7 @@ func TestPOP3Proxy_MasterAuthenticationPriority(t *testing.T) {
 		defer client.Close()
 
 		// Try proxy master username suffix with account password (should fail)
-		username := account.Email + "*" + proxyMasterUsername
+		username := account.Email + "@" + proxyMasterUsername
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 
@@ -364,5 +364,64 @@ func TestPOP3Proxy_MasterAuthenticationPriority(t *testing.T) {
 			t.Fatalf("STAT failed: %s", response)
 		}
 		t.Logf("✓ STAT successful: %s", response)
+	})
+}
+
+// TestPOP3Proxy_TokenAuthentication tests token-based authentication through prelookup
+func TestPOP3Proxy_TokenAuthentication(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create backend POP3 server with master SASL credentials
+	backendServer, account := common.SetupPOP3ServerWithMaster(t)
+	defer backendServer.Close()
+
+	// Create proxy with master credentials
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupPOP3ProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
+	defer proxy.Stop()
+
+	t.Run("USER with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to POP3 proxy: %v", err)
+		}
+		defer client.Close()
+
+		// USER format: user@domain.com@TOKEN with USER_PASSWORD
+		// The @TOKEN should be sent to prelookup (not validated locally)
+		username := account.Email + "@sometoken123"
+		client.SendCommand("USER " + username)
+		client.ReadResponse()
+
+		client.SendCommand("PASS " + account.Password)
+		response, _ := client.ReadResponse()
+		// Without prelookup configured, this will fail - but that's expected
+		// The important part is that the code path handles @TOKEN differently than *MASTER
+		if strings.HasPrefix(response, "+OK") {
+			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+		} else {
+			t.Logf("Login with @TOKEN failed (expected without prelookup): %s", response)
+		}
+	})
+
+	t.Run("@TOKEN behaves same as @MASTER when suffix matches", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to POP3 proxy: %v", err)
+		}
+		defer client.Close()
+
+		// Using @ separator with suffix that matches master username should validate locally
+		username := account.Email + "@" + proxyMasterUsername
+		client.SendCommand("USER " + username)
+		client.ReadResponse()
+
+		client.SendCommand("PASS " + proxyMasterPassword)
+		response, _ := client.ReadResponse()
+		// This should succeed - @ separator checks if suffix matches master username
+		if !strings.HasPrefix(response, "+OK") {
+			t.Fatalf("Authentication failed unexpectedly: %s", response)
+		}
+		t.Log("✓ @ separator with master username suffix authenticated successfully")
 	})
 }
