@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -26,6 +27,62 @@ func GetAddrString(addr net.Addr) string {
 	default:
 		// For unknown types, must use String() which may trigger DNS lookup
 		return addr.String()
+	}
+}
+
+// CopyWithDeadline copies data from src to dst with write deadlines to prevent blocking on slow clients.
+// This is a generic utility function used by all proxy protocols to prevent indefinite blocking
+// when clients are not reading data fast enough (which causes TCP send buffers to fill).
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - dst: Destination connection (must support SetWriteDeadline)
+//   - src: Source connection to read from
+//   - direction: Description for logging (e.g., "client-to-backend")
+//
+// Returns total bytes copied and any error encountered.
+func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction string) (int64, error) {
+	const (
+		writeDeadline = 30 * time.Second
+		bufferSize    = 32 * 1024
+	)
+
+	buf := make([]byte, bufferSize)
+	var totalBytes int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return totalBytes, ctx.Err()
+		default:
+		}
+
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			if err := dst.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+				return totalBytes, fmt.Errorf("failed to set write deadline: %w", err)
+			}
+
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				totalBytes += int64(nw)
+			}
+			if ew != nil {
+				if netErr, ok := ew.(net.Error); ok && netErr.Timeout() {
+					return totalBytes, fmt.Errorf("write timeout in %s: %w", direction, ew)
+				}
+				return totalBytes, ew
+			}
+			if nr != nw {
+				return totalBytes, io.ErrShortWrite
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				return totalBytes, err
+			}
+			return totalBytes, nil
+		}
 	}
 }
 

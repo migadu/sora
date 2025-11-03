@@ -720,7 +720,7 @@ func (s *Session) startProxy(initialCommand string) {
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
-		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		bytesOut, err := server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("Error copying from backend to client", "error", err)

@@ -309,22 +309,17 @@ func (s *POP3ProxyServer) Start() error {
 		},
 	}
 
+	// Create base TCP listener
+	tcpListener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		s.cancel()
+		return fmt.Errorf("failed to create TCP listener: %w", err)
+	}
+
 	if s.tlsConfig != nil {
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", s.addr)
-		if err != nil {
-			s.cancel()
-			return fmt.Errorf("failed to create TCP listener: %w", err)
-		}
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 	} else {
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", s.addr)
-		if err != nil {
-			s.cancel()
-			return fmt.Errorf("failed to create listener: %w", err)
-		}
 		// Use SoraListener for non-TLS with timeout protection
 		listener = server.NewSoraListener(tcpListener, connConfig)
 	}

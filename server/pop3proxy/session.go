@@ -716,14 +716,14 @@ func (s *POP3ProxySession) startProxying() {
 		s.filteredCopyClientToBackend()
 	}()
 
-	// Copy from backend to client
+	// Copy from backend to client with write deadline protection
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
-		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		bytesOut, err := server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.WarnLog("error copying backend to client: %v", err)
@@ -848,6 +848,9 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		metrics.BytesThroughput.WithLabelValues("pop3_proxy", "in").Add(float64(totalBytesIn))
 	}()
 
+	// Write deadline for backend writes (30 seconds should be enough for any command)
+	const writeDeadline = 30 * time.Second
+
 	for {
 		// Set a read deadline to prevent idle authenticated connections.
 		if s.server.sessionTimeout > 0 {
@@ -882,10 +885,20 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 			continue
 		}
 
+		// Set write deadline to prevent blocking on slow backend
+		if err := s.backendConn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+			s.WarnLog("Failed to set write deadline: %v", err)
+			return
+		}
+
 		// Forward the command to backend
 		n, err := writer.WriteString(line)
 		totalBytesIn += int64(n)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.WarnLog("Backend write timeout (slow backend), closing connection")
+				return
+			}
 			if !isClosingError(err) {
 				s.WarnLog("error writing to backend: %v", err)
 			}
@@ -893,6 +906,10 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		}
 
 		if err := writer.Flush(); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.WarnLog("Backend flush timeout (slow backend), closing connection")
+				return
+			}
 			if !isClosingError(err) {
 				s.WarnLog("error flushing to backend: %v", err)
 			}

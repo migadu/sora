@@ -803,7 +803,7 @@ func (s *Session) startProxy() {
 		// If this copy returns, it means the client has closed the connection or there was an error.
 		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
-		bytesIn, err := io.Copy(s.backendConn, s.clientConn)
+		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from client to backend: %v", err)
@@ -817,7 +817,7 @@ func (s *Session) startProxy() {
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
-		bytesOut, err := io.Copy(s.clientConn, s.backendConn)
+		bytesOut, err := server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from backend to client: %v", err)
