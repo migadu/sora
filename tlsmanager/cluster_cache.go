@@ -3,6 +3,7 @@ package tlsmanager
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
@@ -26,19 +27,26 @@ func NewClusterAwareCache(cache autocert.Cache, clusterMgr *cluster.Manager) *Cl
 
 // Get retrieves a certificate from the cache (all nodes can read)
 func (c *ClusterAwareCache) Get(ctx context.Context, name string) ([]byte, error) {
-	logger.Debug("ClusterCache: Get certificate", "name", name, "node", c.clusterManager.GetNodeID(), "leader", c.clusterManager.GetLeaderID())
+	startTime := time.Now()
+	nodeID := c.clusterManager.GetNodeID()
+	leaderID := c.clusterManager.GetLeaderID()
 
+	logger.Debug("ClusterCache: Get certificate", "name", name, "node", nodeID, "leader", leaderID)
+
+	underlyingStart := time.Now()
 	data, err := c.underlying.Get(ctx, name)
+	underlyingDuration := time.Since(underlyingStart)
+
 	if err != nil {
 		if err == autocert.ErrCacheMiss {
-			logger.Debug("ClusterCache: Certificate not found", "name", name)
+			logger.Debug("ClusterCache: Certificate not found", "name", name, "duration_ms", time.Since(startTime).Milliseconds())
 		} else {
-			logger.Debug("ClusterCache: Error getting certificate", "name", name, "error", err)
+			logger.Warn("ClusterCache: Error getting certificate", "name", name, "error", err, "underlying_ms", underlyingDuration.Milliseconds(), "total_ms", time.Since(startTime).Milliseconds())
 		}
 		return nil, err
 	}
 
-	logger.Debug("ClusterCache: Certificate retrieved", "name", name)
+	logger.Debug("ClusterCache: Certificate retrieved", "name", name, "underlying_ms", underlyingDuration.Milliseconds(), "total_ms", time.Since(startTime).Milliseconds())
 	return data, nil
 }
 

@@ -407,6 +407,10 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
+		// Log TCP connection accepted (before TLS handshake)
+		remoteAddr := conn.RemoteAddr().String()
+		logger.Info("TCP connection accepted", "proto", "imap_proxy", "remote", remoteAddr, "server", s.name)
+
 		// Check connection limits before processing
 		var releaseConn func()
 		if s.limiter != nil {
