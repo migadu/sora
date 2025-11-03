@@ -73,7 +73,7 @@ func NewSieveExecutor(scriptContent string) (Executor, error) {
 }
 
 // NewSieveExecutorWithExtensions creates a new SieveExecutor with the given script content and enabled extensions.
-// If enabledExtensions is nil, all extensions are allowed (backward compatible).
+// If enabledExtensions is nil, all extensions are allowed
 func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []string) (Executor, error) {
 	// Load the script
 	scriptReader := strings.NewReader(scriptContent)

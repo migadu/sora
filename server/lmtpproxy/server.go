@@ -348,7 +348,7 @@ func (s *Server) acceptConnections() error {
 		// Check total connection limits after trusted network verification
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
 			if err != nil {
 				logger.Debug("LMTP Proxy: Connection rejected", "name", s.name, "ip", ip, "error", err)
 				conn.Close()

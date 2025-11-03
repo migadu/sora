@@ -72,24 +72,10 @@ func (a Address) MasterAddress() string {
 	return baseAddr
 }
 
-// MasterToken returns the suffix if present (from syntax like user@domain.com@SUFFIX)
-// Note: This is kept for backward compatibility. The suffix can be either:
-// - A master username (for master password authentication)
-// - A prelookup token (for HTTP prelookup authentication)
-func (a Address) MasterToken() string {
-	return a.suffix
-}
-
 // Suffix returns the suffix after the second @ if present (from syntax like user@domain.com@SUFFIX)
 // The suffix can be either a master username or a prelookup token depending on context
 func (a Address) Suffix() string {
 	return a.suffix
-}
-
-// HasMasterToken returns true if the address contains a suffix
-// Note: Kept for backward compatibility, use HasSuffix() for new code
-func (a Address) HasMasterToken() bool {
-	return a.suffix != ""
 }
 
 // HasSuffix returns true if the address contains a suffix after the second @

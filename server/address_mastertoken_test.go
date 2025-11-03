@@ -151,8 +151,8 @@ func TestParseAddressWithMasterToken(t *testing.T) {
 			if addr.Detail() != tt.expectDetail {
 				t.Errorf("Detail: expected '%s', got '%s'", tt.expectDetail, addr.Detail())
 			}
-			if addr.MasterToken() != tt.expectToken {
-				t.Errorf("MasterToken: expected '%s', got '%s'", tt.expectToken, addr.MasterToken())
+			if addr.Suffix() != tt.expectToken {
+				t.Errorf("MasterToken: expected '%s', got '%s'", tt.expectToken, addr.Suffix())
 			}
 			if addr.BaseAddress() != tt.expectBase {
 				t.Errorf("BaseAddress: expected '%s', got '%s'", tt.expectBase, addr.BaseAddress())

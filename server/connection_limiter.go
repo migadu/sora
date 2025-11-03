@@ -288,12 +288,6 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 	return nil
 }
 
-// Accept registers a new connection and returns a function to release it
-func (cl *ConnectionLimiter) Accept(remoteAddr net.Addr) (func(), error) {
-	// Use the enhanced method with empty real client IP for backward compatibility
-	return cl.AcceptWithRealIP(remoteAddr, "")
-}
-
 // GetStats returns current connection statistics
 func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 	stats := ConnectionStats{

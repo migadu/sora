@@ -329,3 +329,32 @@ var (
 		[]string{"protocol"},
 	)
 )
+
+// Timeout scheduler metrics
+var (
+	TimeoutSchedulerConnectionsTotal = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_timeout_scheduler_connections_total",
+			Help: "Total number of connections registered with timeout scheduler",
+		},
+		[]string{"shard"},
+	)
+
+	TimeoutSchedulerCheckDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_timeout_scheduler_check_duration_seconds",
+			Help:    "Duration of timeout check cycles per shard",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0},
+		},
+		[]string{"shard"},
+	)
+
+	// Connection timeout events (different from command timeouts)
+	ConnectionTimeoutsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_connection_timeouts_total",
+			Help: "Total number of connection timeouts by protocol and reason",
+		},
+		[]string{"protocol", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
+	)
+)

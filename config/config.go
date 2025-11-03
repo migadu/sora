@@ -1011,13 +1011,6 @@ type LMTPProxyServerConfig struct {
 	PreLookup              *PreLookupConfig `toml:"prelookup"` // Database-driven user routing
 }
 
-// ConnectionTrackingConfig is deprecated - connection tracking is now configured per-server
-// via ServerConfig.MaxConnectionsPerUser. This type is kept for backward compatibility.
-type ConnectionTrackingConfig struct {
-	Enabled               bool `toml:"enabled"`                  // Ignored
-	MaxConnectionsPerUser int  `toml:"max_connections_per_user"` // Ignored - use per-server config instead
-}
-
 // MetricsConfig holds metrics server configuration
 type MetricsConfig struct {
 	Enabled              bool   `toml:"enabled"`
@@ -1088,6 +1081,7 @@ type ServerTimeoutsConfig struct {
 	CommandTimeout         string `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 30m)
 	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
+	SchedulerShardCount    int    `toml:"scheduler_shard_count,omitempty"`    // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
 }
 
 // ServerConfig represents a single server instance
@@ -1180,23 +1174,27 @@ type ServerConfig struct {
 	DisabledCaps  []string                 `toml:"disabled_caps,omitempty"` // Globally disabled capabilities (IMAP specific)
 }
 
+// TimeoutSchedulerConfig holds global timeout scheduler configuration
+type TimeoutSchedulerConfig struct {
+	ShardCount int `toml:"shard_count"` // Number of timeout scheduler shards (0=runtime.NumCPU(), -1=runtime.NumCPU()/2, >0=specific value)
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	TrustedNetworks []string `toml:"trusted_networks"` // Global trusted networks for proxy parameter forwarding
 
-	IMAP               IMAPServerConfig             `toml:"imap,omitempty"`
-	LMTP               LMTPServerConfig             `toml:"lmtp,omitempty"`
-	POP3               POP3ServerConfig             `toml:"pop3,omitempty"`
-	ManageSieve        ManageSieveServerConfig      `toml:"managesieve,omitempty"`
-	IMAPProxy          IMAPProxyServerConfig        `toml:"imap_proxy,omitempty"`
-	POP3Proxy          POP3ProxyServerConfig        `toml:"pop3_proxy,omitempty"`
-	ManageSieveProxy   ManageSieveProxyServerConfig `toml:"managesieve_proxy,omitempty"`
-	LMTPProxy          LMTPProxyServerConfig        `toml:"lmtp_proxy,omitempty"`
-	ConnectionTracking ConnectionTrackingConfig     `toml:"connection_tracking"`
-	Metrics            MetricsConfig                `toml:"metrics"`
-	HTTPAPI            HTTPAPIConfig                `toml:"http_api"`
-	UserAPI            UserAPIServerConfig          `toml:"user_api,omitempty"`
-	UserAPIProxy       UserAPIProxyServerConfig     `toml:"user_api_proxy,omitempty"`
+	IMAP             IMAPServerConfig             `toml:"imap,omitempty"`
+	LMTP             LMTPServerConfig             `toml:"lmtp,omitempty"`
+	POP3             POP3ServerConfig             `toml:"pop3,omitempty"`
+	ManageSieve      ManageSieveServerConfig      `toml:"managesieve,omitempty"`
+	IMAPProxy        IMAPProxyServerConfig        `toml:"imap_proxy,omitempty"`
+	POP3Proxy        POP3ProxyServerConfig        `toml:"pop3_proxy,omitempty"`
+	ManageSieveProxy ManageSieveProxyServerConfig `toml:"managesieve_proxy,omitempty"`
+	LMTPProxy        LMTPProxyServerConfig        `toml:"lmtp_proxy,omitempty"`
+	Metrics          MetricsConfig                `toml:"metrics"`
+	HTTPAPI          HTTPAPIConfig                `toml:"http_api"`
+	UserAPI          UserAPIServerConfig          `toml:"user_api,omitempty"`
+	UserAPIProxy     UserAPIProxyServerConfig     `toml:"user_api_proxy,omitempty"`
 }
 
 // LoggingConfig holds logging configuration
@@ -1243,20 +1241,21 @@ type AdminCLIConfig struct {
 
 // Config holds all configuration for the application.
 type Config struct {
-	Logging         LoggingConfig         `toml:"logging"`
-	Database        DatabaseConfig        `toml:"database"`
-	S3              S3Config              `toml:"s3"`
-	TLS             TLSConfig             `toml:"tls"`
-	Cluster         ClusterConfig         `toml:"cluster"`
-	LocalCache      LocalCacheConfig      `toml:"local_cache"`
-	Cleanup         CleanupConfig         `toml:"cleanup"`
-	Servers         ServersConfig         `toml:"servers"`
-	Uploader        UploaderConfig        `toml:"uploader"`
-	Metadata        MetadataConfig        `toml:"metadata"`
-	SharedMailboxes SharedMailboxesConfig `toml:"shared_mailboxes"`
-	AuthCache       AuthCacheConfig       `toml:"auth_cache"`
-	Relay           RelayConfig           `toml:"relay"`
-	AdminCLI        AdminCLIConfig        `toml:"admin_cli"` // Admin CLI tool configuration
+	Logging          LoggingConfig          `toml:"logging"`
+	Database         DatabaseConfig         `toml:"database"`
+	S3               S3Config               `toml:"s3"`
+	TLS              TLSConfig              `toml:"tls"`
+	Cluster          ClusterConfig          `toml:"cluster"`
+	LocalCache       LocalCacheConfig       `toml:"local_cache"`
+	Cleanup          CleanupConfig          `toml:"cleanup"`
+	Servers          ServersConfig          `toml:"servers"`
+	Uploader         UploaderConfig         `toml:"uploader"`
+	Metadata         MetadataConfig         `toml:"metadata"`
+	SharedMailboxes  SharedMailboxesConfig  `toml:"shared_mailboxes"`
+	AuthCache        AuthCacheConfig        `toml:"auth_cache"`
+	Relay            RelayConfig            `toml:"relay"`
+	AdminCLI         AdminCLIConfig         `toml:"admin_cli"`         // Admin CLI tool configuration
+	TimeoutScheduler TimeoutSchedulerConfig `toml:"timeout_scheduler"` // Global timeout scheduler configuration
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
@@ -1450,10 +1449,6 @@ func NewDefaultConfig() Config {
 				RemoteUseProxyProtocol: true,
 				RemoteUseXCLIENT:       false,
 				EnableAffinity:         true,
-			},
-			ConnectionTracking: ConnectionTrackingConfig{
-				Enabled:               true,
-				MaxConnectionsPerUser: 0, // Unlimited by default
 			},
 			Metrics: MetricsConfig{
 				Enabled:              true,
@@ -1950,14 +1945,6 @@ func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 		return 30 * time.Second
 	}
 	return interval
-}
-
-// GetMaxConnectionsPerUser returns the cluster-wide connection limit per user
-func (c *ConnectionTrackingConfig) GetMaxConnectionsPerUser() int {
-	if c.MaxConnectionsPerUser < 0 {
-		return 0 // Unlimited
-	}
-	return c.MaxConnectionsPerUser
 }
 
 // IsEnabled checks if a server should be started based on its configuration

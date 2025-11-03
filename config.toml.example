@@ -694,6 +694,26 @@ default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creator
 # - The NAMESPACE command will advertise the shared namespace when enabled
 
 
+# TIMEOUT SCHEDULER CONFIGURATION
+# =============================================================================
+# Global timeout scheduler configuration for connection timeout management.
+# The scheduler uses sharding to efficiently check timeouts across many connections.
+
+[timeout_scheduler]
+# Number of shards for parallel timeout checking. More shards = better scalability for high connection counts.
+# - 0: Default - uses runtime.NumCPU() logical cores (includes hyperthreading)
+# - -1: Physical cores - uses runtime.NumCPU()/2 (approximates physical cores)
+# - >0: Custom - uses specified number of shards
+#
+# RECOMMENDATIONS:
+# - Default (0): Best for most deployments, balances CPU usage and responsiveness
+# - Physical cores (-1): Use if hyperthreading causes contention issues
+# - Custom (>0): Use for fine-tuning in specific scenarios (e.g., 4, 8, 16)
+#
+# Each shard runs an independent goroutine checking connections every 100ms.
+# Memory usage: ~200KB per shard. CPU usage: minimal during low activity.
+shard_count = 0  # Default: 0 (runtime.NumCPU())
+
 # GLOBAL SERVERS CONFIGURATION
 # =============================================================================
 # Global settings that apply to all protocol servers.

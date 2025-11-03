@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+
 	"io"
 	"net"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
+
+// timeout shard implementation lives in timeout_scheduler.go
 
 // GetAddrString safely extracts address string without triggering reverse DNS lookup.
 // This should be used instead of addr.String() to avoid slow reverse DNS lookups.
@@ -96,6 +99,9 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 // with a single, unified implementation.
 type SoraConn struct {
 	net.Conn // Underlying connection (TLS or plain TCP)
+	// Cached remote address string to avoid touching the underlying connection
+	// during shutdown/unregister which could race with Close()
+	remoteAddr string
 
 	// Buffered reader (created if TLS detection is used)
 	reader *bufio.Reader
@@ -171,6 +177,7 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 
 	sc := &SoraConn{
 		Conn:                conn,
+		remoteAddr:          "",
 		idleTimeout:         config.IdleTimeout,
 		absoluteTimeout:     config.AbsoluteTimeout,
 		minBytesPerMinute:   config.MinBytesPerMinute,
@@ -187,148 +194,132 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 		cancelIdle:          make(chan struct{}),
 	}
 
-	// Start background timeout checker if enabled
+	// Cache remote address early to avoid touching the underlying net.Conn later
+	if conn != nil && conn.RemoteAddr() != nil {
+		sc.remoteAddr = GetAddrString(conn.RemoteAddr())
+	}
+
+	// Register with global timeout scheduler if enabled
 	if config.EnableTimeoutChecker && (sc.idleTimeout > 0 || sc.absoluteTimeout > 0 || sc.minBytesPerMinute > 0) {
-		go sc.timeoutChecker()
+		registerConn(sc)
 	}
 
 	return sc
 }
 
-// timeoutChecker runs in background and enforces timeout protections
-func (c *SoraConn) timeoutChecker() {
-	// Check frequency: every 1 minute for throughput, or more frequently for idle/absolute timeout
-	checkInterval := 1 * time.Minute
-	if c.idleTimeout > 0 && c.idleTimeout/4 < checkInterval {
-		checkInterval = c.idleTimeout / 4
+// checkTimeouts is called periodically by the global scheduler to check timeout conditions
+// This method performs a single check without looping or sleeping
+func (c *SoraConn) checkTimeouts(now time.Time) {
+	c.mu.RLock()
+	closed := c.closed
+	if closed {
+		c.mu.RUnlock()
+		return
 	}
-	if c.absoluteTimeout > 0 && c.absoluteTimeout/4 < checkInterval {
-		checkInterval = c.absoluteTimeout / 4
-	}
 
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
+	idleTime := now.Sub(c.lastActivity)
+	sessionDuration := now.Sub(c.sessionStart)
+	throughputDuration := now.Sub(c.lastThroughputCheck)
+	bytesTransferred := c.bytesTransferred
+	username := c.username
+	suspended := c.throughputCheckingSuspended
+	c.mu.RUnlock()
 
-	for {
-		select {
-		case <-ticker.C:
-			c.mu.RLock()
-			idleTime := time.Since(c.lastActivity)
-			sessionDuration := time.Since(c.sessionStart)
-			throughputDuration := time.Since(c.lastThroughputCheck)
-			bytesTransferred := c.bytesTransferred
-			closed := c.closed
-			username := c.username
-			c.mu.RUnlock()
+	// Check absolute session timeout (highest priority)
+	if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
+		remoteAddr := c.remoteAddr
+		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
 
-			if closed {
-				return
-			}
-
-			// Check absolute session timeout (highest priority)
-			if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
-				remoteAddr := GetAddrString(c.Conn.RemoteAddr())
-				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
-				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
-
-				// Call timeout handler before closing (if provided)
-				if c.onTimeout != nil {
-					c.onTimeout(c.Conn, "session_max")
-				}
-
-				c.Close()
-				return
-			}
-
-			// Check minimum throughput (protects against slowloris attacks)
-			// IMPROVED: Uses 3-minute rolling average and requires 2 consecutive slow periods
-			// Skip if throughput checking is suspended (e.g., during IMAP IDLE)
-			c.mu.RLock()
-			suspended := c.throughputCheckingSuspended
-			c.mu.RUnlock()
-
-			if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute && !suspended {
-				sessionDurationSinceStart := time.Since(c.sessionStart)
-
-				// Only enforce throughput after the first 2 minutes of the session
-				// to allow time for TLS handshake, greeting, and initial authentication
-				if sessionDurationSinceStart >= 2*time.Minute {
-					minutesElapsed := throughputDuration.Minutes()
-					bytesPerMinute := int64(float64(bytesTransferred) / minutesElapsed)
-
-					// Add current measurement to rolling history
-					c.mu.Lock()
-					c.throughputHistory[c.throughputHistoryIndex] = bytesPerMinute
-					c.throughputHistoryIndex = (c.throughputHistoryIndex + 1) % 3
-
-					// Calculate average over last 3 measurements (or fewer if we don't have 3 yet)
-					var sum int64
-					var count int
-					for i := 0; i < 3; i++ {
-						if c.throughputHistory[i] > 0 {
-							sum += c.throughputHistory[i]
-							count++
-						}
-					}
-					avgBytesPerMin := int64(0)
-					if count > 0 {
-						avgBytesPerMin = sum / int64(count)
-					}
-
-					// Check if current measurement is slow
-					if bytesPerMinute < c.minBytesPerMinute {
-						c.consecutiveSlowMinutes++
-					} else {
-						c.consecutiveSlowMinutes = 0
-					}
-
-					consecutiveSlow := c.consecutiveSlowMinutes
-					c.mu.Unlock()
-
-					// Disconnect only if:
-					// 1. Average over 3 minutes is below threshold, AND
-					// 2. We've had 2 consecutive slow minutes
-					// This reduces false positives for legitimate users
-					if avgBytesPerMin < c.minBytesPerMinute && consecutiveSlow >= 2 {
-						remoteAddr := GetAddrString(c.Conn.RemoteAddr())
-						logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min_avg", int(avgBytesPerMin), "bytes_per_min_current", int(bytesPerMinute), "required", c.minBytesPerMinute, "consecutive_slow", consecutiveSlow)
-						metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
-
-						// Call timeout handler before closing (if provided)
-						if c.onTimeout != nil {
-							c.onTimeout(c.Conn, "slow_throughput")
-						}
-
-						c.Close()
-						return
-					}
-				}
-
-				// Reset throughput counters for next measurement period
-				c.mu.Lock()
-				c.lastThroughputCheck = time.Now()
-				c.bytesTransferred = 0
-				c.mu.Unlock()
-			}
-
-			// Check idle timeout
-			if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
-				remoteAddr := GetAddrString(c.Conn.RemoteAddr())
-				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
-				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
-
-				// Call timeout handler before closing (if provided)
-				if c.onTimeout != nil {
-					c.onTimeout(c.Conn, "idle")
-				}
-
-				c.Close()
-				return
-			}
-
-		case <-c.cancelIdle:
-			return
+		// Call timeout handler before closing (if provided)
+		if c.onTimeout != nil {
+			c.onTimeout(c.Conn, "session_max")
 		}
+
+		c.Close()
+		return
+	}
+
+	// Check minimum throughput (protects against slowloris attacks)
+	// IMPROVED: Uses 3-minute rolling average and requires 2 consecutive slow periods
+	// Skip if throughput checking is suspended (e.g., during IMAP IDLE)
+	if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute && !suspended {
+		sessionDurationSinceStart := now.Sub(c.sessionStart)
+
+		// Only enforce throughput after the first 2 minutes of the session
+		// to allow time for TLS handshake, greeting, and initial authentication
+		if sessionDurationSinceStart >= 2*time.Minute {
+			minutesElapsed := throughputDuration.Minutes()
+			bytesPerMinute := int64(float64(bytesTransferred) / minutesElapsed)
+
+			// Add current measurement to rolling history
+			c.mu.Lock()
+			c.throughputHistory[c.throughputHistoryIndex] = bytesPerMinute
+			c.throughputHistoryIndex = (c.throughputHistoryIndex + 1) % 3
+
+			// Calculate average over last 3 measurements (or fewer if we don't have 3 yet)
+			var sum int64
+			var count int
+			for i := 0; i < 3; i++ {
+				if c.throughputHistory[i] > 0 {
+					sum += c.throughputHistory[i]
+					count++
+				}
+			}
+			avgBytesPerMin := int64(0)
+			if count > 0 {
+				avgBytesPerMin = sum / int64(count)
+			}
+
+			// Check if current measurement is slow
+			if bytesPerMinute < c.minBytesPerMinute {
+				c.consecutiveSlowMinutes++
+			} else {
+				c.consecutiveSlowMinutes = 0
+			}
+
+			consecutiveSlow := c.consecutiveSlowMinutes
+			c.mu.Unlock()
+
+			// Disconnect only if:
+			// 1. Average over 3 minutes is below threshold, AND
+			// 2. We've had 2 consecutive slow minutes
+			// This reduces false positives for legitimate users
+			if avgBytesPerMin < c.minBytesPerMinute && consecutiveSlow >= 2 {
+				remoteAddr := c.remoteAddr
+				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min_avg", int(avgBytesPerMin), "bytes_per_min_current", int(bytesPerMinute), "required", c.minBytesPerMinute, "consecutive_slow", consecutiveSlow)
+				metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
+
+				// Call timeout handler before closing (if provided)
+				if c.onTimeout != nil {
+					c.onTimeout(c.Conn, "slow_throughput")
+				}
+
+				c.Close()
+				return
+			}
+		}
+
+		// Reset throughput counters for next measurement period
+		c.mu.Lock()
+		c.lastThroughputCheck = now
+		c.bytesTransferred = 0
+		c.mu.Unlock()
+	}
+
+	// Check idle timeout
+	if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
+		remoteAddr := c.remoteAddr
+		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
+
+		// Call timeout handler before closing (if provided)
+		if c.onTimeout != nil {
+			c.onTimeout(c.Conn, "idle")
+		}
+
+		c.Close()
+		return
 	}
 }
 
@@ -374,6 +365,8 @@ func (c *SoraConn) Close() error {
 	if !c.closed {
 		c.closed = true
 		close(c.cancelIdle)
+		// Unregister from global timeout scheduler
+		unregisterConn(c)
 	}
 	c.closeMutex.Unlock()
 
@@ -522,7 +515,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 	// TLS 1.3: 0x16 0x03 0x03 (legacy version field)
 	if peekBuf[0] == 0x16 && peekBuf[1] == 0x03 {
 		// This is very likely a TLS Client Hello
-		remoteAddr := GetAddrString(c.Conn.RemoteAddr())
+		remoteAddr := c.remoteAddr
 		logger.Warn("TLS handshake detected on plain-text port - rejecting", "proto", c.protocol, "remote", remoteAddr)
 
 		// Write a helpful error message
@@ -530,7 +523,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 		c.Conn.Write([]byte("ERROR: TLS connection attempted on plain-text port. Use STARTTLS or connect to the TLS port.\r\n"))
 
 		// Record metric
-		metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "tls_on_plain_port").Inc()
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "tls_on_plain_port").Inc()
 
 		// Close the connection
 		c.Close()
@@ -637,7 +630,8 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	}
 	c.handshakeComplete = true
 
-	remoteAddr := GetAddrString(c.tcpConn.RemoteAddr())
+	// Prefer cached remoteAddr
+	remoteAddr := c.remoteAddr
 
 	// Clone TLS config and add GetConfigForClient callback to capture JA4
 	tlsConfig := c.tlsConfig.Clone()
@@ -693,9 +687,9 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	// Replace the underlying connection in SoraConn with the TLS connection
 	c.SoraConn.Conn = c.tlsConn
 
-	// NOW start the timeout checker, after TLS handshake is complete
+	// NOW register with timeout scheduler, after TLS handshake is complete
 	if c.connConfig.EnableTimeoutChecker && (c.SoraConn.idleTimeout > 0 || c.SoraConn.absoluteTimeout > 0 || c.SoraConn.minBytesPerMinute > 0) {
-		go c.SoraConn.timeoutChecker()
+		registerConn(c.SoraConn)
 	}
 
 	return nil

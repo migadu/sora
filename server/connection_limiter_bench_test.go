@@ -14,7 +14,7 @@ func BenchmarkConnectionLimiterAccept(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			release, err := limiter.Accept(addr)
+			release, err := limiter.AcceptWithRealIP(addr, "")
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -42,7 +42,7 @@ func BenchmarkConnectionLimiterAcceptHighContention(b *testing.B) {
 		for pb.Next() {
 			addr := addrs[i%len(addrs)]
 			i++
-			release, err := limiter.Accept(addr)
+			release, err := limiter.AcceptWithRealIP(addr, "")
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -59,7 +59,7 @@ func BenchmarkConnectionLimiterConcurrentOperations(b *testing.B) {
 	// Pre-populate with some connections
 	var releases []func()
 	for i := 0; i < 10; i++ {
-		release, _ := limiter.Accept(addr)
+		release, _ := limiter.AcceptWithRealIP(addr, "")
 		releases = append(releases, release)
 	}
 	defer func() {
@@ -76,7 +76,7 @@ func BenchmarkConnectionLimiterConcurrentOperations(b *testing.B) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < b.N; i++ {
-			release, err := limiter.Accept(addr)
+			release, err := limiter.AcceptWithRealIP(addr, "")
 			if err != nil {
 				continue
 			}

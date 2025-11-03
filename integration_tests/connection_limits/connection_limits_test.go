@@ -515,21 +515,21 @@ func TestConnectionLimiterUnitPerIP(t *testing.T) {
 	externalAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.1"), Port: 12345} // RFC5737 test IP
 
 	// First connection should be accepted
-	release1, err := limiter.Accept(externalAddr)
+	release1, err := limiter.AcceptWithRealIP(externalAddr, "")
 	if err != nil {
 		t.Fatalf("First connection should be accepted: %v", err)
 	}
 	defer release1()
 
 	// Second connection should be accepted
-	release2, err := limiter.Accept(externalAddr)
+	release2, err := limiter.AcceptWithRealIP(externalAddr, "")
 	if err != nil {
 		t.Fatalf("Second connection should be accepted: %v", err)
 	}
 	defer release2()
 
 	// Third connection from same IP should be rejected due to per-IP limit
-	release3, err := limiter.Accept(externalAddr)
+	release3, err := limiter.AcceptWithRealIP(externalAddr, "")
 	if err == nil {
 		release3()
 		t.Fatalf("Third connection should have been rejected due to per-IP limit")
@@ -541,7 +541,7 @@ func TestConnectionLimiterUnitPerIP(t *testing.T) {
 
 	// Verify we can connect from a different IP
 	differentAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.2"), Port: 12346}
-	release4, err := limiter.Accept(differentAddr)
+	release4, err := limiter.AcceptWithRealIP(differentAddr, "")
 	if err != nil {
 		t.Fatalf("Connection from different IP should be accepted: %v", err)
 	}

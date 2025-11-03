@@ -364,7 +364,7 @@ func (s *Server) acceptConnections() error {
 		// Check connection limits before processing
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.Accept(conn.RemoteAddr())
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
 			if err != nil {
 				logger.Debug("ManageSieve Proxy: Connection rejected", "name", s.name, "error", err)
 				conn.Close()

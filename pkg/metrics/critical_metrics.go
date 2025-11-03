@@ -111,12 +111,14 @@ var (
 	)
 
 	// Command timeout metrics
+	// Note: label names are protocol and reason (reason describes why the timeout occurred,
+	// e.g. "idle", "slow_throughput", "session_max", "tls_on_plain_port").
 	CommandTimeoutsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_command_timeouts_total",
 			Help: "Total number of commands that exceeded timeout threshold",
 		},
-		[]string{"protocol", "command"},
+		[]string{"protocol", "reason"},
 	)
 
 	CommandTimeoutThresholdSeconds = promauto.NewGaugeVec(

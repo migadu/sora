@@ -330,7 +330,7 @@ func (s *Server) connStateHandler(conn net.Conn, state http.ConnState) {
 	case http.StateNew:
 		// Check connection limits
 		if s.limiter != nil {
-			if _, err := s.limiter.Accept(conn.RemoteAddr()); err != nil {
+			if _, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), ""); err != nil {
 				logger.Warn("User API Proxy: Connection rejected", "name", s.name, "error", err)
 				conn.Close()
 			}

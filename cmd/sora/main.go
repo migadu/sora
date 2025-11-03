@@ -138,6 +138,20 @@ func main() {
 	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
 	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
 
+	// Initialize global timeout scheduler with configured shard count
+	shardCount := cfg.TimeoutScheduler.ShardCount
+	if err := serverPkg.InitializeGlobalTimeoutScheduler(shardCount); err != nil {
+		errorHandler.FatalError("initialize timeout scheduler", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+	if shardCount == 0 {
+		logger.Info("Timeout scheduler initialized", "mode", "default", "shards", "runtime.NumCPU()")
+	} else if shardCount == -1 {
+		logger.Info("Timeout scheduler initialized", "mode", "physical_cores", "shards", "runtime.NumCPU()/2")
+	} else {
+		logger.Info("Timeout scheduler initialized", "mode", "custom", "shards", shardCount)
+	}
+
 	// Set up context and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
