@@ -15,6 +15,20 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
+// GetAddrString safely extracts address string without triggering reverse DNS lookup.
+// This should be used instead of addr.String() to avoid slow reverse DNS lookups.
+func GetAddrString(addr net.Addr) string {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return net.JoinHostPort(a.IP.String(), fmt.Sprintf("%d", a.Port))
+	case *net.UDPAddr:
+		return net.JoinHostPort(a.IP.String(), fmt.Sprintf("%d", a.Port))
+	default:
+		// For unknown types, must use String() which may trigger DNS lookup
+		return addr.String()
+	}
+}
+
 // SoraConn is a unified connection wrapper that handles all Sora-specific connection features:
 // - Timeout protection (idle, absolute session, minimum throughput)
 // - JA4 TLS fingerprint capture and storage
@@ -156,7 +170,7 @@ func (c *SoraConn) timeoutChecker() {
 
 			// Check absolute session timeout (highest priority)
 			if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
-				remoteAddr := c.Conn.RemoteAddr().String()
+				remoteAddr := GetAddrString(c.Conn.RemoteAddr())
 				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
 
@@ -219,7 +233,7 @@ func (c *SoraConn) timeoutChecker() {
 					// 2. We've had 2 consecutive slow minutes
 					// This reduces false positives for legitimate users
 					if avgBytesPerMin < c.minBytesPerMinute && consecutiveSlow >= 2 {
-						remoteAddr := c.Conn.RemoteAddr().String()
+						remoteAddr := GetAddrString(c.Conn.RemoteAddr())
 						logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min_avg", int(avgBytesPerMin), "bytes_per_min_current", int(bytesPerMinute), "required", c.minBytesPerMinute, "consecutive_slow", consecutiveSlow)
 						metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
 
@@ -242,7 +256,7 @@ func (c *SoraConn) timeoutChecker() {
 
 			// Check idle timeout
 			if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
-				remoteAddr := c.Conn.RemoteAddr().String()
+				remoteAddr := GetAddrString(c.Conn.RemoteAddr())
 				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
 				metrics.CommandTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
 
@@ -451,7 +465,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 	// TLS 1.3: 0x16 0x03 0x03 (legacy version field)
 	if peekBuf[0] == 0x16 && peekBuf[1] == 0x03 {
 		// This is very likely a TLS Client Hello
-		remoteAddr := c.Conn.RemoteAddr().String()
+		remoteAddr := GetAddrString(c.Conn.RemoteAddr())
 		logger.Warn("TLS handshake detected on plain-text port - rejecting", "proto", c.protocol, "remote", remoteAddr)
 
 		// Write a helpful error message
@@ -566,7 +580,7 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	}
 	c.handshakeComplete = true
 
-	remoteAddr := c.tcpConn.RemoteAddr().String()
+	remoteAddr := GetAddrString(c.tcpConn.RemoteAddr())
 
 	// Clone TLS config and add GetConfigForClient callback to capture JA4
 	tlsConfig := c.tlsConfig.Clone()

@@ -5,13 +5,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
@@ -378,7 +379,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			cancel:     sessionCancel,
 		}
 
-		session.RemoteIP = conn.RemoteAddr().String()
+		session.RemoteIP = server.GetAddrString(conn.RemoteAddr())
 		if s.debug {
 			logger.Debug("POP3 proxy: New connection", "proxy", s.name, "remote", session.RemoteIP)
 		}

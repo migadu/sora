@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server"
 )
 
 // AffinityManager defines the interface for cluster-wide affinity management
@@ -502,7 +503,7 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	}
 
 	// Log the actual local and remote addresses of the established connection
-	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
+	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", server.GetAddrString(conn.LocalAddr()), "remote", server.GetAddrString(conn.RemoteAddr()))
 
 	return conn, nil
 }
@@ -551,7 +552,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		return nil, err
 	}
 
-	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
+	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", server.GetAddrString(conn.LocalAddr()), "remote", server.GetAddrString(conn.RemoteAddr()))
 
 	// Determine effective settings for this connection.
 	// Default to the connection manager's global settings.
@@ -749,9 +750,9 @@ func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP 
 	}
 
 	if ja4Fingerprint != "" {
-		logger.Debug("PROXY: Sent PROXY v2 header with JA4 TLV to backend", "backend", conn.RemoteAddr().String(), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort, "ja4", ja4Fingerprint)
+		logger.Debug("PROXY: Sent PROXY v2 header with JA4 TLV to backend", "backend", server.GetAddrString(conn.RemoteAddr()), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort, "ja4", ja4Fingerprint)
 	} else {
-		logger.Debug("PROXY: Sent PROXY v2 header to backend", "backend", conn.RemoteAddr().String(), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
+		logger.Debug("PROXY: Sent PROXY v2 header to backend", "backend", server.GetAddrString(conn.RemoteAddr()), "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
 	}
 
 	return nil

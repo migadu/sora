@@ -413,7 +413,7 @@ func (s *Session) sendContinuation() error {
 
 // Log logs at INFO level with session context
 func (s *Session) Log(format string, args ...any) {
-	remoteAddr := s.clientConn.RemoteAddr().String()
+	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
 		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
@@ -427,7 +427,7 @@ func (s *Session) Log(format string, args ...any) {
 // DebugLog logs at DEBUG level with session context
 func (s *Session) DebugLog(msg string, keyvals ...any) {
 	if s.server.debug {
-		remoteAddr := s.clientConn.RemoteAddr().String()
+		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		user := "none"
 		if s.username != "" && s.accountID > 0 {
 			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
@@ -444,7 +444,7 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
-	remoteAddr := s.clientConn.RemoteAddr().String()
+	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
 		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
@@ -946,7 +946,7 @@ func (s *Session) close() {
 	// Unregister connection asynchronously - don't block session cleanup
 	if s.accountID > 0 {
 		accountID := s.accountID
-		clientAddr := s.clientConn.RemoteAddr().String()
+		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		connTracker := s.server.connTracker
 
 		// Fire-and-forget: unregister in background to avoid blocking session teardown
@@ -983,7 +983,7 @@ func (s *Session) registerConnection() error {
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
-	clientAddr := s.clientConn.RemoteAddr().String()
+	clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
 		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "ManageSieve", clientAddr)

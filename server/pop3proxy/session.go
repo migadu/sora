@@ -320,7 +320,7 @@ func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string
 // Log logs a client command with password masking if debug is enabled.
 // Log logs at INFO level with session context
 func (s *POP3ProxySession) Log(format string, args ...any) {
-	remoteAddr := s.clientConn.RemoteAddr().String()
+	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
 		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
@@ -334,7 +334,7 @@ func (s *POP3ProxySession) Log(format string, args ...any) {
 // DebugLog logs at DEBUG level with session context
 func (s *POP3ProxySession) DebugLog(format string, args ...any) {
 	if s.server.debug {
-		remoteAddr := s.clientConn.RemoteAddr().String()
+		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		user := "none"
 		if s.username != "" && s.accountID > 0 {
 			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
@@ -348,7 +348,7 @@ func (s *POP3ProxySession) DebugLog(format string, args ...any) {
 
 // WarnLog logs at WARN level with session context
 func (s *POP3ProxySession) WarnLog(format string, args ...any) {
-	remoteAddr := s.clientConn.RemoteAddr().String()
+	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
 		user = fmt.Sprintf("%s/%d", s.username, s.accountID)

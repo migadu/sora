@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -78,7 +79,7 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		// Must happen before go-imap library starts reading from the connection
 		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
 			if err := tlsConn.PerformHandshake(); err != nil {
-				logger.Debug("IMAP: TLS handshake failed", "name", l.name, "remote", conn.RemoteAddr().String(), "error", err)
+				logger.Debug("IMAP: TLS handshake failed", "name", l.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
 				releaseConn() // Release the connection limit
 				conn.Close()
 				continue // Try to accept the next connection
@@ -885,7 +886,7 @@ func (s *IMAPServer) sendGracefulShutdownBye() {
 		// Send untagged BYE with text message
 		// RFC 3501 Section 7.1.5: BYE response indicates the server is closing the connection
 		if err := conn.Bye("Server shutting down, please reconnect"); err != nil {
-			logger.Debug("IMAP: Failed to send BYE", "name", s.name, "remote", conn.NetConn().RemoteAddr().String(), "error", err)
+			logger.Debug("IMAP: Failed to send BYE", "name", s.name, "remote", server.GetAddrString(conn.NetConn().RemoteAddr()), "error", err)
 		}
 	}
 
@@ -934,7 +935,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic IMAP
-			logger.Debug("IMAP: No PROXY protocol header, treating as direct connection in optional mode", "remote", conn.RemoteAddr().String())
+			logger.Debug("IMAP: No PROXY protocol header, treating as direct connection in optional mode", "remote", server.GetAddrString(conn.RemoteAddr()))
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
@@ -942,7 +943,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
 		// Note: We don't have access to server name in this listener, use generic IMAP
-		logger.Debug("IMAP: PROXY protocol error, rejecting connection", "remote", conn.RemoteAddr().String(), "error", err)
+		logger.Debug("IMAP: PROXY protocol error, rejecting connection", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
 		continue
 	}
 }

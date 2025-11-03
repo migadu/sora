@@ -388,7 +388,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 		defer cancel()
 
-		clientAddr := s.conn.NetConn().RemoteAddr().String()
+		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
 			s.Log("Failed to register connection: %v", err)
@@ -404,7 +404,7 @@ func (s *IMAPSession) unregisterConnection() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		clientAddr := s.conn.NetConn().RemoteAddr().String()
+		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
 			s.Log("Failed to unregister connection: %v", err)

@@ -1933,7 +1933,7 @@ func (s *POP3Session) registerConnection(email string) {
 		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 		defer cancel()
 
-		clientAddr := (*s.conn).RemoteAddr().String()
+		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
 			s.DebugLog("Failed to register connection: %v", err)
@@ -1947,7 +1947,7 @@ func (s *POP3Session) unregisterConnection() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		clientAddr := (*s.conn).RemoteAddr().String()
+		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
 			s.DebugLog("Failed to unregister connection: %v", err)
