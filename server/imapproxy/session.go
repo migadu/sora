@@ -66,22 +66,17 @@ func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 
-	clientAddr := s.clientConn.RemoteAddr().String()
+	s.Log("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
-		logger.Info("Starting TLS handshake", "proto", "imap_proxy", "remote", clientAddr)
-		handshakeStart := time.Now()
 		if err := tlsConn.PerformHandshake(); err != nil {
-			handshakeDuration := time.Since(handshakeStart)
-			logger.Warn("TLS handshake failed", "proto", "imap_proxy", "remote", clientAddr, "duration_ms", handshakeDuration.Milliseconds(), "error", err)
+			s.WarnLog("TLS handshake failed: %v", err)
 			return
 		}
-		handshakeDuration := time.Since(handshakeStart)
-		logger.Info("TLS handshake complete", "proto", "imap_proxy", "remote", clientAddr, "duration_ms", handshakeDuration.Milliseconds())
 	}
 
-	s.Log("session ready (post-TLS)")
+	clientAddr := s.clientConn.RemoteAddr().String()
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
 		logger.Error("Failed to send greeting", "proxy", s.server.name, "remote", clientAddr, "error", err)

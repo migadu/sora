@@ -207,7 +207,6 @@ func (m *Manager) initLetsEncryptProvider() error {
 	baseTLSConfig := m.autocertMgr.TLSConfig()
 	m.tlsConfig = &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			startTime := time.Now()
 			serverName := hello.ServerName
 
 			// Handle missing SNI by using default domain
@@ -231,24 +230,21 @@ func (m *Manager) initLetsEncryptProvider() error {
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
 
-			logger.Info("TLS: GetCertificate called during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
+			logger.Debug("TLS: Certificate request during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
 
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverName
 
-			certStart := time.Now()
 			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
-			certDuration := time.Since(certStart)
-
 			if err != nil {
 				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
 				// This allows the server to continue serving cached certificates for other domains
-				logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err, "cert_retrieval_ms", certDuration.Milliseconds(), "total_ms", time.Since(startTime).Milliseconds())
+				logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err)
 				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 			}
-			logger.Info("TLS: Certificate provided successfully", "domain", serverName, "cert_retrieval_ms", certDuration.Milliseconds(), "total_ms", time.Since(startTime).Milliseconds())
+			logger.Debug("TLS: Certificate provided", "domain", serverName)
 			return cert, nil
 		},
 		MinVersion:    tls.VersionTLS12,
