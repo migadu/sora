@@ -849,8 +849,10 @@ func (s *POP3Session) handleConnection() {
 				// Message has no body, just headers
 				// Convert back to CRLF for POP3 protocol
 				result := strings.ReplaceAll(messageStr, "\n", "\r\n")
+				// Dot-stuff per RFC 1939
+				stuffedResult := dotStuffPOP3(result)
 				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-				writer.WriteString(result)
+				writer.WriteString(stuffedResult)
 				writer.WriteString("\r\n.\r\n")
 				s.DebugLog("retrieved headers for message %d", msg.UID)
 				continue
@@ -887,8 +889,10 @@ func (s *POP3Session) handleConnection() {
 			// Convert back to CRLF for POP3 protocol
 			result = strings.ReplaceAll(result, "\n", "\r\n")
 
+			// Dot-stuff per RFC 1939
+			stuffedResult := dotStuffPOP3(result)
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-			writer.WriteString(result)
+			writer.WriteString(stuffedResult)
 			writer.WriteString("\r\n.\r\n")
 			s.DebugLog("retrieved top %d lines of message %d", lines, msg.UID)
 			success = true
@@ -1048,8 +1052,10 @@ func (s *POP3Session) handleConnection() {
 				s.WarnLog("Body size mismatch for UID %d: expected %d, got %d", msg.UID, msg.Size, len(bodyData))
 			}
 
+			// Dot-stuff the message body per RFC 1939 to prevent premature termination
+			stuffedBody := dotStuffPOP3(string(bodyData))
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
-			writer.WriteString(string(bodyData))
+			writer.WriteString(stuffedBody)
 			writer.WriteString("\r\n.\r\n")
 			s.DebugLog("retrieved message %d", msg.UID)
 
@@ -2010,4 +2016,30 @@ func (s *POP3Session) startTerminationPoller() {
 
 func checkMasterCredential(provided string, actual []byte) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
+}
+
+// dotStuffPOP3 performs byte-stuffing per RFC 1939 Section 3.
+// Any line beginning with a termination octet (.) must be prepended with another dot.
+// This prevents premature message termination when the body contains lines starting with "."
+func dotStuffPOP3(data string) string {
+	// Fast path: if no dots at line start, return as-is
+	if !strings.Contains(data, "\r\n.") && !strings.HasPrefix(data, ".") {
+		return data
+	}
+
+	var result strings.Builder
+	result.Grow(len(data) + 64) // Pre-allocate with some buffer for stuffing
+
+	lines := strings.Split(data, "\r\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, ".") {
+			result.WriteString(".")
+		}
+		result.WriteString(line)
+		if i < len(lines)-1 {
+			result.WriteString("\r\n")
+		}
+	}
+
+	return result.String()
 }
