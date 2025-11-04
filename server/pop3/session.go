@@ -1034,6 +1034,20 @@ func (s *POP3Session) handleConnection() {
 			}
 			s.DebugLog("retrieved message body for UID %d", msg.UID)
 
+			// Validate body data to prevent empty line protocol violations
+			if len(bodyData) == 0 {
+				s.WarnLog("Empty message body for UID %d (expected size: %d)", msg.UID, msg.Size)
+				if s.handleClientError(writer, "-ERR Message body is empty\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Warn if body size mismatch indicates corruption or incomplete fetch
+			if len(bodyData) != msg.Size {
+				s.WarnLog("Body size mismatch for UID %d: expected %d, got %d", msg.UID, msg.Size, len(bodyData))
+			}
+
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
 			writer.WriteString(string(bodyData))
 			writer.WriteString("\r\n.\r\n")
@@ -1700,10 +1714,8 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString("+OK Goodbye\r\n")
 			writer.Flush()
 
-			// Close connection directly without lock acquisition
-			// We don't need lock protection during explicit QUIT
-			s.closeWithoutLock()
 			success = true
+			// Return and let defer s.Close() handle cleanup
 			return
 
 		case "XCLIENT":
@@ -1860,15 +1872,22 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		// Try cache first
 		data, err := s.server.cache.Get(msg.ContentHash)
 		if err == nil && data != nil {
-			logger.Debug("POP3: Cache hit", "uid", msg.UID)
-			// Track memory usage for cached data
-			if s.memTracker != nil {
-				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-					metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
-					return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+			// Validate cached data is not empty
+			if len(data) == 0 {
+				logger.Warn("POP3: Cache contains empty body", "uid", msg.UID, "hash", msg.ContentHash)
+				// Don't return empty data, fall through to S3
+				data = nil
+			} else {
+				logger.Debug("POP3: Cache hit", "uid", msg.UID)
+				// Track memory usage for cached data
+				if s.memTracker != nil {
+					if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+						metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+						return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+					}
 				}
+				return data, nil
 			}
-			return data, nil
 		}
 
 		// Fallback to S3
@@ -1888,6 +1907,11 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		data, err = io.ReadAll(reader)
 		if err != nil {
 			return nil, err
+		}
+		// Validate S3 data is not empty
+		if len(data) == 0 {
+			logger.Warn("POP3: Retrieved empty body from S3", "uid", msg.UID, "hash", msg.ContentHash, "s3_key", s3Key)
+			return nil, fmt.Errorf("message UID %d has empty body in S3 (hash: %s)", msg.UID, msg.ContentHash)
 		}
 		// Track memory usage for S3 data
 		if s.memTracker != nil {
@@ -1916,6 +1940,11 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 	if data == nil { // Should ideally not happen if GetLocalFile returns nil, nil for "not found"
 		return nil, fmt.Errorf("message UID %d (hash %s) not found on disk (GetLocalFile returned nil data, nil error)", msg.UID, msg.ContentHash)
+	}
+	// Validate disk data is not empty
+	if len(data) == 0 {
+		logger.Warn("POP3: Retrieved empty body from disk", "uid", msg.UID, "hash", msg.ContentHash, "path", filePath)
+		return nil, fmt.Errorf("message UID %d has empty body on disk (hash: %s, path: %s)", msg.UID, msg.ContentHash, filePath)
 	}
 	// Track memory usage for disk data
 	if s.memTracker != nil {

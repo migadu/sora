@@ -317,6 +317,9 @@ func (s *Session) handleAuthError(response string) bool {
 
 // sendGreeting sends the IMAP greeting.
 func (s *Session) sendGreeting() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	greeting := "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
 	if err != nil {
@@ -327,6 +330,9 @@ func (s *Session) sendGreeting() error {
 
 // sendResponse sends a response to the client.
 func (s *Session) sendResponse(response string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	_, err := s.clientWriter.WriteString(response + "\r\n")
 	if err != nil {
 		return err
@@ -695,12 +701,16 @@ func (s *Session) authenticateToBackend() (string, error) {
 	tag := fmt.Sprintf("p%d", rand.Intn(10000))
 	// Send AUTHENTICATE PLAIN with initial response
 	authCmd := fmt.Sprintf("%s AUTHENTICATE PLAIN %s\r\n", tag, encoded)
+
+	s.mu.Lock()
 	_, err := s.backendWriter.WriteString(authCmd)
 	if err != nil {
+		s.mu.Unlock()
 		logger.Error("Failed to send AUTHENTICATE command to backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
 	}
 	s.backendWriter.Flush()
+	s.mu.Unlock()
 
 	// Read authentication response
 	response, err := s.backendReader.ReadString('\n')
@@ -817,7 +827,18 @@ func (s *Session) startProxy() {
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
-		bytesOut, err := server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
+		var bytesOut int64
+		var err error
+		// Use the buffered reader from authentication phase to avoid losing buffered data
+		if s.backendReader != nil {
+			// Copy from buffered reader with deadline protection
+			// This ensures we don't lose any data that was buffered during authentication
+			// or any subsequent data that gets read into the buffer during the proxy phase
+			bytesOut, err = s.copyBufferedReaderToConn(s.clientConn, s.backendReader)
+		} else {
+			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)
+			bytesOut, err = server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
+		}
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from backend to client: %v", err)
@@ -924,6 +945,57 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 			return
 		case <-ctx.Done():
 			return
+		}
+	}
+}
+
+// copyBufferedReaderToConn copies data from a buffered reader to a connection with write deadline protection.
+// This is used for backend-to-client copying when the backend connection has a buffered reader
+// from the authentication phase. We must read from the buffered reader to avoid losing any data
+// that was buffered but not yet read.
+func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int64, error) {
+	const writeDeadline = 30 * time.Second
+	var totalBytes int64
+	buf := make([]byte, 32*1024)
+	nextDeadline := time.Now()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return totalBytes, s.ctx.Err()
+		default:
+		}
+
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			// Only update write deadline once per second to reduce syscall frequency
+			now := time.Now()
+			if now.After(nextDeadline) {
+				if err := dst.SetWriteDeadline(now.Add(writeDeadline)); err != nil {
+					return totalBytes, fmt.Errorf("failed to set write deadline: %w", err)
+				}
+				nextDeadline = now.Add(time.Second)
+			}
+
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				totalBytes += int64(nw)
+			}
+			if ew != nil {
+				if netErr, ok := ew.(net.Error); ok && netErr.Timeout() {
+					return totalBytes, fmt.Errorf("write timeout in backend-to-client: %w", ew)
+				}
+				return totalBytes, ew
+			}
+			if nr != nw {
+				return totalBytes, io.ErrShortWrite
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				return totalBytes, err
+			}
+			return totalBytes, nil
 		}
 	}
 }

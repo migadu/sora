@@ -529,10 +529,8 @@ func (s *ManageSieveSession) handleConnection() {
 			s.sendResponse("OK Goodbye\r\n")
 			s.writer.Flush()
 
-			// Close connection directly without lock acquisition
-			// We don't need lock protection during explicit LOGOUT
-			s.closeWithoutLock()
 			success = true
+			// Return and let defer s.Close() handle cleanup
 			return
 
 		default:

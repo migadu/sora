@@ -140,7 +140,7 @@ func (s *Server) start(ctx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			logger.Warn("HTTP Mail API: Error shutting down server: %v", "name", s.name, "param", err)
+			logger.Warn("HTTP Mail API: Error shutting down server", "name", s.name, "error", err)
 		}
 	}()
 
@@ -334,9 +334,9 @@ func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		logger.Debug("HTTP Mail API: %s %s from %s", "name", s.name, "param", r.Method, r.URL.Path, r.RemoteAddr)
+		logger.Debug("HTTP Mail API: request", "name", s.name, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		next.ServeHTTP(w, r)
-		logger.Debug("HTTP Mail API: %s %s completed in %v", "name", s.name, "param", r.Method, r.URL.Path, time.Since(start))
+		logger.Debug("HTTP Mail API: request completed", "name", s.name, "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
 	})
 }
 
@@ -426,7 +426,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		logger.Warn("HTTP Mail API: Error encoding JSON response: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error encoding JSON response", "name", s.name, "error", err)
 	}
 }
 

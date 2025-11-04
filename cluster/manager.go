@@ -544,7 +544,7 @@ func (m *Manager) notifyLeaderChange(isLeader bool, newLeaderID string) {
 		go func(cb func(bool, string)) {
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Error("Panic in leader change callback", fmt.Errorf("%v", r))
+					logger.Error("Panic in leader change callback", "error", fmt.Errorf("%v", r))
 				}
 			}()
 			cb(isLeader, newLeaderID)
@@ -621,7 +621,7 @@ func (m *Manager) Shutdown() error {
 	if m.memberlist != nil {
 		// Leave the cluster gracefully
 		if err := m.memberlist.Leave(time.Second * 5); err != nil {
-			logger.Warn("Error leaving cluster: %v", err)
+			logger.Warn("Error leaving cluster", "error", err)
 		}
 		if err := m.memberlist.Shutdown(); err != nil {
 			return fmt.Errorf("failed to shutdown memberlist: %w", err)

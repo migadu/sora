@@ -69,7 +69,7 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error updating message flags: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error updating message flags", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to update message flags")
 		return
 	}
@@ -116,7 +116,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error marking message as deleted: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error marking message as deleted", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete message")
 		return
 	}

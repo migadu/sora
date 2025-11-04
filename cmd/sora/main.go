@@ -738,7 +738,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
 					if err := httpServer.Shutdown(shutdownCtx); err != nil {
-						logger.Warn("HTTP-01 challenge server shutdown error: %v", err)
+						logger.Warn("HTTP-01 challenge server shutdown error", "error", err)
 					}
 				}()
 

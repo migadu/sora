@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"net"
 	"time"
 
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -21,10 +22,21 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	// and legitimate clients may stay idle for 29 minutes waiting for new mail.
 	// The slowloris protection would incorrectly flag these as attacks.
 	if netConn := s.conn.NetConn(); netConn != nil {
+		// Try direct cast first
 		if tc, ok := netConn.(*serverPkg.SoraConn); ok {
 			tc.SuspendThroughputChecking()
-			// Resume when exiting IDLE
 			defer tc.ResumeThroughputChecking()
+		} else {
+			// Try to unwrap if it's wrapped
+			type unwrapper interface {
+				Unwrap() net.Conn
+			}
+			if uw, ok := netConn.(unwrapper); ok {
+				if tc, ok := uw.Unwrap().(*serverPkg.SoraConn); ok {
+					tc.SuspendThroughputChecking()
+					defer tc.ResumeThroughputChecking()
+				}
+			}
 		}
 	}
 

@@ -76,7 +76,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error retrieving messages: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve messages")
 		return
 	}
@@ -89,7 +89,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		total, err = s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mailboxName)
 	}
 	if err != nil {
-		logger.Warn("HTTP Mail API: Error getting message count: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "error", err)
 		total = len(messages) // Fallback to returned count
 	}
 
@@ -136,7 +136,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error searching messages: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error searching messages", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to search messages")
 		return
 	}

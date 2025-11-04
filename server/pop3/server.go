@@ -294,7 +294,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		if err != nil {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				logger.Debug("POP3: %v, rejecting connection", "name", s.name, "param", err)
+				logger.Debug("POP3: rejecting connection", "name", s.name, "error", err)
 				continue // Continue accepting other connections
 			}
 
@@ -323,7 +323,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			logger.Debug("POP3: Connection rejected: %v", "name", s.name, "param", err)
+			logger.Debug("POP3: Connection rejected", "name", s.name, "error", err)
 			conn.Close()
 			continue
 		}
@@ -387,7 +387,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		} else {
 			remoteInfo = session.RemoteIP
 		}
-		logger.Debug("POP3: new connection from %s (connections: total=%d, authenticated=%d)", "name", s.name, "param", remoteInfo, totalCount, authCount)
+		logger.Debug("POP3: new connection", "name", s.name, "remote", remoteInfo, "total_connections", totalCount, "authenticated_connections", authCount)
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -438,7 +438,7 @@ func (s *POP3Server) waitForSessionsDrain(timeout time.Duration) {
 	case <-done:
 		logger.Debug("POP3: All sessions drained gracefully", "name", s.name)
 	case <-time.After(timeout):
-		logger.Debug("POP3: Session drain timeout after %v, forcing shutdown", "name", s.name, "param", timeout)
+		logger.Debug("POP3: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
 
@@ -469,7 +469,7 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 		return
 	}
 
-	logger.Debug("POP3: Sending graceful shutdown message to %d active connection(s)", "name", s.name, "param", len(activeSessions))
+	logger.Debug("POP3: Sending graceful shutdown message to active connections", "name", s.name, "count", len(activeSessions))
 
 	// Send shutdown message to all active connections
 	for _, session := range activeSessions {

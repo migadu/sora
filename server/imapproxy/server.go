@@ -535,6 +535,9 @@ func (s *Server) sendGracefulShutdownBye() {
 
 	// Send shutdown messages to both client and backend
 	for _, session := range activeSessions {
+		// Lock the session to safely access writers
+		session.mu.Lock()
+
 		// Send BYE to client
 		if session.clientWriter != nil {
 			session.clientWriter.WriteString("* BYE Server shutting down, please reconnect\r\n")
@@ -547,6 +550,8 @@ func (s *Server) sendGracefulShutdownBye() {
 			session.backendWriter.WriteString("PROXY1 LOGOUT\r\n")
 			session.backendWriter.Flush()
 		}
+
+		session.mu.Unlock()
 	}
 
 	// Give both clients and backends a brief moment to process

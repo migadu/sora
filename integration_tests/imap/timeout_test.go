@@ -148,7 +148,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 	server, account := common.SetupIMAPServerWithTimeout(t, 2*time.Second)
 
 	// Record initial idle timeout count
-	initialIdleTimeouts := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("imap", "idle"))
+	initialIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("imap", "idle"))
 	t.Logf("Initial idle timeout count: %.0f", initialIdleTimeouts)
 
 	// Connect to server
@@ -213,7 +213,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 
 	// Verify idle timeout metric increased
 	time.Sleep(500 * time.Millisecond) // Give metrics time to update
-	newIdleTimeouts := testutil.ToFloat64(metrics.CommandTimeoutsTotal.WithLabelValues("imap", "idle"))
+	newIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("imap", "idle"))
 	if newIdleTimeouts <= initialIdleTimeouts {
 		t.Errorf("Expected idle timeout count to increase from %.0f, but got %.0f", initialIdleTimeouts, newIdleTimeouts)
 	} else {

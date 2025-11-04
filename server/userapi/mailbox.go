@@ -43,7 +43,7 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// Get mailboxes from database
 	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, subscribedOnly)
 	if err != nil {
-		logger.Warn("HTTP Mail API: Error retrieving mailboxes: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error retrieving mailboxes", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
 		return
 	}
@@ -54,13 +54,13 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		// Get message counts
 		total, err := s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
 		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting message count for %s: %v", "name", s.name, "param", mb.Name, err)
+			logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "mailbox", mb.Name, "error", err)
 			total = 0 // Continue with zero count on error
 		}
 
 		unseen, err := s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
 		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting unseen count for %s: %v", "name", s.name, "param", mb.Name, err)
+			logger.Warn("HTTP Mail API: Error getting unseen count", "name", s.name, "mailbox", mb.Name, "error", err)
 			unseen = 0 // Continue with zero count on error
 		}
 
@@ -114,7 +114,7 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusConflict, "Mailbox already exists")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error creating mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error creating mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to create mailbox")
 		return
 	}
@@ -155,7 +155,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error deleting mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete mailbox")
 		return
 	}
@@ -190,7 +190,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error subscribing to mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error subscribing to mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to subscribe to mailbox")
 		return
 	}
@@ -226,7 +226,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
-		logger.Warn("HTTP Mail API: Error unsubscribing from mailbox: %v", "name", s.name, "param", err)
+		logger.Warn("HTTP Mail API: Error unsubscribing from mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to unsubscribe from mailbox")
 		return
 	}

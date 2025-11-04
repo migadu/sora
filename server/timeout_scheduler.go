@@ -210,11 +210,12 @@ func (s *TimeoutScheduler) Register(c *SoraConn) {
 	// must hold shard lock to mutate conns
 	shard.mu.Lock()
 	shard.conns[c] = struct{}{}
+	connCount := len(shard.conns)
 	shard.mu.Unlock()
 	s.mu.Unlock()
 
 	// Update metric
-	metrics.TimeoutSchedulerConnectionsTotal.WithLabelValues(fmt.Sprintf("%d", shardIdx)).Set(float64(len(shard.conns)))
+	metrics.TimeoutSchedulerConnectionsTotal.WithLabelValues(fmt.Sprintf("%d", shardIdx)).Set(float64(connCount))
 
 	// Immediately trigger a check for this connection in a goroutine. This
 	// ensures short absolute timeouts are detected without waiting for the
@@ -249,8 +250,9 @@ func (s *TimeoutScheduler) Unregister(c *SoraConn) {
 
 	shard.mu.Lock()
 	delete(shard.conns, c)
+	connCount := len(shard.conns)
 	shard.mu.Unlock()
-	metrics.TimeoutSchedulerConnectionsTotal.WithLabelValues(fmt.Sprintf("%d", shardIdx)).Set(float64(len(shard.conns)))
+	metrics.TimeoutSchedulerConnectionsTotal.WithLabelValues(fmt.Sprintf("%d", shardIdx)).Set(float64(connCount))
 	s.mu.Unlock()
 }
 

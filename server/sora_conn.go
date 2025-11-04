@@ -17,7 +17,13 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-// timeout shard implementation lives in timeout_scheduler.go
+// copyBufPool provides reusable 32KB buffers for CopyWithDeadline to avoid per-call allocations
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
 
 // GetAddrString safely extracts address string without triggering reverse DNS lookup.
 // This should be used instead of addr.String() to avoid slow reverse DNS lookups.
@@ -37,6 +43,10 @@ func GetAddrString(addr net.Addr) string {
 // This is a generic utility function used by all proxy protocols to prevent indefinite blocking
 // when clients are not reading data fast enough (which causes TCP send buffers to fill).
 //
+// Optimizations:
+//   - Uses a global buffer pool to avoid per-call allocations
+//   - Coarsens write deadline updates to ~1 second intervals to reduce syscall frequency
+//
 // Parameters:
 //   - ctx: Context for cancellation
 //   - dst: Destination connection (must support SetWriteDeadline)
@@ -45,13 +55,15 @@ func GetAddrString(addr net.Addr) string {
 //
 // Returns total bytes copied and any error encountered.
 func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction string) (int64, error) {
-	const (
-		writeDeadline = 30 * time.Second
-		bufferSize    = 32 * 1024
-	)
+	const writeDeadline = 30 * time.Second
 
-	buf := make([]byte, bufferSize)
+	// Use buffered copy with pooled buffer
+	bufp := copyBufPool.Get().(*[]byte)
+	buf := *bufp
+	defer copyBufPool.Put(bufp)
+
 	var totalBytes int64
+	nextDeadline := time.Now()
 
 	for {
 		select {
@@ -62,8 +74,13 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 
 		nr, err := src.Read(buf)
 		if nr > 0 {
-			if err := dst.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-				return totalBytes, fmt.Errorf("failed to set write deadline: %w", err)
+			// Only update write deadline once per second to reduce syscall frequency
+			now := time.Now()
+			if now.After(nextDeadline) {
+				if err := dst.SetWriteDeadline(now.Add(writeDeadline)); err != nil {
+					return totalBytes, fmt.Errorf("failed to set write deadline: %w", err)
+				}
+				nextDeadline = now.Add(time.Second)
 			}
 
 			nw, ew := dst.Write(buf[0:nr])
@@ -210,13 +227,16 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 // checkTimeouts is called periodically by the global scheduler to check timeout conditions
 // This method performs a single check without looping or sleeping
 func (c *SoraConn) checkTimeouts(now time.Time) {
-	c.mu.RLock()
+	// Check if connection is closed using closeMutex (same lock used in Close())
+	c.closeMutex.Lock()
 	closed := c.closed
+	c.closeMutex.Unlock()
+
 	if closed {
-		c.mu.RUnlock()
 		return
 	}
 
+	c.mu.RLock()
 	idleTime := now.Sub(c.lastActivity)
 	sessionDuration := now.Sub(c.sessionStart)
 	throughputDuration := now.Sub(c.lastThroughputCheck)
@@ -243,7 +263,11 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	// Check minimum throughput (protects against slowloris attacks)
 	// IMPROVED: Uses 3-minute rolling average and requires 2 consecutive slow periods
 	// Skip if throughput checking is suspended (e.g., during IMAP IDLE)
-	if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute && !suspended {
+	if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
+		if suspended {
+			// Throughput checking is suspended - skip check
+			return
+		}
 		sessionDurationSinceStart := now.Sub(c.sessionStart)
 
 		// Only enforce throughput after the first 2 minutes of the session
@@ -408,6 +432,7 @@ func (c *SoraConn) SuspendThroughputChecking() {
 	c.throughputCheckingSuspended = true
 	c.bytesTransferred = 0 // Reset counter as well
 	c.mu.Unlock()
+	logger.Info("Throughput checking suspended", "proto", c.protocol, "remote", c.remoteAddr)
 }
 
 // ResumeThroughputChecking re-enables slowloris throughput checks
@@ -422,6 +447,7 @@ func (c *SoraConn) ResumeThroughputChecking() {
 	c.throughputHistory = [3]int64{}
 	c.throughputHistoryIndex = 0
 	c.mu.Unlock()
+	logger.Info("Throughput checking resumed", "proto", c.protocol, "remote", c.remoteAddr)
 }
 
 // SetUsername sets the authenticated username (for logging)

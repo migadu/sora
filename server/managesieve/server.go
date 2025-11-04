@@ -315,7 +315,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		if err != nil {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
-				logger.Debug("ManageSieve: %v, rejecting connection", "name", s.name, "param", err)
+				logger.Debug("ManageSieve: rejecting connection", "name", s.name, "error", err)
 				continue // Continue accepting other connections
 			}
 
@@ -344,7 +344,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if err != nil {
-			logger.Debug("ManageSieve: Connection rejected: %v", "name", s.name, "param", err)
+			logger.Debug("ManageSieve: Connection rejected", "name", s.name, "error", err)
 			conn.Close()
 			continue
 		}
@@ -413,7 +413,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			remoteInfo = session.RemoteIP
 		}
 		// Log connection with connection counters
-		logger.Debug("ManageSieve: new connection from %s (connections: total=%d, authenticated=%d)", "name", s.name, "param", remoteInfo, totalCount, authCount)
+		logger.Debug("ManageSieve: new connection", "name", s.name, "remote", remoteInfo, "total_connections", totalCount, "authenticated_connections", authCount)
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -463,7 +463,7 @@ func (s *ManageSieveServer) waitForSessionsDrain(timeout time.Duration) {
 	case <-done:
 		logger.Debug("ManageSieve: All sessions drained gracefully", "name", s.name)
 	case <-time.After(timeout):
-		logger.Debug("ManageSieve: Session drain timeout after %v, forcing shutdown", "name", s.name, "param", timeout)
+		logger.Debug("ManageSieve: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
 
@@ -494,7 +494,7 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 		return
 	}
 
-	logger.Debug("ManageSieve: Sending graceful shutdown message to %d active connection(s)", "name", s.name, "param", len(activeSessions))
+	logger.Debug("ManageSieve: Sending graceful shutdown message to active connections", "name", s.name, "count", len(activeSessions))
 
 	// Send shutdown message to all active connections
 	// ManageSieve uses BYE response for clean disconnection
