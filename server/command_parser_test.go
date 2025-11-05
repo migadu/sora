@@ -336,3 +336,80 @@ func TestParseLineUnquoteStringIntegration(t *testing.T) {
 		})
 	}
 }
+
+func TestParseLiteral(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    int
+		wantErr bool
+	}{
+		{
+			name:    "valid literal",
+			input:   "{10}",
+			want:    10,
+			wantErr: false,
+		},
+		{
+			name:    "valid literal zero",
+			input:   "{0}",
+			want:    0,
+			wantErr: false,
+		},
+		{
+			name:    "valid literal large",
+			input:   "{12345}",
+			want:    12345,
+			wantErr: false,
+		},
+		{
+			name:    "invalid - no braces",
+			input:   "10",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - missing close brace",
+			input:   "{10",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - missing open brace",
+			input:   "10}",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - non-numeric",
+			input:   "{abc}",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - negative",
+			input:   "{-10}",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "empty",
+			input:   "{}",
+			want:    0,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseLiteral(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseLiteral() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("ParseLiteral() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

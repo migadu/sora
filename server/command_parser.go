@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -124,4 +125,23 @@ func UnquoteString(str string) string {
 	}
 
 	return result.String()
+}
+
+// ParseLiteral parses an IMAP literal string {size} and returns the size.
+// Returns error if the format is invalid or size is negative.
+func ParseLiteral(str string) (int, error) {
+	if !strings.HasPrefix(str, "{") || !strings.HasSuffix(str, "}") {
+		return 0, fmt.Errorf("not a literal")
+	}
+
+	sizeStr := str[1 : len(str)-1]
+	size, err := strconv.Atoi(sizeStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid literal size: %w", err)
+	}
+	if size < 0 {
+		return 0, fmt.Errorf("negative literal size")
+	}
+
+	return size, nil
 }

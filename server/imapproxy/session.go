@@ -143,15 +143,134 @@ func (s *Session) handleConnection() {
 
 		switch command {
 		case "LOGIN":
-			if len(args) < 2 {
+			var username, password string
+
+			// Handle literals in LOGIN command
+			if len(args) >= 1 {
+				username = server.UnquoteString(args[0])
+
+				// Check if username is a literal
+				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
+					literalSize, err := server.ParseLiteral(args[0])
+					if err != nil {
+						if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
+							return
+						}
+						continue
+					}
+
+					// Send continuation
+					s.sendResponse("+")
+
+					// Read literal data
+					literalBuf := make([]byte, literalSize)
+					if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
+						if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read username literal", tag)) {
+							return
+						}
+						continue
+					}
+					username = string(literalBuf)
+
+					// Read the rest of the line (should be password or another literal)
+					line, err := s.clientReader.ReadString('\n')
+					if err != nil {
+						if err != io.EOF {
+							s.DebugLog("error reading password after username literal: %v", err)
+						}
+						return
+					}
+					line = strings.TrimRight(line, "\r\n")
+					line = strings.TrimSpace(line)
+
+					if line == "" {
+						if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+							return
+						}
+						continue
+					}
+
+					// Check if password is a literal
+					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+						literalSize, err := server.ParseLiteral(line)
+						if err != nil {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+								return
+							}
+							continue
+						}
+
+						// Send continuation
+						s.sendResponse("+")
+
+						// Read literal data
+						literalBuf := make([]byte, literalSize)
+						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
+								return
+							}
+							continue
+						}
+						password = string(literalBuf)
+
+						// Read CRLF after literal
+						if _, err := s.clientReader.ReadString('\n'); err != nil && err != io.EOF {
+							s.DebugLog("error reading CRLF after password literal: %v", err)
+						}
+					} else {
+						password = server.UnquoteString(line)
+					}
+				} else if len(args) >= 2 {
+					// Normal case - both args on one line
+					password = server.UnquoteString(args[1])
+
+					// Check if password is a literal (username was not)
+					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
+						literalSize, err := server.ParseLiteral(args[1])
+						if err != nil {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+								return
+							}
+							continue
+						}
+
+						// Send continuation
+						s.sendResponse("+")
+
+						// Read literal data
+						literalBuf := make([]byte, literalSize)
+						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
+								return
+							}
+							continue
+						}
+						password = string(literalBuf)
+
+						// Read CRLF after literal
+						if _, err := s.clientReader.ReadString('\n'); err != nil && err != io.EOF {
+							s.DebugLog("error reading CRLF after password literal: %v", err)
+						}
+					}
+				} else {
+					if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+						return
+					}
+					continue
+				}
+			} else {
 				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
 					return
 				}
 				continue
 			}
 
-			username := server.UnquoteString(args[0])
-			password := server.UnquoteString(args[1])
+			if username == "" || password == "" {
+				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+					return
+				}
+				continue
+			}
 
 			if err := s.authenticateUser(username, password); err != nil {
 				s.DebugLog("authentication failed: %v", err)
