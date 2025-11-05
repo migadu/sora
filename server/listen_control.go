@@ -37,10 +37,16 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 	// Determine address family
 	var family int
 	var sockaddr unix.Sockaddr
-	if addr.IP.To4() != nil {
+
+	// Handle nil IP (e.g., ":143" resolves to IP=nil)
+	// Default to IPv4 for backward compatibility
+	if addr.IP == nil || addr.IP.To4() != nil {
 		family = unix.AF_INET
 		sa := &unix.SockaddrInet4{Port: addr.Port}
-		copy(sa.Addr[:], addr.IP.To4())
+		if addr.IP != nil {
+			copy(sa.Addr[:], addr.IP.To4())
+		}
+		// If IP is nil, sa.Addr is zero (0.0.0.0), which means all interfaces
 		sockaddr = sa
 	} else {
 		family = unix.AF_INET6
