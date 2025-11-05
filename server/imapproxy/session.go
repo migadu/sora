@@ -567,6 +567,9 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.Log("attempting authentication via prelookup", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
+		// Log prelookup response immediately
+		s.Log("prelookup response", "auth_result", authResult, "has_error", err != nil, "error", err)
+
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
