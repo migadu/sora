@@ -203,6 +203,9 @@ type IMAPServer struct {
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// Authentication rate limiting
 	authLimiter serverPkg.AuthLimiter
 
@@ -252,6 +255,7 @@ type IMAPServerOptions struct {
 	MaxConnections        int
 	MaxConnectionsPerIP   int
 	MaxConnectionsPerUser int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	ListenBacklog         int      // TCP listen backlog size (0 = use default 1024)
 	ProxyProtocol         bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout  string   // Timeout for reading PROXY headers
 	TrustedNetworks       []string // Global trusted networks for parameter forwarding
@@ -481,6 +485,12 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	s.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+
+	// Set listen backlog with reasonable default
+	s.listenBacklog = options.ListenBacklog
+	if s.listenBacklog == 0 {
+		s.listenBacklog = 1024 // Default backlog
+	}
 
 	if s.appendLimit > 0 {
 		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
@@ -765,11 +775,14 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	}
 
 	if s.tlsConfig != nil {
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", imapAddr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create TCP listener: %w", err)
 		}
+		logger.Debug("IMAP: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
@@ -779,11 +792,14 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true)
 		}
 	} else {
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", imapAddr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", imapAddr)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}
+		logger.Debug("IMAP: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListener(tcpListener, connConfig)

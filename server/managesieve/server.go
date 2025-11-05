@@ -47,6 +47,9 @@ type ManageSieveServer struct {
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
 
@@ -85,6 +88,7 @@ type ManageSieveServerOptions struct {
 	MaxConnections         int
 	MaxConnectionsPerIP    int
 	MaxConnectionsPerUser  int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	ListenBacklog          int      // TCP listen backlog size (0 = use default 1024)
 	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
@@ -183,6 +187,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
+	// Set listen backlog with reasonable default
+	serverInstance.listenBacklog = options.ListenBacklog
+	if serverInstance.listenBacklog == 0 {
+		serverInstance.listenBacklog = 1024 // Default backlog
+	}
+
 	// Set up TLS config: Support both file-based certificates and global TLS manager
 	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
 	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
@@ -265,12 +275,15 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if isImplicitTLS {
-		// Implicit TLS - use SoraTLSListener
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Implicit TLS - create TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
 			return
 		}
+		logger.Debug("ManageSieve: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
@@ -280,11 +293,15 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
+		logger.Debug("ManageSieve: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
 		if connConfig.EnableTimeoutChecker {
