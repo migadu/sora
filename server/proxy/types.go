@@ -19,6 +19,22 @@ const (
 	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - user should retry later
 )
 
+// String returns a human-readable representation of AuthResult
+func (a AuthResult) String() string {
+	switch a {
+	case AuthUserNotFound:
+		return "AuthUserNotFound"
+	case AuthSuccess:
+		return "AuthSuccess"
+	case AuthFailed:
+		return "AuthFailed"
+	case AuthTemporarilyUnavailable:
+		return "AuthTemporarilyUnavailable"
+	default:
+		return "AuthUnknown"
+	}
+}
+
 // Prelookup error types for distinguishing failure modes
 var (
 	// ErrPrelookupTransient represents a transient error (network issue, 5xx, circuit breaker open)

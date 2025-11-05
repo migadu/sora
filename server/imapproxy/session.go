@@ -564,11 +564,24 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.Log("attempting authentication via prelookup", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
-		// Log prelookup response immediately
-		s.Log("prelookup response", "auth_result", authResult, "has_error", err != nil, "error", err)
+		// Log prelookup response with all details
+		backend := "none"
+		actualEmail := "none"
+		if routingInfo != nil {
+			if routingInfo.ServerAddress != "" {
+				backend = routingInfo.ServerAddress
+			}
+			if routingInfo.ActualEmail != "" {
+				actualEmail = routingInfo.ActualEmail
+			}
+		}
+		if err != nil {
+			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+		} else {
+			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+		}
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
