@@ -181,10 +181,7 @@ type SoraConnConfig struct {
 func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 	now := time.Now()
 
-	// Apply defaults
-	if config.MinBytesPerMinute == 0 {
-		config.MinBytesPerMinute = 512 // Default: 512 bytes/minute (balanced slowloris protection)
-	}
+	// Apply defaults (MinBytesPerMinute default is protocol-specific, set by caller)
 	if config.AbsoluteTimeout == 0 {
 		config.AbsoluteTimeout = 30 * time.Minute // Default: 30 minutes
 	}

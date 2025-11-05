@@ -256,6 +256,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 // Start starts the IMAP proxy server.
 func (s *Server) Start() error {
+
 	// Three TLS scenarios:
 	// 1. Per-server TLS: cert files provided
 	// 2. Global TLS: tls=true, no cert files, global TLS config provided
@@ -286,7 +287,6 @@ func (s *Server) Start() error {
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		var tcpListener net.Listener
-		var err error
 		if s.listenBacklog > 0 {
 			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)

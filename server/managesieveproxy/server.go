@@ -278,7 +278,7 @@ func (s *Server) Start() error {
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 			OnTimeout: func(conn net.Conn, reason string) {
 				// Send BYE with TRYLATER before closing (RFC 5804)
 				var message string
@@ -320,7 +320,7 @@ func (s *Server) Start() error {
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 			OnTimeout: func(conn net.Conn, reason string) {
 				// Send BYE with TRYLATER before closing (RFC 5804)
 				var message string

@@ -1,19 +1,22 @@
 # SORA MAIL SERVER - TEST CONFIGURATION FILE
 # =============================================================================
-# 
+#
 # This configuration file is specifically for running database integration tests.
 # It uses a local PostgreSQL database with test-specific settings.
 #
 # SETUP INSTRUCTIONS:
-# 1. Create a test database: createdb sora_test
-# 2. Enable pg_trgm extension: psql sora_test -c "CREATE EXTENSION pg_trgm;"
-# 3. Run tests with: go test -tags=integration ./db
+# 1. Create a test database: createdb sora_test_db
+# 2. Enable pg_trgm extension: psql sora_test_db -c "CREATE EXTENSION pg_trgm;"
+# 3. Run tests with: go test -tags=integration ./integration_tests/imap
 #
 # DATABASE REQUIREMENTS:
 # - PostgreSQL server running locally
-# - Database named 'sora_test' (separate from production)
+# - Database named 'sora_test_db' (separate from production)
 # - pg_trgm extension enabled
 # - User with CREATE/DROP privileges for test isolation
+#
+# NOTE: The integration test setup (common/testutil.go) defaults to 'sora_test_db'
+# but can be overridden with SORA_TEST_DB_NAME environment variable
 
 # TEST DATABASE CONFIGURATION
 # =============================================================================
@@ -30,7 +33,7 @@ hosts = ["localhost"]
 port = 5432
 user = "postgres"
 password = "password"
-name = "sora_mail_db"
+name = "sora_test_db"
 tls = false
 
 # Smaller connection pools for testing
@@ -47,7 +50,7 @@ hosts = ["localhost"]
 port = 5432
 user = "postgres"
 password = "password"
-name = "sora_mail_db"
+name = "sora_test_db"
 tls = false
 
 max_conns = 5

@@ -296,7 +296,7 @@ func (s *POP3ProxyServer) Start() error {
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send POP3 error response before closing
 			var message string
