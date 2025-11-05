@@ -55,6 +55,9 @@ type Server struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -142,6 +145,7 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
+	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
@@ -243,6 +247,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		prelookupConfig:        opts.PreLookup,
 		remoteUseIDCommand:     opts.RemoteUseIDCommand,
 		limiter:                limiter,
+		listenBacklog:          opts.ListenBacklog,
 		debug:                  opts.Debug,
 		debugWriter:            debugWriter,
 		activeSessions:         make(map[*Session]struct{}),
@@ -279,8 +284,13 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		if s.listenBacklog > 0 {
+			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		}
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
@@ -313,8 +323,13 @@ func (s *Server) Start() error {
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
 		s.listenerMu.Lock()
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		if s.listenBacklog > 0 {
+			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		}
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
@@ -351,7 +366,13 @@ func (s *Server) Start() error {
 	} else {
 		// Scenario 3: No TLS
 		s.listenerMu.Lock()
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		if s.listenBacklog > 0 {
+			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		}
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)

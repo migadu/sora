@@ -52,6 +52,9 @@ type POP3ProxyServer struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -140,6 +143,7 @@ type POP3ProxyServerOptions struct {
 	MaxConnections      int      // Maximum total connections (0 = unlimited)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
+	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -240,6 +244,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		remoteUseXCLIENT:       options.RemoteUseXCLIENT,
 		limiter:                limiter,
+		listenBacklog:          options.ListenBacklog,
 		debug:                  options.Debug,
 		debugWriter:            debugWriter,
 		activeSessions:         make(map[*POP3ProxySession]struct{}),
@@ -309,8 +314,14 @@ func (s *POP3ProxyServer) Start() error {
 		},
 	}
 
-	// Create base TCP listener
-	tcpListener, err := net.Listen("tcp", s.addr)
+	// Create base TCP listener with custom backlog
+	listenConfig := &net.ListenConfig{}
+	if s.listenBacklog > 0 {
+		// Use custom Control function to set backlog (platform-specific)
+		listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+		logger.Debug("POP3 Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+	}
+	tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 	if err != nil {
 		s.cancel()
 		return fmt.Errorf("failed to create TCP listener: %w", err)

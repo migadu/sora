@@ -553,7 +553,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic ManageSieve
-			logger.Debug("ManageSieve: No PROXY protocol header - treating as direct", "remote", conn.RemoteAddr())
+			logger.Debug("ManageSieve: No PROXY protocol header - treating as direct", "remote", serverPkg.GetAddrString(conn.RemoteAddr()))
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
@@ -561,7 +561,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
 		// Note: We don't have access to server name in this listener, use generic ManageSieve
-		logger.Debug("ManageSieve: PROXY protocol error - rejecting", "remote", conn.RemoteAddr(), "error", err)
+		logger.Debug("ManageSieve: PROXY protocol error - rejecting", "remote", serverPkg.GetAddrString(conn.RemoteAddr()), "error", err)
 		continue
 	}
 }
