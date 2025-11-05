@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Sora is a production-ready, cloud-native email server written in Go. It provides enterprise-grade email infrastructure with modern storage backends, comprehensive monitoring, proxy capabilities, horizontal scaling support, and advanced security features.
 
 **Key Technologies:**
-- Language: Go 1.23+
+- Language: Go 1.24.0+
 - Database: PostgreSQL 14+ (with pg_trgm extension for full-text search)
 - Object Storage: S3-compatible storage for message bodies
 - Clustering: HashiCorp memberlist (gossip protocol) for cluster coordination
-- Protocols: IMAP4rev1, LMTP, POP3, ManageSieve, SIEVE, HTTP API
+- Protocols: IMAP4rev1, LMTP, POP3, ManageSieve, SIEVE, Admin API (HTTP), User API (HTTP)
 
 **Status:** PRODUCTION READY with comprehensive resilience, security, and clustering features
 
@@ -113,11 +113,15 @@ go test -run "TestMessage" ./db          # Message operation tests
    - server/pop3/ - POP3 with SASL authentication
    - server/managesieve/ - SIEVE script management
    - server/sieveengine/ - SIEVE script interpreter
-   - **server/httpapi/** - REST API for administration and monitoring
+   - **server/adminapi/** - REST API for administration and monitoring (HTTP)
+   - **server/userapi/** - REST API for user mailbox access (HTTP, JWT-based)
+   - **server/delivery/** - Shared message delivery functionality (used by LMTP and Admin API)
+   - **server/aclservice/** - ACL service for shared mailbox access control
+   - **server/idgen/** - Custom ID generator (base32-encoded hybrid IDs instead of UUIDs)
    - **server/uploader/** - Background S3 upload worker
    - **server/cleaner/** - Background message cleanup worker
    - **server/relayqueue/** - Disk-based relay queue with retry logic
-   - Each protocol has proxy variants in `*proxy/` subdirectories for horizontal scaling
+   - Each protocol has proxy variants in `*proxy/` subdirectories for horizontal scaling (including userapiproxy/)
 
 5. **storage/** - S3 abstraction for message body storage
    - Circuit breaker for resilience
@@ -149,12 +153,20 @@ go test -run "TestMessage" ./db          # Message operation tests
 
 10. **integration_tests/** - Comprehensive integration test suite
     - Organized by protocol: imap/, lmtp/, pop3/, managesieve/
-    - Proxy tests: imapproxy/, lmtpproxy/, pop3proxy/, managesieveproxy/
+    - Proxy tests: imapproxy/, lmtpproxy/, pop3proxy/, managesieveproxy/, userapiproxy/
     - Connection limits: connection_limits/, *_connection_limits/
-    - HTTP API tests: httpapi/
+    - HTTP API tests: adminapi/, userapi/
+    - Relay tests: relay/
     - Configuration tests: config/
     - ACL and shared mailbox tests: imap/acl_test.go, imap/shared_mailbox_test.go
     - Admin tool tests in cmd/sora-admin/*_test.go
+
+11. **server/idgen/** - Custom ID generator for message and mailbox IDs
+    - Hybrid format: timestamp + node ID + sequence + random data
+    - Base32-encoded ~20 character strings (12 bytes)
+    - Advantages: sortable by time, collision-resistant, URL-safe
+    - Replaces UUID v4 for better performance and debuggability
+    - See server/idgen/README.md for detailed format specification
 
 ### Message Flow
 
@@ -293,7 +305,7 @@ The import/export tools use a local SQLite database (`sora-maildir.db`) to track
 
 This enables fast re-runs and true incremental imports without re-checking PostgreSQL or S3.
 
-### HTTP API
+### Admin API (HTTP)
 
 Sora provides a comprehensive REST API for administration and monitoring:
 
@@ -308,8 +320,9 @@ Sora provides a comprehensive REST API for administration and monitoring:
 
 #### Configuration
 ```toml
-[servers.http_api]
-start = true
+[[server]]
+type = "http_admin_api"
+name = "admin-api"
 addr = ":8080"
 api_key = "your-secure-api-key-here"
 allowed_hosts = ["127.0.0.1", "10.0.0.0/8"]
@@ -330,6 +343,64 @@ curl -X POST -H "Authorization: Bearer $API_KEY" \
   http://localhost:8080/admin/connections/kick \
   -d '{"email": "user@example.com"}'
 ```
+
+### User API (HTTP)
+
+Sora provides a modern RESTful HTTP API for user mailbox access, designed as a simpler alternative to IMAP/POP3 for web and mobile applications:
+
+#### Features
+- **JWT Authentication**: Token-based authentication with configurable expiration
+- **Mailbox Operations**: List, create, delete, rename mailboxes
+- **Message Operations**: Fetch, move, delete messages with full metadata
+- **Full-Text Search**: Search messages by sender, recipient, subject, and body
+- **Sieve Filters**: Manage server-side filtering rules
+- **JSON Responses**: Modern RESTful API with standard HTTP verbs
+- **CORS Support**: Configurable origins for web applications
+- **Stateless**: No session management, fully scalable
+- **Proxy Support**: User API proxy for horizontal scaling (user_api_proxy)
+
+#### Configuration
+```toml
+[[server]]
+type = "http_user_api"
+name = "user-api"
+addr = ":8081"
+jwt_secret = "your-secret-jwt-signing-key-here"
+token_duration = "24h"
+token_issuer = "sora-mail-api"
+allowed_origins = ["*"]  # Use specific origins in production
+allowed_hosts = []       # IP-based access control
+tls = false
+```
+
+#### Example Usage
+```bash
+# Login and get JWT token
+curl -X POST http://localhost:8081/user/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "password"}'
+
+# List mailboxes (with JWT token)
+curl -H "Authorization: Bearer $JWT_TOKEN" \
+  http://localhost:8081/user/mailboxes
+
+# Fetch messages from INBOX
+curl -H "Authorization: Bearer $JWT_TOKEN" \
+  http://localhost:8081/user/mailboxes/INBOX/messages
+
+# Search messages
+curl -H "Authorization: Bearer $JWT_TOKEN" \
+  "http://localhost:8081/user/search?q=from:sender@example.com"
+```
+
+#### Compared to IMAP/POP3
+- ✅ Simpler authentication (JWT instead of SASL)
+- ✅ JSON responses (easier to parse than IMAP literals)
+- ✅ RESTful semantics (standard HTTP verbs)
+- ✅ Better mobile support (less connection overhead)
+- ✅ Built-in search API
+- ❌ No real-time IDLE notifications (use polling)
+- ❌ No partial fetch of message parts (fetch full body)
 
 ### JA4 TLS Fingerprinting
 
@@ -396,17 +467,24 @@ Comprehensive monitoring with 26 Prometheus metrics:
 
 ## Database Schema
 
-The PostgreSQL schema (db/schema.sql) includes:
+The PostgreSQL schema is managed via migrations in `db/migrations/`. The current schema (migration 000001) includes:
+
 - **accounts**: Email accounts with bcrypt/SSHA512 password hashing
 - **credentials**: Multiple credentials per account (primary + aliases)
 - **mailboxes**: Hierarchical mailbox structure with subscriptions
 - **mailbox_acls**: Access control lists for shared mailboxes (RFC 4314)
-- **messages**: Message metadata with full-text search indexing
-- **message_flags**: User-defined IMAP flags
+- **messages**: Message metadata with full-text search indexing (using pg_trgm extension)
+- **message_sequences**: Sequence tracking for IMAP UIDs
+- **mailbox_stats**: Cached mailbox statistics
+- **message_contents**: Full-text searchable message content
+- **pending_uploads**: Messages queued for S3 upload
 - **sieve_scripts**: Per-account SIEVE filtering scripts
-- **vacation_tracking**: Vacation response tracking to prevent loops
-- **s3_upload_queue**: Queued messages for background S3 upload
+- **vacation_responses**: Vacation response tracking to prevent loops
 - **auth_attempts**: Rate limiting and IP blocking data
+- **locks**: Distributed locking for cluster coordination
+- **health_status**: Component health tracking
+- **cache_metrics**: Cache performance metrics
+- **metadata**: System metadata and configuration
 
 ## Important Considerations
 
@@ -432,7 +510,7 @@ The PostgreSQL schema (db/schema.sql) includes:
 
 ### Modifying Message Storage
 1. Update db/message.go for metadata changes
-2. Update db/schema.sql if adding/changing columns
+2. Create new migration in db/migrations/ if adding/changing columns
 3. Modify storage/storage.go for S3 operations
 4. Consider impact on cache/cache.go
 5. Update background workers if needed (upload_worker.go, cleaner.go)
@@ -485,9 +563,15 @@ Integration tests are organized by scope and run via `./run_integration_tests.sh
 ./run_integration_tests.sh --scope pop3                    # POP3 protocol tests
 ./run_integration_tests.sh --scope managesieve             # ManageSieve tests
 ./run_integration_tests.sh --scope sora-admin              # Import/export tests
+./run_integration_tests.sh --scope adminapi                # Admin API (HTTP) tests
+./run_integration_tests.sh --scope userapi                 # User API (HTTP) tests
 ./run_integration_tests.sh --scope imapproxy               # IMAP proxy tests
+./run_integration_tests.sh --scope lmtpproxy               # LMTP proxy tests
+./run_integration_tests.sh --scope pop3proxy               # POP3 proxy tests
+./run_integration_tests.sh --scope managesieveproxy        # ManageSieve proxy tests
+./run_integration_tests.sh --scope userapiproxy            # User API proxy tests
 ./run_integration_tests.sh --scope connection_limits       # Connection limit tests
-./run_integration_tests.sh --scope httpapi                 # HTTP API tests
+./run_integration_tests.sh --scope relay                   # Relay queue tests
 ./run_integration_tests.sh --scope config                  # Configuration tests
 ```
 
@@ -550,9 +634,11 @@ go test -run "TestACL" ./db         # ACL and shared mailbox tests
 - Tests automatically check for database availability and skip if unavailable
 - See `db/README_TESTING.md` for detailed testing guide
 
-### Working with HTTP API
+### Working with HTTP APIs
 
-1. **Enable API**: Configure in config.toml
+#### Admin API
+
+1. **Enable API**: Configure in config.toml with type = "http_admin_api"
 2. **Generate API Key**: Use strong random key
 3. **Restrict Access**: Configure allowed_hosts with IP/CIDR
 4. **Test Endpoints**: Use curl or integration tests
@@ -560,16 +646,43 @@ go test -run "TestACL" ./db         # ACL and shared mailbox tests
 
 Example development workflow:
 ```bash
-# Start server with API enabled
+# Start server with Admin API enabled
 ./start-dev.sh
 
-# Test API (in another terminal)
+# Test Admin API (in another terminal)
 export API_KEY="your-api-key"
 curl -H "Authorization: Bearer $API_KEY" \
-  http://localhost:8080/adming/health/overview
+  http://localhost:8080/admin/health/overview
 
 # Run integration tests
-go test -v -tags=integration ./integration_tests/httpapi
+go test -v -tags=integration ./integration_tests/adminapi
+```
+
+#### User API
+
+1. **Enable API**: Configure in config.toml with type = "http_user_api"
+2. **Generate JWT Secret**: Use strong random key for signing tokens
+3. **Configure CORS**: Set allowed_origins for web applications
+4. **Test Endpoints**: Use curl or integration tests
+5. **Monitor**: Check logs for authentication and errors
+
+Example development workflow:
+```bash
+# Start server with User API enabled
+./start-dev.sh
+
+# Test User API (in another terminal)
+# Get JWT token
+TOKEN=$(curl -X POST http://localhost:8081/user/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "password"}' | jq -r '.token')
+
+# List mailboxes
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8081/user/mailboxes
+
+# Run integration tests
+go test -v -tags=integration ./integration_tests/userapi
 ```
 
 ### Monitoring Cluster Health
@@ -635,13 +748,24 @@ Do not use the standard `log` package - use `logger` instead.
 - Leader-only certificate issuance
 - Hot reload without restart
 
-### HTTP API (2025)
-- Full REST API with 25+ endpoints
+### Admin API (HTTP) (2025)
+- Full REST API with 25+ endpoints for administration
 - Account and credential management
-- Connection monitoring and control
+- Connection monitoring and control (kick users, view stats)
 - Cache and health monitoring
-- Bearer token authentication
-- Host-based access control
+- Upload queue monitoring
+- Bearer token (API key) authentication
+- Host-based access control with CIDR support
+
+### User API (HTTP) (2025)
+- RESTful HTTP API for user mailbox access
+- JWT-based authentication with configurable token expiration
+- Alternative to IMAP/POP3 for web and mobile applications
+- Mailbox and message operations (list, create, delete, move)
+- Full-text search capabilities
+- Sieve filter management
+- CORS support for web applications
+- User API proxy for horizontal scaling (user_api_proxy)
 
 ### Relay Queue (2025)
 - Disk-based persistence with retry logic
@@ -667,6 +791,14 @@ Do not use the standard `log` package - use `logger` instead.
 - Backend: Local tracking (currently disabled, infrastructure ready)
 - Per-user connection limits
 - Cluster-wide kick mechanism
+
+### Custom ID Generator (2025)
+- Hybrid ID format replacing UUID v4
+- Base32-encoded 12-byte IDs (~20 characters)
+- Components: timestamp + node ID + sequence + random data
+- Sortable by creation time for better query performance
+- Collision-resistant in distributed systems
+- URL-safe and human-readable format
 
 ## Related Documentation
 
