@@ -194,6 +194,9 @@ type LMTPServerBackend struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// Trusted networks for connection filtering
 	trustedNetworks []*net.IPNet
 
@@ -222,6 +225,7 @@ type LMTPServerOptions struct {
 	TLSConfig            *tls.Config // Global TLS config from TLS manager (optional)
 	MaxConnections       int
 	MaxConnectionsPerIP  int
+	ListenBacklog        int      // TCP listen backlog size (0 = use default 1024)
 	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
 	TrustedNetworks      []string // Global trusted networks for parameter forwarding
@@ -277,6 +281,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// LMTP doesn't use per-IP connection limits, only total connection limits
 	limiterTrustedProxies := server.GetTrustedProxiesForServer(backend.proxyReader)
 	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", options.MaxConnections, 0, limiterTrustedProxies)
+
+	// Set listen backlog with reasonable default
+	backend.listenBacklog = options.ListenBacklog
+	if backend.listenBacklog == 0 {
+		backend.listenBacklog = 1024 // Default backlog
+	}
 
 	// Initialize Sieve script cache with a reasonable default size and TTL
 	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
@@ -497,21 +507,23 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	var listener net.Listener
 	var err error
 
+	// Create base TCP listener with custom backlog
+	listenConfig := &net.ListenConfig{}
+	listenConfig.Control = server.MakeListenControl(b.listenBacklog)
+	tcpListener, err := listenConfig.Listen(context.Background(), "tcp", b.server.Addr)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create listener: %w", err)
+		return
+	}
+	logger.Debug("LMTP: Using custom listen backlog", "server", b.name, "backlog", b.listenBacklog)
+
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if b.tlsConfig != nil && b.server.TLSConfig == nil {
-		// Implicit TLS - use TLS listener
-		listener, err = tls.Listen("tcp", b.server.Addr, b.tlsConfig)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to create TLS listener: %w", err)
-			return
-		}
+		// Implicit TLS - wrap TCP listener with TLS
+		listener = tls.NewListener(tcpListener, b.tlsConfig)
 		logger.Info("LMTP server listening with TLS", "name", b.name, "addr", b.server.Addr)
 	} else {
-		listener, err = net.Listen("tcp", b.server.Addr)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to create listener: %w", err)
-			return
-		}
+		listener = tcpListener
 		logger.Info("LMTP server listening", "name", b.name, "addr", b.server.Addr, "tls", false)
 	}
 	defer listener.Close()

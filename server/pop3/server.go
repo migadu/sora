@@ -46,6 +46,9 @@ type POP3Server struct {
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
 
@@ -85,6 +88,7 @@ type POP3ServerOptions struct {
 	MaxConnections         int
 	MaxConnectionsPerIP    int
 	MaxConnectionsPerUser  int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	ListenBacklog          int      // TCP listen backlog size (0 = use default 1024)
 	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
@@ -170,6 +174,12 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
 
+	// Set listen backlog with reasonable default
+	server.listenBacklog = options.ListenBacklog
+	if server.listenBacklog == 0 {
+		server.listenBacklog = 1024 // Default backlog
+	}
+
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
@@ -242,12 +252,16 @@ func (s *POP3Server) Start(errChan chan error) {
 	}
 
 	if s.tlsConfig != nil {
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
 			return
 		}
+		logger.Debug("POP3: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		// Use SoraTLSListener for TLS with timeout protection
 		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
@@ -257,12 +271,16 @@ func (s *POP3Server) Start(errChan chan error) {
 			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.cancel()
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return
 		}
+		logger.Debug("POP3: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListener(tcpListener, connConfig)

@@ -761,6 +761,9 @@ debug = false                 # Enable debug logging for this IMAP server
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
 max_connections = 1000        # Maximum concurrent IMAP connections to this server instance.
 max_connections_per_ip = 10   # Max connections per client IP. Set to 0 if behind a load balancer.
+listen_backlog = 4096         # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
+                              # FreeBSD/Linux default is often too small (~128-512). Recommended: 4096-8192 for high-load servers.
+                              # Small backlog causes SYN queue to fill, leading to ~60s connection delays.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
 append_limit = "25mb"         # Maximum message size for IMAP APPEND. Empty = no limit.
