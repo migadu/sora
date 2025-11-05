@@ -516,14 +516,14 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.DebugLog("Attempting prelookup auth for user: %s", usernameForPrelookup)
+		s.Log("attempting prelookup auth for user: %s", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
 				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				s.DebugLog("Prelookup invalid response - server bug", "error", err)
+				s.WarnLog("prelookup invalid response - server bug", "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 				return fmt.Errorf("prelookup server error: invalid response")
@@ -532,25 +532,25 @@ func (s *Session) authenticateUser(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					s.DebugLog("Prelookup transient error - fallback enabled", "error", err)
+					s.DebugLog("prelookup transient error - fallback enabled", "error", err)
 					// Fallthrough to main DB auth
 				} else {
-					s.DebugLog("Prelookup transient error - fallback disabled", "error", err)
+					s.DebugLog("prelookup transient error - fallback disabled", "error", err)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
 				}
 			} else {
 				// Unknown error type - log and fallthrough
-				s.DebugLog("Prelookup unknown error - attempting fallback", "error", err)
+				s.WarnLog("prelookup unknown error - attempting fallback", "error", err)
 				// Fallthrough to main DB auth
 			}
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.DebugLog("Prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				s.DebugLog("Prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
+				s.DebugLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -578,21 +578,21 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
 				}
-				s.DebugLog("Prelookup auth failed - bad password")
+				s.Log("prelookup auth failed - bad password")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				s.DebugLog("Prelookup service temporarily unavailable")
+				s.WarnLog("Prelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.DebugLog("User not found in prelookup - trying main DB")
+				s.Log("User not found in prelookup - trying main DB")
 			}
 		}
 	}

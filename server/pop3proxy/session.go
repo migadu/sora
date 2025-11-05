@@ -416,14 +416,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.DebugLog("Attempting authentication via prelookup for user: %s", usernameForPrelookup)
+		s.Log("attempting authentication via prelookup for user: %s", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
 				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				s.WarnLog("Prelookup returned invalid response - server bug, rejecting authentication: %v", err)
+				s.WarnLog("prelookup returned invalid response - server bug, rejecting authentication: %v", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 				return fmt.Errorf("prelookup server error: invalid response")
@@ -432,10 +432,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					s.DebugLog("Prelookup transient error, fallback enabled - attempting main DB: %v", err)
+					s.WarnLog("prelookup transient error, fallback enabled - attempting main DB: %v", err)
 					// Fallthrough to main DB auth
 				} else {
-					s.WarnLog("Prelookup transient error, fallback disabled - rejecting authentication: %v", err)
+					s.WarnLog("prelookup transient error, fallback disabled - rejecting authentication: %v", err)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
@@ -447,7 +447,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.DebugLog("prelookup successful (account_id: %d, master_auth_validated: %v)", routingInfo.AccountID, masterAuthValidated)
+				s.Log("prelookup successful (account_id: %d, master_auth_validated: %v)", routingInfo.AccountID, masterAuthValidated)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -494,14 +494,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				s.DebugLog("Prelookup service temporarily unavailable")
+				s.WarnLog("relookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.DebugLog("User not found in prelookup, attempting main DB")
+				s.Log("user not found in prelookup, attempting main DB")
 			}
 		}
 	}

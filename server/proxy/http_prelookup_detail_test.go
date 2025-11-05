@@ -34,14 +34,14 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 		{
 			name:             "email_with_master_token",
 			inputEmail:       "user@example.com@TOKEN",
-			expectedURLEmail: "user@example.com@token",
-			description:      "Master token preserved, normalized to lowercase",
+			expectedURLEmail: "user@example.com@TOKEN", // Case preserved for security
+			description:      "Master token preserved with original case",
 		},
 		{
 			name:             "email_with_detail_and_master_token",
 			inputEmail:       "user+tag@example.com@TOKEN",
-			expectedURLEmail: "user@example.com@token",
-			description:      "+detail stripped, master token preserved",
+			expectedURLEmail: "user@example.com@TOKEN", // Case preserved for security
+			description:      "+detail stripped, master token case preserved",
 		},
 		{
 			name:             "complex_detail",
@@ -52,8 +52,8 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 		{
 			name:             "complex_detail_with_token",
 			inputEmail:       "user+important.tag@example.com@MyToken123",
-			expectedURLEmail: "user@example.com@mytoken123",
-			description:      "Complex +detail stripped, token preserved and lowercased",
+			expectedURLEmail: "user@example.com@MyToken123", // Case preserved for security
+			description:      "Complex +detail stripped, token case preserved",
 		},
 	}
 
@@ -131,7 +131,7 @@ func TestHTTPPrelookupURLEncoding(t *testing.T) {
 		{
 			name:          "at_symbol_in_token",
 			inputEmail:    "user@example.com@TOKEN",
-			expectedParam: "user@example.com@token",
+			expectedParam: "user@example.com@TOKEN", // Case preserved for security
 			description:   "@ symbol in master token should be encoded",
 		},
 	}

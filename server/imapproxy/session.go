@@ -409,6 +409,7 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
+		logger.Debug("Comparing master username", "provided_suffix", parsedAddr.Suffix(), "configured_master", string(s.server.masterUsername))
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if !checkMasterCredential(password, s.server.masterPassword) {
@@ -438,14 +439,14 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.DebugLog("attempting authentication via prelookup for user: %s", usernameForPrelookup)
+		s.Log("attempting authentication via prelookup for user: %s", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
 				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				logger.Error("Prelookup returned invalid response - server bug", "proxy", s.server.name, "user", username, "error", err)
+				logger.Error("prelookup returned invalid response - server bug", "proxy", s.server.name, "user", username, "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("prelookup server error: invalid response")
@@ -454,7 +455,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					s.DebugLog("prelookup transient error, fallback enabled: %v", err)
+					s.WarnLog("prelookup transient error, fallback enabled: %v", err)
 					// Fallthrough to main DB auth
 				} else {
 					s.WarnLog("prelookup transient error, fallback disabled: %v", err)
@@ -469,7 +470,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.DebugLog("prelookup successful (account_id: %d, master_auth_validated: %v)", routingInfo.AccountID, masterAuthValidated)
+				s.Log("prelookup successful (account_id: %d, master_auth_validated: %v)", routingInfo.AccountID, masterAuthValidated)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -497,7 +498,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
 				}
-				s.DebugLog("prelookup authentication failed - bad password")
+				s.Log("prelookup authentication failed - bad password")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
@@ -511,7 +512,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.DebugLog("user not found in prelookup, attempting main DB")
+				s.Log("user not found in prelookup, attempting main DB")
 			}
 		}
 	}

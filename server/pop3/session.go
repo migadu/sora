@@ -32,7 +32,6 @@ type POP3Session struct {
 	server.Session
 	server         *POP3Server
 	conn           *net.Conn    // Connection to the client
-	*server.User                // User associated with the session
 	mutex          sync.RWMutex // Mutex for protecting session state
 	mutexHelper    *server.MutexTimeoutHelper
 	authenticated  bool               // Flag to indicate if the user has been authenticated
@@ -834,10 +833,6 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				continue
 			}
-			// Auto-free memory after processing
-			if s.memTracker != nil && bodyData != nil {
-				defer s.memTracker.Free(int64(len(bodyData)))
-			}
 
 			// Normalize line endings for consistent processing
 			messageStr := string(bodyData)
@@ -855,6 +850,10 @@ func (s *POP3Session) handleConnection() {
 				writer.WriteString(stuffedResult)
 				writer.WriteString("\r\n.\r\n")
 				s.DebugLog("retrieved headers for message %d", msg.UID)
+				// Free memory immediately after sending response
+				if s.memTracker != nil && bodyData != nil {
+					s.memTracker.Free(int64(len(bodyData)))
+				}
 				continue
 			}
 
@@ -895,6 +894,11 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(stuffedResult)
 			writer.WriteString("\r\n.\r\n")
 			s.DebugLog("retrieved top %d lines of message %d", lines, msg.UID)
+
+			// Free memory immediately after sending response
+			if s.memTracker != nil && bodyData != nil {
+				s.memTracker.Free(int64(len(bodyData)))
+			}
 			success = true
 
 		case "RETR":
@@ -1032,15 +1036,15 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				continue
 			}
-			// Auto-free memory after processing
-			if s.memTracker != nil && bodyData != nil {
-				defer s.memTracker.Free(int64(len(bodyData)))
-			}
 			s.DebugLog("retrieved message body for UID %d", msg.UID)
 
 			// Validate body data to prevent empty line protocol violations
 			if len(bodyData) == 0 {
 				s.WarnLog("Empty message body for UID %d (expected size: %d)", msg.UID, msg.Size)
+				// Free memory before error handling
+				if s.memTracker != nil {
+					s.memTracker.Free(int64(len(bodyData)))
+				}
 				if s.handleClientError(writer, "-ERR Message body is empty\r\n") {
 					return
 				}
@@ -1058,6 +1062,11 @@ func (s *POP3Session) handleConnection() {
 			writer.WriteString(stuffedBody)
 			writer.WriteString("\r\n.\r\n")
 			s.DebugLog("retrieved message %d", msg.UID)
+
+			// Free memory immediately after sending response
+			if s.memTracker != nil && bodyData != nil {
+				s.memTracker.Free(int64(len(bodyData)))
+			}
 
 			// Track successful message retrieval
 			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()

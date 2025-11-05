@@ -45,25 +45,25 @@ func TestParseAddressWithMasterToken(t *testing.T) {
 			name:         "email with master token",
 			input:        "user@example.com@TOKEN",
 			expectError:  false,
-			expectAddr:   "user@example.com@token",
+			expectAddr:   "user@example.com@TOKEN", // Suffix case preserved
 			expectDomain: "example.com",
 			expectLocal:  "user",
 			expectDetail: "",
-			expectToken:  "token",
+			expectToken:  "TOKEN", // Suffix case preserved
 			expectBase:   "user@example.com",
-			expectMaster: "user@example.com@token",
+			expectMaster: "user@example.com@TOKEN", // Suffix case preserved
 		},
 		{
 			name:         "email with +detail and master token",
 			input:        "user+tag@example.com@TOKEN",
 			expectError:  false,
-			expectAddr:   "user+tag@example.com@token",
+			expectAddr:   "user+tag@example.com@TOKEN", // Suffix case preserved
 			expectDomain: "example.com",
 			expectLocal:  "user+tag",
 			expectDetail: "tag",
-			expectToken:  "token",
+			expectToken:  "TOKEN", // Suffix case preserved
 			expectBase:   "user@example.com",
-			expectMaster: "user@example.com@token",
+			expectMaster: "user@example.com@TOKEN", // Suffix case preserved
 		},
 		{
 			name:        "invalid - no @",

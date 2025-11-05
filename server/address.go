@@ -89,9 +89,14 @@ func (a Address) HasSuffix() bool {
 // - A master username (for master password authentication) - validated locally if it matches config
 // - A prelookup token (for HTTP prelookup authentication) - sent to prelookup if it doesn't match
 // Returns the parsed Address with proper validation, stripping +detail for authentication
+func ParseAddressWithMasterToken(input string) (Address, error) {
+	return NewAddress(input)
+}
+
+// NewAddress is an alias for ParseAddressWithMasterToken for backward compatibility
 func NewAddress(input string) (Address, error) {
-	// Normalize: trim and lowercase
-	input = strings.ToLower(strings.TrimSpace(input))
+	// Normalize: trim (but don't lowercase yet - need to preserve suffix case)
+	input = strings.TrimSpace(input)
 
 	// Check for internal whitespace (after trimming)
 	if strings.ContainsAny(input, " \t\n\r") {
@@ -103,7 +108,7 @@ func NewAddress(input string) (Address, error) {
 		return Address{}, fmt.Errorf("address is empty")
 	}
 
-	// Parse suffix (master username or prelookup token)
+	// Parse suffix BEFORE lowercasing (to preserve case for master username/token)
 	// Format: localpart@domain or localpart@domain@SUFFIX (where SUFFIX may contain @)
 	var suffix string
 	var emailPart string
@@ -127,8 +132,12 @@ func NewAddress(input string) (Address, error) {
 		// The email part is everything up to the second @
 		emailPart = input[:firstAt+1+secondAt]
 		// The suffix is everything after the second @ (may contain more @)
+		// IMPORTANT: Preserve original case for suffix (for master username/token comparison)
 		suffix = input[firstAt+1+secondAt+1:]
 	}
+
+	// NOW lowercase the email part for validation
+	emailPart = strings.ToLower(emailPart)
 
 	// Validate the email part (without suffix)
 	emailParts := strings.Split(emailPart, "@")
@@ -155,8 +164,16 @@ func NewAddress(input string) (Address, error) {
 		detail = localPart[plusIndex+1:]
 	}
 
+	// Reconstruct full address with lowercased email part and case-preserved suffix
+	var fullAddr string
+	if suffix != "" {
+		fullAddr = emailPart + "@" + suffix
+	} else {
+		fullAddr = emailPart
+	}
+
 	return Address{
-		fullAddress: input, // Store original input with suffix
+		fullAddress: fullAddr, // Lowercased email + case-preserved suffix
 		localPart:   localPart,
 		domain:      domain,
 		detail:      detail,
