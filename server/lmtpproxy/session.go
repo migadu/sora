@@ -316,16 +316,18 @@ func (s *Session) Log(format string, args ...any) {
 }
 
 // InfoLog logs at INFO level with session context
-func (s *Session) InfoLog(format string, args ...any) {
+func (s *Session) InfoLog(msg string, keyvals ...any) {
 	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
-		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		user = s.username + "/" + fmt.Sprint(s.accountID)
 	} else if s.username != "" {
 		user = s.username
 	}
 
-	logger.Info("Session", "proto", "lmtp_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
+	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
+	allKeyvals = append(allKeyvals, keyvals...)
+	logger.Info(msg, allKeyvals...)
 }
 
 // DebugLog logs at DEBUG level with session context
@@ -333,7 +335,7 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 	if s.server.debug {
 		user := "none"
 		if s.username != "" && s.accountID > 0 {
-			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+			user = s.username + "/" + fmt.Sprint(s.accountID)
 		} else if s.username != "" {
 			user = s.username
 		}
@@ -349,7 +351,7 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 func (s *Session) WarnLog(msg string, keyvals ...any) {
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
-		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		user = s.username + "/" + fmt.Sprint(s.accountID)
 	} else if s.username != "" {
 		user = s.username
 	}
@@ -831,7 +833,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.InfoLog("disconnected (duration: %v)", duration)
+	s.InfoLog("disconnected", "duration", duration)
 
 	// Unregister connection asynchronously - don't block session cleanup
 	if s.accountID > 0 {
