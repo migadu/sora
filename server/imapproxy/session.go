@@ -66,7 +66,7 @@ func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 
-	s.Log("connected")
+	s.InfoLog("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -459,51 +459,31 @@ func (s *Session) sendResponse(response string) error {
 	return s.clientWriter.Flush()
 }
 
-// Log logs at INFO level with session context
-func (s *Session) Log(msg string, keysAndValues ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
+// getLogger returns a ProxySessionLogger for this session
+func (s *Session) getLogger() *server.ProxySessionLogger {
+	return &server.ProxySessionLogger{
+		Protocol:   "imap_proxy",
+		ServerName: s.server.name,
+		ClientConn: s.clientConn,
+		Username:   s.username,
+		AccountID:  s.accountID,
+		Debug:      s.server.debug,
 	}
+}
 
-	allKeyvals := []any{"proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keysAndValues...)
-	logger.Info(msg, allKeyvals...)
+// InfoLog logs at INFO level with session context
+func (s *Session) InfoLog(msg string, keysAndValues ...any) {
+	s.getLogger().InfoLog(msg, keysAndValues...)
 }
 
 // DebugLog logs at DEBUG level with session context
 func (s *Session) DebugLog(msg string, keysAndValues ...any) {
-	if s.server.debug {
-		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		user := "none"
-		if s.username != "" && s.accountID > 0 {
-			user = s.username + "/" + fmt.Sprint(s.accountID)
-		} else if s.username != "" {
-			user = s.username
-		}
-
-		allKeyvals := []any{"proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-		allKeyvals = append(allKeyvals, keysAndValues...)
-		logger.Debug(msg, allKeyvals...)
-	}
+	s.getLogger().DebugLog(msg, keysAndValues...)
 }
 
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keysAndValues ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	allKeyvals := []any{"proto", "imap_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keysAndValues...)
-	logger.Warn(msg, allKeyvals...)
+	s.getLogger().WarnLog(msg, keysAndValues...)
 }
 
 // authenticateUser authenticates the user against the database.
@@ -611,7 +591,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.Log("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.InfoLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -639,7 +619,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue")
 				}
-				s.Log("prelookup authentication failed - bad password")
+				s.InfoLog("prelookup authentication failed - bad password")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
@@ -653,7 +633,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.Log("user not found in prelookup, attempting main DB")
+				s.InfoLog("user not found in prelookup, attempting main DB")
 			}
 		}
 	}
@@ -920,7 +900,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 	}
 
 	// Log authentication at INFO level
-	s.Log("authenticated", "backend", s.serverAddr)
+	s.InfoLog("authenticated", "backend", s.serverAddr)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string
@@ -1007,9 +987,9 @@ func (s *Session) close() {
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
 	if s.username != "" {
-		s.Log("disconnected", "duration", duration, "backend", s.serverAddr)
+		s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 	} else {
-		s.Log("disconnected", "duration", duration)
+		s.InfoLog("disconnected", "duration", duration)
 	}
 
 	// Decrement current connections metric
@@ -1081,7 +1061,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			s.Log("connection kicked - disconnecting user")
+			s.InfoLog("connection kicked - disconnecting user")
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

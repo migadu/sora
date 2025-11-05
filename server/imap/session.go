@@ -71,7 +71,7 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 		if fingerprint, err := s.ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 			s.ja4Fingerprint = fingerprint
 			s.ja4Conn = nil
-			s.Log("[JA4] Captured fingerprint during lazy evaluation: %s", s.ja4Fingerprint)
+			s.InfoLog("[JA4] Captured fingerprint during lazy evaluation: %s", s.ja4Fingerprint)
 
 			// Re-initialize capabilities from server defaults
 			s.sessionCaps = make(imap.CapSet)
@@ -113,13 +113,13 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		} else {
 			clientInfo = "unknown client"
 		}
-		s.Log("Applied capability filters for %s: disabled %v, %d/%d capabilities enabled",
+		s.InfoLog("Applied capability filters for %s: disabled %v, %d/%d capabilities enabled",
 			clientInfo, disabledCaps, len(s.sessionCaps), originalCapCount)
 	}
 }
 
 func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
-	s.Log(format, a...)
+	s.InfoLog(format, a...)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeServerBug,
@@ -217,7 +217,7 @@ func (s *IMAPSession) Close() error {
 		peak := s.memTracker.Peak()
 		metrics.SessionMemoryPeakBytes.WithLabelValues("imap").Observe(float64(peak))
 		if peak > 0 {
-			s.Log("session memory - peak: %s", server.FormatBytes(peak))
+			s.InfoLog("session memory - peak: %s", server.FormatBytes(peak))
 		}
 	}
 
@@ -230,7 +230,7 @@ func (s *IMAPSession) Close() error {
 	if s.IMAPUser != nil {
 		authCount = s.server.authenticatedConnections.Add(-1)
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
-		s.Log("closing session for user: %v (connections: total=%d, authenticated=%d)",
+		s.InfoLog("closing session for user: %v (connections: total=%d, authenticated=%d)",
 			s.IMAPUser.FullAddress(), totalCount, authCount)
 
 		// Unregister connection from tracker
@@ -240,7 +240,7 @@ func (s *IMAPSession) Close() error {
 		s.Session.User = nil
 	} else {
 		authCount = s.server.authenticatedConnections.Load()
-		s.Log("client dropped unauthenticated connection (connections: total=%d, authenticated=%d)",
+		s.InfoLog("client dropped unauthenticated connection (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 
@@ -359,7 +359,7 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 // It uses the server's warmup settings and ensures it only runs once per session.
 func (s *IMAPSession) triggerCacheWarmup() {
 	if s.IMAPUser == nil {
-		s.Log("warmup skipped: no user in session")
+		s.InfoLog("warmup skipped: no user in session")
 		return // Should not happen if called after authentication
 	}
 
@@ -378,7 +378,7 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	err := s.server.WarmupCache(s.server.appCtx, s.AccountID(), s.server.warmupMailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
 	if err != nil {
 		// The WarmupCache method already logs its own errors, so just log a generic failure here.
-		s.Log("cache warmup trigger failed: %v", err)
+		s.InfoLog("cache warmup trigger failed: %v", err)
 	}
 }
 
@@ -391,7 +391,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.Log("Failed to register connection: %v", err)
+			s.InfoLog("Failed to register connection: %v", err)
 			return err
 		}
 	}
@@ -407,7 +407,7 @@ func (s *IMAPSession) unregisterConnection() {
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
-			s.Log("Failed to unregister connection: %v", err)
+			s.InfoLog("Failed to unregister connection: %v", err)
 		}
 	}
 }
@@ -428,7 +428,7 @@ func (s *IMAPSession) startTerminationPoller() {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connection
-			s.Log("Connection kicked - disconnecting user")
+			s.InfoLog("Connection kicked - disconnecting user")
 			s.conn.NetConn().Close()
 		case <-s.ctx.Done():
 			// Session ended normally

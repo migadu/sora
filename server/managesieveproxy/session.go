@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -71,7 +69,7 @@ func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 
-	s.Log("connected")
+	s.InfoLog("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -412,53 +410,31 @@ func (s *Session) sendContinuation() error {
 	return s.clientWriter.Flush()
 }
 
-// Log logs at INFO level with session context
-func (s *Session) Log(msg string, keysAndValues ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
+// InfoLog logs at INFO level with session context
+// getLogger returns a ProxySessionLogger for this session
+func (s *Session) getLogger() *server.ProxySessionLogger {
+	return &server.ProxySessionLogger{
+		Protocol:   "managesieve_proxy",
+		ServerName: s.server.name,
+		ClientConn: s.clientConn,
+		Username:   s.username,
+		AccountID:  s.accountID,
+		Debug:      s.server.debug,
 	}
+}
 
-	allKeyvals := []any{"proto", "managesieve_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keysAndValues...)
-	logger.Info(msg, allKeyvals...)
+func (s *Session) InfoLog(msg string, keysAndValues ...any) {
+	s.getLogger().InfoLog(msg, keysAndValues...)
 }
 
 // DebugLog logs at DEBUG level with session context
 func (s *Session) DebugLog(msg string, keyvals ...any) {
-	if s.server.debug {
-		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		user := "none"
-		if s.username != "" && s.accountID > 0 {
-			user = s.username + "/" + fmt.Sprint(s.accountID)
-		} else if s.username != "" {
-			user = s.username
-		}
-
-		// Build the keyvals array with user field
-		allKeyvals := []any{"proto", "managesieve_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-		allKeyvals = append(allKeyvals, keyvals...)
-		logger.Debug(msg, allKeyvals...)
-	}
+	s.getLogger().DebugLog(msg, keyvals...)
 }
 
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	// Build the keyvals array with user field
-	allKeyvals := []any{"proto", "managesieve_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keyvals...)
-	logger.Warn(msg, allKeyvals...)
+	s.getLogger().WarnLog(msg, keyvals...)
 }
 
 // authenticateUser authenticates the user against the database.
@@ -518,7 +494,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.Log("attempting prelookup auth", "username", usernameForPrelookup)
+		s.InfoLog("attempting prelookup auth", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
@@ -580,7 +556,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
 				}
-				s.Log("prelookup auth failed - bad password")
+				s.InfoLog("prelookup auth failed - bad password")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
@@ -594,7 +570,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.Log("User not found in prelookup - trying main DB")
+				s.InfoLog("User not found in prelookup - trying main DB")
 			}
 		}
 	}
@@ -877,7 +853,7 @@ func (s *Session) authenticateToBackend() error {
 	s.DebugLog("Backend authentication successful")
 
 	// Log authentication at INFO level
-	s.Log("authenticated")
+	s.InfoLog("authenticated")
 
 	return nil
 }
@@ -954,7 +930,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.Log("disconnected", "duration", duration)
+	s.InfoLog("disconnected", "duration", duration)
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
@@ -1023,7 +999,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			s.Log("connection kicked")
+			s.InfoLog("connection kicked")
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

@@ -489,7 +489,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	// Create logging function for the mutex helper
 	logFunc := func(format string, args ...any) {
-		s.Log(format, args...)
+		s.InfoLog(format, args...)
 	}
 
 	// Initialize the mutex helper
@@ -497,7 +497,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	// Log connection with connection counters
 	totalCount := b.totalConnections.Load()
-	s.Log("new session remote=%s id=%s (connections: total=%d)",
+	s.InfoLog("new session remote=%s id=%s (connections: total=%d)",
 		s.RemoteIP, s.Id, totalCount)
 
 	return s, nil

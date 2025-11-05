@@ -71,7 +71,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
+			s.InfoLog("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
 				addressParsed.BaseAddress(), addressParsed.Suffix(), totalCount, authCount)
 
 			// Prometheus metrics - successful authentication
@@ -151,7 +151,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	authCount := s.server.authenticatedConnections.Add(1)
 	totalCount := s.server.totalConnections.Load()
-	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
+	s.InfoLog("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
 		addressParsed.BaseAddress(), totalCount, authCount)
 
 	// Prometheus metrics - successful authentication

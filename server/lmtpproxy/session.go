@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -315,51 +313,31 @@ func (s *Session) Log(format string, args ...any) {
 	}
 }
 
+// getLogger returns a ProxySessionLogger for this session
+func (s *Session) getLogger() *server.ProxySessionLogger {
+	return &server.ProxySessionLogger{
+		Protocol:   "lmtp_proxy",
+		ServerName: s.server.name,
+		ClientConn: s.clientConn,
+		Username:   s.username,
+		AccountID:  s.accountID,
+		Debug:      s.server.debug,
+	}
+}
+
 // InfoLog logs at INFO level with session context
 func (s *Session) InfoLog(msg string, keyvals ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keyvals...)
-	logger.Info(msg, allKeyvals...)
+	s.getLogger().InfoLog(msg, keyvals...)
 }
 
 // DebugLog logs at DEBUG level with session context
 func (s *Session) DebugLog(msg string, keyvals ...any) {
-	if s.server.debug {
-		user := "none"
-		if s.username != "" && s.accountID > 0 {
-			user = s.username + "/" + fmt.Sprint(s.accountID)
-		} else if s.username != "" {
-			user = s.username
-		}
-
-		// Build the keyvals array with user field
-		allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
-		allKeyvals = append(allKeyvals, keyvals...)
-		logger.Debug(msg, allKeyvals...)
-	}
+	s.getLogger().DebugLog(msg, keyvals...)
 }
 
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	// Build the keyvals array with user field
-	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
-	allKeyvals = append(allKeyvals, keyvals...)
-	logger.Warn(msg, allKeyvals...)
+	s.getLogger().WarnLog(msg, keyvals...)
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.

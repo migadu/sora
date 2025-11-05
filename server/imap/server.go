@@ -704,10 +704,10 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
-	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
 
 	// Log connection at INFO level
-	session.Log("connected")
+	session.InfoLog("connected")
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
@@ -723,9 +723,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
 		logger.Debug("IMAP: Received proxy session ID from PROXY v2 TLV", "name", s.name, "session_id", proxyInfo.ProxySessionID)
-		session.Log("connected (connections: total=%d, authenticated=%d) proxy_session=%s", totalCount, authCount, proxyInfo.ProxySessionID)
+		session.InfoLog("connected (connections: total=%d, authenticated=%d) proxy_session=%s", totalCount, authCount, proxyInfo.ProxySessionID)
 	} else {
-		session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
+		session.InfoLog("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
 	}
 	return session, greeting, nil
 }

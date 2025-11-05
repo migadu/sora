@@ -412,7 +412,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		// Create logging function for the mutex helper
 		logFunc := func(format string, args ...any) {
-			session.Log(format, args...)
+			session.InfoLog(format, args...)
 		}
 
 		// Initialize the mutex helper

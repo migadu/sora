@@ -273,7 +273,7 @@ func (s *ManageSieveSession) handleConnection() {
 			// Increment authenticated connections counter
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("user %s authenticated (connections: total=%d, authenticated=%d)",
+			s.InfoLog("user %s authenticated (connections: total=%d, authenticated=%d)",
 				address.FullAddress(), totalCount, authCount)
 
 			// Track successful authentication
@@ -949,7 +949,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
-		s.Log("session closed (connections: total=%d, authenticated=%d)",
+		s.InfoLog("session closed (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 		s.User = nil
 		s.Id = ""
@@ -959,7 +959,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		}
 	} else {
 		authCount = s.server.authenticatedConnections.Load()
-		s.Log("session closed unauthenticated (connections: total=%d, authenticated=%d)",
+		s.InfoLog("session closed unauthenticated (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 
@@ -976,7 +976,7 @@ func (s *ManageSieveSession) Close() error {
 		// Acquire write lock for cleanup
 		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 		if !acquired {
-			s.Log("failed to acquire write lock within timeout")
+			s.InfoLog("failed to acquire write lock within timeout")
 			// Continue with close even if we can't get the lock
 			return s.closeWithoutLock()
 		}
@@ -1261,10 +1261,10 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	authCount := s.server.authenticatedConnections.Add(1)
 	totalCount := s.server.totalConnections.Load()
 	if impersonating {
-		s.Log("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
+		s.InfoLog("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
 			targetAddress.FullAddress(), totalCount, authCount)
 	} else {
-		s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
+		s.InfoLog("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 

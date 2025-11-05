@@ -1733,7 +1733,7 @@ func (s *ServerConfig) GetMinBytesPerMinute() int64 {
 	if s.Timeouts != nil && s.Timeouts.MinBytesPerMinute > 0 {
 		return s.Timeouts.MinBytesPerMinute
 	}
-	return 512 // Default: 512 bytes/min
+	return 0 // Default: disabled (0 bytes/min = no throughput checking)
 }
 
 func (s *ServerConfig) GetRemotePort() (int, error) {

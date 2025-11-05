@@ -12,11 +12,11 @@ import (
 // XCLIENT implements the smtp.XCLIENTBackend interface for full XCLIENT support
 // This method is called by the go-smtp library when an XCLIENT command is received
 func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) error {
-	s.Log("[XCLIENT] *** XCLIENT METHOD CALLED *** Backend received XCLIENT command with %d attributes: %+v", len(attrs), attrs)
+	s.InfoLog("[XCLIENT] *** XCLIENT METHOD CALLED *** Backend received XCLIENT command with %d attributes: %+v", len(attrs), attrs)
 
 	// Check if connection is from trusted proxy
 	if !s.isFromTrustedProxy() {
-		s.Log("[XCLIENT] XCLIENT not permitted from this host")
+		s.InfoLog("[XCLIENT] XCLIENT not permitted from this host")
 		return fmt.Errorf("XCLIENT denied")
 	}
 
@@ -71,7 +71,7 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		}
 	}
 
-	s.Log("[XCLIENT] Processed XCLIENT attributes: client=%s:%d, proto=%s, helo=%s, login=%s",
+	s.InfoLog("[XCLIENT] Processed XCLIENT attributes: client=%s:%d, proto=%s, helo=%s, login=%s",
 		s.ForwardingParams.OriginatingIP, s.ForwardingParams.OriginatingPort,
 		s.ForwardingParams.Protocol, s.ForwardingParams.HELO, s.ForwardingParams.Login)
 
@@ -113,7 +113,7 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 
 	// Check if connection is from trusted proxy
 	if !s.isFromTrustedProxy() {
-		s.Log("[RCPT] XRCPTFORWARD not permitted from this host")
+		s.InfoLog("[RCPT] XRCPTFORWARD not permitted from this host")
 		return
 	}
 
@@ -128,7 +128,7 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 	// This reuses the same parsing logic as POP3 XCLIENT FORWARD parameter
 	forwardParams, err := server.ParsePOP3XCLIENT("FORWARD=" + xrcptforward)
 	if err != nil {
-		s.Log("[RCPT] Failed to parse XRCPTFORWARD: %v", err)
+		s.InfoLog("[RCPT] Failed to parse XRCPTFORWARD: %v", err)
 		return
 	}
 
@@ -147,8 +147,8 @@ func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
 		// Don't update s.RemoteIP for XRCPTFORWARD, unlike XCLIENT
 		// XRCPTFORWARD is per-recipient forwarding, not session-level IP forwarding
 
-		s.Log("[RCPT] XRCPTFORWARD set proxy information: proxy=%s", proxyIP)
+		s.InfoLog("[RCPT] XRCPTFORWARD set proxy information: proxy=%s", proxyIP)
 	}
 
-	s.Log("[RCPT] Processed XRCPTFORWARD parameters: %d variables", len(forwardParams.Variables))
+	s.InfoLog("[RCPT] Processed XRCPTFORWARD parameters: %d variables", len(forwardParams.Variables))
 }

@@ -50,7 +50,7 @@ func (s *POP3ProxySession) handleConnection() {
 	s.startTime = time.Now()
 
 	// Log connection at INFO level
-	s.Log("connected")
+	s.InfoLog("connected")
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -159,7 +159,7 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.Flush()
 
 			// Log authentication at INFO level
-			s.Log("authenticated")
+			s.InfoLog("authenticated")
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.sessionTimeout > 0 {
@@ -270,7 +270,7 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.Flush()
 
 			// Log authentication at INFO level
-			s.Log("authenticated via SASL PLAIN")
+			s.InfoLog("authenticated via SASL PLAIN")
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.sessionTimeout > 0 {
@@ -318,52 +318,32 @@ func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string
 	return false
 }
 
-// Log logs a client command with password masking if debug is enabled.
-// Log logs at INFO level with session context
-func (s *POP3ProxySession) Log(msg string, keysAndValues ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
+// InfoLog logs a client command with password masking if debug is enabled.
+// InfoLog logs at INFO level with session context
+// getLogger returns a ProxySessionLogger for this session
+func (s *POP3ProxySession) getLogger() *server.ProxySessionLogger {
+	return &server.ProxySessionLogger{
+		Protocol:   "pop3_proxy",
+		ServerName: s.server.name,
+		ClientConn: s.clientConn,
+		Username:   s.username,
+		AccountID:  s.accountID,
+		Debug:      s.server.debug,
 	}
+}
 
-	allKeyvals := []any{"proto", "pop3_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keysAndValues...)
-	logger.Info(msg, allKeyvals...)
+func (s *POP3ProxySession) InfoLog(msg string, keysAndValues ...any) {
+	s.getLogger().InfoLog(msg, keysAndValues...)
 }
 
 // DebugLog logs at DEBUG level with session context
 func (s *POP3ProxySession) DebugLog(msg string, keysAndValues ...any) {
-	if s.server.debug {
-		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		user := "none"
-		if s.username != "" && s.accountID > 0 {
-			user = s.username + "/" + fmt.Sprint(s.accountID)
-		} else if s.username != "" {
-			user = s.username
-		}
-
-		allKeyvals := []any{"proto", "pop3_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-		allKeyvals = append(allKeyvals, keysAndValues...)
-		logger.Debug(msg, allKeyvals...)
-	}
+	s.getLogger().DebugLog(msg, keysAndValues...)
 }
 
 // WarnLog logs at WARN level with session context
 func (s *POP3ProxySession) WarnLog(msg string, keysAndValues ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	allKeyvals := []any{"proto", "pop3_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keysAndValues...)
-	logger.Warn(msg, allKeyvals...)
+	s.getLogger().WarnLog(msg, keysAndValues...)
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
@@ -422,7 +402,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.Log("attempting authentication via prelookup", "username", usernameForPrelookup)
+		s.InfoLog("attempting authentication via prelookup", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
@@ -453,7 +433,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.Log("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.InfoLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -507,7 +487,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.Log("user not found in prelookup, attempting main DB")
+				s.InfoLog("user not found in prelookup, attempting main DB")
 			}
 		}
 	}
@@ -779,9 +759,9 @@ func (s *POP3ProxySession) close() {
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
 	if s.username != "" {
-		s.Log("disconnected", "duration", duration)
+		s.InfoLog("disconnected", "duration", duration)
 	} else {
-		s.Log("disconnected unauthenticated", "duration", duration)
+		s.InfoLog("disconnected unauthenticated", "duration", duration)
 	}
 
 	// Decrement current connections metric
@@ -851,7 +831,7 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connections
-			s.Log("connection kicked - disconnecting", "backend", s.serverAddr)
+			s.InfoLog("connection kicked - disconnecting", "backend", s.serverAddr)
 			s.clientConn.Close()
 			s.backendConn.Close()
 			return

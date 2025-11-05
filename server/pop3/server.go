@@ -6,11 +6,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
@@ -392,7 +393,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.Id = idgen.New()
 		session.HostName = s.hostname
 		session.Stats = s
-		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.Log)
+		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
 
 		// Build connection info for logging
 		var remoteInfo string

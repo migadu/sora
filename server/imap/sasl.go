@@ -106,7 +106,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					authCount := s.server.authenticatedConnections.Add(1)
 					totalCount := s.server.totalConnections.Load()
-					s.Log("Authentication: session established for impersonated user '%s' (ID: %d) via master username login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
+					s.InfoLog("Authentication: session established for impersonated user '%s' (ID: %d) via master username login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -184,7 +184,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					authCount := s.server.authenticatedConnections.Add(1)
 					totalCount := s.server.totalConnections.Load()
-					s.Log("Authentication: session established for impersonated user '%s' (ID: %d) via master SASL login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
+					s.InfoLog("Authentication: session established for impersonated user '%s' (ID: %d) via master SASL login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
