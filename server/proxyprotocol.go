@@ -147,10 +147,11 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	if !r.isTrustedConnection(conn) {
 		// If PROXY protocol is enabled, we MUST only accept connections from trusted proxies.
 		// This is a critical security boundary.
-		logger.Debug("PROXY protocol: REJECTING untrusted connection", "remote", conn.RemoteAddr())
-		return nil, conn, fmt.Errorf("connection from untrusted source %s", conn.RemoteAddr())
+		remoteAddrStr := GetAddrString(conn.RemoteAddr())
+		logger.Debug("PROXY protocol: REJECTING untrusted connection", "remote", remoteAddrStr)
+		return nil, conn, fmt.Errorf("connection from untrusted source %s", remoteAddrStr)
 	}
-	logger.Debug("PROXY protocol: Processing connection from trusted proxy", "remote", conn.RemoteAddr())
+	logger.Debug("PROXY protocol: Processing connection from trusted proxy", "remote", GetAddrString(conn.RemoteAddr()))
 
 	// Set read deadline for PROXY header
 	if err := conn.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
@@ -176,7 +177,7 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 
 	// Check for PROXY v1 signature
 	if len(peek) >= 5 && string(peek[:5]) == "PROXY" {
-		logger.Debug("PROXY protocol: Detected v1", "remote", conn.RemoteAddr())
+		logger.Debug("PROXY protocol: Detected v1", "remote", GetAddrString(conn.RemoteAddr()))
 		info, err := r.parseProxyV1(reader)
 		if err != nil {
 			return nil, conn, fmt.Errorf("failed to parse PROXY v1 header: %w", err)
@@ -209,7 +210,7 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 				}
 			}
 			if match {
-				logger.Debug("PROXY protocol: Detected v2", "remote", conn.RemoteAddr())
+				logger.Debug("PROXY protocol: Detected v2", "remote", GetAddrString(conn.RemoteAddr()))
 				info, err := r.parseProxyV2(reader)
 				if err != nil {
 					return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
@@ -742,6 +743,6 @@ func WriteProxyV2Header(conn net.Conn, clientIP string, clientPort int, serverIP
 		return fmt.Errorf("failed to write PROXY v2 header: %w", err)
 	}
 
-	logger.Debug("PROXY protocol: Sent v2 header", "remote", conn.RemoteAddr())
+	logger.Debug("PROXY protocol: Sent v2 header", "remote", GetAddrString(conn.RemoteAddr()))
 	return nil
 }
