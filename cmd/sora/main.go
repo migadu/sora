@@ -1474,6 +1474,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		ListenBacklog:          serverConfig.ListenBacklog,
 		Debug:                  serverConfig.Debug,
 		SupportedExtensions:    serverConfig.SupportedExtensions,
 	})
@@ -1558,6 +1559,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,
 		MaxConnections:         serverConfig.MaxConnections,
+		ListenBacklog:          serverConfig.ListenBacklog,
 		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {

@@ -52,6 +52,9 @@ type Server struct {
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	limiter *server.ConnectionLimiter
 
+	// Listen backlog
+	listenBacklog int
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -85,6 +88,7 @@ type ServerOptions struct {
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
+	ListenBacklog  int // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 
 	// Debug logging
 	Debug bool // Enable debug logging
@@ -202,6 +206,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
 		limiter:            limiter,
+		listenBacklog:      opts.ListenBacklog,
 		debug:              opts.Debug,
 		debugWriter:        debugWriter,
 	}
@@ -254,8 +259,13 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		// Create base TCP listener
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		if s.listenBacklog > 0 {
+			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			logger.Debug("LMTP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		}
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
@@ -271,7 +281,13 @@ func (s *Server) Start() error {
 		}
 
 		s.listenerMu.Lock()
-		tcpListener, err := net.Listen("tcp", s.addr)
+		// Create base TCP listener with custom backlog
+		listenConfig := &net.ListenConfig{}
+		if s.listenBacklog > 0 {
+			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			logger.Debug("LMTP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		}
+		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
