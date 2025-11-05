@@ -776,9 +776,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 
 	if s.tlsConfig != nil {
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", imapAddr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
 		if err != nil {
 			return fmt.Errorf("failed to create TCP listener: %w", err)
 		}
@@ -793,9 +791,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		}
 	} else {
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", imapAddr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
 		if err != nil {
 			return fmt.Errorf("failed to create listener: %w", err)
 		}

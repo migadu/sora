@@ -315,13 +315,15 @@ func (s *POP3ProxyServer) Start() error {
 	}
 
 	// Create base TCP listener with custom backlog
-	listenConfig := &net.ListenConfig{}
+	var tcpListener net.Listener
+	var err error
 	if s.listenBacklog > 0 {
-		// Use custom Control function to set backlog (platform-specific)
-		listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+		// Use custom backlog function (platform-specific)
+		tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		logger.Debug("POP3 Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+	} else {
+		tcpListener, err = net.Listen("tcp", s.addr)
 	}
-	tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 	if err != nil {
 		s.cancel()
 		return fmt.Errorf("failed to create TCP listener: %w", err)

@@ -276,9 +276,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if isImplicitTLS {
 		// Implicit TLS - create TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
 			return
@@ -294,9 +292,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 	} else {
 		// Create TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
 			return

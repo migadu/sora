@@ -508,9 +508,7 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	var err error
 
 	// Create base TCP listener with custom backlog
-	listenConfig := &net.ListenConfig{}
-	listenConfig.Control = server.MakeListenControl(b.listenBacklog)
-	tcpListener, err := listenConfig.Listen(context.Background(), "tcp", b.server.Addr)
+	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return

@@ -253,9 +253,7 @@ func (s *POP3Server) Start(errChan chan error) {
 
 	if s.tlsConfig != nil {
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.cancel()
 			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
@@ -272,9 +270,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		}
 	} else {
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
-		listenConfig.Control = serverPkg.MakeListenControl(s.listenBacklog)
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
+		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.cancel()
 			errChan <- fmt.Errorf("failed to create listener: %w", err)
