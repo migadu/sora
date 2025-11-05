@@ -859,8 +859,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
-limits.search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
-limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
+limits.search_rate_limit_per_min = 30    # Maximum searches per minute per user (default: 30, set to 0 to disable).
+limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
