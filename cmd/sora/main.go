@@ -1255,6 +1255,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		ListenBacklog:          serverConfig.ListenBacklog,
 		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {
@@ -1364,6 +1365,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
+		ListenBacklog:          serverConfig.ListenBacklog,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
