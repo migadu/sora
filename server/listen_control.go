@@ -1,5 +1,4 @@
 //go:build linux || freebsd || darwin || openbsd || netbsd
-// +build linux freebsd darwin openbsd netbsd
 
 package server
 
