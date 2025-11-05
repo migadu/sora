@@ -413,16 +413,18 @@ func (s *Session) sendContinuation() error {
 }
 
 // Log logs at INFO level with session context
-func (s *Session) Log(format string, args ...any) {
+func (s *Session) Log(msg string, keysAndValues ...any) {
 	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
-		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		user = s.username + "/" + fmt.Sprint(s.accountID)
 	} else if s.username != "" {
 		user = s.username
 	}
 
-	logger.Info("Session", "proto", "managesieve_proxy", "name", s.server.name, "remote", remoteAddr, "user", user, "msg", fmt.Sprintf(format, args...))
+	allKeyvals := []any{"proto", "managesieve_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
+	allKeyvals = append(allKeyvals, keysAndValues...)
+	logger.Info(msg, allKeyvals...)
 }
 
 // DebugLog logs at DEBUG level with session context
@@ -431,7 +433,7 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 		remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		user := "none"
 		if s.username != "" && s.accountID > 0 {
-			user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+			user = s.username + "/" + fmt.Sprint(s.accountID)
 		} else if s.username != "" {
 			user = s.username
 		}
@@ -448,7 +450,7 @@ func (s *Session) WarnLog(msg string, keyvals ...any) {
 	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	user := "none"
 	if s.username != "" && s.accountID > 0 {
-		user = fmt.Sprintf("%s/%d", s.username, s.accountID)
+		user = s.username + "/" + fmt.Sprint(s.accountID)
 	} else if s.username != "" {
 		user = s.username
 	}
@@ -516,7 +518,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.Log("attempting prelookup auth for user: %s", usernameForPrelookup)
+		s.Log("attempting prelookup auth", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
 
 		if err != nil {
@@ -952,7 +954,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.Log("disconnected (duration: %v)", duration)
+	s.Log("disconnected", "duration", duration)
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
