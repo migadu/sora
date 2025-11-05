@@ -1,15 +1,20 @@
+//go:build linux || freebsd || darwin || openbsd || netbsd
 // +build linux freebsd darwin openbsd netbsd
 
 package server
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// MakeListenControl creates a Control function for net.ListenConfig that sets the listen backlog.
-// The backlog parameter specifies the maximum length of the queue of pending connections.
+// ListenWithBacklog creates a TCP listener with a custom listen backlog.
+// This manually creates the socket to have full control over the listen() syscall.
 //
 // Why this matters:
 // - Small backlog (default SOMAXCONN = 128-512) causes SYN packets to be dropped when under load
@@ -17,29 +22,76 @@ import (
 // - This leads to connection delays of ~60 seconds before clients can connect
 // - Larger backlog (4096-8192) allows the kernel to queue more connections during bursts
 //
-// Platform notes:
-// - FreeBSD: Must call listen() with custom backlog BEFORE net.Listen() wraps the socket
-// - Linux/Darwin/Others: Call listen() in Control function; net package's listen() call will be a no-op
-//
-// How it works:
-// 1. net.ListenConfig creates a socket and calls this Control function
-// 2. We call listen() with the custom backlog on the raw file descriptor
-// 3. net.ListenConfig tries to call listen() again, which is a no-op (already listening)
-// 4. The socket is now listening with our custom backlog
+// The process:
+// 1. Create socket
+// 2. Set SO_REUSEADDR for fast restart
+// 3. Bind socket to address
+// 4. Call listen() with custom backlog
+// 5. Create net.Listener from file descriptor
+func ListenWithBacklog(ctx context.Context, network, address string, backlog int) (net.Listener, error) {
+	// Resolve the address
+	addr, err := net.ResolveTCPAddr(network, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve address: %w", err)
+	}
+
+	// Determine address family
+	var family int
+	var sockaddr unix.Sockaddr
+	if addr.IP.To4() != nil {
+		family = unix.AF_INET
+		sa := &unix.SockaddrInet4{Port: addr.Port}
+		copy(sa.Addr[:], addr.IP.To4())
+		sockaddr = sa
+	} else {
+		family = unix.AF_INET6
+		sa := &unix.SockaddrInet6{Port: addr.Port}
+		copy(sa.Addr[:], addr.IP.To16())
+		sockaddr = sa
+	}
+
+	// Create socket
+	fd, err := unix.Socket(family, unix.SOCK_STREAM, unix.IPPROTO_TCP)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create socket: %w", err)
+	}
+
+	// Set SO_REUSEADDR to allow fast restart
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
+	}
+
+	// Bind socket
+	if err := unix.Bind(fd, sockaddr); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to bind socket: %w", err)
+	}
+
+	// Listen with custom backlog
+	if err := unix.Listen(fd, backlog); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to listen: %w", err)
+	}
+
+	// Create net.Listener from file descriptor
+	file := os.NewFile(uintptr(fd), "listener")
+	listener, err := net.FileListener(file)
+	file.Close() // FileListener dups the fd, so we can close the file
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to create listener: %w", err)
+	}
+
+	return listener, nil
+}
+
+// MakeListenControl creates a Control function for net.ListenConfig that sets socket options.
+// This is kept for compatibility but doesn't set the backlog (use ListenWithBacklog for that).
 func MakeListenControl(backlog int) func(network, address string, c syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
-		var controlErr error
-		err := c.Control(func(fd uintptr) {
-			// Call listen() directly with our custom backlog
-			// This must be done before net.ListenConfig wraps the socket
-			if err := unix.Listen(int(fd), backlog); err != nil {
-				controlErr = err
-				return
-			}
-		})
-		if err != nil {
-			return err
-		}
-		return controlErr
+		// This function is no longer used for setting backlog.
+		// Use ListenWithBacklog instead for proper backlog control.
+		return nil
 	}
 }

@@ -298,12 +298,14 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
+		var tcpListener net.Listener
+		var err error
 		if s.listenBacklog > 0 {
-			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 			logger.Debug("ManageSieve Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		} else {
+			tcpListener, err = net.Listen("tcp", s.addr)
 		}
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
@@ -338,12 +340,14 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		listenConfig := &net.ListenConfig{}
+		var tcpListener net.Listener
+		var err error
 		if s.listenBacklog > 0 {
-			listenConfig.Control = server.MakeListenControl(s.listenBacklog)
+			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 			logger.Debug("ManageSieve Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		} else {
+			tcpListener, err = net.Listen("tcp", s.addr)
 		}
-		tcpListener, err := listenConfig.Listen(context.Background(), "tcp", s.addr)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
