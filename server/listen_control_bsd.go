@@ -83,10 +83,14 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		return nil, fmt.Errorf("failed to create socket: %w", err)
 	}
 
-	// Set nonblocking mode (matches Go's net package)
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("failed to set nonblock: %w", err)
+	// CRITICAL FOR FREEBSD IPv6: Set IPV6_V6ONLY immediately after socket creation
+	// FreeBSD requires this to be set BEFORE SO_REUSEADDR and SetNonblock for IPv6 sockets
+	// Setting it later can cause random connection delays on IPv6
+	if family == unix.AF_INET6 {
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, ipv6only); err != nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
+		}
 	}
 
 	// Set SO_REUSEADDR to allow fast restart
@@ -95,14 +99,10 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
 	}
 
-	// For IPv6 sockets, set IPV6_V6ONLY based on address type
-	// - Wildcard addresses (::): Use IPV6_V6ONLY=0 for dual-stack (accepts both IPv4 and IPv6)
-	// - Explicit IPv6 addresses: Use IPV6_V6ONLY=1 to prevent IPv4 connections
-	if family == unix.AF_INET6 {
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, ipv6only); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
-		}
+	// Set nonblocking mode (matches Go's net package)
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to set nonblock: %w", err)
 	}
 
 	// Bind socket
