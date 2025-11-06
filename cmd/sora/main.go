@@ -1234,8 +1234,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Info("IMAP proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 5 * time.Minute
+		logger.Info("IMAP proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		commandTimeout = 0 // IMAP proxy cannot detect IDLE commands, so command_timeout must be disabled
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
@@ -1344,8 +1344,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Info("POP3 proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 5 * time.Minute
+		logger.Info("POP3 proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
@@ -1451,8 +1451,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	// Parse timeout configurations
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
-		logger.Info("ManageSieve proxy: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 5 * time.Minute
+		logger.Info("ManageSieve proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
 	}
 
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
