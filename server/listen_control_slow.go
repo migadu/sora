@@ -34,21 +34,28 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		return nil, fmt.Errorf("failed to resolve address: %w", err)
 	}
 
-	// Determine address family
+	// Determine address family and socket options
 	var family int
 	var sockaddr unix.Sockaddr
+	var ipv6only int = 1 // Default: IPv6-only for explicit IPv6 addresses
 
 	// Handle nil IP (e.g., ":143" resolves to IP=nil)
-	// Default to IPv4 for backward compatibility
-	if addr.IP == nil || addr.IP.To4() != nil {
+	// Use IPv6 dual-stack for wildcard to accept both IPv4 and IPv6 (matches Go's net.Listen)
+	if addr.IP == nil {
+		// Wildcard address - use IPv6 dual-stack (accepts both IPv4 and IPv6)
+		family = unix.AF_INET6
+		sa := &unix.SockaddrInet6{Port: addr.Port}
+		// sa.Addr is zero (::), which means all interfaces
+		sockaddr = sa
+		ipv6only = 0 // Enable dual-stack (accept IPv4-mapped IPv6 addresses)
+	} else if addr.IP.To4() != nil {
+		// Explicit IPv4 address
 		family = unix.AF_INET
 		sa := &unix.SockaddrInet4{Port: addr.Port}
-		if addr.IP != nil {
-			copy(sa.Addr[:], addr.IP.To4())
-		}
-		// If IP is nil, sa.Addr is zero (0.0.0.0), which means all interfaces
+		copy(sa.Addr[:], addr.IP.To4())
 		sockaddr = sa
 	} else {
+		// Explicit IPv6 address
 		family = unix.AF_INET6
 		sa := &unix.SockaddrInet6{Port: addr.Port}
 		copy(sa.Addr[:], addr.IP.To16())
@@ -59,6 +66,7 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 			}
 		}
 		sockaddr = sa
+		ipv6only = 1 // IPv6-only for explicit IPv6 addresses
 	}
 
 	// Create socket (Darwin doesn't support SOCK_NONBLOCK/SOCK_CLOEXEC flags)
@@ -85,9 +93,11 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
 	}
 
-	// For IPv6 sockets, set IPV6_V6ONLY to prevent dual-stack issues
+	// For IPv6 sockets, set IPV6_V6ONLY based on address type
+	// - Wildcard addresses (::): Use IPV6_V6ONLY=0 for dual-stack (accepts both IPv4 and IPv6)
+	// - Explicit IPv6 addresses: Use IPV6_V6ONLY=1 to prevent IPv4 connections
 	if family == unix.AF_INET6 {
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, ipv6only); err != nil {
 			unix.Close(fd)
 			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
 		}
