@@ -1067,9 +1067,9 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #    - Prevents indefinitely long sessions
 #    - 30 minutes from connection to disconnection, regardless of activity
 #
-timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy).
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration from connect to disconnect.
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
+timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration from connect to disconnect (default: 30m).
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -1337,9 +1337,9 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
+timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1383,9 +1383,9 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
+timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- SIEVE EXTENSIONS ---
 # Supported SIEVE extensions advertised to clients and validated during script upload.

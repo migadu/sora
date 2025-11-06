@@ -942,9 +942,9 @@ type IMAPProxyServerConfig struct {
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseIDCommand     bool                  `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
@@ -970,9 +970,9 @@ type POP3ProxyServerConfig struct {
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
@@ -1000,9 +1000,9 @@ type ManageSieveProxyServerConfig struct {
 	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
 	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
+	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`                // Database-driven user routing
@@ -1605,7 +1605,7 @@ func (c *LMTPProxyServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 // GetCommandTimeout parses the command timeout duration for IMAP proxy
 func (c *IMAPProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
 	if c.CommandTimeout == "" {
-		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+		return 0, nil // Default: 0 (disabled) - IMAP proxy cannot detect IDLE commands
 	}
 	return helpers.ParseDuration(c.CommandTimeout)
 }
@@ -1621,7 +1621,7 @@ func (c *IMAPProxyServerConfig) GetAbsoluteSessionTimeout() (time.Duration, erro
 // GetCommandTimeout parses the command timeout duration for POP3 proxy
 func (c *POP3ProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
 	if c.CommandTimeout == "" {
-		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+		return 0, nil // Default: 0 (disabled) - use auth_idle_timeout and absolute_session_timeout instead
 	}
 	return helpers.ParseDuration(c.CommandTimeout)
 }
@@ -1637,7 +1637,7 @@ func (c *POP3ProxyServerConfig) GetAbsoluteSessionTimeout() (time.Duration, erro
 // GetCommandTimeout parses the command timeout duration for ManageSieve proxy
 func (c *ManageSieveProxyServerConfig) GetCommandTimeout() (time.Duration, error) {
 	if c.CommandTimeout == "" {
-		return 5 * time.Minute, nil // Default: 5 minutes idle timeout
+		return 0, nil // Default: 0 (disabled) - use auth_idle_timeout and absolute_session_timeout instead
 	}
 	return helpers.ParseDuration(c.CommandTimeout)
 }

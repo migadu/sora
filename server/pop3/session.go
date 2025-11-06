@@ -75,12 +75,14 @@ func (s *POP3Session) handleConnection() {
 
 	for {
 		// Set idle timeout for reading command
-		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use Pop3IdleTimeout
-		// After authentication: use Pop3IdleTimeout
+		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use command_timeout
+		// After authentication: use command_timeout
 		if !s.authenticated && s.server.authIdleTimeout > 0 {
 			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
+		} else if s.server.commandTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.commandTimeout))
 		} else {
-			(*s.conn).SetReadDeadline(time.Now().Add(Pop3IdleTimeout))
+			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
 		}
 
 		line, err := reader.ReadString('\n')

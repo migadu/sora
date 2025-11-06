@@ -4619,10 +4619,7 @@ func applyConfigDefaults(cfg *config.Config) {
 		// Apply min_bytes_per_minute default
 		if srv.Timeouts.MinBytesPerMinute == 0 {
 			srv.Timeouts.MinBytesPerMinute = srv.GetMinBytesPerMinute()
-			// If still 0, set the actual default of 512
-			if srv.Timeouts.MinBytesPerMinute == 0 {
-				srv.Timeouts.MinBytesPerMinute = 512
-			}
+			// GetMinBytesPerMinute() returns 0 by default (disabled)
 		}
 
 		// Apply connect_timeout default (for proxy types)
@@ -4670,9 +4667,7 @@ func applyConfigDefaults(cfg *config.Config) {
 				*absoluteSessionTimeout = timeout.String()
 			}
 		}
-		if *minBytesPerMinute == 0 {
-			*minBytesPerMinute = 512
-		}
+		// minBytesPerMinute default is 0 (disabled) - don't override
 	}
 
 	// IMAP Proxy (legacy)
@@ -4747,9 +4742,7 @@ func applyConfigDefaults(cfg *config.Config) {
 				*absoluteSessionTimeout = timeout.String()
 			}
 		}
-		if *minBytesPerMinute == 0 {
-			*minBytesPerMinute = 512
-		}
+		// minBytesPerMinute default is 0 (disabled) - don't override
 	}
 
 	// IMAP backend (legacy)
