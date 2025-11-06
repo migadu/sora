@@ -55,8 +55,8 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
 
-	// Get a random port but bind to all interfaces to allow testing from different IPs
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	// Get a random port on localhost (use 127.0.0.1 to ensure IPv4)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to listen on a random port: %v", err)
 	}
