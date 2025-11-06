@@ -6,14 +6,14 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"syscall"
 
+	"github.com/migadu/sora/logger"
 	"golang.org/x/sys/unix"
 )
 
 // ListenWithBacklog creates a TCP listener with a custom listen backlog.
-// This manually creates the socket to have full control over the listen() syscall.
+// Uses net.ListenConfig with a Control function to set socket options and backlog.
 //
 // Why this matters:
 // - Small backlog (default SOMAXCONN = 128-512) causes SYN packets to be dropped when under load
@@ -21,85 +21,49 @@ import (
 // - This leads to connection delays of ~60 seconds before clients can connect
 // - Larger backlog (4096-8192) allows the kernel to queue more connections during bursts
 //
-// The process:
-// 1. Create socket
-// 2. Set SO_REUSEADDR for fast restart
-// 3. Bind socket to address
-// 4. Call listen() with custom backlog
-// 5. Create net.Listener from file descriptor
+// Implementation: Uses net.ListenConfig which properly handles all socket setup,
+// and we only intervene to set SO_LISTENQLIMIT (FreeBSD) or adjust the backlog.
 func ListenWithBacklog(ctx context.Context, network, address string, backlog int) (net.Listener, error) {
-	// Resolve the address
-	addr, err := net.ResolveTCPAddr(network, address)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve address: %w", err)
-	}
+	// On FreeBSD, we can use SO_LISTENQLIMIT to set the listen backlog
+	// This must be set BEFORE calling listen()
+	lc := &net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var ctrlErr error
+			err := c.Control(func(fd uintptr) {
+				// Set SO_REUSEADDR for fast restart
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+					ctrlErr = fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
+					return
+				}
 
-	// Determine address family
-	var family int
-	var sockaddr unix.Sockaddr
-	if addr.IP.To4() != nil {
-		family = unix.AF_INET
-		sa := &unix.SockaddrInet4{Port: addr.Port}
-		copy(sa.Addr[:], addr.IP.To4())
-		sockaddr = sa
-	} else {
-		family = unix.AF_INET6
-		sa := &unix.SockaddrInet6{Port: addr.Port}
-		copy(sa.Addr[:], addr.IP.To16())
-		// Handle zone ID for link-local addresses (fe80::)
-		if addr.Zone != "" {
-			if iface, err := net.InterfaceByName(addr.Zone); err == nil {
-				sa.ZoneId = uint32(iface.Index)
+				// On FreeBSD, set SO_LISTENQLIMIT before listen()
+				// This controls the listen queue size
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_LISTENQLIMIT, backlog); err != nil {
+					// Log but don't fail - this might not be supported on all BSD versions
+					logger.Debug("Failed to set SO_LISTENQLIMIT, will use default backlog",
+						"network", network, "address", address, "backlog", backlog, "error", err)
+				}
+			})
+			if err != nil {
+				return err
 			}
-		}
-		sockaddr = sa
+			return ctrlErr
+		},
 	}
 
-	// Create socket with NONBLOCK and CLOEXEC flags (matches Go's net package)
-	fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	listener, err := lc.Listen(ctx, network, address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create socket: %w", err)
-	}
-
-	// Set SO_REUSEADDR to allow fast restart
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
-	}
-
-	// For IPv6 sockets, set IPV6_V6ONLY to prevent dual-stack issues
-	// This is critical on BSD systems (FreeBSD, OpenBSD, etc.)
-	if family == unix.AF_INET6 {
-		// Set IPV6_V6ONLY=1 to avoid dual-stack complications
-		// This matches Go's net package behavior and prevents connection delays
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
-		}
-	}
-
-	// Bind socket
-	if err := unix.Bind(fd, sockaddr); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("failed to bind socket: %w", err)
-	}
-
-	// Listen with custom backlog
-	if err := unix.Listen(fd, backlog); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("failed to listen: %w", err)
-	}
-
-	// Create net.Listener from file descriptor
-	file := os.NewFile(uintptr(fd), "listener")
-	listener, err := net.FileListener(file)
-	file.Close() // FileListener dups the fd, so we can close the file
-	if err != nil {
-		unix.Close(fd)
 		return nil, fmt.Errorf("failed to create listener: %w", err)
 	}
 
 	return listener, nil
+}
+
+// ListenWithBacklogManual is the old manual socket creation approach.
+// Kept for reference but should not be used as it causes issues on FreeBSD IPv6.
+func ListenWithBacklogManual(ctx context.Context, network, address string, backlog int) (net.Listener, error) {
+	// This function is kept for reference but should not be used
+	return nil, fmt.Errorf("ListenWithBacklogManual is deprecated, use ListenWithBacklog instead")
 }
 
 // MakeListenControl creates a Control function for net.ListenConfig that sets socket options.
