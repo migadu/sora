@@ -37,17 +37,17 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 	// Determine address family and socket options
 	var family int
 	var sockaddr unix.Sockaddr
+	var ipv6only int = 1 // Default: IPv6-only for explicit IPv6 addresses
 
 	// Handle nil IP (e.g., ":143" resolves to IP=nil)
-	// On FreeBSD, use IPv4-only for wildcard addresses to avoid dual-stack complexity
-	// and IPv4-mapped IPv6 connection delays. For IPv6 support, explicitly bind to [::]:port.
+	// Use IPv6 dual-stack for wildcard to accept both IPv4 and IPv6 (matches Go's net.Listen)
 	if addr.IP == nil {
-		// Wildcard address - use IPv4-only (0.0.0.0) on FreeBSD
-		// This avoids IPv4-mapped IPv6 issues that cause connection delays
-		family = unix.AF_INET
-		sa := &unix.SockaddrInet4{Port: addr.Port}
-		// sa.Addr is zero (0.0.0.0), which means all IPv4 interfaces
+		// Wildcard address - use IPv6 dual-stack (accepts both IPv4 and IPv6)
+		family = unix.AF_INET6
+		sa := &unix.SockaddrInet6{Port: addr.Port}
+		// sa.Addr is zero (::), which means all interfaces
 		sockaddr = sa
+		ipv6only = 0 // Enable dual-stack (accept IPv4-mapped IPv6 addresses)
 	} else if addr.IP.To4() != nil {
 		// Explicit IPv4 address
 		family = unix.AF_INET
@@ -66,10 +66,13 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 			}
 		}
 		sockaddr = sa
+		ipv6only = 1 // IPv6-only for explicit IPv6 addresses
 	}
 
-	// Create socket without flags, then set them separately
-	// This matches Go's standard library behavior and ensures compatibility across BSD variants
+	// Create socket without flags to avoid FreeBSD timing issues with IPv6 dual-stack + NONBLOCK
+	// On FreeBSD, passing SOCK_NONBLOCK|SOCK_CLOEXEC to socket() can cause significant delays
+	// when accepting IPv4 connections on IPv6 dual-stack sockets (IPV6_V6ONLY=0).
+	// Instead, create the socket first, then set flags separately (matches Go's behavior).
 	syscall.ForkLock.RLock()
 	fd, err := unix.Socket(family, unix.SOCK_STREAM, unix.IPPROTO_TCP)
 	if err == nil {
@@ -92,10 +95,11 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
 	}
 
-	// For explicit IPv6 sockets, set IPV6_V6ONLY=1 to prevent dual-stack behavior
-	// This ensures IPv6 addresses only accept IPv6 connections
+	// For IPv6 sockets, set IPV6_V6ONLY based on address type
+	// - Wildcard addresses (::): Use IPV6_V6ONLY=0 for dual-stack (accepts both IPv4 and IPv6)
+	// - Explicit IPv6 addresses: Use IPV6_V6ONLY=1 to prevent IPv4 connections
 	if family == unix.AF_INET6 {
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, ipv6only); err != nil {
 			unix.Close(fd)
 			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
 		}
