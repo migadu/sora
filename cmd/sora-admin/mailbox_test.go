@@ -3,15 +3,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/testutils"
 )
 
 // TestMailboxCommands tests the sora-admin mailbox commands
@@ -224,4 +229,179 @@ func createMailboxTestAccount(t *testing.T, rdb *resilient.ResilientDatabase, em
 
 	t.Logf("Created test account: %s (ID: %d)", email, accountID)
 	return accountID
+}
+
+// TestMailboxPurge tests the mailbox purge functionality
+func TestMailboxPurge(t *testing.T) {
+	// Skip if database is not available
+	if os.Getenv("SKIP_DB_TESTS") == "true" {
+		t.Skip("Skipping database tests")
+	}
+
+	// Setup test database
+	rdb := setupMailboxTestDatabase(t)
+	defer rdb.Close()
+
+	// Create temporary directory for S3 mock
+	tempDir := t.TempDir()
+	s3MockDir := filepath.Join(tempDir, "s3-mock")
+
+	// Setup file-based S3 mock
+	s3Mock, err := testutils.NewFileBasedS3Mock(s3MockDir)
+	if err != nil {
+		t.Fatalf("Failed to create S3 mock: %v", err)
+	}
+
+	// Create test account with unique email
+	timestamp := time.Now().UnixNano()
+	testEmail := fmt.Sprintf("purge-test-%d@purge-test-%d.com", timestamp, timestamp)
+	accountID := createMailboxTestAccount(t, rdb, testEmail, "password123")
+
+	ctx := context.Background()
+
+	// Create a mailbox
+	testMailboxName := "PurgeTest"
+	err = rdb.CreateMailboxWithRetry(ctx, accountID, testMailboxName, nil)
+	if err != nil {
+		t.Fatalf("Failed to create mailbox: %v", err)
+	}
+
+	// Get the mailbox
+	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, testMailboxName)
+	if err != nil {
+		t.Fatalf("Failed to get mailbox: %v", err)
+	}
+
+	// Create child mailbox
+	childMailboxName := "PurgeTest/Child"
+	err = rdb.CreateMailboxWithRetry(ctx, accountID, childMailboxName, &mbox.ID)
+	if err != nil {
+		t.Fatalf("Failed to create child mailbox: %v", err)
+	}
+
+	childMbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, childMailboxName)
+	if err != nil {
+		t.Fatalf("Failed to get child mailbox: %v", err)
+	}
+
+	// Insert test messages into parent and child mailboxes
+	domain := "purge-test.com"
+	localpart := "test"
+	messageCount := 5
+
+	for i := 0; i < messageCount; i++ {
+		// Create message content
+		contentHash := fmt.Sprintf("hash-%d", i)
+		messageContent := []byte(fmt.Sprintf("Subject: Test Message %d\r\n\r\nTest body %d", i, i))
+
+		// Store in S3 mock
+		s3Key := helpers.NewS3Key(domain, localpart, contentHash)
+		err = s3Mock.Put(s3Key, bytes.NewReader(messageContent), int64(len(messageContent)))
+		if err != nil {
+			t.Fatalf("Failed to store message in S3: %v", err)
+		}
+
+		// Alternate between parent and child mailbox
+		targetMailboxID := mbox.ID
+		if i%2 == 0 {
+			targetMailboxID = childMbox.ID
+		}
+
+		// Insert message into database
+		var bodyStruct imap.BodyStructure = &imap.BodyStructureSinglePart{
+			Type:    "text",
+			Subtype: "plain",
+		}
+
+		opts := &db.InsertMessageOptions{
+			AccountID:     accountID,
+			MailboxID:     targetMailboxID,
+			MailboxName:   testMailboxName,
+			ContentHash:   contentHash,
+			S3Domain:      domain,
+			S3Localpart:   localpart,
+			MessageID:     fmt.Sprintf("msg-%d@test.com", i),
+			InReplyTo:     []string{},
+			Subject:       fmt.Sprintf("Test Message %d", i),
+			SentDate:      time.Now(),
+			InternalDate:  time.Now(),
+			Flags:         []imap.Flag{},
+			Size:          int64(len(messageContent)),
+			BodyStructure: &bodyStruct,
+			Recipients:    []helpers.Recipient{},
+			RawHeaders:    "",
+		}
+
+		_, _, err = rdb.InsertMessageFromImporterWithRetry(ctx, opts)
+		if err != nil {
+			t.Fatalf("Failed to insert message: %v", err)
+		}
+	}
+
+	t.Logf("✅ Created %d test messages in parent and child mailboxes", messageCount)
+
+	// Verify messages exist in database
+	messages, err := rdb.GetMessagesForMailboxAndChildren(ctx, accountID, mbox.ID, mbox.Path)
+	if err != nil {
+		t.Fatalf("Failed to get messages: %v", err)
+	}
+
+	if len(messages) != messageCount {
+		t.Fatalf("Expected %d messages, got %d", messageCount, len(messages))
+	}
+
+	// Verify S3 objects exist
+	for i := 0; i < messageCount; i++ {
+		contentHash := fmt.Sprintf("hash-%d", i)
+		s3Key := helpers.NewS3Key(domain, localpart, contentHash)
+		_, err := s3Mock.Get(s3Key)
+		if err != nil {
+			t.Fatalf("S3 object should exist before purge: %s", s3Key)
+		}
+	}
+
+	t.Logf("✅ Verified all S3 objects exist before purge")
+
+	// Perform purge
+	err = purgeMailboxMessages(ctx, rdb, s3Mock, accountID, testMailboxName)
+	if err != nil {
+		t.Fatalf("Failed to purge mailbox: %v", err)
+	}
+
+	t.Logf("✅ Purge completed successfully")
+
+	// Verify messages are deleted from database
+	messagesAfter, err := rdb.GetMessagesForMailboxAndChildren(ctx, accountID, mbox.ID, mbox.Path)
+	if err != nil {
+		t.Fatalf("Failed to get messages after purge: %v", err)
+	}
+
+	if len(messagesAfter) != 0 {
+		t.Fatalf("Expected 0 messages after purge, got %d", len(messagesAfter))
+	}
+
+	// Verify S3 objects are deleted
+	for i := 0; i < messageCount; i++ {
+		contentHash := fmt.Sprintf("hash-%d", i)
+		s3Key := helpers.NewS3Key(domain, localpart, contentHash)
+		_, err := s3Mock.Get(s3Key)
+		if err == nil {
+			t.Fatalf("S3 object should be deleted after purge: %s", s3Key)
+		}
+	}
+
+	t.Logf("✅ Verified all S3 objects are deleted after purge")
+
+	// Delete the mailboxes to clean up
+	err = rdb.DeleteMailboxWithRetry(ctx, childMbox.ID, accountID)
+	if err != nil {
+		t.Fatalf("Failed to delete child mailbox: %v", err)
+	}
+
+	err = rdb.DeleteMailboxWithRetry(ctx, mbox.ID, accountID)
+	if err != nil {
+		t.Fatalf("Failed to delete parent mailbox: %v", err)
+	}
+
+	t.Log("✅ Mailbox purge test passed!")
 }

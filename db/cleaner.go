@@ -445,3 +445,53 @@ func (d *Database) CleanupOldHealthStatuses(ctx context.Context, tx pgx.Tx, rete
 
 	return result.RowsAffected(), nil
 }
+
+// GetMessagesForMailboxAndChildren retrieves all messages for a mailbox and its children
+// This is used by the admin tool for immediate purging of messages
+func (d *Database) GetMessagesForMailboxAndChildren(ctx context.Context, accountID int64, mailboxID int64, mailboxPath string) ([]Message, error) {
+	query := `
+		SELECT
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart,
+			m.uploaded, m.flags, m.custom_flags, m.internal_date, m.size, m.body_structure,
+			m.created_modseq, m.updated_modseq, m.expunged_modseq, 0 as seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		WHERE m.account_id = $1
+		  AND (mb.id = $2 OR mb.path LIKE $3 || '%')
+		ORDER BY m.id
+	`
+
+	rows, err := d.GetReadPool().Query(ctx, query, accountID, mailboxID, mailboxPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages for mailbox and children: %w", err)
+	}
+	defer rows.Close()
+
+	return scanMessages(rows)
+}
+
+// PurgeMessagesByIDs permanently deletes messages by their IDs
+// This is a hard delete used by the admin tool for immediate purging
+func (d *Database) PurgeMessagesByIDs(ctx context.Context, messageIDs []int64) (int64, error) {
+	if len(messageIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := d.GetWritePool().Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	result, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = ANY($1)`, messageIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to purge messages: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit purge transaction: %w", err)
+	}
+
+	return result.RowsAffected(), nil
+}
