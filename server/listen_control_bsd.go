@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -105,6 +106,15 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
+	}
+
+	// On FreeBSD, set SO_REUSEPORT to better handle separate IPv4/IPv6 listeners on the same port.
+	// This is conditional to avoid potential side effects on other OSes.
+	if runtime.GOOS == "freebsd" {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("failed to set SO_REUSEPORT: %w", err)
+		}
 	}
 
 	// Bind socket
