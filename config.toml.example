@@ -866,7 +866,7 @@ limits.search_rate_limit_window = "1m"   # Time window for search rate limiting 
 # Multi-layered timeout protection against various DoS attacks
 timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration regardless of activity (e.g., "30m", default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Use dotted notation for nested config within [[server]] array element
@@ -955,7 +955,7 @@ proxy_protocol_timeout = "5s"
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -1006,7 +1006,7 @@ proxy_protocol_timeout = "5s"
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
 # IMAP PROXY EXAMPLE
@@ -1069,7 +1069,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #
 timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy).
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration from connect to disconnect.
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -1339,7 +1339,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1385,7 +1385,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- SIEVE EXTENSIONS ---
 # Supported SIEVE extensions advertised to clients and validated during script upload.

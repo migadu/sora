@@ -784,7 +784,7 @@ type IMAPServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`         // Idle timeout during authentication phase (pre-auth only, 0=disabled, default: 0)
 	CommandTimeout         string                `toml:"command_timeout"`           // Maximum idle time before disconnection (e.g., "5m", default: 5 minutes)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"`  // Maximum total session duration (e.g., "30m", default: 30 minutes)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 }
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
@@ -849,7 +849,7 @@ type POP3ServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, 0=disabled, default: 0)
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 2m)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 }
 
 // GetAuthIdleTimeout parses the auth idle timeout duration for POP3 backend
@@ -896,7 +896,7 @@ type ManageSieveServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, 0=disabled, default: 0)
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time before disconnection (default: 3m)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 }
 
 // GetAuthIdleTimeout parses the auth idle timeout duration for ManageSieve backend
@@ -945,7 +945,7 @@ type IMAPProxyServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
@@ -973,7 +973,7 @@ type POP3ProxyServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
@@ -1003,7 +1003,7 @@ type ManageSieveProxyServerConfig struct {
 	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only)
 	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (e.g., "5m")
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (e.g., "30m")
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris attacks
+	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
 	PreLookup              *PreLookupConfig      `toml:"prelookup"`                // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
@@ -1107,7 +1107,7 @@ type ServerLimitsConfig struct {
 type ServerTimeoutsConfig struct {
 	CommandTimeout         string `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
 	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 30m)
-	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 512 bytes/min, 0=use default)
+	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	SchedulerShardCount    int    `toml:"scheduler_shard_count,omitempty"`    // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
 }
 
