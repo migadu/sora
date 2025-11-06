@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -68,10 +69,24 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		ipv6only = 1 // IPv6-only for explicit IPv6 addresses
 	}
 
-	// Create socket with NONBLOCK and CLOEXEC flags (matches Go's net package on Linux/BSD)
-	fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	// Create socket without flags to avoid FreeBSD timing issues with IPv6 dual-stack + NONBLOCK
+	// On FreeBSD, passing SOCK_NONBLOCK|SOCK_CLOEXEC to socket() can cause significant delays
+	// when accepting IPv4 connections on IPv6 dual-stack sockets (IPV6_V6ONLY=0).
+	// Instead, create the socket first, then set flags separately (matches Go's behavior).
+	syscall.ForkLock.RLock()
+	fd, err := unix.Socket(family, unix.SOCK_STREAM, unix.IPPROTO_TCP)
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket: %w", err)
+	}
+
+	// Set nonblocking mode (matches Go's net package)
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("failed to set nonblock: %w", err)
 	}
 
 	// Set SO_REUSEADDR to allow fast restart
