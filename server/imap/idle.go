@@ -12,7 +12,7 @@ import (
 var idlePollInterval = 15 * time.Second
 
 func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) error {
-	s.Log("client entered IDLE mode")
+	s.InfoLog("client entered IDLE mode")
 
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()

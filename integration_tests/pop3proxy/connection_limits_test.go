@@ -137,7 +137,7 @@ func setupPOP3ProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 		MasterSASLUsername:     masterUsername,
 		MasterSASLPassword:     masterPassword,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         10 * time.Minute,
+		AuthIdleTimeout:        10 * time.Minute,
 		EnableAffinity:         false,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

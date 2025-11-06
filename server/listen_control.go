@@ -36,16 +36,28 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 					return
 				}
 
-				// On FreeBSD, set SO_LISTENQLIMIT before listen()
-				// This controls the listen queue size
-				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_LISTENQLIMIT, backlog); err != nil {
-					// Log but don't fail - this might not be supported on all BSD versions
-					logger.Debug("Failed to set SO_LISTENQLIMIT, will use default backlog",
-						"network", network, "address", address, "backlog", backlog, "error", err)
-				}
-			})
-			if err != nil {
-				return err
+	// Determine address family
+	var family int
+	var sockaddr unix.Sockaddr
+
+	// Handle nil IP (e.g., ":143" resolves to IP=nil)
+	// Default to IPv4 for backward compatibility
+	if addr.IP == nil || addr.IP.To4() != nil {
+		family = unix.AF_INET
+		sa := &unix.SockaddrInet4{Port: addr.Port}
+		if addr.IP != nil {
+			copy(sa.Addr[:], addr.IP.To4())
+		}
+		// If IP is nil, sa.Addr is zero (0.0.0.0), which means all interfaces
+		sockaddr = sa
+	} else {
+		family = unix.AF_INET6
+		sa := &unix.SockaddrInet6{Port: addr.Port}
+		copy(sa.Addr[:], addr.IP.To16())
+		// Handle zone ID for link-local addresses (fe80::)
+		if addr.Zone != "" {
+			if iface, err := net.InterfaceByName(addr.Zone); err == nil {
+				sa.ZoneId = uint32(iface.Index)
 			}
 			return ctrlErr
 		},
@@ -57,21 +69,4 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 	}
 
 	return listener, nil
-}
-
-// ListenWithBacklogManual is the old manual socket creation approach.
-// Kept for reference but should not be used as it causes issues on FreeBSD IPv6.
-func ListenWithBacklogManual(ctx context.Context, network, address string, backlog int) (net.Listener, error) {
-	// This function is kept for reference but should not be used
-	return nil, fmt.Errorf("ListenWithBacklogManual is deprecated, use ListenWithBacklog instead")
-}
-
-// MakeListenControl creates a Control function for net.ListenConfig that sets socket options.
-// This is kept for compatibility but doesn't set the backlog (use ListenWithBacklog for that).
-func MakeListenControl(backlog int) func(network, address string, c syscall.RawConn) error {
-	return func(network, address string, c syscall.RawConn) error {
-		// This function is no longer used for setting backlog.
-		// Use ListenWithBacklog instead for proper backlog control.
-		return nil
-	}
 }

@@ -43,7 +43,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 		MasterSASLUsername:     "proxyuser", // Master credentials for backend authentication
 		MasterSASLPassword:     "proxypass", // Master credentials for backend authentication
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Second,
+		AuthIdleTimeout:        30 * time.Second,
 		CommandTimeout:         idleTimeout,      // Short timeout for testing (3 seconds)
 		AbsoluteSessionTimeout: 30 * time.Minute, // Long session timeout (not testing this)
 		MinBytesPerMinute:      0,                // Disable throughput check for this test

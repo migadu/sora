@@ -78,22 +78,20 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 	}
 	defer tx.Rollback(ctx)
 
-	// Get mailbox details
-	mailbox, err := db.GetMailboxByName(ctx, ownerAccountID, mailboxName)
-	if err != nil {
-		return fmt.Errorf("mailbox not found: %w", err)
-	}
-
-	// Verify mailbox is shared and get owner domain
+	// Get mailbox details within the transaction
+	var mailboxID int64
 	var isShared bool
 	var ownerDomain *string
 	err = tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE), owner_domain
+		SELECT id, COALESCE(is_shared, FALSE), owner_domain
 		FROM mailboxes
-		WHERE id = $1
-	`, mailbox.ID).Scan(&isShared, &ownerDomain)
+		WHERE account_id = $1 AND LOWER(name) = LOWER($2)
+	`, ownerAccountID, mailboxName).Scan(&mailboxID, &isShared, &ownerDomain)
 	if err != nil {
-		return fmt.Errorf("failed to check mailbox type: %w", err)
+		if err == pgx.ErrNoRows {
+			return fmt.Errorf("mailbox not found: %w", err)
+		}
+		return fmt.Errorf("failed to get mailbox: %w", err)
 	}
 
 	if !isShared {
@@ -112,7 +110,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 			VALUES ($1, NULL, $2, $3, now(), now())
 			ON CONFLICT (mailbox_id, identifier)
 			DO UPDATE SET rights = EXCLUDED.rights, updated_at = now()
-		`, mailbox.ID, identifier, rights)
+		`, mailboxID, identifier, rights)
 		if err != nil {
 			return fmt.Errorf("failed to grant access to %s: %w", AnyoneIdentifier, err)
 		}
@@ -151,7 +149,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 		VALUES ($1, $2, $3, $4, now(), now())
 		ON CONFLICT (mailbox_id, identifier)
 		DO UPDATE SET rights = EXCLUDED.rights, updated_at = now()
-	`, mailbox.ID, granteeAccountID, identifier, rights)
+	`, mailboxID, granteeAccountID, identifier, rights)
 	if err != nil {
 		return fmt.Errorf("failed to grant access: %w", err)
 	}

@@ -43,7 +43,7 @@ type POP3ProxyServer struct {
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig        *config.PreLookupConfig
-	sessionTimeout         time.Duration
+	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
@@ -127,7 +127,7 @@ type POP3ProxyServerOptions struct {
 	MasterSASLUsername     string
 	MasterSASLPassword     string
 	ConnectTimeout         time.Duration
-	SessionTimeout         time.Duration
+	AuthIdleTimeout        time.Duration
 	CommandTimeout         time.Duration // Idle timeout
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration
 	MinBytesPerMinute      int64         // Minimum throughput
@@ -220,6 +220,12 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debugWriter = &maskingWriter{w: os.Stdout}
 	}
 
+	// Set listen backlog with reasonable default
+	listenBacklog := options.ListenBacklog
+	if listenBacklog == 0 {
+		listenBacklog = 1024 // Default backlog
+	}
+
 	server := &POP3ProxyServer{
 		name:                   options.Name,
 		hostname:               hostname,
@@ -238,13 +244,13 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		authLimiter:            authLimiter,
 		trustedProxies:         options.TrustedProxies,
 		prelookupConfig:        options.PreLookup,
-		sessionTimeout:         options.SessionTimeout,
+		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		remoteUseXCLIENT:       options.RemoteUseXCLIENT,
 		limiter:                limiter,
-		listenBacklog:          options.ListenBacklog,
+		listenBacklog:          listenBacklog,
 		debug:                  options.Debug,
 		debugWriter:            debugWriter,
 		activeSessions:         make(map[*POP3ProxySession]struct{}),
@@ -296,38 +302,32 @@ func (s *POP3ProxyServer) Start() error {
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send POP3 error response before closing
+			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
 			var message string
 			switch reason {
 			case "idle":
-				message = "-ERR Idle timeout, please reconnect\r\n"
+				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "-ERR Connection too slow, please reconnect\r\n"
+				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "-ERR Maximum session duration exceeded, please reconnect\r\n"
+				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "-ERR Connection timeout, please reconnect\r\n"
+				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
 
 	// Create base TCP listener with custom backlog
-	var tcpListener net.Listener
-	var err error
-	if s.listenBacklog > 0 {
-		// Use custom backlog function (platform-specific)
-		tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		logger.Debug("POP3 Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-	} else {
-		tcpListener, err = net.Listen("tcp", s.addr)
-	}
+	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 	if err != nil {
 		s.cancel()
 		return fmt.Errorf("failed to create TCP listener: %w", err)
 	}
+	logger.Debug("POP3 Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 
 	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection

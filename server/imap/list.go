@@ -100,7 +100,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						numUnseenStr = fmt.Sprint(*statusData.NumUnseen)
 					}
 
-					s.Log("[LIST-STATUS] Mailbox '%s': NumMessages=%s, UIDNext=%v, UIDValidity=%v, NumUnseen=%s, HighestModSeq=%v",
+					s.InfoLog("[LIST-STATUS] Mailbox '%s': NumMessages=%s, UIDNext=%v, UIDValidity=%v, NumUnseen=%s, HighestModSeq=%v",
 						data.Mailbox,
 						numMessagesStr,
 						statusData.UIDNext,
@@ -108,7 +108,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						numUnseenStr,
 						statusData.HighestModSeq)
 				} else {
-					s.Log("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err) // err can be nil if statusData is nil
+					s.InfoLog("[LIST-STATUS] Failed to get status for mailbox '%s': %v", data.Mailbox, err) // err can be nil if statusData is nil
 				}
 			}
 		}

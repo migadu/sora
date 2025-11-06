@@ -199,7 +199,7 @@ func setupIMAPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 		RemoteUseProxyProtocol: true,
 		RemoteUseIDCommand:     false,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         10 * time.Minute,
+		AuthIdleTimeout:        10 * time.Minute,
 		EnableAffinity:         false,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

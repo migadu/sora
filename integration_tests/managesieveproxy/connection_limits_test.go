@@ -140,7 +140,7 @@ func setupManageSieveProxyWithConnectionLimits(t *testing.T, rdb *resilient.Resi
 		RemoteTLSVerify:        false,
 		RemoteUseProxyProtocol: false,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         10 * time.Minute,
+		AuthIdleTimeout:        10 * time.Minute,
 		EnableAffinity:         false,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

@@ -6,11 +6,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
@@ -62,6 +63,7 @@ type POP3Server struct {
 	sessionMemoryLimit int64
 
 	// Command timeout and throughput enforcement
+	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
@@ -94,6 +96,7 @@ type POP3ServerOptions struct {
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
 	AuthRateLimit          serverPkg.AuthRateLimiterConfig
 	SessionMemoryLimit     int64          // Memory limit per session in bytes
+	AuthIdleTimeout        time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout         time.Duration  // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
@@ -149,6 +152,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		authLimiter:            authLimiter,
 		trustedNetworks:        options.TrustedNetworks,
 		sessionMemoryLimit:     options.SessionMemoryLimit,
+		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
@@ -249,6 +253,24 @@ func (s *POP3Server) Start(errChan chan error) {
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
 		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		OnTimeout: func(conn net.Conn, reason string) {
+			// Send POP3 error message before closing due to timeout
+			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
+			var message string
+			switch reason {
+			case "idle":
+				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
+			case "slow_throughput":
+				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+			case "session_max":
+				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
+			default:
+				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+			}
+			// Write error message - ignore errors as connection may already be broken
+			// This is best-effort to inform the client
+			_, _ = fmt.Fprint(conn, message)
+		},
 	}
 
 	if s.tlsConfig != nil {
@@ -392,7 +414,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.Id = idgen.New()
 		session.HostName = s.hostname
 		session.Stats = s
-		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.Log)
+		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
 
 		// Build connection info for logging
 		var remoteInfo string

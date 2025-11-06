@@ -11,14 +11,14 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 	searchCriteria = s.decodeSearchCriteria(searchCriteria)
 
 	if s.currentNumMessages.Load() == 0 && len(searchCriteria.SeqNum) > 0 {
-		s.Log("[SORT] skipping SORT because mailbox is empty")
+		s.InfoLog("[SORT] skipping SORT because mailbox is empty")
 		return &imap.SortData{All: []uint32{}}, nil
 	}
 
 	// Acquire a read lock to safely get a snapshot of the session tracker.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.Log("[SORT] Failed to acquire read lock for session tracker")
+		s.InfoLog("[SORT] Failed to acquire read lock for session tracker")
 		return nil, s.internalError("failed to acquire lock for sort")
 	}
 	sessionTrackerSnapshot := s.sessionTracker
@@ -53,9 +53,9 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 	// Handle ESORT options if provided and capability is enabled
 	if options != nil {
 		if !s.GetCapabilities().Has(imap.CapESort) {
-			s.Log("[SORT] ESORT options ignored due to capability filtering")
+			s.InfoLog("[SORT] ESORT options ignored due to capability filtering")
 		} else {
-			s.Log("[SORT ESORT] ESORT options provided: Min=%v, Max=%v, All=%v, Count=%v",
+			s.InfoLog("[SORT ESORT] ESORT options provided: Min=%v, Max=%v, All=%v, Count=%v",
 				options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 			if options.ReturnCount {
 				sortData.Count = uint32(len(nums))

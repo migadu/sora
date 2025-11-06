@@ -68,14 +68,22 @@ func (s *POP3Session) handleConnection() {
 	writer.WriteString("+OK POP3 server ready\r\n")
 	writer.Flush()
 
-	s.Log("connected")
+	s.InfoLog("connected")
 
 	ctx := s.ctx
 	var userAddress *server.Address
 
 	for {
 		// Set idle timeout for reading command
-		(*s.conn).SetReadDeadline(time.Now().Add(Pop3IdleTimeout))
+		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use command_timeout
+		// After authentication: use command_timeout
+		if !s.authenticated && s.server.authIdleTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
+		} else if s.server.commandTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.commandTimeout))
+		} else {
+			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
+		}
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -391,9 +399,10 @@ func (s *POP3Session) handleConnection() {
 			s.deleted = make(map[int]bool)                   // Initialize deletion map on authentication
 			s.useMasterDB = true                             // Pin session to master DB after a write to ensure consistency
 			release()
+
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("authenticated (connections: total=%d, authenticated=%d)", totalCount, authCount)
+			s.InfoLog("authenticated (connections: total=%d, authenticated=%d)", totalCount, authCount)
 
 			// Track successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", "success").Inc()
@@ -1560,11 +1569,11 @@ func (s *POP3Session) handleConnection() {
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
 			if impersonating {
-				s.Log("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)", authzID, totalCount, authCount)
+				s.InfoLog("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)", authzID, totalCount, authCount)
 				// Register connection for tracking with the impersonated user's email
 				s.registerConnection(authzID)
 			} else {
-				s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)", totalCount, authCount)
+				s.InfoLog("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)", totalCount, authCount)
 				// Register connection for tracking with the authenticated user's email
 				s.registerConnection(authnID)
 			}
@@ -1689,7 +1698,7 @@ func (s *POP3Session) handleConnection() {
 			var mailboxID int64
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.Log("QUIT: Failed to acquire read lock, cannot expunge messages.")
+				s.InfoLog("QUIT: Failed to acquire read lock, cannot expunge messages.")
 				// Continue with QUIT, but don't expunge.
 			} else {
 				mailboxID = s.inboxMailboxID
@@ -1845,7 +1854,7 @@ func (s *POP3Session) closeWithoutLock() error {
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
-		s.Log("closed (connections: total=%d, authenticated=%d)", totalCount, authCount)
+		s.InfoLog("closed (connections: total=%d, authenticated=%d)", totalCount, authCount)
 
 		// Clean up session state
 		s.User = nil
@@ -2015,7 +2024,7 @@ func (s *POP3Session) startTerminationPoller() {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connection
-			s.Log("Connection kicked - disconnecting user")
+			s.InfoLog("Connection kicked - disconnecting user")
 			(*s.conn).Close()
 		case <-s.ctx.Done():
 			// Session ended normally

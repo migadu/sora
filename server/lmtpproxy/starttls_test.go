@@ -56,7 +56,7 @@ func TestLMTPProxyServerOptions(t *testing.T) {
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
 				// RemoteTLSVerify:      true,
 				// ConnectTimeout:       10 * time.Second,
-				// SessionTimeout:       5 * time.Minute,
+				// AuthIdleTimeout:       5 * time.Minute,
 				// MaxMessageSize:       52428800, // 50MB
 			}
 
@@ -156,7 +156,7 @@ func TestLMTPProxyServerStartTLSConfiguration(t *testing.T) {
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
 				RemoteTLSVerify:      true,
 				ConnectTimeout:       10 * time.Second,
-				SessionTimeout:       5 * time.Minute,
+				AuthIdleTimeout:      5 * time.Minute,
 				MaxMessageSize:       52428800, // 50MB
 			}
 
@@ -308,7 +308,7 @@ func TestLMTPProxyTLSModeMatrix(t *testing.T) {
 			opts.TLSCertFile = "../../testdata/sora.crt"
 			opts.TLSKeyFile = "../../testdata/sora.key"
 			opts.ConnectTimeout = 10 * time.Second
-			opts.SessionTimeout = 5 * time.Minute
+			opts.AuthIdleTimeout = 5 * time.Minute
 			opts.MaxMessageSize = 52428800 // 50MB
 
 			srv, err := New(ctx, nil, "test.example.com", opts)
@@ -340,7 +340,7 @@ func TestLMTPProxyStartTLSWithXCLIENT(t *testing.T) {
 		RemoteTLSUseStartTLS: true,
 		RemoteUseXCLIENT:     true, // XCLIENT forwarding enabled
 		ConnectTimeout:       10 * time.Second,
-		SessionTimeout:       5 * time.Minute,
+		AuthIdleTimeout:      5 * time.Minute,
 		MaxMessageSize:       52428800,
 	}
 

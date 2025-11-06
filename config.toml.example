@@ -859,14 +859,14 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
-limits.search_rate_limit_per_min = 0     # Maximum searches per minute per user (0 = disabled).
-limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (e.g., "1m", "2m").
+limits.search_rate_limit_per_min = 30    # Maximum searches per minute per user (default: 30, set to 0 to disable).
+limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
 timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration regardless of activity (e.g., "30m", default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Use dotted notation for nested config within [[server]] array element
@@ -955,7 +955,7 @@ proxy_protocol_timeout = "5s"
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -1006,7 +1006,7 @@ proxy_protocol_timeout = "5s"
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
 timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
 # IMAP PROXY EXAMPLE
@@ -1040,13 +1040,36 @@ remote_use_id_command = false         # Send IMAP ID command to backends
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-session_timeout = "30m"
+auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
+                              # Resets after each command received. If client is silent for 2 minutes, disconnected.
+                              # Cleared after successful authentication.
+                              # Note: absolute_session_timeout (below) separately limits total session duration.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+# IMPORTANT: IMAP proxy cannot detect IDLE commands (RFC 2177), so command_timeout should be disabled (0).
+#
+# IMAP proxy has THREE timeout mechanisms:
+# 1. auth_idle_timeout (above): Idle timeout during pre-auth phase only
+#    - Resets after each command received
+#    - 2 minutes of silence during login → disconnect
+#    - Cleared after successful authentication
+#
+# 2. command_timeout (below): Idle timeout that applies during entire connection
+#    - MUST be disabled (0) for IMAP proxy because:
+#      - IDLE commands can legitimately last 29+ minutes (RFC 2177)
+#      - Proxy is protocol-agnostic and cannot detect IDLE
+#      - Backend IMAP server handles IDLE correctly with its own timeouts
+#    - Pre-auth protection is already provided by session_timeout above
+#
+# 3. absolute_session_timeout (below): Maximum total session duration
+#    - Enforced throughout entire connection (pre-auth AND post-auth)
+#    - Prevents indefinitely long sessions
+#    - 30 minutes from connection to disconnection, regardless of activity
+#
+timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration from connect to disconnect (default: 30m).
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
@@ -1308,13 +1331,15 @@ remote_use_xclient = false            # Send XCLIENT command to backends for for
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-session_timeout = "10m"
+auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
+                              # Resets after each command received. Cleared after successful authentication.
+                              # Note: absolute_session_timeout (below) separately limits total session duration.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -1352,13 +1377,15 @@ remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-session_timeout = "15m"
+auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
+                              # Resets after each command received. Cleared after successful authentication.
+                              # Note: absolute_session_timeout (below) separately limits total session duration.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "5m"             # Maximum idle time (default: 5 minutes)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
-timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = use default of 512)
+timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- SIEVE EXTENSIONS ---
 # Supported SIEVE extensions advertised to clients and validated during script upload.
@@ -1408,7 +1435,7 @@ remote_use_xclient = false            # Send XCLIENT command to backends for for
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-session_timeout = "5m"
+auth_idle_timeout = "2m"
 max_message_size = "50mb"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 

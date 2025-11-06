@@ -48,7 +48,7 @@ type Server struct {
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig        *config.PreLookupConfig
-	sessionTimeout         time.Duration
+	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
@@ -92,7 +92,7 @@ type ServerOptions struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
-	SessionTimeout         time.Duration
+	AuthIdleTimeout        time.Duration
 	CommandTimeout         time.Duration // Idle timeout
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration
 	MinBytesPerMinute      int64         // Minimum throughput
@@ -190,6 +190,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter = server.NewConnectionLimiterWithTrustedNets("SIEVE-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
 	}
 
+	// Set listen backlog with reasonable default
+	listenBacklog := opts.ListenBacklog
+	if listenBacklog == 0 {
+		listenBacklog = 1024 // Default backlog
+	}
+
 	s := &Server{
 		rdb:                    rdb,
 		name:                   opts.Name,
@@ -214,12 +220,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		authLimiter:            authLimiter,
 		trustedProxies:         opts.TrustedProxies,
 		prelookupConfig:        opts.PreLookup,
-		sessionTimeout:         opts.SessionTimeout,
+		authIdleTimeout:        opts.AuthIdleTimeout,
 		commandTimeout:         opts.CommandTimeout,
 		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
 		minBytesPerMinute:      opts.MinBytesPerMinute,
 		limiter:                limiter,
-		listenBacklog:          opts.ListenBacklog,
+		listenBacklog:          listenBacklog,
 		debug:                  opts.Debug,
 		supportedExtensions:    opts.SupportedExtensions,
 		activeSessions:         make(map[*Session]struct{}),
@@ -278,7 +284,7 @@ func (s *Server) Start() error {
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 			OnTimeout: func(conn net.Conn, reason string) {
 				// Send BYE with TRYLATER before closing (RFC 5804)
 				var message string
@@ -298,18 +304,12 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("ManageSieve Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
+		logger.Debug("ManageSieve Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
@@ -320,7 +320,7 @@ func (s *Server) Start() error {
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
 			OnTimeout: func(conn net.Conn, reason string) {
 				// Send BYE with TRYLATER before closing (RFC 5804)
 				var message string
@@ -340,18 +340,12 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("ManageSieve Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
+		logger.Debug("ManageSieve Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraListener for non-TLS with timeout protection
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()

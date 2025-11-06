@@ -25,9 +25,9 @@ func TestMailboxCommands(t *testing.T) {
 	rdb := setupMailboxTestDatabase(t)
 	defer rdb.Close()
 
-	// Create test account with unique email to avoid conflicts
+	// Create test account with unique email AND domain to avoid ACL conflicts
 	timestamp := time.Now().UnixNano()
-	testEmail := fmt.Sprintf("mailbox-test-%d@example.com", timestamp)
+	testEmail := fmt.Sprintf("mailbox-test-%d@mailbox-test-%d.com", timestamp, timestamp)
 	accountID := createMailboxTestAccount(t, rdb, testEmail, "password123")
 
 	ctx := context.Background()

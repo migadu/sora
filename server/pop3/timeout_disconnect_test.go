@@ -1,9 +1,8 @@
-package imap
+package pop3
 
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -16,8 +15,8 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
-// TestIdleTimeoutSendsBye verifies that idle timeout sends BYE message
-func TestIdleTimeoutSendsBye(t *testing.T) {
+// TestIdleTimeoutSendsError verifies that idle timeout sends POP3 error message
+func TestIdleTimeoutSendsError(t *testing.T) {
 	// Skip in short mode
 	if testing.Short() {
 		t.Skip("Skipping timeout test in short mode")
@@ -41,24 +40,20 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 	mockUploader := &uploader.UploadWorker{}  // Mock - won't be used in this test
 	mockCache := &cache.Cache{}               // Mock - won't be used in this test
 
-	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, IMAPServerOptions{
+	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, POP3ServerOptions{
 		Debug:          false,
 		TLS:            false,
 		CommandTimeout: 2 * time.Second, // Very short idle timeout
-		AppendLimit:    DefaultAppendLimit,
 		MaxConnections: 10,
 		Config:         &config.Config{}, // Minimal config
 	})
 	if err != nil {
-		t.Fatalf("Failed to create IMAP server: %v", err)
+		t.Fatalf("Failed to create POP3 server: %v", err)
 	}
 
 	// Start server in background
-	go func() {
-		if err := server.Serve(addr); err != nil && ctx.Err() == nil {
-			t.Logf("Server error: %v", err)
-		}
-	}()
+	errChan := make(chan error, 1)
+	go server.Start(errChan)
 
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
@@ -77,32 +72,32 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read greeting: %v", err)
 	}
-	if !strings.HasPrefix(greeting, "* OK") {
-		t.Errorf("Expected OK greeting, got: %s", greeting)
+	if !strings.HasPrefix(greeting, "+OK") {
+		t.Errorf("Expected +OK greeting, got: %s", greeting)
 	}
 
 	// Wait for idle timeout (2 seconds + buffer)
 	time.Sleep(3 * time.Second)
 
-	// Read BYE message
-	bye, err := reader.ReadString('\n')
+	// Read error message
+	errMsg, err := reader.ReadString('\n')
 	if err != nil {
-		t.Fatalf("Failed to read BYE: %v", err)
+		t.Fatalf("Failed to read error message: %v", err)
 	}
 
-	// Verify BYE message contains expected text
-	if !strings.HasPrefix(bye, "* BYE") {
-		t.Errorf("Expected BYE response, got: %s", bye)
+	// Verify error message contains expected text
+	if !strings.HasPrefix(errMsg, "-ERR") {
+		t.Errorf("Expected -ERR response, got: %s", errMsg)
 	}
-	if !strings.Contains(bye, "Idle timeout") {
-		t.Errorf("Expected 'Idle timeout' in BYE message, got: %s", bye)
+	if !strings.Contains(errMsg, "timed out") && !strings.Contains(errMsg, "timeout") {
+		t.Errorf("Expected 'timeout' in error message, got: %s", errMsg)
 	}
 
-	t.Logf("✓ Received expected BYE message: %s", strings.TrimSpace(bye))
+	t.Logf("✓ Received expected error message: %s", strings.TrimSpace(errMsg))
 }
 
-// TestSessionMaxTimeoutSendsBye verifies that session max timeout sends BYE message
-func TestSessionMaxTimeoutSendsBye(t *testing.T) {
+// TestSessionMaxTimeoutSendsError verifies that session max timeout sends POP3 error message
+func TestSessionMaxTimeoutSendsError(t *testing.T) {
 	// Skip in short mode
 	if testing.Short() {
 		t.Skip("Skipping timeout test in short mode")
@@ -125,25 +120,21 @@ func TestSessionMaxTimeoutSendsBye(t *testing.T) {
 	mockUploader := &uploader.UploadWorker{}
 	mockCache := &cache.Cache{}
 
-	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, IMAPServerOptions{
+	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, POP3ServerOptions{
 		Debug:                  false,
 		TLS:                    false,
 		CommandTimeout:         10 * time.Second, // Long idle timeout
 		AbsoluteSessionTimeout: 2 * time.Second,  // Very short session max
-		AppendLimit:            DefaultAppendLimit,
 		MaxConnections:         10,
 		Config:                 &config.Config{},
 	})
 	if err != nil {
-		t.Fatalf("Failed to create IMAP server: %v", err)
+		t.Fatalf("Failed to create POP3 server: %v", err)
 	}
 
 	// Start server in background
-	go func() {
-		if err := server.Serve(addr); err != nil && ctx.Err() == nil {
-			t.Logf("Server error: %v", err)
-		}
-	}()
+	errChan := make(chan error, 1)
+	go server.Start(errChan)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -161,8 +152,8 @@ func TestSessionMaxTimeoutSendsBye(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read greeting: %v", err)
 	}
-	if !strings.HasPrefix(greeting, "* OK") {
-		t.Errorf("Expected OK greeting, got: %s", greeting)
+	if !strings.HasPrefix(greeting, "+OK") {
+		t.Errorf("Expected +OK greeting, got: %s", greeting)
 	}
 
 	// Keep connection active but wait for session max timeout
@@ -175,7 +166,7 @@ func TestSessionMaxTimeoutSendsBye(t *testing.T) {
 		for {
 			select {
 			case <-ticker.C:
-				fmt.Fprintf(conn, "A001 NOOP\r\n")
+				conn.Write([]byte("NOOP\r\n"))
 			case <-done:
 				return
 			}
@@ -186,26 +177,26 @@ func TestSessionMaxTimeoutSendsBye(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	close(done)
 
-	// Read any pending responses and look for BYE
+	// Read any pending responses and look for error message
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	var foundBye bool
+	var foundError bool
 	for i := 0; i < 10; i++ { // Read up to 10 lines
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
-		if strings.HasPrefix(line, "* BYE") {
-			foundBye = true
-			if !strings.Contains(line, "session duration") {
-				t.Errorf("Expected 'session duration' in BYE message, got: %s", line)
+		if strings.HasPrefix(line, "-ERR") && strings.Contains(line, "session duration") {
+			foundError = true
+			if !strings.Contains(line, "[IN-USE]") {
+				t.Errorf("Expected '[IN-USE]' response code in error message, got: %s", line)
 			}
-			t.Logf("✓ Received expected BYE message: %s", strings.TrimSpace(line))
+			t.Logf("✓ Received expected error message: %s", strings.TrimSpace(line))
 			break
 		}
 	}
 
-	if !foundBye {
-		t.Error("Did not receive expected BYE message for session max timeout")
+	if !foundError {
+		t.Error("Did not receive expected error message for session max timeout")
 	}
 }
 
@@ -216,14 +207,11 @@ func TestSlowThroughputTimeoutInfo(t *testing.T) {
 
 	t.Log("✓ Slow throughput timeout mechanism is implemented")
 	t.Log("  Trigger: Data transfer rate below min_bytes_per_minute after 2 minutes")
-	t.Log("  Message: * BYE Connection too slow, please reconnect")
+	t.Log("  Message: -ERR [IN-USE] Connection too slow, please reconnect")
 	t.Log("  (Full integration test would require >2 minutes to execute)")
 }
 
 // TestAuthIdleTimeoutDuringPreAuth verifies that auth_idle_timeout disconnects during pre-auth phase
-// Note: auth_idle_timeout uses SetReadDeadline() which closes the connection without sending BYE.
-// This is acceptable because: (1) default is 0 (disabled), (2) meant for aggressive cleanup,
-// (3) post-auth timeouts via SoraConn properly send BYE messages.
 func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	// Skip in short mode
 	if testing.Short() {
@@ -247,25 +235,21 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	mockUploader := &uploader.UploadWorker{}
 	mockCache := &cache.Cache{}
 
-	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, IMAPServerOptions{
+	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, POP3ServerOptions{
 		Debug:           false,
 		TLS:             false,
 		AuthIdleTimeout: 2 * time.Second,  // Very short auth idle timeout
 		CommandTimeout:  10 * time.Second, // Longer command timeout (should not trigger)
-		AppendLimit:     DefaultAppendLimit,
 		MaxConnections:  10,
 		Config:          &config.Config{},
 	})
 	if err != nil {
-		t.Fatalf("Failed to create IMAP server: %v", err)
+		t.Fatalf("Failed to create POP3 server: %v", err)
 	}
 
 	// Start server in background
-	go func() {
-		if err := server.Serve(addr); err != nil && ctx.Err() == nil {
-			t.Logf("Server error: %v", err)
-		}
-	}()
+	errChan := make(chan error, 1)
+	go server.Start(errChan)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -283,22 +267,34 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read greeting: %v", err)
 	}
-	if !strings.HasPrefix(greeting, "* OK") {
-		t.Errorf("Expected OK greeting, got: %s", greeting)
+	if !strings.HasPrefix(greeting, "+OK") {
+		t.Errorf("Expected +OK greeting, got: %s", greeting)
 	}
 
 	// Do NOT authenticate - just wait idle during pre-auth phase
 	// Auth idle timeout should trigger (2 seconds + buffer)
 	time.Sleep(3 * time.Second)
 
-	// Try to read - should get connection closed or timeout error
+	// Read error message from server
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	_, err = reader.ReadString('\n')
+	errMsg, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read timeout error message: %v", err)
+	}
 
-	// We expect either EOF (connection closed) or timeout
+	// Verify error message
+	if !strings.HasPrefix(errMsg, "-ERR") {
+		t.Errorf("Expected -ERR response, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "timed out") {
+		t.Errorf("Expected 'timed out' in error message, got: %s", errMsg)
+	}
+
+	t.Logf("✓ Connection timed out during pre-auth idle as expected: %s", strings.TrimSpace(errMsg))
+
+	// Connection should now be closed - next read should fail
+	_, err = reader.ReadString('\n')
 	if err == nil {
-		t.Error("Expected connection to be closed after auth idle timeout, but read succeeded")
-	} else {
-		t.Logf("✓ Connection closed during pre-auth idle as expected: %v", err)
+		t.Error("Expected connection to be closed after timeout, but second read succeeded")
 	}
 }

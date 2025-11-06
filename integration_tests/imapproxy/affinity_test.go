@@ -72,7 +72,7 @@ func TestIMAPProxyUserAffinity(t *testing.T) {
 		MasterSASLPassword:     "proxypass",
 		RemoteUseProxyProtocol: true,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         30 * time.Second,
+		AuthIdleTimeout:        30 * time.Second,
 		EnableAffinity:         true, // Enable affinity
 		AuthRateLimit:          server.DefaultAuthRateLimiterConfig(),
 	})
@@ -206,7 +206,7 @@ func TestIMAPProxyAffinityFailover(t *testing.T) {
 		MasterSASLPassword:     "proxypass",
 		RemoteUseProxyProtocol: true,
 		ConnectTimeout:         2 * time.Second,
-		SessionTimeout:         30 * time.Second,
+		AuthIdleTimeout:        30 * time.Second,
 		EnableAffinity:         true,
 		AuthRateLimit:          server.DefaultAuthRateLimiterConfig(),
 	})
@@ -333,7 +333,7 @@ func TestIMAPProxyAffinityWithoutAffinityManager(t *testing.T) {
 		MasterSASLPassword:     "proxypass",
 		RemoteUseProxyProtocol: true,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         30 * time.Second,
+		AuthIdleTimeout:        30 * time.Second,
 		EnableAffinity:         true, // Enabled but manager not attached!
 		AuthRateLimit:          server.DefaultAuthRateLimiterConfig(),
 	})

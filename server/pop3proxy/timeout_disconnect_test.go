@@ -169,3 +169,94 @@ func TestSlowThroughputTimeoutInfo(t *testing.T) {
 	t.Log("  Message: -ERR Connection too slow, please reconnect")
 	t.Log("  (Full integration test would require >2 minutes to execute)")
 }
+
+// TestAuthIdleTimeoutDuringPreAuth verifies that auth_idle_timeout disconnects during pre-auth phase
+func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping timeout test in short mode")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Find available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find available port: %v", err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	// Create mock dependencies
+	mockRDB := &resilient.ResilientDatabase{}
+
+	srv, err := New(ctx, "localhost", addr, mockRDB, POP3ProxyServerOptions{
+		Name:            "test",
+		RemoteAddrs:     []string{"127.0.0.1:110"}, // Dummy backend
+		RemotePort:      110,
+		AuthIdleTimeout: 2 * time.Second,  // Very short auth idle timeout
+		CommandTimeout:  10 * time.Second, // Longer command timeout (should not trigger)
+		ConnectTimeout:  5 * time.Second,
+		AuthRateLimit:   server.AuthRateLimiterConfig{},
+		MaxConnections:  10,
+		PreLookup:       &config.PreLookupConfig{},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create POP3 proxy: %v", err)
+	}
+
+	// Start server in background
+	go func() {
+		if err := srv.Start(); err != nil && ctx.Err() == nil {
+			t.Logf("Server error: %v", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect client
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	// Read greeting
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read greeting: %v", err)
+	}
+	// POP3 greeting starts with +OK or -ERR
+	if !strings.HasPrefix(greeting, "+OK") && !strings.HasPrefix(greeting, "-ERR") {
+		t.Logf("Unexpected greeting (may be normal for proxy without backend): %s", greeting)
+	}
+
+	// Do NOT authenticate - just wait idle during pre-auth phase
+	// Auth idle timeout should trigger (2 seconds + buffer)
+	time.Sleep(3 * time.Second)
+
+	// Read error message from server
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	errMsg, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read timeout error message: %v", err)
+	}
+
+	// Verify error message
+	if !strings.HasPrefix(errMsg, "-ERR") {
+		t.Errorf("Expected -ERR response, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "Idle timeout") {
+		t.Errorf("Expected 'Idle timeout' in error message, got: %s", errMsg)
+	}
+
+	t.Logf("✓ Connection timed out during pre-auth idle as expected: %s", strings.TrimSpace(errMsg))
+
+	// Connection should now be closed - next read should fail
+	_, err = reader.ReadString('\n')
+	if err == nil {
+		t.Error("Expected connection to be closed after timeout, but second read succeeded")
+	}
+}

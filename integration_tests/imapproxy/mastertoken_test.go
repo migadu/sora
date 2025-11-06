@@ -323,7 +323,7 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 		RemoteUseProxyProtocol: true,
 		RemoteUseIDCommand:     false,
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		PreLookup:              prelookupConfig,
 		AuthRateLimit: server.AuthRateLimiterConfig{

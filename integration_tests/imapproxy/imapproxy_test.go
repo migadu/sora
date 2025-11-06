@@ -186,7 +186,7 @@ func setupIMAPProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		RemoteUseProxyProtocol: true,  // Enable PROXY protocol to backend
 		RemoteUseIDCommand:     false, // Disable ID command (using PROXY instead)
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
@@ -239,7 +239,7 @@ func setupIMAPProxyWithIDCommand(t *testing.T, rdb *resilient.ResilientDatabase,
 		RemoteUseProxyProtocol: false, // Disable PROXY protocol (using ID instead)
 		RemoteUseIDCommand:     true,  // Enable ID command for Dovecot compatibility
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
@@ -383,7 +383,7 @@ func setupIMAPProxyWithLimits(t *testing.T, rdb *resilient.ResilientDatabase, pr
 		RemoteUseProxyProtocol: true,
 		RemoteUseIDCommand:     false,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         10 * time.Minute,
+		AuthIdleTimeout:        10 * time.Minute,
 		EnableAffinity:         false,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

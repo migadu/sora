@@ -4588,6 +4588,197 @@ Examples:
 	}
 }
 
+// applyConfigDefaults fills in default values for any empty config fields
+// so that "config dump" shows the actual values that would be used at runtime
+func applyConfigDefaults(cfg *config.Config) {
+	// Apply defaults to each server in the DynamicServers slice
+	for i := range cfg.DynamicServers {
+		srv := &cfg.DynamicServers[i]
+
+		// Apply timeout defaults based on type if timeouts struct exists
+		if srv.Timeouts == nil {
+			srv.Timeouts = &config.ServerTimeoutsConfig{}
+		}
+
+		// Apply command_timeout default
+		if srv.Timeouts.CommandTimeout == "" {
+			timeout, _ := srv.GetCommandTimeout()
+			if timeout > 0 {
+				srv.Timeouts.CommandTimeout = timeout.String()
+			} else {
+				srv.Timeouts.CommandTimeout = "0"
+			}
+		}
+
+		// Apply absolute_session_timeout default
+		if srv.Timeouts.AbsoluteSessionTimeout == "" {
+			timeout, _ := srv.GetAbsoluteSessionTimeout()
+			srv.Timeouts.AbsoluteSessionTimeout = timeout.String()
+		}
+
+		// Apply min_bytes_per_minute default
+		if srv.Timeouts.MinBytesPerMinute == 0 {
+			srv.Timeouts.MinBytesPerMinute = srv.GetMinBytesPerMinute()
+			// GetMinBytesPerMinute() returns 0 by default (disabled)
+		}
+
+		// Apply connect_timeout default (for proxy types)
+		if srv.ConnectTimeout == "" {
+			timeout, _ := srv.GetConnectTimeout()
+			if timeout > 0 {
+				srv.ConnectTimeout = timeout.String()
+			}
+		}
+
+		// Apply auth_idle_timeout default
+		if srv.AuthIdleTimeout == "" {
+			timeout, _ := srv.GetAuthIdleTimeout()
+			if timeout > 0 {
+				srv.AuthIdleTimeout = timeout.String()
+			} else {
+				srv.AuthIdleTimeout = "0"
+			}
+		}
+	}
+
+	// Apply defaults to legacy configs (if used via [servers.imap_proxy] syntax)
+	applyProxyDefaults := func(connectTimeout, authIdleTimeout, commandTimeout, absoluteSessionTimeout *string, minBytesPerMinute *int64, getConnect, getAuthIdle, getCommand, getAbsolute func() (time.Duration, error)) {
+		if *connectTimeout == "" {
+			if timeout, _ := getConnect(); timeout > 0 {
+				*connectTimeout = timeout.String()
+			}
+		}
+		if *authIdleTimeout == "" {
+			if timeout, _ := getAuthIdle(); timeout > 0 {
+				*authIdleTimeout = timeout.String()
+			} else {
+				*authIdleTimeout = "0"
+			}
+		}
+		if *commandTimeout == "" {
+			if timeout, _ := getCommand(); timeout > 0 {
+				*commandTimeout = timeout.String()
+			} else {
+				*commandTimeout = "0"
+			}
+		}
+		if *absoluteSessionTimeout == "" {
+			if timeout, _ := getAbsolute(); timeout > 0 {
+				*absoluteSessionTimeout = timeout.String()
+			}
+		}
+		// minBytesPerMinute default is 0 (disabled) - don't override
+	}
+
+	// IMAP Proxy (legacy)
+	applyProxyDefaults(
+		&cfg.Servers.IMAPProxy.ConnectTimeout,
+		&cfg.Servers.IMAPProxy.AuthIdleTimeout,
+		&cfg.Servers.IMAPProxy.CommandTimeout,
+		&cfg.Servers.IMAPProxy.AbsoluteSessionTimeout,
+		&cfg.Servers.IMAPProxy.MinBytesPerMinute,
+		cfg.Servers.IMAPProxy.GetConnectTimeout,
+		cfg.Servers.IMAPProxy.GetAuthIdleTimeout,
+		cfg.Servers.IMAPProxy.GetCommandTimeout,
+		cfg.Servers.IMAPProxy.GetAbsoluteSessionTimeout,
+	)
+
+	// POP3 Proxy (legacy)
+	applyProxyDefaults(
+		&cfg.Servers.POP3Proxy.ConnectTimeout,
+		&cfg.Servers.POP3Proxy.AuthIdleTimeout,
+		&cfg.Servers.POP3Proxy.CommandTimeout,
+		&cfg.Servers.POP3Proxy.AbsoluteSessionTimeout,
+		&cfg.Servers.POP3Proxy.MinBytesPerMinute,
+		cfg.Servers.POP3Proxy.GetConnectTimeout,
+		cfg.Servers.POP3Proxy.GetAuthIdleTimeout,
+		cfg.Servers.POP3Proxy.GetCommandTimeout,
+		cfg.Servers.POP3Proxy.GetAbsoluteSessionTimeout,
+	)
+
+	// ManageSieve Proxy (legacy)
+	applyProxyDefaults(
+		&cfg.Servers.ManageSieveProxy.ConnectTimeout,
+		&cfg.Servers.ManageSieveProxy.AuthIdleTimeout,
+		&cfg.Servers.ManageSieveProxy.CommandTimeout,
+		&cfg.Servers.ManageSieveProxy.AbsoluteSessionTimeout,
+		&cfg.Servers.ManageSieveProxy.MinBytesPerMinute,
+		cfg.Servers.ManageSieveProxy.GetConnectTimeout,
+		cfg.Servers.ManageSieveProxy.GetAuthIdleTimeout,
+		cfg.Servers.ManageSieveProxy.GetCommandTimeout,
+		cfg.Servers.ManageSieveProxy.GetAbsoluteSessionTimeout,
+	)
+
+	// LMTP Proxy - has no timeout fields, only connect_timeout and auth_idle_timeout
+	if cfg.Servers.LMTPProxy.ConnectTimeout == "" {
+		if timeout, _ := cfg.Servers.LMTPProxy.GetConnectTimeout(); timeout > 0 {
+			cfg.Servers.LMTPProxy.ConnectTimeout = timeout.String()
+		}
+	}
+	if cfg.Servers.LMTPProxy.AuthIdleTimeout == "" {
+		if timeout, _ := cfg.Servers.LMTPProxy.GetAuthIdleTimeout(); timeout > 0 {
+			cfg.Servers.LMTPProxy.AuthIdleTimeout = timeout.String()
+		} else {
+			cfg.Servers.LMTPProxy.AuthIdleTimeout = "0"
+		}
+	}
+
+	// Apply backend server defaults
+	applyBackendDefaults := func(authIdleTimeout, commandTimeout, absoluteSessionTimeout *string, minBytesPerMinute *int64, getAuthIdle, getCommand, getAbsolute func() (time.Duration, error)) {
+		if *authIdleTimeout == "" {
+			if timeout, _ := getAuthIdle(); timeout > 0 {
+				*authIdleTimeout = timeout.String()
+			} else {
+				*authIdleTimeout = "0"
+			}
+		}
+		if *commandTimeout == "" {
+			if timeout, _ := getCommand(); timeout > 0 {
+				*commandTimeout = timeout.String()
+			}
+		}
+		if *absoluteSessionTimeout == "" {
+			if timeout, _ := getAbsolute(); timeout > 0 {
+				*absoluteSessionTimeout = timeout.String()
+			}
+		}
+		// minBytesPerMinute default is 0 (disabled) - don't override
+	}
+
+	// IMAP backend (legacy)
+	applyBackendDefaults(
+		&cfg.Servers.IMAP.AuthIdleTimeout,
+		&cfg.Servers.IMAP.CommandTimeout,
+		&cfg.Servers.IMAP.AbsoluteSessionTimeout,
+		&cfg.Servers.IMAP.MinBytesPerMinute,
+		cfg.Servers.IMAP.GetAuthIdleTimeout,
+		cfg.Servers.IMAP.GetCommandTimeout,
+		cfg.Servers.IMAP.GetAbsoluteSessionTimeout,
+	)
+
+	// POP3 backend (legacy)
+	applyBackendDefaults(
+		&cfg.Servers.POP3.AuthIdleTimeout,
+		&cfg.Servers.POP3.CommandTimeout,
+		&cfg.Servers.POP3.AbsoluteSessionTimeout,
+		&cfg.Servers.POP3.MinBytesPerMinute,
+		cfg.Servers.POP3.GetAuthIdleTimeout,
+		cfg.Servers.POP3.GetCommandTimeout,
+		cfg.Servers.POP3.GetAbsoluteSessionTimeout,
+	)
+
+	// ManageSieve backend (legacy)
+	applyBackendDefaults(
+		&cfg.Servers.ManageSieve.AuthIdleTimeout,
+		&cfg.Servers.ManageSieve.CommandTimeout,
+		&cfg.Servers.ManageSieve.AbsoluteSessionTimeout,
+		&cfg.Servers.ManageSieve.MinBytesPerMinute,
+		cfg.Servers.ManageSieve.GetAuthIdleTimeout,
+		cfg.Servers.ManageSieve.GetCommandTimeout,
+		cfg.Servers.ManageSieve.GetAbsoluteSessionTimeout,
+	)
+}
+
 func handleConfigDump(_ context.Context) {
 	// Parse config-dump specific flags
 	var configFile, format string
@@ -4628,6 +4819,9 @@ Examples:
 	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
+
+	// Populate default values for display
+	applyConfigDefaults(&cfg)
 
 	// Mask secrets if requested
 	if maskSecrets {

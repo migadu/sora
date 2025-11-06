@@ -10,7 +10,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// Check search rate limit first (before any expensive operations)
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
 		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
-			s.DebugLog("[SEARCH] Rate limited: %v", err)
+			s.InfoLog("[SEARCH] Rate limited for user %s (account_id=%d): %v", s.IMAPUser.FullAddress(), s.IMAPUser.AccountID(), err)
 			metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "rate_limited", "client_error").Inc()
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -105,7 +105,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	if isESEARCH && options != nil {
-		s.Log("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
+		s.InfoLog("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
 			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
 
 		// At this point, isESEARCH is true and capability is verified
@@ -156,7 +156,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
-			s.Log("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
+			s.InfoLog("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
 			// Set count for default ESEARCH responses
 			searchData.Count = uint32(len(messages))
 

@@ -2,6 +2,7 @@ package imap
 
 import (
 	"crypto/subtle"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/pkg/metrics"
@@ -71,7 +72,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
+			s.InfoLog("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
 				addressParsed.BaseAddress(), addressParsed.Suffix(), totalCount, authCount)
 
 			// Prometheus metrics - successful authentication
@@ -98,6 +99,14 @@ func (s *IMAPSession) Login(address, password string) error {
 
 			// Start termination poller to check for kick commands
 			s.startTerminationPoller()
+
+			// Clear auth idle timeout after successful authentication
+			// Post-auth timeouts are handled by SoraConn (command_timeout)
+			if s.server.authIdleTimeout > 0 {
+				if err := netConn.SetReadDeadline(time.Time{}); err != nil {
+					s.WarnLog("[LOGIN] failed to clear auth idle timeout: %v", err)
+				}
+			}
 
 			return nil
 		}
@@ -151,7 +160,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	authCount := s.server.authenticatedConnections.Add(1)
 	totalCount := s.server.totalConnections.Load()
-	s.Log("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
+	s.InfoLog("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
 		addressParsed.BaseAddress(), totalCount, authCount)
 
 	// Prometheus metrics - successful authentication
@@ -185,6 +194,14 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	// Trigger cache warmup for the authenticated user
 	s.triggerCacheWarmup()
+
+	// Clear auth idle timeout after successful authentication
+	// Post-auth timeouts are handled by SoraConn (command_timeout)
+	if s.server.authIdleTimeout > 0 {
+		if err := netConn.SetReadDeadline(time.Time{}); err != nil {
+			s.WarnLog("[LOGIN] failed to clear auth idle timeout: %v", err)
+		}
+	}
 
 	return nil
 }

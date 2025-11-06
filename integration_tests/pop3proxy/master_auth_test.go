@@ -102,7 +102,7 @@ func setupPOP3ProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, proxyAdd
 		RemoteTLS:          false,
 		RemoteTLSVerify:    false,
 		ConnectTimeout:     10 * time.Second,
-		SessionTimeout:     30 * time.Minute,
+		AuthIdleTimeout:    30 * time.Minute,
 		EnableAffinity:     true,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

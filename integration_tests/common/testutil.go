@@ -45,13 +45,19 @@ func (ts *TestServer) Close() {
 func SetupTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
+	// Use database name from environment variable, or default to sora_test_db
+	dbName := os.Getenv("SORA_TEST_DB_NAME")
+	if dbName == "" {
+		dbName = "sora_test_db"
+	}
+
 	cfg := &config.DatabaseConfig{
 		Debug: false, // Set to true for debugging
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     "5432",
 			User:     "postgres",
-			Name:     "sora_mail_db",
+			Name:     dbName,
 			Password: "",
 		},
 	}

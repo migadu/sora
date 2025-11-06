@@ -85,9 +85,25 @@ func (s *ManageSieveSession) handleConnection() {
 	s.sendCapabilitiesGreeting()
 
 	for {
+		// Set timeout for reading command
+		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use commandTimeout
+		// After authentication: use commandTimeout
+		if !s.authenticated && s.server.authIdleTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
+		} else if s.server.commandTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.commandTimeout))
+		} else {
+			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
+		}
+
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if err == io.EOF {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.sendRawLine("BYE (TRYLATER) \"Connection timed out due to inactivity, please reconnect\"")
+				s.writer.Flush()
+				s.WarnLog("connection timed out")
+				return
+			} else if err == io.EOF {
 				s.DebugLog("client dropped connection")
 			} else {
 				s.WarnLog("read error: %v", err)
@@ -108,7 +124,7 @@ func (s *ManageSieveSession) handleConnection() {
 		// This is a defensive change as the direct logging is not visible in this file.
 		s.DebugLog("C: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
-		// Set command execution deadline
+		// Set command execution deadline (for processing the command, not reading it)
 		commandDeadline := time.Time{} // Zero time means no deadline
 		if s.server.commandTimeout > 0 {
 			commandDeadline = time.Now().Add(s.server.commandTimeout)
@@ -273,7 +289,7 @@ func (s *ManageSieveSession) handleConnection() {
 			// Increment authenticated connections counter
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
-			s.Log("user %s authenticated (connections: total=%d, authenticated=%d)",
+			s.InfoLog("user %s authenticated (connections: total=%d, authenticated=%d)",
 				address.FullAddress(), totalCount, authCount)
 
 			// Track successful authentication
@@ -949,7 +965,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
-		s.Log("session closed (connections: total=%d, authenticated=%d)",
+		s.InfoLog("session closed (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 		s.User = nil
 		s.Id = ""
@@ -959,7 +975,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		}
 	} else {
 		authCount = s.server.authenticatedConnections.Load()
-		s.Log("session closed unauthenticated (connections: total=%d, authenticated=%d)",
+		s.InfoLog("session closed unauthenticated (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 
@@ -976,7 +992,7 @@ func (s *ManageSieveSession) Close() error {
 		// Acquire write lock for cleanup
 		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 		if !acquired {
-			s.Log("failed to acquire write lock within timeout")
+			s.InfoLog("failed to acquire write lock within timeout")
 			// Continue with close even if we can't get the lock
 			return s.closeWithoutLock()
 		}
@@ -1261,10 +1277,10 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	authCount := s.server.authenticatedConnections.Add(1)
 	totalCount := s.server.totalConnections.Load()
 	if impersonating {
-		s.Log("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
+		s.InfoLog("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
 			targetAddress.FullAddress(), totalCount, authCount)
 	} else {
-		s.Log("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
+		s.InfoLog("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
 			totalCount, authCount)
 	}
 

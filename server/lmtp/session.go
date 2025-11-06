@@ -464,7 +464,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			}
 
 			// Success - both copies saved
-			s.Log("message delivered according to fileinto :copy directive")
+			s.InfoLog("message delivered according to fileinto :copy directive")
 			return nil
 		} else {
 			s.DebugLog("[SIEVE] fileinto action - delivering message to mailbox: %s", mailboxName)
@@ -537,7 +537,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
-	s.Log("message delivered successfully to mailbox '%s'", mailboxName)
+	s.InfoLog("message delivered successfully to mailbox '%s'", mailboxName)
 
 	// Track domain and user activity - LMTP delivery is critical!
 	if s.User != nil {
@@ -568,15 +568,15 @@ func (s *LMTPSession) Reset() {
 	s.User = nil
 	s.sender = nil
 
-	s.Log("session reset")
+	s.InfoLog("session reset")
 }
 
 func (s *LMTPSession) Logout() error {
 	// Check if this is a normal QUIT command or an abrupt connection close
 	if s.conn != nil && s.conn.Conn() != nil {
-		s.Log("session logout requested")
+		s.InfoLog("session logout requested")
 	} else {
-		s.Log("client dropped connection")
+		s.InfoLog("client dropped connection")
 	}
 
 	// Acquire write lock for logout operations
@@ -606,7 +606,7 @@ func (s *LMTPSession) Logout() error {
 		s.cancel()
 	}
 
-	s.Log("session logout completed (connections: total=%d)", totalCount)
+	s.InfoLog("session logout completed (connections: total=%d)", totalCount)
 
 	return &smtp.SMTPError{
 		Code:         221,
@@ -616,9 +616,9 @@ func (s *LMTPSession) Logout() error {
 }
 
 func (s *LMTPSession) InternalError(format string, a ...any) error {
-	s.Log(format, a...)
+	s.InfoLog(format, a...)
 	errorMsg := fmt.Sprintf(format, a...)
-	s.Log("INTERNAL ERROR: %s", errorMsg)
+	s.InfoLog("INTERNAL ERROR: %s", errorMsg)
 	return &smtp.SMTPError{
 		Code:         421,
 		EnhancedCode: smtp.EnhancedCode{4, 4, 2},
@@ -785,6 +785,6 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	s.useMasterDB = true
 
 	s.backend.uploader.NotifyUploadQueued()
-	s.Log("message saved with UID %d in mailbox '%s'", messageUID, mailbox.Name)
+	s.InfoLog("message saved with UID %d in mailbox '%s'", messageUID, mailbox.Name)
 	return nil
 }

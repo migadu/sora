@@ -86,8 +86,8 @@ func TestSharedMailbox_CreateAndList(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
-	// Create a shared mailbox
-	sharedMailbox := "Shared/TestMailbox"
+	// Create a shared mailbox with unique name to avoid conflicts
+	sharedMailbox := fmt.Sprintf("Shared/TestMailbox-%d", common.GetTimestamp())
 	if err := c.Create(sharedMailbox, nil).Wait(); err != nil {
 		t.Fatalf("Failed to create shared mailbox: %v", err)
 	}

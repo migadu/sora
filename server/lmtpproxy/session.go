@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
@@ -83,8 +81,8 @@ func (s *Session) handleConnection() {
 	// Handle commands until we get RCPT TO
 	for {
 		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -179,7 +177,7 @@ func (s *Session) handleConnection() {
 
 			// Clear the read deadline before connecting to the backend and starting the proxy.
 			// The proxy loop will manage its own deadlines.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.DebugLog("Failed to clear read deadline", "error", err)
 				}
@@ -315,51 +313,31 @@ func (s *Session) Log(format string, args ...any) {
 	}
 }
 
+// getLogger returns a ProxySessionLogger for this session
+func (s *Session) getLogger() *server.ProxySessionLogger {
+	return &server.ProxySessionLogger{
+		Protocol:   "lmtp_proxy",
+		ServerName: s.server.name,
+		ClientConn: s.clientConn,
+		Username:   s.username,
+		AccountID:  s.accountID,
+		Debug:      s.server.debug,
+	}
+}
+
 // InfoLog logs at INFO level with session context
 func (s *Session) InfoLog(msg string, keyvals ...any) {
-	remoteAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "remote", remoteAddr, "user", user}
-	allKeyvals = append(allKeyvals, keyvals...)
-	logger.Info(msg, allKeyvals...)
+	s.getLogger().InfoLog(msg, keyvals...)
 }
 
 // DebugLog logs at DEBUG level with session context
 func (s *Session) DebugLog(msg string, keyvals ...any) {
-	if s.server.debug {
-		user := "none"
-		if s.username != "" && s.accountID > 0 {
-			user = s.username + "/" + fmt.Sprint(s.accountID)
-		} else if s.username != "" {
-			user = s.username
-		}
-
-		// Build the keyvals array with user field
-		allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
-		allKeyvals = append(allKeyvals, keyvals...)
-		logger.Debug(msg, allKeyvals...)
-	}
+	s.getLogger().DebugLog(msg, keyvals...)
 }
 
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
-	user := "none"
-	if s.username != "" && s.accountID > 0 {
-		user = s.username + "/" + fmt.Sprint(s.accountID)
-	} else if s.username != "" {
-		user = s.username
-	}
-
-	// Build the keyvals array with user field
-	allKeyvals := []any{"proto", "lmtp_proxy", "name", s.server.name, "user", user}
-	allKeyvals = append(allKeyvals, keyvals...)
-	logger.Warn(msg, allKeyvals...)
+	s.getLogger().WarnLog(msg, keyvals...)
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -760,8 +738,8 @@ func (s *Session) proxyClientToBackend() {
 
 	for {
 		// Set a read deadline to prevent idle connections between commands.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -801,7 +779,7 @@ func (s *Session) proxyClientToBackend() {
 			// The backend's "354" response will be handled by the other goroutine.
 			// We must now proxy the message body until ".\r\n".
 			// The idle timeout is suspended during active data transfer.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.DebugLog("Failed to clear read deadline for DATA transfer", "error", err)
 				}

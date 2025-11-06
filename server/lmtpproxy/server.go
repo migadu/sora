@@ -43,7 +43,7 @@ type Server struct {
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig    *config.PreLookupConfig
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
-	sessionTimeout     time.Duration
+	authIdleTimeout    time.Duration
 	maxMessageSize     int64
 
 	// Trusted networks for connection filtering
@@ -77,7 +77,7 @@ type ServerOptions struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
-	SessionTimeout         time.Duration
+	AuthIdleTimeout        time.Duration
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
@@ -183,6 +183,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debugWriter = os.Stdout
 	}
 
+	// Set listen backlog with reasonable default
+	listenBacklog := opts.ListenBacklog
+	if listenBacklog == 0 {
+		listenBacklog = 1024 // Default backlog
+	}
+
 	s := &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -202,11 +208,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		trustedProxies:     opts.TrustedProxies,
 		prelookupConfig:    opts.PreLookup,
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
-		sessionTimeout:     opts.SessionTimeout,
+		authIdleTimeout:    opts.AuthIdleTimeout,
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
 		limiter:            limiter,
-		listenBacklog:      opts.ListenBacklog,
+		listenBacklog:      listenBacklog,
 		debug:              opts.Debug,
 		debugWriter:        debugWriter,
 	}
@@ -260,18 +266,12 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("LMTP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
+		logger.Debug("LMTP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for TLS with JA4 capture
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
@@ -284,18 +284,12 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("LMTP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
+		logger.Debug("LMTP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraListener for non-TLS
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()

@@ -198,7 +198,7 @@ func setupLMTPProxyWithConnectionLimits(t *testing.T, rdb *resilient.ResilientDa
 		RemoteTLSVerify:        false,
 		RemoteUseProxyProtocol: false,
 		ConnectTimeout:         5 * time.Second,
-		SessionTimeout:         10 * time.Minute,
+		AuthIdleTimeout:        10 * time.Minute,
 		EnableAffinity:         false,
 		TrustedProxies:         trustedProxies, // These are the trusted networks that can connect
 

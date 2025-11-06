@@ -231,6 +231,7 @@ type IMAPServer struct {
 	capFilters []ClientCapabilityFilter
 
 	// Command timeout and throughput enforcement
+	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
@@ -283,6 +284,7 @@ type IMAPServerOptions struct {
 	MetadataMaxEntriesPerServer  int
 	MetadataMaxTotalSize         int
 	// Command timeout and throughput enforcement
+	AuthIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout         time.Duration // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
@@ -401,6 +403,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterPassword:         options.MasterPassword,
 		masterSASLUsername:     options.MasterSASLUsername,
 		masterSASLPassword:     options.MasterSASLPassword,
+		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
@@ -605,6 +608,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		memTracker: memTracker,
 	}
 
+	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
+	netConn := conn.NetConn()
+
+	// Set auth idle timeout if configured (applies during pre-auth phase only)
+	if s.authIdleTimeout > 0 {
+		if err := netConn.SetReadDeadline(time.Now().Add(s.authIdleTimeout)); err != nil {
+			logger.Warn("IMAP: Failed to set auth idle timeout", "name", s.name, "error", err)
+		}
+	}
+
 	// Initialize session with full server capabilities
 	// These will be filtered in GetCapabilities() when JA4 fingerprint becomes available
 	session.sessionCaps = make(imap.CapSet)
@@ -614,7 +627,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
 	// Need to unwrap connection layers to get to proxyProtocolConn
-	netConn := conn.NetConn()
 	var proxyInfo *serverPkg.ProxyProtocolInfo
 	currentConn := netConn
 	for currentConn != nil {
@@ -704,10 +716,10 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
-	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.Log)
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
 
 	// Log connection at INFO level
-	session.Log("connected")
+	session.InfoLog("connected")
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
@@ -723,9 +735,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
 		logger.Debug("IMAP: Received proxy session ID from PROXY v2 TLV", "name", s.name, "session_id", proxyInfo.ProxySessionID)
-		session.Log("connected (connections: total=%d, authenticated=%d) proxy_session=%s", totalCount, authCount, proxyInfo.ProxySessionID)
+		session.InfoLog("connected (connections: total=%d, authenticated=%d) proxy_session=%s", totalCount, authCount, proxyInfo.ProxySessionID)
 	} else {
-		session.Log("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
+		session.InfoLog("connected (connections: total=%d, authenticated=%d)", totalCount, authCount)
 	}
 	return session, greeting, nil
 }
