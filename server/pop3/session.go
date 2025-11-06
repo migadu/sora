@@ -75,7 +75,13 @@ func (s *POP3Session) handleConnection() {
 
 	for {
 		// Set idle timeout for reading command
-		(*s.conn).SetReadDeadline(time.Now().Add(Pop3IdleTimeout))
+		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use Pop3IdleTimeout
+		// After authentication: use Pop3IdleTimeout
+		if !s.authenticated && s.server.authIdleTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
+		} else {
+			(*s.conn).SetReadDeadline(time.Now().Add(Pop3IdleTimeout))
+		}
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -391,6 +397,7 @@ func (s *POP3Session) handleConnection() {
 			s.deleted = make(map[int]bool)                   // Initialize deletion map on authentication
 			s.useMasterDB = true                             // Pin session to master DB after a write to ensure consistency
 			release()
+
 			authCount := s.server.authenticatedConnections.Add(1)
 			totalCount := s.server.totalConnections.Load()
 			s.InfoLog("authenticated (connections: total=%d, authenticated=%d)", totalCount, authCount)

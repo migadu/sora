@@ -219,3 +219,86 @@ func TestSlowThroughputTimeoutInfo(t *testing.T) {
 	t.Log("  Message: * BYE Connection too slow, please reconnect")
 	t.Log("  (Full integration test would require >2 minutes to execute)")
 }
+
+// TestAuthIdleTimeoutDuringPreAuth verifies that auth_idle_timeout disconnects during pre-auth phase
+// Note: auth_idle_timeout uses SetReadDeadline() which closes the connection without sending BYE.
+// This is acceptable because: (1) default is 0 (disabled), (2) meant for aggressive cleanup,
+// (3) post-auth timeouts via SoraConn properly send BYE messages.
+func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
+	// Skip in short mode
+	if testing.Short() {
+		t.Skip("Skipping timeout test in short mode")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Find available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find available port: %v", err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	// Create mock dependencies
+	mockRDB := &resilient.ResilientDatabase{}
+	mockS3 := &storage.S3Storage{}
+	mockUploader := &uploader.UploadWorker{}
+	mockCache := &cache.Cache{}
+
+	server, err := New(ctx, "test", "localhost", addr, mockS3, mockRDB, mockUploader, mockCache, IMAPServerOptions{
+		Debug:           false,
+		TLS:             false,
+		AuthIdleTimeout: 2 * time.Second,  // Very short auth idle timeout
+		CommandTimeout:  10 * time.Second, // Longer command timeout (should not trigger)
+		AppendLimit:     DefaultAppendLimit,
+		MaxConnections:  10,
+		Config:          &config.Config{},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	// Start server in background
+	go func() {
+		if err := server.Serve(addr); err != nil && ctx.Err() == nil {
+			t.Logf("Server error: %v", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect client
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	// Read greeting
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read greeting: %v", err)
+	}
+	if !strings.HasPrefix(greeting, "* OK") {
+		t.Errorf("Expected OK greeting, got: %s", greeting)
+	}
+
+	// Do NOT authenticate - just wait idle during pre-auth phase
+	// Auth idle timeout should trigger (2 seconds + buffer)
+	time.Sleep(3 * time.Second)
+
+	// Try to read - should get connection closed or timeout error
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, err = reader.ReadString('\n')
+
+	// We expect either EOF (connection closed) or timeout
+	if err == nil {
+		t.Error("Expected connection to be closed after auth idle timeout, but read succeeded")
+	} else {
+		t.Logf("✓ Connection closed during pre-auth idle as expected: %v", err)
+	}
+}

@@ -89,8 +89,8 @@ func (s *Session) handleConnection() {
 	authenticated := false
 	for !authenticated {
 		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("failed to set read deadline: %v", err)
 				return
 			}
@@ -362,7 +362,7 @@ func (s *Session) handleConnection() {
 	// Clear the read deadline once authenticated. ManageSieve is transactional,
 	// but we'll follow the IMAP proxy pattern. The backend is expected to handle
 	// its own connection lifetime.
-	if s.server.sessionTimeout > 0 {
+	if s.server.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.DebugLog("failed to clear read deadline: %v", err)
 		}

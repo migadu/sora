@@ -88,8 +88,8 @@ func (s *Session) handleConnection() {
 	for !authenticated {
 		// Set a read deadline for the client command to prevent idle connections
 		// from sitting in the authentication phase forever.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				logger.Error("Failed to set read deadline", "proxy", s.server.name, "remote", clientAddr, "error", err)
 				return
 			}
@@ -406,7 +406,7 @@ func (s *Session) handleConnection() {
 
 	// Clear the read deadline once authenticated, as the connection will now be
 	// in proxy mode where idle is handled by the backend (e.g., IDLE command).
-	if s.server.sessionTimeout > 0 {
+	if s.server.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.WarnLog("failed to clear read deadline", "error", err)
 		}

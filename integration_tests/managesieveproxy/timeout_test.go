@@ -41,7 +41,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 		Addr:                   proxyAddr,
 		RemoteAddrs:            []string{"127.0.0.1:9999"}, // Fake backend (we'll timeout before reaching it)
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Second,
+		AuthIdleTimeout:        30 * time.Second,
 		CommandTimeout:         idleTimeout,      // Short timeout for testing (3 seconds)
 		AbsoluteSessionTimeout: 30 * time.Minute, // Long session timeout (not testing this)
 		MinBytesPerMinute:      0,                // Disable throughput check for this test

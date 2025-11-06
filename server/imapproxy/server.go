@@ -40,7 +40,7 @@ type Server struct {
 	tlsVerify              bool
 	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
 	enableAffinity         bool
-	sessionTimeout         time.Duration
+	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only)
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
@@ -131,7 +131,7 @@ type ServerOptions struct {
 	RemoteTLSVerify        bool
 	RemoteUseProxyProtocol bool
 	ConnectTimeout         time.Duration
-	SessionTimeout         time.Duration
+	AuthIdleTimeout        time.Duration
 	CommandTimeout         time.Duration // Idle timeout
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration
 	MinBytesPerMinute      int64         // Minimum throughput
@@ -220,6 +220,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debugWriter = &maskingWriter{w: os.Stdout}
 	}
 
+	// Set listen backlog with reasonable default
+	listenBacklog := opts.ListenBacklog
+	if listenBacklog == 0 {
+		listenBacklog = 1024 // Default backlog
+	}
+
 	return &Server{
 		rdb:                    rdb,
 		name:                   opts.Name,
@@ -236,7 +242,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		tlsVerify:              opts.TLSVerify,
 		tlsConfig:              opts.TLSConfig,
 		enableAffinity:         opts.EnableAffinity,
-		sessionTimeout:         opts.SessionTimeout,
+		authIdleTimeout:        opts.AuthIdleTimeout,
 		commandTimeout:         opts.CommandTimeout,
 		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
 		minBytesPerMinute:      opts.MinBytesPerMinute,
@@ -247,7 +253,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		prelookupConfig:        opts.PreLookup,
 		remoteUseIDCommand:     opts.RemoteUseIDCommand,
 		limiter:                limiter,
-		listenBacklog:          opts.ListenBacklog,
+		listenBacklog:          listenBacklog,
 		debug:                  opts.Debug,
 		debugWriter:            debugWriter,
 		activeSessions:         make(map[*Session]struct{}),
@@ -286,17 +292,12 @@ func (s *Server) Start() error {
 
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
+		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",
@@ -326,18 +327,12 @@ func (s *Server) Start() error {
 		// Scenario 2: Global TLS manager
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
+		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",
@@ -371,18 +366,12 @@ func (s *Server) Start() error {
 		// Scenario 3: No TLS
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
-		var tcpListener net.Listener
-		var err error
-		if s.listenBacklog > 0 {
-			tcpListener, err = server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-			logger.Debug("IMAP Proxy: Using custom listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		} else {
-			tcpListener, err = net.Listen("tcp", s.addr)
-		}
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
 		if err != nil {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
+		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraListener for timeout protection (no TLS/JA4)
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",

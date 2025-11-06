@@ -81,8 +81,8 @@ func (s *Session) handleConnection() {
 	// Handle commands until we get RCPT TO
 	for {
 		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -177,7 +177,7 @@ func (s *Session) handleConnection() {
 
 			// Clear the read deadline before connecting to the backend and starting the proxy.
 			// The proxy loop will manage its own deadlines.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.DebugLog("Failed to clear read deadline", "error", err)
 				}
@@ -738,8 +738,8 @@ func (s *Session) proxyClientToBackend() {
 
 	for {
 		// Set a read deadline to prevent idle connections between commands.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -779,7 +779,7 @@ func (s *Session) proxyClientToBackend() {
 			// The backend's "354" response will be handled by the other goroutine.
 			// We must now proxy the message body until ".\r\n".
 			// The idle timeout is suspended during active data transfer.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.DebugLog("Failed to clear read deadline for DATA transfer", "error", err)
 				}

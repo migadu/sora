@@ -148,7 +148,7 @@ func TestManageSieveProxyServerStartTLSConfiguration(t *testing.T) {
 				RemoteTLSUseStartTLS: tt.remoteTLSUseStartTLS,
 				RemoteTLSVerify:      true,
 				ConnectTimeout:       10 * time.Second,
-				SessionTimeout:       30 * time.Minute,
+				AuthIdleTimeout:      30 * time.Minute,
 				CommandTimeout:       5 * time.Minute,
 				MasterSASLUsername:   "proxyuser",
 				MasterSASLPassword:   "proxypass",
@@ -303,7 +303,7 @@ func TestManageSieveProxyTLSModeMatrix(t *testing.T) {
 			opts.RemoteAddrs = []string{"backend.example.com:4190"}
 			opts.RemotePort = 4190
 			opts.ConnectTimeout = 10 * time.Second
-			opts.SessionTimeout = 30 * time.Minute
+			opts.AuthIdleTimeout = 30 * time.Minute
 			opts.CommandTimeout = 5 * time.Minute
 			opts.MasterSASLUsername = "proxyuser"
 			opts.MasterSASLPassword = "proxypass"

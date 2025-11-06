@@ -108,7 +108,7 @@ func setupManageSieveProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, p
 		RemoteTLSVerify:    false,
 		InsecureAuth:       true, // Allow authentication over non-TLS for testing
 		ConnectTimeout:     10 * time.Second,
-		SessionTimeout:     30 * time.Minute,
+		AuthIdleTimeout:    30 * time.Minute,
 		CommandTimeout:     5 * time.Minute,
 		EnableAffinity:     true,
 		AuthRateLimit: server.AuthRateLimiterConfig{

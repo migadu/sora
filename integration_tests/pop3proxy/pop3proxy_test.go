@@ -310,7 +310,7 @@ func setupPOP3ProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		RemoteUseProxyProtocol: true,  // Enable PROXY protocol to backend
 		RemoteUseXCLIENT:       false, // Disable XCLIENT (using PROXY instead)
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AffinityValidity:       24 * time.Hour,
 		AffinityStickiness:     0.9,
@@ -371,7 +371,7 @@ func setupPOP3ProxyWithXCLIENT(t *testing.T, rdb *resilient.ResilientDatabase, p
 		RemoteUseProxyProtocol: false, // Disable PROXY protocol (using XCLIENT instead)
 		RemoteUseXCLIENT:       true,  // Enable XCLIENT command for parameter forwarding
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AffinityValidity:       24 * time.Hour,
 		AffinityStickiness:     0.9,

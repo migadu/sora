@@ -69,8 +69,8 @@ func (s *POP3ProxySession) handleConnection() {
 
 	for {
 		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.WarnLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -162,7 +162,7 @@ func (s *POP3ProxySession) handleConnection() {
 			s.InfoLog("authenticated")
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.WarnLog("Failed to clear read deadline", "error", err)
 				}
@@ -273,7 +273,7 @@ func (s *POP3ProxySession) handleConnection() {
 			s.InfoLog("authenticated via SASL PLAIN")
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
-			if s.server.sessionTimeout > 0 {
+			if s.server.authIdleTimeout > 0 {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.WarnLog("Failed to clear read deadline", "error", err)
 				}
@@ -860,8 +860,8 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 
 	for {
 		// Set a read deadline to prevent idle authenticated connections.
-		if s.server.sessionTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.sessionTimeout)); err != nil {
+		if s.server.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.WarnLog("Failed to set read deadline", "error", err)
 				return
 			}

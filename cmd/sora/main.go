@@ -851,6 +851,13 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
+	// Parse auth idle timeout
+	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
+	if err != nil {
+		logger.Info("IMAP: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		authIdleTimeout = 0
+	}
+
 	// Parse command timeout
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
@@ -887,6 +894,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SessionMemoryLimit:           sessionMemoryLimit,
+			AuthIdleTimeout:              authIdleTimeout,
 			CommandTimeout:               commandTimeout,
 			AbsoluteSessionTimeout:       absoluteSessionTimeout,
 			MinBytesPerMinute:            serverConfig.GetMinBytesPerMinute(),
@@ -1010,6 +1018,13 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
+	// Parse auth idle timeout
+	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
+	if err != nil {
+		logger.Info("POP3: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		authIdleTimeout = 0
+	}
+
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
 		logger.Info("POP3: Invalid command timeout - using default (2 minutes)", "name",
@@ -1040,6 +1055,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
 		SessionMemoryLimit:     sessionMemoryLimit,
+		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
@@ -1087,6 +1103,12 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
+	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
+	if err != nil {
+		logger.Info("ManageSieve: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
+		authIdleTimeout = 0
+	}
+
 	commandTimeout, err := serverConfig.GetCommandTimeout()
 	if err != nil {
 		logger.Info("ManageSieve: Invalid command timeout - using default (3 minutes)", "name",
@@ -1129,6 +1151,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTimeout:   proxyProtocolTimeout,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
+		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
@@ -1195,7 +1218,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
@@ -1248,7 +1271,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:     serverConfig.RemoteUseIDCommand,
 		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
+		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
@@ -1305,7 +1328,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
@@ -1357,7 +1380,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
+		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
@@ -1412,7 +1435,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
@@ -1467,7 +1490,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLSVerify:        serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
+		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
@@ -1523,7 +1546,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
-	sessionTimeout := serverConfig.GetSessionTimeoutWithDefault()
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
 	remotePort, err := serverConfig.GetRemotePort()
@@ -1557,7 +1580,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol: serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
-		SessionTimeout:         sessionTimeout,
+		AuthIdleTimeout:        authIdleTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,

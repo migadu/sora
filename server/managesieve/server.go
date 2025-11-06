@@ -57,6 +57,7 @@ type ManageSieveServer struct {
 	authLimiter serverPkg.AuthLimiter
 
 	// Command timeout and throughput enforcement
+	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
@@ -93,6 +94,7 @@ type ManageSieveServerOptions struct {
 	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
 	TrustedNetworks        []string // Global trusted networks for parameter forwarding
 	AuthRateLimit          serverPkg.AuthRateLimiterConfig
+	AuthIdleTimeout        time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout         time.Duration  // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
@@ -156,6 +158,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
 		proxyReader:            proxyReader,
 		authLimiter:            authLimiter,
+		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
@@ -270,6 +273,24 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
 		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		OnTimeout: func(conn net.Conn, reason string) {
+			// Send BYE message before closing due to timeout (RFC 5804 Section 1.3)
+			// Use TRYLATER response code to indicate temporary condition
+			var message string
+			switch reason {
+			case "idle":
+				message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
+			case "slow_throughput":
+				message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
+			case "session_max":
+				message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
+			default:
+				message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
+			}
+			// Write BYE - ignore errors as connection may already be broken
+			// This is best-effort to inform the client
+			_, _ = fmt.Fprint(conn, message)
+		},
 	}
 
 	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS

@@ -52,7 +52,7 @@ func TestIMAPProxy_MasterUsernameWithAtSign(t *testing.T) {
 		RemoteUseProxyProtocol: false, // Backend doesn't use PROXY protocol (uses ID command instead)
 		RemoteUseIDCommand:     true,  // Backend uses ID command for client IP
 		ConnectTimeout:         10 * time.Second,
-		SessionTimeout:         30 * time.Minute,
+		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,

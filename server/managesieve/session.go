@@ -85,9 +85,25 @@ func (s *ManageSieveSession) handleConnection() {
 	s.sendCapabilitiesGreeting()
 
 	for {
+		// Set timeout for reading command
+		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use commandTimeout
+		// After authentication: use commandTimeout
+		if !s.authenticated && s.server.authIdleTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
+		} else if s.server.commandTimeout > 0 {
+			(*s.conn).SetReadDeadline(time.Now().Add(s.server.commandTimeout))
+		} else {
+			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
+		}
+
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if err == io.EOF {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.sendRawLine("BYE (TRYLATER) \"Connection timed out due to inactivity, please reconnect\"")
+				s.writer.Flush()
+				s.WarnLog("connection timed out")
+				return
+			} else if err == io.EOF {
 				s.DebugLog("client dropped connection")
 			} else {
 				s.WarnLog("read error: %v", err)
@@ -108,7 +124,7 @@ func (s *ManageSieveSession) handleConnection() {
 		// This is a defensive change as the direct logging is not visible in this file.
 		s.DebugLog("C: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
-		// Set command execution deadline
+		// Set command execution deadline (for processing the command, not reading it)
 		commandDeadline := time.Time{} // Zero time means no deadline
 		if s.server.commandTimeout > 0 {
 			commandDeadline = time.Now().Add(s.server.commandTimeout)

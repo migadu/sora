@@ -167,7 +167,7 @@ func setupLMTPProxyWithPROXY(t *testing.T, backendAddress string) (string, *LMTP
 			RemoteUseXCLIENT:       false,                              // Disable XCLIENT (using PROXY instead)
 			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"}, // Trust localhost
 			ConnectTimeout:         5 * time.Second,
-			SessionTimeout:         30 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
 		},
 	)
 	if err != nil {
@@ -208,7 +208,7 @@ func setupLMTPProxyWithXCLIENT(t *testing.T, backendAddress string) (string, *LM
 			RemoteUseXCLIENT:       true,                               // Enable XCLIENT command
 			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"}, // Trust localhost
 			ConnectTimeout:         5 * time.Second,
-			SessionTimeout:         30 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
 		},
 	)
 	if err != nil {
@@ -581,7 +581,7 @@ func setupLMTPProxyWithXRCPTFORWARD(t *testing.T, backendAddress string) (string
 			RemoteUseXCLIENT:       false,                              // Disable XCLIENT (focus on XRCPTFORWARD)
 			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"}, // Trust localhost
 			ConnectTimeout:         5 * time.Second,
-			SessionTimeout:         30 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
 		},
 	)
 	if err != nil {
@@ -747,7 +747,7 @@ func TestLMTPProxyXRCPTFORWARDTrustedNetworksOnly(t *testing.T) {
 			RemoteUseXCLIENT:       false,                  // Disable XCLIENT
 			TrustedProxies:         []string{"10.0.0.0/8"}, // Trust only private networks (NOT localhost)
 			ConnectTimeout:         5 * time.Second,
-			SessionTimeout:         30 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
 		},
 	)
 	if err != nil {
@@ -814,7 +814,7 @@ func TestLMTPProxyXCLIENTTrustedNetworksOnly(t *testing.T) {
 			RemoteUseXCLIENT:       true,                   // Enable XCLIENT command
 			TrustedProxies:         []string{"10.0.0.0/8"}, // Trust only private networks (NOT localhost)
 			ConnectTimeout:         5 * time.Second,
-			SessionTimeout:         30 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
 		},
 	)
 	if err != nil {
