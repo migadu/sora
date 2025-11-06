@@ -52,6 +52,12 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		family = unix.AF_INET6
 		sa := &unix.SockaddrInet6{Port: addr.Port}
 		copy(sa.Addr[:], addr.IP.To16())
+		// Handle zone ID for link-local addresses (fe80::)
+		if addr.Zone != "" {
+			if iface, err := net.InterfaceByName(addr.Zone); err == nil {
+				sa.ZoneId = uint32(iface.Index)
+			}
+		}
 		sockaddr = sa
 	}
 
@@ -65,6 +71,17 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
+	}
+
+	// For IPv6 sockets, set IPV6_V6ONLY to prevent dual-stack issues
+	// This is critical on BSD systems (FreeBSD, OpenBSD, etc.)
+	if family == unix.AF_INET6 {
+		// Set IPV6_V6ONLY=1 to avoid dual-stack complications
+		// This matches Go's net package behavior and prevents connection delays
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("failed to set IPV6_V6ONLY: %w", err)
+		}
 	}
 
 	// Bind socket
