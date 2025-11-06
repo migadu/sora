@@ -61,8 +61,8 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		sockaddr = sa
 	}
 
-	// Create socket
-	fd, err := unix.Socket(family, unix.SOCK_STREAM, unix.IPPROTO_TCP)
+	// Create socket with NONBLOCK and CLOEXEC flags (matches Go's net package)
+	fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket: %w", err)
 	}
