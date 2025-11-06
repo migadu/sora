@@ -354,7 +354,12 @@ func (s *POP3ProxyServer) Start() error {
 
 func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 	for {
+		acceptStart := time.Now()
 		conn, err := listener.Accept()
+		acceptDuration := time.Since(acceptStart)
+		if acceptDuration > 100*time.Millisecond {
+			logger.Warn("POP3 Proxy: Slow accept() detected", "proxy", s.name, "duration", acceptDuration)
+		}
 		if err != nil {
 			// If context is cancelled, listener.Close() was called, so this is a graceful shutdown.
 			if s.appCtx.Err() != nil {

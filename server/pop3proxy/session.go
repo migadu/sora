@@ -54,9 +54,14 @@ func (s *POP3ProxySession) handleConnection() {
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
+		handshakeStart := time.Now()
 		if err := tlsConn.PerformHandshake(); err != nil {
 			s.WarnLog("TLS handshake failed", "error", err)
 			return
+		}
+		handshakeDuration := time.Since(handshakeStart)
+		if handshakeDuration > 100*time.Millisecond {
+			s.WarnLog("Slow TLS handshake detected", "duration", handshakeDuration)
 		}
 	}
 

@@ -410,7 +410,12 @@ func (s *Server) Start() error {
 // acceptConnections accepts incoming connections.
 func (s *Server) acceptConnections() error {
 	for {
+		acceptStart := time.Now()
 		conn, err := s.listener.Accept()
+		acceptDuration := time.Since(acceptStart)
+		if acceptDuration > 100*time.Millisecond {
+			logger.Warn("IMAP Proxy: Slow accept() detected", "proxy", s.name, "duration", acceptDuration)
+		}
 		if err != nil {
 			select {
 			case <-s.ctx.Done():
