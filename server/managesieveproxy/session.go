@@ -265,7 +265,14 @@ func (s *Session) handleConnection() {
 			return
 
 		case "NOOP":
-			s.sendResponse(`OK "NOOP completed"`)
+			// Handle NOOP with optional tag argument (e.g., NOOP "STARTTLS-RESYNC-CAPA")
+			// sieve-connect uses this to verify capabilities were received
+			if len(args) > 0 {
+				tag := server.UnquoteString(args[0])
+				s.sendResponse(fmt.Sprintf(`OK (TAG "%s") "Done"`, tag))
+			} else {
+				s.sendResponse(`OK "NOOP completed"`)
+			}
 
 		case "CAPABILITY":
 			// Re-send capabilities as per RFC 5804

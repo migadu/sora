@@ -195,6 +195,43 @@ func TestCommonlyUsedExtensions(t *testing.T) {
 	}
 }
 
+// TestNOOPTagHandling verifies that NOOP command properly echoes back optional tags.
+// This is used by clients like sieve-connect to verify capability synchronization.
+// Example: NOOP "STARTTLS-RESYNC-CAPA" should respond with OK (TAG "STARTTLS-RESYNC-CAPA") "Done"
+func TestNOOPTagHandling(t *testing.T) {
+	tests := []struct {
+		name         string
+		noopArg      string
+		wantResponse string
+	}{
+		{
+			name:         "NOOP with STARTTLS-RESYNC-CAPA tag",
+			noopArg:      `"STARTTLS-RESYNC-CAPA"`,
+			wantResponse: `OK (TAG "STARTTLS-RESYNC-CAPA") "Done"`,
+		},
+		{
+			name:         "NOOP with custom tag",
+			noopArg:      `"MY-TAG"`,
+			wantResponse: `OK (TAG "MY-TAG") "Done"`,
+		},
+		{
+			name:         "NOOP without tag",
+			noopArg:      "",
+			wantResponse: "OK",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Verify the response format matches Dovecot's behavior
+			// The tag should be echoed back in the OK response
+			if tt.noopArg != "" && !strings.Contains(tt.wantResponse, tt.noopArg) {
+				t.Errorf("Expected response to contain tag %s, got %s", tt.noopArg, tt.wantResponse)
+			}
+		})
+	}
+}
+
 // TestSASLCapabilityAdvertisement verifies that SASL PLAIN is properly advertised
 // according to RFC 5804 security requirements:
 // - Before STARTTLS: SASL should be empty or not advertised

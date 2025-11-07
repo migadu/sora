@@ -529,7 +529,14 @@ func (s *ManageSieveSession) handleConnection() {
 				metrics.CommandDuration.WithLabelValues("managesieve", "NOOP").Observe(time.Since(start).Seconds())
 			}()
 
-			s.sendResponse("OK\r\n")
+			// Handle NOOP with optional tag argument (e.g., NOOP "STARTTLS-RESYNC-CAPA")
+			// sieve-connect uses this to verify capabilities were received
+			if len(parts) > 1 {
+				tag := server.UnquoteString(parts[1])
+				s.sendResponse(fmt.Sprintf("OK (TAG \"%s\") \"Done\"\r\n", tag))
+			} else {
+				s.sendResponse("OK\r\n")
+			}
 			success = true
 
 		case "LOGOUT":
