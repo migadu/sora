@@ -312,6 +312,69 @@ user = "admin"
 	}
 }
 
+// TestRemoveDuplicateKeys_MultipleServers tests that multiple [[server]] blocks don't trigger false duplicates
+func TestRemoveDuplicateKeys_MultipleServers(t *testing.T) {
+	content := `
+[[server]]
+type = "imap_proxy"
+name = "imap-main-ip4"
+addr = "0.0.0.0:993"
+max_connections = 10000
+
+[server.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+
+[server.prelookup]
+enabled = true
+url = "https://api.example.com/lookup/$email"
+
+[[server]]
+type = "imap_proxy"
+name = "imap-main-ip6"
+addr = "[::]:993"
+max_connections = 10000
+
+[server.auth_rate_limit]
+enabled = false
+max_attempts_per_ip = 10
+
+[server.prelookup]
+enabled = true
+url = "https://api.example.com/lookup/$email"
+`
+
+	cleaned, err := removeDuplicateKeysFromTOML(content)
+	if err != nil {
+		t.Fatalf("removeDuplicateKeysFromTOML failed: %v", err)
+	}
+
+	// Count how many times keys appear in cleaned output
+	// None should be marked as duplicates since each [[server]] is a new array element
+	duplicateCount := strings.Count(cleaned, "# DUPLICATE IGNORED:")
+	if duplicateCount > 0 {
+		t.Errorf("Expected no false duplicates in multiple [[server]] blocks, but found %d duplicates:\n%s",
+			duplicateCount, cleaned)
+	}
+
+	// Verify both server blocks are preserved
+	serverCount := strings.Count(cleaned, "[[server]]")
+	if serverCount != 2 {
+		t.Errorf("Expected 2 [[server]] blocks, got %d", serverCount)
+	}
+
+	// Verify all sections are present and not commented out
+	if !strings.Contains(cleaned, "type = \"imap_proxy\"") {
+		t.Error("Expected 'type' key to be preserved")
+	}
+	if !strings.Contains(cleaned, "[server.auth_rate_limit]") {
+		t.Error("Expected [server.auth_rate_limit] sections to be preserved")
+	}
+	if !strings.Contains(cleaned, "[server.prelookup]") {
+		t.Error("Expected [server.prelookup] sections to be preserved")
+	}
+}
+
 // mockError is a simple error type for testing
 type mockError struct {
 	msg string

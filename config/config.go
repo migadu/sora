@@ -2180,7 +2180,6 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 	seenKeys := make(map[string]int) // Maps key path to line number
 	var result []string
 	var currentSection string
-	var lastArrayTable string
 
 	for lineNum, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -2197,17 +2196,13 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 			// Remove outer brackets to get the section name
 			currentSection = strings.TrimSpace(trimmed[2 : len(trimmed)-2])
 
-			// Reset key tracking for this array table instance
-			// Each [[table]] is a new array element, so same keys are expected
-			if currentSection == lastArrayTable {
-				// Same array table name - clear keys for this section
-				for k := range seenKeys {
-					if strings.HasPrefix(k, currentSection+".") {
-						delete(seenKeys, k)
-					}
+			// Clear keys for this array table section
+			// Each [[table]] is a new array element, so same keys are expected and not duplicates
+			for k := range seenKeys {
+				if strings.HasPrefix(k, currentSection+".") {
+					delete(seenKeys, k)
 				}
 			}
-			lastArrayTable = currentSection
 
 			result = append(result, line)
 			continue
@@ -2215,7 +2210,6 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 			// Regular table: [table.name]
 			// Remove brackets to get the section name
 			currentSection = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
-			lastArrayTable = "" // Not an array table
 			result = append(result, line)
 			continue
 		}
