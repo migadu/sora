@@ -92,7 +92,6 @@ func ListenWithBacklog(ctx context.Context, network, address string, backlog int
 		}
 	}
 
-
 	// Set SO_REUSEADDR to allow fast restart
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		unix.Close(fd)
