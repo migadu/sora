@@ -276,32 +276,38 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 // Start starts the ManageSieve proxy server.
 func (s *Server) Start() error {
-	// Only use implicit TLS listener if TLS is enabled AND StartTLS is not being used
-	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		// Configure SoraConn with timeout protection
-		connConfig := server.SoraConnConfig{
-			Protocol:             "managesieve_proxy",
-			IdleTimeout:          s.commandTimeout,
-			AbsoluteTimeout:      s.absoluteSessionTimeout,
-			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
-			OnTimeout: func(conn net.Conn, reason string) {
-				// Send BYE with TRYLATER before closing (RFC 5804)
-				var message string
-				switch reason {
-				case "idle":
-					message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
-				case "slow_throughput":
-					message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
-				case "session_max":
-					message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
-				default:
-					message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
-				}
-				_, _ = fmt.Fprint(conn, message)
-			},
-		}
+	// Configure SoraConn with timeout protection
+	connConfig := server.SoraConnConfig{
+		Protocol:             "managesieve_proxy",
+		IdleTimeout:          s.commandTimeout,
+		AbsoluteTimeout:      s.absoluteSessionTimeout,
+		MinBytesPerMinute:    s.minBytesPerMinute,
+		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
+		OnTimeout: func(conn net.Conn, reason string) {
+			// Send BYE with TRYLATER before closing (RFC 5804)
+			var message string
+			switch reason {
+			case "idle":
+				message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
+			case "slow_throughput":
+				message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
+			case "session_max":
+				message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
+			default:
+				message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
+			}
+			_, _ = fmt.Fprint(conn, message)
+		},
+	}
 
+	// Four TLS scenarios:
+	// 1. Per-server TLS with cert files (implicit TLS): Use static certificate with TLS listener
+	// 2. Global TLS manager (implicit TLS): Use dynamic certificate with TLS listener
+	// 3. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
+	// 4. No TLS: Plain text listener
+
+	if s.tls && !s.tlsUseStartTLS && s.tlsCertFile != "" && s.tlsKeyFile != "" {
+		// Scenario 1: Per-server TLS with cert files (implicit TLS)
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -309,35 +315,42 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
+		logger.Debug("ManageSieve Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
+		// Use SoraTLSListener for implicit TLS with JA4 capture and timeout protection
 		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
-	} else {
-		// Configure SoraConn with timeout protection
-		connConfig := server.SoraConnConfig{
-			Protocol:             "managesieve_proxy",
-			IdleTimeout:          s.commandTimeout,
-			AbsoluteTimeout:      s.absoluteSessionTimeout,
-			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
-			OnTimeout: func(conn net.Conn, reason string) {
-				// Send BYE with TRYLATER before closing (RFC 5804)
-				var message string
-				switch reason {
-				case "idle":
-					message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
-				case "slow_throughput":
-					message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
-				case "session_max":
-					message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
-				default:
-					message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
-				}
-				_, _ = fmt.Fprint(conn, message)
-			},
+	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
+		// Scenario 2: Global TLS manager (implicit TLS)
+		s.listenerMu.Lock()
+		// Create base TCP listener with custom backlog
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
+		if err != nil {
+			s.listenerMu.Unlock()
+			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-
+		logger.Debug("ManageSieve Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
+		// Use SoraTLSListener with global TLS config for implicit TLS
+		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		s.listenerMu.Unlock()
+	} else if s.tls && s.tlsUseStartTLS {
+		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
+		s.listenerMu.Lock()
+		// Create base TCP listener with custom backlog
+		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
+		if err != nil {
+			s.listenerMu.Unlock()
+			return fmt.Errorf("failed to start TCP listener: %w", err)
+		}
+		logger.Debug("ManageSieve Proxy: Using listen backlog with STARTTLS mode", "proxy", s.name, "backlog", s.listenBacklog)
+		// Use plain SoraListener - TLS upgrade handled in session after STARTTLS command
+		s.listener = server.NewSoraListener(tcpListener, connConfig)
+		s.listenerMu.Unlock()
+	} else if s.tls {
+		// TLS enabled but no cert files and no global TLS config provided
+		s.cancel()
+		return fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
+	} else {
+		// Scenario 4: No TLS - plain text listener
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -345,7 +358,7 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start listener: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+		logger.Debug("ManageSieve Proxy: Using listen backlog (no TLS)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraListener for non-TLS with timeout protection
 		s.listener = server.NewSoraListener(tcpListener, connConfig)
 		s.listenerMu.Unlock()
