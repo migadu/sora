@@ -62,9 +62,11 @@ func (s *ManageSieveSession) sendCapabilities() {
 
 	if s.server.tlsConfig != nil && s.server.useStartTLS && !s.isTLS {
 		s.sendRawLine("\"STARTTLS\"")
-	}
-	if !s.isTLS && s.server.insecureAuth { // This check is safe under the read lock
-		s.sendRawLine("\"AUTH=PLAIN\"")
+		// Before STARTTLS: Don't advertise SASL mechanisms (RFC 5804 security requirement)
+		s.sendRawLine("\"SASL\" \"\"")
+	} else if s.isTLS || s.server.insecureAuth {
+		// After STARTTLS or on implicit TLS: Advertise available SASL mechanisms
+		s.sendRawLine("\"SASL\" \"PLAIN\"")
 	}
 	if s.server.maxScriptSize > 0 {
 		s.sendRawLine(fmt.Sprintf("\"MAXSCRIPTSIZE\" \"%d\"", s.server.maxScriptSize))
