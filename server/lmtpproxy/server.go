@@ -385,7 +385,7 @@ func (s *Server) acceptConnections() error {
 		}
 
 		if !s.isFromTrustedNetwork(ip) {
-			logger.Debug("LMTP Proxy: Connection rejected - not from trusted network", "name", s.name, "ip", ip)
+			logger.Warn("LMTP Proxy: Connection rejected - not from trusted network", "name", s.name, "ip", ip, "remote", remoteAddr)
 			conn.Close()
 			continue
 		}

@@ -433,7 +433,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	}
 
 	if !b.isFromTrustedNetwork(ip) {
-		logger.Debug("LMTP: Connection rejected - not from trusted network", "name", b.name, "ip", ip)
+		logger.Warn("LMTP: Connection rejected - not from trusted network", "name", b.name, "ip", ip, "remote", remoteAddr)
 		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
 	}
 
