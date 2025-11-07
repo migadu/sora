@@ -81,22 +81,30 @@ func TestInsecureAuthDisabled(t *testing.T) {
 
 	// Verify STARTTLS capability is advertised (since we're not over TLS yet)
 	foundStartTLS := false
-	foundAuthPlain := false
+	foundSASLPlain := false
+	foundEmptySASL := false
 	for _, line := range greetingLines {
 		if strings.Contains(line, `"STARTTLS"`) {
 			foundStartTLS = true
 		}
-		// AUTH=PLAIN should NOT be advertised when !isTLS && !insecureAuth
-		if strings.Contains(line, `"AUTH=PLAIN"`) {
-			foundAuthPlain = true
+		// SASL PLAIN should NOT be advertised when !isTLS && !insecureAuth
+		// Instead, empty SASL should be advertised (RFC 5804 security requirement)
+		if strings.Contains(line, `"SASL" "PLAIN"`) {
+			foundSASLPlain = true
+		}
+		if strings.Contains(line, `"SASL" ""`) {
+			foundEmptySASL = true
 		}
 	}
 
 	if !foundStartTLS {
 		t.Errorf("Expected STARTTLS capability in greeting when not over TLS")
 	}
-	if foundAuthPlain {
-		t.Errorf("Did not expect AUTH=PLAIN capability in greeting when !isTLS && !insecureAuth")
+	if foundSASLPlain {
+		t.Errorf("Did not expect SASL PLAIN capability in greeting when !isTLS && !insecureAuth")
+	}
+	if !foundEmptySASL {
+		t.Errorf("Expected empty SASL capability before STARTTLS (RFC 5804 requirement)")
 	}
 
 	// Try to authenticate without STARTTLS - should be rejected
@@ -184,16 +192,16 @@ func TestInsecureAuthEnabled(t *testing.T) {
 		}
 	}
 
-	// Verify AUTH=PLAIN capability IS advertised (since insecure_auth = true)
-	foundAuthPlain := false
+	// Verify SASL PLAIN capability IS advertised (since insecure_auth = true)
+	foundSASLPlain := false
 	for _, line := range greetingLines {
-		if strings.Contains(line, `"AUTH=PLAIN"`) {
-			foundAuthPlain = true
+		if strings.Contains(line, `"SASL" "PLAIN"`) {
+			foundSASLPlain = true
 		}
 	}
 
-	if !foundAuthPlain {
-		t.Errorf("Expected AUTH=PLAIN capability in greeting when insecure_auth=true")
+	if !foundSASLPlain {
+		t.Errorf("Expected SASL PLAIN capability in greeting when insecure_auth=true, got: %v", greetingLines)
 	}
 
 	// Authenticate without TLS - should succeed
@@ -423,17 +431,23 @@ func TestInsecureAuthWithImplicitTLS(t *testing.T) {
 	}
 
 	// Verify STARTTLS is NOT advertised (since we're already over TLS)
-	// Note: AUTH=PLAIN is NOT advertised in capabilities when over TLS, per RFC 5804.
-	// Authentication is implicitly available over secure connections without explicit capability advertisement.
+	// Note: SASL PLAIN IS advertised in capabilities when over TLS, per RFC 5804.
 	foundStartTLS := false
+	foundSASLPlain := false
 	for _, line := range greetingLines {
 		if strings.Contains(line, `"STARTTLS"`) {
 			foundStartTLS = true
+		}
+		if strings.Contains(line, `"SASL" "PLAIN"`) {
+			foundSASLPlain = true
 		}
 	}
 
 	if foundStartTLS {
 		t.Errorf("Did not expect STARTTLS capability when already using implicit TLS")
+	}
+	if !foundSASLPlain {
+		t.Errorf("Expected SASL PLAIN capability when over TLS (RFC 5804 requirement), got: %v", greetingLines)
 	}
 
 	// Authenticate - should succeed since we're over TLS
