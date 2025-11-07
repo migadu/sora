@@ -1622,7 +1622,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		server.Stop()
 	}()
 
-	server.Start()
+	if err := server.Start(); err != nil && ctx.Err() == nil {
+		errChan <- fmt.Errorf("LMTP proxy server error: %w", err)
+	}
 }
 
 func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
