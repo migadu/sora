@@ -12,7 +12,7 @@ import (
 // XCLIENT implements the smtp.XCLIENTBackend interface for full XCLIENT support
 // This method is called by the go-smtp library when an XCLIENT command is received
 func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) error {
-	s.InfoLog("[XCLIENT] *** XCLIENT METHOD CALLED *** Backend received XCLIENT command with %d attributes: %+v", len(attrs), attrs)
+	s.DebugLog("[XCLIENT] Backend received XCLIENT command with %d attributes: %+v", len(attrs), attrs)
 
 	// Check if connection is from trusted proxy
 	if !s.isFromTrustedProxy() {
@@ -71,7 +71,7 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		}
 	}
 
-	s.InfoLog("[XCLIENT] Processed XCLIENT attributes: client=%s:%d, proto=%s, helo=%s, login=%s",
+	s.DebugLog("[XCLIENT] Processed XCLIENT attributes: client=%s:%d, proto=%s, helo=%s, login=%s",
 		s.ForwardingParams.OriginatingIP, s.ForwardingParams.OriginatingPort,
 		s.ForwardingParams.Protocol, s.ForwardingParams.HELO, s.ForwardingParams.Login)
 
