@@ -160,7 +160,7 @@ func (s *Session) handleConnection() {
 					}
 
 					// Send continuation
-					s.sendResponse("+ Ready for literal data")
+					s.sendResponse("+")
 
 					// Read literal data
 					literalBuf := make([]byte, literalSize)
@@ -201,7 +201,7 @@ func (s *Session) handleConnection() {
 						}
 
 						// Send continuation
-						s.sendResponse("+ Ready for literal data")
+						s.sendResponse("+")
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
@@ -235,7 +235,7 @@ func (s *Session) handleConnection() {
 						}
 
 						// Send continuation
-						s.sendResponse("+ Ready for literal data")
+						s.sendResponse("+")
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
@@ -310,7 +310,7 @@ func (s *Session) handleConnection() {
 				saslLine = server.UnquoteString(args[1])
 			} else {
 				// No initial response, send continuation request
-				s.sendResponse("+ Ready for literal data")
+				s.sendResponse("+")
 
 				// Read SASL response from client
 				var err error
