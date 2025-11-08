@@ -384,10 +384,14 @@ func (s *Session) handleRecipient(to string) error {
 	}
 
 	// 1. Try prelookup first
-	if s.server.connManager.HasRouting() {
+	hasRouting := s.server.connManager.HasRouting()
+	s.InfoLog("checking prelookup availability", "username", s.username, "has_routing", hasRouting)
+
+	if hasRouting {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
 		defer routingCancel()
 
+		s.InfoLog("calling prelookup", "username", s.username)
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
 			s.InfoLog("prelookup failed - falling back to main DB", "username", s.username, "error", lookupErr)
@@ -397,7 +401,11 @@ func (s *Session) handleRecipient(to string) error {
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
 			return nil
+		} else {
+			s.InfoLog("prelookup returned empty result", "username", s.username, "routing_info", routingInfo)
 		}
+	} else {
+		s.InfoLog("prelookup not available - HasRouting returned false", "username", s.username)
 	}
 
 	// 2. Fallback to main DB to get account ID for affinity
