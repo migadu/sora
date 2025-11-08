@@ -13,8 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIMAP_MetadataRawCommand tests raw GETMETADATA command like SnappyMail sends
-func TestIMAP_MetadataRawCommand(t *testing.T) {
+// TestIMAP_MetadataRawProtocol tests raw GETMETADATA command protocol handling
+// This test verifies that the go-imap parser correctly handles GETMETADATA syntax
+// and that our wildcard rejection works at the application level.
+func TestIMAP_MetadataRawProtocol(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
@@ -31,6 +33,7 @@ func TestIMAP_MetadataRawCommand(t *testing.T) {
 	greeting, err := reader.ReadString('\n')
 	require.NoError(t, err)
 	t.Logf("Greeting: %s", greeting)
+	require.Contains(t, greeting, "OK")
 
 	// Login
 	loginCmd := fmt.Sprintf("A001 LOGIN %s %s\r\n", account.Email, account.Password)
@@ -41,80 +44,167 @@ func TestIMAP_MetadataRawCommand(t *testing.T) {
 	for {
 		line, err := reader.ReadString('\n')
 		require.NoError(t, err)
-		t.Logf("Login response: %s", line)
+		t.Logf("Login response: %s", strings.TrimRight(line, "\r\n"))
 		if strings.HasPrefix(line, "A001 ") {
+			require.Contains(t, line, "OK")
 			break
 		}
 	}
 
-	// Test 1: Send GETMETADATA with wildcard mailbox like SnappyMail does
-	t.Run("SnappyMailStyleCommand", func(t *testing.T) {
-		// This is exactly what SnappyMail sends
-		cmd := "A002 GETMETADATA (DEPTH infinity) \"*\" (/shared /private)\r\n"
-		t.Logf("Sending: %q", cmd)
-
-		_, err := conn.Write([]byte(cmd))
-		require.NoError(t, err)
-
-		// Read all response lines
-		for {
-			line, err := reader.ReadString('\n')
-			require.NoError(t, err)
-			t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
-
-			if strings.HasPrefix(line, "A002 ") {
-				// Check if this is a parse error
-				if strings.Contains(line, "CLIENTBUG") {
-					t.Errorf("Got CLIENTBUG error: %s", line)
-				}
-				if strings.Contains(line, "expected CRLF") {
-					t.Errorf("Got CRLF parse error: %s", line)
-				}
-				break
-			}
-		}
-	})
-
-	// Test 2: Send GETMETADATA with correct server metadata syntax
-	t.Run("CorrectServerMetadata", func(t *testing.T) {
-		cmd := "A003 GETMETADATA \"\" (/shared /private)\r\n"
+	t.Run("WildcardSingleEntry", func(t *testing.T) {
+		// Test wildcard mailbox with single entry in list
+		// NOTE: go-imap currently requires parentheses for RFC 5464 compliance
+		// TODO: Update when single entry without parens is supported
+		cmd := "A002 GETMETADATA \"*\" (/private/comment)\r\n"
 		t.Logf("Sending: %q", cmd)
 
 		_, err := conn.Write([]byte(cmd))
 		require.NoError(t, err)
 
 		// Read response
-		for {
-			line, err := reader.ReadString('\n')
-			require.NoError(t, err)
-			t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
 
-			if strings.HasPrefix(line, "A003 ") {
-				require.Contains(t, line, "OK", "Command should succeed")
-				break
-			}
-		}
+		// Should reject wildcard with CLIENTBUG (not a parse error)
+		require.Contains(t, line, "A002 NO", "Expected NO response for wildcard")
+		require.Contains(t, line, "CLIENTBUG", "Expected CLIENTBUG code")
+		require.Contains(t, strings.ToLower(line), "wildcard", "Error should mention wildcards")
 	})
 
-	// Test 3: Send GETMETADATA with options
-	t.Run("WithDepthOption", func(t *testing.T) {
-		cmd := "A004 GETMETADATA (DEPTH infinity) \"\" (/shared /private)\r\n"
+	t.Run("WildcardMultipleEntries", func(t *testing.T) {
+		// Test wildcard mailbox with multiple entries in parentheses
+		cmd := "A003 GETMETADATA \"*\" (/private/comment /shared/comment)\r\n"
 		t.Logf("Sending: %q", cmd)
 
 		_, err := conn.Write([]byte(cmd))
 		require.NoError(t, err)
 
-		// Read response
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+		// Should reject wildcard
+		require.Contains(t, line, "A003 NO")
+		require.Contains(t, line, "CLIENTBUG")
+		require.Contains(t, strings.ToLower(line), "wildcard")
+	})
+
+	t.Run("ValidServerMetadataSingleEntry", func(t *testing.T) {
+		// Test with correct empty string for server metadata, single entry
+		// NOTE: go-imap currently requires parentheses
+		// TODO: Update when single entry without parens is supported
+		cmd := "A004 GETMETADATA \"\" (/private/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		// Read all response lines until we get the tagged response
 		for {
 			line, err := reader.ReadString('\n')
 			require.NoError(t, err)
 			t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
 
 			if strings.HasPrefix(line, "A004 ") {
-				// This should work - DEPTH infinity with empty string for server metadata
-				t.Logf("Final response: %s", line)
+				require.Contains(t, line, "OK", "Valid command should succeed")
 				break
 			}
 		}
+	})
+
+	t.Run("ValidServerMetadataMultipleEntries", func(t *testing.T) {
+		// Test with parenthesized entry list
+		cmd := "A005 GETMETADATA \"\" (/private/comment /shared/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		for {
+			line, err := reader.ReadString('\n')
+			require.NoError(t, err)
+			t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+			if strings.HasPrefix(line, "A005 ") {
+				require.Contains(t, line, "OK", "Valid command should succeed")
+				break
+			}
+		}
+	})
+
+	t.Run("PercentWildcard", func(t *testing.T) {
+		// Test with % wildcard
+		// NOTE: go-imap currently requires parentheses
+		cmd := "A006 GETMETADATA \"%\" (/shared/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+		// Should also reject % wildcard
+		require.Contains(t, line, "A006 NO")
+		require.Contains(t, line, "CLIENTBUG")
+	})
+
+	t.Run("WildcardInMiddle", func(t *testing.T) {
+		// Test wildcard in middle of mailbox name
+		// NOTE: go-imap currently requires parentheses
+		cmd := "A007 GETMETADATA \"INBOX*\" (/private/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+		// Should reject wildcards anywhere in name
+		require.Contains(t, line, "A007 NO")
+		require.Contains(t, line, "CLIENTBUG")
+		require.Contains(t, strings.ToLower(line), "wildcard")
+	})
+
+	t.Run("WithDepthOption", func(t *testing.T) {
+		// Test GETMETADATA with DEPTH option
+		cmd := "A008 GETMETADATA (DEPTH infinity) \"\" (/private/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		for {
+			line, err := reader.ReadString('\n')
+			require.NoError(t, err)
+			t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+			if strings.HasPrefix(line, "A008 ") {
+				require.Contains(t, line, "OK", "Valid command with options should succeed")
+				break
+			}
+		}
+	})
+
+	t.Run("WildcardWithDepthOption", func(t *testing.T) {
+		// Test wildcard with DEPTH option (what SnappyMail originally sent)
+		cmd := "A009 GETMETADATA (DEPTH infinity) \"*\" (/private/comment)\r\n"
+		t.Logf("Sending: %q", cmd)
+
+		_, err := conn.Write([]byte(cmd))
+		require.NoError(t, err)
+
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		t.Logf("Response: %s", strings.TrimRight(line, "\r\n"))
+
+		// Should reject wildcard even with valid options
+		require.Contains(t, line, "A009 NO")
+		require.Contains(t, line, "CLIENTBUG")
+		require.Contains(t, strings.ToLower(line), "wildcard")
 	})
 }

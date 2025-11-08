@@ -18,7 +18,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
 	// SnappyMail webmail incorrectly sends "*" as the mailbox parameter
 	// Reject wildcards with a clear error message
-	if mailbox == "*" || mailbox == "%" || strings.Contains(mailbox, "*") || strings.Contains(mailbox, "%") {
+	if strings.ContainsAny(mailbox, "*%") {
 		s.DebugLog("[GETMETADATA] Rejected wildcard mailbox: %q", mailbox)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,

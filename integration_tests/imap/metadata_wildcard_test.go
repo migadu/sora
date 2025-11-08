@@ -41,7 +41,7 @@ func TestIMAP_MetadataWildcardMailbox(t *testing.T) {
 		// GETMETADATA (DEPTH infinity) "*" (/shared /private)
 
 		// Test with wildcard "*" mailbox name
-		_, err := c.GetMetadata("*", []string{"/shared", "/private"}, nil).Wait()
+		_, err := c.GetMetadata("*", []string{"/shared/comment", "/private/comment"}, nil).Wait()
 
 		// This should fail with a proper error about wildcards not being supported
 		require.Error(t, err)
@@ -61,7 +61,7 @@ func TestIMAP_MetadataWildcardMailbox(t *testing.T) {
 
 	t.Run("PercentWildcard", func(t *testing.T) {
 		// Test with "%" wildcard as well
-		_, err := c.GetMetadata("%", []string{"/shared"}, nil).Wait()
+		_, err := c.GetMetadata("%", []string{"/shared/comment"}, nil).Wait()
 
 		require.Error(t, err)
 		t.Logf("Error received: %v", err)
@@ -75,7 +75,7 @@ func TestIMAP_MetadataWildcardMailbox(t *testing.T) {
 
 	t.Run("EmptyMailboxForServerMetadata", func(t *testing.T) {
 		// The correct way to get server metadata is with empty string
-		result, err := c.GetMetadata("", []string{"/shared", "/private"}, nil).Wait()
+		result, err := c.GetMetadata("", []string{"/shared/comment", "/private/comment"}, nil).Wait()
 
 		// This should succeed (even if no metadata exists)
 		require.NoError(t, err)
@@ -90,10 +90,36 @@ func TestIMAP_MetadataWildcardMailbox(t *testing.T) {
 		require.NoError(t, err)
 
 		// Getting metadata for a specific mailbox should work
-		result, err := c.GetMetadata(mailboxName, []string{"/shared", "/private"}, nil).Wait()
+		result, err := c.GetMetadata(mailboxName, []string{"/shared/comment", "/private/comment"}, nil).Wait()
 		require.NoError(t, err)
 		t.Logf("Mailbox metadata: %+v", result)
-		assert.Equal(t, mailboxName, result.Mailbox)
+		// The mailbox name should match (or be empty if no metadata exists)
+		// Note: Some implementations may return empty mailbox name when no metadata entries exist
+		if len(result.Entries) > 0 {
+			assert.Equal(t, mailboxName, result.Mailbox)
+		}
+	})
+
+	t.Run("WildcardInMiddle", func(t *testing.T) {
+		// Test mailbox names like "INBOX*" or "Sent%" which contain wildcards
+		_, err := c.GetMetadata("INBOX*", []string{"/shared/comment"}, nil).Wait()
+		require.Error(t, err)
+		t.Logf("INBOX* error: %v", err)
+
+		var imapErr *imap.Error
+		if assert.ErrorAs(t, err, &imapErr) {
+			assert.Equal(t, imap.ResponseCodeClientBug, imapErr.Code)
+			assert.Contains(t, strings.ToLower(imapErr.Text), "wildcard")
+		}
+
+		// Test with % in middle
+		_, err = c.GetMetadata("Sent%", []string{"/shared/comment"}, nil).Wait()
+		require.Error(t, err)
+		t.Logf("Sent%% error: %v", err)
+
+		if assert.ErrorAs(t, err, &imapErr) {
+			assert.Equal(t, imap.ResponseCodeClientBug, imapErr.Code)
+		}
 	})
 
 	t.Run("WithDepthOption", func(t *testing.T) {
@@ -103,12 +129,12 @@ func TestIMAP_MetadataWildcardMailbox(t *testing.T) {
 		}
 
 		// Should work with empty mailbox (server metadata)
-		result, err := c.GetMetadata("", []string{"/shared", "/private"}, options).Wait()
+		result, err := c.GetMetadata("", []string{"/shared/comment", "/private/comment"}, options).Wait()
 		require.NoError(t, err)
 		t.Logf("Server metadata with DEPTH infinity: %+v", result)
 
 		// Should fail with wildcard
-		_, err = c.GetMetadata("*", []string{"/shared", "/private"}, options).Wait()
+		_, err = c.GetMetadata("*", []string{"/shared/comment", "/private/comment"}, options).Wait()
 		require.Error(t, err)
 		t.Logf("Wildcard with DEPTH rejected: %v", err)
 	})

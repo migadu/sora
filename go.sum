@@ -166,8 +166,8 @@ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D
 github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
 github.com/miekg/dns v1.1.26 h1:gPxPSwALAeHJSjarOs00QjVdV9QoBvc1D2ujQUr5BzU=
 github.com/miekg/dns v1.1.26/go.mod h1:bPDLeHnStXmXAq1m/Ch/hvfNHr14JKNPMBo3VZKjuso=
-github.com/migadu/go-imap/v2 v2.0.0-20251025213219-e4dddcf942d2 h1:UkC4p0MAEpGukkcfDAUMxTDwnlSFx+zEDI8lJuogdRI=
-github.com/migadu/go-imap/v2 v2.0.0-20251025213219-e4dddcf942d2/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
+github.com/migadu/go-imap/v2 v2.0.0-20251108210014-eefc7750bd16 h1:ETkYAPbTycSqqouI6VBPg3qy4otCh1IHRN31LniDZ3c=
+github.com/migadu/go-imap/v2 v2.0.0-20251108210014-eefc7750bd16/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
 github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43 h1:/07M1CWNcis7nhsnt7N2eWGIdPZue3YfCrKxXmVOFTw=
 github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43/go.mod h1:XykjlGKeykHsZKfFBDlmJiFbbQT+6Li9iUNNuZQNqxg=
 github.com/minio/crc64nvme v1.1.1 h1:8dwx/Pz49suywbO+auHCBpCtlW1OfpcLN7wYgVR6wAI=
