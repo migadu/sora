@@ -399,11 +399,14 @@ func (s *Session) handleRecipient(to string) error {
 			// User not found (404) always falls through to support partitioning scenarios
 			if s.server.prelookupConfig != nil && !s.server.prelookupConfig.FallbackDefault {
 				s.InfoLog("prelookup transient error and fallback_to_default=false - rejecting recipient", "username", s.username)
+				metrics.PrelookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
 				return fmt.Errorf("prelookup failed and fallback disabled: %w", lookupErr)
 			}
 			s.InfoLog("prelookup transient error - fallback_to_default=true, falling back to main DB", "username", s.username)
+			metrics.PrelookupResult.WithLabelValues("lmtp", "transient_error_fallback").Inc()
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
 			s.InfoLog("prelookup succeeded", "username", s.username, "server", routingInfo.ServerAddress, "cached", routingInfo.FromCache)
+			metrics.PrelookupResult.WithLabelValues("lmtp", "success").Inc()
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
@@ -413,6 +416,7 @@ func (s *Session) handleRecipient(to string) error {
 			// Always fall through to main DB - this supports partitioning scenarios
 			// where some users are in prelookup system and others are in main DB.
 			s.InfoLog("user not found in prelookup, attempting main DB", "username", s.username)
+			metrics.PrelookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 		}
 	} else {
 		s.InfoLog("prelookup not available - HasRouting returned false", "username", s.username)

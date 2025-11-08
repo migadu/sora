@@ -519,9 +519,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					s.DebugLog("prelookup transient error - fallback enabled", "error", err)
+					metrics.PrelookupResult.WithLabelValues("managesieve", "transient_error_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
 					s.DebugLog("prelookup transient error - fallback disabled", "error", err)
+					metrics.PrelookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 					return fmt.Errorf("prelookup service unavailable")
@@ -537,6 +539,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Prelookup returned success - use routing info
 				s.DebugLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 				s.DebugLog("prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
+				metrics.PrelookupResult.WithLabelValues("managesieve", "success").Inc()
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
@@ -579,6 +582,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// User not found in prelookup (404). This means the user is NOT in the other system.
 				// Always fall through to main DB auth - this is the expected behavior for partitioning.
 				s.InfoLog("User not found in prelookup - trying main DB")
+				metrics.PrelookupResult.WithLabelValues("managesieve", "user_not_found_fallback").Inc()
 			}
 		}
 	}

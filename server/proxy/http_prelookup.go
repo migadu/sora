@@ -250,7 +250,13 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
-		// 4xx errors (except 404) mean user lookup failed - allow fallback
+		// 401 Unauthorized and 403 Forbidden mean authentication failed (user exists but access denied)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			logger.Debug("prelookup: Authentication failed", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
+			return map[string]any{"result": AuthFailed}, nil
+		}
+
+		// Other 4xx errors mean user lookup failed - treat as user not found to allow fallback
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			logger.Debug("prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
 			return map[string]any{"result": AuthUserNotFound}, nil
@@ -321,14 +327,23 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		return nil, AuthFailed, err
 	}
 
-	// Handle user not found case
+	// Handle special auth result cases (user not found, auth failed)
 	if resultMap, ok := result.(map[string]any); ok {
-		if authResult, ok := resultMap["result"].(AuthResult); ok && authResult == AuthUserNotFound {
-			// Store user not found in cache (negative caching)
-			if c.cache != nil {
-				c.cache.Set(cacheKey, nil, AuthUserNotFound)
+		if authResult, ok := resultMap["result"].(AuthResult); ok {
+			if authResult == AuthUserNotFound {
+				// Store user not found in cache (negative caching)
+				if c.cache != nil {
+					c.cache.Set(cacheKey, nil, AuthUserNotFound)
+				}
+				return nil, AuthUserNotFound, nil
 			}
-			return nil, AuthUserNotFound, nil
+			if authResult == AuthFailed {
+				// Store auth failed in cache (negative caching)
+				if c.cache != nil {
+					c.cache.Set(cacheKey, nil, AuthFailed)
+				}
+				return nil, AuthFailed, nil
+			}
 		}
 	}
 

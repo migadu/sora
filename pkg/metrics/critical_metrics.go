@@ -244,6 +244,14 @@ var (
 		},
 		[]string{"protocol", "method"}, // e.g., protocol="imap", method="prelookup"
 	)
+
+	PrelookupResult = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_prelookup_result_total",
+			Help: "Total number of prelookup results by outcome type.",
+		},
+		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found_fallback/transient_error_fallback/transient_error_rejected
+	)
 )
 
 // Business metrics - Actually useful for operations
