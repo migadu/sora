@@ -960,3 +960,247 @@ func TestLMTPDirectXRCPTFORWARD(t *testing.T) {
 
 	t.Logf("LMTP direct XRCPTFORWARD test completed")
 }
+
+// TestLMTPProxyBackendUnavailable tests that the proxy correctly rejects messages when backend is unavailable
+func TestLMTPProxyBackendUnavailable(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Set up backend LMTP server
+	backendServer, account := common.SetupLMTPServerWithXCLIENT(t)
+
+	// Set up LMTP proxy pointing to the backend
+	proxyAddress, proxyWrapper := setupLMTPProxyWithXCLIENT(t, backendServer.Address)
+	defer proxyWrapper.Close()
+
+	// Now stop the backend server to simulate unavailability
+	backendServer.Close()
+	time.Sleep(100 * time.Millisecond) // Wait for backend to stop
+
+	// Connect to the proxy
+	client, err := NewLMTPClient(proxyAddress)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Send LHLO
+	if err := client.SendCommand("LHLO localhost"); err != nil {
+		t.Fatalf("Failed to send LHLO: %v", err)
+	}
+	responses, err := client.ReadMultilineResponse()
+	if err != nil {
+		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+	if len(responses) == 0 || !strings.HasPrefix(responses[0], "250") {
+		t.Fatalf("LHLO failed: %v", responses)
+	}
+
+	// Send MAIL FROM
+	if err := client.SendCommand("MAIL FROM:<sender@example.com>"); err != nil {
+		t.Fatalf("Failed to send MAIL FROM: %v", err)
+	}
+	response, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read MAIL FROM response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("MAIL FROM failed: %s", response)
+	}
+
+	// Send RCPT TO - this should fail because backend is unavailable
+	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
+		t.Fatalf("Failed to send RCPT TO: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read RCPT TO response: %v", err)
+	}
+
+	// Verify we get a 4xx temporary failure code (not 2xx success)
+	if strings.HasPrefix(response, "250") {
+		t.Errorf("RCPT TO should have failed with 4xx when backend unavailable, got: %s", response)
+	}
+
+	// Verify we get the expected error code (451 4.4.1 Backend connection failed)
+	if !strings.HasPrefix(response, "451") {
+		t.Errorf("Expected '451 4.4.1 Backend connection failed', got: %s", response)
+	}
+
+	// Verify the error message indicates backend failure
+	if !strings.Contains(response, "Backend") && !strings.Contains(response, "backend") {
+		t.Errorf("Expected error message to mention backend failure, got: %s", response)
+	}
+
+	t.Logf("Backend unavailability test passed - proxy correctly rejected with: %s", response)
+}
+
+// TestLMTPProxyBackendFailsDuringDelivery tests backend failure during message DATA transmission
+func TestLMTPProxyBackendFailsDuringDelivery(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Set up a mock LMTP backend that accepts connection but fails during DATA
+	backendAddr := common.GetRandomAddress(t)
+	backendListener, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("Failed to create mock backend listener: %v", err)
+	}
+	defer backendListener.Close()
+
+	// Create test account
+	rdb := common.SetupTestDatabase(t)
+	accountEmail := "test@example.com"
+	common.CreateTestAccountWithEmail(t, rdb, accountEmail, "password")
+
+	// Start mock backend that fails during DATA
+	go func() {
+		for {
+			conn, err := backendListener.Accept()
+			if err != nil {
+				return
+			}
+			go handleMockLMTPBackendFailDuringDATA(conn)
+		}
+	}()
+
+	// Set up LMTP proxy pointing to the mock backend
+	proxyAddress, proxyWrapper := setupLMTPProxyWithXCLIENT(t, backendAddr)
+	defer proxyWrapper.Close()
+
+	// Connect to the proxy
+	client, err := NewLMTPClient(proxyAddress)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Send LHLO
+	if err := client.SendCommand("LHLO localhost"); err != nil {
+		t.Fatalf("Failed to send LHLO: %v", err)
+	}
+	responses, err := client.ReadMultilineResponse()
+	if err != nil {
+		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+	if len(responses) == 0 || !strings.HasPrefix(responses[0], "250") {
+		t.Fatalf("LHLO failed: %v", responses)
+	}
+
+	// Send MAIL FROM
+	if err := client.SendCommand("MAIL FROM:<sender@example.com>"); err != nil {
+		t.Fatalf("Failed to send MAIL FROM: %v", err)
+	}
+	response, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read MAIL FROM response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("MAIL FROM failed: %s", response)
+	}
+
+	// Send RCPT TO - should succeed (backend accepts it)
+	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", accountEmail)); err != nil {
+		t.Fatalf("Failed to send RCPT TO: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read RCPT TO response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("RCPT TO failed: %s", response)
+	}
+
+	// Send DATA command - backend accepts
+	if err := client.SendCommand("DATA"); err != nil {
+		t.Fatalf("Failed to send DATA: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read DATA response: %v", err)
+	}
+	if !strings.HasPrefix(response, "354") {
+		t.Fatalf("DATA failed: %s", response)
+	}
+
+	// Send message content - backend will fail with 5xx error
+	messageContent := "Subject: Test Message\r\n\r\nThis is a test message.\r\n.\r\n"
+	if err := client.SendCommand(messageContent); err != nil {
+		t.Fatalf("Failed to send message content: %v", err)
+	}
+
+	// Read response - should be a failure from backend (forwarded by proxy)
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read message response: %v", err)
+	}
+
+	// Verify we get a 5xx permanent failure (backend storage error)
+	if !strings.HasPrefix(response, "554") {
+		t.Errorf("Expected '554 5.3.0 Backend storage error' when backend fails, got: %s", response)
+	}
+
+	// Verify the message was NOT accepted
+	if strings.HasPrefix(response, "250") {
+		t.Errorf("Message should NOT be accepted when backend fails during DATA, got: %s", response)
+	}
+
+	t.Logf("Backend failure during DATA test passed - proxy forwarded error: %s", response)
+}
+
+// handleMockLMTPBackendFailDuringDATA simulates an LMTP backend that fails during DATA
+func handleMockLMTPBackendFailDuringDATA(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Send greeting
+	writer.WriteString("220 localhost LMTP Service Ready\r\n")
+	writer.Flush()
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+
+		line = strings.TrimSpace(line)
+		cmd := strings.ToUpper(strings.Fields(line)[0])
+
+		switch cmd {
+		case "LHLO", "EHLO":
+			writer.WriteString("250 localhost\r\n")
+			writer.Flush()
+		case "MAIL":
+			writer.WriteString("250 Ok\r\n")
+			writer.Flush()
+		case "RCPT":
+			writer.WriteString("250 Ok\r\n")
+			writer.Flush()
+		case "DATA":
+			writer.WriteString("354 Start mail input; end with <CRLF>.<CRLF>\r\n")
+			writer.Flush()
+
+			// Read message body until ".\r\n"
+			for {
+				bodyLine, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.TrimSpace(bodyLine) == "." {
+					break
+				}
+			}
+
+			// Simulate backend storage failure
+			writer.WriteString("554 5.3.0 Backend storage error\r\n")
+			writer.Flush()
+			return
+		case "QUIT":
+			writer.WriteString("221 Bye\r\n")
+			writer.Flush()
+			return
+		default:
+			writer.WriteString("502 Command not implemented\r\n")
+			writer.Flush()
+		}
+	}
+}

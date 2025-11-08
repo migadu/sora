@@ -36,6 +36,7 @@ type POP3ProxySession struct {
 	accountID          int64
 	isPrelookupAccount bool
 	routingInfo        *proxy.UserRoutingInfo
+	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
 	authenticated      bool
 	mutex              sync.Mutex
@@ -158,8 +159,9 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
-			// Log authentication at INFO level
-			s.InfoLog("authenticated")
+			// Log authentication at INFO level with routing method and cache status
+			prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
+			s.InfoLog("authenticated", "method", s.routingMethod, "prelookup_cached", prelookupCached)
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {
@@ -269,8 +271,9 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
-			// Log authentication at INFO level
-			s.InfoLog("authenticated via SASL PLAIN")
+			// Log authentication at INFO level with routing method and cache status
+			prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
+			s.InfoLog("authenticated via SASL PLAIN", "method", s.routingMethod, "prelookup_cached", prelookupCached)
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {
@@ -574,6 +577,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 
 	// Update session routing info if it was fetched by DetermineRoute
 	s.routingInfo = routeResult.RoutingInfo
+	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 

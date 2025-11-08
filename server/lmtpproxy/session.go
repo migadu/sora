@@ -35,6 +35,7 @@ type Session struct {
 	routingInfo        *proxy.UserRoutingInfo
 	accountID          int64
 	serverAddr         string
+	routingMethod      string
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -184,7 +185,7 @@ func (s *Session) handleConnection() {
 			}
 			// Now connect to backend
 			if err := s.connectToBackend(); err != nil {
-				s.DebugLog("Failed to connect to backend", "error", err)
+				s.InfoLog("backend connection failed", "recipient", s.to, "error", err)
 				s.sendResponse("451 4.4.1 Backend connection failed")
 				return
 			}
@@ -429,6 +430,7 @@ func (s *Session) connectToBackend() error {
 
 	// Update session routing info if it was fetched by DetermineRoute
 	s.routingInfo = routeResult.RoutingInfo
+	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 
@@ -678,6 +680,9 @@ func (s *Session) startProxy(initialCommand string) {
 	s.clientWriter.WriteString(response)
 	s.clientWriter.Flush()
 
+	// Log routing decision at INFO level with sender, recipient, and routing method
+	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
+	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "prelookup_cached", prelookupCached, "sender", s.sender, "recipient", s.to)
 	var wg sync.WaitGroup
 
 	// Start activity updater
@@ -705,8 +710,6 @@ func (s *Session) startProxy(initialCommand string) {
 		// Use the buffered reader from authentication phase to avoid losing buffered data
 		if s.backendReader != nil {
 			// Copy from buffered reader with deadline protection
-			// This ensures we don't lose any data that was buffered during authentication
-			// or any subsequent data that gets read into the buffer during the proxy phase
 			bytesOut, err = s.copyBufferedReaderToConn(s.clientConn, s.backendReader)
 		} else {
 			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)

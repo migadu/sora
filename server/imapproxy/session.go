@@ -37,6 +37,7 @@ type Session struct {
 	accountID          int64
 	isPrelookupAccount bool
 	routingInfo        *proxy.UserRoutingInfo
+	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
 	sessionID          string // Proxy session ID for end-to-end tracing
 	mu                 sync.Mutex
@@ -712,6 +713,7 @@ func (s *Session) connectToBackend() error {
 
 	// Update session routing info if it was fetched by DetermineRoute
 	s.routingInfo = routeResult.RoutingInfo
+	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 
@@ -899,9 +901,9 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 		s.WarnLog("failed to register connection", "error", err)
 	}
 
-	// Log authentication at INFO level with cache status (prelookup cache only)
+	// Log authentication at INFO level with routing method and cache status
 	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
-	s.InfoLog("authenticated", "backend", s.serverAddr, "prelookup_cached", prelookupCached)
+	s.InfoLog("authenticated", "backend", s.serverAddr, "method", s.routingMethod, "prelookup_cached", prelookupCached)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string

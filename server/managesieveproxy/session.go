@@ -37,6 +37,7 @@ type Session struct {
 	accountID          int64
 	isPrelookupAccount bool
 	routingInfo        *proxy.UserRoutingInfo
+	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
 	isTLS              bool // Whether the client connection is over TLS
 	mu                 sync.Mutex
@@ -702,6 +703,7 @@ func (s *Session) connectToBackendAndAuth() error {
 
 	// Update session routing info if it was fetched by DetermineRoute
 	s.routingInfo = routeResult.RoutingInfo
+	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
 	isPrelookupRoute := routeResult.IsPrelookupRoute
 
@@ -859,8 +861,9 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend authentication successful")
 
-	// Log authentication at INFO level
-	s.InfoLog("authenticated")
+	// Log authentication at INFO level with routing method and cache status
+	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
+	s.InfoLog("authenticated", "method", s.routingMethod, "prelookup_cached", prelookupCached)
 
 	return nil
 }
