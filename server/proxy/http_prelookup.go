@@ -192,6 +192,10 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 	if c.cache != nil {
 		if info, authResult, found := c.cache.Get(cacheKey); found {
 			logger.Debug("Prelookup cache HIT", "user", authEmail)
+			// Mark as from cache if we have routing info
+			if info != nil {
+				info.FromCache = true
+			}
 			return info, authResult, nil
 		}
 		logger.Debug("Prelookup cache MISS", "user", authEmail)

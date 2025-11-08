@@ -59,6 +59,7 @@ type UserRoutingInfo struct {
 	AccountID              int64    // Account ID for tracking/metrics
 	IsPrelookupAccount     bool     // Whether this came from prelookup
 	ActualEmail            string   // Actual email address for backend impersonation
+	FromCache              bool     // Whether this result came from prelookup cache
 	RemoteTLS              bool     // Use TLS for backend connection
 	RemoteTLSUseStartTLS   bool     // Use STARTTLS (LMTP/ManageSieve only)
 	RemoteTLSVerify        bool     // Verify backend TLS certificate

@@ -899,8 +899,9 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 		s.WarnLog("failed to register connection", "error", err)
 	}
 
-	// Log authentication at INFO level
-	s.InfoLog("authenticated", "backend", s.serverAddr)
+	// Log authentication at INFO level with cache status (prelookup cache only)
+	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
+	s.InfoLog("authenticated", "backend", s.serverAddr, "prelookup_cached", prelookupCached)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string
