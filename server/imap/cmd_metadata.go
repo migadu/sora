@@ -13,6 +13,20 @@ import (
 // GetMetadata implements the GETMETADATA command (RFC 5464).
 // If mailbox is empty string "", retrieves server metadata.
 func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+	s.DebugLog("[GETMETADATA] Called with mailbox=%q, entries=%v, options=%+v", mailbox, entries, options)
+
+	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
+	// SnappyMail webmail incorrectly sends "*" as the mailbox parameter
+	// Reject wildcards with a clear error message
+	if mailbox == "*" || mailbox == "%" || strings.Contains(mailbox, "*") || strings.Contains(mailbox, "%") {
+		s.DebugLog("[GETMETADATA] Rejected wildcard mailbox: %q", mailbox)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeClientBug,
+			Text: "GETMETADATA does not support wildcard mailbox names. Use empty string \"\" for server metadata or a specific mailbox name.",
+		}
+	}
+
 	// Validate entry names
 	for _, entry := range entries {
 		if err := validateMetadataEntry(entry); err != nil {
