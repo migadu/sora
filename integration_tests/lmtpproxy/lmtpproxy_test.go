@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/lmtpproxy"
 )
@@ -1203,4 +1204,268 @@ func handleMockLMTPBackendFailDuringDATA(conn net.Conn) {
 			writer.Flush()
 		}
 	}
+}
+
+// TestLMTPProxyPrelookupFallbackToDefault tests the fallback_to_default setting
+// when prelookup fails or returns empty results
+func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Test cases for different fallback scenarios
+	testCases := []struct {
+		name                string
+		fallbackToDefault   bool
+		prelookupStatusCode int    // HTTP status code for prelookup response
+		prelookupBody       string // HTTP response body
+		expectAccept        bool   // Should RCPT TO succeed?
+		expectLog           string // Expected log message
+	}{
+		{
+			name:                "fallback enabled - prelookup 500 error - accepts recipient",
+			fallbackToDefault:   true,
+			prelookupStatusCode: 500,
+			prelookupBody:       `{"error": "internal server error"}`,
+			expectAccept:        true,
+			expectLog:           "prelookup failed - fallback_to_default=true, falling back to main DB",
+		},
+		{
+			name:                "fallback disabled - prelookup 500 error - rejects recipient",
+			fallbackToDefault:   false,
+			prelookupStatusCode: 500,
+			prelookupBody:       `{"error": "internal server error"}`,
+			expectAccept:        false,
+			expectLog:           "prelookup failed and fallback_to_default=false - rejecting recipient",
+		},
+		{
+			name:                "fallback enabled - prelookup empty result - accepts recipient",
+			fallbackToDefault:   true,
+			prelookupStatusCode: 200,
+			prelookupBody:       `{"account_id": 0, "server_address": ""}`,
+			expectAccept:        true,
+			expectLog:           "prelookup user not found - fallback_to_default=true, falling back to main DB",
+		},
+		{
+			name:                "fallback disabled - prelookup empty result - rejects recipient",
+			fallbackToDefault:   false,
+			prelookupStatusCode: 200,
+			prelookupBody:       `{"account_id": 0, "server_address": ""}`,
+			expectAccept:        false,
+			expectLog:           "prelookup user not found and fallback_to_default=false - rejecting recipient",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Start log capture
+			logCapture := NewLogCapture()
+			defer logCapture.Close()
+
+			// Set up backend LMTP server
+			backendServer, account := common.SetupLMTPServerWithXCLIENT(t)
+			defer backendServer.Close()
+
+			// Set up mock prelookup HTTP server
+			prelookupAddr := common.GetRandomAddress(t)
+			mockPrelookupServer := setupMockPrelookupServer(t, prelookupAddr, tc.prelookupStatusCode, tc.prelookupBody)
+			defer mockPrelookupServer.Close()
+
+			// Get HTTP URL for prelookup
+			prelookupURL := fmt.Sprintf("http://%s/lookup", prelookupAddr)
+
+			// Set up LMTP proxy with prelookup
+			proxyAddress, proxyWrapper := setupLMTPProxyWithPrelookup(t, backendServer.Address, prelookupURL, tc.fallbackToDefault)
+			defer proxyWrapper.Close()
+
+			// Connect to proxy
+			client, err := NewLMTPClient(proxyAddress)
+			if err != nil {
+				t.Fatalf("Failed to connect to LMTP proxy: %v", err)
+			}
+			defer client.Close()
+
+			// Send LHLO
+			if err := client.SendCommand("LHLO localhost"); err != nil {
+				t.Fatalf("Failed to send LHLO: %v", err)
+			}
+			responses, err := client.ReadMultilineResponse()
+			if err != nil {
+				t.Fatalf("Failed to read LHLO response: %v", err)
+			}
+			if len(responses) == 0 || !strings.HasPrefix(responses[0], "250") {
+				t.Fatalf("LHLO failed: %v", responses)
+			}
+
+			// Send MAIL FROM
+			if err := client.SendCommand("MAIL FROM:<sender@example.com>"); err != nil {
+				t.Fatalf("Failed to send MAIL FROM: %v", err)
+			}
+			response, err := client.ReadResponse()
+			if err != nil {
+				t.Fatalf("Failed to read MAIL FROM response: %v", err)
+			}
+			if !strings.HasPrefix(response, "250") {
+				t.Fatalf("MAIL FROM failed: %s", response)
+			}
+
+			// Send RCPT TO - this is where prelookup is called
+			if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
+				t.Fatalf("Failed to send RCPT TO: %v", err)
+			}
+			response, err = client.ReadResponse()
+			if err != nil {
+				t.Fatalf("Failed to read RCPT TO response: %v", err)
+			}
+
+			// Wait a bit for logs to be written
+			time.Sleep(100 * time.Millisecond)
+
+			// Verify response matches expectation
+			if tc.expectAccept {
+				if !strings.HasPrefix(response, "250") {
+					t.Errorf("Expected RCPT TO to succeed (fallback enabled), got: %s", response)
+				}
+			} else {
+				if strings.HasPrefix(response, "250") {
+					t.Errorf("Expected RCPT TO to fail (fallback disabled), got: %s", response)
+				}
+			}
+
+			// Verify log message
+			logOutput := logCapture.GetOutput()
+			if !strings.Contains(logOutput, tc.expectLog) {
+				t.Errorf("Expected log message '%s' not found in output:\n%s", tc.expectLog, logOutput)
+			}
+
+			t.Logf("Test case '%s' passed - RCPT TO result: %s", tc.name, response)
+		})
+	}
+}
+
+// setupLMTPProxyWithPrelookup creates an LMTP proxy with prelookup configuration
+func setupLMTPProxyWithPrelookup(t *testing.T, backendAddress string, prelookupURL string, fallbackToDefault bool) (string, *LMTPProxyWrapper) {
+	t.Helper()
+
+	rdb := common.SetupTestDatabase(t)
+	proxyAddress := common.GetRandomAddress(t)
+
+	// Create LMTP proxy server with prelookup
+	server, err := lmtpproxy.New(
+		context.Background(),
+		rdb,
+		"localhost",
+		lmtpproxy.ServerOptions{
+			Name:                   "test-proxy-prelookup",
+			Addr:                   proxyAddress,
+			RemoteAddrs:            []string{backendAddress},
+			RemotePort:             25,
+			RemoteUseProxyProtocol: false,
+			RemoteUseXCLIENT:       true,
+			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"},
+			ConnectTimeout:         5 * time.Second,
+			AuthIdleTimeout:        30 * time.Second,
+			PreLookup: &config.PreLookupConfig{
+				Enabled:         true,
+				URL:             prelookupURL,
+				Timeout:         "5s",
+				FallbackDefault: fallbackToDefault,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create LMTP proxy with prelookup: %v", err)
+	}
+
+	// Start the proxy server
+	go func() {
+		if err := server.Start(); err != nil {
+			t.Logf("LMTP proxy server error: %v", err)
+		}
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	return proxyAddress, &LMTPProxyWrapper{server: server}
+}
+
+// MockPrelookupServer wraps the mock HTTP server for cleanup
+type MockPrelookupServer struct {
+	listener net.Listener
+	done     chan struct{}
+}
+
+func (m *MockPrelookupServer) Close() error {
+	close(m.done)
+	return m.listener.Close()
+}
+
+// setupMockPrelookupServer creates a mock HTTP server for prelookup
+func setupMockPrelookupServer(t *testing.T, addr string, statusCode int, responseBody string) *MockPrelookupServer {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("Failed to create mock prelookup listener: %v", err)
+	}
+
+	done := make(chan struct{})
+	server := &MockPrelookupServer{
+		listener: listener,
+		done:     done,
+	}
+
+	// Start HTTP server
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go handleMockPrelookupRequest(conn, statusCode, responseBody)
+		}
+	}()
+
+	return server
+}
+
+// handleMockPrelookupRequest handles a mock prelookup HTTP request
+func handleMockPrelookupRequest(conn net.Conn, statusCode int, responseBody string) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Read HTTP request (we don't parse it, just consume it)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		// Empty line signals end of headers
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Send HTTP response
+	statusText := "OK"
+	if statusCode >= 400 {
+		statusText = "Internal Server Error"
+	}
+
+	response := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
+	response += "Content-Type: application/json\r\n"
+	response += fmt.Sprintf("Content-Length: %d\r\n", len(responseBody))
+	response += "\r\n"
+	response += responseBody
+
+	writer.WriteString(response)
+	writer.Flush()
 }

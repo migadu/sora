@@ -835,7 +835,8 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
 	}
-	info, authResult, err := cm.routingLookup.LookupUserRoute(ctx, email, "")
+	// Use routeOnly=true for LMTP routing lookups (no authentication, only routing info needed)
+	info, authResult, err := cm.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
 	if err != nil {
 		return nil, err
 	}

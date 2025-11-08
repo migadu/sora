@@ -394,7 +394,13 @@ func (s *Session) handleRecipient(to string) error {
 		s.InfoLog("calling prelookup", "username", s.username)
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			s.InfoLog("prelookup failed - falling back to main DB", "username", s.username, "error", lookupErr)
+			s.InfoLog("prelookup failed", "username", s.username, "error", lookupErr)
+			// Check if fallback is allowed
+			if s.server.prelookupConfig != nil && !s.server.prelookupConfig.FallbackDefault {
+				s.InfoLog("prelookup failed and fallback_to_default=false - rejecting recipient", "username", s.username)
+				return fmt.Errorf("prelookup failed and fallback disabled: %w", lookupErr)
+			}
+			s.InfoLog("prelookup failed - fallback_to_default=true, falling back to main DB", "username", s.username)
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
 			s.InfoLog("prelookup succeeded", "username", s.username, "server", routingInfo.ServerAddress, "cached", routingInfo.FromCache)
 			s.routingInfo = routingInfo
@@ -403,6 +409,12 @@ func (s *Session) handleRecipient(to string) error {
 			return nil
 		} else {
 			s.InfoLog("prelookup returned empty result", "username", s.username, "routing_info", routingInfo)
+			// Check if fallback is allowed for user not found
+			if s.server.prelookupConfig != nil && !s.server.prelookupConfig.FallbackDefault {
+				s.InfoLog("prelookup user not found and fallback_to_default=false - rejecting recipient", "username", s.username)
+				return fmt.Errorf("user not found in prelookup and fallback disabled")
+			}
+			s.InfoLog("prelookup user not found - fallback_to_default=true, falling back to main DB", "username", s.username)
 		}
 	} else {
 		s.InfoLog("prelookup not available - HasRouting returned false", "username", s.username)
