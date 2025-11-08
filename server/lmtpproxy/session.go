@@ -390,9 +390,9 @@ func (s *Session) handleRecipient(to string) error {
 
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			s.DebugLog("Prelookup failed - falling back to main DB", "error", lookupErr)
+			s.InfoLog("prelookup failed - falling back to main DB", "username", s.username, "error", lookupErr)
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			s.DebugLog("Routing via prelookup", "server", routingInfo.ServerAddress)
+			s.InfoLog("prelookup succeeded", "username", s.username, "server", routingInfo.ServerAddress, "cached", routingInfo.FromCache)
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
