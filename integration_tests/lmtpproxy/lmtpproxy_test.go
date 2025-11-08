@@ -1212,6 +1212,8 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Test cases for different fallback scenarios
+	// Note: User not found (404) always falls through to main DB for partitioning support.
+	// The fallback_to_default setting only controls transient errors (network, 5xx, circuit breaker).
 	testCases := []struct {
 		name                string
 		fallbackToDefault   bool
@@ -1221,36 +1223,28 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 		expectLog           string // Expected log message
 	}{
 		{
-			name:                "fallback enabled - prelookup 500 error - accepts recipient",
+			name:                "fallback_enabled_transient_error_accepts_recipient",
 			fallbackToDefault:   true,
 			prelookupStatusCode: 500,
 			prelookupBody:       `{"error": "internal server error"}`,
 			expectAccept:        true,
-			expectLog:           "prelookup failed - fallback_to_default=true, falling back to main DB",
+			expectLog:           "prelookup transient error - fallback_to_default=true, falling back to main DB",
 		},
 		{
-			name:                "fallback disabled - prelookup 500 error - rejects recipient",
+			name:                "fallback_disabled_transient_error_rejects_recipient",
 			fallbackToDefault:   false,
 			prelookupStatusCode: 500,
 			prelookupBody:       `{"error": "internal server error"}`,
 			expectAccept:        false,
-			expectLog:           "prelookup failed and fallback_to_default=false - rejecting recipient",
+			expectLog:           "prelookup transient error and fallback_to_default=false - rejecting recipient",
 		},
 		{
-			name:                "fallback enabled - prelookup empty result - accepts recipient",
-			fallbackToDefault:   true,
+			name:                "user_not_found_always_falls_through",
+			fallbackToDefault:   false, // Even with fallback disabled, user not found always falls through
 			prelookupStatusCode: 200,
 			prelookupBody:       `{"account_id": 0, "server_address": ""}`,
-			expectAccept:        true,
-			expectLog:           "prelookup user not found - fallback_to_default=true, falling back to main DB",
-		},
-		{
-			name:                "fallback disabled - prelookup empty result - rejects recipient",
-			fallbackToDefault:   false,
-			prelookupStatusCode: 200,
-			prelookupBody:       `{"account_id": 0, "server_address": ""}`,
-			expectAccept:        false,
-			expectLog:           "prelookup user not found and fallback_to_default=false - rejecting recipient",
+			expectAccept:        true, // Should accept because it falls through to main DB
+			expectLog:           "user not found in prelookup, attempting main DB",
 		},
 	}
 
