@@ -552,7 +552,7 @@ func TestLMTPProxyXCLIENTShouldWork(t *testing.T) {
 	}
 
 	// Verify backend processed XCLIENT command
-	if !strings.Contains(logOutput, "*** XCLIENT METHOD CALLED ***") {
+	if !strings.Contains(logOutput, "[XCLIENT] Backend received XCLIENT command") {
 		t.Errorf("Expected backend to process XCLIENT command")
 		t.Errorf("This indicates XCLIENT command never reached the backend handler")
 	}
@@ -1046,9 +1046,9 @@ func TestLMTPProxyBackendFailsDuringDelivery(t *testing.T) {
 	}
 	defer backendListener.Close()
 
-	// Create test account
+	// Create test account with unique email
 	rdb := common.SetupTestDatabase(t)
-	accountEmail := "test@example.com"
+	accountEmail := fmt.Sprintf("test-%s-%d@example.com", strings.ToLower(t.Name()), time.Now().UnixNano())
 	common.CreateTestAccountWithEmail(t, rdb, accountEmail, "password")
 
 	// Start mock backend that fails during DATA
