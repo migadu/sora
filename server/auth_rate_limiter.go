@@ -173,10 +173,14 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 			return fmt.Errorf("IP %s is temporarily blocked until %v (failed %d times)",
 				ip, blocked.BlockedUntil.Format("15:04:05"), blocked.FailureCount)
 		}
-		// Block has expired, remove it
+		// Block has expired, remove it - must upgrade to write lock
+		a.blockMu.RUnlock()
+		a.blockMu.Lock()
 		delete(a.blockedIPs, ip)
+		a.blockMu.Unlock()
+	} else {
+		a.blockMu.RUnlock()
 	}
-	a.blockMu.RUnlock()
 
 	// Regular rate limiting check (database if healthy, otherwise deny)
 	if a.shouldCheckDatabase() {
