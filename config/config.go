@@ -619,7 +619,7 @@ func (c *PreLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
 // GetDialTimeout returns the TCP dial timeout duration (includes DNS resolution)
 func (c *PreLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
 	if c.DialTimeout == "" {
-		return 30 * time.Second, nil // Default: 30 seconds
+		return 10 * time.Second, nil // Default: 10 seconds
 	}
 	return helpers.ParseDuration(c.DialTimeout)
 }
@@ -627,7 +627,7 @@ func (c *PreLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
 // GetTLSHandshakeTimeout returns the TLS handshake timeout duration
 func (c *PreLookupTransportConfig) GetTLSHandshakeTimeout() (time.Duration, error) {
 	if c.TLSHandshakeTimeout == "" {
-		return 30 * time.Second, nil // Default: 30 seconds
+		return 10 * time.Second, nil // Default: 10 seconds
 	}
 	return helpers.ParseDuration(c.TLSHandshakeTimeout)
 }

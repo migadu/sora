@@ -350,7 +350,9 @@ func (s *POP3ProxySession) WarnLog(msg string, keysAndValues ...any) {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	// Use configured prelookup timeout instead of hardcoded value
+	authTimeout := s.server.connManager.GetPrelookupTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, authTimeout)
 	defer cancel()
 
 	// Apply progressive authentication delay BEFORE any other checks

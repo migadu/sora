@@ -24,12 +24,14 @@ import (
 // These control different phases of HTTP connection establishment and request lifecycle
 const (
 	// DefaultDialTimeout is the maximum time to establish a TCP connection (includes DNS resolution)
-	// This should be generous as DNS and TCP connection can be slow over unreliable networks
-	DefaultDialTimeout = 30 * time.Second
+	// Typical values: DNS 100-500ms, TCP handshake 10-100ms
+	// We set this to 10s to handle slow DNS and high-latency networks (100x typical)
+	DefaultDialTimeout = 10 * time.Second
 
 	// DefaultTLSHandshakeTimeout is the maximum time for TLS handshake to complete
-	// TLS handshakes can take significant time, especially over high-latency networks
-	DefaultTLSHandshakeTimeout = 30 * time.Second
+	// Typical values: 50-300ms for TLS 1.3, 100-500ms for TLS 1.2
+	// We set this to 10s to handle high-latency networks and slow servers (20-50x typical)
+	DefaultTLSHandshakeTimeout = 10 * time.Second
 
 	// DefaultExpectContinueTimeout limits time waiting for server's first response headers
 	// after sending request headers (for 100-continue responses)
@@ -56,6 +58,8 @@ type HTTPPreLookupClient struct {
 	remoteUseProxyProtocol bool
 	remoteUseIDCommand     bool
 	remoteUseXCLIENT       bool
+	dialTimeout            time.Duration // Stored for timeout calculation
+	tlsHandshakeTimeout    time.Duration // Stored for timeout calculation
 }
 
 // HTTPPreLookupResponse represents the JSON response from the HTTP prelookup endpoint
@@ -207,6 +211,8 @@ func NewHTTPPreLookupClient(
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
 		remoteUseIDCommand:     remoteUseIDCommand,
 		remoteUseXCLIENT:       remoteUseXCLIENT,
+		dialTimeout:            transportSettings.DialTimeout,
+		tlsHandshakeTimeout:    transportSettings.TLSHandshakeTimeout,
 	}
 }
 
@@ -546,6 +552,17 @@ func (c *HTTPPreLookupClient) HealthCheck(ctx context.Context) error {
 // GetCircuitBreaker returns the circuit breaker for health monitoring
 func (c *HTTPPreLookupClient) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 	return c.breaker
+}
+
+// GetTimeout returns the configured HTTP request timeout
+func (c *HTTPPreLookupClient) GetTimeout() time.Duration {
+	return c.timeout
+}
+
+// GetTransportTimeouts returns the dial and TLS handshake timeouts
+// Used for calculating total context timeout including connection establishment
+func (c *HTTPPreLookupClient) GetTransportTimeouts() (dialTimeout, tlsHandshakeTimeout time.Duration) {
+	return c.dialTimeout, c.tlsHandshakeTimeout
 }
 
 // GetHealth returns the health status of the HTTP prelookup service

@@ -284,6 +284,46 @@ func (cm *ConnectionManager) GetRoutingLookup() UserRoutingLookup {
 	return cm.routingLookup
 }
 
+// GetPrelookupTimeout returns the timeout for prelookup HTTP requests including connection establishment
+// This automatically calculates a context timeout that allows enough time for:
+// - DNS resolution + TCP dial (dial_timeout)
+// - TLS handshake (tls_handshake_timeout)
+// - HTTP request/response (configured timeout)
+//
+// The context timeout is set to the maximum of:
+// 1. Configured HTTP timeout (for reused connections)
+// 2. dial_timeout + tls_handshake_timeout + HTTP timeout (for new connections)
+//
+// This ensures:
+// - First request to new host: Has time for full connection setup
+// - Subsequent requests: Reuse connection, complete within HTTP timeout
+// - Context never cancels before HTTP client timeouts complete
+func (cm *ConnectionManager) GetPrelookupTimeout() time.Duration {
+	if cm.routingLookup == nil {
+		return 10 * time.Second // Default if no prelookup configured
+	}
+
+	// Type assert to HTTPPreLookupClient to access timeout and transport settings
+	if httpClient, ok := cm.routingLookup.(*HTTPPreLookupClient); ok {
+		baseTimeout := httpClient.GetTimeout()
+		dialTimeout, tlsTimeout := httpClient.GetTransportTimeouts()
+
+		// Context timeout must allow for worst case: new connection requiring dial + TLS + HTTP
+		// We add a small buffer (10%) to account for network overhead
+		totalTimeout := dialTimeout + tlsTimeout + baseTimeout
+		contextTimeout := totalTimeout + (totalTimeout / 10) // +10% buffer
+
+		// Use whichever is larger: configured HTTP timeout or calculated total
+		// This maintains backward compatibility if someone manually set a high timeout
+		if contextTimeout > baseTimeout {
+			return contextTimeout
+		}
+		return baseTimeout
+	}
+
+	return 10 * time.Second // Fallback default
+}
+
 // GetTLSConfig returns the TLS configuration for remote connections
 // Used for StartTLS negotiation at the protocol layer
 func (cm *ConnectionManager) GetTLSConfig() *tls.Config {

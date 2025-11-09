@@ -447,7 +447,9 @@ func (s *Session) WarnLog(msg string, keyvals ...any) {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	// Use configured prelookup timeout instead of hardcoded value
+	authTimeout := s.server.connManager.GetPrelookupTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, authTimeout)
 	defer cancel()
 
 	// Apply progressive authentication delay BEFORE any other checks

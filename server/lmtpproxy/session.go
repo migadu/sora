@@ -388,7 +388,9 @@ func (s *Session) handleRecipient(to string) error {
 	s.InfoLog("checking prelookup availability", "username", s.username, "has_routing", hasRouting)
 
 	if hasRouting {
-		routingCtx, routingCancel := context.WithTimeout(s.ctx, 5*time.Second)
+		// Use configured prelookup timeout instead of hardcoded value
+		routingTimeout := s.server.connManager.GetPrelookupTimeout()
+		routingCtx, routingCancel := context.WithTimeout(s.ctx, routingTimeout)
 		defer routingCancel()
 
 		s.InfoLog("calling prelookup", "username", s.username)

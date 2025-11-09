@@ -1073,7 +1073,11 @@ url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $ema
                                             #   "http://localhost:8080/lookup?email=$email" → query parameter
                                             #   "http://localhost:8080/user/$email/lookup" → path parameter
                                             #   "http://localhost:8080/api/v1/auth?user=$email&format=json" → custom format
-timeout = "5s"                              # HTTP request timeout (default: 5s)
+timeout = "10s"                             # HTTP response timeout (default: 10s)
+                                            # NOTE: The actual context timeout is automatically calculated as:
+                                            #   dial_timeout + tls_handshake_timeout + timeout + 10% buffer
+                                            # With defaults (10s + 10s + 10s + 10%) = ~33 seconds for first request
+                                            # Subsequent requests reuse connections and complete within this timeout
 # auth_token = "your-secret-token"          # Bearer token for HTTP authentication (optional)
                                             # If set, sends "Authorization: Bearer <token>" header with requests
                                             # Use this to secure your prelookup endpoint
@@ -1247,14 +1251,15 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # These settings control timeouts for different phases of HTTP connection establishment.
   # They allow generous time for initial connection while keeping response timeouts tight.
   #
-  # dial_timeout = "30s"            # TCP connection + DNS resolution timeout (default: "30s")
+  # dial_timeout = "10s"            # TCP connection + DNS resolution timeout (default: "10s")
                                     # Time to establish TCP connection and resolve DNS
-                                    # Should be generous as DNS and TCP can be slow over unreliable networks
-                                    # Increase if operating in high-latency regions
-  # tls_handshake_timeout = "30s"   # TLS handshake timeout (default: "30s")
-                                    # TLS handshakes can take significant time over high-latency networks
+                                    # Typical: DNS 100-500ms, TCP 10-100ms. Default allows 100x margin.
+                                    # Increase to 20-30s for very high-latency or unreliable networks
+  # tls_handshake_timeout = "10s"   # TLS handshake timeout (default: "10s")
+                                    # TLS handshakes typically take 50-500ms
+                                    # Default allows 20-50x margin for slow servers and high latency
                                     # This is ONLY for initial connection; reused connections skip this
-                                    # Increase if seeing timeout errors during connection establishment
+                                    # Increase to 20-30s if experiencing timeout errors on slow networks
   # keep_alive = "30s"              # TCP keep-alive interval for idle connections (default: "30s")
                                     # Interval for TCP keep-alive probes on idle connections
                                     # Helps detect broken connections and prevent NAT/firewall timeouts
@@ -1264,10 +1269,25 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # This is just a protocol-level acknowledgment, should be short
                                     # Rarely needs adjustment
   #
-  # TIMEOUT CALCULATION EXAMPLE (with defaults):
-  # - First request to new host: up to dial_timeout (30s) + tls_handshake_timeout (30s) + timeout (10s) = 70s total
-  # - Subsequent requests (connection reused): up to timeout (10s) only
-  # - This allows initial setup to succeed on slow networks while keeping responses fast
+  # AUTOMATIC CONTEXT TIMEOUT CALCULATION:
+  # The context timeout for authentication is automatically calculated as:
+  #   context_timeout = (dial_timeout + tls_handshake_timeout + timeout) * 1.10
+  #
+  # With default values:
+  #   context_timeout = (10s + 10s + 10s) * 1.10 = 33s
+  #
+  # This ensures:
+  # - First request to new host: Has full 33s for dial + TLS + HTTP
+  # - Subsequent requests (connection reused): Complete within HTTP timeout (~10s)
+  # - Context never cancels before HTTP client timeouts complete
+  # - No manual tuning required - automatically adapts to your timeout settings
+  #
+  # If you increase dial_timeout or tls_handshake_timeout, the context timeout
+  # automatically increases proportionally. You never need to worry about the
+  # context canceling requests prematurely.
+  #
+  # Example: For very slow networks, set dial_timeout="20s" and tls_handshake_timeout="20s"
+  # → context_timeout automatically becomes (20s + 20s + 10s) * 1.10 = 55s
 
 # --- MASTER TOKEN / ALIAS RESOLUTION ---
 # The HTTP endpoint can implement master token authentication or alias resolution.
