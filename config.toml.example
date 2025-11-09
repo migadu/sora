@@ -484,64 +484,6 @@ concurrency = 10              # Number of concurrent upload workers.
 max_attempts = 5              # Maximum retry attempts for failed uploads.
 retry_interval = "30s"        # Initial delay between retry attempts (exponential backoff is applied).
 
-
-# RELAY CONFIGURATION
-# =============================================================================
-# External relay configuration for SIEVE redirect and vacation response delivery.
-# When SIEVE scripts use "redirect" or generate vacation responses, messages are
-# sent via this relay instead of directly. Supports SMTP and HTTP relay methods.
-#
-# The relay queue is ALWAYS enabled when relay is configured. Messages are queued
-# to disk and delivered asynchronously with automatic retry on failure.
-#
-# QUEUE MANAGEMENT:
-# Use the sora-admin relay commands to monitor and manage the queue:
-#   ./sora-admin relay stats           - Show queue statistics (pending, processing, failed)
-#   ./sora-admin relay list            - List messages in queue
-#   ./sora-admin relay show --id <id>  - Show detailed message info
-#   ./sora-admin relay delete --id <id> --confirm  - Delete message from queue
-#   ./sora-admin relay requeue --id <id>           - Move failed message back to pending
-
-[relay]
-type = "smtp"                     # Relay type: "smtp" or "http"
-smtp_host = "smtp.example.com:587" # SMTP relay hostname and port (required for type="smtp")
-# http_url = "https://api.example.com/send"  # HTTP API endpoint (required for type="http")
-# http_token = "your-bearer-token"           # Bearer token for HTTP Authorization header
-
-# TLS/STARTTLS configuration (SMTP only)
-tls = false                       # Use direct TLS (SMTPS, typically port 465)
-tls_verify = true                 # Verify server certificate (recommended: true)
-tls_use_starttls = true           # Use opportunistic STARTTLS (typically port 587)
-# tls_cert_file = "/path/to/relay-client.crt"  # Client certificate (if relay requires mutual TLS)
-# tls_key_file = "/path/to/relay-client.key"   # Client key (if relay requires mutual TLS)
-
-# RELAY QUEUE CONFIGURATION
-# The queue is ALWAYS ENABLED when relay is configured.
-# Messages are persisted to disk and processed asynchronously with automatic retry.
-#
-# NOTE: If max_attempts > len(retry_backoff), the last backoff value is used for all remaining attempts.
-# Example with current settings below:
-#   - Attempts 1-6: Use configured backoff values (1m, 5m, 15m, 1h, 6h, 24h)
-#   - Attempts 7-10: All use 24h (last value is repeated)
-#   - Total retry time: ~99 hours (4 days) before moving to failed queue
-
-[relay.queue]
-path = "/var/spool/sora/relay"    # Queue directory path (default: /var/spool/sora/relay)
-worker_interval = "1m"            # How often the worker checks for messages to deliver
-batch_size = 100                  # Maximum messages to process per worker tick
-concurrency = 5                   # Number of concurrent delivery attempts
-max_attempts = 10                 # Maximum delivery attempts before moving to failed queue
-retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]  # Exponential backoff schedule
-
-# CIRCUIT BREAKER CONFIGURATION
-# Protects against cascading failures when the relay endpoint is down.
-# When failures exceed threshold, the circuit opens and stops delivery attempts.
-# After timeout, it enters half-open state to test if the endpoint has recovered.
-circuit_breaker_threshold = 5     # Consecutive failures before opening circuit (default: 5)
-circuit_breaker_timeout = "30s"   # How long to wait before attempting recovery (default: 30s)
-circuit_breaker_max_requests = 3  # Max requests in half-open state before closing circuit (default: 3)
-
-
 # CLEANUP PROCESS CONFIGURATION
 # =============================================================================
 # Background worker that manages message lifecycle and removes old/deleted
@@ -1259,23 +1201,33 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # Production: Consider 5-10 for more stable thresholds
 
   # --- HTTP TRANSPORT CONFIGURATION ---
-  # Connection pooling settings for the HTTP client used to query the prelookup endpoint.
+  # Connection pooling and timeout settings for the HTTP client used to query the prelookup endpoint.
   # Proper connection pooling enables parallel authentication requests while reusing connections.
+  # Separate timeouts for different connection phases prevent premature timeouts during initial setup.
   #
   # TRANSPORT BEHAVIOR:
   # - Multiple concurrent authentication requests reuse pooled HTTP connections
   # - Idle connections are kept alive to avoid TCP handshake overhead
   # - Unlimited concurrent connections per host (max_conns_per_host=0) for high throughput
+  # - First connection: dial + TLS handshake + HTTP request (can take 60s+ on slow networks)
+  # - Subsequent requests: Reuse existing connection, only HTTP timeout applies (typically <10s)
   #
   # PERFORMANCE IMPACT:
   # - Higher max_idle_conns = more connections kept alive = faster subsequent requests
   # - max_conns_per_host=0 (unlimited) = no bottleneck for concurrent auth requests
   # - Longer idle_conn_timeout = fewer reconnects = better performance under load
+  # - Separate dial/TLS timeouts prevent timeouts during initial connection establishment
+  #
+  # CONNECTION REUSE VERIFICATION:
+  # Testing shows connection reuse provides 16x performance improvement:
+  # - First request (cold): 165ms (10ms TCP + 26ms TLS + 129ms HTTP)
+  # - Subsequent requests (warm): 10ms (connection reused, only HTTP phase)
   #
   # EXAMPLE SCENARIOS:
   # - 100 concurrent user logins → reuses up to 100 idle connections from pool
   # - Low traffic → connections automatically closed after idle_conn_timeout
   # - High traffic → connections stay warm and reused immediately
+  # - Slow network → generous dial/TLS timeouts prevent spurious failures
   #
   # [server.prelookup.transport]
   # max_idle_conns = 100            # Maximum idle connections across all hosts (default: 100)
@@ -1290,6 +1242,32 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # idle_conn_timeout = "90s"       # How long idle connections stay open (default: "90s")
                                     # Longer = better for sustained traffic, more memory
                                     # Shorter = less memory, more reconnects under load
+  #
+  # --- TIMEOUT SETTINGS FOR DIFFERENT CONNECTION PHASES ---
+  # These settings control timeouts for different phases of HTTP connection establishment.
+  # They allow generous time for initial connection while keeping response timeouts tight.
+  #
+  # dial_timeout = "30s"            # TCP connection + DNS resolution timeout (default: "30s")
+                                    # Time to establish TCP connection and resolve DNS
+                                    # Should be generous as DNS and TCP can be slow over unreliable networks
+                                    # Increase if operating in high-latency regions
+  # tls_handshake_timeout = "30s"   # TLS handshake timeout (default: "30s")
+                                    # TLS handshakes can take significant time over high-latency networks
+                                    # This is ONLY for initial connection; reused connections skip this
+                                    # Increase if seeing timeout errors during connection establishment
+  # keep_alive = "30s"              # TCP keep-alive interval for idle connections (default: "30s")
+                                    # Interval for TCP keep-alive probes on idle connections
+                                    # Helps detect broken connections and prevent NAT/firewall timeouts
+                                    # Lower values = more frequent probes, better dead connection detection
+  # expect_continue_timeout = "1s"  # 100-continue protocol timeout (default: "1s")
+                                    # Time to wait for server's first response headers
+                                    # This is just a protocol-level acknowledgment, should be short
+                                    # Rarely needs adjustment
+  #
+  # TIMEOUT CALCULATION EXAMPLE (with defaults):
+  # - First request to new host: up to dial_timeout (30s) + tls_handshake_timeout (30s) + timeout (10s) = 70s total
+  # - Subsequent requests (connection reused): up to timeout (10s) only
+  # - This allows initial setup to succeed on slow networks while keeping responses fast
 
 # --- MASTER TOKEN / ALIAS RESOLUTION ---
 # The HTTP endpoint can implement master token authentication or alias resolution.

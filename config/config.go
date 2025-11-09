@@ -499,12 +499,16 @@ type PreLookupCircuitBreakerConfig struct {
 	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
 }
 
-// PreLookupTransportConfig holds HTTP transport configuration for prelookup connection pooling
+// PreLookupTransportConfig holds HTTP transport configuration for prelookup connection pooling and timeouts
 type PreLookupTransportConfig struct {
-	MaxIdleConns        int    `toml:"max_idle_conns"`          // Maximum idle connections across all hosts (default: 100)
-	MaxIdleConnsPerHost int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
-	MaxConnsPerHost     int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
-	IdleConnTimeout     string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
+	MaxIdleConns          int    `toml:"max_idle_conns"`          // Maximum idle connections across all hosts (default: 100)
+	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
+	MaxConnsPerHost       int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
+	IdleConnTimeout       string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
+	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "30s")
+	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "30s")
+	ExpectContinueTimeout string `toml:"expect_continue_timeout"` // 100-continue timeout (default: "1s")
+	KeepAlive             string `toml:"keep_alive"`              // TCP keep-alive interval (default: "30s")
 }
 
 // GetTimeout returns the configured HTTP timeout duration
@@ -610,6 +614,38 @@ func (c *PreLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
 		return 90 * time.Second, nil // Default: 90 seconds
 	}
 	return helpers.ParseDuration(c.IdleConnTimeout)
+}
+
+// GetDialTimeout returns the TCP dial timeout duration (includes DNS resolution)
+func (c *PreLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
+	if c.DialTimeout == "" {
+		return 30 * time.Second, nil // Default: 30 seconds
+	}
+	return helpers.ParseDuration(c.DialTimeout)
+}
+
+// GetTLSHandshakeTimeout returns the TLS handshake timeout duration
+func (c *PreLookupTransportConfig) GetTLSHandshakeTimeout() (time.Duration, error) {
+	if c.TLSHandshakeTimeout == "" {
+		return 30 * time.Second, nil // Default: 30 seconds
+	}
+	return helpers.ParseDuration(c.TLSHandshakeTimeout)
+}
+
+// GetExpectContinueTimeout returns the expect continue timeout duration
+func (c *PreLookupTransportConfig) GetExpectContinueTimeout() (time.Duration, error) {
+	if c.ExpectContinueTimeout == "" {
+		return 1 * time.Second, nil // Default: 1 second
+	}
+	return helpers.ParseDuration(c.ExpectContinueTimeout)
+}
+
+// GetKeepAlive returns the TCP keep-alive interval
+func (c *PreLookupTransportConfig) GetKeepAlive() (time.Duration, error) {
+	if c.KeepAlive == "" {
+		return 30 * time.Second, nil // Default: 30 seconds
+	}
+	return helpers.ParseDuration(c.KeepAlive)
 }
 
 // GetRemotePort parses the remote port and returns it as an int.

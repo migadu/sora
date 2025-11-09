@@ -111,12 +111,32 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 		if err != nil {
 			return nil, fmt.Errorf("invalid transport.idle_conn_timeout: %w", err)
 		}
+		dialTimeout, err := cfg.Transport.GetDialTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("invalid transport.dial_timeout: %w", err)
+		}
+		tlsHandshakeTimeout, err := cfg.Transport.GetTLSHandshakeTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("invalid transport.tls_handshake_timeout: %w", err)
+		}
+		expectContinueTimeout, err := cfg.Transport.GetExpectContinueTimeout()
+		if err != nil {
+			return nil, fmt.Errorf("invalid transport.expect_continue_timeout: %w", err)
+		}
+		keepAlive, err := cfg.Transport.GetKeepAlive()
+		if err != nil {
+			return nil, fmt.Errorf("invalid transport.keep_alive: %w", err)
+		}
 
 		transportSettings = &TransportSettings{
-			MaxIdleConns:        cfg.Transport.GetMaxIdleConns(),
-			MaxIdleConnsPerHost: cfg.Transport.GetMaxIdleConnsPerHost(),
-			MaxConnsPerHost:     cfg.Transport.GetMaxConnsPerHost(),
-			IdleConnTimeout:     idleConnTimeout,
+			MaxIdleConns:          cfg.Transport.GetMaxIdleConns(),
+			MaxIdleConnsPerHost:   cfg.Transport.GetMaxIdleConnsPerHost(),
+			MaxConnsPerHost:       cfg.Transport.GetMaxConnsPerHost(),
+			IdleConnTimeout:       idleConnTimeout,
+			DialTimeout:           dialTimeout,
+			TLSHandshakeTimeout:   tlsHandshakeTimeout,
+			ExpectContinueTimeout: expectContinueTimeout,
+			KeepAlive:             keepAlive,
 		}
 	}
 	// If nil, NewHTTPPreLookupClient will use defaults

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,27 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/server"
+)
+
+// HTTP transport timeout defaults for prelookup client
+// These control different phases of HTTP connection establishment and request lifecycle
+const (
+	// DefaultDialTimeout is the maximum time to establish a TCP connection (includes DNS resolution)
+	// This should be generous as DNS and TCP connection can be slow over unreliable networks
+	DefaultDialTimeout = 30 * time.Second
+
+	// DefaultTLSHandshakeTimeout is the maximum time for TLS handshake to complete
+	// TLS handshakes can take significant time, especially over high-latency networks
+	DefaultTLSHandshakeTimeout = 30 * time.Second
+
+	// DefaultExpectContinueTimeout limits time waiting for server's first response headers
+	// after sending request headers (for 100-continue responses)
+	// This should be short as it's just a protocol-level acknowledgment
+	DefaultExpectContinueTimeout = 1 * time.Second
+
+	// DefaultKeepAlive is the interval for TCP keep-alive probes on idle connections
+	// Helps detect broken connections and prevent NAT/firewall timeouts
+	DefaultKeepAlive = 30 * time.Second
 )
 
 // HTTPPreLookupClient performs user routing lookups via HTTP GET requests
@@ -53,12 +75,16 @@ type CircuitBreakerSettings struct {
 	MinRequests  uint32        // Minimum requests before evaluating failure ratio
 }
 
-// TransportSettings holds HTTP transport configuration for connection pooling
+// TransportSettings holds HTTP transport configuration for connection pooling and timeouts
 type TransportSettings struct {
-	MaxIdleConns        int           // Maximum idle connections across all hosts
-	MaxIdleConnsPerHost int           // Maximum idle connections per host
-	MaxConnsPerHost     int           // Maximum total connections per host (0 = unlimited)
-	IdleConnTimeout     time.Duration // How long idle connections stay open
+	MaxIdleConns          int           // Maximum idle connections across all hosts
+	MaxIdleConnsPerHost   int           // Maximum idle connections per host
+	MaxConnsPerHost       int           // Maximum total connections per host (0 = unlimited)
+	IdleConnTimeout       time.Duration // How long idle connections stay open
+	DialTimeout           time.Duration // TCP connection timeout (includes DNS)
+	TLSHandshakeTimeout   time.Duration // TLS handshake timeout
+	ExpectContinueTimeout time.Duration // 100-continue timeout
+	KeepAlive             time.Duration // TCP keep-alive interval
 }
 
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
@@ -114,15 +140,40 @@ func NewHTTPPreLookupClient(
 	// Apply defaults for transport settings if not provided
 	if transportSettings == nil {
 		transportSettings = &TransportSettings{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			MaxConnsPerHost:     0,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   100,
+			MaxConnsPerHost:       0,
+			IdleConnTimeout:       90 * time.Second,
+			DialTimeout:           DefaultDialTimeout,
+			TLSHandshakeTimeout:   DefaultTLSHandshakeTimeout,
+			ExpectContinueTimeout: DefaultExpectContinueTimeout,
+			KeepAlive:             DefaultKeepAlive,
 		}
 	}
 
+	// Apply defaults for zero-value timeout fields
+	if transportSettings.DialTimeout == 0 {
+		transportSettings.DialTimeout = DefaultDialTimeout
+	}
+	if transportSettings.TLSHandshakeTimeout == 0 {
+		transportSettings.TLSHandshakeTimeout = DefaultTLSHandshakeTimeout
+	}
+	if transportSettings.ExpectContinueTimeout == 0 {
+		transportSettings.ExpectContinueTimeout = DefaultExpectContinueTimeout
+	}
+	if transportSettings.KeepAlive == 0 {
+		transportSettings.KeepAlive = DefaultKeepAlive
+	}
+
 	// Configure HTTP transport with connection pooling for high concurrency
+	// Create a custom dialer with timeout for TCP connection establishment
+	dialer := &net.Dialer{
+		Timeout:   transportSettings.DialTimeout, // Time to establish TCP connection (includes DNS)
+		KeepAlive: transportSettings.KeepAlive,   // TCP keep-alive interval
+	}
+
 	transport := &http.Transport{
+		DialContext:         dialer.DialContext, // Use custom dialer with timeout
 		MaxIdleConns:        transportSettings.MaxIdleConns,
 		MaxIdleConnsPerHost: transportSettings.MaxIdleConnsPerHost,
 		MaxConnsPerHost:     transportSettings.MaxConnsPerHost,
@@ -130,9 +181,14 @@ func NewHTTPPreLookupClient(
 		DisableKeepAlives:   false, // Enable keep-alives for connection reuse
 		DisableCompression:  false, // Enable compression
 		ForceAttemptHTTP2:   true,  // Try HTTP/2 if available
+		// Separate timeouts for different phases of connection establishment
+		// This allows connection reuse to work while giving more time for initial setup
+		TLSHandshakeTimeout:   transportSettings.TLSHandshakeTimeout,   // TLS handshake can take time, especially for slow networks
+		ResponseHeaderTimeout: timeout,                                 // Response headers should arrive within configured timeout
+		ExpectContinueTimeout: transportSettings.ExpectContinueTimeout, // Don't wait long for 100-continue
 	}
 
-	logger.Debug("prelookup: Initialized HTTP transport", "max_idle_conns", transportSettings.MaxIdleConns, "max_idle_conns_per_host", transportSettings.MaxIdleConnsPerHost, "max_conns_per_host", transportSettings.MaxConnsPerHost, "idle_conn_timeout", transportSettings.IdleConnTimeout)
+	logger.Info("prelookup: Initialized HTTP transport", "max_idle_conns", transportSettings.MaxIdleConns, "max_idle_conns_per_host", transportSettings.MaxIdleConnsPerHost, "max_conns_per_host", transportSettings.MaxConnsPerHost, "idle_conn_timeout", transportSettings.IdleConnTimeout, "dial_timeout", transportSettings.DialTimeout, "tls_handshake_timeout", transportSettings.TLSHandshakeTimeout, "keep_alive", transportSettings.KeepAlive, "response_header_timeout", timeout)
 
 	return &HTTPPreLookupClient{
 		baseURL:   baseURL,
