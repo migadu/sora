@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -91,6 +93,17 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("Authentication: failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("Authentication: master username auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: "Server is shutting down. Please try again.",
+							}
+						}
+
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -177,6 +190,17 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("Authentication: failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+
+						// Check if error is due to context cancellation (server shutdown)
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							s.InfoLog("Authentication: master SASL auth cancelled due to server shutdown")
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: "Server is shutting down. Please try again.",
+							}
+						}
+
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,

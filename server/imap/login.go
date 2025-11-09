@@ -1,7 +1,9 @@
 package imap
 
 import (
+	"context"
 	"crypto/subtle"
+	"errors"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -135,6 +137,17 @@ func (s *IMAPSession) Login(address, password string) error {
 	AccountID, err := s.server.rdb.AuthenticateWithRetry(s.ctx, addressParsed.BaseAddress(), password)
 	if err != nil {
 		s.DebugLog("[LOGIN] authentication failed: %v", err)
+
+		// Check if error is due to context cancellation (server shutdown)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Server is shutting down - return temporary failure without recording as auth failure
+			s.InfoLog("[LOGIN] authentication cancelled due to server shutdown")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeUnavailable,
+				Text: "Server is shutting down. Please try again.",
+			}
+		}
 
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
