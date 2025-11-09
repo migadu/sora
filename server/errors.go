@@ -12,6 +12,24 @@ import (
 	"github.com/migadu/sora/tlsmanager"
 )
 
+// Authentication error sentinels
+var (
+	// ErrServerShuttingDown indicates that authentication failed because the server is shutting down
+	ErrServerShuttingDown = errors.New("server is shutting down, please try again")
+
+	// ErrAuthServiceUnavailable indicates that an authentication service (e.g., prelookup) is temporarily unavailable
+	ErrAuthServiceUnavailable = errors.New("authentication service temporarily unavailable, please try again later")
+)
+
+// IsTemporaryAuthFailure checks if an authentication error is temporary (server shutdown, service unavailable)
+// and should result in an UNAVAILABLE response rather than AUTHENTICATIONFAILED.
+func IsTemporaryAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrServerShuttingDown) || errors.Is(err, ErrAuthServiceUnavailable)
+}
+
 // IsConnectionError checks if an error is a common, non-fatal network connection error.
 // These errors are typically logged and the connection is closed, but they should not crash the server.
 // This helps distinguish between client-side issues (e.g., connection reset) and genuine server problems.

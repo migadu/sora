@@ -544,6 +544,13 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 	// Give clients a brief moment (1 second) to receive the message
 	time.Sleep(1 * time.Second)
 
+	// Close connections to unblock any sessions blocked on reads
+	for _, session := range activeSessions {
+		if session.conn != nil && *session.conn != nil {
+			(*session.conn).Close()
+		}
+	}
+
 	logger.Debug("ManageSieve: Proceeding with connection cleanup", "name", s.name)
 }
 

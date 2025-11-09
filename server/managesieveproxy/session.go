@@ -237,7 +237,12 @@ func (s *Session) handleConnection() {
 				s.DebugLog("authentication failed: %v", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
-				s.sendResponse(`NO "Authentication failed"`)
+				// Check if error is due to server shutdown or temporary unavailability
+				if server.IsTemporaryAuthFailure(err) {
+					s.sendResponse(`NO (UNAVAILABLE) "Service temporarily unavailable, please try again later"`)
+				} else {
+					s.sendResponse(`NO "Authentication failed"`)
+				}
 				continue
 			}
 
@@ -518,6 +523,13 @@ func (s *Session) authenticateUser(username, password string) error {
 			}
 
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
+				// Check if this is due to context cancellation (server shutdown)
+				if errors.Is(err, server.ErrServerShuttingDown) {
+					s.InfoLog("prelookup cancelled due to server shutdown")
+					metrics.PrelookupResult.WithLabelValues("managesieve", "shutdown").Inc()
+					return server.ErrServerShuttingDown
+				}
+
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					s.DebugLog("prelookup transient error - fallback enabled", "error", err)
@@ -612,6 +624,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("master auth already validated, getting account ID from main database")
 		accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master auth cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, address.BaseAddress(), false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -622,6 +640,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)

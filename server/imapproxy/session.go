@@ -275,7 +275,12 @@ func (s *Session) handleConnection() {
 
 			if err := s.authenticateUser(username, password); err != nil {
 				s.DebugLog("authentication failed", "error", err)
-				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+				// Check if error is due to server shutdown or temporary unavailability
+				if server.IsTemporaryAuthFailure(err) {
+					s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] %s", tag, err.Error()))
+				} else {
+					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+				}
 				continue
 			}
 
@@ -357,7 +362,12 @@ func (s *Session) handleConnection() {
 				s.DebugLog("authentication failed", "error", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
-				s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+				// Check if error is due to server shutdown or temporary unavailability
+				if server.IsTemporaryAuthFailure(err) {
+					s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] %s", tag, err.Error()))
+				} else {
+					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+				}
 				continue
 			}
 
@@ -578,6 +588,13 @@ func (s *Session) authenticateUser(username, password string) error {
 			}
 
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
+				// Check if this is due to context cancellation (server shutdown)
+				if errors.Is(err, server.ErrServerShuttingDown) {
+					s.InfoLog("prelookup cancelled due to server shutdown")
+					metrics.PrelookupResult.WithLabelValues("imap", "shutdown").Inc()
+					return server.ErrServerShuttingDown
+				}
+
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					s.WarnLog("prelookup transient error, fallback enabled", "error", err)
@@ -635,7 +652,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Prelookup service is temporarily unavailable - tell user to retry later
 				s.WarnLog("prelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "unavailable").Inc()
-				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+				return server.ErrAuthServiceUnavailable
 
 			case proxy.AuthUserNotFound:
 				// User not found in prelookup (404). This means the user is NOT in the other system.
@@ -668,6 +685,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("master auth already validated, getting account ID from main database")
 		accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master auth cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, address.BaseAddress(), false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -678,6 +701,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)

@@ -520,5 +520,15 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	// Give both clients and backends a brief moment to process
 	time.Sleep(1 * time.Second)
 
+	// Close connections to unblock any sessions blocked on reads
+	for _, session := range activeSessions {
+		if session.clientConn != nil {
+			session.clientConn.Close()
+		}
+		if session.backendConn != nil {
+			session.backendConn.Close()
+		}
+	}
+
 	logger.Debug("POP3 Proxy: Proceeding with connection cleanup", "proxy", s.name)
 }

@@ -562,7 +562,6 @@ func (s *Server) sendGracefulShutdownBye() {
 
 		// Send LOGOUT to backend for clean disconnect
 		if session.backendWriter != nil {
-			// Generate a unique tag for the LOGOUT command
 			session.backendWriter.WriteString("PROXY1 LOGOUT\r\n")
 			session.backendWriter.Flush()
 		}
@@ -570,8 +569,20 @@ func (s *Server) sendGracefulShutdownBye() {
 		session.mu.Unlock()
 	}
 
-	// Give both clients and backends a brief moment to process
+	// Give both clients and backends a brief moment to process the BYE/LOGOUT
 	time.Sleep(1 * time.Second)
+
+	// Close connections to unblock any sessions blocked on reads
+	for _, session := range activeSessions {
+		session.mu.Lock()
+		if session.clientConn != nil {
+			session.clientConn.Close()
+		}
+		if session.backendConn != nil {
+			session.backendConn.Close()
+		}
+		session.mu.Unlock()
+	}
 
 	logger.Debug("Proceeding with connection cleanup", "proxy", s.name)
 }

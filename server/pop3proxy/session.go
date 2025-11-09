@@ -145,8 +145,10 @@ func (s *POP3ProxySession) handleConnection() {
 			password := server.UnquoteString(parts[1])
 
 			if err := s.authenticate(s.username, password); err != nil {
-				// Check if the error is due to a backend connection failure.
-				if strings.Contains(err.Error(), "failed to connect to backend") {
+				// Check if error is due to server shutdown or temporary unavailability
+				if server.IsTemporaryAuthFailure(err) {
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
+				} else if strings.Contains(err.Error(), "failed to connect to backend") {
 					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
 				} else {
 					writer.WriteString("-ERR Authentication failed\r\n")
@@ -257,8 +259,10 @@ func (s *POP3ProxySession) handleConnection() {
 			}
 
 			if err := s.authenticate(authnID, password); err != nil {
-				// Check if the error is due to a backend connection failure.
-				if strings.Contains(err.Error(), "failed to connect to backend") {
+				// Check if error is due to server shutdown or temporary unavailability
+				if server.IsTemporaryAuthFailure(err) {
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
+				} else if strings.Contains(err.Error(), "failed to connect to backend") {
 					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
 				} else {
 					writer.WriteString("-ERR Authentication failed\r\n")
@@ -421,6 +425,13 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			}
 
 			if errors.Is(err, proxy.ErrPrelookupTransient) {
+				// Check if this is due to context cancellation (server shutdown)
+				if errors.Is(err, server.ErrServerShuttingDown) {
+					s.InfoLog("prelookup cancelled due to server shutdown")
+					metrics.PrelookupResult.WithLabelValues("pop3", "shutdown").Inc()
+					return server.ErrServerShuttingDown
+				}
+
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
 				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
 					s.WarnLog("prelookup transient error, fallback enabled - attempting main DB: %v", err)
@@ -523,6 +534,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		s.DebugLog("master auth already validated, getting account ID from main database")
 		accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("master auth cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, address.BaseAddress(), false)
 			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -533,6 +550,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 		if err != nil {
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return server.ErrServerShuttingDown
+			}
+
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)

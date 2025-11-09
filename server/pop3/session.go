@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -342,6 +343,16 @@ func (s *POP3Session) handleConnection() {
 				// Use base address (without +detail) for authentication
 				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.BaseAddress(), password)
 				if err != nil {
+					// Check if error is due to context cancellation (server shutdown)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						s.InfoLog("authentication cancelled due to server shutdown")
+						metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
+						if s.handleClientError(writer, "-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n") {
+							return
+						}
+						continue
+					}
+
 					// Record failed attempt
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
@@ -1503,6 +1514,15 @@ func (s *POP3Session) handleConnection() {
 
 				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 				if err != nil {
+					// Check if error is due to context cancellation (server shutdown)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						s.InfoLog("[SASL] authentication cancelled due to server shutdown")
+						if s.handleClientError(writer, "-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n") {
+							return
+						}
+						continue
+					}
+
 					// Record failed attempt
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)

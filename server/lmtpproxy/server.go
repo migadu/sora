@@ -58,6 +58,10 @@ type Server struct {
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
+
+	// Active session tracking for graceful shutdown
+	activeSessionsMu sync.RWMutex
+	activeSessions   map[*Session]struct{}
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -215,6 +219,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		listenBacklog:      listenBacklog,
 		debug:              opts.Debug,
 		debugWriter:        debugWriter,
+		activeSessions:     make(map[*Session]struct{}),
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
@@ -437,14 +442,85 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 	return s.connManager
 }
 
+// registerSession adds a session to the active sessions map for graceful shutdown tracking
+func (s *Server) registerSession(session *Session) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	s.activeSessions[session] = struct{}{}
+}
+
+// unregisterSession removes a session from the active sessions map
+func (s *Server) unregisterSession(session *Session) {
+	s.activeSessionsMu.Lock()
+	defer s.activeSessionsMu.Unlock()
+	delete(s.activeSessions, session)
+}
+
+// sendGracefulShutdownMessage sends a shutdown message to all active client connections
+func (s *Server) sendGracefulShutdownMessage() {
+	s.activeSessionsMu.RLock()
+	activeSessions := make([]*Session, 0, len(s.activeSessions))
+	for session := range s.activeSessions {
+		activeSessions = append(activeSessions, session)
+	}
+	s.activeSessionsMu.RUnlock()
+
+	if len(activeSessions) == 0 {
+		return
+	}
+
+	logger.Info("Sending graceful shutdown messages to LMTP sessions", "name", s.name, "count", len(activeSessions))
+
+	// Send shutdown message to all active sessions
+	for _, session := range activeSessions {
+		// Lock the session to safely access writer
+		session.mu.Lock()
+
+		// Send 421 temporary failure to client
+		// LMTP RFC 2821: 421 means "service not available, closing transmission channel"
+		if session.clientWriter != nil {
+			session.clientWriter.WriteString("421 4.3.2 Service shutting down, please try again later\r\n")
+			session.clientWriter.Flush()
+		}
+
+		// Send QUIT to backend for clean disconnect
+		if session.backendWriter != nil {
+			session.backendWriter.WriteString("QUIT\r\n")
+			session.backendWriter.Flush()
+		}
+
+		session.mu.Unlock()
+	}
+
+	// Give both clients and backends a brief moment to process the messages
+	time.Sleep(1 * time.Second)
+
+	// Close connections to unblock any sessions blocked on reads
+	for _, session := range activeSessions {
+		session.mu.Lock()
+		if session.clientConn != nil {
+			session.clientConn.Close()
+		}
+		if session.backendConn != nil {
+			session.backendConn.Close()
+		}
+		session.mu.Unlock()
+	}
+
+	logger.Debug("LMTP Proxy: Proceeding with connection cleanup", "name", s.name)
+}
+
 // Stop stops the LMTP proxy server.
 func (s *Server) Stop() error {
-	logger.Debug("LMTP Proxy: Stopping", "name", s.name)
+	logger.Info("Stopping LMTP proxy server", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
 	if s.connTracker != nil {
 		s.connTracker.Stop()
 	}
+
+	// Send graceful shutdown messages to all active sessions
+	s.sendGracefulShutdownMessage()
 
 	s.cancel()
 

@@ -60,10 +60,14 @@ func newSession(server *Server, conn net.Conn) *Session {
 func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
+	defer s.server.unregisterSession(s)
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
 	// Log connection at INFO level
 	s.InfoLog("connected")
+
+	// Register this session for graceful shutdown tracking
+	s.server.registerSession(s)
 
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
@@ -172,6 +176,12 @@ func (s *Session) handleConnection() {
 
 			if err := s.handleRecipient(to); err != nil {
 				s.DebugLog("Recipient rejected", "recipient", to, "error", err)
+				// Check if error is due to server shutdown
+				if errors.Is(err, server.ErrServerShuttingDown) {
+					s.InfoLog("Recipient lookup failed due to server shutdown", "recipient", to)
+					s.sendResponse("421 4.3.2 Service shutting down, please try again later")
+					return
+				}
 				s.sendResponse("550 5.1.1 User unknown")
 				continue
 			}
@@ -397,6 +407,14 @@ func (s *Session) handleRecipient(to string) error {
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
 			s.InfoLog("prelookup failed", "username", s.username, "error", lookupErr)
+
+			// Check if error is due to context cancellation (server shutdown)
+			if errors.Is(lookupErr, server.ErrServerShuttingDown) {
+				s.InfoLog("prelookup cancelled due to server shutdown")
+				metrics.PrelookupResult.WithLabelValues("lmtp", "shutdown").Inc()
+				return server.ErrServerShuttingDown
+			}
+
 			// Only check fallback setting for transient errors (network, 5xx, circuit breaker)
 			// User not found (404) always falls through to support partitioning scenarios
 			if s.server.prelookupConfig != nil && !s.server.prelookupConfig.FallbackDefault {
@@ -433,6 +451,11 @@ func (s *Session) handleRecipient(to string) error {
 
 	row := s.server.rdb.QueryRowWithRetry(dbCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
 	if err := row.Scan(&s.accountID); err != nil {
+		// Check if error is due to context cancellation (server shutdown)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.InfoLog("database lookup cancelled due to server shutdown")
+			return server.ErrServerShuttingDown
+		}
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
 	return nil

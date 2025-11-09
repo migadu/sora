@@ -343,11 +343,25 @@ func setupPOP3ProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		rdb:   rdb,
 	}
 
-	return &common.TestServer{
+	testServer := &common.TestServer{
 		Address:     proxyAddr,
 		Server:      wrapper,
 		ResilientDB: rdb,
 	}
+
+	testServer.SetCleanup(func() {
+		wrapper.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("POP3 proxy error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	return testServer
 }
 
 // setupPOP3ProxyWithXCLIENT creates POP3 proxy using XCLIENT command for parameter forwarding
@@ -404,11 +418,25 @@ func setupPOP3ProxyWithXCLIENT(t *testing.T, rdb *resilient.ResilientDatabase, p
 		rdb:   rdb,
 	}
 
-	return &common.TestServer{
+	testServer := &common.TestServer{
 		Address:     proxyAddr,
 		Server:      wrapper,
 		ResilientDB: rdb,
 	}
+
+	testServer.SetCleanup(func() {
+		wrapper.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("POP3 proxy error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	return testServer
 }
 
 // testBasicPOP3ProxyConnection tests basic connection and authentication through proxy

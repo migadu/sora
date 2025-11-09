@@ -42,6 +42,11 @@ func (ts *TestServer) Close() {
 	}
 }
 
+// SetCleanup sets the cleanup function for the test server
+func (ts *TestServer) SetCleanup(cleanup func()) {
+	ts.cleanup = cleanup
+}
+
 func SetupTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 

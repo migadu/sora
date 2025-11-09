@@ -210,11 +210,25 @@ func setupIMAPProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 	// Wait for proxy to start
 	time.Sleep(200 * time.Millisecond)
 
-	return &common.TestServer{
+	testServer := &common.TestServer{
 		Address:     proxyAddr,
 		Server:      proxy,
 		ResilientDB: rdb,
 	}
+
+	testServer.SetCleanup(func() {
+		proxy.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP proxy error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	return testServer
 }
 
 // setupIMAPProxyWithIDCommand creates IMAP proxy using ID command for Dovecot compatibility
@@ -263,11 +277,25 @@ func setupIMAPProxyWithIDCommand(t *testing.T, rdb *resilient.ResilientDatabase,
 	// Wait for proxy to start
 	time.Sleep(200 * time.Millisecond)
 
-	return &common.TestServer{
+	testServer := &common.TestServer{
 		Address:     proxyAddr,
 		Server:      proxy,
 		ResilientDB: rdb,
 	}
+
+	testServer.SetCleanup(func() {
+		proxy.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP proxy error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	return testServer
 }
 
 // testBasicProxyConnection tests basic connection and authentication through proxy
@@ -407,9 +435,23 @@ func setupIMAPProxyWithLimits(t *testing.T, rdb *resilient.ResilientDatabase, pr
 	// Wait for proxy to start
 	time.Sleep(200 * time.Millisecond)
 
-	return &common.TestServer{
+	testServer := &common.TestServer{
 		Address:     proxyAddr,
 		Server:      proxy,
 		ResilientDB: rdb,
 	}
+
+	testServer.SetCleanup(func() {
+		proxy.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP proxy error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	return testServer
 }

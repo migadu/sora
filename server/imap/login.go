@@ -145,7 +145,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeUnavailable,
-				Text: "Server is shutting down. Please try again.",
+				Text: server.ErrServerShuttingDown.Error(),
 			}
 		}
 

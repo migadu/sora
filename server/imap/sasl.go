@@ -100,7 +100,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							return &imap.Error{
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
-								Text: "Server is shutting down. Please try again.",
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
@@ -197,7 +197,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							return &imap.Error{
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
-								Text: "Server is shutting down. Please try again.",
+								Text: server.ErrServerShuttingDown.Error(),
 							}
 						}
 
