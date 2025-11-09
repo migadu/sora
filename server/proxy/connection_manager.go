@@ -916,7 +916,9 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 
 	// 1. Try routing lookup first, only if not already available from auth
 	if result.RoutingInfo == nil && params.ConnManager.HasRouting() {
-		routingCtx, routingCancel := context.WithTimeout(params.Ctx, 5*time.Second)
+		// Use prelookup timeout for routing lookup (accounts for dial + TLS + HTTP)
+		lookupTimeout := params.ConnManager.GetPrelookupTimeout()
+		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
 		result.RoutingInfo, lookupErr = params.ConnManager.LookupUserRoute(routingCtx, params.Username)
 		routingCancel()

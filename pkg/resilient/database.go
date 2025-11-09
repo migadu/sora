@@ -329,6 +329,28 @@ func (rd *ResilientDatabase) GetDatabase() *db.Database {
 	return rd.getCurrentDatabase()
 }
 
+// GetQueryTimeout returns the configured query timeout for read operations
+// This is useful when code needs to create its own context with appropriate timeout
+func (rd *ResilientDatabase) GetQueryTimeout() time.Duration {
+	timeout, err := rd.config.GetQueryTimeout()
+	if err != nil {
+		logger.Warn("Invalid global query_timeout, using default", "error", err)
+		return 30 * time.Second
+	}
+	return timeout
+}
+
+// GetWriteTimeout returns the configured write timeout for write operations
+// This is useful when code needs to create its own context with appropriate timeout
+func (rd *ResilientDatabase) GetWriteTimeout() time.Duration {
+	timeout, err := rd.config.GetWriteTimeout()
+	if err != nil {
+		logger.Warn("Invalid global write_timeout, using default", "error", err)
+		return 15 * time.Second
+	}
+	return timeout
+}
+
 // isRetryableError checks if an error is transient and the operation can be retried.
 // It uses type assertions and error codes for robust checking.
 func (rd *ResilientDatabase) isRetryableError(err error) bool {

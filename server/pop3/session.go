@@ -1983,7 +1983,9 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 // registerConnection registers the connection in the connection tracker
 func (s *POP3Session) registerConnection(email string) {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
-		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		// Use configured database query timeout for connection tracking (database INSERT)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
@@ -1997,7 +1999,9 @@ func (s *POP3Session) registerConnection(email string) {
 // unregisterConnection removes the connection from the connection tracker
 func (s *POP3Session) unregisterConnection() {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use configured database query timeout for connection tracking (database DELETE)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())

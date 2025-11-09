@@ -1318,7 +1318,9 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 // registerConnection registers the connection in the connection tracker
 func (s *ManageSieveSession) registerConnection(email string) {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
-		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		// Use configured database query timeout for connection tracking (database INSERT)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
@@ -1332,7 +1334,9 @@ func (s *ManageSieveSession) registerConnection(email string) {
 // unregisterConnection removes the connection from the connection tracker
 func (s *ManageSieveSession) unregisterConnection() {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use configured database query timeout for connection tracking (database DELETE)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())

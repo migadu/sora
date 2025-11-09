@@ -816,7 +816,9 @@ func (s *POP3ProxySession) close() {
 
 // registerConnection registers the connection in the database.
 func (s *POP3ProxySession) registerConnection() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {

@@ -433,7 +433,13 @@ func (a *AuthRateLimiter) syncPendingRecords() {
 	a.pendingRecords = a.pendingRecords[:0]
 	a.pendingMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Use configured write timeout for database operations (auth attempt records are writes)
+	// Try to get timeout from resilient database if available, otherwise use default
+	writeTimeout := 10 * time.Second // Default fallback
+	if rdb, ok := a.db.(interface{ GetWriteTimeout() time.Duration }); ok {
+		writeTimeout = rdb.GetWriteTimeout()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()
 
 	for i, record := range records {

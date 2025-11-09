@@ -426,7 +426,9 @@ func (s *Session) handleRecipient(to string) error {
 
 	// 2. Fallback to main DB to get account ID for affinity
 	s.isPrelookupAccount = false
-	dbCtx, dbCancel := context.WithTimeout(s.ctx, 5*time.Second)
+	// Use configured database query timeout instead of hardcoded value
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	dbCtx, dbCancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer dbCancel()
 
 	row := s.server.rdb.QueryRowWithRetry(dbCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
@@ -877,7 +879,9 @@ func (s *Session) close() {
 
 // registerConnection registers the connection in the database.
 func (s *Session) registerConnection() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 
 	clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())

@@ -385,7 +385,9 @@ func (s *IMAPSession) triggerCacheWarmup() {
 // registerConnection registers the connection in the connection tracker
 func (s *IMAPSession) registerConnection(email string) error {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
-		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+		// Use configured database query timeout for connection tracking (database INSERT)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
@@ -401,7 +403,9 @@ func (s *IMAPSession) registerConnection(email string) error {
 // unregisterConnection removes the connection from the connection tracker
 func (s *IMAPSession) unregisterConnection() {
 	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use configured database query timeout for connection tracking (database DELETE)
+		queryTimeout := s.server.rdb.GetQueryTimeout()
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
