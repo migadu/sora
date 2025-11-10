@@ -769,16 +769,18 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send BYE message before closing due to timeout (RFC 3501 Section 7.1.5)
+			// Using [UNAVAILABLE] response code helps clients recognize this as a normal
+			// server condition rather than an error (RFC 5530 Section 3)
 			var message string
 			switch reason {
 			case "idle":
-				message = "* BYE Idle timeout, please reconnect\r\n"
+				message = "* BYE [UNAVAILABLE] Idle timeout, please reconnect\r\n"
 			case "slow_throughput":
-				message = "* BYE Connection too slow, please reconnect\r\n"
+				message = "* BYE [UNAVAILABLE] Connection too slow, please reconnect\r\n"
 			case "session_max":
-				message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
+				message = "* BYE [UNAVAILABLE] Maximum session duration exceeded, please reconnect\r\n"
 			default:
-				message = "* BYE Connection timeout, please reconnect\r\n"
+				message = "* BYE [UNAVAILABLE] Connection timeout, please reconnect\r\n"
 			}
 			// Write BYE - ignore errors as connection may already be broken
 			// This is best-effort to inform the client

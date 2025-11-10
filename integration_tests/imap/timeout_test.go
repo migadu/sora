@@ -193,9 +193,12 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 
 	// We should either get a BYE message or a connection error
 	if readErr == nil {
-		// Got a response - should be a BYE message
+		// Got a response - should be a BYE message with [UNAVAILABLE] response code
 		if !strings.HasPrefix(response, "* BYE") {
 			t.Fatalf("Expected BYE message after idle timeout, got: %s", response)
+		}
+		if !strings.Contains(response, "[UNAVAILABLE]") {
+			t.Logf("⚠️  BYE message missing [UNAVAILABLE] response code: %s", strings.TrimSpace(response))
 		}
 		t.Logf("✅ Received BYE message after idle timeout: %s", strings.TrimSpace(response))
 

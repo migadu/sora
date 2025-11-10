@@ -90,9 +90,12 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 		t.Fatalf("Failed to read BYE: %v", err)
 	}
 
-	// Verify BYE message contains expected text
+	// Verify BYE message contains expected text and response code
 	if !strings.HasPrefix(bye, "* BYE") {
 		t.Errorf("Expected BYE response, got: %s", bye)
+	}
+	if !strings.Contains(bye, "[UNAVAILABLE]") {
+		t.Errorf("Expected '[UNAVAILABLE]' response code in BYE message, got: %s", bye)
 	}
 	if !strings.Contains(bye, "Idle timeout") {
 		t.Errorf("Expected 'Idle timeout' in BYE message, got: %s", bye)
@@ -196,6 +199,9 @@ func TestSessionMaxTimeoutSendsBye(t *testing.T) {
 		}
 		if strings.HasPrefix(line, "* BYE") {
 			foundBye = true
+			if !strings.Contains(line, "[UNAVAILABLE]") {
+				t.Errorf("Expected '[UNAVAILABLE]' response code in BYE message, got: %s", line)
+			}
 			if !strings.Contains(line, "session duration") {
 				t.Errorf("Expected 'session duration' in BYE message, got: %s", line)
 			}
