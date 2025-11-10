@@ -476,7 +476,7 @@ func (db *Database) DeleteAccount(ctx context.Context, tx pgx.Tx, email string) 
 	}
 
 	if result.RowsAffected() == 0 {
-		return fmt.Errorf("account not found or already deleted")
+		return fmt.Errorf("%w or already deleted", ErrAccountNotFound)
 	}
 
 	// NOTE: Connection tracking no longer uses database.
@@ -528,7 +528,7 @@ func (db *Database) RestoreAccount(ctx context.Context, tx pgx.Tx, email string)
 	}
 
 	if result.RowsAffected() == 0 {
-		return fmt.Errorf("account not found or not deleted")
+		return fmt.Errorf("%w or not deleted", ErrAccountNotFound)
 	}
 
 	return nil

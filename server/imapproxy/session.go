@@ -869,7 +869,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	if err != nil {
 		s.mu.Unlock()
 		logger.Error("Failed to send AUTHENTICATE command to backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
-		return "", fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
+		return "", fmt.Errorf("%w: failed to send AUTHENTICATE command: %w", server.ErrBackendAuthFailed, err)
 	}
 	s.backendWriter.Flush()
 	s.mu.Unlock()
@@ -878,7 +878,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
 		logger.Error("Failed to read auth response from backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
-		return "", fmt.Errorf("failed to read auth response: %w", err)
+		return "", fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	// Clear the deadline after successful authentication
@@ -887,7 +887,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	}
 
 	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
-		return "", fmt.Errorf("backend authentication failed: %s", response)
+		return "", fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
 	s.DebugLog("backend authentication successful")
@@ -923,7 +923,13 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 	backendResponse, err := s.authenticateToBackend()
 	if err != nil {
 		logger.Error("Backend authentication failed", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr, "error", err)
-		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", clientTag))
+		// Check if this is a timeout or connection error (backend unavailable)
+		// rather than an actual authentication failure
+		if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
+			s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
+		} else {
+			s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", clientTag))
+		}
 		// Close the backend connection since authentication failed
 		if s.backendConn != nil {
 			s.backendConn.Close()

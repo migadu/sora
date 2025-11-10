@@ -148,9 +148,11 @@ func (s *POP3ProxySession) handleConnection() {
 				// Check if error is due to server shutdown or temporary unavailability
 				if server.IsTemporaryAuthFailure(err) {
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				} else if strings.Contains(err.Error(), "failed to connect to backend") {
+				} else if server.IsBackendError(err) {
+					// Backend connection or authentication issues
 					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
 				} else {
+					// Actual authentication failure (wrong password, etc.)
 					writer.WriteString("-ERR Authentication failed\r\n")
 				}
 				writer.Flush()
@@ -262,9 +264,11 @@ func (s *POP3ProxySession) handleConnection() {
 				// Check if error is due to server shutdown or temporary unavailability
 				if server.IsTemporaryAuthFailure(err) {
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				} else if strings.Contains(err.Error(), "failed to connect to backend") {
+				} else if server.IsBackendError(err) {
+					// Backend connection or authentication issues
 					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
 				} else {
+					// Actual authentication failure (wrong password, etc.)
 					writer.WriteString("-ERR Authentication failed\r\n")
 				}
 				writer.Flush()
@@ -655,12 +659,12 @@ func (s *POP3ProxySession) connectToBackend() error {
 	greeting, err := backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
-		return fmt.Errorf("failed to read backend greeting: %w", err)
+		return fmt.Errorf("%w: failed to read backend greeting: %w", server.ErrBackendConnectionFailed, err)
 	}
 
 	if !strings.HasPrefix(greeting, "+OK") {
 		s.backendConn.Close()
-		return fmt.Errorf("unexpected backend greeting: %s", greeting)
+		return fmt.Errorf("%w: unexpected backend greeting: %s", server.ErrBackendConnectionFailed, greeting)
 	}
 
 	// Store backendReader for use in proxy phase to avoid losing buffered data
@@ -688,23 +692,23 @@ func (s *POP3ProxySession) connectToBackend() error {
 
 	if _, err := backendWriter.WriteString(fmt.Sprintf("AUTH PLAIN %s\r\n", encoded)); err != nil {
 		s.backendConn.Close()
-		return fmt.Errorf("failed to send AUTH PLAIN to backend: %w", err)
+		return fmt.Errorf("%w: failed to send AUTH PLAIN to backend: %w", server.ErrBackendAuthFailed, err)
 	}
 	if err := backendWriter.Flush(); err != nil {
 		s.backendConn.Close()
-		return fmt.Errorf("failed to flush AUTH PLAIN to backend: %w", err)
+		return fmt.Errorf("%w: failed to flush AUTH PLAIN to backend: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	// Read auth response
 	authResp, err := backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
-		return fmt.Errorf("failed to read auth response: %w", err)
+		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	if !strings.HasPrefix(authResp, "+OK") {
 		s.backendConn.Close()
-		return fmt.Errorf("backend authentication failed: %s", authResp)
+		return fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(authResp))
 	}
 
 	s.DebugLog("Authenticated to backend")

@@ -1494,7 +1494,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 	// List deleted messages
 	messages, err := s.rdb.ListDeletedMessagesWithRetry(ctx, params)
 	if err != nil {
-		if strings.Contains(err.Error(), "account not found") {
+		if errors.Is(err, db.ErrAccountNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
@@ -1564,7 +1564,7 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	// Restore messages
 	count, err := s.rdb.RestoreMessagesWithRetry(ctx, params)
 	if err != nil {
-		if strings.Contains(err.Error(), "account not found") {
+		if errors.Is(err, db.ErrAccountNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}

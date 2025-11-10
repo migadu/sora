@@ -993,11 +993,7 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 }
 
 func isClosingError(err error) bool {
-	if err == io.EOF || errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	// Check for the specific string net.OpError produces on a closed connection
-	return strings.Contains(err.Error(), "use of closed network connection")
+	return server.IsConnectionError(err)
 }
 
 // findParameter searches for a parameter with a given prefix in a list of arguments.

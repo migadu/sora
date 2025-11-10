@@ -110,7 +110,7 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 
 	// Create mailbox
 	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, req.Name); err != nil {
-		if errors.Is(err, consts.ErrMailboxAlreadyExists) || err.Error() == "unique violation" {
+		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.writeError(w, http.StatusConflict, "Mailbox already exists")
 			return
 		}
@@ -151,7 +151,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 
 	// Delete mailbox
 	if err := s.rdb.DeleteMailboxForUserWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) || err.Error() == "mailbox not found" {
+		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}

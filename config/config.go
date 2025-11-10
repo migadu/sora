@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -2142,17 +2143,17 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 	// Try to decode - capture metadata to check for unknown keys
 	metadata, err := toml.Decode(string(content), cfg)
 	if err != nil {
-		// Check if this is a duplicate key error
-		if strings.Contains(err.Error(), "has already been defined") {
-			// Extract the duplicate key name from error message
-			errMsg := err.Error()
-			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, errMsg)
+		// Check if this is a duplicate key error using ParseError type
+		// Note: toml.Decode returns ParseError by value, not by pointer
+		var parseErr toml.ParseError
+		if errors.As(err, &parseErr) && strings.Contains(parseErr.Message, "has already been defined") {
+			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, parseErr.Error())
 			log.Printf("WARNING: Ignoring duplicate entries. Only the first occurrence of each key will be used.")
 			log.Printf("WARNING: Please fix your configuration file to remove duplicates.")
 
 			// Parse again with a lenient approach by removing duplicate keys
-			cleanedContent, parseErr := removeDuplicateKeysFromTOML(string(content))
-			if parseErr != nil {
+			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
+			if cleanErr != nil {
 				// If we can't clean it, return a helpful error
 				return enhanceConfigError(err)
 			}

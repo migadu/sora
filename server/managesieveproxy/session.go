@@ -249,7 +249,12 @@ func (s *Session) handleConnection() {
 			// Connect to backend and authenticate
 			if err := s.connectToBackendAndAuth(); err != nil {
 				s.DebugLog("backend connection/auth failed: %v", err)
-				s.sendResponse(`NO "Backend server temporarily unavailable"`)
+				// Check if this is a timeout or connection error (backend unavailable)
+				if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
+					s.sendResponse(`NO (UNAVAILABLE) "Backend server temporarily unavailable"`)
+				} else {
+					s.sendResponse(`NO "Backend server error"`)
+				}
 				continue
 			}
 
@@ -789,7 +794,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		line, err := backendReader.ReadString('\n')
 		if err != nil {
 			s.backendConn.Close()
-			return fmt.Errorf("failed to read backend greeting: %w", err)
+			return fmt.Errorf("%w: failed to read backend greeting: %w", server.ErrBackendConnectionFailed, err)
 		}
 
 		// Just consume the backend greeting, don't forward it (we already sent our own)
@@ -826,7 +831,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		_, err := backendWriter.WriteString("STARTTLS\r\n")
 		if err != nil {
 			s.backendConn.Close()
-			return fmt.Errorf("failed to send STARTTLS command: %w", err)
+			return fmt.Errorf("%w: failed to send STARTTLS command: %w", server.ErrBackendConnectionFailed, err)
 		}
 		backendWriter.Flush()
 
@@ -834,12 +839,12 @@ func (s *Session) connectToBackendAndAuth() error {
 		response, err := backendReader.ReadString('\n')
 		if err != nil {
 			s.backendConn.Close()
-			return fmt.Errorf("failed to read STARTTLS response: %w", err)
+			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
 		}
 
 		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
 			s.backendConn.Close()
-			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
+			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
 		}
 
 		// Upgrade connection to TLS
@@ -847,7 +852,7 @@ func (s *Session) connectToBackendAndAuth() error {
 		err = tlsConn.Handshake()
 		if err != nil {
 			s.backendConn.Close()
-			return fmt.Errorf("TLS handshake with backend failed: %w", err)
+			return fmt.Errorf("%w: TLS handshake with backend failed: %w", server.ErrBackendConnectionFailed, err)
 		}
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
@@ -875,20 +880,20 @@ func (s *Session) authenticateToBackend() error {
 	// ManageSieve requires quoted strings for command arguments
 	_, err := backendWriter.WriteString(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", encoded))
 	if err != nil {
-		return fmt.Errorf("failed to send AUTHENTICATE command: %w", err)
+		return fmt.Errorf("%w: failed to send AUTHENTICATE command: %w", server.ErrBackendAuthFailed, err)
 	}
 	backendWriter.Flush()
 
 	// Read authentication response
 	response, err := backendReader.ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("failed to read auth response: %w", err)
+		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
 	if !strings.HasPrefix(response, "OK") {
-		return fmt.Errorf("backend authentication failed: %s", response)
+		return fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
 	s.DebugLog("Backend authentication successful")

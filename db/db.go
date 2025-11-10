@@ -400,9 +400,8 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	case err := <-errChan:
 		// Check if error is a lock acquisition timeout (another instance is running migrations)
 		if err != nil && err != migrate.ErrNoChange {
-			errStr := err.Error()
 			// If it's a lock acquisition error, verify migrations instead of failing
-			if strings.Contains(errStr, "can't acquire database lock") || strings.Contains(errStr, "Timeout on advisory lock") {
+			if errors.Is(err, migrate.ErrLockTimeout) {
 				log.Println("Database: migration lock acquisition failed (another instance is running migrations)")
 				log.Println("Database: verifying current migration state...")
 

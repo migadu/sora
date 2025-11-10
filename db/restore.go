@@ -46,7 +46,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	`, params.Email).Scan(&accountID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil, fmt.Errorf("account not found: %s", params.Email)
+			return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, params.Email)
 		}
 		return nil, fmt.Errorf("failed to get account ID for %q: %w", params.Email, err)
 	}
@@ -150,7 +150,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	`, params.Email).Scan(&accountID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return 0, fmt.Errorf("account not found: %s", params.Email)
+			return 0, fmt.Errorf("%w: %s", ErrAccountNotFound, params.Email)
 		}
 		return 0, fmt.Errorf("failed to get account ID: %w", err)
 	}

@@ -525,7 +525,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		_ = os.Remove(*filePath) // cleanup file on failure
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
 
-		if err.Error() == "message already exists: unique violation" {
+		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.WarnLog("message already exists in database (content hash: %s)", contentHash)
 			return &smtp.SMTPError{
 				Code:         541,
@@ -774,9 +774,9 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		})
 
 	if err != nil {
-		if err == consts.ErrDBUniqueViolation {
+		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.WarnLog("message already exists in database (content hash: %s)", contentHash)
-			return fmt.Errorf("message already exists: unique violation")
+			return fmt.Errorf("%w: message already exists", consts.ErrDBUniqueViolation)
 		}
 		return fmt.Errorf("failed to save message: %v", err)
 	}

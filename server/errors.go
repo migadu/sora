@@ -21,6 +21,21 @@ var (
 	ErrAuthServiceUnavailable = errors.New("authentication service temporarily unavailable, please try again later")
 )
 
+// Backend connection/authentication error sentinels (for proxy servers)
+var (
+	// ErrBackendConnectionFailed indicates the proxy could not connect to the backend server
+	ErrBackendConnectionFailed = errors.New("failed to connect to backend server")
+
+	// ErrBackendAuthFailed indicates the proxy could not authenticate to the backend server
+	ErrBackendAuthFailed = errors.New("failed to authenticate to backend server")
+
+	// ErrBackendTimeout indicates a timeout occurred while communicating with the backend
+	ErrBackendTimeout = errors.New("backend server timeout")
+
+	// ErrBackendUnavailable is a general error for any backend unavailability
+	ErrBackendUnavailable = errors.New("backend server temporarily unavailable")
+)
+
 // IsTemporaryAuthFailure checks if an authentication error is temporary (server shutdown, service unavailable)
 // and should result in an UNAVAILABLE response rather than AUTHENTICATIONFAILED.
 func IsTemporaryAuthFailure(err error) bool {
@@ -28,6 +43,19 @@ func IsTemporaryAuthFailure(err error) bool {
 		return false
 	}
 	return errors.Is(err, ErrServerShuttingDown) || errors.Is(err, ErrAuthServiceUnavailable)
+}
+
+// IsBackendError checks if an error is related to backend connectivity or authentication.
+// These errors should result in "Backend server temporarily unavailable" responses
+// rather than "Authentication failed" (which implies wrong credentials).
+func IsBackendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrBackendConnectionFailed) ||
+		errors.Is(err, ErrBackendAuthFailed) ||
+		errors.Is(err, ErrBackendTimeout) ||
+		errors.Is(err, ErrBackendUnavailable)
 }
 
 // IsConnectionError checks if an error is a common, non-fatal network connection error.
@@ -55,8 +83,8 @@ func IsConnectionError(err error) bool {
 		if errors.Is(opErr.Err, syscall.ECONNRESET) {
 			return true
 		}
-		// "use of closed network connection" can happen if the connection is closed by another goroutine
-		if strings.Contains(opErr.Err.Error(), "use of closed network connection") {
+		// Check if the connection was closed (net.ErrClosed wraps poll.ErrNetClosing)
+		if errors.Is(opErr.Err, net.ErrClosed) {
 			return true
 		}
 	}
@@ -80,21 +108,23 @@ func IsConnectionError(err error) bool {
 		return true
 	}
 
-	// Handle general TLS handshake errors from crypto/tls package
-	// These include: unsupported versions, bad certificates, protocol errors, etc.
-	// All TLS handshake failures are client-side issues and should not crash the server
-	// Note: We use string matching because crypto/tls doesn't export typed errors for these cases
+	// Handle TLS alert errors (e.g., handshake failures, bad certificates, unsupported versions)
+	// AlertError represents TLS alerts which are typically client-side issues
+	var alertErr tls.AlertError
+	if errors.As(err, &alertErr) {
+		return true
+	}
+
+	// Handle certificate verification errors
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+
+	// Handle general TLS errors as fallback
+	// Note: Some TLS errors may not be wrapped in AlertError, so we check for "tls:" prefix
 	errMsg := err.Error()
-	if strings.Contains(errMsg, "unsupported versions") ||
-		strings.Contains(errMsg, "tls: handshake failure") ||
-		strings.Contains(errMsg, "tls: bad certificate") ||
-		strings.Contains(errMsg, "tls: certificate required") ||
-		strings.Contains(errMsg, "tls: unknown certificate") ||
-		strings.Contains(errMsg, "tls: client offered only") ||
-		strings.Contains(errMsg, "tls: no cipher suite") ||
-		strings.Contains(errMsg, "tls: oversized record") ||
-		strings.Contains(errMsg, "tls: first record does not look like a TLS handshake") ||
-		strings.Contains(errMsg, "remote error: tls:") {
+	if strings.Contains(errMsg, "tls:") || strings.Contains(errMsg, "remote error: tls:") {
 		return true
 	}
 
