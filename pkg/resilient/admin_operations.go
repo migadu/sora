@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/retry"
 )
 
@@ -309,6 +310,13 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			return op(opCtx, tx)
 		})
 		if cbErr != nil {
+			// Log circuit breaker state to understand failure patterns
+			state := rd.writeBreaker.State()
+			counts := rd.writeBreaker.Counts()
+			logger.Warn("Write transaction operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
+				"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
+				"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
+
 			for _, nonRetryableErr := range nonRetryableErrors {
 				if errors.Is(cbErr, nonRetryableErr) {
 					return retry.Stop(cbErr)

@@ -510,13 +510,6 @@ openssl rand -base64 32
 
 ## Incident Response
 
-### Suspected Brute-Force Attack
-
-1. Check blocked IPs: `psql -c "SELECT ip, blocked_until FROM auth_attempts WHERE blocked_until > now()"`
-2. Review auth statistics: `./sora-admin stats auth --config config.toml`
-3. Increase rate limit sensitivity if needed
-4. Consider blocking entire IP ranges at firewall level
-
 ### Suspected DoS Attack
 
 1. Check connection counts: `./sora-admin connections list --config config.toml`

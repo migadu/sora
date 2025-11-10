@@ -855,7 +855,7 @@ func TestAuthStatistics(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()
 
-	t.Run("get auth stats - default window", func(t *testing.T) {
+	t.Run("get auth stats - in-memory implementation", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/admin/auth/stats", nil)
 
 		if resp.StatusCode != http.StatusOK {
@@ -865,20 +865,27 @@ func TestAuthStatistics(t *testing.T) {
 		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		if _, ok := result["stats"]; !ok {
-			t.Error("Expected stats field")
+		// Check for new in-memory implementation fields
+		if result["implementation"] != "in-memory" {
+			t.Errorf("Expected implementation in-memory, got %v", result["implementation"])
 		}
 
-		if _, ok := result["window"]; !ok {
-			t.Error("Expected window field")
+		if _, ok := result["tracking_mode"]; !ok {
+			t.Error("Expected tracking_mode field")
 		}
 
-		if _, ok := result["window_seconds"]; !ok {
-			t.Error("Expected window_seconds field")
+		if _, ok := result["available_stats"]; !ok {
+			t.Error("Expected available_stats field")
+		}
+
+		if _, ok := result["access_methods"]; !ok {
+			t.Error("Expected access_methods field")
 		}
 	})
 
-	t.Run("get auth stats - custom window", func(t *testing.T) {
+	t.Run("get auth stats - window parameter ignored", func(t *testing.T) {
+		// The window parameter is no longer used since we moved to in-memory tracking
+		// but the endpoint should still accept it without error for backwards compatibility
 		resp, body := server.makeRequest(t, "GET", "/admin/auth/stats?window=1h", nil)
 
 		if resp.StatusCode != http.StatusOK {
@@ -888,13 +895,9 @@ func TestAuthStatistics(t *testing.T) {
 		var result map[string]any
 		server.expectJSON(t, body, &result)
 
-		if result["window"] != "1h0m0s" {
-			t.Errorf("Expected window 1h0m0s, got %v", result["window"])
-		}
-
-		windowSeconds, ok := result["window_seconds"].(float64)
-		if !ok || windowSeconds != 3600 {
-			t.Errorf("Expected window_seconds 3600, got %v", result["window_seconds"])
+		// Should still return in-memory implementation info
+		if result["implementation"] != "in-memory" {
+			t.Errorf("Expected implementation in-memory, got %v", result["implementation"])
 		}
 	})
 }
@@ -1130,14 +1133,22 @@ func TestErrorScenarios(t *testing.T) {
 		server.expectError(t, body, "not found")
 	})
 
-	t.Run("invalid auth stats window", func(t *testing.T) {
+	t.Run("auth stats ignores invalid window parameter", func(t *testing.T) {
+		// Since we moved to in-memory rate limiting, the window parameter is no longer used
+		// The endpoint should accept any parameters and return the implementation info
 		resp, body := server.makeRequest(t, "GET", "/admin/auth/stats?window=invalid-duration", nil)
 
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected status %d (window param ignored), got %d. Body: %s", http.StatusOK, resp.StatusCode, string(body))
 		}
 
-		server.expectError(t, body, "Invalid window duration")
+		var result map[string]any
+		server.expectJSON(t, body, &result)
+
+		// Should still return in-memory implementation info
+		if result["implementation"] != "in-memory" {
+			t.Errorf("Expected implementation in-memory, got %v", result["implementation"])
+		}
 	})
 
 	t.Run("invalid cache metrics since parameter", func(t *testing.T) {

@@ -39,7 +39,6 @@ type DatabaseManager interface {
 	CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
-	CleanupOldAuthAttemptsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
@@ -68,7 +67,6 @@ type CleanupWorker struct {
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
 	ftsRetention          time.Duration
-	authAttemptsRetention time.Duration
 	healthStatusRetention time.Duration
 	stopCh                chan struct{}
 	errCh                 chan<- error
@@ -78,7 +76,7 @@ type CleanupWorker struct {
 }
 
 // New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention time.Duration, errCh chan<- error) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention time.Duration, errCh chan<- error) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -90,7 +88,6 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAgeRestriction,
 		ftsRetention:          ftsRetention,
-		authAttemptsRetention: authAttemptsRetention,
 		healthStatusRetention: healthStatusRetention,
 		stopCh:                make(chan struct{}),
 		errCh:                 errCh,
@@ -128,7 +125,6 @@ func (w *CleanupWorker) run(ctx context.Context) {
 		logParts = append(logParts, fmt.Sprintf("max age restriction: %v", w.maxAgeRestriction))
 	}
 	logParts = append(logParts, fmt.Sprintf("FTS retention: %v", w.ftsRetention))
-	logParts = append(logParts, fmt.Sprintf("auth attempts retention: %v", w.authAttemptsRetention))
 	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
 
 	logger.Info("Cleanup: Worker processing", "config", strings.Join(logParts, ", "))
@@ -199,7 +195,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}()
 
 	// Initialize counters for summary logging
-	var failedUploadsCount, deletedAccountCount, vacationCount, authCount, healthCount int64
+	var failedUploadsCount, deletedAccountCount, vacationCount, healthCount int64
 	var successfulDeletes []db.UserScopedObjectForCleanup
 	var prunedBodiesCount, orphanHashCount, finalizedAccountCount int64
 
@@ -241,16 +237,6 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// Continue with S3 cleanup even if vacation cleanup fails
 	} else if vacationCount > 0 {
 		logger.Info("Cleanup: Deleted old vacation responses", "count", vacationCount)
-	}
-
-	// --- Cleanup of old auth attempts ---
-	if w.authAttemptsRetention > 0 {
-		authCount, err = w.rdb.CleanupOldAuthAttemptsWithRetry(ctx, w.authAttemptsRetention)
-		if err != nil {
-			logger.Error("Cleanup: Failed to clean up old auth attempts", "error", err)
-		} else if authCount > 0 {
-			logger.Info("Cleanup: Deleted old auth attempts", "count", authCount, "retention", w.authAttemptsRetention)
-		}
 	}
 
 	// --- Cleanup of old health statuses ---
@@ -391,7 +377,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// Log cleanup cycle summary for observability
 	logger.Info("Cleanup: Cycle completed", "failed_uploads", failedUploadsCount,
 		"soft_deleted_accounts", deletedAccountCount, "vacation_responses", vacationCount,
-		"auth_attempts", authCount, "health_statuses", healthCount, "s3_objects", len(successfulDeletes),
+		"health_statuses", healthCount, "s3_objects", len(successfulDeletes),
 		"pruned_bodies", prunedBodiesCount, "orphan_hashes", orphanHashCount, "finalized_accounts", finalizedAccountCount)
 
 	return nil

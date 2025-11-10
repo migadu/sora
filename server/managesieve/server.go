@@ -139,7 +139,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, rdb, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, options.TrustedNetworks)
 
 	serverInstance := &ManageSieveServer{
 		hostname:               hostname,

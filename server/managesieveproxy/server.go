@@ -182,7 +182,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.AuthRateLimit, rdb, opts.TrustedProxies)
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.AuthRateLimit, opts.TrustedProxies)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter

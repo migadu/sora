@@ -206,7 +206,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.AuthRateLimit, rdb, options.TrustedProxies)
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.AuthRateLimit, options.TrustedProxies)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter

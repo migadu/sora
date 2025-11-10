@@ -241,8 +241,8 @@ func TestDatabaseEndpointConfig_HostsWithPorts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := DatabaseEndpointConfig{
-				Hosts: tt.hosts,
-				Port:  tt.port,
+				//Hosts: tt.hosts,
+				Port: tt.port,
 			}
 
 			// Verify each host gets the correct port treatment

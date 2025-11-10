@@ -246,7 +246,6 @@ type CleanupConfig struct {
 	WakeInterval          string `toml:"wake_interval"`
 	MaxAgeRestriction     string `toml:"max_age_restriction"`
 	FTSRetention          string `toml:"fts_retention"`
-	AuthAttemptsRetention string `toml:"auth_attempts_retention"`
 	HealthStatusRetention string `toml:"health_status_retention"`
 }
 
@@ -280,14 +279,6 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 		return 730 * 24 * time.Hour, nil // 2 years default
 	}
 	return helpers.ParseDuration(c.FTSRetention)
-}
-
-// GetAuthAttemptsRetention parses the auth attempts retention duration
-func (c *CleanupConfig) GetAuthAttemptsRetention() (time.Duration, error) {
-	if c.AuthAttemptsRetention == "" {
-		return 7 * 24 * time.Hour, nil // 7 days default
-	}
-	return helpers.ParseDuration(c.AuthAttemptsRetention)
 }
 
 // GetHealthStatusRetention parses the health status retention duration
@@ -405,9 +396,6 @@ type AuthRateLimiterConfig struct {
 	MaxDelay             time.Duration `toml:"max_delay"`              // Maximum delay duration
 	DelayMultiplier      float64       `toml:"delay_multiplier"`       // Delay increase factor
 	CacheCleanupInterval time.Duration `toml:"cache_cleanup_interval"` // How often to clean in-memory cache
-	DBSyncInterval       time.Duration `toml:"db_sync_interval"`       // How often to sync attempt batches to database
-	MaxPendingBatch      int           `toml:"max_pending_batch"`      // Max records before a forced batch sync
-	DBErrorThreshold     time.Duration `toml:"db_error_threshold"`     // Wait time before retrying DB after an error
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -428,9 +416,6 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 		MaxDelay:             30 * time.Second, // Max 30 second delay
 		DelayMultiplier:      2.0,              // Double delay each time
 		CacheCleanupInterval: 10 * time.Minute, // Clean in-memory cache every 10 min
-		DBSyncInterval:       30 * time.Second, // Sync batches every 30 seconds
-		MaxPendingBatch:      100,              // Max 100 records before force sync
-		DBErrorThreshold:     1 * time.Minute,  // Wait 1 minute after DB error
 	}
 }
 
@@ -1376,7 +1361,6 @@ func NewDefaultConfig() Config {
 			GracePeriod:           "14d",
 			WakeInterval:          "1h",
 			FTSRetention:          "730d", // 2 years default
-			AuthAttemptsRetention: "7d",
 			HealthStatusRetention: "30d",
 		},
 		LocalCache: LocalCacheConfig{
@@ -1903,15 +1887,6 @@ func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 	if err != nil {
 		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (2 years)", err)
 		return 730 * 24 * time.Hour
-	}
-	return retention
-}
-
-func (c *CleanupConfig) GetAuthAttemptsRetentionWithDefault() time.Duration {
-	retention, err := c.GetAuthAttemptsRetention()
-	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup auth_attempts_retention: %v, using default (7 days)", err)
-		return 7 * 24 * time.Hour
 	}
 	return retention
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 )
 
@@ -28,6 +29,7 @@ type Server struct {
 	rdb            *resilient.ResilientDatabase
 	storage        *storage.S3Storage
 	cache          *cache.Cache
+	authLimiter    *server.AuthRateLimiter
 	server         *http.Server
 	tls            bool
 	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
@@ -47,6 +49,7 @@ type ServerOptions struct {
 	AllowedHosts   []string
 	Storage        *storage.S3Storage
 	Cache          *cache.Cache
+	AuthRateLimit  server.AuthRateLimiterConfig
 	TLS            bool
 	TLSConfig      *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile    string
@@ -78,6 +81,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		}
 	}
 
+	// Create auth rate limiter
+	authLimiter := server.NewAuthRateLimiter("user-api", options.AuthRateLimit)
+
 	s := &Server{
 		name:           options.Name,
 		addr:           options.Addr,
@@ -89,6 +95,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		rdb:            rdb,
 		storage:        options.Storage,
 		cache:          options.Cache,
+		authLimiter:    authLimiter,
 		tls:            options.TLS,
 		tlsConfig:      options.TLSConfig,
 		tlsCertFile:    options.TLSCertFile,

@@ -121,7 +121,6 @@ func newDefaultAdminConfig() AdminConfig {
 			GracePeriod:           "14d",  // 14 days
 			WakeInterval:          "1h",   // 1 hour
 			FTSRetention:          "730d", // 2 years default
-			AuthAttemptsRetention: "7d",   // 7 days
 			HealthStatusRetention: "30d",  // 30 days
 		},
 	}
@@ -305,7 +304,7 @@ func handleStatsCommand(ctx context.Context) {
 	subcommand := os.Args[2]
 	switch subcommand {
 	case "auth":
-		handleAuthStats(ctx)
+		handleAuthStatsCommand(ctx)
 	case "connection":
 		handleConnectionStats(ctx)
 	case "help", "--help", "-h":
@@ -3428,6 +3427,163 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
+func handleAuthStatsCommand(ctx context.Context) {
+	// Parse auth-stats specific flags
+	fs := flag.NewFlagSet("stats auth", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Show authentication rate limiting statistics
+
+Usage:
+  sora-admin stats auth [options]
+
+Options:
+  --config string       Path to TOML configuration file (required)
+
+NOTE: Authentication rate limiting uses in-memory tracking:
+      - Local mode: Per-server in-memory counters
+      - Cluster mode: Synchronized via gossip (50-200ms latency)
+      Statistics are retrieved via HTTP Admin API.
+
+This command shows:
+  - Implementation mode (in-memory)
+  - Available statistics (blocked_ips, tracked_ips, tracked_usernames)
+  - Access methods (Prometheus, logs, API)
+  - Notes about database persistence (removed)
+
+Examples:
+  sora-admin stats auth --config config.toml
+`)
+	}
+
+	// Parse the remaining arguments
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *configPath == "" {
+		fmt.Printf("Error: --config is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Load configuration
+	cfg := newDefaultAdminConfig()
+	if err := loadAdminConfig(*configPath, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			logger.Fatalf("ERROR: specified configuration file '%s' not found: %v", *configPath, err)
+		} else {
+			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
+		}
+	}
+
+	// Show auth stats
+	if err := showAuthStats(ctx, cfg); err != nil {
+		logger.Fatalf("Failed to get auth stats: %v", err)
+	}
+}
+
+func showAuthStats(ctx context.Context, cfg AdminConfig) error {
+	// Create HTTP API client
+	client, err := createHTTPAPIClient(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
+	}
+
+	// Build URL
+	url := fmt.Sprintf("%s/admin/auth/stats", cfg.HTTPAPIAddr)
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get auth stats: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API request failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Display results
+	fmt.Println("Authentication Rate Limiting - In-Memory Stats")
+	fmt.Println(strings.Repeat("=", 50))
+	fmt.Println()
+
+	// Implementation mode
+	if impl, ok := result["implementation"].(string); ok {
+		fmt.Printf("Implementation: %s\n\n", impl)
+	}
+
+	// Tracking modes
+	if modes, ok := result["tracking_mode"].(map[string]any); ok {
+		fmt.Println("Tracking Modes:")
+		if local, ok := modes["local"].(string); ok {
+			fmt.Printf("  • Local:   %s\n", local)
+		}
+		if cluster, ok := modes["cluster"].(string); ok {
+			fmt.Printf("  • Cluster: %s\n", cluster)
+		}
+		fmt.Println()
+	}
+
+	// Available stats
+	if stats, ok := result["available_stats"].([]any); ok && len(stats) > 0 {
+		fmt.Println("Available Statistics:")
+		for _, stat := range stats {
+			if s, ok := stat.(string); ok {
+				fmt.Printf("  • %s\n", s)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Access methods
+	if methods, ok := result["access_methods"].([]any); ok && len(methods) > 0 {
+		fmt.Println("Access Methods:")
+		for i, method := range methods {
+			if m, ok := method.(string); ok {
+				fmt.Printf("  %d. %s\n", i+1, m)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Note
+	if note, ok := result["note"].(string); ok {
+		fmt.Printf("Note: %s\n", note)
+	}
+
+	// Database table removal info
+	if dbInfo, ok := result["database_table_removed"].(string); ok {
+		fmt.Printf("      %s\n", dbInfo)
+	}
+
+	return nil
+}
+
 func handleConnectionStats(ctx context.Context) {
 	// Parse connection-stats specific flags
 	fs := flag.NewFlagSet("stats connection", flag.ExitOnError)
@@ -3643,125 +3799,6 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 	}
 
 	return nil
-}
-
-func handleAuthStats(ctx context.Context) {
-	// Parse auth-stats specific flags
-	fs := flag.NewFlagSet("stats auth", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
-	windowDuration := fs.String("window", "15m", "Time window for statistics (e.g., '15m', '1h', '24h')")
-	showBlocked := fs.Bool("blocked", true, "Show currently blocked IPs and usernames")
-	showStats := fs.Bool("stats", true, "Show overall authentication statistics")
-	maxAttemptsIP := fs.Int("max-attempts-ip", 10, "Max attempts per IP for blocking threshold")
-	maxAttemptsUsername := fs.Int("max-attempts-username", 5, "Max attempts per username for blocking threshold")
-
-	// Database connection flags (overrides from config file)
-
-	fs.Usage = func() {
-		fmt.Printf(`Show authentication statistics and blocked IPs
-Usage:
-  sora-admin auth-stats [options]
-
-Options:
-  --window string               Time window for statistics (default: "15m")
-  --blocked                     Show currently blocked IPs and usernames (default: true)
-  --stats                       Show overall authentication statistics (default: true)
-  --max-attempts-ip int         Max attempts per IP for blocking threshold (default: 10)
-  --max-attempts-username int   Max attempts per username for blocking threshold (default: 5)
-  --config string              Path to TOML configuration file (required)
-
-
-Examples:
-  sora-admin auth-stats                                    # Show stats for last 15 minutes
-  sora-admin auth-stats --window 1h --blocked             # Show blocked IPs in last hour
-  sora-admin auth-stats --window 24h --stats              # Show 24-hour auth statistics
-`)
-	}
-
-	err := fs.Parse(os.Args[2:])
-	if err != nil {
-		logger.Fatalf("Failed to parse flags: %v", err)
-	}
-
-	// Parse window duration
-	window, err := time.ParseDuration(*windowDuration)
-	if err != nil {
-		logger.Fatalf("Invalid window duration '%s': %v", *windowDuration, err)
-	}
-
-	// Load configuration
-	var adminConfig AdminConfig
-	if err := loadAdminConfig(*configPath, &adminConfig); err != nil {
-		logger.Fatalf("Failed to load config: %v", err)
-	}
-
-	// Create context for database operations
-
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &adminConfig.Database, false, false)
-	if err != nil {
-		logger.Fatalf("Failed to initialize resilient database: %v", err)
-	}
-	defer rdb.Close()
-
-	fmt.Printf("Authentication Statistics and Blocked IPs\n")
-	fmt.Printf("Window: %s\n", window)
-	fmt.Printf("Generated at: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
-
-	// Show general auth statistics
-	if *showStats {
-		stats, err := rdb.GetAuthAttemptsStatsWithRetry(ctx, window)
-		if err != nil {
-			logger.Info("Failed to get auth statistics", "error", err)
-		} else {
-			fmt.Printf("Overall Statistics (last %s):\n", window)
-			fmt.Printf("  Total Attempts:     %v\n", stats["total_attempts"])
-			fmt.Printf("  Failed Attempts:    %v\n", stats["failed_attempts"])
-			fmt.Printf("  Success Rate:       %.2f%%\n", stats["success_rate"])
-			fmt.Printf("  Unique IPs:         %v\n", stats["unique_ips"])
-			fmt.Printf("  Unique Usernames:   %v\n", stats["unique_usernames"])
-			fmt.Printf("  Unique Protocols:   %v\n", stats["unique_protocols"])
-			fmt.Printf("\n")
-		}
-	}
-
-	// Show currently blocked IPs and usernames
-	if *showBlocked {
-		blocked, err := rdb.GetBlockedIPsWithRetry(ctx, window, window, *maxAttemptsIP, *maxAttemptsUsername)
-		if err != nil {
-			logger.Info("Failed to get blocked IPs", "error", err)
-		} else {
-			if len(blocked) > 0 {
-				fmt.Printf("Currently Blocked (exceeding thresholds):\n")
-				fmt.Printf("%-12s %-25s %-8s %-20s %-20s %-25s\n", "Type", "Identifier", "Failures", "First Failure", "Last Failure", "Username")
-				fmt.Printf("%s\n", strings.Repeat("-", 115))
-
-				for _, block := range blocked {
-					blockType := block["block_type"].(string)
-					identifier := block["identifier"].(string)
-					failureCount := block["failure_count"].(int)
-					firstFailure := block["first_failure"].(time.Time)
-					lastFailure := block["last_failure"].(time.Time)
-
-					username := ""
-					if block["username"] != nil {
-						username = block["username"].(string)
-					}
-
-					fmt.Printf("%-12s %-25s %-8d %-20s %-20s %-25s\n",
-						blockType,
-						identifier,
-						failureCount,
-						firstFailure.Format("2006-01-02 15:04:05"),
-						lastFailure.Format("2006-01-02 15:04:05"),
-						username)
-				}
-				fmt.Printf("\nTotal blocked: %d\n", len(blocked))
-			} else {
-				fmt.Printf("No currently blocked IPs or usernames (exceeding %d failures per IP, %d per username).\n", *maxAttemptsIP, *maxAttemptsUsername)
-			}
-		}
-	}
 }
 
 func handleHealthCommand(ctx context.Context) {

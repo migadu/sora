@@ -14,6 +14,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/server"
 )
 
 // contextKey is a custom type for context keys to avoid collisions
@@ -67,10 +68,30 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Get client IP for rate limiting
+	clientIP := getClientIP(r)
+	remoteAddr := &server.StringAddr{Addr: clientIP}
+
+	// Apply progressive authentication delay BEFORE any other checks
+	server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN")
+
+	// Check authentication rate limiting
+	if s.authLimiter != nil {
+		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, req.Email); err != nil {
+			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
+			s.writeError(w, http.StatusTooManyRequests, "Too many authentication attempts. Please try again later.")
+			return
+		}
+	}
+
 	// Authenticate user
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
+			// Record failed attempt
+			if s.authLimiter != nil {
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+			}
 			// Don't reveal whether user exists or not
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
@@ -82,8 +103,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
+		// Record failed attempt
+		if s.authLimiter != nil {
+			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+		}
 		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 		return
+	}
+
+	// Record successful attempt
+	if s.authLimiter != nil {
+		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, true)
 	}
 
 	// Generate JWT token

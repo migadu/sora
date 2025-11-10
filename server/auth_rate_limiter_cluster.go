@@ -22,6 +22,12 @@ const (
 
 	// RateLimitEventFailureCount indicates progressive delay failure count update
 	RateLimitEventFailureCount RateLimitEventType = "FAILURE_COUNT"
+
+	// RateLimitEventUsernameFailure indicates a username authentication failure
+	RateLimitEventUsernameFailure RateLimitEventType = "USERNAME_FAILURE"
+
+	// RateLimitEventUsernameSuccess indicates a username authentication success (clears failures)
+	RateLimitEventUsernameSuccess RateLimitEventType = "USERNAME_SUCCESS"
 )
 
 // RateLimitEvent represents a cluster-wide rate limiting event
@@ -39,6 +45,9 @@ type RateLimitEvent struct {
 
 	// For FAILURE_COUNT events (progressive delays)
 	LastDelay time.Duration `json:"last_delay,omitempty"`
+
+	// For USERNAME_FAILURE and USERNAME_SUCCESS events
+	Username string `json:"username,omitempty"`
 }
 
 // ClusterRateLimiter wraps an AuthRateLimiter with cluster synchronization
@@ -145,12 +154,40 @@ func (crl *ClusterRateLimiter) BroadcastFailureCount(ip string, failureCount int
 	crl.queueEvent(event)
 }
 
+// BroadcastUsernameFailure broadcasts a username authentication failure to the cluster
+func (crl *ClusterRateLimiter) BroadcastUsernameFailure(username string) {
+	// Username tracking always syncs when cluster is enabled
+	event := RateLimitEvent{
+		Type:      RateLimitEventUsernameFailure,
+		Username:  username,
+		Timestamp: time.Now(),
+		NodeID:    crl.clusterManager.GetNodeID(),
+	}
+
+	crl.queueEvent(event)
+}
+
+// BroadcastUsernameSuccess broadcasts a username authentication success (clears failures)
+func (crl *ClusterRateLimiter) BroadcastUsernameSuccess(username string) {
+	// Username tracking always syncs when cluster is enabled
+	event := RateLimitEvent{
+		Type:      RateLimitEventUsernameSuccess,
+		Username:  username,
+		Timestamp: time.Now(),
+		NodeID:    crl.clusterManager.GetNodeID(),
+	}
+
+	crl.queueEvent(event)
+}
+
 // queueEvent adds an event to the broadcast queue
 func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 	crl.queueMu.Lock()
 	defer crl.queueMu.Unlock()
 
 	crl.broadcastQueue = append(crl.broadcastQueue, event)
+	logger.Info("CLUSTER-LIMITER: Event queued for broadcast", "protocol", crl.limiter.protocol,
+		"type", event.Type, "ip", event.IP, "username", event.Username, "queue_size", len(crl.broadcastQueue))
 }
 
 // GetBroadcasts returns events to broadcast (called by cluster manager)
@@ -158,15 +195,20 @@ func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
 	crl.queueMu.Lock()
 	defer crl.queueMu.Unlock()
 
-	if len(crl.broadcastQueue) == 0 {
+	queueLen := len(crl.broadcastQueue)
+	if queueLen == 0 {
 		return nil
 	}
+
+	logger.Info("CLUSTER-LIMITER: GetBroadcasts called", "protocol", crl.limiter.protocol,
+		"queued_events", queueLen, "overhead", overhead, "limit", limit)
 
 	broadcasts := make([][]byte, 0, len(crl.broadcastQueue))
 	totalSize := 0
 
 	for i := 0; i < len(crl.broadcastQueue); i++ {
-		encoded, err := encodeRateLimitEvent(crl.broadcastQueue[i])
+		event := crl.broadcastQueue[i]
+		encoded, err := encodeRateLimitEvent(event)
 		if err != nil {
 			logger.Warn("Cluster limiter: Failed to encode rate limit event", "error", err)
 			continue
@@ -177,15 +219,20 @@ func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
 		if totalSize+msgSize > limit && len(broadcasts) > 0 {
 			// Keep remaining events for next broadcast
 			crl.broadcastQueue = crl.broadcastQueue[i:]
+			logger.Debug("CLUSTER-LIMITER: Broadcast limit reached, queuing remaining",
+				"broadcasted", i, "remaining", len(crl.broadcastQueue))
 			return broadcasts
 		}
 
 		broadcasts = append(broadcasts, encoded)
 		totalSize += msgSize
+		logger.Debug("CLUSTER-LIMITER: Queued event for broadcast", "type", event.Type,
+			"ip", event.IP, "username", event.Username)
 	}
 
 	// All events broadcasted, clear queue
 	crl.broadcastQueue = crl.broadcastQueue[:0]
+	logger.Debug("CLUSTER-LIMITER: Broadcasting all events", "count", len(broadcasts))
 	return broadcasts
 }
 
@@ -216,6 +263,10 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 		crl.handleUnblockIP(event)
 	case RateLimitEventFailureCount:
 		crl.handleFailureCount(event)
+	case RateLimitEventUsernameFailure:
+		crl.handleUsernameFailure(event)
+	case RateLimitEventUsernameSuccess:
+		crl.handleUsernameSuccess(event)
 	default:
 		logger.Warn("Cluster limiter: Unknown rate limit event type", "type", event.Type)
 	}
@@ -295,6 +346,43 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	}
 
 	logger.Debug("Cluster limiter: Updated failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID, "failures", event.FailureCount, "delay", event.LastDelay)
+}
+
+// handleUsernameFailure applies a username failure from another node
+func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
+	if event.Username == "" {
+		return
+	}
+
+	crl.limiter.usernameMu.Lock()
+	defer crl.limiter.usernameMu.Unlock()
+
+	info, exists := crl.limiter.usernameFailureCounts[event.Username]
+	if !exists {
+		info = &UsernameFailureInfo{FirstFailure: event.Timestamp}
+		crl.limiter.usernameFailureCounts[event.Username] = info
+	}
+
+	// Increment failure count (each node broadcasts its local failure)
+	info.FailureCount++
+	info.LastFailure = event.Timestamp
+
+	logger.Debug("CLUSTER-LIMITER: Applied username failure from cluster", "protocol", crl.limiter.protocol,
+		"username", event.Username, "from_node", event.NodeID, "total_failures", info.FailureCount)
+}
+
+// handleUsernameSuccess clears username failures (successful auth)
+func (crl *ClusterRateLimiter) handleUsernameSuccess(event RateLimitEvent) {
+	if event.Username == "" {
+		return
+	}
+
+	crl.limiter.usernameMu.Lock()
+	delete(crl.limiter.usernameFailureCounts, event.Username)
+	crl.limiter.usernameMu.Unlock()
+
+	logger.Debug("CLUSTER-LIMITER: Cleared username failures from cluster", "protocol", crl.limiter.protocol,
+		"username", event.Username, "from_node", event.NodeID)
 }
 
 // broadcastRoutine periodically triggers broadcasts

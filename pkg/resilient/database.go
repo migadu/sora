@@ -177,7 +177,14 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	querySettings.Timeout = 45 * time.Second
 	querySettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
 		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 8 && failureRatio >= 0.6
+		shouldTrip := counts.Requests >= 8 && failureRatio >= 0.6
+		if shouldTrip {
+			logger.Warn("Query circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
+				"requests", counts.Requests, "failures", counts.TotalFailures,
+				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+				"consecutive_failures", counts.ConsecutiveFailures)
+		}
+		return shouldTrip
 	}
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
@@ -206,7 +213,14 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	writeSettings.Timeout = 30 * time.Second
 	writeSettings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
 		failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= 5 && failureRatio >= 0.5
+		shouldTrip := counts.Requests >= 5 && failureRatio >= 0.5
+		if shouldTrip {
+			logger.Warn("Write circuit breaker ready to trip", "component", "RESILIENT-FAILOVER",
+				"requests", counts.Requests, "failures", counts.TotalFailures,
+				"failure_ratio", fmt.Sprintf("%.2f%%", failureRatio*100),
+				"consecutive_failures", counts.ConsecutiveFailures)
+		}
+		return shouldTrip
 	}
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
@@ -530,6 +544,13 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		})
 
 		if cbErr != nil {
+			// Log circuit breaker state to understand failure patterns
+			state := rd.writeBreaker.State()
+			counts := rd.writeBreaker.Counts()
+			logger.Warn("Write operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
+				"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
+				"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
+
 			if !rd.isRetryableError(cbErr) {
 				return retry.Stop(cbErr)
 			}

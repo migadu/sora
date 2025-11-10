@@ -657,17 +657,6 @@ grep "database" /var/log/sora.log | grep -i "pool\|connection"
 grep "circuit breaker" /var/log/sora.log
 ```
 
-#### Authentication Failures
-```bash
-# Check rate limiting
-grep "rate limit" /var/log/sora.log
-
-# View authentication statistics
-./sora-admin stats auth --config config.toml
-
-# Check blocked IPs (in database)
-psql -c "SELECT ip, blocked_until FROM auth_attempts WHERE blocked_until > now()"
-```
 
 #### Cluster Issues
 ```bash

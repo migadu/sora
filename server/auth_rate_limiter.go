@@ -33,22 +33,6 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	return config.DefaultAuthRateLimiterConfig()
 }
 
-// AuthAttempt represents a single authentication attempt
-type AuthAttempt struct {
-	Timestamp time.Time
-	Success   bool
-	IP        string
-	Username  string
-}
-
-// AuthDatabase interface for rate limiting database operations
-type AuthDatabase interface {
-	RecordAuthAttemptWithRetry(ctx context.Context, ipAddress, username, protocol string, success bool) error
-	GetFailedAttemptsCountSeparateWindowsWithRetry(ctx context.Context, ipAddress, username string, ipWindowDuration, usernameWindowDuration time.Duration) (ipCount, usernameCount int, err error)
-	CleanupOldAuthAttemptsWithRetry(ctx context.Context, maxAge time.Duration) (int64, error)
-	GetAuthAttemptsStats(ctx context.Context, windowDuration time.Duration) (map[string]any, error)
-}
-
 // AuthLimiter interface that both AuthRateLimiter and EnhancedAuthRateLimiter implement
 type AuthLimiter interface {
 	CanAttemptAuth(ctx context.Context, remoteAddr net.Addr, username string) error
@@ -63,7 +47,6 @@ type AuthLimiter interface {
 // AuthRateLimiter provides fast IP blocking and progressive delays
 type AuthRateLimiter struct {
 	config   AuthRateLimiterConfig
-	db       AuthDatabase
 	protocol string
 
 	// Trusted networks for exemption
@@ -77,21 +60,14 @@ type AuthRateLimiter struct {
 	ipFailureCounts map[string]*IPFailureInfo
 	delayMu         sync.RWMutex
 
-	// Database sync for persistence
-	pendingRecords []AuthAttempt
-	pendingMu      sync.Mutex
-	dbSyncInterval time.Duration
-
-	// Circuit breaker for database protection
-	dbHealthy        bool
-	lastDBError      time.Time
-	dbErrorThreshold time.Duration
+	// Username failure tracking (cluster-synchronized)
+	usernameFailureCounts map[string]*UsernameFailureInfo
+	usernameMu            sync.RWMutex
 
 	// Cluster integration (optional)
 	clusterLimiter *ClusterRateLimiter
 
 	stopCleanup chan struct{}
-	stopSync    chan struct{}
 }
 
 // BlockedIPInfo tracks IPs that are temporarily blocked
@@ -111,35 +87,36 @@ type IPFailureInfo struct {
 	LastDelay    time.Duration
 }
 
+// UsernameFailureInfo tracks failure counts per username (cluster-synchronized)
+type UsernameFailureInfo struct {
+	FailureCount int
+	FirstFailure time.Time
+	LastFailure  time.Time
+}
+
 // NewAuthRateLimiter creates a new authentication rate limiter.
-func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig, rdb AuthDatabase) *AuthRateLimiter {
-	return NewAuthRateLimiterWithTrustedNetworks(protocol, config, rdb, nil)
+func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig) *AuthRateLimiter {
+	return NewAuthRateLimiterWithTrustedNetworks(protocol, config, nil)
 }
 
 // NewAuthRateLimiterWithTrustedNetworks creates a new authentication rate limiter with trusted networks exemption.
-func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimiterConfig, rdb AuthDatabase, trustedNetworks []string) *AuthRateLimiter {
+func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimiterConfig, trustedNetworks []string) *AuthRateLimiter {
 	if !config.Enabled {
 		return nil
 	}
 
 	limiter := &AuthRateLimiter{
-		config:           config,
-		db:               rdb,
-		protocol:         protocol,
-		trustedNetworks:  trustedNetworks,
-		blockedIPs:       make(map[string]*BlockedIPInfo),
-		ipFailureCounts:  make(map[string]*IPFailureInfo),
-		pendingRecords:   make([]AuthAttempt, 0, config.MaxPendingBatch),
-		dbSyncInterval:   config.DBSyncInterval,
-		dbHealthy:        true,
-		dbErrorThreshold: config.DBErrorThreshold,
-		stopCleanup:      make(chan struct{}),
-		stopSync:         make(chan struct{}),
+		config:                config,
+		protocol:              protocol,
+		trustedNetworks:       trustedNetworks,
+		blockedIPs:            make(map[string]*BlockedIPInfo),
+		ipFailureCounts:       make(map[string]*IPFailureInfo),
+		usernameFailureCounts: make(map[string]*UsernameFailureInfo),
+		stopCleanup:           make(chan struct{}),
 	}
 
-	// Start background routines
+	// Start background cleanup routine
 	go limiter.cleanupRoutine(config.CacheCleanupInterval)
-	go limiter.syncRoutine()
 
 	logger.Debug("Auth limiter: Initialized", "protocol", protocol, "fast_block_threshold", config.FastBlockThreshold, "fast_block_duration", config.FastBlockDuration, "delay_start_threshold", config.DelayStartThreshold, "max_delay", config.MaxDelay)
 
@@ -182,27 +159,17 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 		a.blockMu.RUnlock()
 	}
 
-	// Regular rate limiting check (database if healthy, otherwise deny)
-	if a.shouldCheckDatabase() {
-		ipCount, usernameCount, err := a.db.GetFailedAttemptsCountSeparateWindowsWithRetry(
-			ctx, ip, username, a.config.IPWindowDuration, a.config.UsernameWindowDuration)
-
-		if err != nil {
-			a.markDBUnhealthy()
-			logger.Debug("Auth limiter: CRITICAL - database check failed, denying auth for security", "protocol", a.protocol, "error", err)
-			// Fail closed - deny authentication when database is unavailable
-			// This prevents attackers from bypassing rate limiting by causing DB errors
-			return fmt.Errorf("authentication rate limiting unavailable, access temporarily denied for security")
-		}
-
-		if a.config.MaxAttemptsPerIP > 0 && ipCount >= a.config.MaxAttemptsPerIP {
-			return fmt.Errorf("too many failed authentication attempts from IP %s (%d/%d in %v)",
-				ip, ipCount, a.config.MaxAttemptsPerIP, a.config.IPWindowDuration)
-		}
-
-		if a.config.MaxAttemptsPerUsername > 0 && username != "" && usernameCount >= a.config.MaxAttemptsPerUsername {
-			return fmt.Errorf("too many failed authentication attempts for user %s (%d/%d in %v)",
-				username, usernameCount, a.config.MaxAttemptsPerUsername, a.config.UsernameWindowDuration)
+	// Check username-based limit using in-memory tracking
+	// In cluster mode, this is synchronized via gossip. Without cluster, it's local only.
+	if a.config.MaxAttemptsPerUsername > 0 && username != "" {
+		usernameCount := a.getUsernameFailureCount(username)
+		if usernameCount >= a.config.MaxAttemptsPerUsername {
+			if a.clusterLimiter != nil {
+				return fmt.Errorf("too many failed authentication attempts for user %s (%d/%d cluster-wide)",
+					username, usernameCount, a.config.MaxAttemptsPerUsername)
+			}
+			return fmt.Errorf("too many failed authentication attempts for user %s (%d/%d)",
+				username, usernameCount, a.config.MaxAttemptsPerUsername)
 		}
 	}
 
@@ -294,14 +261,16 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 	}
 
 	now := time.Now()
-	attempt := AuthAttempt{Timestamp: now, Success: success, IP: ip, Username: username}
-	a.queueForDBSync(attempt)
 
 	if !success {
+		// Failed authentication: track both IP and username
 		a.updateFailureTracking(ip, now)
+		a.updateUsernameFailure(username, now)
 		logger.Debug("Auth limiter: Failed authentication attempt", "protocol", a.protocol, "ip", ip, "user", username)
 	} else {
+		// Successful authentication: clear tracking for both IP and username
 		a.clearFailureTracking(ip)
+		a.clearUsernameFailure(username)
 		logger.Debug("Auth limiter: Successful authentication", "protocol", a.protocol, "ip", ip, "user", username)
 	}
 }
@@ -388,79 +357,69 @@ func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
 }
 
-func (a *AuthRateLimiter) queueForDBSync(attempt AuthAttempt) {
-	a.pendingMu.Lock()
-	defer a.pendingMu.Unlock()
-	a.pendingRecords = append(a.pendingRecords, attempt)
-	if len(a.pendingRecords) >= a.config.MaxPendingBatch {
-		go a.syncPendingRecords()
+// updateUsernameFailure tracks username authentication failures (cluster-synchronized)
+func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime time.Time) {
+	if username == "" {
+		return // Skip empty usernames
+	}
+
+	a.usernameMu.Lock()
+	defer a.usernameMu.Unlock()
+
+	info, exists := a.usernameFailureCounts[username]
+	if !exists {
+		info = &UsernameFailureInfo{FirstFailure: failureTime}
+		a.usernameFailureCounts[username] = info
+	}
+
+	info.FailureCount++
+	info.LastFailure = failureTime
+
+	// Broadcast to cluster
+	if a.clusterLimiter != nil {
+		a.clusterLimiter.BroadcastUsernameFailure(username)
 	}
 }
 
-func (a *AuthRateLimiter) shouldCheckDatabase() bool {
-	if !a.dbHealthy {
-		if time.Since(a.lastDBError) < a.config.DBErrorThreshold {
-			return false
-		}
-		a.dbHealthy = true
+// clearUsernameFailure clears username failure tracking (cluster-synchronized)
+func (a *AuthRateLimiter) clearUsernameFailure(username string) {
+	if username == "" {
+		return // Skip empty usernames
 	}
-	return true
-}
 
-func (a *AuthRateLimiter) markDBUnhealthy() {
-	a.dbHealthy = false
-	a.lastDBError = time.Now()
-}
+	a.usernameMu.Lock()
+	delete(a.usernameFailureCounts, username)
+	a.usernameMu.Unlock()
 
-func (a *AuthRateLimiter) syncRoutine() {
-	ticker := time.NewTicker(a.dbSyncInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			a.syncPendingRecords()
-		case <-a.stopSync:
-			a.syncPendingRecords()
-			return
-		}
+	logger.Debug("Auth limiter: Cleared username failure tracking after successful login", "protocol", a.protocol, "username", username)
+
+	// Broadcast to cluster
+	if a.clusterLimiter != nil {
+		a.clusterLimiter.BroadcastUsernameSuccess(username)
 	}
 }
 
-func (a *AuthRateLimiter) syncPendingRecords() {
-	a.pendingMu.Lock()
-	if len(a.pendingRecords) == 0 {
-		a.pendingMu.Unlock()
-		return
+// getUsernameFailureCount returns the number of failures for a username
+func (a *AuthRateLimiter) getUsernameFailureCount(username string) int {
+	if username == "" {
+		return 0
 	}
-	records := make([]AuthAttempt, len(a.pendingRecords))
-	copy(records, a.pendingRecords)
-	a.pendingRecords = a.pendingRecords[:0]
-	a.pendingMu.Unlock()
 
-	// Use configured write timeout for database operations (auth attempt records are writes)
-	// Try to get timeout from resilient database if available, otherwise use default
-	writeTimeout := 10 * time.Second // Default fallback
-	if rdb, ok := a.db.(interface{ GetWriteTimeout() time.Duration }); ok {
-		writeTimeout = rdb.GetWriteTimeout()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-	defer cancel()
+	a.usernameMu.RLock()
+	defer a.usernameMu.RUnlock()
 
-	for i, record := range records {
-		if err := a.db.RecordAuthAttemptWithRetry(ctx, record.IP, record.Username, a.protocol, record.Success); err != nil {
-			logger.Debug("Auth limiter: Warning - failed to sync auth attempt", "protocol", a.protocol, "error", err)
-			a.markDBUnhealthy()
-			// Re-queue failed records
-			a.pendingMu.Lock()
-			a.pendingRecords = append(records[i:], a.pendingRecords...)
-			a.pendingMu.Unlock()
-			return
-		}
+	if info, exists := a.usernameFailureCounts[username]; exists {
+		return info.FailureCount
 	}
-	logger.Debug("Auth limiter: Synced auth attempts to database", "protocol", a.protocol, "count", len(records))
+	return 0
 }
 
 func (a *AuthRateLimiter) cleanupRoutine(interval time.Duration) {
+	// Handle zero or negative interval (skip cleanup)
+	if interval <= 0 {
+		interval = 10 * time.Minute // Default to 10 minutes if not set
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -505,39 +464,36 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 	if a == nil {
 		return map[string]any{"enabled": false}
 	}
+
+	// Collect in-memory stats
 	a.blockMu.RLock()
 	blockedCount := len(a.blockedIPs)
 	a.blockMu.RUnlock()
+
 	a.delayMu.RLock()
 	trackedIPs := len(a.ipFailureCounts)
 	a.delayMu.RUnlock()
-	a.pendingMu.Lock()
-	pendingCount := len(a.pendingRecords)
-	a.pendingMu.Unlock()
+
+	a.usernameMu.RLock()
+	trackedUsernames := len(a.usernameFailureCounts)
+	a.usernameMu.RUnlock()
 
 	stats := map[string]any{
-		"enabled":      true,
-		"blocked_ips":  blockedCount,
-		"tracked_ips":  trackedIPs,
-		"pending_sync": pendingCount,
-		"db_healthy":   a.dbHealthy,
+		"enabled":           true,
+		"blocked_ips":       blockedCount,
+		"tracked_ips":       trackedIPs,
+		"tracked_usernames": trackedUsernames,
+		"cluster_enabled":   a.clusterLimiter != nil,
 		"config": map[string]any{
 			"max_attempts_per_ip":       a.config.MaxAttemptsPerIP,
 			"max_attempts_per_username": a.config.MaxAttemptsPerUsername,
 			"ip_window_duration":        a.config.IPWindowDuration.String(),
 			"username_window_duration":  a.config.UsernameWindowDuration.String(),
+			"fast_block_threshold":      a.config.FastBlockThreshold,
+			"fast_block_duration":       a.config.FastBlockDuration.String(),
 		},
 	}
 
-	if a.shouldCheckDatabase() {
-		dbStats, err := a.db.GetAuthAttemptsStats(ctx, windowDuration)
-		if err != nil {
-			stats["db_stats_error"] = err.Error()
-			a.markDBUnhealthy()
-		} else {
-			stats["database"] = dbStats
-		}
-	}
 	return stats
 }
 
@@ -546,5 +502,4 @@ func (a *AuthRateLimiter) Stop() {
 		return
 	}
 	close(a.stopCleanup)
-	close(a.stopSync)
 }

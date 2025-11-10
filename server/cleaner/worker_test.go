@@ -42,10 +42,6 @@ func (m *mockDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Context,
 	args := m.Called(ctx, gracePeriod)
 	return args.Get(0).(int64), args.Error(1)
 }
-func (m *mockDatabase) CleanupOldAuthAttemptsWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
-	args := m.Called(ctx, retention)
-	return args.Get(0).(int64), args.Error(1)
-}
 func (m *mockDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
 	args := m.Called(ctx, retention)
 	return args.Get(0).(int64), args.Error(1)
@@ -109,7 +105,6 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	gracePeriod := 14 * 24 * time.Hour
 	maxAge := 365 * 24 * time.Hour
 	ftsRetention := 730 * 24 * time.Hour
-	authRetention := 7 * 24 * time.Hour
 	healthRetention := 30 * 24 * time.Hour
 
 	worker := &CleanupWorker{
@@ -119,7 +114,6 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAge,
 		ftsRetention:          ftsRetention,
-		authAttemptsRetention: authRetention,
 		healthStatusRetention: healthRetention,
 	}
 
@@ -130,7 +124,6 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, gracePeriod).Return(int64(2), nil).Once()
-	mockDB.On("CleanupOldAuthAttemptsWithRetry", ctx, authRetention).Return(int64(10), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, healthRetention).Return(int64(20), nil).Once()
 
 	// Phase 1: User-scoped cleanup
@@ -193,7 +186,6 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 		cache:                 mockCache,
 		maxAgeRestriction:     1 * time.Hour,
 		ftsRetention:          1 * time.Hour,
-		authAttemptsRetention: 1 * time.Hour,
 		healthStatusRetention: 1 * time.Hour,
 	}
 
@@ -208,7 +200,6 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
-	mockDB.On("CleanupOldAuthAttemptsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, criticalErr).Once()
 
@@ -230,7 +221,6 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 		s3:                    mockS3,
 		maxAgeRestriction:     1 * time.Hour,
 		ftsRetention:          1 * time.Hour,
-		authAttemptsRetention: 1 * time.Hour,
 		healthStatusRetention: 1 * time.Hour,
 	}
 
@@ -240,7 +230,6 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil)
-	mockDB.On("CleanupOldAuthAttemptsWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 
 	s3Err := errors.New("s3 is down")
@@ -270,7 +259,6 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
 		cache:                 mockCache,
-		authAttemptsRetention: 1 * time.Hour,
 		healthStatusRetention: 1 * time.Hour,
 	}
 
@@ -279,7 +267,6 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
-	mockDB.On("CleanupOldAuthAttemptsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
 	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()

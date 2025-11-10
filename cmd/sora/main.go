@@ -489,11 +489,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		wakeInterval := cfg.Cleanup.GetWakeIntervalWithDefault()
 		maxAgeRestriction := cfg.Cleanup.GetMaxAgeRestrictionWithDefault()
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
-		authAttemptsRetention := cfg.Cleanup.GetAuthAttemptsRetentionWithDefault()
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, authAttemptsRetention, healthStatusRetention, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cleanupErrChan)
 
 		// Start error listener for cleanup worker
 		go func() {

@@ -132,7 +132,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, rdb, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, options.TrustedNetworks)
 
 	server := &POP3Server{
 		hostname:               hostname,

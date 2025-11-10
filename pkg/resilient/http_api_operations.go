@@ -131,31 +131,3 @@ func (rd *ResilientDatabase) GetFailedUploadsWithRetry(ctx context.Context, maxA
 	}
 	return result.([]db.PendingUpload), nil
 }
-
-func (rd *ResilientDatabase) GetAuthAttemptsStatsWithRetry(ctx context.Context, windowDuration time.Duration) (map[string]any, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetAuthAttemptsStats(ctx, windowDuration)
-	}
-	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return map[string]any{}, nil
-	}
-	return result.(map[string]any), nil
-}
-
-func (rd *ResilientDatabase) GetBlockedIPsWithRetry(ctx context.Context, ipWindow, usernameWindow time.Duration, maxAttemptsIP, maxAttemptsUsername int) ([]map[string]any, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetBlockedIPs(ctx, ipWindow, usernameWindow, maxAttemptsIP, maxAttemptsUsername)
-	}
-	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []map[string]any{}, nil
-	}
-	return result.([]map[string]any), nil
-}

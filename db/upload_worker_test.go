@@ -27,7 +27,6 @@ func setupUploadWorkerTest(t *testing.T) *Database {
 		"cache_metrics",
 		"health_status",
 		"locks",
-		"auth_attempts",
 		"vacation_responses",
 		"sieve_scripts",
 		"pending_uploads",

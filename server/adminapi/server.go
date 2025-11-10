@@ -1417,32 +1417,26 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Parse query parameters
-	windowParam := r.URL.Query().Get("window")
-
-	windowDuration := 24 * time.Hour // Default to last 24 hours
-	if windowParam != "" {
-		var err error
-		windowDuration, err = time.ParseDuration(windowParam)
-		if err != nil {
-			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid window duration: %v", err))
-			return
-		}
-	}
-
-	stats, err := s.rdb.GetAuthAttemptsStatsWithRetry(ctx, windowDuration)
-	if err != nil {
-		logger.Warn("HTTP API: Error getting auth stats", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to get auth stats")
-		return
-	}
-
+	// Authentication rate limiting is now in-memory (gossip-synchronized in cluster mode)
+	// Each protocol server (IMAP, POP3, ManageSieve, proxies) maintains its own rate limiter
+	// This endpoint provides information about how to access those stats
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"stats":          stats,
-		"window":         windowDuration.String(),
-		"window_seconds": int64(windowDuration.Seconds()),
+		"implementation": "in-memory",
+		"tracking_mode": map[string]string{
+			"local":   "Per-server in-memory counters",
+			"cluster": "Synchronized via gossip (50-200ms latency)",
+		},
+		"available_stats": []string{
+			"blocked_ips: Currently blocked IP addresses",
+			"tracked_ips: IPs with failure history",
+			"tracked_usernames: Usernames with failures (cluster-wide in cluster mode)",
+			"cluster_enabled: Whether gossip synchronization is active",
+		},
+		"access_methods": []string{
+			"Prometheus metrics: sora_auth_* metrics",
+			"Server logs: Auth limiter debug logs (set log level to DEBUG)",
+			"Per-protocol stats: Each protocol server tracks its own stats",
+		},
 	})
 }
 

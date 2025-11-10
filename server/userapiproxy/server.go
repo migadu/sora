@@ -210,73 +210,102 @@ func (s *Server) setupHandler() http.Handler {
 		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy").Inc()
 		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy").Dec()
 
-		// Validate JWT token and extract claims
-		claims, err := s.extractAndValidateToken(r)
-		if err != nil {
-			logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		// Check if this is an authentication endpoint (no JWT required)
+		isAuthEndpoint := strings.HasPrefix(r.URL.Path, "/user/auth/")
+
+		if !isAuthEndpoint {
+			// Validate JWT token and extract claims for non-auth endpoints
+			claims, err := s.extractAndValidateToken(r)
+			if err != nil {
+				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			// Get backend for this user using consistent hash
+			backendAddr := s.connManager.GetBackendByConsistentHash(claims.Email)
+			if backendAddr == "" {
+				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email)
+				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
+			// Proxy authenticated request with user headers
+			s.proxyRequest(w, r, backendAddr, &claims.Email, &claims.AccountID)
 			return
 		}
 
-		// Get backend for this user using consistent hash
-		backendAddr := s.connManager.GetBackendByConsistentHash(claims.Email)
+		// For auth endpoints (login/refresh), use consistent hash with path as key
+		// This provides some distribution without needing user info
+		// Backend will handle rate limiting
+		backendAddr := s.connManager.GetBackendByConsistentHash(r.URL.Path)
 		if backendAddr == "" {
-			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email)
+			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path)
 			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
-		// Create reverse proxy to backend
-		scheme := "http"
-		if s.connManager.IsRemoteTLS() {
-			scheme = "https"
-		}
-
-		target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, backendAddr))
-		if err != nil {
-			logger.Warn("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		// Create reverse proxy
-		proxy := httputil.NewSingleHostReverseProxy(target)
-
-		// Configure TLS for backend connections
-		if s.connManager.IsRemoteTLS() {
-			proxy.Transport = &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: !s.connManager.IsRemoteTLSVerifyEnabled(),
-					Renegotiation:      tls.RenegotiateNever,
-				},
-				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			}
-		}
-
-		// Modify request
-		r.URL.Host = target.Host
-		r.URL.Scheme = target.Scheme
-		r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
-		r.Host = target.Host
-
-		// Add headers for backend to identify the authenticated user
-		// Backend should trust these headers from trusted proxy networks
-		r.Header.Set("X-Forwarded-User", claims.Email)
-		r.Header.Set("X-Forwarded-User-ID", fmt.Sprintf("%d", claims.AccountID))
-
-		// Keep Authorization header for backend verification if needed
-		// (Backend can choose to skip validation for trusted networks)
-
-		// Proxy the request
-		proxy.ServeHTTP(w, r)
+		// Proxy unauthenticated request (no user headers)
+		s.proxyRequest(w, r, backendAddr, nil, nil)
 	})
+}
+
+// proxyRequest proxies the request to the backend
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAddr string, userEmail *string, accountID *int64) {
+	// Create reverse proxy to backend
+	scheme := "http"
+	if s.connManager.IsRemoteTLS() {
+		scheme = "https"
+	}
+
+	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, backendAddr))
+	if err != nil {
+		logger.Warn("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Create reverse proxy
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Configure TLS for backend connections
+	if s.connManager.IsRemoteTLS() {
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: !s.connManager.IsRemoteTLSVerifyEnabled(),
+				Renegotiation:      tls.RenegotiateNever,
+			},
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+
+	// Modify request
+	r.URL.Host = target.Host
+	r.URL.Scheme = target.Scheme
+	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+	r.Host = target.Host
+
+	// Add headers for backend to identify the authenticated user (if authenticated)
+	// Backend should trust these headers from trusted proxy networks
+	if userEmail != nil {
+		r.Header.Set("X-Forwarded-User", *userEmail)
+	}
+	if accountID != nil {
+		r.Header.Set("X-Forwarded-User-ID", fmt.Sprintf("%d", *accountID))
+	}
+
+	// Keep Authorization header for backend verification if needed
+	// (Backend can choose to skip validation for trusted networks)
+
+	// Proxy the request
+	proxy.ServeHTTP(w, r)
 }
 
 // validateToken validates a JWT token and returns the claims

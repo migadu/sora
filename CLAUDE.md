@@ -480,7 +480,6 @@ The PostgreSQL schema is managed via migrations in `db/migrations/`. The current
 - **pending_uploads**: Messages queued for S3 upload
 - **sieve_scripts**: Per-account SIEVE filtering scripts
 - **vacation_responses**: Vacation response tracking to prevent loops
-- **auth_attempts**: Rate limiting and IP blocking data
 - **locks**: Distributed locking for cluster coordination
 - **health_status**: Component health tracking
 - **cache_metrics**: Cache performance metrics

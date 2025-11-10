@@ -83,7 +83,6 @@ reset-test-db:
 		TRUNCATE TABLE credentials CASCADE; \
 		TRUNCATE TABLE accounts CASCADE; \
 		TRUNCATE TABLE metadata CASCADE; \
-		TRUNCATE TABLE auth_attempts CASCADE; \
 		TRUNCATE TABLE health_status CASCADE; \
 		TRUNCATE TABLE cache_metrics CASCADE; \
 		SET session_replication_role = DEFAULT;" > /dev/null 2>&1 || true

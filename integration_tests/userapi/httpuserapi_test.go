@@ -17,6 +17,7 @@ import (
 
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/userapi"
 )
 
@@ -1116,4 +1117,188 @@ func TestHTTPUserAPI_TLS_WithoutInsecureSkipVerify(t *testing.T) {
 	}
 
 	t.Logf("✓ TLS certificate verification correctly fails for self-signed cert: %v", err)
+}
+
+// TestAuthRateLimiting tests authentication rate limiting on the User API
+func TestAuthRateLimiting(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	t.Run("IP_Blocking_After_Failed_Attempts", func(t *testing.T) {
+		// Setup database and account
+		rdb := common.SetupTestDatabase(t)
+		account := common.CreateTestAccount(t, rdb)
+
+		// Create server with aggressive rate limiting
+		serverOptions := userapi.ServerOptions{
+			Name:          "test-server-rate-limit-1",
+			Addr:          "127.0.0.1:0",
+			JWTSecret:     "test-secret-key",
+			TokenDuration: 1 * time.Hour,
+			TokenIssuer:   "test-issuer",
+			Storage:       nil,
+			Cache:         nil,
+			TLS:           false,
+			AuthRateLimit: server.AuthRateLimiterConfig{
+				Enabled:            true,
+				FastBlockThreshold: 3, // Block after 3 failures
+				FastBlockDuration:  1 * time.Minute,
+				IPWindowDuration:   5 * time.Minute,
+			},
+		}
+
+		srv, err := userapi.New(rdb, serverOptions)
+		if err != nil {
+			t.Fatalf("Failed to create server: %v", err)
+		}
+
+		router := srv.SetupRoutes()
+		testServer := httptest.NewServer(router)
+		defer testServer.Close()
+
+		client := testServer.Client()
+		// Make 3 failed login attempts
+		for i := 0; i < 3; i++ {
+			loginBody := map[string]string{
+				"email":    account.Email,
+				"password": fmt.Sprintf("wrongpassword%d", i),
+			}
+			body, _ := json.Marshal(loginBody)
+
+			resp, err := client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("Request %d failed: %v", i+1, err)
+			}
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("Attempt %d: Expected 401, got %d", i+1, resp.StatusCode)
+			}
+			resp.Body.Close()
+			t.Logf("Failed attempt %d: Got expected 401 Unauthorized", i+1)
+		}
+
+		// 4th attempt should be blocked with 429
+		loginBody := map[string]string{
+			"email":    account.Email,
+			"password": account.Password, // Even with correct password!
+		}
+		body, _ := json.Marshal(loginBody)
+
+		resp, err := client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("4th request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusTooManyRequests {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			t.Errorf("Expected 429 Too Many Requests, got %d. Body: %s", resp.StatusCode, string(bodyBytes))
+		}
+
+		t.Logf("✓ IP successfully blocked after 3 failed attempts (got 429)")
+	})
+
+	t.Run("Success_Resets_Failure_Count", func(t *testing.T) {
+		// Setup database and account
+		rdb := common.SetupTestDatabase(t)
+		account := common.CreateTestAccount(t, rdb)
+
+		// Create server with aggressive rate limiting
+		serverOptions := userapi.ServerOptions{
+			Name:          "test-server-rate-limit-2",
+			Addr:          "127.0.0.1:0",
+			JWTSecret:     "test-secret-key",
+			TokenDuration: 1 * time.Hour,
+			TokenIssuer:   "test-issuer",
+			Storage:       nil,
+			Cache:         nil,
+			TLS:           false,
+			AuthRateLimit: server.AuthRateLimiterConfig{
+				Enabled:            true,
+				FastBlockThreshold: 3, // Block after 3 failures
+				FastBlockDuration:  1 * time.Minute,
+				IPWindowDuration:   5 * time.Minute,
+			},
+		}
+
+		srv, err := userapi.New(rdb, serverOptions)
+		if err != nil {
+			t.Fatalf("Failed to create server: %v", err)
+		}
+
+		router := srv.SetupRoutes()
+		testServer := httptest.NewServer(router)
+		defer testServer.Close()
+
+		client := testServer.Client()
+
+		// Make 2 failed attempts
+		for i := 0; i < 2; i++ {
+			loginBody := map[string]string{
+				"email":    account.Email,
+				"password": "wrongpassword",
+			}
+			body, _ := json.Marshal(loginBody)
+
+			resp, err := client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("Failed request: %v", err)
+			}
+			resp.Body.Close()
+		}
+
+		// Successful login should reset counter
+		loginBody := map[string]string{
+			"email":    account.Email,
+			"password": account.Password,
+		}
+		body, _ := json.Marshal(loginBody)
+
+		resp, err := client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("Success login request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 OK, got %d", resp.StatusCode)
+		}
+
+		// Now we should be able to make 2 more failed attempts without blocking
+		for i := 0; i < 2; i++ {
+			loginBody := map[string]string{
+				"email":    account.Email,
+				"password": "wrongpassword",
+			}
+			body, _ := json.Marshal(loginBody)
+
+			resp, err := client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("Request failed: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("Expected 401, got %d", resp.StatusCode)
+			}
+			resp.Body.Close()
+		}
+
+		// Should still be able to login successfully (not blocked)
+		loginBody = map[string]string{
+			"email":    account.Email,
+			"password": account.Password,
+		}
+		body, _ = json.Marshal(loginBody)
+
+		resp, err = client.Post(testServer.URL+"/user/auth/login", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("Final login request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 OK after reset, got %d", resp.StatusCode)
+		}
+
+		t.Logf("✓ Successful authentication resets failure count")
+	})
 }
