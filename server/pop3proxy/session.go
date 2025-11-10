@@ -174,7 +174,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				s.WarnLog("Failed to register connection", "error", err)
+				s.InfoLog("rejected connection registration", "error", err)
 			}
 
 			// Start proxying
@@ -288,7 +288,7 @@ func (s *POP3ProxySession) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				s.WarnLog("Failed to register connection", "error", err)
+				s.InfoLog("rejected connection registration", "error", err)
 			}
 
 			// Start proxying

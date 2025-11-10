@@ -2011,7 +2011,7 @@ func (s *POP3Session) registerConnection(email string) {
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
-			s.DebugLog("Failed to register connection: %v", err)
+			s.InfoLog("rejected connection registration: %v", err)
 		}
 	}
 }

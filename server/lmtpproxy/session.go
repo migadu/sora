@@ -202,7 +202,7 @@ func (s *Session) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				s.DebugLog("Failed to register connection", "error", err)
+				s.InfoLog("rejected connection registration", "error", err)
 			}
 
 			// Start proxying only if backend connection was successful
@@ -210,7 +210,7 @@ func (s *Session) handleConnection() {
 				s.DebugLog("Starting proxy", "recipient", s.to, "account_id", s.accountID)
 				s.startProxy(line)
 			} else {
-				s.DebugLog("Cannot start proxy - no backend connection", "recipient", s.to)
+				s.WarnLog("Cannot start proxy - no backend connection", "recipient", s.to)
 			}
 			return
 

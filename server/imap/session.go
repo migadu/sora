@@ -393,7 +393,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("Failed to register connection: %v", err)
+			s.InfoLog("rejected connection registration: %v", err)
 			return err
 		}
 	}

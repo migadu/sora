@@ -936,7 +936,7 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 
 	// Register connection
 	if err := s.registerConnection(); err != nil {
-		s.WarnLog("failed to register connection", "error", err)
+		s.InfoLog("rejected connection registration", "error", err)
 	}
 
 	// Log authentication at INFO level with routing method and cache status

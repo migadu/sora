@@ -1326,7 +1326,7 @@ func (s *ManageSieveSession) registerConnection(email string) {
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
-			s.WarnLog("Failed to register connection: %v", err)
+			s.InfoLog("rejected connection registration: %v", err)
 		}
 	}
 }
