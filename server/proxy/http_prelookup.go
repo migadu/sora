@@ -247,20 +247,32 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		logger.Debug("prelookup: Stripping +detail for authentication", "from", email, "to", lookupEmail)
 	}
 
-	// Build cache key from base email and password hash (for security, we hash the password)
-	cacheKey := fmt.Sprintf("%s:%s", authEmail, hashPassword(password))
+	// Cache key is just the email address (base address without +detail or @TOKEN)
+	cacheKey := authEmail
 
-	// Check cache first
+	// Check cache first - verify password against cached hash
 	if c.cache != nil {
-		if info, authResult, found := c.cache.Get(cacheKey); found {
-			logger.Debug("Prelookup cache HIT", "user", authEmail)
-			// Mark as from cache if we have routing info
-			if info != nil {
-				info.FromCache = true
+		// Get cached password hash for this email
+		if cachedHash, found := c.cache.GetPasswordHash(cacheKey); found {
+			// Verify submitted password against cached hash
+			if c.verifyPassword(password, cachedHash) {
+				// Password matches cached hash - return cached result
+				if info, authResult, foundInfo := c.cache.Get(cacheKey); foundInfo {
+					logger.Debug("Prelookup cache HIT - password verified against cached hash", "user", authEmail)
+					// Mark as from cache if we have routing info
+					if info != nil {
+						info.FromCache = true
+					}
+					return info, authResult, nil
+				}
+			} else {
+				// Password doesn't match cached hash - invalidate cache and do fresh lookup
+				logger.Debug("Prelookup cache INVALIDATED - password changed", "user", authEmail)
+				c.cache.Delete(cacheKey)
 			}
-			return info, authResult, nil
+		} else {
+			logger.Debug("Prelookup cache MISS - no cached hash", "user", authEmail)
 		}
-		logger.Debug("Prelookup cache MISS", "user", authEmail)
 	}
 
 	// Execute HTTP request through circuit breaker
@@ -400,17 +412,13 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok {
 			if authResult == AuthUserNotFound {
-				// Store user not found in cache (negative caching)
-				if c.cache != nil {
-					c.cache.Set(cacheKey, nil, AuthUserNotFound)
-				}
+				// Don't cache user not found - these should always go to prelookup
+				// This prevents issues with user creation between cache checks
 				return nil, AuthUserNotFound, nil
 			}
 			if authResult == AuthFailed {
-				// Store auth failed in cache (negative caching)
-				if c.cache != nil {
-					c.cache.Set(cacheKey, nil, AuthFailed)
-				}
+				// Don't cache auth failures - these could be typos or password changes
+				// Better to always check prelookup for security
 				return nil, AuthFailed, nil
 			}
 		}
@@ -440,10 +448,8 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		// Verify password against hash returned by HTTP endpoint
 		// Note: The HTTP endpoint handles all master token logic and returns the appropriate hash
 		if !c.verifyPassword(password, lookupResp.PasswordHash) {
-			// Store failed auth in cache (negative caching)
-			if c.cache != nil {
-				c.cache.Set(cacheKey, nil, AuthFailed)
-			}
+			// Don't cache auth failures - password verification failed
+			// Could be wrong password or password change in progress
 			return nil, AuthFailed, nil
 		}
 
@@ -470,9 +476,9 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
 	}
 
-	// Store successful result in cache
+	// Store successful result in cache with password hash for invalidation on change
 	if c.cache != nil {
-		c.cache.Set(cacheKey, info, AuthSuccess)
+		c.cache.SetWithHash(cacheKey, info, AuthSuccess, lookupResp.PasswordHash)
 	}
 
 	return info, AuthSuccess, nil

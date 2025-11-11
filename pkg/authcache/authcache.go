@@ -74,12 +74,12 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 // Authenticate attempts to authenticate using cached data
 // Returns (accountID, nil) on success, or (0, error) if not in cache or cache miss
 // If credentials are in cache, it verifies the password against the cached hash
+// If password doesn't match cached hash, invalidates the cache (password changed)
 func (c *AuthCache) Authenticate(address, password string) (int64, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	entry, exists := c.entries[address]
 	if !exists {
+		c.mu.RUnlock()
 		c.misses++
 		metrics.AuthCacheMissesTotal.Inc()
 		return 0, false
@@ -87,6 +87,7 @@ func (c *AuthCache) Authenticate(address, password string) (int64, bool) {
 
 	// Check if expired
 	if time.Now().After(entry.expiresAt) {
+		c.mu.RUnlock()
 		c.misses++
 		metrics.AuthCacheMissesTotal.Inc()
 		return 0, false
@@ -97,16 +98,27 @@ func (c *AuthCache) Authenticate(address, password string) (int64, bool) {
 
 	// If it's a negative cache entry (user not found or previous auth failed)
 	if entry.result != AuthSuccess {
+		c.mu.RUnlock()
 		return 0, false
 	}
 
 	// Verify password against cached hash
 	if err := db.VerifyPassword(entry.hashedPassword, password); err != nil {
-		// Password verification failed - this is a cache hit but auth failure
-		// Don't update cache here, let it expire naturally
+		// Password verification failed - password likely changed
+		// Release read lock and acquire write lock to invalidate
+		c.mu.RUnlock()
+		c.mu.Lock()
+		// Double-check entry still exists and hasn't changed
+		if currentEntry, stillExists := c.entries[address]; stillExists && currentEntry == entry {
+			logger.Debug("AuthCache: Password mismatch - invalidating cache", "address", address)
+			delete(c.entries, address)
+			metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+		}
+		c.mu.Unlock()
 		return 0, false
 	}
 
+	c.mu.RUnlock()
 	// Password verified successfully
 	return entry.accountID, true
 }

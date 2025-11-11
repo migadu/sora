@@ -620,8 +620,8 @@ func TestGetUnusedContentHashes(t *testing.T) {
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
-	// Test: Get unused content hashes
-	unused, err := db.GetUnusedContentHashes(ctx, 10)
+	// Test: Get unused content hashes (use larger limit to handle test database with leftover data)
+	unused, err := db.GetUnusedContentHashes(ctx, 1000)
 	require.NoError(t, err)
 
 	t.Logf("Found %d unused content hashes", len(unused))

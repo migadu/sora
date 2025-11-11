@@ -434,6 +434,8 @@ func (a *AuthRateLimiter) cleanupRoutine(interval time.Duration) {
 
 func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	now := time.Now()
+
+	// Clean up expired IP blocks
 	a.blockMu.Lock()
 	expiredBlocks := 0
 	for ip, blocked := range a.blockedIPs {
@@ -444,19 +446,32 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	}
 	a.blockMu.Unlock()
 
+	// Clean up old IP failure tracking
 	a.delayMu.Lock()
 	expiredFailures := 0
-	cutoff := now.Add(-a.config.IPWindowDuration)
+	ipCutoff := now.Add(-a.config.IPWindowDuration)
 	for ip, info := range a.ipFailureCounts {
-		if info.LastFailure.Before(cutoff) {
+		if info.LastFailure.Before(ipCutoff) {
 			delete(a.ipFailureCounts, ip)
 			expiredFailures++
 		}
 	}
 	a.delayMu.Unlock()
 
-	if expiredBlocks > 0 || expiredFailures > 0 {
-		logger.Debug("Auth limiter: Cleaned up expired blocks and old failure records", "protocol", a.protocol, "expired_blocks", expiredBlocks, "expired_failures", expiredFailures)
+	// Clean up old username failure tracking
+	a.usernameMu.Lock()
+	expiredUsernames := 0
+	usernameCutoff := now.Add(-a.config.UsernameWindowDuration)
+	for username, info := range a.usernameFailureCounts {
+		if info.LastFailure.Before(usernameCutoff) {
+			delete(a.usernameFailureCounts, username)
+			expiredUsernames++
+		}
+	}
+	a.usernameMu.Unlock()
+
+	if expiredBlocks > 0 || expiredFailures > 0 || expiredUsernames > 0 {
+		logger.Debug("Auth limiter: Cleaned up expired entries", "protocol", a.protocol, "expired_blocks", expiredBlocks, "expired_ip_failures", expiredFailures, "expired_username_failures", expiredUsernames)
 	}
 }
 

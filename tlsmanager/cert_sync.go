@@ -205,16 +205,22 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for {
+			select {
+			case <-m.stopCertSync:
+				logger.Info("Certificate sync worker stopped")
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-			for _, domain := range m.config.LetsEncrypt.Domains {
-				if err := m.syncCertificateFromS3(ctx, domain); err != nil {
-					logger.Debug("CertSync: Sync failed", "domain", domain, "error", err)
+				for _, domain := range m.config.LetsEncrypt.Domains {
+					if err := m.syncCertificateFromS3(ctx, domain); err != nil {
+						logger.Debug("CertSync: Sync failed", "domain", domain, "error", err)
+					}
 				}
-			}
 
-			cancel()
+				cancel()
+			}
 		}
 	}()
 }

@@ -273,6 +273,138 @@ func testAffinityStaleEventRejection(t *testing.T) {
 	t.Logf("✅ PASS: Stale events (>5 minutes old) are rejected")
 }
 
+// TestAffinityManagerCleanup tests that expired affinities are properly cleaned up
+func TestAffinityManagerCleanup(t *testing.T) {
+	t.Run("CleanupExpiredEntries", testAffinityCleanupExpiredEntries)
+	t.Run("ContinuousCleanupPreventsGrowth", testAffinityContinuousCleanupPreventsGrowth)
+	t.Run("MemoryGrowthPrevention", testAffinityMemoryGrowthPrevention)
+}
+
+// testAffinityCleanupExpiredEntries verifies that expired affinities are removed
+func testAffinityCleanupExpiredEntries(t *testing.T) {
+	// Create cluster with short TTL and fast cleanup
+	cluster1, err := createTestCluster("node-cleanup-1", 22946, []string{})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer cluster1.Shutdown()
+
+	// Create affinity manager with very short TTL (500ms) and fast cleanup (100ms)
+	// Must enable gossip for AffinityManager to be created
+	affinity := NewAffinityManager(cluster1, true, 500*time.Millisecond, 100*time.Millisecond)
+
+	// Add 100 affinities
+	for i := 0; i < 100; i++ {
+		user := fmt.Sprintf("user%d@example.com", i)
+		backend := fmt.Sprintf("backend%d:143", i%5)
+		affinity.SetBackend(user, backend, "imap")
+	}
+
+	// Verify we have 100 entries
+	initialCount := affinity.GetAffinityCount()
+	if initialCount != 100 {
+		t.Errorf("Expected 100 entries, got %d", initialCount)
+	}
+	t.Logf("Initial affinity count: %d", initialCount)
+
+	// Wait for entries to expire (500ms TTL + 100ms buffer)
+	time.Sleep(600 * time.Millisecond)
+
+	// Wait for cleanup to run (cleanup interval is 100ms)
+	// Give it 2-3 cleanup cycles to be safe
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify entries were cleaned up
+	finalCount := affinity.GetAffinityCount()
+	if finalCount != 0 {
+		t.Errorf("Expected 0 entries after cleanup, got %d - MEMORY LEAK!", finalCount)
+	}
+	t.Logf("Final affinity count: %d (cleaned up %d entries)", finalCount, initialCount-finalCount)
+}
+
+// testAffinityContinuousCleanupPreventsGrowth verifies continuous traffic doesn't cause unbounded growth
+func testAffinityContinuousCleanupPreventsGrowth(t *testing.T) {
+	// Create cluster
+	cluster1, err := createTestCluster("node-growth-1", 23946, []string{})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer cluster1.Shutdown()
+
+	// Create affinity manager with short TTL (200ms) and frequent cleanup (50ms)
+	// Must enable gossip for AffinityManager to be created
+	affinity := NewAffinityManager(cluster1, true, 200*time.Millisecond, 50*time.Millisecond)
+
+	// Simulate continuous connection attempts over 1 second
+	// This simulates real-world scenario where users continuously connect
+	done := make(chan bool)
+	go func() {
+		for i := 0; i < 200; i++ {
+			user := fmt.Sprintf("user%d@example.com", i%100) // Reuse 100 users
+			backend := fmt.Sprintf("backend%d:143", i%5)
+			affinity.SetBackend(user, backend, "imap")
+			time.Sleep(5 * time.Millisecond) // 5ms between connections
+		}
+		done <- true
+	}()
+
+	<-done
+
+	// Wait for cleanup to run (TTL is 200ms, cleanup every 50ms)
+	time.Sleep(300 * time.Millisecond)
+
+	// Affinity count should be small (not all 200 entries!)
+	// Most should have expired and been cleaned up
+	finalCount := affinity.GetAffinityCount()
+	if finalCount > 50 {
+		t.Errorf("Expected affinity count < 50 after cleanup, got %d - MEMORY LEAK!", finalCount)
+	}
+	t.Logf("Final affinity count: %d (expected < 50)", finalCount)
+}
+
+// testAffinityMemoryGrowthPrevention verifies affinity doesn't grow unbounded
+func testAffinityMemoryGrowthPrevention(t *testing.T) {
+	// Create cluster
+	cluster1, err := createTestCluster("node-memory-1", 24946, []string{})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer cluster1.Shutdown()
+
+	// Simulate production config: 5min TTL, 1min cleanup
+	// Must enable gossip for AffinityManager to be created
+	affinity := NewAffinityManager(cluster1, true, 5*time.Minute, 1*time.Minute)
+
+	// Add 1000 entries (simulating high traffic)
+	for i := 0; i < 1000; i++ {
+		user := fmt.Sprintf("user%d@example.com", i)
+		backend := fmt.Sprintf("backend%d:143", i%10)
+		affinity.SetBackend(user, backend, "imap")
+	}
+
+	// Verify count
+	count := affinity.GetAffinityCount()
+	if count != 1000 {
+		t.Errorf("Expected 1000 entries, got %d", count)
+	}
+	t.Logf("Affinity count after adding 1000 entries: %d", count)
+
+	// Wait 100ms (should NOT expire with 5min TTL)
+	time.Sleep(100 * time.Millisecond)
+	countAfter := affinity.GetAffinityCount()
+	t.Logf("Affinity count after 100ms (should still be ~1000): %d", countAfter)
+
+	// Count should still be ~1000 (not expired yet)
+	if countAfter < 990 {
+		t.Errorf("Unexpected cleanup! Expected ~1000 entries, got %d - cleanup running too aggressively!", countAfter)
+	}
+
+	// Verify no unbounded growth
+	if countAfter > 1000 {
+		t.Errorf("Affinity grew beyond expected! Expected 1000, got %d - MEMORY LEAK!", countAfter)
+	}
+}
+
 // Helper function to create test cluster
 func createTestCluster(nodeID string, port int, peers []string) (*cluster.Manager, error) {
 	cfg := config.ClusterConfig{

@@ -418,6 +418,13 @@ func (am *AffinityManager) cleanup() {
 	}
 }
 
+// GetAffinityCount returns the number of active affinities (for testing/monitoring)
+func (am *AffinityManager) GetAffinityCount() int {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return len(am.affinityMap)
+}
+
 // broadcastRoutine periodically triggers broadcasts
 func (am *AffinityManager) broadcastRoutine() {
 	ticker := time.NewTicker(100 * time.Millisecond)

@@ -571,10 +571,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				actualEmail = routingInfo.ActualEmail
 			}
 		}
+		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
+		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		if err != nil {
-			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
-			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
 		}
 
 		if err != nil {

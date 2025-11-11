@@ -21,21 +21,30 @@ type SieveScriptCacheEntry struct {
 
 // SieveScriptCache implements an LRU cache for parsed Sieve scripts with TTL
 type SieveScriptCache struct {
-	mu          sync.RWMutex
-	cache       map[string]*SieveScriptCacheEntry
-	maxEntries  int
-	ttl         time.Duration // Time to live for cache entries
-	accessOrder []string      // Track access order for LRU eviction
+	mu              sync.RWMutex
+	cache           map[string]*SieveScriptCacheEntry
+	maxEntries      int
+	ttl             time.Duration // Time to live for cache entries
+	accessOrder     []string      // Track access order for LRU eviction
+	cleanupInterval time.Duration
+	stopCleanup     chan struct{}
 }
 
 // NewSieveScriptCache creates a new Sieve script cache with the specified maximum entries and TTL
 func NewSieveScriptCache(maxEntries int, ttl time.Duration) *SieveScriptCache {
-	return &SieveScriptCache{
-		cache:       make(map[string]*SieveScriptCacheEntry),
-		maxEntries:  maxEntries,
-		ttl:         ttl,
-		accessOrder: make([]string, 0, maxEntries),
+	cache := &SieveScriptCache{
+		cache:           make(map[string]*SieveScriptCacheEntry),
+		maxEntries:      maxEntries,
+		ttl:             ttl,
+		accessOrder:     make([]string, 0, maxEntries),
+		cleanupInterval: 5 * time.Minute, // Cleanup every 5 minutes
+		stopCleanup:     make(chan struct{}),
 	}
+
+	// Start background cleanup goroutine
+	go cache.cleanupRoutine()
+
+	return cache
 }
 
 // hashScript creates a hash of the script content for use as a cache key
@@ -260,5 +269,31 @@ func (c *SieveScriptCache) CleanExpired() {
 	for _, key := range keysToRemove {
 		delete(c.cache, key)
 		c.removeFromAccessOrder(key)
+	}
+}
+
+// cleanupRoutine periodically removes expired entries from the cache
+func (c *SieveScriptCache) cleanupRoutine() {
+	ticker := time.NewTicker(c.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.CleanExpired()
+		case <-c.stopCleanup:
+			return
+		}
+	}
+}
+
+// Stop stops the cleanup goroutine
+func (c *SieveScriptCache) Stop() {
+	select {
+	case <-c.stopCleanup:
+		// Already stopped
+		return
+	default:
+		close(c.stopCleanup)
 	}
 }

@@ -211,19 +211,6 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		go m.joinRetryLoop(filteredPeers)
 	}
 
-	// Start a test routine to verify GetBroadcasts is being called
-	go func() {
-		time.Sleep(5 * time.Second)
-		logger.Info("Cluster: Testing if GetBroadcasts is being called by memberlist")
-		for i := 0; i < 6; i++ {
-			time.Sleep(10 * time.Second)
-			m.connectionBroadcastMu.RLock()
-			broadcasterCount := len(m.connectionBroadcasts)
-			m.connectionBroadcastMu.RUnlock()
-			logger.Info("Cluster: Connection broadcasters status", "seconds", (i+1)*10, "broadcasters", broadcasterCount, "members", m.memberlist.NumMembers())
-		}
-	}()
-
 	if selfReferenceFound {
 		logger.Info("Cluster manager started", "node_id", nodeID, "addr", cfg.Addr, "original_peers", cfg.Peers, "filtered_peers", filteredPeers)
 	} else {
@@ -359,8 +346,29 @@ func (m *Manager) notifyRateLimitHandlers(data []byte) {
 	m.rateLimitMu.RUnlock()
 
 	// Call handlers asynchronously to avoid blocking gossip receive
+	// Use timeout to prevent goroutine leaks from blocked handlers
 	for _, handler := range handlers {
-		go handler(data)
+		go func(h func([]byte)) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("Panic in rate limit handler", "error", fmt.Errorf("%v", r))
+					}
+				}()
+				h(data)
+			}()
+
+			select {
+			case <-done:
+				// Handler completed successfully
+			case <-time.After(5 * time.Second):
+				logger.Warn("Cluster: Rate limit handler timed out after 5s")
+			case <-m.ctx.Done():
+				// Manager shutting down
+			}
+		}(handler)
 	}
 }
 
@@ -386,8 +394,29 @@ func (m *Manager) notifyAffinityHandlers(data []byte) {
 	m.affinityMu.RUnlock()
 
 	// Call handlers asynchronously to avoid blocking gossip receive
+	// Use timeout to prevent goroutine leaks from blocked handlers
 	for _, handler := range handlers {
-		go handler(data)
+		go func(h func([]byte)) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("Panic in affinity handler", "error", fmt.Errorf("%v", r))
+					}
+				}()
+				h(data)
+			}()
+
+			select {
+			case <-done:
+				// Handler completed successfully
+			case <-time.After(5 * time.Second):
+				logger.Warn("Cluster: Affinity handler timed out after 5s")
+			case <-m.ctx.Done():
+				// Manager shutting down
+			}
+		}(handler)
 	}
 }
 
@@ -417,8 +446,29 @@ func (m *Manager) notifyConnectionHandlers(data []byte) {
 	logger.Debug("Cluster: Notifying connection handlers", "handlers", handlerCount, "data_len", len(data))
 
 	// Call handlers asynchronously to avoid blocking gossip receive
+	// Use timeout to prevent goroutine leaks from blocked handlers
 	for _, handler := range handlers {
-		go handler(data)
+		go func(h func([]byte)) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("Panic in connection handler", "error", fmt.Errorf("%v", r))
+					}
+				}()
+				h(data)
+			}()
+
+			select {
+			case <-done:
+				// Handler completed successfully
+			case <-time.After(5 * time.Second):
+				logger.Warn("Cluster: Connection handler timed out after 5s")
+			case <-m.ctx.Done():
+				// Manager shutting down
+			}
+		}(handler)
 	}
 }
 
@@ -541,13 +591,27 @@ func (m *Manager) notifyLeaderChange(isLeader bool, newLeaderID string) {
 
 	for _, callback := range callbacks {
 		// Call callbacks in goroutines to avoid blocking election loop
+		// Use timeout to prevent goroutine leaks from blocked callbacks
 		go func(cb func(bool, string)) {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("Panic in leader change callback", "error", fmt.Errorf("%v", r))
-				}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("Panic in leader change callback", "error", fmt.Errorf("%v", r))
+					}
+				}()
+				cb(isLeader, newLeaderID)
 			}()
-			cb(isLeader, newLeaderID)
+
+			select {
+			case <-done:
+				// Callback completed successfully
+			case <-time.After(30 * time.Second):
+				logger.Warn("Cluster: Leader change callback timed out after 30s", "is_leader", isLeader, "leader_id", newLeaderID)
+			case <-m.ctx.Done():
+				// Manager shutting down
+			}
 		}(callback)
 	}
 }

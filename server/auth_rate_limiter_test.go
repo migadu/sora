@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -369,6 +370,219 @@ func TestAuthRateLimiterCleanupExpiredEntries(t *testing.T) {
 	stats := limiter.GetStats(ctx, 30*time.Minute)
 	if blockedIPs, ok := stats["blocked_ips"].(int); ok && blockedIPs > 0 {
 		t.Errorf("Stats should show 0 blocked IPs after cleanup, got %d", blockedIPs)
+	}
+}
+
+// TestAuthRateLimiterUsernameCleanup tests that username failure tracking is cleaned up
+func TestAuthRateLimiterUsernameCleanup(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled:                true,
+		MaxAttemptsPerUsername: 5,
+		FastBlockThreshold:     10,
+		IPWindowDuration:       100 * time.Millisecond,
+		UsernameWindowDuration: 100 * time.Millisecond, // Very short for testing
+		CacheCleanupInterval:   50 * time.Millisecond,  // Frequent cleanup
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+
+	// Record failures for multiple usernames
+	for i := 0; i < 10; i++ {
+		username := fmt.Sprintf("user%d@example.com", i)
+		addr := &StringAddr{Addr: fmt.Sprintf("192.168.1.%d:12345", i+1)}
+		limiter.RecordAuthAttempt(ctx, addr, username, false)
+	}
+
+	// Verify usernames are tracked
+	stats := limiter.GetStats(ctx, 30*time.Minute)
+	trackedUsernames, ok := stats["tracked_usernames"].(int)
+	if !ok {
+		t.Fatal("tracked_usernames not found in stats")
+	}
+	if trackedUsernames != 10 {
+		t.Errorf("Expected 10 tracked usernames, got %d", trackedUsernames)
+	}
+	t.Logf("Initial tracked usernames: %d", trackedUsernames)
+
+	// Wait for username window to expire and cleanup to run
+	// UsernameWindowDuration=100ms, cleanup every 50ms
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify usernames were cleaned up
+	stats = limiter.GetStats(ctx, 30*time.Minute)
+	trackedUsernamesAfter, ok := stats["tracked_usernames"].(int)
+	if !ok {
+		t.Fatal("tracked_usernames not found in stats")
+	}
+	if trackedUsernamesAfter != 0 {
+		t.Errorf("Expected 0 tracked usernames after cleanup, got %d - USERNAME TRACKING NOT CLEANED UP!", trackedUsernamesAfter)
+	}
+	t.Logf("Tracked usernames after cleanup: %d", trackedUsernamesAfter)
+}
+
+// TestAuthRateLimiterCompleteMemoryCleanup tests that ALL tracking maps are cleaned up (no memory leak)
+func TestAuthRateLimiterCompleteMemoryCleanup(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled:                true,
+		MaxAttemptsPerUsername: 5,
+		FastBlockThreshold:     3, // Block after 3 failures
+		FastBlockDuration:      100 * time.Millisecond,
+		DelayStartThreshold:    2, // Start delays after 2 failures
+		InitialDelay:           10 * time.Millisecond,
+		DelayMultiplier:        2.0,
+		MaxDelay:               100 * time.Millisecond,
+		IPWindowDuration:       100 * time.Millisecond,
+		UsernameWindowDuration: 100 * time.Millisecond,
+		CacheCleanupInterval:   50 * time.Millisecond, // Cleanup every 50ms
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+
+	// Scenario 1: Create IP blocks (blockedIPs map)
+	// Record 3 failures to trigger fast block
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("10.0.1.%d:12345", i)
+		addr := &StringAddr{Addr: ip}
+		username := fmt.Sprintf("user%d@example.com", i)
+
+		// 3 failures = block
+		for j := 0; j < 3; j++ {
+			limiter.RecordAuthAttempt(ctx, addr, username, false)
+		}
+	}
+
+	// Scenario 2: Create IP failure tracking without blocks (ipFailureCounts map)
+	// Record 2 failures (below block threshold) to track failures only
+	for i := 10; i < 20; i++ {
+		ip := fmt.Sprintf("10.0.2.%d:12345", i)
+		addr := &StringAddr{Addr: ip}
+		username := fmt.Sprintf("user%d@example.com", i)
+
+		// 2 failures = tracked but not blocked
+		for j := 0; j < 2; j++ {
+			limiter.RecordAuthAttempt(ctx, addr, username, false)
+		}
+	}
+
+	// Scenario 3: Create username tracking (usernameFailureCounts map)
+	// Already created above, but add more
+	for i := 30; i < 40; i++ {
+		ip := fmt.Sprintf("10.0.3.%d:12345", i)
+		addr := &StringAddr{Addr: ip}
+		username := fmt.Sprintf("user%d@example.com", i)
+
+		limiter.RecordAuthAttempt(ctx, addr, username, false)
+	}
+
+	// Verify all three maps have entries
+	stats := limiter.GetStats(ctx, 30*time.Minute)
+
+	blockedIPs, _ := stats["blocked_ips"].(int)
+	trackedIPs, _ := stats["tracked_ips"].(int)
+	trackedUsernames, _ := stats["tracked_usernames"].(int)
+
+	t.Logf("Before cleanup: blocked_ips=%d, tracked_ips=%d, tracked_usernames=%d",
+		blockedIPs, trackedIPs, trackedUsernames)
+
+	if blockedIPs == 0 {
+		t.Error("Expected some blocked IPs before cleanup")
+	}
+	if trackedIPs == 0 {
+		t.Error("Expected some tracked IPs before cleanup")
+	}
+	if trackedUsernames == 0 {
+		t.Error("Expected some tracked usernames before cleanup")
+	}
+
+	// Wait for ALL entries to expire and cleanup to run
+	// Max window is 100ms, cleanup runs every 50ms
+	// Wait 300ms to ensure multiple cleanup cycles
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify ALL maps are cleaned up (no memory leak)
+	stats = limiter.GetStats(ctx, 30*time.Minute)
+
+	blockedIPsAfter, _ := stats["blocked_ips"].(int)
+	trackedIPsAfter, _ := stats["tracked_ips"].(int)
+	trackedUsernamesAfter, _ := stats["tracked_usernames"].(int)
+
+	t.Logf("After cleanup: blocked_ips=%d, tracked_ips=%d, tracked_usernames=%d",
+		blockedIPsAfter, trackedIPsAfter, trackedUsernamesAfter)
+
+	if blockedIPsAfter != 0 {
+		t.Errorf("MEMORY LEAK: Expected 0 blocked IPs after cleanup, got %d", blockedIPsAfter)
+	}
+	if trackedIPsAfter != 0 {
+		t.Errorf("MEMORY LEAK: Expected 0 tracked IPs after cleanup, got %d", trackedIPsAfter)
+	}
+	if trackedUsernamesAfter != 0 {
+		t.Errorf("MEMORY LEAK: Expected 0 tracked usernames after cleanup, got %d", trackedUsernamesAfter)
+	}
+}
+
+// TestAuthRateLimiterContinuousCleanup tests that cleanup prevents unbounded growth
+func TestAuthRateLimiterContinuousCleanup(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled:                true,
+		MaxAttemptsPerUsername: 10,
+		FastBlockThreshold:     5,
+		FastBlockDuration:      200 * time.Millisecond,
+		IPWindowDuration:       200 * time.Millisecond,
+		UsernameWindowDuration: 200 * time.Millisecond,
+		CacheCleanupInterval:   50 * time.Millisecond, // Cleanup every 50ms
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+
+	// Simulate continuous failed login attempts over 1 second
+	// This simulates high attack traffic
+	done := make(chan bool)
+	go func() {
+		for i := 0; i < 200; i++ {
+			ip := fmt.Sprintf("10.0.%d.%d:12345", i/256, i%256)
+			addr := &StringAddr{Addr: ip}
+			username := fmt.Sprintf("user%d@example.com", i%50) // 50 unique usernames
+
+			limiter.RecordAuthAttempt(ctx, addr, username, false)
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	<-done
+
+	// Wait for cleanup to stabilize
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify maps didn't grow unbounded
+	stats := limiter.GetStats(ctx, 30*time.Minute)
+
+	blockedIPs, _ := stats["blocked_ips"].(int)
+	trackedIPs, _ := stats["tracked_ips"].(int)
+	trackedUsernames, _ := stats["tracked_usernames"].(int)
+
+	t.Logf("Final state: blocked_ips=%d, tracked_ips=%d, tracked_usernames=%d",
+		blockedIPs, trackedIPs, trackedUsernames)
+
+	// With 200ms TTL and continuous cleanup, should not have all 200 IPs
+	// Should be much smaller (most expired and cleaned up)
+	if trackedIPs > 100 {
+		t.Errorf("MEMORY LEAK: Too many tracked IPs (%d), cleanup not working efficiently", trackedIPs)
+	}
+	if trackedUsernames > 50 {
+		t.Errorf("MEMORY LEAK: Too many tracked usernames (%d), cleanup not working efficiently", trackedUsernames)
+	}
+	if blockedIPs > 100 {
+		t.Errorf("MEMORY LEAK: Too many blocked IPs (%d), cleanup not working efficiently", blockedIPs)
 	}
 }
 

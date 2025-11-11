@@ -32,6 +32,7 @@ type Manager struct {
 	autocertMgr    *autocert.Manager
 	tlsConfig      *tls.Config
 	clusterManager *cluster.Manager
+	stopCertSync   chan struct{} // Signal to stop certificate sync worker
 }
 
 // New creates a new TLS manager based on the provided configuration.
@@ -44,6 +45,7 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 	m := &Manager{
 		config:         cfg,
 		clusterManager: clusterMgr,
+		stopCertSync:   make(chan struct{}),
 	}
 
 	// Log cluster integration status
@@ -344,4 +346,12 @@ func WrapTLSConfigWithDefaultDomain(baseCfg *tls.Config, serverDefaultDomain str
 	}
 
 	return wrapped
+}
+
+// Shutdown gracefully stops the TLS manager and its background workers
+func (m *Manager) Shutdown() {
+	if m.stopCertSync != nil {
+		close(m.stopCertSync)
+	}
+	logger.Info("TLS manager shutdown complete")
 }

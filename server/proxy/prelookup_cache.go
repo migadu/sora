@@ -10,10 +10,11 @@ import (
 
 // cacheEntry represents a cached prelookup result
 type cacheEntry struct {
-	info       *UserRoutingInfo
-	authResult AuthResult
-	expiresAt  time.Time
-	isNegative bool // True for negative cache entries (user not found, etc.)
+	info         *UserRoutingInfo
+	authResult   AuthResult
+	expiresAt    time.Time
+	isNegative   bool   // True for negative cache entries (user not found, etc.)
+	passwordHash string // Password hash from prelookup (for detecting password changes)
 }
 
 // prelookupCache provides in-memory caching for HTTP prelookup results
@@ -77,8 +78,32 @@ func (c *prelookupCache) Get(key string) (*UserRoutingInfo, AuthResult, bool) {
 	return entry.info, entry.authResult, true
 }
 
+// GetPasswordHash retrieves just the password hash from cache for a given email
+// Returns the hash and whether it was found
+func (c *prelookupCache) GetPasswordHash(email string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[email]
+	if !exists {
+		return "", false
+	}
+
+	// Check if expired
+	if time.Now().After(entry.expiresAt) {
+		return "", false
+	}
+
+	return entry.passwordHash, true
+}
+
 // Set stores a result in the cache
 func (c *prelookupCache) Set(key string, info *UserRoutingInfo, authResult AuthResult) {
+	c.SetWithHash(key, info, authResult, "")
+}
+
+// SetWithHash stores a result in the cache with password hash for invalidation on change
+func (c *prelookupCache) SetWithHash(key string, info *UserRoutingInfo, authResult AuthResult, passwordHash string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -97,11 +122,19 @@ func (c *prelookupCache) Set(key string, info *UserRoutingInfo, authResult AuthR
 	}
 
 	c.entries[key] = &cacheEntry{
-		info:       info,
-		authResult: authResult,
-		expiresAt:  time.Now().Add(ttl),
-		isNegative: isNegative,
+		info:         info,
+		authResult:   authResult,
+		expiresAt:    time.Now().Add(ttl),
+		isNegative:   isNegative,
+		passwordHash: passwordHash,
 	}
+}
+
+// Delete removes a cache entry by key
+func (c *prelookupCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
 }
 
 // evictOldest removes the oldest entry from the cache

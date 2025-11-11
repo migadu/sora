@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/managesieve"
@@ -514,8 +515,26 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		s.InfoLog("attempting prelookup auth", "username", usernameForPrelookup)
 		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
+
+		// Log prelookup response with all details
+		backend := "none"
+		actualEmail := "none"
+		if routingInfo != nil {
+			if routingInfo.ServerAddress != "" {
+				backend = routingInfo.ServerAddress
+			}
+			if routingInfo.ActualEmail != "" {
+				actualEmail = routingInfo.ActualEmail
+			}
+		}
+		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
+		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
+		if err != nil {
+			logger.Info("prelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+		} else {
+			logger.Info("prelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+		}
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior

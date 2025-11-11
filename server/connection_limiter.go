@@ -201,9 +201,17 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 
 			// Clean up IP entry if no connections remain (lazy cleanup)
 			if remaining <= 0 {
-				// Use sync.Map's CompareAndDelete for lock-free cleanup
+				// Double-check after a brief moment to avoid race with new connections
+				// If a new connection arrives between Add(-1) and this check, we'll see count > 0
 				if ipCounter.Load() <= 0 {
-					cl.perIPConnections.CompareAndDelete(trackingIP, ipCounter)
+					// Final check: only delete if we can confirm the counter is still at the same address
+					// and still has zero value. This prevents deleting an entry that was just incremented
+					// by a racing new connection.
+					if loaded, ok := cl.perIPConnections.Load(trackingIP); ok {
+						if loadedCounter, ok := loaded.(*atomic.Int64); ok && loadedCounter == ipCounter && loadedCounter.Load() <= 0 {
+							cl.perIPConnections.CompareAndDelete(trackingIP, ipCounter)
+						}
+					}
 				}
 			}
 
