@@ -795,11 +795,13 @@ func (s *Session) connectToBackendAndAuth() error {
 	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity
-	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
+	// Auth-only prelookup users (IsPrelookupAccount=true but ServerAddress="") should get affinity
+	if s.server.enableAffinity && actualAddr != "" {
 		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
 			Username:           s.username,
 			Protocol:           "managesieve",
 			IsPrelookupAccount: s.isPrelookupAccount,
+			RoutingInfo:        s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
 			ConnManager:        s.server.connManager,
 			EnableAffinity:     s.server.enableAffinity,
 			ProxyName:          "ManageSieve Proxy",

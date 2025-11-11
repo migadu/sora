@@ -66,8 +66,9 @@ type HTTPPreLookupClient struct {
 type HTTPPreLookupResponse struct {
 	Address      string `json:"address"`       // Email address for the user (required - used to derive account_id)
 	PasswordHash string `json:"password_hash"` // Password hash to verify against (required)
-	Server       string `json:"server"`        // Backend server IP/hostname:port (required)
+	Server       string `json:"server"`        // Backend server IP/hostname:port (optional - if empty, uses auth-only mode)
 	AccountID    int64  // Derived from Address, not part of JSON response
+	AuthOnlyMode bool   // Internal flag: true when Server is empty (auth-only, local backend selection)
 }
 
 // CircuitBreakerSettings holds configurable circuit breaker settings
@@ -218,12 +219,19 @@ func NewHTTPPreLookupClient(
 
 // LookupUserRoute performs an HTTP GET request to lookup user routing information
 func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
-	return c.LookupUserRouteWithOptions(ctx, email, password, false)
+	return c.LookupUserRouteWithClientIP(ctx, email, password, "", false)
 }
 
 // LookupUserRouteWithOptions performs prelookup with optional route-only mode
 // routeOnly: if true, adds ?route_only=true to skip password validation (for master username auth)
 func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
+	return c.LookupUserRouteWithClientIP(ctx, email, password, "", routeOnly)
+}
+
+// LookupUserRouteWithClientIP performs prelookup with client IP and optional route-only mode
+// clientIP: client IP address to include in URL (supports $ip placeholder)
+// routeOnly: if true, adds ?route_only=true to skip password validation (for master username auth)
+func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	// Parse and validate email address with master token support
 	// This also handles +detail addressing and validates format
 	addr, err := server.NewAddress(email)
@@ -277,9 +285,13 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 
 	// Execute HTTP request through circuit breaker
 	result, err := c.breaker.Execute(func() (any, error) {
-		// Build request URL by interpolating $email placeholder
-		// Use lookupEmail (MasterAddress) to include master token but not +detail
+		// Build request URL by interpolating placeholders:
+		// - $email: user email (MasterAddress - includes master token but not +detail)
+		// - $ip: client IP address
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
+		if clientIP != "" {
+			requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
+		}
 
 		// Add route_only parameter if requested (for master username authentication)
 		if routeOnly {
@@ -291,7 +303,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 			}
 		}
 
-		logger.Debug("prelookup: Requesting lookup", "user", lookupEmail, "url", requestURL, "route_only", routeOnly)
+		logger.Debug("prelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
@@ -362,13 +374,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
-		// If server is null/empty, treat as user not found (404)
-		if strings.TrimSpace(lookupResp.Server) == "" {
-			logger.Debug("prelookup: Server is null/empty - treating as user not found", "user", lookupEmail)
-			return map[string]any{"result": AuthUserNotFound}, nil
-		}
-
-		// Validate other required fields - invalid 200 response is a server bug
+		// Validate required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {
 			logger.Debug("prelookup: Validation failed - address is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
@@ -378,6 +384,14 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		if !routeOnly && strings.TrimSpace(lookupResp.PasswordHash) == "" {
 			logger.Debug("prelookup: Validation failed - password_hash is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
+		}
+
+		// If server is null/empty, this is auth-only mode (prelookup handles authentication,
+		// Sora handles backend selection via affinity/consistent-hash/round-robin)
+		// We mark this with a special flag in the response so it can be processed differently
+		if strings.TrimSpace(lookupResp.Server) == "" {
+			logger.Debug("prelookup: Server is null/empty - auth-only mode (local backend selection)", "user", lookupEmail)
+			lookupResp.AuthOnlyMode = true
 		}
 
 		// Derive account_id from the address field
@@ -459,10 +473,14 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, em
 		logger.Info("prelookup: Skipping password verification (route_only mode)", "user", authEmail)
 	}
 
-	// Normalize server address (add default port if missing)
-	normalizedServer := c.normalizeServerAddress(lookupResp.Server)
+	// Build routing info based on mode
+	var normalizedServer string
+	if !lookupResp.AuthOnlyMode {
+		// Normal mode: prelookup specifies backend server
+		normalizedServer = c.normalizeServerAddress(lookupResp.Server)
+	}
+	// else: Auth-only mode - ServerAddress will be empty, backend selected locally
 
-	// Build routing info
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedServer,
 		AccountID:              lookupResp.AccountID,

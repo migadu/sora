@@ -273,10 +273,17 @@ func (cm *ConnectionManager) AuthenticateAndRoute(ctx context.Context, email, pa
 // AuthenticateAndRouteWithOptions performs authentication and routing with additional options
 // routeOnly: if true, skip password validation and only return routing info (for master username auth)
 func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
+	return cm.AuthenticateAndRouteWithClientIP(ctx, email, password, "", routeOnly)
+}
+
+// AuthenticateAndRouteWithClientIP performs authentication and routing with client IP and additional options
+// clientIP: client IP address to include in prelookup URL (supports $ip placeholder)
+// routeOnly: if true, skip password validation and only return routing info (for master username auth)
+func (cm *ConnectionManager) AuthenticateAndRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
 		return nil, AuthUserNotFound, fmt.Errorf("no routing lookup configured")
 	}
-	return cm.routingLookup.LookupUserRouteWithOptions(ctx, email, password, routeOnly)
+	return cm.routingLookup.LookupUserRouteWithClientIP(ctx, email, password, clientIP, routeOnly)
 }
 
 // GetRoutingLookup returns the routing lookup client (may be nil)
@@ -928,7 +935,7 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
-		// Use server address from routing info
+		// Use server address from routing info (prelookup specified backend)
 		result.PreferredAddr = result.RoutingInfo.ServerAddress
 		logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
 		result.RoutingMethod = "prelookup"
@@ -936,20 +943,27 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	// 2. If no routing info from prelookup, try cluster-wide affinity
-	if result.PreferredAddr == "" && params.EnableAffinity && !params.IsPrelookupAccount {
-		affinityMgr := params.ConnManager.GetAffinityManager()
-		if affinityMgr != nil && params.Protocol != "" {
-			// Use gossip-based cluster affinity
-			if lastAddr, found := affinityMgr.GetBackend(params.Username, params.Protocol); found {
-				// Check if backend is healthy
-				if params.ConnManager.IsBackendHealthy(lastAddr) {
-					result.PreferredAddr = lastAddr
-					result.RoutingMethod = "affinity"
-					logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", result.PreferredAddr)
-				} else {
-					logger.Info("Cluster affinity backend unhealthy - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username)
-					// Delete unhealthy affinity
-					affinityMgr.DeleteBackend(params.Username, params.Protocol)
+	// Note: For auth-only prelookup (IsPrelookupAccount=true but ServerAddress=""),
+	// we still use affinity/consistent-hash (prelookup only handled auth, not routing)
+	if result.PreferredAddr == "" && params.EnableAffinity {
+		// Only skip affinity if prelookup explicitly provided a backend server
+		// Auth-only mode: has routing info but no server address - should use affinity
+		skipAffinity := params.IsPrelookupAccount && result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != ""
+		if !skipAffinity {
+			affinityMgr := params.ConnManager.GetAffinityManager()
+			if affinityMgr != nil && params.Protocol != "" {
+				// Use gossip-based cluster affinity
+				if lastAddr, found := affinityMgr.GetBackend(params.Username, params.Protocol); found {
+					// Check if backend is healthy
+					if params.ConnManager.IsBackendHealthy(lastAddr) {
+						result.PreferredAddr = lastAddr
+						result.RoutingMethod = "affinity"
+						logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", result.PreferredAddr)
+					} else {
+						logger.Info("Cluster affinity backend unhealthy - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username)
+						// Delete unhealthy affinity
+						affinityMgr.DeleteBackend(params.Username, params.Protocol)
+					}
 				}
 			}
 		}
@@ -979,8 +993,10 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 // - If backend A fails and user moves to backend B, affinity tracks the failover
 // - Affinity ensures user stays on backend B even after A recovers (session continuity)
 func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, wasAffinityRoute bool) {
-	// Only update affinity for non-prelookup users
-	if params.IsPrelookupAccount {
+	// Skip affinity updates only for prelookup users with explicit backend routing
+	// Auth-only prelookup (ServerAddress="") should use affinity like regular users
+	if params.IsPrelookupAccount && params.RoutingInfo != nil && params.RoutingInfo.ServerAddress != "" {
+		// Prelookup explicitly specified backend - don't use affinity (prelookup controls routing)
 		return
 	}
 

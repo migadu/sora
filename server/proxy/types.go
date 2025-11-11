@@ -50,6 +50,7 @@ var (
 type UserRoutingLookup interface {
 	LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error)
 	LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error)
+	LookupUserRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error)
 	Close() error
 }
 

@@ -558,7 +558,9 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for prelookup authentication
 	if s.server.connManager.HasRouting() {
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
+		// Extract client IP from remote address (remove port)
+		clientIP, _ := server.GetHostPortFromAddr(remoteAddr)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForPrelookup, password, clientIP, masterAuthValidated)
 
 		// Log prelookup response with all details
 		backend := "none"
@@ -813,11 +815,13 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Record successful connection for future affinity if enabled
-	if s.server.enableAffinity && !s.isPrelookupAccount && actualAddr != "" {
+	// Auth-only prelookup users (IsPrelookupAccount=true but ServerAddress="") should get affinity
+	if s.server.enableAffinity && actualAddr != "" {
 		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
 			Username:           s.username,
 			Protocol:           "imap",
 			IsPrelookupAccount: s.isPrelookupAccount,
+			RoutingInfo:        s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
 			ConnManager:        s.server.connManager,
 			EnableAffinity:     s.server.enableAffinity,
 			ProxyName:          "IMAP Proxy",
