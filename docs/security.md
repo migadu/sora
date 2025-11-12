@@ -36,8 +36,6 @@ enabled = true
 max_attempts_per_ip = 10
 max_attempts_per_username = 5
 ip_window_duration = "15m"
-fast_block_threshold = 10
-fast_block_duration = "5m"
 ```
 
 This system tracks failed login attempts per IP and per username, introducing progressive delays and temporary blocks to thwart attackers.

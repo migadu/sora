@@ -843,37 +843,6 @@ func (ct *ConnectionTracker) Stop() {
 	})
 }
 
-// GetOperationTimeout returns a timeout for operations (for compatibility with old interface)
-func (ct *ConnectionTracker) GetOperationTimeout() time.Duration {
-	return 5 * time.Second // Gossip is fast, short timeout is fine
-}
-
-// IsEnabled returns whether connection tracking is enabled
-func (ct *ConnectionTracker) IsEnabled() bool {
-	return ct != nil
-}
-
-// Start is a no-op for gossip tracker (background routines started in constructor)
-func (ct *ConnectionTracker) Start() {
-	// Background routines already started in NewConnectionTracker
-}
-
-// UpdateActivity is a no-op for gossip tracker (no activity tracking needed)
-func (ct *ConnectionTracker) UpdateActivity(ctx context.Context, accountID int64, protocol, clientAddr string) error {
-	// Gossip tracker doesn't track activity timestamps
-	return nil
-}
-
-// CheckTermination is deprecated - use RegisterSession instead
-func (ct *ConnectionTracker) CheckTermination(ctx context.Context, accountID int64, protocol string) (bool, error) {
-	return false, nil
-}
-
-// KickChannel is deprecated - use RegisterSession instead
-func (ct *ConnectionTracker) KickChannel() <-chan struct{} {
-	return nil
-}
-
 // encodeConnectionEvent encodes an event to bytes using gob
 func encodeConnectionEvent(event ConnectionEvent) ([]byte, error) {
 	var buf bytes.Buffer

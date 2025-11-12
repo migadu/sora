@@ -262,10 +262,17 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	if c.cache != nil {
 		cachedHash, info, authResult, found := c.cache.GetWithPasswordHash(cacheKey)
 		if found {
+			// Log password length and hash for debugging
+			hashPrefix := cachedHash
+			if len(hashPrefix) > 30 {
+				hashPrefix = hashPrefix[:30] + "..."
+			}
+			logger.Info("Prelookup cache lookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
+
 			// Verify submitted password against cached hash
 			if c.verifyPassword(password, cachedHash) {
 				// Password matches cached hash - return cached result
-				logger.Info("Prelookup cache HIT - password verified against cached hash", "user", authEmail)
+				logger.Info("Prelookup cache HIT - password verified against cached hash", "user", authEmail, "password_len", len(password))
 				// Mark as from cache if we have routing info
 				if info != nil {
 					info.FromCache = true
@@ -275,15 +282,11 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 				// Password doesn't match cached hash - fall through to fresh prelookup
 				// DO NOT delete cache here! Concurrent wrong password attempts should not
 				// invalidate cache for other threads. We'll update cache only if prelookup succeeds.
-				hashPrefix := cachedHash
-				if len(hashPrefix) > 30 {
-					hashPrefix = hashPrefix[:30] + "..."
-				}
-				logger.Info("Prelookup cache STALE - password mismatch, verifying with prelookup", "user", authEmail, "cached_hash_prefix", hashPrefix)
+				logger.Info("Prelookup cache STALE - password mismatch, verifying with prelookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
 				// Note: We intentionally do NOT call c.cache.Delete(cacheKey) here
 			}
 		} else {
-			logger.Debug("Prelookup cache MISS - no cached entry", "user", authEmail)
+			logger.Info("Prelookup cache MISS - no cached entry", "user", authEmail, "password_len", len(password))
 		}
 	}
 
@@ -462,7 +465,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		if len(hashPrefix) > 30 {
 			hashPrefix = hashPrefix[:30] + "..."
 		}
-		logger.Debug("prelookup: Verifying credentials", "user", authEmail, "password_len", len(password), "hash_prefix", hashPrefix)
+		logger.Info("prelookup: Received hash from HTTP endpoint", "user", authEmail, "password_len", len(password), "hash_prefix", hashPrefix)
 
 		// Verify password against hash returned by HTTP endpoint
 		// Note: The HTTP endpoint handles all master token logic and returns the appropriate hash
@@ -473,7 +476,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 			return nil, AuthFailed, nil
 		}
 
-		logger.Info("prelookup: Authentication successful", "user", authEmail)
+		logger.Info("prelookup: Authentication successful", "user", authEmail, "password_len", len(password))
 	} else {
 		// Route-only mode: password already validated by master username check
 		logger.Info("prelookup: Skipping password verification (route_only mode)", "user", authEmail)
@@ -502,6 +505,11 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 	// Store successful result in cache with password hash for invalidation on change
 	if c.cache != nil {
+		hashPrefix := lookupResp.PasswordHash
+		if len(hashPrefix) > 30 {
+			hashPrefix = hashPrefix[:30] + "..."
+		}
+		logger.Info("prelookup: Caching successful auth", "user", authEmail, "hash_prefix", hashPrefix)
 		c.cache.SetWithHash(cacheKey, info, AuthSuccess, lookupResp.PasswordHash)
 	}
 
@@ -510,15 +518,18 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 // verifyPassword verifies a password against a hash
 func (c *HTTPPreLookupClient) verifyPassword(password, hash string) bool {
+	hashPrefix := hash
+	if len(hashPrefix) > 30 {
+		hashPrefix = hashPrefix[:30] + "..."
+	}
+	logger.Info("prelookup: Verifying password", "password_len", len(password), "hash_prefix", hashPrefix)
+
 	err := db.VerifyPassword(hash, password)
 	if err != nil {
-		hashPrefix := hash
-		if len(hashPrefix) > 30 {
-			hashPrefix = hashPrefix[:30] + "..."
-		}
-		logger.Debug("prelookup: Password verification failed", "hash_prefix", hashPrefix, "error", err)
+		logger.Info("prelookup: Password verification FAILED", "password_len", len(password), "hash_prefix", hashPrefix, "error", err)
 		return false
 	}
+	logger.Info("prelookup: Password verification SUCCESS", "password_len", len(password), "hash_prefix", hashPrefix)
 	return true
 }
 

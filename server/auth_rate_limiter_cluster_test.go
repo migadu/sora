@@ -68,8 +68,8 @@ func TestClusterRateLimitSync(t *testing.T) {
 	// Create auth rate limiters
 	rateLimitCfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   5, // Block after 5 failures
-		FastBlockDuration:    5 * time.Minute,
+		MaxAttemptsPerIP:     5, // Block after 5 failures
+		IPBlockDuration:      5 * time.Minute,
 		DelayStartThreshold:  2,
 		MaxDelay:             30 * time.Second,
 		InitialDelay:         2 * time.Second,
@@ -282,8 +282,8 @@ func TestClusterUsernameRateLimitSync(t *testing.T) {
 		Enabled:                true,
 		MaxAttemptsPerUsername: 3, // Block username after 3 failures cluster-wide
 		UsernameWindowDuration: 30 * time.Minute,
-		FastBlockThreshold:     10, // High threshold so we don't hit IP blocks
-		FastBlockDuration:      5 * time.Minute,
+		MaxAttemptsPerIP:       10, // High threshold so we don't hit IP blocks
+		IPBlockDuration:        5 * time.Minute,
 		DelayStartThreshold:    10,
 		MaxDelay:               30 * time.Second,
 		InitialDelay:           2 * time.Second,
@@ -359,32 +359,33 @@ func TestClusterUsernameRateLimitSync(t *testing.T) {
 			t.Logf("⚠ Node 2 did not receive cluster event yet (gossip propagation may be slow)")
 		}
 
-		// Fail 1 more time on node 1 (should hit limit of 3)
+		// Fail 1 more time on node 1 (total 3 failures across cluster)
 		limiter1.RecordAuthAttempt(ctx, &StringAddr{Addr: "192.168.1.300:12345"}, username, false)
 
 		// Wait for gossip
 		time.Sleep(1 * time.Second)
 
-		// Node 1 should definitely block (has 2 local failures minimum)
+		// Username tracking is for statistics only - should NOT block authentication
+		// This prevents DoS attacks where attacker locks out legitimate users
 		err1 := limiter1.CanAttemptAuth(ctx, &StringAddr{Addr: "192.168.1.400:12345"}, username)
 		count1After := limiter1.getUsernameFailureCount(username)
 		t.Logf("Node 1 final count: %d", count1After)
-		if count1After >= 3 && err1 == nil {
-			t.Errorf("Node 1 should block username after %d failures", count1After)
-		} else if err1 != nil {
-			t.Logf("✓ Node 1 correctly blocking username (count: %d)", count1After)
+		if err1 != nil {
+			t.Errorf("Node 1 should NOT block based on username failures (prevents DoS): %v", err1)
+		}
+		if count1After >= 2 {
+			t.Logf("✓ Node 1 correctly tracking username failures for statistics: %d", count1After)
 		}
 
-		// Node 2 blocking depends on gossip propagation
+		// Node 2 should also not block (username tracking is for statistics only)
 		err2 := limiter2.CanAttemptAuth(ctx, &StringAddr{Addr: "192.168.1.500:12345"}, username)
 		count2After := limiter2.getUsernameFailureCount(username)
 		t.Logf("Node 2 final count: %d", count2After)
-		if count2After >= 3 && err2 == nil {
-			t.Errorf("Node 2 should block username after %d failures", count2After)
-		} else if err2 != nil {
-			t.Logf("✓ Node 2 correctly blocking username (count: %d)", count2After)
-		} else {
-			t.Logf("⚠ Node 2 not blocking yet (gossip may not have propagated all events)")
+		if err2 != nil {
+			t.Errorf("Node 2 should NOT block based on username failures (prevents DoS): %v", err2)
+		}
+		if count2After >= 1 {
+			t.Logf("✓ Node 2 correctly tracking username failures for statistics: %d", count2After)
 		}
 	})
 

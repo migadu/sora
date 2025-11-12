@@ -468,7 +468,6 @@ max_connections_per_ip = 50
 [servers.imap.auth_rate_limit]
 enabled = true
 max_attempts_per_ip = 10
-fast_block_threshold = 5
 
 [[servers]]
 type = "http_api"

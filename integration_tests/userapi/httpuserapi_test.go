@@ -1139,10 +1139,10 @@ func TestAuthRateLimiting(t *testing.T) {
 			Cache:         nil,
 			TLS:           false,
 			AuthRateLimit: server.AuthRateLimiterConfig{
-				Enabled:            true,
-				FastBlockThreshold: 3, // Block after 3 failures
-				FastBlockDuration:  1 * time.Minute,
-				IPWindowDuration:   5 * time.Minute,
+				Enabled:          true,
+				MaxAttemptsPerIP: 3, // Block after 3 failures
+				IPBlockDuration:  1 * time.Minute,
+				IPWindowDuration: 5 * time.Minute,
 			},
 		}
 
@@ -1213,10 +1213,10 @@ func TestAuthRateLimiting(t *testing.T) {
 			Cache:         nil,
 			TLS:           false,
 			AuthRateLimit: server.AuthRateLimiterConfig{
-				Enabled:            true,
-				FastBlockThreshold: 3, // Block after 3 failures
-				FastBlockDuration:  1 * time.Minute,
-				IPWindowDuration:   5 * time.Minute,
+				Enabled:          true,
+				MaxAttemptsPerIP: 3, // Block after 3 failures
+				IPBlockDuration:  1 * time.Minute,
+				IPWindowDuration: 5 * time.Minute,
 			},
 		}
 

@@ -250,8 +250,6 @@ username_window_duration = "30m" # Time window for username-based limiting
 progressive_delay_enabled = true
 progressive_delay_min = "1s"
 progressive_delay_max = "30s"
-fast_block_threshold = 5       # Fast block after N failures
-fast_block_duration = "5m"
 ```
 
 #### Relay Queue
@@ -585,8 +583,6 @@ max_conn_idle_time = "30m" # Close idle connections
 [servers.imap.auth_rate_limit]
 max_attempts_per_ip = 10    # Adjust based on security needs
 ip_window_duration = "15m"   # Shorter window = more forgiving
-fast_block_threshold = 5     # Fast block after N failures
-fast_block_duration = "5m"   # Longer = better protection
 ```
 
 #### Background Workers

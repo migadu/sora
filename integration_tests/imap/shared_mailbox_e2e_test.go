@@ -63,8 +63,8 @@ func TestSharedMailboxE2E(t *testing.T) {
 	t.Run("GrantACLViaSoraAdmin", func(t *testing.T) {
 		// Run sora-admin acl grant command
 		cmd := exec.Command("../../sora-admin",
-			"acl", "grant",
 			"--config", "../../config-test.toml",
+			"acl", "grant",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
 			"--user", user.Email,
@@ -83,8 +83,8 @@ func TestSharedMailboxE2E(t *testing.T) {
 	// Test 3: List ACL via sora-admin command
 	t.Run("ListACLViaSoraAdmin", func(t *testing.T) {
 		cmd := exec.Command("../../sora-admin",
-			"acl", "list",
 			"--config", "../../config-test.toml",
+			"acl", "list",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
 		)
@@ -126,8 +126,8 @@ func TestSharedMailboxE2E(t *testing.T) {
 	// Test 5: Revoke ACL via sora-admin command
 	t.Run("RevokeACLViaSoraAdmin", func(t *testing.T) {
 		cmd := exec.Command("../../sora-admin",
-			"acl", "revoke",
 			"--config", "../../config-test.toml",
+			"acl", "revoke",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
 			"--user", user.Email,
@@ -247,8 +247,8 @@ func TestSharedMailboxConfigPropagation(t *testing.T) {
 func TestSoraAdminACLWithoutConfigFails(t *testing.T) {
 	t.Run("GrantWithoutConfig", func(t *testing.T) {
 		cmd := exec.Command("../../sora-admin",
-			"acl", "grant",
 			"--config", "/nonexistent/config.toml",
+			"acl", "grant",
 			"--email", "owner@example.com",
 			"--mailbox", "Shared/Test",
 			"--user", "user@example.com",
@@ -266,8 +266,8 @@ func TestSoraAdminACLWithoutConfigFails(t *testing.T) {
 
 	t.Run("GrantWithMissingParameters", func(t *testing.T) {
 		cmd := exec.Command("../../sora-admin",
-			"acl", "grant",
 			"--config", "../../config-test.toml",
+			"acl", "grant",
 			// Missing required parameters
 		)
 

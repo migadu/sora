@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -34,8 +35,30 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Check authentication rate limiting after delay using proxy-aware method
 	if s.server.authLimiter != nil {
 		if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
+			// Check if this is a rate limit error
+			var rateLimitErr *server.RateLimitError
+			if errors.As(err, &rateLimitErr) {
+				logger.Info("IMAP: Rate limit exceeded",
+					"address", address,
+					"ip", rateLimitErr.IP,
+					"reason", rateLimitErr.Reason,
+					"failure_count", rateLimitErr.FailureCount,
+					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+				// Track rate limiting as a specific error type
+				metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
+
+				// Send BYE with ALERT per RFC 3501
+				// This immediately closes the connection with an informative message
+				return &imap.Error{
+					Type: imap.StatusResponseTypeBye,
+					Code: imap.ResponseCodeAlert,
+					Text: "Too many failed authentication attempts. Please try again later.",
+				}
+			}
+
+			// Unknown rate limiting error (shouldn't happen, but handle gracefully)
 			s.DebugLog("[LOGIN] rate limited: %v", err)
-			// Track rate limiting as a specific error type
 			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,

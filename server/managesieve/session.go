@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"github.com/foxcpp/go-sieve"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -190,7 +192,19 @@ func (s *ManageSieveSession) handleConnection() {
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
-					s.DebugLog("[LOGIN] rate limited: %v", err)
+					// Check if this is a rate limit error
+					var rateLimitErr *server.RateLimitError
+					if errors.As(err, &rateLimitErr) {
+						logger.Info("ManageSieve: Rate limit exceeded",
+							"address", address.FullAddress(),
+							"ip", rateLimitErr.IP,
+							"reason", rateLimitErr.Reason,
+							"failure_count", rateLimitErr.FailureCount,
+							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+					} else {
+						s.DebugLog("[LOGIN] rate limited: %v", err)
+					}
+
 					s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
 					continue
 				}
@@ -1317,7 +1331,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 // registerConnection registers the connection in the connection tracker
 func (s *ManageSieveSession) registerConnection(email string) {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
+	if s.server.connTracker != nil && s.User != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -1333,7 +1347,7 @@ func (s *ManageSieveSession) registerConnection(email string) {
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.User != nil {
+	if s.server.connTracker != nil && s.User != nil {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
@@ -1349,7 +1363,7 @@ func (s *ManageSieveSession) unregisterConnection() {
 
 // startTerminationPoller starts a goroutine that waits for kick notifications
 func (s *ManageSieveSession) startTerminationPoller() {
-	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || s.User == nil {
+	if s.server.connTracker == nil || s.User == nil {
 		return
 	}
 

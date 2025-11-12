@@ -42,11 +42,12 @@ type ClientCapabilityFilter struct {
 	ja4FingerprintRegexps []*regexp.Regexp // Multiple JA4 patterns - matches if ANY pattern matches
 }
 
-// connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
+// connectionLimitingListener wraps a net.Listener to enforce connection limits and rate limits at the TCP level
 type connectionLimitingListener struct {
 	net.Listener
-	limiter *serverPkg.ConnectionLimiter
-	name    string
+	limiter     *serverPkg.ConnectionLimiter
+	authLimiter serverPkg.AuthLimiter
+	name        string
 }
 
 // Accept accepts connections and checks connection limits before returning them
@@ -71,6 +72,23 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if limitErr != nil {
 			logger.Debug("IMAP: Connection rejected", "name", l.name, "error", limitErr)
+			conn.Close()
+			continue // Try to accept the next connection
+		}
+
+		// Check if IP is blocked by rate limiter (Tier 2: IP-level blocking)
+		// This happens BEFORE TLS handshake to save resources
+		if l.authLimiter != nil && l.authLimiter.IsIPBlockedWithProxy(conn, proxyInfo) {
+			// Determine real IP for logging
+			logIP := realClientIP
+			if logIP == "" {
+				logIP = server.GetAddrString(conn.RemoteAddr())
+			}
+			logger.Info("IMAP: Rejected connection from rate-limited IP",
+				"name", l.name,
+				"ip", logIP,
+				"reason", "IP blocked by rate limiter (Tier 2)")
+			releaseConn() // Release the connection limit
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -832,11 +850,12 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		}
 	}
 
-	// Wrap listener with connection limiting
+	// Wrap listener with connection limiting and rate limiting
 	limitedListener := &connectionLimitingListener{
-		Listener: listener,
-		limiter:  s.limiter,
-		name:     s.name,
+		Listener:    listener,
+		limiter:     s.limiter,
+		authLimiter: s.authLimiter,
+		name:        s.name,
 	}
 
 	err = s.server.Serve(limitedListener)

@@ -10,12 +10,12 @@ import (
 	"github.com/migadu/sora/config"
 )
 
-// TestAuthRateLimiterBasicIPBlocking tests that IPs are blocked after exceeding fast_block_threshold
+// TestAuthRateLimiterBasicIPBlocking tests that IPs are blocked after exceeding max_attempts_per_ip (Tier 2)
 func TestAuthRateLimiterBasicIPBlocking(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   3, // Block after 3 failures
-		FastBlockDuration:    5 * time.Minute,
+		MaxAttemptsPerIP:     3, // Tier 2: Block after 3 failures
+		IPBlockDuration:      5 * time.Minute,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -35,7 +35,7 @@ func TestAuthRateLimiterBasicIPBlocking(t *testing.T) {
 		t.Errorf("Should not block after 2 failures (threshold 3): %v", err)
 	}
 
-	// Record 3rd failure - should trigger fast block
+	// Record 3rd failure - should trigger Tier 2 IP block
 	limiter.RecordAuthAttempt(ctx, addr, "user@example.com", false)
 
 	err = limiter.CanAttemptAuth(ctx, addr, "user@example.com")
@@ -59,7 +59,7 @@ func TestAuthRateLimiterProgressiveDelays(t *testing.T) {
 		InitialDelay:         100 * time.Millisecond,
 		MaxDelay:             1 * time.Second,
 		DelayMultiplier:      2.0, // Double each time
-		FastBlockThreshold:   10,  // High threshold so we don't block
+		MaxAttemptsPerIP:     10,  // High threshold so we don't block
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -106,13 +106,13 @@ func TestAuthRateLimiterProgressiveDelays(t *testing.T) {
 	}
 }
 
-// TestAuthRateLimiterUsernameBlocking tests username-based blocking
-func TestAuthRateLimiterUsernameBlocking(t *testing.T) {
+// TestAuthRateLimiterUsernameTracking tests username failure tracking (for statistics only, not blocking)
+func TestAuthRateLimiterUsernameTracking(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
-		MaxAttemptsPerUsername: 3, // Block username after 3 failures
+		MaxAttemptsPerUsername: 3, // Track failures but don't block
 		UsernameWindowDuration: 30 * time.Minute,
-		FastBlockThreshold:     10, // High threshold so IP doesn't block first
+		MaxAttemptsPerIP:       10, // High threshold so IP doesn't block first
 		IPWindowDuration:       15 * time.Minute,
 	}
 
@@ -122,38 +122,39 @@ func TestAuthRateLimiterUsernameBlocking(t *testing.T) {
 	ctx := context.Background()
 	username := "target@example.com"
 
-	// Record 2 failures from different IPs
+	// Record failures from different IPs
 	addr1 := &StringAddr{Addr: "192.168.1.100:12345"}
 	addr2 := &StringAddr{Addr: "192.168.1.101:12345"}
+	addr3 := &StringAddr{Addr: "192.168.1.102:12345"}
 
 	limiter.RecordAuthAttempt(ctx, addr1, username, false)
 	limiter.RecordAuthAttempt(ctx, addr2, username, false)
+	limiter.RecordAuthAttempt(ctx, addr3, username, false)
 
-	// Should still allow attempts
+	// Username tracking is for statistics only - should NOT block authentication
+	// This prevents DoS attacks where attacker locks out legitimate users
 	err := limiter.CanAttemptAuth(ctx, addr1, username)
 	if err != nil {
-		t.Errorf("Should not block username after 2 failures: %v", err)
+		t.Errorf("Should not block based on username failures (prevents DoS): %v", err)
 	}
 
-	// Third failure - should block username
-	limiter.RecordAuthAttempt(ctx, addr1, username, false)
-
-	err = limiter.CanAttemptAuth(ctx, addr1, username)
-	if err == nil {
-		t.Error("Should block username after 3 failures")
-	}
-
-	// Should block from any IP
-	addr3 := &StringAddr{Addr: "192.168.1.102:12345"}
+	// Should allow from any IP (username blocking removed to prevent DoS)
 	err = limiter.CanAttemptAuth(ctx, addr3, username)
-	if err == nil {
-		t.Error("Should block username from all IPs after 3 failures")
+	if err != nil {
+		t.Errorf("Should not block username from any IP (prevents DoS): %v", err)
 	}
 
-	// Different username should work
-	err = limiter.CanAttemptAuth(ctx, addr1, "other@example.com")
-	if err != nil {
-		t.Errorf("Different username should not be blocked: %v", err)
+	// Verify username failure count is tracked (for monitoring/statistics)
+	count := limiter.getUsernameFailureCount(username)
+	if count != 3 {
+		t.Errorf("Username failure count should be 3, got %d", count)
+	}
+
+	// Successful auth should clear username failures
+	limiter.RecordAuthAttempt(ctx, addr1, username, true)
+	count = limiter.getUsernameFailureCount(username)
+	if count != 0 {
+		t.Errorf("Username failure count should be 0 after success, got %d", count)
 	}
 }
 
@@ -161,8 +162,8 @@ func TestAuthRateLimiterUsernameBlocking(t *testing.T) {
 func TestAuthRateLimiterSuccessResetsFailures(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
-		FastBlockThreshold:     3,
-		FastBlockDuration:      5 * time.Minute,
+		MaxAttemptsPerIP:       3,
+		IPBlockDuration:        5 * time.Minute,
 		MaxAttemptsPerUsername: 5,
 		IPWindowDuration:       15 * time.Minute,
 		UsernameWindowDuration: 30 * time.Minute,
@@ -208,8 +209,8 @@ func TestAuthRateLimiterSuccessResetsFailures(t *testing.T) {
 // TestAuthRateLimiterDisabled tests that disabled limiter allows all attempts
 func TestAuthRateLimiterDisabled(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
-		Enabled:            false, // Disabled
-		FastBlockThreshold: 1,     // Would block after 1 failure if enabled
+		Enabled:          false, // Disabled
+		MaxAttemptsPerIP: 1,     // Would block after 1 failure if enabled
 	}
 
 	limiter := NewAuthRateLimiter("imap", cfg)
@@ -238,7 +239,7 @@ func TestAuthRateLimiterMaxDelayCapEnforced(t *testing.T) {
 		InitialDelay:         100 * time.Millisecond,
 		MaxDelay:             300 * time.Millisecond, // Cap at 300ms
 		DelayMultiplier:      2.0,
-		FastBlockThreshold:   10,
+		MaxAttemptsPerIP:     10,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -283,8 +284,8 @@ func TestAuthRateLimiterMaxDelayCapEnforced(t *testing.T) {
 func TestAuthRateLimiterGetStats(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
-		FastBlockThreshold:     3,
-		FastBlockDuration:      5 * time.Minute,
+		MaxAttemptsPerIP:       3,
+		IPBlockDuration:        5 * time.Minute,
 		MaxAttemptsPerUsername: 5,
 		IPWindowDuration:       15 * time.Minute,
 		UsernameWindowDuration: 30 * time.Minute,
@@ -334,8 +335,8 @@ func TestAuthRateLimiterGetStats(t *testing.T) {
 func TestAuthRateLimiterCleanupExpiredEntries(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   3,
-		FastBlockDuration:    100 * time.Millisecond, // Very short for testing
+		MaxAttemptsPerIP:     3,
+		IPBlockDuration:      100 * time.Millisecond, // Very short for testing
 		IPWindowDuration:     100 * time.Millisecond,
 		CacheCleanupInterval: 50 * time.Millisecond, // Frequent cleanup
 	}
@@ -378,7 +379,7 @@ func TestAuthRateLimiterUsernameCleanup(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
 		MaxAttemptsPerUsername: 5,
-		FastBlockThreshold:     10,
+		MaxAttemptsPerIP:       10,
 		IPWindowDuration:       100 * time.Millisecond,
 		UsernameWindowDuration: 100 * time.Millisecond, // Very short for testing
 		CacheCleanupInterval:   50 * time.Millisecond,  // Frequent cleanup
@@ -428,8 +429,8 @@ func TestAuthRateLimiterCompleteMemoryCleanup(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
 		MaxAttemptsPerUsername: 5,
-		FastBlockThreshold:     3, // Block after 3 failures
-		FastBlockDuration:      100 * time.Millisecond,
+		MaxAttemptsPerIP:       3, // Block after 3 failures
+		IPBlockDuration:        100 * time.Millisecond,
 		DelayStartThreshold:    2, // Start delays after 2 failures
 		InitialDelay:           10 * time.Millisecond,
 		DelayMultiplier:        2.0,
@@ -531,8 +532,8 @@ func TestAuthRateLimiterContinuousCleanup(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:                true,
 		MaxAttemptsPerUsername: 10,
-		FastBlockThreshold:     5,
-		FastBlockDuration:      200 * time.Millisecond,
+		MaxAttemptsPerIP:       5,
+		IPBlockDuration:        200 * time.Millisecond,
 		IPWindowDuration:       200 * time.Millisecond,
 		UsernameWindowDuration: 200 * time.Millisecond,
 		CacheCleanupInterval:   50 * time.Millisecond, // Cleanup every 50ms
@@ -590,7 +591,7 @@ func TestAuthRateLimiterContinuousCleanup(t *testing.T) {
 func TestAuthRateLimiterConcurrentAccess(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   10,
+		MaxAttemptsPerIP:     10,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -629,7 +630,7 @@ func TestAuthRateLimiterConcurrentAccess(t *testing.T) {
 func TestAuthRateLimiterWithTrustedNetworks(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   3,
+		MaxAttemptsPerIP:     3,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -651,8 +652,8 @@ func TestAuthRateLimiterWithTrustedNetworks(t *testing.T) {
 func TestAuthRateLimiterTrustedNetworksWithProxy(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   1, // Block after just 1 failure
-		FastBlockDuration:    5 * time.Minute,
+		MaxAttemptsPerIP:     1, // Block after just 1 failure
+		IPBlockDuration:      5 * time.Minute,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -712,8 +713,8 @@ func TestAuthRateLimiterTrustedNetworksWithProxy(t *testing.T) {
 func TestAuthRateLimiterProxyProtocolInfo(t *testing.T) {
 	cfg := config.AuthRateLimiterConfig{
 		Enabled:              true,
-		FastBlockThreshold:   2,
-		FastBlockDuration:    5 * time.Minute,
+		MaxAttemptsPerIP:     2,
+		IPBlockDuration:      5 * time.Minute,
 		IPWindowDuration:     15 * time.Minute,
 		CacheCleanupInterval: 1 * time.Minute,
 	}
@@ -772,3 +773,418 @@ func (m *testAuthConn) RemoteAddr() net.Addr               { return &StringAddr{
 func (m *testAuthConn) SetDeadline(t time.Time) error      { return nil }
 func (m *testAuthConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *testAuthConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ========== IP+USERNAME BLOCKING TESTS (TIER 1) ==========
+
+// TestAuthRateLimiter_IPUsernameBlocking_Basic tests basic IP+username blocking (Tier 1)
+func TestAuthRateLimiter_IPUsernameBlocking_Basic(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+		MaxAttemptsPerIP:         100,
+		IPBlockDuration:          15 * time.Minute,
+		IPWindowDuration:         15 * time.Minute,
+		CacheCleanupInterval:     1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	ip := &StringAddr{Addr: "1.2.3.4:12345"}
+	username := "test@example.com"
+
+	// Record 3 failures
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+
+	err := limiter.CanAttemptAuth(ctx, ip, username)
+	if err == nil {
+		t.Error("Should block IP+username after 3 failures")
+	} else {
+		t.Logf("Correctly blocked: %v", err)
+	}
+}
+
+// TestAuthRateLimiter_IPUsernameBlocking_IsolatesUsers tests that IP+username blocking
+// only blocks specific user from specific IP, not other users from same IP
+func TestAuthRateLimiter_IPUsernameBlocking_IsolatesUsers(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		// Tier 1: IP+username blocking (fast)
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+
+		// Tier 2: High threshold
+		MaxAttemptsPerIP: 100,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	sharedIP := &StringAddr{Addr: "10.20.30.40:12345"}
+
+	user1 := "alice@example.com"
+	user2 := "bob@example.com"
+	user3 := "charlie@example.com"
+
+	// User1 fails 3 times - should be blocked
+	for i := 0; i < 3; i++ {
+		limiter.RecordAuthAttempt(ctx, sharedIP, user1, false)
+	}
+
+	// User1 should be blocked
+	err := limiter.CanAttemptAuth(ctx, sharedIP, user1)
+	if err == nil {
+		t.Error("User1 should be blocked after 3 failures")
+	}
+
+	// User2 and User3 should NOT be blocked (different usernames)
+	err = limiter.CanAttemptAuth(ctx, sharedIP, user2)
+	if err != nil {
+		t.Errorf("User2 should NOT be blocked (different username): %v", err)
+	}
+
+	err = limiter.CanAttemptAuth(ctx, sharedIP, user3)
+	if err != nil {
+		t.Errorf("User3 should NOT be blocked (different username): %v", err)
+	}
+
+	// User2 can successfully authenticate
+	limiter.RecordAuthAttempt(ctx, sharedIP, user2, true)
+	err = limiter.CanAttemptAuth(ctx, sharedIP, user2)
+	if err != nil {
+		t.Errorf("User2 should still work after successful auth: %v", err)
+	}
+
+	t.Logf("✓ IP+username blocking correctly isolates users on shared IP")
+}
+
+// TestAuthRateLimiter_IPUsernameBlocking_DifferentIPsSameUser tests that
+// blocking one IP+username combo doesn't block same username from different IP
+func TestAuthRateLimiter_IPUsernameBlocking_DifferentIPsSameUser(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+
+		MaxAttemptsPerIP: 100,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	username := "test@example.com"
+	ip1 := &StringAddr{Addr: "1.1.1.1:12345"}
+	ip2 := &StringAddr{Addr: "2.2.2.2:12345"}
+
+	// Fail 3 times from IP1 - blocks IP1+username
+	for i := 0; i < 3; i++ {
+		limiter.RecordAuthAttempt(ctx, ip1, username, false)
+	}
+
+	// IP1 should be blocked for this username
+	err := limiter.CanAttemptAuth(ctx, ip1, username)
+	if err == nil {
+		t.Error("IP1+username should be blocked")
+	}
+
+	// Same username from IP2 should NOT be blocked (different IP)
+	err = limiter.CanAttemptAuth(ctx, ip2, username)
+	if err != nil {
+		t.Errorf("IP2+username should NOT be blocked (different IP): %v", err)
+	}
+
+	// User can successfully auth from IP2
+	limiter.RecordAuthAttempt(ctx, ip2, username, true)
+	err = limiter.CanAttemptAuth(ctx, ip2, username)
+	if err != nil {
+		t.Errorf("IP2+username should work after successful auth: %v", err)
+	}
+
+	t.Logf("✓ IP+username blocking correctly isolates by IP")
+}
+
+// TestAuthRateLimiter_IPUsernameBlocking_SuccessClears tests that successful
+// authentication clears IP+username failure tracking
+func TestAuthRateLimiter_IPUsernameBlocking_SuccessClears(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+
+		MaxAttemptsPerIP: 100,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	ip := &StringAddr{Addr: "1.2.3.4:12345"}
+	username := "test@example.com"
+
+	// Record 2 failures (not blocked yet)
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+
+	// Check stats - should have IP+username tracking entry
+	stats := limiter.GetStats(ctx, 1*time.Minute)
+	blockedIPUsernameCount := stats["blocked_ip_usernames"].(int)
+	if blockedIPUsernameCount == 0 {
+		t.Error("Should have IP+username tracking entry after failures")
+	}
+
+	// Successful authentication should clear tracking
+	limiter.RecordAuthAttempt(ctx, ip, username, true)
+
+	// Check stats - should be cleared
+	stats = limiter.GetStats(ctx, 1*time.Minute)
+	blockedIPUsernameCount = stats["blocked_ip_usernames"].(int)
+	if blockedIPUsernameCount != 0 {
+		t.Errorf("IP+username tracking should be cleared after success, got %d", blockedIPUsernameCount)
+	}
+
+	// Can continue with more attempts without accumulating
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+	limiter.RecordAuthAttempt(ctx, ip, username, false)
+	err := limiter.CanAttemptAuth(ctx, ip, username)
+	if err != nil {
+		t.Errorf("Should not block after success reset: %v", err)
+	}
+
+	t.Logf("✓ Successful authentication clears IP+username tracking")
+}
+
+// TestAuthRateLimiter_IPUsernameBlocking_EmptyUsername tests that empty username
+// doesn't trigger IP+username blocking (falls back to IP-only)
+func TestAuthRateLimiter_IPUsernameBlocking_EmptyUsername(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		// Tier 1: IP+username (should not trigger for empty username)
+		MaxAttemptsPerIPUsername: 2,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+
+		// Tier 2: IP-only (should trigger)
+		MaxAttemptsPerIP: 4,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	ip := &StringAddr{Addr: "1.2.3.4:12345"}
+
+	// Record 3 failures with empty username
+	// Should NOT trigger Tier 1 (threshold 2) because username is empty
+	// Should eventually trigger Tier 2 (threshold 4)
+	limiter.RecordAuthAttempt(ctx, ip, "", false)
+	limiter.RecordAuthAttempt(ctx, ip, "", false)
+	limiter.RecordAuthAttempt(ctx, ip, "", false)
+
+	// Should not be blocked yet (Tier 2 threshold is 4)
+	err := limiter.CanAttemptAuth(ctx, ip, "")
+	if err != nil {
+		t.Errorf("Should not block after 3 failures (Tier 2 threshold is 4): %v", err)
+	}
+
+	// 4th failure should trigger Tier 2 block
+	limiter.RecordAuthAttempt(ctx, ip, "", false)
+	err = limiter.CanAttemptAuth(ctx, ip, "")
+	if err == nil {
+		t.Error("Should block after 4 failures (Tier 2 threshold)")
+	}
+
+	t.Logf("✓ Empty username correctly uses Tier 2 (IP-only) blocking")
+}
+
+// TestAuthRateLimiter_TierInteraction_BothTiersActive tests interaction when both
+// Tier 1 and Tier 2 are active with different thresholds
+func TestAuthRateLimiter_TierInteraction_BothTiersActive(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		// Tier 1: Fast IP+username blocking
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  5 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+
+		// Tier 2: Slower IP-only blocking
+		MaxAttemptsPerIP: 10,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	ip := &StringAddr{Addr: "5.5.5.5:12345"}
+
+	// Attacker tries 4 different users, 3 attempts each (= 12 total)
+	users := []string{"user1@example.com", "user2@example.com", "user3@example.com", "user4@example.com"}
+
+	for _, user := range users {
+		for i := 0; i < 3; i++ {
+			limiter.RecordAuthAttempt(ctx, ip, user, false)
+		}
+	}
+
+	// Each individual user should be blocked by Tier 1
+	for _, user := range users {
+		err := limiter.CanAttemptAuth(ctx, ip, user)
+		if err == nil {
+			t.Errorf("User %s should be blocked by Tier 1 (IP+username)", user)
+		}
+	}
+
+	// Entire IP should ALSO be blocked by Tier 2 (12 > 10 threshold)
+	// Try with a NEW username that hasn't been tried
+	newUser := "newuser@example.com"
+	err := limiter.CanAttemptAuth(ctx, ip, newUser)
+	if err == nil {
+		t.Error("Entire IP should be blocked by Tier 2 after 12 total failures (threshold 10)")
+	}
+
+	t.Logf("✓ Both tiers work together: Tier 1 blocks specific users, Tier 2 blocks entire IP")
+}
+
+// TestAuthRateLimiter_TierInteraction_Tier2OnlyWhenDisabledTier1 tests that when
+// Tier 1 is disabled (MaxAttemptsPerIPUsername=0), only Tier 2 applies
+func TestAuthRateLimiter_TierInteraction_Tier2OnlyWhenDisabledTier1(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		// Tier 1: DISABLED
+		MaxAttemptsPerIPUsername: 0,
+
+		// Tier 2: IP-only blocking
+		MaxAttemptsPerIP: 5,
+		IPBlockDuration:  15 * time.Minute,
+		IPWindowDuration: 15 * time.Minute,
+
+		CacheCleanupInterval: 1 * time.Minute,
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+	ip := &StringAddr{Addr: "7.7.7.7:12345"}
+
+	// Try 3 users, 2 failures each (6 total)
+	users := []string{"user1@example.com", "user2@example.com", "user3@example.com"}
+	for _, user := range users {
+		limiter.RecordAuthAttempt(ctx, ip, user, false)
+		limiter.RecordAuthAttempt(ctx, ip, user, false)
+	}
+
+	// Individual users should NOT be blocked (Tier 1 disabled)
+	// But IP should be blocked (Tier 2: 6 > 5)
+	for _, user := range users {
+		err := limiter.CanAttemptAuth(ctx, ip, user)
+		// Should be blocked by Tier 2 (IP-only), not Tier 1
+		if err == nil {
+			t.Errorf("User %s should be blocked by Tier 2 (IP-only) after 6 total failures", user)
+		}
+	}
+
+	// Verify stats show no IP+username blocks
+	stats := limiter.GetStats(ctx, 1*time.Minute)
+	blockedIPUsernameCount := stats["blocked_ip_usernames"].(int)
+	if blockedIPUsernameCount != 0 {
+		t.Errorf("Should have no IP+username blocks when Tier 1 disabled, got %d", blockedIPUsernameCount)
+	}
+
+	blockedIPs := stats["blocked_ips"].(int)
+	if blockedIPs == 0 {
+		t.Error("Should have IP blocks from Tier 2")
+	}
+
+	t.Logf("✓ Tier 2 works independently when Tier 1 is disabled")
+}
+
+// TestAuthRateLimiter_IPUsernameBlocking_Cleanup tests that IP+username blocks
+// are properly cleaned up after expiration
+func TestAuthRateLimiter_IPUsernameBlocking_CleanupExpired(t *testing.T) {
+	cfg := config.AuthRateLimiterConfig{
+		Enabled: true,
+
+		// Tier 1: Very short duration for testing
+		MaxAttemptsPerIPUsername: 2,
+		IPUsernameBlockDuration:  100 * time.Millisecond,
+		IPUsernameWindowDuration: 100 * time.Millisecond,
+
+		// Tier 2: High threshold
+		MaxAttemptsPerIP: 100,
+		IPBlockDuration:  1 * time.Minute,
+		IPWindowDuration: 1 * time.Minute,
+
+		CacheCleanupInterval: 50 * time.Millisecond, // Fast cleanup
+	}
+
+	limiter := NewAuthRateLimiter("imap", cfg)
+	defer limiter.Stop()
+
+	ctx := context.Background()
+
+	// Create multiple IP+username blocks
+	for i := 1; i <= 5; i++ {
+		ip := &StringAddr{Addr: fmt.Sprintf("10.0.0.%d:12345", i)}
+		username := fmt.Sprintf("user%d@example.com", i)
+
+		// Trigger block
+		limiter.RecordAuthAttempt(ctx, ip, username, false)
+		limiter.RecordAuthAttempt(ctx, ip, username, false)
+	}
+
+	// Verify blocks exist
+	stats := limiter.GetStats(ctx, 1*time.Minute)
+	blockedCount := stats["blocked_ip_usernames"].(int)
+	if blockedCount == 0 {
+		t.Error("Should have IP+username blocks initially")
+	}
+	t.Logf("Initially blocked: %d IP+username combinations", blockedCount)
+
+	// Wait for blocks to expire and cleanup to run
+	time.Sleep(250 * time.Millisecond)
+
+	// Verify cleanup removed expired blocks
+	stats = limiter.GetStats(ctx, 1*time.Minute)
+	blockedCountAfter := stats["blocked_ip_usernames"].(int)
+	if blockedCountAfter != 0 {
+		t.Errorf("Cleanup should have removed expired IP+username blocks, got %d remaining", blockedCountAfter)
+	}
+
+	t.Logf("✓ IP+username blocks properly cleaned up after expiration")
+}

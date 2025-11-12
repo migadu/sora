@@ -384,7 +384,7 @@ func (s *IMAPSession) triggerCacheWarmup() {
 
 // registerConnection registers the connection in the connection tracker
 func (s *IMAPSession) registerConnection(email string) error {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
+	if s.server.connTracker != nil && s.IMAPUser != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -402,7 +402,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *IMAPSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.IMAPUser != nil {
+	if s.server.connTracker != nil && s.IMAPUser != nil {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
@@ -418,7 +418,7 @@ func (s *IMAPSession) unregisterConnection() {
 
 // startTerminationPoller starts a goroutine that waits for kick notifications
 func (s *IMAPSession) startTerminationPoller() {
-	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || s.IMAPUser == nil {
+	if s.server.connTracker == nil || s.IMAPUser == nil {
 		return
 	}
 

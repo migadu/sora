@@ -369,7 +369,24 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
 	if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, s.clientConn, nil, username); err != nil {
-		// Don't record as auth failure - this is rate limiting, not authentication failure
+		// Check if this is a rate limit error
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			logger.Info("POP3 Proxy: Rate limit exceeded",
+				"username", username,
+				"ip", rateLimitErr.IP,
+				"reason", rateLimitErr.Reason,
+				"failure_count", rateLimitErr.FailureCount,
+				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+			// Track rate limiting
+			metrics.ProtocolErrors.WithLabelValues("pop3_proxy", "AUTH", "rate_limited", "client_error").Inc()
+
+			// Return the error - caller will send appropriate POP3 response
+			return rateLimitErr
+		}
+
+		// Unknown rate limiting error
 		metrics.ProtocolErrors.WithLabelValues("pop3_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
 	}
@@ -837,14 +854,12 @@ func (s *POP3ProxySession) close() {
 		// Fire-and-forget: unregister in background to avoid blocking session teardown
 		go func() {
 			// Check if connection tracker is available before using it
-			if connTracker == nil || !connTracker.IsEnabled() {
+			if connTracker == nil {
 				return
 			}
 
 			// Use a new background context for this final operation, as s.ctx is likely already cancelled.
-			// Use configurable timeout from connection tracker to handle database load spikes during heavy connection churn.
-			timeout := connTracker.GetOperationTimeout()
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "POP3", remoteIP); err != nil {
@@ -870,7 +885,7 @@ func (s *POP3ProxySession) registerConnection() error {
 	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
+	if s.server.connTracker != nil {
 		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "POP3", s.RemoteIP)
 	}
 	return nil
@@ -879,7 +894,7 @@ func (s *POP3ProxySession) registerConnection() error {
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 	// If connection tracking is disabled, do nothing and wait for session to end.
-	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
+	if s.server.connTracker == nil {
 		<-ctx.Done()
 		return
 	}

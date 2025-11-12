@@ -809,20 +809,35 @@ timeouts.absolute_session_timeout = "24h"   # Maximum total session duration reg
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- AUTHENTICATION RATE LIMITING ---
+# Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element
 auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
-auth_rate_limit.max_attempts_per_ip = 10          # Max failed auth attempts per IP address.
-auth_rate_limit.max_attempts_per_username = 5     # Max failed auth attempts per username (across all IPs).
-auth_rate_limit.ip_window_duration = "15m"        # Time window for IP-based rate limiting.
-auth_rate_limit.username_window_duration = "30m"  # Time window for username-based rate limiting.
-auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
-auth_rate_limit.fast_block_threshold = 10         # Failed attempts before immediate IP blocking.
-auth_rate_limit.fast_block_duration = "5m"        # Duration of the fast IP block.
-auth_rate_limit.delay_start_threshold = 2         # Failed attempts before applying authentication delays.
-auth_rate_limit.initial_delay = "2s"              # Initial authentication delay after threshold is reached.
-auth_rate_limit.max_delay = "30s"                 # Maximum authentication delay.
+
+# TIER 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
+# Blocks specific user from specific IP - does NOT affect other users on same IP
+auth_rate_limit.max_attempts_per_ip_username = 3  # Max failed attempts per IP+username combo before blocking.
+auth_rate_limit.ip_username_block_duration = "5m" # How long to block specific IP+username combo.
+auth_rate_limit.ip_username_window_duration = "5m" # Time window for counting IP+username failures.
+
+# TIER 2: Slow IP-only blocking (catches distributed attacks from same IP)
+# Blocks entire IP when threshold reached - use high threshold to avoid false positives
+auth_rate_limit.max_attempts_per_ip = 50          # Max failed attempts per IP (any username) before blocking entire IP.
+auth_rate_limit.ip_block_duration = "15m"         # How long to block entire IP after max_attempts_per_ip reached.
+auth_rate_limit.ip_window_duration = "15m"        # Time window for counting IP failures.
+
+# Username tracking (statistics only, does NOT block - prevents DoS)
+auth_rate_limit.max_attempts_per_username = 5     # Track username failures across all IPs (monitoring only).
+auth_rate_limit.username_window_duration = "30m"  # Time window for username failure tracking.
+
+# Progressive delays (applied before blocking thresholds)
+auth_rate_limit.delay_start_threshold = 2         # Failed attempts before applying progressive authentication delays.
+auth_rate_limit.initial_delay = "2s"              # Initial authentication delay after delay_start_threshold.
+auth_rate_limit.max_delay = "30s"                 # Maximum authentication delay (cap for exponential backoff).
 auth_rate_limit.delay_multiplier = 2.0            # Multiplier for progressive delay (exponential backoff).
+
+# Cleanup intervals
 auth_rate_limit.cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
+auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
 
 
 # LMTP SERVER EXAMPLE

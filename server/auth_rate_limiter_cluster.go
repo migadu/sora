@@ -284,8 +284,8 @@ func (crl *ClusterRateLimiter) handleBlockIP(event RateLimitEvent) {
 		return
 	}
 
-	crl.limiter.blockMu.Lock()
-	defer crl.limiter.blockMu.Unlock()
+	crl.limiter.ipMu.Lock()
+	defer crl.limiter.ipMu.Unlock()
 
 	// Check if we already have a more recent block for this IP
 	existing, exists := crl.limiter.blockedIPs[event.IP]
@@ -313,8 +313,8 @@ func (crl *ClusterRateLimiter) handleUnblockIP(event RateLimitEvent) {
 		return
 	}
 
-	crl.limiter.blockMu.Lock()
-	defer crl.limiter.blockMu.Unlock()
+	crl.limiter.ipMu.Lock()
+	defer crl.limiter.ipMu.Unlock()
 
 	if _, exists := crl.limiter.blockedIPs[event.IP]; exists {
 		delete(crl.limiter.blockedIPs, event.IP)
@@ -328,8 +328,8 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 		return
 	}
 
-	crl.limiter.delayMu.Lock()
-	defer crl.limiter.delayMu.Unlock()
+	crl.limiter.ipMu.Lock()
+	defer crl.limiter.ipMu.Unlock()
 
 	// Check if we already have more recent failure info for this IP
 	existing, exists := crl.limiter.ipFailureCounts[event.IP]

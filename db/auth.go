@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -42,20 +43,30 @@ const (
 
 // verifySSHA512 checks if the provided password matches the SSHA512 hashed password
 func verifySSHA512(hashedPassword, password string) error {
+	hashPrefix := hashedPassword
+	if len(hashPrefix) > 30 {
+		hashPrefix = hashPrefix[:30] + "..."
+	}
+	logger.Debug("verifySSHA512: Starting verification", "password_len", len(password), "hash_prefix", hashPrefix)
+
 	decoded, err := decodePasswordData(hashedPassword, ssha512PrefixB64, ssha512PrefixB64Explicit, ssha512PrefixHex)
 	if err != nil {
+		logger.Debug("verifySSHA512: Decode failed", "password_len", len(password), "hash_prefix", hashPrefix, "error", err)
 		return fmt.Errorf("invalid SSHA512 format/data: %w", err)
 	}
 
 	// The SHA512 hash is 64 bytes (512 bits / 8 bits per byte)
 	// Everything after that is the salt
 	if len(decoded) < sha512HashLength+ssha512MinSaltLength {
+		logger.Debug("verifySSHA512: Hash too short", "password_len", len(password), "decoded_len", len(decoded), "hash_prefix", hashPrefix)
 		return errors.New("invalid SSHA512 hash: too short")
 	}
 
 	// Extract the hash and salt
 	storedHash := decoded[:sha512HashLength]
 	salt := decoded[sha512HashLength:]
+
+	logger.Debug("verifySSHA512: Extracted components", "password_len", len(password), "salt_len", len(salt), "hash_prefix", hashPrefix)
 
 	// Calculate hash for the provided password with the same salt
 	h := sha512.New()
@@ -65,9 +76,11 @@ func verifySSHA512(hashedPassword, password string) error {
 
 	// Compare the hashes
 	if !bytes.Equal(storedHash, calculatedHash) {
+		logger.Debug("verifySSHA512: Hash mismatch", "password_len", len(password), "salt_len", len(salt), "hash_prefix", hashPrefix)
 		return errors.New("invalid password")
 	}
 
+	logger.Debug("verifySSHA512: Verification SUCCESS", "password_len", len(password), "salt_len", len(salt), "hash_prefix", hashPrefix)
 	return nil
 }
 

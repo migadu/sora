@@ -267,9 +267,23 @@ func (s *POP3Session) handleConnection() {
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress()); err != nil {
-					s.DebugLog("[PASS] rate limited: %v", err)
-					// Track rate limiting
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
+					// Check if this is a rate limit error
+					var rateLimitErr *server.RateLimitError
+					if errors.As(err, &rateLimitErr) {
+						logger.Info("POP3: Rate limit exceeded",
+							"address", userAddress.FullAddress(),
+							"ip", rateLimitErr.IP,
+							"reason", rateLimitErr.Reason,
+							"failure_count", rateLimitErr.FailureCount,
+							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+						// Track rate limiting
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
+					} else {
+						s.DebugLog("[PASS] rate limited: %v", err)
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
+					}
+
 					if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
 						return
 					}
@@ -2002,7 +2016,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 // registerConnection registers the connection in the connection tracker
 func (s *POP3Session) registerConnection(email string) {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
+	if s.server.connTracker != nil && s.authenticated {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -2018,7 +2032,7 @@ func (s *POP3Session) registerConnection(email string) {
 
 // unregisterConnection removes the connection from the connection tracker
 func (s *POP3Session) unregisterConnection() {
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() && s.authenticated {
+	if s.server.connTracker != nil && s.authenticated {
 		// Use configured database query timeout for connection tracking (database DELETE)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
@@ -2034,7 +2048,7 @@ func (s *POP3Session) unregisterConnection() {
 
 // startTerminationPoller starts a goroutine that waits for kick notifications
 func (s *POP3Session) startTerminationPoller() {
-	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() || !s.authenticated {
+	if s.server.connTracker == nil || !s.authenticated {
 		return
 	}
 

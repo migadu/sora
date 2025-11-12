@@ -876,14 +876,12 @@ func (s *Session) close() {
 		// Fire-and-forget: unregister in background to avoid blocking session teardown
 		go func() {
 			// Check if connection tracker is available before using it
-			if connTracker == nil || !connTracker.IsEnabled() {
+			if connTracker == nil {
 				return
 			}
 
 			// Use a new background context for this final operation, as s.ctx is likely already cancelled.
-			// Use configurable timeout from connection tracker to handle database load spikes during heavy connection churn.
-			timeout := connTracker.GetOperationTimeout()
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			if err := connTracker.UnregisterConnection(ctx, accountID, "LMTP", clientAddr); err != nil {
@@ -911,7 +909,7 @@ func (s *Session) registerConnection() error {
 
 	clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 
-	if s.server.connTracker != nil && s.server.connTracker.IsEnabled() {
+	if s.server.connTracker != nil {
 		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", clientAddr)
 	}
 	return nil
@@ -920,7 +918,7 @@ func (s *Session) registerConnection() error {
 // updateActivityPeriodically updates the connection activity in the database.
 func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	// If connection tracking is disabled, do nothing and wait for session to end.
-	if s.server.connTracker == nil || !s.server.connTracker.IsEnabled() {
+	if s.server.connTracker == nil {
 		<-ctx.Done()
 		return
 	}

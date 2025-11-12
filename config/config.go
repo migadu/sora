@@ -382,16 +382,26 @@ type ProxyProtocolConfig struct {
 
 // AuthRateLimiterConfig holds authentication rate limiter configuration
 type AuthRateLimiterConfig struct {
-	Enabled                bool          `toml:"enabled"`                   // Enable/disable rate limiting
-	MaxAttemptsPerIP       int           `toml:"max_attempts_per_ip"`       // Max failed attempts per IP before DB-based block
-	MaxAttemptsPerUsername int           `toml:"max_attempts_per_username"` // Max failed attempts per username before DB-based block
-	IPWindowDuration       time.Duration `toml:"ip_window_duration"`        // Time window for IP-based limiting
-	UsernameWindowDuration time.Duration `toml:"username_window_duration"`  // Time window for username-based limiting
-	CleanupInterval        time.Duration `toml:"cleanup_interval"`          // How often to clean up old DB entries
+	Enabled bool `toml:"enabled"` // Enable/disable rate limiting
 
-	// Enhanced Features (for EnhancedAuthRateLimiter)
-	FastBlockThreshold   int           `toml:"fast_block_threshold"`   // Failed attempts before in-memory fast block
-	FastBlockDuration    time.Duration `toml:"fast_block_duration"`    // How long to fast block an IP in-memory
+	// Two-tier blocking system
+	// Tier 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
+	MaxAttemptsPerIPUsername int           `toml:"max_attempts_per_ip_username"` // Max failed attempts per IP+username combo before blocking
+	IPUsernameBlockDuration  time.Duration `toml:"ip_username_block_duration"`   // How long to block specific IP+username combo
+	IPUsernameWindowDuration time.Duration `toml:"ip_username_window_duration"`  // Time window for counting IP+username failures
+
+	// Tier 2: Slow IP-only blocking (catches distributed attacks from same IP)
+	MaxAttemptsPerIP int           `toml:"max_attempts_per_ip"` // Max failed attempts per IP (any username) before blocking entire IP
+	IPBlockDuration  time.Duration `toml:"ip_block_duration"`   // How long to block entire IP after max_attempts_per_ip reached
+	IPWindowDuration time.Duration `toml:"ip_window_duration"`  // Time window for counting IP failures
+
+	// Username tracking (statistics only, does not block)
+	MaxAttemptsPerUsername int           `toml:"max_attempts_per_username"` // Max failed attempts per username (tracking only, does not block)
+	UsernameWindowDuration time.Duration `toml:"username_window_duration"`  // Time window for username-based tracking
+
+	CleanupInterval time.Duration `toml:"cleanup_interval"` // How often to clean up old entries
+
+	// Progressive delay settings
 	DelayStartThreshold  int           `toml:"delay_start_threshold"`  // Failed attempts before progressive delays start
 	InitialDelay         time.Duration `toml:"initial_delay"`          // First delay duration
 	MaxDelay             time.Duration `toml:"max_delay"`              // Maximum delay duration
@@ -402,18 +412,29 @@ type AuthRateLimiterConfig struct {
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
 func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	return AuthRateLimiterConfig{
-		MaxAttemptsPerIP:       10,               // 10 failed attempts per IP
-		MaxAttemptsPerUsername: 5,                // 5 failed attempts per username
-		IPWindowDuration:       15 * time.Minute, // 15 minute window for IP
-		UsernameWindowDuration: 30 * time.Minute, // 30 minute window for username
-		CleanupInterval:        5 * time.Minute,  // Clean up every 5 minutes
-		Enabled:                false,            // Disabled by default
+		Enabled: false, // Disabled by default
 
-		// Enhanced Defaults
-		FastBlockThreshold:   10,               // Block IP after 10 failures
-		FastBlockDuration:    5 * time.Minute,  // Block for 5 minutes
+		// Tier 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
+		// Blocks specific user from specific IP only - does not affect other users on same IP
+		MaxAttemptsPerIPUsername: 5,                // Block after 5 failures (allows for typos)
+		IPUsernameBlockDuration:  15 * time.Minute, // Block for 15 minutes
+		IPUsernameWindowDuration: 10 * time.Minute, // 10 minute sliding window
+
+		// Tier 2: Slow IP-only blocking (catches distributed attacks from same IP)
+		// Only triggers when many usernames are tried from same IP
+		MaxAttemptsPerIP: 50,               // Block entire IP after 50 failures (high threshold)
+		IPBlockDuration:  30 * time.Minute, // Block for 30 minutes (more severe)
+		IPWindowDuration: 30 * time.Minute, // 30 minute sliding window
+
+		// Username tracking (statistics only, does NOT block to prevent DoS)
+		MaxAttemptsPerUsername: 10,               // Track username failures across all IPs
+		UsernameWindowDuration: 60 * time.Minute, // 1 hour window for monitoring
+
+		CleanupInterval: 5 * time.Minute, // Clean up expired entries every 5 minutes
+
+		// Progressive delays (slows down attackers before blocking)
 		DelayStartThreshold:  2,                // Start delays after 2 failures
-		InitialDelay:         2 * time.Second,  // 2 second initial delay
+		InitialDelay:         1 * time.Second,  // 1 second initial delay
 		MaxDelay:             30 * time.Second, // Max 30 second delay
 		DelayMultiplier:      2.0,              // Double delay each time
 		CacheCleanupInterval: 10 * time.Minute, // Clean in-memory cache every 10 min
