@@ -385,19 +385,35 @@ func (a *AuthRateLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn n
 	// Extract real client IP and proxy IP
 	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
 
-	// Check if the real client IP is from a trusted network
-	if a.isFromTrustedNetwork(clientIP) {
-		if proxyIP != "" {
-			logger.Debug("Auth limiter: Skipping rate limiting recording for trusted client", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
-		} else {
-			logger.Debug("Auth limiter: Skipping rate limiting recording for trusted client", "protocol", a.protocol, "client", clientIP)
-		}
-		return
-	}
+	now := time.Now()
+	isTrusted := a.isFromTrustedNetwork(clientIP)
 
-	// Use the real client IP for rate limiting
-	clientAddr := &StringAddr{Addr: clientIP}
-	a.RecordAuthAttempt(ctx, clientAddr, username, success)
+	if !success {
+		// Failed authentication: track IP+username (Tier 1), IP-only (Tier 2), and username (statistics)
+
+		// Tier 1 & 2: Skip IP-based tracking for trusted networks (no blocking)
+		if !isTrusted {
+			a.updateIPUsernameFailure(clientIP, username, now) // Tier 1: Fast IP+username blocking
+			a.updateFailureTracking(clientIP, now)             // Tier 2: Slow IP-only blocking
+		} else {
+			if proxyIP != "" {
+				logger.Debug("Auth limiter: Skipping IP-based tracking for trusted client (tracking username only)", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
+			} else {
+				logger.Debug("Auth limiter: Skipping IP-based tracking for trusted client (tracking username only)", "protocol", a.protocol, "client", clientIP)
+			}
+		}
+
+		// Username statistics: ALWAYS track (even from trusted networks)
+		// This is critical for detecting attacks through webmail/trusted proxies
+		a.updateUsernameFailure(username, now) // Statistics only
+	} else {
+		// Successful authentication: clear all tracking
+		if !isTrusted {
+			a.clearIPUsernameFailure(clientIP, username) // Clear Tier 1
+			a.clearFailureTracking(clientIP)             // Clear Tier 2
+		}
+		a.clearUsernameFailure(username) // Clear statistics (always, even for trusted networks)
+	}
 }
 
 // isFromTrustedNetwork checks if an IP address is in the trusted networks
@@ -436,23 +452,28 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 		ip = remoteAddr.String()
 	}
 
-	// Don't record auth attempts from trusted networks
-	if a.isFromTrustedNetwork(ip) {
-		return
-	}
-
 	now := time.Now()
+	isTrusted := a.isFromTrustedNetwork(ip)
 
 	if !success {
 		// Failed authentication: track IP+username (Tier 1), IP-only (Tier 2), and username (statistics)
-		a.updateIPUsernameFailure(ip, username, now) // Tier 1: Fast IP+username blocking
-		a.updateFailureTracking(ip, now)             // Tier 2: Slow IP-only blocking
-		a.updateUsernameFailure(username, now)       // Statistics only
+
+		// Tier 1 & 2: Skip IP-based tracking for trusted networks (no blocking)
+		if !isTrusted {
+			a.updateIPUsernameFailure(ip, username, now) // Tier 1: Fast IP+username blocking
+			a.updateFailureTracking(ip, now)             // Tier 2: Slow IP-only blocking
+		}
+
+		// Username statistics: ALWAYS track (even from trusted networks)
+		// This is critical for detecting attacks through webmail/trusted proxies
+		a.updateUsernameFailure(username, now) // Statistics only
 	} else {
 		// Successful authentication: clear all tracking
-		a.clearIPUsernameFailure(ip, username) // Clear Tier 1
-		a.clearFailureTracking(ip)             // Clear Tier 2
-		a.clearUsernameFailure(username)       // Clear statistics
+		if !isTrusted {
+			a.clearIPUsernameFailure(ip, username) // Clear Tier 1
+			a.clearFailureTracking(ip)             // Clear Tier 2
+		}
+		a.clearUsernameFailure(username) // Clear statistics (always, even for trusted networks)
 	}
 }
 

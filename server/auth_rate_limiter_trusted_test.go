@@ -126,9 +126,10 @@ func TestAuthRateLimiter_TrustedNetworks_BothTiers(t *testing.T) {
 	})
 }
 
-// TestAuthRateLimiter_TrustedNetworks_NoRecording verifies that auth attempts
-// from trusted networks are not even recorded in failure tracking
-func TestAuthRateLimiter_TrustedNetworks_NoRecording(t *testing.T) {
+// TestAuthRateLimiter_TrustedNetworks_UsernameStatsTracked verifies that:
+// - IP-based tracking (Tier 1 & 2) is NOT recorded for trusted networks
+// - Username statistics ARE recorded for trusted networks (for webmail/proxy scenarios)
+func TestAuthRateLimiter_TrustedNetworks_UsernameStatsTracked(t *testing.T) {
 	cfg := AuthRateLimiterConfig{
 		Enabled:                  true,
 		MaxAttemptsPerIPUsername: 3,
@@ -150,30 +151,39 @@ func TestAuthRateLimiter_TrustedNetworks_NoRecording(t *testing.T) {
 	defer limiter.Stop()
 
 	ctx := context.Background()
-	trustedAddr := &net.TCPAddr{IP: net.ParseIP("172.16.10.20"), Port: 12345}
+	trustedAddr := &net.TCPAddr{IP: net.ParseIP("172.16.10.20"), Port: 12345} // Webmail server
 
-	// Record 5 failed attempts from trusted network
+	// Record 5 failed attempts from trusted network (webmail)
 	for i := 0; i < 5; i++ {
-		limiter.RecordAuthAttempt(ctx, trustedAddr, "norecord@example.com", false)
+		limiter.RecordAuthAttempt(ctx, trustedAddr, "victim@example.com", false)
 	}
 
-	// Get stats - should show zero failures because trusted IPs aren't tracked
-	stats := limiter.GetStats(ctx, 5*time.Minute)
-
+	// TEST 1: IP-based tracking should NOT be recorded (trusted network)
 	// Check if there are any IP failures recorded
-	if ipFailures, ok := stats["ip_failures"].(map[string]int); ok {
-		if count, exists := ipFailures["172.16.10.20"]; exists && count > 0 {
-			t.Errorf("Trusted network failures should not be recorded, found %d failures", count)
-		}
+	if ipFailures, ok := limiter.ipFailureCounts["172.16.10.20"]; ok {
+		t.Errorf("Trusted network IP failures should NOT be tracked, found %d failures", ipFailures.FailureCount)
 	}
 
 	// Check if there are any IP+username failures recorded
-	if ipUsernameFailures, ok := stats["ip_username_failures"].(map[string]int); ok {
-		key := "172.16.10.20|norecord@example.com"
-		if count, exists := ipUsernameFailures[key]; exists && count > 0 {
-			t.Errorf("Trusted network IP+username failures should not be recorded, found %d failures", count)
-		}
+	key := "172.16.10.20|victim@example.com"
+	if ipUsernameFailures, ok := limiter.blockedIPUsernames[key]; ok {
+		t.Errorf("Trusted network IP+username failures should NOT be tracked, found %d failures", ipUsernameFailures.FailureCount)
 	}
+	t.Log("✓ IP-based tracking correctly skipped for trusted networks")
 
-	t.Log("✓ Trusted network auth attempts are correctly not recorded in failure tracking")
+	// TEST 2: Username statistics SHOULD be recorded (even from trusted networks)
+	// This is critical for detecting brute-force through webmail
+	usernameCount := limiter.getUsernameFailureCount("victim@example.com")
+	if usernameCount != 5 {
+		t.Errorf("Username statistics should be tracked from trusted networks, expected 5 failures, got %d", usernameCount)
+	}
+	t.Log("✓ Username statistics correctly tracked from trusted networks (webmail scenario)")
+
+	// TEST 3: Verify that successful auth clears username stats
+	limiter.RecordAuthAttempt(ctx, trustedAddr, "victim@example.com", true)
+	usernameCountAfterSuccess := limiter.getUsernameFailureCount("victim@example.com")
+	if usernameCountAfterSuccess != 0 {
+		t.Errorf("Username statistics should be cleared after successful auth, expected 0, got %d", usernameCountAfterSuccess)
+	}
+	t.Log("✓ Username statistics correctly cleared after successful authentication")
 }
