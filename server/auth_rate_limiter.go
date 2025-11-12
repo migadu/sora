@@ -191,6 +191,11 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 		ip = remoteAddr.String()
 	}
 
+	// Check if IP is from a trusted network (never rate limit trusted IPs)
+	if a.isFromTrustedNetwork(ip) {
+		return nil
+	}
+
 	// TIER 1: Check if IP+username combination is blocked (fast, strict)
 	// This protects shared IPs (corporate gateways) by blocking specific users
 	if username != "" && a.config.MaxAttemptsPerIPUsername > 0 {
@@ -429,6 +434,11 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 	ip, _, err := net.SplitHostPort(remoteAddr.String())
 	if err != nil {
 		ip = remoteAddr.String()
+	}
+
+	// Don't record auth attempts from trusted networks
+	if a.isFromTrustedNetwork(ip) {
+		return
 	}
 
 	now := time.Now()
