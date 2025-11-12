@@ -805,7 +805,7 @@ limits.search_rate_limit_window = "1m"   # Time window for search rate limiting 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
 timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration regardless of activity (e.g., "30m", default: 30 minutes)
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration regardless of activity (e.g., "24h", default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 # --- AUTHENTICATION RATE LIMITING ---
@@ -891,7 +891,7 @@ proxy_protocol_timeout = "5s"
 
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
@@ -942,7 +942,7 @@ proxy_protocol_timeout = "5s"
 
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30 minutes)
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
 
@@ -1005,7 +1005,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #    - 30 minutes from connection to disconnection, regardless of activity
 #
 timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration from connect to disconnect (default: 30m).
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
@@ -1358,7 +1358,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- DEBUG LOGGING ---
@@ -1404,7 +1404,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 
 # --- TIMEOUT CONFIGURATION ---
 timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
-timeouts.absolute_session_timeout = "30m"   # Maximum total session duration (default: 30m)
+timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- SIEVE EXTENSIONS ---
