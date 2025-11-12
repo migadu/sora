@@ -258,28 +258,32 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	// Cache key is just the email address (base address without +detail or @TOKEN)
 	cacheKey := authEmail
 
-	// Check cache first - verify password against cached hash
+	// Check cache first - atomically get both password hash and entry to avoid race condition
 	if c.cache != nil {
-		// Get cached password hash for this email
-		if cachedHash, found := c.cache.GetPasswordHash(cacheKey); found {
+		cachedHash, info, authResult, found := c.cache.GetWithPasswordHash(cacheKey)
+		if found {
 			// Verify submitted password against cached hash
 			if c.verifyPassword(password, cachedHash) {
 				// Password matches cached hash - return cached result
-				if info, authResult, foundInfo := c.cache.Get(cacheKey); foundInfo {
-					logger.Debug("Prelookup cache HIT - password verified against cached hash", "user", authEmail)
-					// Mark as from cache if we have routing info
-					if info != nil {
-						info.FromCache = true
-					}
-					return info, authResult, nil
+				logger.Info("Prelookup cache HIT - password verified against cached hash", "user", authEmail)
+				// Mark as from cache if we have routing info
+				if info != nil {
+					info.FromCache = true
 				}
+				return info, authResult, nil
 			} else {
-				// Password doesn't match cached hash - invalidate cache and do fresh lookup
-				logger.Debug("Prelookup cache INVALIDATED - password changed", "user", authEmail)
-				c.cache.Delete(cacheKey)
+				// Password doesn't match cached hash - fall through to fresh prelookup
+				// DO NOT delete cache here! Concurrent wrong password attempts should not
+				// invalidate cache for other threads. We'll update cache only if prelookup succeeds.
+				hashPrefix := cachedHash
+				if len(hashPrefix) > 30 {
+					hashPrefix = hashPrefix[:30] + "..."
+				}
+				logger.Info("Prelookup cache STALE - password mismatch, verifying with prelookup", "user", authEmail, "cached_hash_prefix", hashPrefix)
+				// Note: We intentionally do NOT call c.cache.Delete(cacheKey) here
 			}
 		} else {
-			logger.Debug("Prelookup cache MISS - no cached hash", "user", authEmail)
+			logger.Debug("Prelookup cache MISS - no cached entry", "user", authEmail)
 		}
 	}
 
@@ -330,14 +334,8 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		}
 		defer resp.Body.Close()
 
-		// Read response body first so we can log it
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			logger.Debug("prelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
-			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
-		}
-
-		// Check status code
+		// Check status code first - for error responses, status code is all we need
+		// Don't waste time reading/parsing body for non-200 responses
 		if resp.StatusCode == http.StatusNotFound {
 			logger.Debug("prelookup: User not found (404)", "user", lookupEmail)
 			return map[string]any{"result": AuthUserNotFound}, nil
@@ -345,44 +343,51 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 		// 401 Unauthorized and 403 Forbidden mean authentication failed (user exists but access denied)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			logger.Debug("prelookup: Authentication failed", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
+			logger.Debug("prelookup: Authentication failed", "status", resp.StatusCode, "user", lookupEmail)
 			return map[string]any{"result": AuthFailed}, nil
 		}
 
 		// Other 4xx errors mean user lookup failed - treat as user not found to allow fallback
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Debug("prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
+			logger.Debug("prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail)
 			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
 		// 5xx errors are transient - fallback controlled by config
 		if resp.StatusCode >= 500 {
-			logger.Debug("prelookup: Server error", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
+			logger.Warn("prelookup: Server error", "status", resp.StatusCode, "user", lookupEmail)
 			return nil, fmt.Errorf("%w: server error %d", ErrPrelookupTransient, resp.StatusCode)
 		}
 
 		// Non-200 2xx responses - treat as transient
 		if resp.StatusCode != http.StatusOK {
-			logger.Debug("prelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail, "body", string(bodyBytes))
+			logger.Warn("prelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail)
 			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrPrelookupTransient, resp.StatusCode)
+		}
+
+		// Only read and parse body for 200 OK responses
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			logger.Warn("prelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
+			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
 		}
 
 		// Parse JSON response - if this fails on a 200 response, it's a server bug
 		var lookupResp HTTPPreLookupResponse
 		if err := json.Unmarshal(bodyBytes, &lookupResp); err != nil {
-			logger.Debug("prelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
+			logger.Warn("prelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
 		}
 
 		// Validate required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {
-			logger.Debug("prelookup: Validation failed - address is empty", "user", lookupEmail)
+			logger.Warn("prelookup: Validation failed - address is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
 		}
 		// Only validate password_hash if NOT route_only mode
 		// In route_only mode (master username auth), password already validated locally
 		if !routeOnly && strings.TrimSpace(lookupResp.PasswordHash) == "" {
-			logger.Debug("prelookup: Validation failed - password_hash is empty", "user", lookupEmail)
+			logger.Warn("prelookup: Validation failed - password_hash is empty", "user", lookupEmail)
 			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
 		}
 
@@ -464,6 +469,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		if !c.verifyPassword(password, lookupResp.PasswordHash) {
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
+			logger.Info("prelookup: Password verification failed", "user", authEmail, "hash_prefix", hashPrefix)
 			return nil, AuthFailed, nil
 		}
 
@@ -506,7 +512,11 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 func (c *HTTPPreLookupClient) verifyPassword(password, hash string) bool {
 	err := db.VerifyPassword(hash, password)
 	if err != nil {
-		logger.Info("prelookup: Password verification failed", "hash", hash, "error", err)
+		hashPrefix := hash
+		if len(hashPrefix) > 30 {
+			hashPrefix = hashPrefix[:30] + "..."
+		}
+		logger.Debug("prelookup: Password verification failed", "hash_prefix", hashPrefix, "error", err)
 		return false
 	}
 	return true
@@ -642,11 +652,4 @@ func (c *HTTPPreLookupClient) Close() error {
 	}
 
 	return nil
-}
-
-// hashPassword creates a simple hash of the password for cache keying
-// This is NOT for storage, just for cache key generation
-func hashPassword(password string) string {
-	h := sha256.Sum256([]byte(password))
-	return fmt.Sprintf("%x", h[:8]) // First 8 bytes as hex (16 chars)
 }

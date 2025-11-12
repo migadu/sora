@@ -670,6 +670,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
+			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)
@@ -680,6 +681,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	s.isPrelookupAccount = false
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+	s.InfoLog("main DB auth successful", "user", address.BaseAddress(), "account_id", accountID)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)

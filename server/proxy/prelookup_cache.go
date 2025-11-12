@@ -97,6 +97,29 @@ func (c *prelookupCache) GetPasswordHash(email string) (string, bool) {
 	return entry.passwordHash, true
 }
 
+// GetWithPasswordHash atomically retrieves both the password hash and full entry
+// This prevents the race condition where an entry is evicted between GetPasswordHash and Get calls
+// Returns: (passwordHash, info, authResult, found)
+func (c *prelookupCache) GetWithPasswordHash(email string) (string, *UserRoutingInfo, AuthResult, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[email]
+	if !exists {
+		c.misses++
+		return "", nil, 0, false
+	}
+
+	// Check if expired
+	if time.Now().After(entry.expiresAt) {
+		c.misses++
+		return "", nil, 0, false
+	}
+
+	c.hits++
+	return entry.passwordHash, entry.info, entry.authResult, true
+}
+
 // Set stores a result in the cache
 func (c *prelookupCache) Set(key string, info *UserRoutingInfo, authResult AuthResult) {
 	c.SetWithHash(key, info, authResult, "")

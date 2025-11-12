@@ -123,18 +123,18 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			description:      "200 with empty password_hash should return ErrPrelookupInvalidResponse",
 		},
 		{
-			name: "200_MissingServerIP",
+			name: "200_MissingServerIP_AuthOnlyMode",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
-					"password_hash": "$2a$10$abcdefghijklmnopqrstuvwxyz",
-					// server is missing - should be treated as 404
+					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash of "password"
+					// server is missing - auth-only mode (prelookup authenticates, Sora routes)
 				})
 			},
-			expectAuthResult: AuthUserNotFound,
+			expectAuthResult: AuthFailed, // Password verification will fail (testpassword != password)
 			expectErrorType:  nil,
-			description:      "200 with missing server should be treated as user not found (404)",
+			description:      "200 with missing server triggers auth-only mode (password verification still happens)",
 		},
 		{
 			name: "200_ValidResponse",

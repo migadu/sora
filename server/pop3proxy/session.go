@@ -578,6 +578,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
+			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)
@@ -587,6 +588,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
+	s.InfoLog("main DB auth successful", "user", address.BaseAddress(), "account_id", accountID)
 	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
 	metrics.TrackDomainConnection("pop3_proxy", address.Domain())
 	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)

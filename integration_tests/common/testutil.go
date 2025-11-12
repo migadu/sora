@@ -513,6 +513,96 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	}, account
 }
 
+// SetupIMAPServerWithPROXYAndDatabase sets up an IMAP server with PROXY protocol using an existing database
+func SetupIMAPServerWithPROXYAndDatabase(t *testing.T, rdb *resilient.ResilientDatabase) *TestServer {
+	t.Helper()
+
+	address := GetRandomAddress(t)
+
+	// Create a temporary directory for the uploader
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-proxy-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	// Create error channel for uploader
+	errCh := make(chan error, 1)
+
+	// Create UploadWorker for testing
+	uploadWorker, err := uploader.New(
+		context.Background(),
+		tempDir,              // path
+		10,                   // batchSize
+		1,                    // concurrency
+		3,                    // maxAttempts
+		time.Second,          // retryInterval
+		"test-instance",      // instanceID
+		rdb,                  // database
+		&storage.S3Storage{}, // S3 storage
+		nil,                  // cache (can be nil)
+		errCh,                // error channel
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+
+	// Create IMAP server with PROXY protocol support and master user credentials
+	masterUsername := "proxyuser"
+	masterPassword := "proxypass"
+
+	server, err := imap.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		&storage.S3Storage{},
+		rdb,
+		uploadWorker, // properly initialized UploadWorker
+		nil,          // cache.Cache
+		imap.IMAPServerOptions{
+			ProxyProtocol:        true,                               // Enable PROXY protocol support
+			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
+			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
+			MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
+			MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server with PROXY support: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		if err := server.Serve(address); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			errChan <- fmt.Errorf("IMAP server error: %w", err)
+		}
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+		// Clean up temporary directory
+		os.RemoveAll(tempDir)
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}
+}
+
 // SetupIMAPServerWithMaster sets up an IMAP server with master credentials (no PROXY protocol)
 func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()

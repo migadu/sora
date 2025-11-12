@@ -5,6 +5,7 @@ package imapproxy_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,8 +36,9 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 	backendServer2, _ := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer2.Close()
 
-	// Create test account using helper
-	account := common.CreateTestAccountWithEmail(t, backendServer1.ResilientDB, "authonly@example.com", "test123")
+	// Create test account using helper with unique email
+	uniqueEmail := fmt.Sprintf("authonly-%d@example.com", time.Now().UnixNano())
+	account := common.CreateTestAccountWithEmail(t, backendServer1.ResilientDB, uniqueEmail, "test123")
 
 	// Generate password hash for prelookup response (same way accounts are created)
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
@@ -143,16 +145,21 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 func TestIMAPProxyMixedMode(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Create two backend IMAP servers
-	backendServer1, _ := common.SetupIMAPServerWithPROXY(t)
+	// Create shared database for both backend servers (they must share the same DB)
+	// Note: Database will be closed by SetupTestDatabase's cleanup
+	rdb := common.SetupTestDatabase(t)
+
+	// Create two backend IMAP servers on the shared database
+	backendServer1 := common.SetupIMAPServerWithPROXYAndDatabase(t, rdb)
 	defer backendServer1.Close()
 
-	backendServer2, _ := common.SetupIMAPServerWithPROXY(t)
+	backendServer2 := common.SetupIMAPServerWithPROXYAndDatabase(t, rdb)
 	defer backendServer2.Close()
 
-	// Create two test accounts using helper (use unique emails to avoid conflicts)
-	authOnlyAccount := common.CreateTestAccountWithEmail(t, backendServer1.ResilientDB, "authonly-mixed@example.com", "test123")
-	routedAccount := common.CreateTestAccountWithEmail(t, backendServer1.ResilientDB, "routed-mixed@example.com", "test456")
+	// Create two test accounts using helper with unique emails to avoid conflicts
+	timestamp := time.Now().UnixNano()
+	authOnlyAccount := common.CreateTestAccountWithEmail(t, rdb, fmt.Sprintf("authonly-mixed-%d@example.com", timestamp), "test123")
+	routedAccount := common.CreateTestAccountWithEmail(t, rdb, fmt.Sprintf("routed-mixed-%d@example.com", timestamp), "test456")
 
 	// Generate password hashes for prelookup response
 	authOnlyHashBytes, err := bcrypt.GenerateFromPassword([]byte(authOnlyAccount.Password), bcrypt.DefaultCost)
@@ -188,6 +195,7 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 				"server":        backendServer2.Address, // Explicitly route to backend 2
 			}
 			t.Logf("Returning routed response for %s (backend: %s)", email, backendServer2.Address)
+			t.Logf("Backend2 actual address: %s, Backend1 address: %s", backendServer2.Address, backendServer1.Address)
 		} else {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -201,7 +209,7 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 
 	// Set up IMAP proxy
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithAuthOnly(t, backendServer1.ResilientDB, proxyAddress,
+	proxy := setupIMAPProxyWithAuthOnly(t, rdb, proxyAddress,
 		[]string{backendServer1.Address, backendServer2.Address}, prelookupServer.URL+"/$email")
 	defer proxy.Close()
 
@@ -211,13 +219,19 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP proxy: %v", err)
 		}
-		defer c.Logout()
 
 		if err := c.Login(authOnlyAccount.Email, authOnlyAccount.Password).Wait(); err != nil {
 			t.Fatalf("Auth-only user login failed: %v", err)
 		}
 		t.Log("✓ Auth-only user login succeeded")
+
+		// Explicitly logout and close
+		c.Logout()
+		c.Close()
 	})
+
+	// Wait for first connection to fully close and backends to be ready
+	time.Sleep(2 * time.Second)
 
 	// Test routed user
 	t.Run("RoutedUser", func(t *testing.T) {
@@ -225,12 +239,15 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP proxy: %v", err)
 		}
-		defer c.Logout()
 
 		if err := c.Login(routedAccount.Email, routedAccount.Password).Wait(); err != nil {
 			t.Fatalf("Routed user login failed: %v", err)
 		}
 		t.Log("✓ Routed user login succeeded (explicit backend routing)")
+
+		// Explicitly logout and close
+		c.Logout()
+		c.Close()
 	})
 }
 
@@ -263,10 +280,11 @@ func setupIMAPProxyWithAuthOnly(t *testing.T, rdb *resilient.ResilientDatabase, 
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupURL,
-			Timeout:         "5s",
-			FallbackDefault: false, // Not needed for auth-only mode
+			Enabled:                true,
+			URL:                    prelookupURL,
+			Timeout:                "5s",
+			FallbackDefault:        false, // Not needed for auth-only mode
+			RemoteUseProxyProtocol: true,  // Backend servers expect PROXY protocol
 		},
 	}
 

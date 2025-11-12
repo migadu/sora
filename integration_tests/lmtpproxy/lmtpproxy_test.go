@@ -1241,8 +1241,8 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 		{
 			name:                "user_not_found_always_falls_through",
 			fallbackToDefault:   false, // Even with fallback disabled, user not found always falls through
-			prelookupStatusCode: 200,
-			prelookupBody:       `{"account_id": 0, "server_address": ""}`,
+			prelookupStatusCode: 404,   // User not found should return 404
+			prelookupBody:       `{"error": "user not found"}`,
 			expectAccept:        true, // Should accept because it falls through to main DB
 			expectLog:           "user not found in prelookup, attempting main DB",
 		},

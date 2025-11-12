@@ -695,6 +695,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
+			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, address.BaseAddress(), false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -711,6 +712,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
+			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 			return fmt.Errorf("authentication failed: %w", err)
@@ -725,7 +727,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 
 	// Track successful authentication.
-	s.DebugLog("main DB auth successful", "account_id", accountID)
+	s.InfoLog("main DB auth successful", "user", address.BaseAddress(), "account_id", accountID)
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
 
 	// Track domain and user connection activity for the login event.
