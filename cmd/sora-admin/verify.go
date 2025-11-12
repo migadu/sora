@@ -55,7 +55,6 @@ func handleVerifyS3(ctx context.Context) {
 	// Parse verify s3 specific flags
 	fs := flag.NewFlagSet("verify s3", flag.ExitOnError)
 
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address to verify (required)")
 	showMissing := fs.Bool("show-missing", false, "Show detailed list of missing/orphaned objects")
 	fixOrphaned := fs.Bool("fix-orphaned", false, "Delete orphaned S3 objects not in DB")
@@ -103,29 +102,14 @@ Examples:
 	}
 
 	// Validate required arguments
-	if *configPath == "" {
-		fmt.Printf("Error: --config is required\n\n")
-		fs.Usage()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Printf("Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		if os.IsNotExist(err) {
-			logger.Fatalf("ERROR: configuration file '%s' not found: %v", *configPath, err)
-		} else {
-			logger.Fatalf("FATAL: error parsing configuration file '%s': %v", *configPath, err)
-		}
-	}
-
 	// Run verification
-	if err := verifyS3Storage(ctx, cfg, *email, *showMissing, *fixOrphaned, *fixMissing, *dryRun, *batchSize); err != nil {
+	if err := verifyS3Storage(ctx, globalConfig, *email, *showMissing, *fixOrphaned, *fixMissing, *dryRun, *batchSize); err != nil {
 		logger.Fatalf("Verification failed: %v", err)
 	}
 }

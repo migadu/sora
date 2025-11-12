@@ -304,7 +304,7 @@ func setupACLTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
 	// Load test configuration - use adminConfig structure instead of full config
-	cfg := newDefaultAdminConfig()
+	cfg := AdminConfig{}
 	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
 		t.Fatalf("Failed to load test config: %v", err)
 	}

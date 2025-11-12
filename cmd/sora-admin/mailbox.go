@@ -45,7 +45,6 @@ func handleMailboxCommand(ctx context.Context) {
 // handleMailboxCreate creates a new mailbox for a user
 func handleMailboxCreate(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox create", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name/path to create, e.g., 'Work' or 'Projects/2024' (required)")
 
@@ -72,11 +71,6 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -88,15 +82,8 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -123,7 +110,6 @@ Examples:
 // handleMailboxList lists all mailboxes for a user
 func handleMailboxList(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox list", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	subscribedOnly := fs.Bool("subscribed", false, "Show only subscribed mailboxes")
 
@@ -150,26 +136,14 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -216,7 +190,6 @@ Examples:
 // handleMailboxDelete deletes a mailbox
 func handleMailboxDelete(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox delete", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name/path to delete (required)")
 	confirm := fs.Bool("confirm", false, "Confirm deletion without interactive prompt (required)")
@@ -247,11 +220,6 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -268,15 +236,8 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -295,12 +256,12 @@ Examples:
 		fmt.Printf("Purging all messages from mailbox '%s' and its children...\n", *mailbox)
 
 		// Initialize S3 storage
-		useSSL := !cfg.S3.DisableTLS
+		useSSL := !globalConfig.S3.DisableTLS
 		s3Storage, err := storage.New(
-			cfg.S3.Endpoint,
-			cfg.S3.AccessKey,
-			cfg.S3.SecretKey,
-			cfg.S3.Bucket,
+			globalConfig.S3.Endpoint,
+			globalConfig.S3.AccessKey,
+			globalConfig.S3.SecretKey,
+			globalConfig.S3.Bucket,
 			useSSL,
 			false, // debug mode
 		)
@@ -310,8 +271,8 @@ Examples:
 		}
 
 		// Enable encryption if configured
-		if cfg.S3.Encrypt {
-			if err := s3Storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+		if globalConfig.S3.Encrypt {
+			if err := s3Storage.EnableEncryption(globalConfig.S3.EncryptionKey); err != nil {
 				fmt.Printf("Failed to enable S3 encryption: %v\n", err)
 				os.Exit(1)
 			}
@@ -341,7 +302,6 @@ Examples:
 // handleMailboxRename renames or moves a mailbox
 func handleMailboxRename(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox rename", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	oldName := fs.String("old-name", "", "Current mailbox name/path (required)")
 	newName := fs.String("new-name", "", "New mailbox name/path (required)")
@@ -370,11 +330,6 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -391,15 +346,8 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -433,7 +381,6 @@ Examples:
 // handleMailboxSubscribe subscribes to a mailbox
 func handleMailboxSubscribe(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox subscribe", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name/path to subscribe to (required)")
 
@@ -456,11 +403,6 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -472,15 +414,8 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -507,7 +442,6 @@ Examples:
 // handleMailboxUnsubscribe unsubscribes from a mailbox
 func handleMailboxUnsubscribe(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox unsubscribe", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name/path to unsubscribe from (required)")
 
@@ -530,11 +464,6 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -546,15 +475,8 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)

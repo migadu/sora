@@ -39,7 +39,6 @@ func handleACLCommand(ctx context.Context) {
 // handleACLGrant grants ACL rights to a user or identifier on a mailbox
 func handleACLGrant(ctx context.Context) {
 	fs := flag.NewFlagSet("acl grant", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the mailbox owner (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
@@ -49,11 +48,6 @@ func handleACLGrant(ctx context.Context) {
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -82,15 +76,8 @@ func handleACLGrant(ctx context.Context) {
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -99,7 +86,7 @@ func handleACLGrant(ctx context.Context) {
 
 	// Create full config for context (needed for shared mailbox detection)
 	fullConfig := &config.Config{
-		SharedMailboxes: cfg.SharedMailboxes,
+		SharedMailboxes: globalConfig.SharedMailboxes,
 	}
 	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 
@@ -120,7 +107,6 @@ func handleACLGrant(ctx context.Context) {
 // handleACLRevoke revokes ACL rights from a user or identifier on a mailbox
 func handleACLRevoke(ctx context.Context) {
 	fs := flag.NewFlagSet("acl revoke", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the mailbox owner (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
@@ -129,11 +115,6 @@ func handleACLRevoke(ctx context.Context) {
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -156,15 +137,8 @@ func handleACLRevoke(ctx context.Context) {
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -173,7 +147,7 @@ func handleACLRevoke(ctx context.Context) {
 
 	// Create full config for context (needed for shared mailbox detection)
 	fullConfig := &config.Config{
-		SharedMailboxes: cfg.SharedMailboxes,
+		SharedMailboxes: globalConfig.SharedMailboxes,
 	}
 	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 
@@ -194,18 +168,12 @@ func handleACLRevoke(ctx context.Context) {
 // handleACLList lists all ACL entries for a mailbox
 func handleACLList(ctx context.Context) {
 	fs := flag.NewFlagSet("acl list", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	email := fs.String("email", "", "Email address of the mailbox owner (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
 
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 	if *email == "" {
 		fmt.Println("Error: --email is required")
 		fs.PrintDefaults()
@@ -217,15 +185,8 @@ func handleACLList(ctx context.Context) {
 		os.Exit(1)
 	}
 
-	// Load configuration
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(*configPath, &cfg); err != nil {
-		fmt.Printf("Failed to load configuration: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -234,7 +195,7 @@ func handleACLList(ctx context.Context) {
 
 	// Create full config for context (needed for shared mailbox detection)
 	fullConfig := &config.Config{
-		SharedMailboxes: cfg.SharedMailboxes,
+		SharedMailboxes: globalConfig.SharedMailboxes,
 	}
 	ctxWithConfig := context.WithValue(ctx, consts.ConfigContextKey, fullConfig)
 

@@ -73,20 +73,13 @@ Use 'sora-admin migrate <subcommand> --help' for detailed help.
 
 func handleMigrateUp(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate up", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
 		fmt.Println("Usage: sora-admin migrate up --config config.toml")
 		fmt.Println("Applies all pending upwards migrations.")
 	}
 	fs.Parse(os.Args[3:])
 
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
-
-	m, db, err := getMigrateInstance(ctx, *configPath)
+	m, db, err := getMigrateInstance(ctx)
 	if err != nil {
 		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
@@ -102,7 +95,6 @@ func handleMigrateUp(ctx context.Context) {
 
 func handleMigrateDown(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate down", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	limit := fs.Int("limit", 1, "Number of migrations to revert")
 	all := fs.Bool("all", false, "Revert all migrations")
 	fs.Usage = func() {
@@ -111,13 +103,7 @@ func handleMigrateDown(ctx context.Context) {
 	}
 	fs.Parse(os.Args[3:])
 
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
-
-	m, db, err := getMigrateInstance(ctx, *configPath)
+	m, db, err := getMigrateInstance(ctx)
 	if err != nil {
 		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
@@ -153,20 +139,13 @@ func handleMigrateDown(ctx context.Context) {
 
 func handleMigrateVersion(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate version", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
 		fmt.Println("Usage: sora-admin migrate version --config config.toml")
 		fmt.Println("Shows the current migration version and dirty state.")
 	}
 	fs.Parse(os.Args[3:])
 
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
-
-	m, db, err := getMigrateInstance(ctx, *configPath)
+	m, db, err := getMigrateInstance(ctx)
 	if err != nil {
 		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
@@ -177,18 +156,11 @@ func handleMigrateVersion(ctx context.Context) {
 
 func handleMigrateForce(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate force", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to TOML configuration file (required)")
 	fs.Usage = func() {
 		fmt.Println("Usage: sora-admin migrate force --config config.toml <version>")
 		fmt.Println("Forcibly sets the database migration version. USE WITH CAUTION.")
 	}
 	fs.Parse(os.Args[3:])
-
-	if *configPath == "" {
-		fmt.Println("Error: --config is required")
-		fs.PrintDefaults()
-		os.Exit(1)
-	}
 
 	if fs.NArg() != 1 {
 		fs.Usage()
@@ -200,7 +172,7 @@ func handleMigrateForce(ctx context.Context) {
 		logger.Fatalf("Invalid version number: %v", err)
 	}
 
-	m, db, err := getMigrateInstance(ctx, *configPath)
+	m, db, err := getMigrateInstance(ctx)
 	if err != nil {
 		logger.Fatalf("Failed to initialize migration tool: %v", err)
 	}
@@ -214,17 +186,8 @@ func handleMigrateForce(ctx context.Context) {
 	showVersion(m)
 }
 
-func getMigrateInstance(ctx context.Context, configPath string) (*migrate.Migrate, *sql.DB, error) {
-	cfg := newDefaultAdminConfig()
-	if err := loadAdminConfig(configPath, &cfg); err != nil {
-		if os.IsNotExist(err) {
-			logger.Info("WARNING: Configuration file not found - using defaults", "config", configPath)
-		} else {
-			return nil, nil, fmt.Errorf("error parsing configuration file '%s': %w", configPath, err)
-		}
-	}
-
-	dbCfg := cfg.Database.Write
+func getMigrateInstance(ctx context.Context) (*migrate.Migrate, *sql.DB, error) {
+	dbCfg := globalConfig.Database.Write
 	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
 		return nil, nil, errors.New("write database configuration is missing or has no hosts")
 	}
