@@ -157,6 +157,9 @@ type ResilientDatabase struct {
 
 	// Authentication cache (optional, set if enabled in config)
 	authCache AuthCache
+
+	// Close synchronization to prevent race with health checker
+	closeOnce sync.Once
 }
 
 // AuthCache interface for authentication caching
@@ -259,6 +262,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 
 	// Start background health checking if enabled
 	if enableHealthCheck {
+		rdb.failoverManager.healthCheckWg.Add(1)
 		go rdb.startRuntimeHealthChecking(ctx)
 	}
 
@@ -601,35 +605,38 @@ func (rd *ResilientDatabase) Close() {
 		return
 	}
 
-	// Stop auth cache if enabled
-	if rd.authCache != nil {
-		logger.Info("Stopping authentication cache...", "component", "RESILIENT-FAILOVER")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := rd.authCache.Stop(ctx); err != nil {
-			logger.Error("Error stopping authentication cache", "component", "RESILIENT-FAILOVER", "error", err)
+	// Use sync.Once to ensure Close() is only executed once to prevent race with health checker
+	rd.closeOnce.Do(func() {
+		// Stop auth cache if enabled
+		if rd.authCache != nil {
+			logger.Info("Stopping authentication cache...", "component", "RESILIENT-FAILOVER")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := rd.authCache.Stop(ctx); err != nil {
+				logger.Error("Error stopping authentication cache", "component", "RESILIENT-FAILOVER", "error", err)
+			}
 		}
-	}
 
-	// Stop the health checker
-	close(rd.failoverManager.healthCheckStop)
+		// Stop the health checker
+		close(rd.failoverManager.healthCheckStop)
 
-	// Wait for all background goroutines to finish
-	logger.Info("Waiting for background goroutines to finish", "component", "RESILIENT-FAILOVER")
-	rd.failoverManager.healthCheckWg.Wait()
-	logger.Info("All background goroutines finished", "component", "RESILIENT-FAILOVER")
+		// Wait for all background goroutines to finish
+		logger.Info("Waiting for background goroutines to finish", "component", "RESILIENT-FAILOVER")
+		rd.failoverManager.healthCheckWg.Wait()
+		logger.Info("All background goroutines finished", "component", "RESILIENT-FAILOVER")
 
-	// Close all managed pools
-	for _, pool := range rd.failoverManager.writePools {
-		pool.database.Close()
-	}
-
-	// Close read pools only if they're different from write pools
-	if rd.failoverManager.readPoolsAreDistinct() {
-		for _, pool := range rd.failoverManager.readPools {
+		// Close all managed pools
+		for _, pool := range rd.failoverManager.writePools {
 			pool.database.Close()
 		}
-	}
+
+		// Close read pools only if they're different from write pools
+		if rd.failoverManager.readPoolsAreDistinct() {
+			for _, pool := range rd.failoverManager.readPools {
+				pool.database.Close()
+			}
+		}
+	})
 }
 
 func (rd *ResilientDatabase) GetQueryBreakerState() circuitbreaker.State {
@@ -975,13 +982,17 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 }
 
 // startRuntimeHealthChecking starts background health checking for all pools
+// Note: Caller must have already called healthCheckWg.Add(1) before starting this goroutine
 func (rd *ResilientDatabase) startRuntimeHealthChecking(ctx context.Context) {
 	if rd.failoverManager == nil {
 		return
 	}
 
-	rd.failoverManager.healthCheckWg.Add(1)
 	defer rd.failoverManager.healthCheckWg.Done()
+
+	// Store local reference to stop channel to avoid race detector warnings
+	// The channel itself is never reassigned, only closed
+	stopChan := rd.failoverManager.healthCheckStop
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -993,7 +1004,7 @@ func (rd *ResilientDatabase) startRuntimeHealthChecking(ctx context.Context) {
 		case <-ctx.Done():
 			logger.Info("Stopped background health checking (context done)", "component", "RESILIENT-FAILOVER")
 			return
-		case <-rd.failoverManager.healthCheckStop:
+		case <-stopChan:
 			logger.Info("Stopped background health checking (close signal)", "component", "RESILIENT-FAILOVER")
 			return
 		case <-ticker.C:
@@ -1142,6 +1153,8 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 // from all managed database pools (both read and write) and exposes them via Prometheus
 func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
 	rd.failoverManager.healthCheckWg.Add(1)
+	// Store local reference to stop channel to avoid race detector warnings
+	stopChan := rd.failoverManager.healthCheckStop
 	go func() {
 		defer rd.failoverManager.healthCheckWg.Done()
 		ticker := time.NewTicker(15 * time.Second)
@@ -1152,7 +1165,7 @@ func (rd *ResilientDatabase) StartPoolMetrics(ctx context.Context) {
 			case <-ctx.Done():
 				logger.Info("Stopped pool metrics collection", "component", "RESILIENT-FAILOVER")
 				return
-			case <-rd.failoverManager.healthCheckStop:
+			case <-stopChan:
 				logger.Info("Stopped pool metrics collection (close signal)", "component", "RESILIENT-FAILOVER")
 				return
 			case <-ticker.C:
@@ -1217,6 +1230,8 @@ func (rd *ResilientDatabase) collectAggregatedPoolStats() {
 // for all managed database pools with enhanced metrics collection
 func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 	rd.failoverManager.healthCheckWg.Add(1)
+	// Store local reference to stop channel to avoid race detector warnings
+	stopChan := rd.failoverManager.healthCheckStop
 	go func() {
 		defer rd.failoverManager.healthCheckWg.Done()
 		ticker := time.NewTicker(30 * time.Second) // Align with existing health check interval
@@ -1229,7 +1244,7 @@ func (rd *ResilientDatabase) StartPoolHealthMonitoring(ctx context.Context) {
 			case <-ctx.Done():
 				logger.Info("Stopping aggregated pool health monitoring", "component", "RESILIENT-FAILOVER")
 				return
-			case <-rd.failoverManager.healthCheckStop:
+			case <-stopChan:
 				logger.Info("Stopping aggregated pool health monitoring (close signal)", "component", "RESILIENT-FAILOVER")
 				return
 			case <-ticker.C:

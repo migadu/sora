@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -64,17 +65,17 @@ func (c *prelookupCache) Get(key string) (*UserRoutingInfo, AuthResult, bool) {
 
 	entry, exists := c.entries[key]
 	if !exists {
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		return nil, 0, false
 	}
 
 	// Check if expired
 	if time.Now().After(entry.expiresAt) {
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		return nil, 0, false
 	}
 
-	c.hits++
+	atomic.AddUint64(&c.hits, 1)
 	return entry.info, entry.authResult, true
 }
 
@@ -106,17 +107,17 @@ func (c *prelookupCache) GetWithPasswordHash(email string) (string, *UserRouting
 
 	entry, exists := c.entries[email]
 	if !exists {
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		return "", nil, 0, false
 	}
 
 	// Check if expired
 	if time.Now().After(entry.expiresAt) {
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		return "", nil, 0, false
 	}
 
-	c.hits++
+	atomic.AddUint64(&c.hits, 1)
 	return entry.passwordHash, entry.info, entry.authResult, true
 }
 
@@ -239,5 +240,5 @@ func (c *prelookupCache) GetStats() (hits, misses uint64, size int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.hits, c.misses, len(c.entries)
+	return atomic.LoadUint64(&c.hits), atomic.LoadUint64(&c.misses), len(c.entries)
 }
