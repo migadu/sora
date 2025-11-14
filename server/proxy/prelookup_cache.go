@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // cacheEntry represents a cached prelookup result
@@ -32,6 +33,9 @@ type prelookupCache struct {
 	// Metrics
 	hits   uint64
 	misses uint64
+
+	// Cleanup counter for periodic memory reporting
+	cleanupCounter uint64
 }
 
 // newPrelookupCache creates a new cache instance
@@ -219,6 +223,42 @@ func (c *prelookupCache) cleanup() {
 
 	if removed > 0 {
 		logger.Debug("Prelookup cache cleanup", "removed", removed, "remaining", len(c.entries))
+	}
+
+	// Calculate positive vs negative entry counts
+	positiveEntries := 0
+	negativeEntries := 0
+	for _, entry := range c.entries {
+		if entry.isNegative {
+			negativeEntries++
+		} else {
+			positiveEntries++
+		}
+	}
+
+	// Update Prometheus metrics every cleanup cycle
+	totalEntries := len(c.entries)
+	metrics.PrelookupCacheEntries.Set(float64(totalEntries))
+	metrics.PrelookupCachePositiveEntries.Set(float64(positiveEntries))
+	metrics.PrelookupCacheNegativeEntries.Set(float64(negativeEntries))
+
+	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
+	c.cleanupCounter++
+	if c.cleanupCounter%10 == 0 {
+		hits := atomic.LoadUint64(&c.hits)
+		misses := atomic.LoadUint64(&c.misses)
+		var hitRate float64
+		if hits+misses > 0 {
+			hitRate = float64(hits) / float64(hits+misses) * 100
+		}
+
+		logger.Info("Prelookup cache: Memory usage stats",
+			"total_entries", totalEntries,
+			"positive_entries", positiveEntries,
+			"negative_entries", negativeEntries,
+			"max_size", c.maxSize,
+			"hit_rate_pct", hitRate,
+			"removed_this_cycle", removed)
 	}
 }
 

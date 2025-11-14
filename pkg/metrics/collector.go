@@ -99,9 +99,6 @@ func (c *Collector) collect(ctx context.Context) {
 	// Update Prometheus gauges
 	AccountsTotal.Set(float64(stats.TotalAccounts))
 	MailboxesTotal.Set(float64(stats.TotalMailboxes))
-	// Note: MessagesTotal is per-mailbox, so we only update the total here
-	// Individual mailbox metrics would require more complex queries
-	// For now, we'll skip the per-mailbox metric
 
 	logger.Info("MetricsCollector: updated DB metrics", "accounts", stats.TotalAccounts,
 		"mailboxes", stats.TotalMailboxes, "messages", stats.TotalMessages)

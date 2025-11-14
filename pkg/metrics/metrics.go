@@ -68,14 +68,6 @@ var (
 		[]string{"operation", "role"},
 	)
 
-	MessagesTotal = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sora_messages_total",
-			Help: "Total number of messages stored",
-		},
-		[]string{"mailbox"},
-	)
-
 	MailboxesTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_mailboxes_total",
@@ -356,5 +348,111 @@ var (
 			Help: "Total number of connection timeouts by protocol and reason",
 		},
 		[]string{"protocol", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
+	)
+)
+
+// Memory usage metrics for internal caches and maps
+var (
+	// Auth rate limiter memory usage
+	AuthRateLimiterIPUsernameEntries = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_rate_limiter_ip_username_entries",
+			Help: "Number of IP+username entries in auth rate limiter",
+		},
+		[]string{"protocol"},
+	)
+
+	AuthRateLimiterIPEntries = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_rate_limiter_ip_entries",
+			Help: "Number of IP failure entries in auth rate limiter",
+		},
+		[]string{"protocol"},
+	)
+
+	AuthRateLimiterUsernameEntries = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_rate_limiter_username_entries",
+			Help: "Number of username failure entries in auth rate limiter",
+		},
+		[]string{"protocol"},
+	)
+
+	AuthRateLimiterBlockedIPs = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_rate_limiter_blocked_ips",
+			Help: "Number of blocked IPs in auth rate limiter",
+		},
+		[]string{"protocol"},
+	)
+
+	// Connection tracker memory usage (proxy mode)
+	ConnectionTrackerUsers = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_connection_tracker_users",
+			Help: "Number of users tracked in connection tracker",
+		},
+		[]string{"protocol"},
+	)
+
+	ConnectionTrackerInstanceIDs = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_connection_tracker_instance_ids",
+			Help: "Number of instance IDs tracked across all users",
+		},
+		[]string{"protocol"},
+	)
+
+	ConnectionTrackerIPs = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_connection_tracker_ips",
+			Help: "Number of IPs tracked across all users",
+		},
+		[]string{"protocol"},
+	)
+
+	ConnectionTrackerBroadcastQueue = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_connection_tracker_broadcast_queue_size",
+			Help: "Size of connection tracker broadcast queue",
+		},
+		[]string{"protocol"},
+	)
+
+	// Affinity manager memory usage
+	AffinityManagerEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_affinity_manager_entries",
+			Help: "Number of affinity entries in affinity manager",
+		},
+	)
+
+	AffinityManagerBroadcastQueue = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_affinity_manager_broadcast_queue_size",
+			Help: "Size of affinity manager broadcast queue",
+		},
+	)
+
+	// Prelookup cache memory usage
+	PrelookupCacheEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_prelookup_cache_entries",
+			Help: "Number of entries in prelookup cache",
+		},
+	)
+
+	PrelookupCachePositiveEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_prelookup_cache_positive_entries",
+			Help: "Number of positive (found) entries in prelookup cache",
+		},
+	)
+
+	PrelookupCacheNegativeEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_prelookup_cache_negative_entries",
+			Help: "Number of negative (not found) entries in prelookup cache",
+		},
 	)
 )

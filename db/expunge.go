@@ -3,12 +3,25 @@ package db
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID int64, uids ...imap.UID) (int64, error) {
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.DBQueryDuration.WithLabelValues("message_expunge", "write").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("message_expunge", status, "write").Inc()
+	}()
+
 	if len(uids) == 0 {
 		log.Printf("Database: no UIDs to expunge for mailbox %d", mailboxID)
 		return 0, nil
@@ -18,7 +31,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 
 	var currentModSeq int64
 	var rowsAffected int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		WITH updated AS (
 			UPDATE messages
 			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')

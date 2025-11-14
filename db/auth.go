@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -206,32 +208,60 @@ func GenerateBcryptHash(password string) (string, error) {
 // verifyPassword checks if the provided password matches the stored password hash
 // It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings
 func VerifyPassword(hashedPassword, password string) error {
+	start := time.Now()
+	var hashType string
+	var err error
+
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "failure"
+		}
+		// Use custom metric for password verification timing (not a DB query)
+		metrics.AuthenticationAttempts.WithLabelValues(hashType, status).Inc()
+		// Track duration to monitor bcrypt/hash performance
+		duration := time.Since(start).Seconds()
+		if duration > 0.1 { // Log slow password verifications (>100ms)
+			logger.Info("Slow password verification", "type", hashType, "duration_ms", duration*1000, "status", status)
+		}
+	}()
+
 	switch {
 	case strings.HasPrefix(hashedPassword, ssha512PrefixB64),
 		strings.HasPrefix(hashedPassword, ssha512PrefixB64Explicit),
 		strings.HasPrefix(hashedPassword, ssha512PrefixHex):
-		return verifySSHA512(hashedPassword, password)
+		hashType = "ssha512"
+		err = verifySSHA512(hashedPassword, password)
+		return err
 
 	case strings.HasPrefix(hashedPassword, sha512PrefixB64),
 		strings.HasPrefix(hashedPassword, sha512PrefixB64Explicit),
 		strings.HasPrefix(hashedPassword, sha512PrefixHex):
-		return verifySHA512(hashedPassword, password)
+		hashType = "sha512"
+		err = verifySHA512(hashedPassword, password)
+		return err
 
 	case strings.HasPrefix(hashedPassword, blfCryptPrefix):
 		// BLF-CRYPT is just bcrypt with a prefix
-		return verifyBcrypt(hashedPassword, password)
+		hashType = "blf_crypt"
+		err = verifyBcrypt(hashedPassword, password)
+		return err
 
 	// Without scheme, we default to Bcrypt
 	case strings.HasPrefix(hashedPassword, bcryptPrefix2a),
 		strings.HasPrefix(hashedPassword, bcryptPrefix2b),
 		strings.HasPrefix(hashedPassword, bcryptPrefix2y):
 		// Standard bcrypt format
-		return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+		hashType = "bcrypt"
+		err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+		return err
 
 	default:
 		// No known scheme prefix
+		hashType = "unknown"
 		log.Printf("Database: unknown password hash scheme: %s", hashedPassword[:min(10, len(hashedPassword))]) // Using built-in min
-		return errors.New("unknown password hash scheme")
+		err = errors.New("unknown password hash scheme")
+		return err
 	}
 }
 
@@ -286,6 +316,20 @@ func (db *Database) UpdatePassword(ctx context.Context, tx pgx.Tx, address strin
 // GetCredentialForAuth retrieves the account ID and hashed password for a given address.
 // It does not perform any password verification.
 func (db *Database) GetCredentialForAuth(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			if errors.Is(err, consts.ErrUserNotFound) {
+				status = "not_found"
+			} else {
+				status = "error"
+			}
+		}
+		metrics.DBQueryDuration.WithLabelValues("auth_get_credential", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("auth_get_credential", status, "read").Inc()
+	}()
+
 	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
 	if normalizedAddress == "" {
 		return 0, "", errors.New("address cannot be empty")

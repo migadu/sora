@@ -407,6 +407,11 @@ type AuthRateLimiterConfig struct {
 	MaxDelay             time.Duration `toml:"max_delay"`              // Maximum delay duration
 	DelayMultiplier      float64       `toml:"delay_multiplier"`       // Delay increase factor
 	CacheCleanupInterval time.Duration `toml:"cache_cleanup_interval"` // How often to clean in-memory cache
+
+	// Memory safety limits (prevents unbounded growth during burst attacks)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (0 = unlimited, default: 100000)
+	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (0 = unlimited, default: 50000)
+	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (0 = unlimited, default: 50000)
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -438,6 +443,11 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 		MaxDelay:             30 * time.Second, // Max 30 second delay
 		DelayMultiplier:      2.0,              // Double delay each time
 		CacheCleanupInterval: 10 * time.Minute, // Clean in-memory cache every 10 min
+
+		// Memory safety limits (prevents OOM during burst attacks)
+		MaxIPUsernameEntries: 100000, // ~25MB per protocol at capacity
+		MaxIPEntries:         50000,  // ~7.5MB per protocol at capacity
+		MaxUsernameEntries:   50000,  // ~7.5MB per protocol at capacity
 	}
 }
 

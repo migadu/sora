@@ -841,6 +841,25 @@ auth_rate_limit.delay_multiplier = 2.0            # Multiplier for progressive d
 auth_rate_limit.cache_cleanup_interval = "1m"     # How often to clean up expired in-memory cache entries.
 auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expired rate limiting data.
 
+# Memory safety limits (prevents unbounded growth during burst attacks)
+# These limits protect against memory exhaustion when under sustained attack. When a map exceeds
+# its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
+# Set to 0 to disable size-based limits (time-based cleanup only).
+#
+# RECOMMENDED VALUES:
+# - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
+# - High-traffic (200k/100k/100k): For servers with >50k users, ~80MB per protocol max
+# - Low-memory (25k/10k/10k): For constrained environments, ~10MB per protocol max
+#
+# MEMORY CALCULATION:
+# - IP+Username entries: ~250 bytes each × max_ip_username_entries
+# - IP entries: ~150 bytes each × max_ip_entries
+# - Username entries: ~150 bytes each × max_username_entries
+#
+auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (0 = unlimited, default: 100000)
+auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (0 = unlimited, default: 50000)
+auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (0 = unlimited, default: 50000)
+
 
 # LMTP SERVER EXAMPLE
 # =============================================================================

@@ -259,9 +259,12 @@ func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
 }
 
 func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
+	start := time.Now()
+
 	object, err := s.Client.GetObject(context.Background(), s.BucketName, key, minio.GetObjectOptions{})
 	if err != nil {
 		metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
+		metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 		return nil, err
 	}
 
@@ -270,6 +273,7 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 		encryptedData, err := io.ReadAll(object)
 		if err != nil {
 			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
+			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 			return nil, fmt.Errorf("failed to read encrypted data: %w", err)
 		}
 
@@ -281,30 +285,37 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 		decryptedData, err := s.decryptData(encryptedData)
 		if err != nil {
 			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
+			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 			return nil, fmt.Errorf("failed to decrypt data: %w", err)
 		}
 
 		metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
+		metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 		return io.NopCloser(bytes.NewReader(decryptedData)), nil
 	}
 
 	metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
+	metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 	return object, nil
 }
 
 func (s *S3Storage) Delete(key string) error {
+	start := time.Now()
+
 	// Check if the object exists before attempting to delete.
 	// This makes DeleteMessage idempotent.
 	exists, versionId, err := s.Exists(key)
 	if err != nil {
 		logger.Error("STORAGE: Error checking existence of object", "key", key, "error", err)
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
+		metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 		return err
 	}
 	if !exists {
 		// Object does not exist, consider it successfully "deleted"
 		logger.Info("STORAGE: Object does not exist in S3 - skipping deletion", "key", key)
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "skipped").Inc()
+		metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 		return nil
 	}
 	err = s.Client.RemoveObject(context.Background(), s.BucketName, key, minio.RemoveObjectOptions{VersionID: versionId})
@@ -313,6 +324,7 @@ func (s *S3Storage) Delete(key string) error {
 	} else {
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "success").Inc()
 	}
+	metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 	return err
 }
 

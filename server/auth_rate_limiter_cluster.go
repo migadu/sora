@@ -185,6 +185,17 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 	crl.queueMu.Lock()
 	defer crl.queueMu.Unlock()
 
+	// Enforce reasonable size limit to prevent unbounded growth
+	const maxQueueSize = 10000
+	if len(crl.broadcastQueue) >= maxQueueSize {
+		// Drop oldest 10% of events when queue is full
+		dropCount := maxQueueSize / 10
+		logger.Warn("Cluster limiter: Broadcast queue overflow - dropping oldest events",
+			"protocol", crl.limiter.protocol, "current", len(crl.broadcastQueue),
+			"max", maxQueueSize, "dropping", dropCount)
+		crl.broadcastQueue = crl.broadcastQueue[dropCount:]
+	}
+
 	crl.broadcastQueue = append(crl.broadcastQueue, event)
 	logger.Info("CLUSTER-LIMITER: Event queued for broadcast", "protocol", crl.limiter.protocol,
 		"type", event.Type, "ip", event.IP, "username", event.Username, "queue_size", len(crl.broadcastQueue))

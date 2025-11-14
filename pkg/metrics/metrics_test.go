@@ -116,7 +116,6 @@ func TestConnectionDurationHistogram(t *testing.T) {
 func TestDatabaseMetrics(t *testing.T) {
 	// Reset the metrics
 	DBQueriesTotal.Reset()
-	MessagesTotal.Reset()
 	MailboxesTotal.Set(0)
 	AccountsTotal.Set(0)
 
@@ -132,21 +131,6 @@ func TestDatabaseMetrics(t *testing.T) {
 		}
 		if insertCount != 2 {
 			t.Errorf("Expected INSERT count to be 2, got %f", insertCount)
-		}
-	})
-
-	t.Run("messages_total_gauge", func(t *testing.T) {
-		MessagesTotal.WithLabelValues("INBOX").Set(100)
-		MessagesTotal.WithLabelValues("Sent").Set(50)
-
-		inboxCount := testutil.ToFloat64(MessagesTotal.WithLabelValues("INBOX"))
-		sentCount := testutil.ToFloat64(MessagesTotal.WithLabelValues("Sent"))
-
-		if inboxCount != 100 {
-			t.Errorf("Expected INBOX messages to be 100, got %f", inboxCount)
-		}
-		if sentCount != 50 {
-			t.Errorf("Expected Sent messages to be 50, got %f", sentCount)
 		}
 	})
 

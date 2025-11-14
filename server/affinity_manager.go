@@ -10,6 +10,7 @@ import (
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // AffinityEventType represents the type of affinity event
@@ -66,6 +67,9 @@ type AffinityManager struct {
 	// Shutdown
 	stopCleanup   chan struct{}
 	stopBroadcast chan struct{}
+
+	// Cleanup counter for periodic memory reporting
+	cleanupCounter uint64
 }
 
 // NewAffinityManager creates a new affinity manager with cluster synchronization
@@ -228,6 +232,16 @@ func (am *AffinityManager) DeleteBackend(username, protocol string) {
 func (am *AffinityManager) queueEvent(event AffinityEvent) {
 	am.queueMu.Lock()
 	defer am.queueMu.Unlock()
+
+	// Enforce reasonable size limit to prevent unbounded growth
+	const maxQueueSize = 5000
+	if len(am.broadcastQueue) >= maxQueueSize {
+		// Drop oldest 10% of events when queue is full
+		dropCount := maxQueueSize / 10
+		logger.Warn("Affinity manager: Broadcast queue overflow - dropping oldest events",
+			"current", len(am.broadcastQueue), "max", maxQueueSize, "dropping", dropCount)
+		am.broadcastQueue = am.broadcastQueue[dropCount:]
+	}
 
 	am.broadcastQueue = append(am.broadcastQueue, event)
 }
@@ -416,6 +430,25 @@ func (am *AffinityManager) cleanup() {
 	if removed > 0 {
 		logger.Debug("Affinity: Cleaned up expired affinities", "count", removed)
 	}
+
+	// Get broadcast queue size for memory reporting and metrics
+	am.queueMu.Lock()
+	queueSize := len(am.broadcastQueue)
+	am.queueMu.Unlock()
+
+	// Update Prometheus metrics every cleanup cycle
+	metrics.AffinityManagerEntries.Set(float64(len(am.affinityMap)))
+	metrics.AffinityManagerBroadcastQueue.Set(float64(queueSize))
+
+	// Log memory usage stats every 10 cleanup cycles (~10 hours with 1h cleanup interval)
+	am.cleanupCounter++
+	if am.cleanupCounter%10 == 0 {
+		logger.Info("Affinity manager: Memory usage stats",
+			"total_entries", len(am.affinityMap),
+			"broadcast_queue_size", queueSize,
+			"broadcast_queue_limit", 5000,
+			"removed_this_cycle", removed)
+	}
 }
 
 // GetAffinityCount returns the number of active affinities (for testing/monitoring)
@@ -464,21 +497,33 @@ func (am *AffinityManager) GetStats(ctx context.Context) map[string]any {
 	}
 
 	am.mu.RLock()
-	defer am.mu.RUnlock()
-
-	stats := map[string]any{
-		"enabled":          am.enabled,
-		"total_entries":    len(am.affinityMap),
-		"ttl":              am.defaultTTL.String(),
-		"cleanup_interval": am.cleanupInterval.String(),
-	}
+	totalEntries := len(am.affinityMap)
 
 	// Count by protocol
 	protocolCounts := make(map[string]int)
 	for _, info := range am.affinityMap {
 		protocolCounts[info.Protocol]++
 	}
-	stats["by_protocol"] = protocolCounts
+	am.mu.RUnlock()
+
+	// Get broadcast queue size
+	am.queueMu.Lock()
+	queueSize := len(am.broadcastQueue)
+	am.queueMu.Unlock()
+
+	stats := map[string]any{
+		"enabled":          am.enabled,
+		"total_entries":    totalEntries,
+		"ttl":              am.defaultTTL.String(),
+		"cleanup_interval": am.cleanupInterval.String(),
+		"by_protocol":      protocolCounts,
+		"memory_usage": map[string]any{
+			"affinity_entries":    totalEntries,
+			"broadcast_queue":     queueSize,
+			"broadcast_queue_max": 5000,
+			"queue_utilization":   float64(queueSize) / 5000.0 * 100,
+		},
+	}
 
 	return stats
 }

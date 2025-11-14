@@ -10,6 +10,7 @@ import (
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // ConnectionEventType represents the type of connection event
@@ -101,6 +102,9 @@ type ConnectionTracker struct {
 	// Broadcast queue for outgoing events
 	broadcastQueue []ConnectionEvent
 	queueMu        sync.Mutex
+
+	// Cleanup counter for periodic memory reporting
+	cleanupCounter uint64
 
 	// Shutdown
 	stopBroadcast     chan struct{}
@@ -775,18 +779,78 @@ func (ct *ConnectionTracker) cleanup() {
 	defer ct.mu.Unlock()
 
 	cleaned := 0
+	cleanedInstances := 0
+	cleanedIPs := 0
 	staleThreshold := time.Now().Add(-10 * time.Minute)
 
 	for accountID, info := range ct.connections {
+		// Clean up zero-count entries in LocalInstances map
+		for instanceID, count := range info.LocalInstances {
+			if count <= 0 {
+				delete(info.LocalInstances, instanceID)
+				cleanedInstances++
+			}
+		}
+
+		// Clean up zero-count entries in PerIPCount map
+		for ip, count := range info.PerIPCount {
+			if count <= 0 {
+				delete(info.PerIPCount, ip)
+				cleanedIPs++
+			}
+		}
+
+		// Remove user entry if no connections and stale
 		if info.TotalCount <= 0 && info.LastUpdate.Before(staleThreshold) {
 			delete(ct.connections, accountID)
 			cleaned++
 		}
 	}
 
-	if cleaned > 0 {
-		logger.Debug("Gossip tracker: Cleaned up stale entries", "name", ct.name, "count", cleaned)
+	// Calculate total instance IDs and IPs across all users for memory reporting
+	totalUsers := len(ct.connections)
+	totalInstanceIDs := 0
+	totalIPs := 0
+	for _, info := range ct.connections {
+		totalInstanceIDs += len(info.LocalInstances)
+		totalIPs += len(info.PerIPCount)
 	}
+
+	if cleaned > 0 || cleanedInstances > 0 || cleanedIPs > 0 {
+		logger.Debug("Gossip tracker: Cleaned up stale entries", "name", ct.name,
+			"users", cleaned, "instance_ids", cleanedInstances, "ips", cleanedIPs)
+	}
+
+	// Update Prometheus metrics every cleanup cycle
+	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name).Set(float64(totalUsers))
+	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name).Set(float64(totalInstanceIDs))
+	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name).Set(float64(totalIPs))
+
+	ct.queueMu.Lock()
+	queueSize := len(ct.broadcastQueue)
+	ct.queueMu.Unlock()
+	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name).Set(float64(queueSize))
+
+	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
+	// This helps monitor for memory leaks without flooding logs
+	ct.cleanupCounter++
+	if ct.cleanupCounter%10 == 0 {
+		logger.Info("Connection tracker: Memory usage stats", "protocol", ct.name,
+			"total_users", totalUsers,
+			"total_instance_ids", totalInstanceIDs,
+			"total_ips", totalIPs,
+			"broadcast_queue", queueSize,
+			"avg_instances_per_user", float64(totalInstanceIDs)/float64(max(totalUsers, 1)),
+			"avg_ips_per_user", float64(totalIPs)/float64(max(totalUsers, 1)))
+	}
+}
+
+// Helper function for division by zero protection
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // stateSnapshotRoutine periodically broadcasts full state for reconciliation
@@ -961,6 +1025,60 @@ func (ct *ConnectionTracker) Stop() {
 			close(ct.stopStateSnapshot)
 		}
 	})
+}
+
+// GetStats returns connection tracker statistics
+func (ct *ConnectionTracker) GetStats(ctx context.Context) map[string]any {
+	if ct == nil {
+		return nil
+	}
+
+	ct.mu.RLock()
+	totalUsers := len(ct.connections)
+	totalInstanceIDs := 0
+	totalIPs := 0
+	totalConnections := 0
+
+	for _, info := range ct.connections {
+		totalInstanceIDs += len(info.LocalInstances)
+		totalIPs += len(info.PerIPCount)
+		totalConnections += info.TotalCount
+	}
+	ct.mu.RUnlock()
+
+	// Get broadcast queue size
+	ct.queueMu.Lock()
+	queueSize := len(ct.broadcastQueue)
+	ct.queueMu.Unlock()
+
+	stats := map[string]any{
+		"protocol":          ct.name,
+		"total_users":       totalUsers,
+		"total_connections": totalConnections,
+		"cluster_enabled":   ct.clusterManager != nil,
+		"memory_usage": map[string]any{
+			"tracked_users":       totalUsers,
+			"instance_ids":        totalInstanceIDs,
+			"tracked_ips":         totalIPs,
+			"broadcast_queue":     queueSize,
+			"broadcast_queue_max": 10000,
+			"queue_utilization":   float64(queueSize) / 10000.0 * 100,
+			"avg_instances_per_user": func() float64 {
+				if totalUsers > 0 {
+					return float64(totalInstanceIDs) / float64(totalUsers)
+				}
+				return 0
+			}(),
+			"avg_ips_per_user": func() float64 {
+				if totalUsers > 0 {
+					return float64(totalIPs) / float64(totalUsers)
+				}
+				return 0
+			}(),
+		},
+	}
+
+	return stats
 }
 
 // encodeConnectionEvent encodes an event to bytes using gob

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
@@ -16,18 +17,40 @@ import (
 )
 
 func handleConfigCommand(ctx context.Context) {
-	if len(os.Args) < 3 {
+	// Find the subcommand - skip over --config and its value
+	// os.Args format: [prog, --config, PATH, config, SUBCOMMAND, ...]
+	var subcommand string
+	skipNext := false
+	for i := 1; i < len(os.Args); i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if os.Args[i] == "--config" {
+			skipNext = true
+			continue
+		}
+		if os.Args[i] == "config" {
+			// Skip the "config" command itself
+			continue
+		}
+		if !strings.HasPrefix(os.Args[i], "-") {
+			subcommand = os.Args[i]
+			break
+		}
+	}
+
+	if subcommand == "" {
 		printConfigUsage()
 		os.Exit(1)
 	}
 
-	subcommand := os.Args[2]
 	switch subcommand {
 	case "dump":
 		handleConfigDump(ctx)
 	case "validate":
 		handleConfigValidate(ctx)
-	case "--help", "-h":
+	case "--help", "-h", "help":
 		printConfigUsage()
 	default:
 		fmt.Printf("Unknown config subcommand: %s\n\n", subcommand)
@@ -37,19 +60,24 @@ func handleConfigCommand(ctx context.Context) {
 }
 
 func handleConfigValidate(_ context.Context) {
-	// Parse config-validate specific flags
+	// Extract config path from os.Args (it was preserved for config subcommand)
 	var configFile string
 
-	flagSet := flag.NewFlagSet("config-validate", flag.ExitOnError)
-	flagSet.StringVar(&configFile, "config", "", "Path to configuration file (required)")
-	flagSet.Usage = func() {
-		fmt.Printf(`Validate configuration file syntax and settings
+	// Look for --config flag in the original args
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			configFile = os.Args[i+1]
+			break
+		}
+	}
+
+	if configFile == "" {
+		fmt.Printf(`Error: --config is required
+
+Validate configuration file syntax and settings
 
 Usage:
-  sora-admin config validate --config PATH
-
-Options:
-  --config PATH        Path to configuration file (required)
+  sora-admin --config PATH config validate
 
 Description:
   Validates the configuration file by:
@@ -65,15 +93,8 @@ Description:
     1 - Configuration has errors
 
 Examples:
-  sora-admin config validate --config sora.config.toml
+  sora-admin --config sora.config.toml config validate
 `)
-	}
-
-	flagSet.Parse(os.Args[3:])
-
-	if configFile == "" {
-		fmt.Printf("Error: --config is required\n\n")
-		flagSet.Usage()
 		os.Exit(1)
 	}
 
@@ -140,32 +161,54 @@ Examples:
 }
 
 func handleConfigDump(_ context.Context) {
-	// Parse config-dump specific flags
-	var configFile, format string
-	var maskSecrets bool
+	// Extract config path from os.Args (it was preserved for config subcommand)
+	// os.Args format: [prog, --config, PATH, config, dump, FLAGS...]
+	var configFile string
+	var format string = "toml"
+	var maskSecrets bool = true
+	var flagsStartIndex int
 
+	// Look for --config flag and find where "dump" ends
+	skipNext := false
+	for i := 1; i < len(os.Args); i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			configFile = os.Args[i+1]
+			skipNext = true
+			continue
+		}
+		if os.Args[i] == "dump" {
+			flagsStartIndex = i + 1
+			break
+		}
+	}
+
+	// Parse additional flags after the subcommand
 	flagSet := flag.NewFlagSet("config-dump", flag.ExitOnError)
-	flagSet.StringVar(&configFile, "config", "", "Path to configuration file (required)")
 	flagSet.StringVar(&format, "format", "toml", "Output format: toml or json")
 	flagSet.BoolVar(&maskSecrets, "mask-secrets", true, "Mask sensitive values (passwords, keys)")
 	flagSet.Usage = func() {
 		fmt.Printf(`Dump the parsed configuration for debugging
 
 Usage:
-  sora-admin config dump --config PATH [options]
+  sora-admin --config PATH config dump [options]
 
 Options:
-  --config PATH        Path to configuration file (required)
   --format FORMAT      Output format: toml or json (default: toml)
   --mask-secrets       Mask sensitive values like passwords (default: true)
 
 Examples:
-  sora-admin config dump --config sora.config.toml
-  sora-admin config dump --format json --mask-secrets=false
+  sora-admin --config sora.config.toml config dump
+  sora-admin --config sora.config.toml config dump --format json --mask-secrets=false
 `)
 	}
 
-	flagSet.Parse(os.Args[3:])
+	if flagsStartIndex > 0 && flagsStartIndex < len(os.Args) {
+		flagSet.Parse(os.Args[flagsStartIndex:])
+	}
 
 	if configFile == "" {
 		fmt.Printf("Error: --config is required\n\n")
@@ -221,17 +264,17 @@ func printConfigUsage() {
 	fmt.Printf(`Configuration Management
 
 Usage:
-  sora-admin config <subcommand> [options]
+  sora-admin --config PATH config <subcommand> [options]
 
 Subcommands:
   validate Validate configuration file syntax and settings
   dump     Dump the parsed configuration for debugging
 
 Examples:
-  sora-admin config validate --config sora.config.toml
-  sora-admin config dump --config sora.config.toml
-  sora-admin config dump --format json --mask-secrets=false
+  sora-admin --config sora.config.toml config validate
+  sora-admin --config sora.config.toml config dump
+  sora-admin --config sora.config.toml config dump --format json --mask-secrets=false
 
-Use 'sora-admin config <subcommand> --help' for detailed help.
+Use 'sora-admin --config PATH config <subcommand> --help' for detailed help.
 `)
 }

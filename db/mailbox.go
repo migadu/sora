@@ -14,6 +14,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // DBMailbox represents the database structure of a mailbox
@@ -142,12 +143,27 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 
 // GetMailboxByName fetches the mailbox for a specific user by name
 func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				status = "not_found"
+			} else {
+				status = "error"
+			}
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_get_by_name", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_get_by_name", status, "read").Inc()
+	}()
+
 	var mailbox DBMailbox
 	var uidValidityInt64 int64
 	var accountID int64
 
 	// First try to find owned mailbox, then check for shared mailbox with ACL access
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 		FROM mailboxes m
 		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1
@@ -547,6 +563,21 @@ type MailboxSummary struct {
 }
 
 func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*MailboxSummary, error) {
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				status = "not_found"
+			} else {
+				status = "error"
+			}
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_summary", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_summary", status, "read").Inc()
+	}()
+
 	tx, err := d.GetReadPoolWithContext(ctx).BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)

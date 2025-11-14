@@ -46,6 +46,9 @@ type Server struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
+
+	// Shared HTTP transport (prevents connection pool leaks)
+	transport *http.Transport
 }
 
 // ServerOptions holds configuration options for the User API proxy server
@@ -107,6 +110,23 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		limiter = server.NewConnectionLimiterWithTrustedNets("USER-API-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
 	}
 
+	// Create shared HTTP transport (reused for all proxied requests to prevent connection pool leaks)
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: !opts.RemoteTLSVerify,
+			Renegotiation:      tls.RenegotiateNever,
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	return &Server{
 		name:           opts.Name,
 		addr:           opts.Addr,
@@ -120,6 +140,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		tlsConfig:      opts.TLSConfig,
 		trustedProxies: opts.TrustedProxies,
 		limiter:        limiter,
+		transport:      transport,
 		ctx:            ctx,
 		cancel:         cancel,
 	}, nil
@@ -265,26 +286,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 		return
 	}
 
-	// Create reverse proxy
+	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
-
-	// Configure TLS for backend connections
-	if s.connManager.IsRemoteTLS() {
-		proxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: !s.connManager.IsRemoteTLSVerifyEnabled(),
-				Renegotiation:      tls.RenegotiateNever,
-			},
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-	}
+	proxy.Transport = s.transport
 
 	// Modify request
 	r.URL.Host = target.Host

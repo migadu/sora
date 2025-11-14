@@ -47,12 +47,7 @@ type ConnectionManager struct {
 	// Consistent hashing for deterministic backend selection
 	consistentHash *ConsistentHash
 
-	// Track healthy servers (legacy simple health tracking)
-	healthyMu     sync.RWMutex
-	healthyStatus map[string]bool
-	lastCheck     map[string]time.Time
-
-	// Detailed backend health tracking
+	// Backend health tracking
 	healthMu      sync.RWMutex
 	backendHealth map[string]*BackendHealth
 
@@ -85,14 +80,10 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		normalizedAddrs[i] = normalizeHostPort(addr, remotePort)
 	}
 
-	healthyStatus := make(map[string]bool)
-	lastCheck := make(map[string]time.Time)
 	backendHealth := make(map[string]*BackendHealth)
 
 	// Initially mark all servers as healthy
 	for _, addr := range normalizedAddrs {
-		healthyStatus[addr] = true
-		lastCheck[addr] = time.Now()
 		backendHealth[addr] = &BackendHealth{
 			IsHealthy:   true,
 			LastSuccess: time.Now(),
@@ -115,8 +106,6 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
 		connectTimeout:         connectTimeout,
 		consistentHash:         consistentHash,
-		healthyStatus:          healthyStatus,
-		lastCheck:              lastCheck,
 		backendHealth:          backendHealth,
 		routingLookup:          routingLookup,
 	}
@@ -373,27 +362,20 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		idx := (startIndex + uint32(i)) % uint32(len(cm.remoteAddrs))
 		addr := cm.remoteAddrs[idx]
 
-		if !cm.isHealthy(addr) {
-			// Check if we should retry this server
-			if cm.shouldRetry(addr) {
-				cm.markHealthy(addr)
-			} else {
-				continue
-			}
+		// Skip unhealthy backends
+		if !cm.IsBackendHealthy(addr) {
+			continue
 		}
 
 		conn, err := cm.dialWithProxy(ctx, addr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if err == nil {
-			// Record success in detailed health tracking
+			// Record success in health tracking
 			cm.RecordConnectionSuccess(addr)
 			return conn, addr, nil
 		}
 
-		// Record failure in detailed health tracking
+		// Record failure in health tracking
 		cm.RecordConnectionFailure(addr)
-
-		// Mark as unhealthy if connection failed (legacy tracking)
-		cm.markUnhealthy(addr)
 		logger.Debug("Failed to connect to backend", "addr", addr, "error", err)
 	}
 
@@ -415,7 +397,7 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 	}
 
 	// If the server is in our list and marked unhealthy, decide whether to fail hard or fall back.
-	if isInList && !cm.isHealthy(preferredAddr) {
+	if isInList && !cm.IsBackendHealthy(preferredAddr) {
 		if isPrelookupRoute {
 			// Prelookup routes are definitive; if the server is unhealthy, we fail hard.
 			logger.Debug("ConnectionManager: Prelookup-designated server is marked as unhealthy. NOT falling back to round-robin.", "server", preferredAddr)
@@ -440,7 +422,6 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 	// Connection failed. Mark it as unhealthy if it's in our managed list.
 	if isInList {
 		cm.RecordConnectionFailure(preferredAddr)
-		cm.markUnhealthy(preferredAddr)
 	}
 
 	if isPrelookupRoute {
@@ -458,8 +439,7 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 // ResolveAddresses resolves hostnames to IP addresses, expanding the address list
 func (cm *ConnectionManager) ResolveAddresses() error {
 	var resolvedAddrs []string
-	newHealthyStatus := make(map[string]bool)
-	newLastCheck := make(map[string]time.Time)
+	newBackendHealth := make(map[string]*BackendHealth)
 
 	for _, addr := range cm.remoteAddrs {
 		host, port, err := net.SplitHostPort(addr)
@@ -474,8 +454,11 @@ func (cm *ConnectionManager) ResolveAddresses() error {
 		if err != nil {
 			// If resolution fails, keep the original address
 			resolvedAddrs = append(resolvedAddrs, addr)
-			newHealthyStatus[addr] = cm.healthyStatus[addr]
-			newLastCheck[addr] = cm.lastCheck[addr]
+			cm.healthMu.RLock()
+			if health, ok := cm.backendHealth[addr]; ok {
+				newBackendHealth[addr] = health
+			}
+			cm.healthMu.RUnlock()
 			continue
 		}
 
@@ -490,21 +473,23 @@ func (cm *ConnectionManager) ResolveAddresses() error {
 			resolvedAddrs = append(resolvedAddrs, resolvedAddr)
 
 			// Preserve health status if we had it
-			if status, ok := cm.healthyStatus[resolvedAddr]; ok {
-				newHealthyStatus[resolvedAddr] = status
-				newLastCheck[resolvedAddr] = cm.lastCheck[resolvedAddr]
+			cm.healthMu.RLock()
+			if health, ok := cm.backendHealth[resolvedAddr]; ok {
+				newBackendHealth[resolvedAddr] = health
 			} else {
-				newHealthyStatus[resolvedAddr] = true
-				newLastCheck[resolvedAddr] = time.Now()
+				newBackendHealth[resolvedAddr] = &BackendHealth{
+					IsHealthy:   true,
+					LastSuccess: time.Now(),
+				}
 			}
+			cm.healthMu.RUnlock()
 		}
 	}
 
-	cm.healthyMu.Lock()
+	cm.healthMu.Lock()
 	cm.remoteAddrs = resolvedAddrs
-	cm.healthyStatus = newHealthyStatus
-	cm.lastCheck = newLastCheck
-	cm.healthyMu.Unlock()
+	cm.backendHealth = newBackendHealth
+	cm.healthMu.Unlock()
 
 	return nil
 }
@@ -803,39 +788,6 @@ func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP 
 	}
 
 	return nil
-}
-
-func (cm *ConnectionManager) isHealthy(addr string) bool {
-	cm.healthyMu.RLock()
-	defer cm.healthyMu.RUnlock()
-	return cm.healthyStatus[addr]
-}
-
-func (cm *ConnectionManager) markHealthy(addr string) {
-	cm.healthyMu.Lock()
-	defer cm.healthyMu.Unlock()
-	cm.healthyStatus[addr] = true
-	cm.lastCheck[addr] = time.Now()
-}
-
-func (cm *ConnectionManager) markUnhealthy(addr string) {
-	cm.healthyMu.Lock()
-	defer cm.healthyMu.Unlock()
-	cm.healthyStatus[addr] = false
-	cm.lastCheck[addr] = time.Now()
-}
-
-func (cm *ConnectionManager) shouldRetry(addr string) bool {
-	cm.healthyMu.RLock()
-	defer cm.healthyMu.RUnlock()
-
-	// Retry unhealthy servers after 30 seconds
-	lastCheck, ok := cm.lastCheck[addr]
-	if !ok {
-		return true
-	}
-
-	return time.Since(lastCheck) > 30*time.Second
 }
 
 // ConnectToSpecificWithContext attempts to connect to a specific server address with proper context propagation

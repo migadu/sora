@@ -117,10 +117,32 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Load config once at startup
-	// Parse --config flag and remove it from os.Args so subcommand handlers don't see it
-	configPath := ""
+	// Determine the command first
 	command := ""
+	for i := 1; i < len(os.Args); i++ {
+		if !strings.HasPrefix(os.Args[i], "-") {
+			command = os.Args[i]
+			break
+		}
+		// Skip --config and its value when looking for command
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			i++ // Skip the value
+		}
+	}
+
+	if command == "" {
+		printUsage()
+		os.Exit(1)
+	}
+
+	// Special handling for 'config' subcommands - they parse their own --config flag
+	if command == "config" {
+		handleConfigCommand(ctx)
+		return
+	}
+
+	// For all other commands, parse and remove the global --config flag
+	configPath := ""
 	newArgs := []string{os.Args[0]} // Keep program name
 
 	for i := 1; i < len(os.Args); i++ {
@@ -129,20 +151,11 @@ func main() {
 			i++ // Skip the config path value
 		} else {
 			newArgs = append(newArgs, os.Args[i])
-			if command == "" && !strings.HasPrefix(os.Args[i], "-") {
-				// First non-flag argument is the command
-				command = os.Args[i]
-			}
 		}
 	}
 
 	if configPath == "" {
 		logger.Fatalf("ERROR: --config flag is required")
-	}
-
-	if command == "" {
-		printUsage()
-		os.Exit(1)
 	}
 
 	if err := loadAdminConfig(configPath, &globalConfig); err != nil {
@@ -171,8 +184,6 @@ func main() {
 		handleAffinityCommand(ctx)
 	case "health":
 		handleHealthCommand(ctx)
-	case "config":
-		handleConfigCommand(ctx)
 	case "migrate":
 		handleMigrateCommand(ctx)
 	case "version":
@@ -204,7 +215,10 @@ func printUsage() {
 	fmt.Printf(`SORA Admin Tool
 
 Usage:
-  sora-admin <command> <subcommand> [options]
+  sora-admin --config PATH <command> <subcommand> [options]
+
+Global Options:
+  --config PATH    Path to configuration file (required for most commands)
 
 Commands:
   accounts      Manage user accounts
@@ -228,17 +242,18 @@ Commands:
   help          Show this help message
 
 Examples:
-  sora-admin accounts create --email user@example.com --password mypassword
-  sora-admin accounts list
-  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
-  sora-admin credentials list --email user@example.com
-  sora-admin cache stats
-  sora-admin stats auth --window 1h
-  sora-admin connections kick --user user@example.com
-  sora-admin affinity set --user user@example.com --protocol imap --backend 192.168.1.10:993
+  sora-admin --config config.toml accounts create --email user@example.com --password mypassword
+  sora-admin --config config.toml accounts list
+  sora-admin --config config.toml credentials add --primary admin@example.com --email alias@example.com --password mypassword
+  sora-admin --config config.toml credentials list --email user@example.com
+  sora-admin --config config.toml cache stats
+  sora-admin --config config.toml stats auth --window 1h
+  sora-admin --config config.toml connections kick --user user@example.com
+  sora-admin --config config.toml affinity set --user user@example.com --protocol imap --backend 192.168.1.10:993
+  sora-admin --config config.toml config validate
 
-Use 'sora-admin <command> --help' for more information about a command group.
-Use 'sora-admin <command> <subcommand> --help' for detailed help on specific commands.
+Use 'sora-admin --config PATH <command> --help' for more information about a command group.
+Use 'sora-admin --config PATH <command> <subcommand> --help' for detailed help on specific commands.
 `)
 }
 

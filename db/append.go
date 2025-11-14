@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
@@ -144,6 +145,22 @@ type InsertMessageOptions struct {
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			// Check for duplicate key violation
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				status = "duplicate"
+			} else {
+				status = "error"
+			}
+		}
+		metrics.DBQueryDuration.WithLabelValues("message_insert", "write").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("message_insert", status, "write").Inc()
+	}()
+
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
 		log.Printf("Database: messageID is empty after sanitization, generating a new one without modifying the message.")

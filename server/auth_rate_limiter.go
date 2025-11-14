@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // ErrRateLimitExceeded is returned when rate limit is exceeded
@@ -103,6 +103,9 @@ type AuthRateLimiter struct {
 	clusterLimiter *ClusterRateLimiter
 
 	stopCleanup chan struct{}
+
+	// Cleanup counter for periodic memory reporting
+	cleanupCounter uint64
 }
 
 // BlockedIPUsernameInfo tracks specific IP+username combinations that are temporarily blocked
@@ -506,6 +509,11 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
 
+	// Enforce size limit with LRU eviction (if configured)
+	if a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
+		a.evictOldestIP()
+	}
+
 	info, exists := a.ipFailureCounts[ip]
 	if !exists {
 		info = &IPFailureInfo{FirstFailure: failureTime, LastDelay: 0}
@@ -573,6 +581,11 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 	ipUsernameKey := ip + "|" + username
 	a.ipUsernameMu.Lock()
 	defer a.ipUsernameMu.Unlock()
+
+	// Enforce size limit with LRU eviction (if configured)
+	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
+		a.evictOldestIPUsername()
+	}
 
 	// Track failures for this IP+username combination
 	var failureCount int
@@ -645,6 +658,11 @@ func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime tim
 
 	a.usernameMu.Lock()
 	defer a.usernameMu.Unlock()
+
+	// Enforce size limit with LRU eviction (if configured)
+	if a.config.MaxUsernameEntries > 0 && len(a.usernameFailureCounts) >= a.config.MaxUsernameEntries {
+		a.evictOldestUsername()
+	}
 
 	info, exists := a.usernameFailureCounts[username]
 	if !exists {
@@ -770,6 +788,39 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 			"expired_ip_failures", expiredFailures,
 			"expired_username_failures", expiredUsernames)
 	}
+
+	// Update Prometheus metrics every cleanup cycle
+	a.ipUsernameMu.RLock()
+	totalIPUsername := len(a.blockedIPUsernames)
+	a.ipUsernameMu.RUnlock()
+
+	a.ipMu.RLock()
+	totalBlockedIPs := len(a.blockedIPs)
+	totalIPFailures := len(a.ipFailureCounts)
+	a.ipMu.RUnlock()
+
+	a.usernameMu.RLock()
+	totalUsernames := len(a.usernameFailureCounts)
+	a.usernameMu.RUnlock()
+
+	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(a.protocol).Set(float64(totalIPUsername))
+	metrics.AuthRateLimiterIPEntries.WithLabelValues(a.protocol).Set(float64(totalIPFailures))
+	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(a.protocol).Set(float64(totalUsernames))
+	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(a.protocol).Set(float64(totalBlockedIPs))
+
+	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min default cleanup interval)
+	// This helps monitor for memory leaks and effectiveness of size caps
+	a.cleanupCounter++
+	if a.cleanupCounter%10 == 0 {
+		logger.Info("Auth rate limiter: Memory usage stats", "protocol", a.protocol,
+			"ip_username_entries", totalIPUsername,
+			"ip_username_limit", a.config.MaxIPUsernameEntries,
+			"blocked_ips", totalBlockedIPs,
+			"ip_failure_entries", totalIPFailures,
+			"ip_limit", a.config.MaxIPEntries,
+			"username_entries", totalUsernames,
+			"username_limit", a.config.MaxUsernameEntries)
+	}
 }
 
 func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Duration) map[string]any {
@@ -798,6 +849,17 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 		"tracked_ips":          trackedIPs,
 		"tracked_usernames":    trackedUsernames,
 		"cluster_enabled":      a.clusterLimiter != nil,
+		"memory_usage": map[string]any{
+			"ip_username_entries":     blockedIPUsernameCount,
+			"ip_username_limit":       a.config.MaxIPUsernameEntries,
+			"ip_failure_entries":      trackedIPs,
+			"ip_limit":                a.config.MaxIPEntries,
+			"username_entries":        trackedUsernames,
+			"username_limit":          a.config.MaxUsernameEntries,
+			"ip_username_utilization": float64(blockedIPUsernameCount) / float64(max(a.config.MaxIPUsernameEntries, 1)) * 100,
+			"ip_utilization":          float64(trackedIPs) / float64(max(a.config.MaxIPEntries, 1)) * 100,
+			"username_utilization":    float64(trackedUsernames) / float64(max(a.config.MaxUsernameEntries, 1)) * 100,
+		},
 		"config": map[string]any{
 			"max_attempts_per_ip_username": a.config.MaxAttemptsPerIPUsername,
 			"ip_username_block_duration":   a.config.IPUsernameBlockDuration.String(),
@@ -818,4 +880,81 @@ func (a *AuthRateLimiter) Stop() {
 		return
 	}
 	close(a.stopCleanup)
+}
+
+// evictOldestIPUsername removes the oldest IP+username entry by FirstFailure time
+// Caller must hold ipUsernameMu write lock
+func (a *AuthRateLimiter) evictOldestIPUsername() {
+	if len(a.blockedIPUsernames) == 0 {
+		return
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+
+	for key, info := range a.blockedIPUsernames {
+		if first || info.FirstFailure.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = info.FirstFailure
+			first = false
+		}
+	}
+
+	if oldestKey != "" {
+		delete(a.blockedIPUsernames, oldestKey)
+		logger.Debug("Auth limiter: Evicted oldest IP+username entry (size limit)", "protocol", a.protocol, "key", oldestKey, "first_failure", oldestTime)
+	}
+}
+
+// evictOldestIP removes the oldest IP entry by FirstFailure time
+// Caller must hold ipMu write lock
+func (a *AuthRateLimiter) evictOldestIP() {
+	if len(a.ipFailureCounts) == 0 {
+		return
+	}
+
+	var oldestIP string
+	var oldestTime time.Time
+	first := true
+
+	for ip, info := range a.ipFailureCounts {
+		if first || info.FirstFailure.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = info.FirstFailure
+			first = false
+		}
+	}
+
+	if oldestIP != "" {
+		delete(a.ipFailureCounts, oldestIP)
+		// Also remove from blockedIPs if present
+		delete(a.blockedIPs, oldestIP)
+		logger.Debug("Auth limiter: Evicted oldest IP entry (size limit)", "protocol", a.protocol, "ip", oldestIP, "first_failure", oldestTime)
+	}
+}
+
+// evictOldestUsername removes the oldest username entry by FirstFailure time
+// Caller must hold usernameMu write lock
+func (a *AuthRateLimiter) evictOldestUsername() {
+	if len(a.usernameFailureCounts) == 0 {
+		return
+	}
+
+	var oldestUsername string
+	var oldestTime time.Time
+	first := true
+
+	for username, info := range a.usernameFailureCounts {
+		if first || info.FirstFailure.Before(oldestTime) {
+			oldestUsername = username
+			oldestTime = info.FirstFailure
+			first = false
+		}
+	}
+
+	if oldestUsername != "" {
+		delete(a.usernameFailureCounts, oldestUsername)
+		logger.Debug("Auth limiter: Evicted oldest username entry (size limit)", "protocol", a.protocol, "username", oldestUsername, "first_failure", oldestTime)
+	}
 }

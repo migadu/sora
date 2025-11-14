@@ -41,6 +41,9 @@ type AuthCache struct {
 	// Metrics
 	hits   uint64
 	misses uint64
+
+	// Cleanup counter for periodic memory reporting
+	cleanupCounter uint64
 }
 
 // New creates a new authentication cache instance
@@ -239,6 +242,40 @@ func (c *AuthCache) cleanup() {
 
 	// Update hit rate metric
 	c.updateHitRateMetric()
+
+	// Calculate positive vs negative entry counts
+	successEntries := 0
+	userNotFoundEntries := 0
+	invalidPasswordEntries := 0
+	for _, entry := range c.entries {
+		switch entry.result {
+		case AuthSuccess:
+			successEntries++
+		case AuthUserNotFound:
+			userNotFoundEntries++
+		case AuthInvalidPassword:
+			invalidPasswordEntries++
+		}
+	}
+
+	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
+	c.cleanupCounter++
+	if c.cleanupCounter%10 == 0 {
+		total := c.hits + c.misses
+		var hitRate float64
+		if total > 0 {
+			hitRate = float64(c.hits) / float64(total) * 100
+		}
+
+		logger.Info("AuthCache: Memory usage stats",
+			"total_entries", len(c.entries),
+			"success_entries", successEntries,
+			"user_not_found", userNotFoundEntries,
+			"invalid_password", invalidPasswordEntries,
+			"max_size", c.maxSize,
+			"hit_rate_pct", hitRate,
+			"removed_this_cycle", removed)
+	}
 }
 
 // updateHitRateMetric updates the Prometheus hit rate gauge
