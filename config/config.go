@@ -1173,10 +1173,11 @@ type ServerConfig struct {
 	ProxyProtocolTimeout string `toml:"proxy_protocol_timeout,omitempty"`
 
 	// Connection limits
-	MaxConnections        int `toml:"max_connections,omitempty"`
-	MaxConnectionsPerIP   int `toml:"max_connections_per_ip,omitempty"`
-	MaxConnectionsPerUser int `toml:"max_connections_per_user,omitempty"` // Cluster-wide per-user limit (proxy only, requires cluster mode)
-	ListenBacklog         int `toml:"listen_backlog,omitempty"`           // TCP listen backlog size (0=system default, typically 128-512; recommended: 4096-8192)
+	MaxConnections             int `toml:"max_connections,omitempty"`
+	MaxConnectionsPerIP        int `toml:"max_connections_per_ip,omitempty"`
+	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Cluster-wide per-user limit (proxy only, requires cluster mode)
+	MaxConnectionsPerUserPerIP int `toml:"max_connections_per_user_per_ip,omitempty"` // Local per-user-per-IP limit
+	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0=system default, typically 128-512; recommended: 4096-8192)
 
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`

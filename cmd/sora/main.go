@@ -796,7 +796,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
-func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, server interface {
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, server interface {
 	SetConnectionTracker(*proxy.ConnectionTracker)
 }) *proxy.ConnectionTracker {
 	if clusterMgr == nil {
@@ -812,9 +812,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		maxEventQueueSize = clusterCfg.GetMaxEventQueueSize()
 	}
 
-	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser)
+	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
 
-	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxEventQueueSize)
+	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
 	if tracker != nil {
 		server.SetConnectionTracker(tracker)
 	}
@@ -920,7 +920,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, 0)
+		tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1069,7 +1069,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, 0)
+		tracker := proxy.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1165,7 +1165,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, 0)
+		tracker := proxy.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1306,7 +1306,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackers["IMAP"] = tracker
 	}
@@ -1415,7 +1415,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackers["POP3"] = tracker
 	}
@@ -1526,7 +1526,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackers["ManageSieve"] = tracker
 	}
@@ -1610,7 +1610,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackers["LMTP"] = tracker
 	}

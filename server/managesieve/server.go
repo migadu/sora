@@ -72,33 +72,34 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth           bool
-	Debug                  bool
-	TLS                    bool
-	TLSCertFile            string
-	TLSKeyFile             string
-	TLSVerify              bool
-	TLSUseStartTLS         bool
-	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
-	MaxScriptSize          int64
-	SupportedExtensions    []string // List of supported Sieve extensions
-	MasterUsername         string
-	MasterPassword         string
-	MasterSASLUsername     string
-	MasterSASLPassword     string
-	MaxConnections         int
-	MaxConnectionsPerIP    int
-	MaxConnectionsPerUser  int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
-	ListenBacklog          int      // TCP listen backlog size (0 = use default 1024)
-	ProxyProtocol          bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout   string   // Timeout for reading PROXY headers
-	TrustedNetworks        []string // Global trusted networks for parameter forwarding
-	AuthRateLimit          serverPkg.AuthRateLimiterConfig
-	AuthIdleTimeout        time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout         time.Duration  // Maximum idle time before disconnection
-	AbsoluteSessionTimeout time.Duration  // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute      int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
-	Config                 *config.Config // Full config for shared settings like connection tracking timeouts
+	InsecureAuth               bool
+	Debug                      bool
+	TLS                        bool
+	TLSCertFile                string
+	TLSKeyFile                 string
+	TLSVerify                  bool
+	TLSUseStartTLS             bool
+	TLSConfig                  *tls.Config // Global TLS config from TLS manager (optional)
+	MaxScriptSize              int64
+	SupportedExtensions        []string // List of supported Sieve extensions
+	MasterUsername             string
+	MasterPassword             string
+	MasterSASLUsername         string
+	MasterSASLPassword         string
+	MaxConnections             int
+	MaxConnectionsPerIP        int
+	MaxConnectionsPerUser      int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	MaxConnectionsPerUserPerIP int      // Maximum connections per user per IP (0=unlimited)
+	ListenBacklog              int      // TCP listen backlog size (0 = use default 1024)
+	ProxyProtocol              bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout       string   // Timeout for reading PROXY headers
+	TrustedNetworks            []string // Global trusted networks for parameter forwarding
+	AuthRateLimit              serverPkg.AuthRateLimiterConfig
+	AuthIdleTimeout            time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	CommandTimeout             time.Duration  // Maximum idle time before disconnection
+	AbsoluteSessionTimeout     time.Duration  // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute          int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	Config                     *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
 func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -246,11 +247,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		// Create ConnectionTracker with nil cluster manager (local mode only)
 		serverInstance.connTracker = proxy.NewConnectionTracker(
-			"ManageSieve",                 // protocol name
-			instanceID,                    // unique instance identifier
-			nil,                           // no cluster manager = local mode
-			options.MaxConnectionsPerUser, // per-user connection limit
-			0,                             // queue size (not used in local mode)
+			"ManageSieve",                      // protocol name
+			instanceID,                         // unique instance identifier
+			nil,                                // no cluster manager = local mode
+			options.MaxConnectionsPerUser,      // per-user connection limit
+			options.MaxConnectionsPerUserPerIP, // per-user-per-IP connection limit
+			0,                                  // queue size (not used in local mode)
 		)
 
 		logger.Debug("ManageSieve: Local connection tracking enabled", "name", name, "max_connections_per_user", options.MaxConnectionsPerUser)

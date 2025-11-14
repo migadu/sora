@@ -699,9 +699,11 @@ addr = ":143"                 # Listen address and port. Use :993 for IMAPS.
 debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
-max_connections = 1000        # Maximum concurrent IMAP connections to this server instance.
-max_connections_per_ip = 10   # Max connections per client IP. Set to 0 if behind a load balancer.
-listen_backlog = 4096         # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
+max_connections = 1000              # Maximum concurrent IMAP connections to this server instance.
+max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. Set to 0 if behind load balancer.
+max_connections_per_user = 15       # Max authenticated connections per user across all IPs. 0 = unlimited. (Requires connection tracking)
+max_connections_per_user_per_ip = 5 # Max connections per user from same IP. KEY PROTECTION against buggy clients & brute force. 0 = unlimited.
+listen_backlog = 4096               # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
                               # FreeBSD/Linux default is often too small (~128-512). Recommended: 4096-8192 for high-load servers.
                               # Small backlog causes SYN queue to fill, leading to ~60s connection delays.
 
@@ -970,9 +972,10 @@ type = "imap_proxy"
 name = "imap-proxy-1"
 addr = ":1143"                # Proxy listen address. Must be different from backend IMAP port.
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
-max_connections = 2000                # Max connections to this proxy instance
-max_connections_per_ip = 50           # Max connections per client IP
-max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections = 5000                  # Max connections to this proxy instance (aggregates multiple clients)
+max_connections_per_ip = 500            # High for corporate gateways (~100 users), catches DoS
+max_connections_per_user = 20           # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections_per_user_per_ip = 8     # Per user per IP - slightly higher for proxies
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1344,9 +1347,10 @@ type = "pop3_proxy"
 name = "pop3-proxy-1"
 addr = ":1110"                # Proxy listen address. Must be different from backend POP3 port.
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
-max_connections = 1000
-max_connections_per_ip = 20
-max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections = 2000
+max_connections_per_ip = 200            # High for gateways, POP3 is typically sequential so less needed
+max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections_per_user_per_ip = 3     # POP3 rarely needs multiple simultaneous connections
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"
 
@@ -1390,8 +1394,9 @@ name = "managesieve-proxy-1"
 addr = ":14190"               # Proxy listen address. Must be different from backend ManageSieve port.
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
-max_connections_per_ip = 10
-max_connections_per_user = 0          # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections_per_ip = 100            # Low volume protocol, moderate limit sufficient
+max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
+max_connections_per_user_per_ip = 3     # Administrative operations, low concurrency needed
 insecure_auth = false                 # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = "proxyuser"
 master_sasl_password = "proxypass"

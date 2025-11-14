@@ -64,6 +64,7 @@ type UserConnectionData struct {
 	AccountID      int64          `json:"account_id"`
 	Username       string         `json:"username"`
 	LocalInstances map[string]int `json:"local_instances"` // instanceID -> count
+	PerIPCount     map[string]int `json:"per_ip_count"`    // clientIP -> count (cluster-wide)
 	LastUpdate     time.Time      `json:"last_update"`
 }
 
@@ -75,6 +76,7 @@ type UserConnectionInfo struct {
 	LocalCount     int // This instance's count
 	LastUpdate     time.Time
 	LocalInstances map[string]int // instanceID -> count on that instance
+	PerIPCount     map[string]int // clientIP -> count (cluster-wide via gossip, for per-user-per-IP limiting)
 }
 
 // ConnectionTracker manages connection tracking using gossip protocol
@@ -92,8 +94,9 @@ type ConnectionTracker struct {
 	kickSessionsMu sync.RWMutex
 
 	// Configuration
-	maxConnectionsPerUser int // Cluster-wide limit per user (0 = unlimited)
-	maxEventQueueSize     int // Maximum events in broadcast queue
+	maxConnectionsPerUser      int // Cluster-wide limit per user (0 = unlimited)
+	maxConnectionsPerUserPerIP int // Local limit per user per IP (0 = unlimited)
+	maxEventQueueSize          int // Maximum events in broadcast queue
 
 	// Broadcast queue for outgoing events
 	broadcastQueue []ConnectionEvent
@@ -109,24 +112,25 @@ type ConnectionTracker struct {
 // NewConnectionTracker creates a new connection tracker.
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
-func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxEventQueueSize int) *ConnectionTracker {
+func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int) *ConnectionTracker {
 	// Use default if not specified
 	if maxEventQueueSize <= 0 {
 		maxEventQueueSize = defaultMaxEventQueueSize
 	}
 
 	ct := &ConnectionTracker{
-		name:                  name,
-		instanceID:            instanceID,
-		clusterManager:        clusterMgr,
-		connections:           make(map[int64]*UserConnectionInfo),
-		maxConnectionsPerUser: maxConnectionsPerUser,
-		maxEventQueueSize:     maxEventQueueSize,
-		kickSessions:          make(map[int64][]chan struct{}),
-		broadcastQueue:        make([]ConnectionEvent, 0, 100),
-		stopBroadcast:         make(chan struct{}),
-		stopCleanup:           make(chan struct{}),
-		stopStateSnapshot:     make(chan struct{}),
+		name:                       name,
+		instanceID:                 instanceID,
+		clusterManager:             clusterMgr,
+		connections:                make(map[int64]*UserConnectionInfo),
+		maxConnectionsPerUser:      maxConnectionsPerUser,
+		maxConnectionsPerUserPerIP: maxConnectionsPerUserPerIP,
+		maxEventQueueSize:          maxEventQueueSize,
+		kickSessions:               make(map[int64][]chan struct{}),
+		broadcastQueue:             make([]ConnectionEvent, 0, 100),
+		stopBroadcast:              make(chan struct{}),
+		stopCleanup:                make(chan struct{}),
+		stopStateSnapshot:          make(chan struct{}),
 	}
 
 	if clusterMgr != nil {
@@ -181,6 +185,7 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 			LocalCount:     0,
 			LastUpdate:     time.Now(),
 			LocalInstances: make(map[string]int),
+			PerIPCount:     make(map[string]int),
 		}
 		ct.connections[accountID] = info
 	}
@@ -202,11 +207,47 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 			username, checkCount, ct.maxConnectionsPerUser, scope)
 	}
 
+	// Check per-user-per-IP limit (cluster-wide via gossip)
+	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
+		// Extract IP from clientAddr (format is usually "IP:port")
+		clientIP := clientAddr
+		if idx := len(clientAddr) - 1; idx >= 0 {
+			for i := idx; i >= 0; i-- {
+				if clientAddr[i] == ':' {
+					clientIP = clientAddr[:i]
+					break
+				}
+			}
+		}
+
+		ipCount := info.PerIPCount[clientIP]
+		if ipCount >= ct.maxConnectionsPerUserPerIP {
+			logger.Info("Connection tracker: Maximum connections per user per IP reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "ip", clientIP, "current", ipCount, "max", ct.maxConnectionsPerUserPerIP, "client_addr", clientAddr)
+			return fmt.Errorf("user %s has reached maximum connections from IP %s (%d/%d)",
+				username, clientIP, ipCount, ct.maxConnectionsPerUserPerIP)
+		}
+	}
+
 	// Increment local count
 	info.LocalCount++
 	info.TotalCount++
 	info.LastUpdate = time.Now()
 	info.LocalInstances[ct.instanceID]++
+
+	// Increment per-IP count (if tracking enabled)
+	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
+		// Extract IP from clientAddr
+		clientIP := clientAddr
+		if idx := len(clientAddr) - 1; idx >= 0 {
+			for i := idx; i >= 0; i-- {
+				if clientAddr[i] == ':' {
+					clientIP = clientAddr[:i]
+					break
+				}
+			}
+		}
+		info.PerIPCount[clientIP]++
+	}
 
 	if ct.clusterManager == nil {
 		info.TotalCount = info.LocalCount // In local mode, total = local
@@ -255,6 +296,27 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	}
 	if count := info.LocalInstances[ct.instanceID]; count > 0 {
 		info.LocalInstances[ct.instanceID] = count - 1
+	}
+
+	// Decrement per-IP count (if tracking enabled)
+	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
+		// Extract IP from clientAddr
+		clientIP := clientAddr
+		if idx := len(clientAddr) - 1; idx >= 0 {
+			for i := idx; i >= 0; i-- {
+				if clientAddr[i] == ':' {
+					clientIP = clientAddr[:i]
+					break
+				}
+			}
+		}
+		if count := info.PerIPCount[clientIP]; count > 0 {
+			info.PerIPCount[clientIP] = count - 1
+			// Clean up zero counts
+			if info.PerIPCount[clientIP] == 0 {
+				delete(info.PerIPCount, clientIP)
+			}
+		}
 	}
 
 	// In local mode, keep total = local
@@ -567,6 +629,7 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 			LocalCount:     0,
 			LastUpdate:     time.Now(),
 			LocalInstances: make(map[string]int),
+			PerIPCount:     make(map[string]int),
 		}
 		ct.connections[event.AccountID] = info
 	}
@@ -575,6 +638,21 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 	info.TotalCount++
 	info.LastUpdate = time.Now()
 	info.LocalInstances[event.InstanceID]++
+
+	// Increment per-IP count (cluster-wide tracking via gossip)
+	if event.ClientAddr != "" {
+		// Extract IP from clientAddr
+		clientIP := event.ClientAddr
+		if idx := len(event.ClientAddr) - 1; idx >= 0 {
+			for i := idx; i >= 0; i-- {
+				if event.ClientAddr[i] == ':' {
+					clientIP = event.ClientAddr[:i]
+					break
+				}
+			}
+		}
+		info.PerIPCount[clientIP]++
+	}
 
 	logger.Debug("Gossip tracker: Cluster register", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
 }
@@ -596,6 +674,28 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 	if count := info.LocalInstances[event.InstanceID]; count > 0 {
 		info.LocalInstances[event.InstanceID] = count - 1
 	}
+
+	// Decrement per-IP count (cluster-wide tracking via gossip)
+	if event.ClientAddr != "" {
+		// Extract IP from clientAddr
+		clientIP := event.ClientAddr
+		if idx := len(event.ClientAddr) - 1; idx >= 0 {
+			for i := idx; i >= 0; i-- {
+				if event.ClientAddr[i] == ':' {
+					clientIP = event.ClientAddr[:i]
+					break
+				}
+			}
+		}
+		if count := info.PerIPCount[clientIP]; count > 0 {
+			info.PerIPCount[clientIP] = count - 1
+			// Clean up zero counts
+			if info.PerIPCount[clientIP] == 0 {
+				delete(info.PerIPCount, clientIP)
+			}
+		}
+	}
+
 	info.LastUpdate = time.Now()
 
 	logger.Debug("Gossip tracker: Cluster unregister", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
@@ -734,10 +834,19 @@ func (ct *ConnectionTracker) broadcastStateSnapshot() {
 			continue // Skip if no actual connections
 		}
 
+		// Copy PerIPCount for cluster-wide tracking
+		perIPCount := make(map[string]int)
+		for ip, count := range info.PerIPCount {
+			if count > 0 {
+				perIPCount[ip] = count
+			}
+		}
+
 		snapshot.Connections[accountID] = UserConnectionData{
 			AccountID:      accountID,
 			Username:       info.Username,
 			LocalInstances: localInstances,
+			PerIPCount:     perIPCount,
 			LastUpdate:     info.LastUpdate,
 		}
 	}
@@ -794,6 +903,7 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 				LocalCount:     0,
 				LastUpdate:     time.Now(),
 				LocalInstances: make(map[string]int),
+				PerIPCount:     make(map[string]int),
 			}
 			ct.connections[accountID] = info
 			addedCount++
@@ -809,6 +919,16 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 			oldCount := info.LocalInstances[instanceID]
 			if oldCount != count {
 				info.LocalInstances[instanceID] = count
+				reconciledCount++
+			}
+		}
+
+		// Merge per-IP counts from remote snapshot (cluster-wide tracking)
+		// We merge all IPs, not just from other instances, because per-IP is cluster-wide
+		for ip, count := range remoteData.PerIPCount {
+			oldCount := info.PerIPCount[ip]
+			if oldCount != count {
+				info.PerIPCount[ip] = count
 				reconciledCount++
 			}
 		}
