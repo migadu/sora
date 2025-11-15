@@ -440,7 +440,7 @@ func (s *Server) acceptConnections() error {
 		if s.limiter != nil {
 			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
 			if err != nil {
-				logger.Warn("Connection rejected", "proxy", s.name, "error", err)
+				logger.Info("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()
 				continue // Try to accept the next connection
 			}

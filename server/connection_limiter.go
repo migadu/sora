@@ -304,11 +304,6 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 	if cl.maxConnections > 0 {
 		current := cl.currentTotal.Load()
 		if current >= int64(cl.maxConnections) {
-			if realClientIP != "" {
-				logger.Info("Connection limiter: Maximum total connections reached", "protocol", cl.protocol, "current", current, "max", cl.maxConnections, "proxy_addr", GetAddrString(remoteAddr), "real_client", realClientIP)
-			} else {
-				logger.Info("Connection limiter: Maximum total connections reached", "protocol", cl.protocol, "current", current, "max", cl.maxConnections, "remote_addr", GetAddrString(remoteAddr))
-			}
 			return fmt.Errorf("maximum connections reached (%d/%d)", current, cl.maxConnections)
 		}
 	}
@@ -360,11 +355,6 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 		}
 
 		if current >= int64(cl.maxPerIP) {
-			if realClientIP != "" {
-				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "proxy_addr", GetAddrString(remoteAddr), "real_client", realClientIP, "current", current, "max", cl.maxPerIP)
-			} else {
-				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", checkIP, "current", current, "max", cl.maxPerIP)
-			}
 			return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
 		}
 	}
