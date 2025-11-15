@@ -51,7 +51,8 @@ type Server struct {
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	prelookupConfig        *config.PreLookupConfig
-	remoteUseIDCommand     bool // Whether backend supports IMAP ID command for forwarding
+	remoteUseIDCommand     bool                        // Whether backend supports IMAP ID command for forwarding
+	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -149,6 +150,10 @@ type ServerOptions struct {
 	ListenBacklog       int              // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 	ClusterManager      *cluster.Manager // Optional: enables cluster-wide per-IP limiting
 
+	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
+	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
+
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
 }
@@ -207,6 +212,26 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Warn("Failed to resolve addresses", "proxy", opts.Name, "error", err)
 	}
 
+	// Initialize PROXY protocol reader for incoming connections if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if opts.ProxyProtocol {
+		// Build config from flat fields (matching backend format)
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        opts.ProxyProtocolTimeout,
+			TrustedProxies: opts.TrustedNetworks, // Proxies always use trusted_networks
+		}
+		proxyReader, err = server.NewProxyProtocolReader("IMAP-PROXY", proxyConfig)
+		if err != nil {
+			if routingLookup != nil {
+				routingLookup.Close()
+			}
+			cancel()
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "proxy", opts.Name)
+	}
+
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.AuthRateLimit, opts.TrustedProxies)
 
@@ -261,6 +286,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		trustedProxies:         opts.TrustedProxies,
 		prelookupConfig:        opts.PreLookup,
 		remoteUseIDCommand:     opts.RemoteUseIDCommand,
+		proxyReader:            proxyReader,
 		limiter:                limiter,
 		listenBacklog:          listenBacklog,
 		debug:                  opts.Debug,
@@ -455,6 +481,14 @@ func (s *Server) acceptConnections() error {
 			metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Inc()
 
 			session := newSession(s, conn)
+			if session == nil {
+				// PROXY protocol error - connection already closed in newSession
+				metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Dec()
+				if releaseConn != nil {
+					releaseConn()
+				}
+				return
+			}
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
 

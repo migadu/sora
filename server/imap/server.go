@@ -33,6 +33,14 @@ import (
 
 const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
 
+// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
+	if len(proxyProtocolTrusted) > 0 {
+		return proxyProtocolTrusted
+	}
+	return trustedNetworks
+}
+
 // ClientCapabilityFilter extends the config.ClientCapabilityFilter with compiled regex patterns
 type ClientCapabilityFilter struct {
 	config.ClientCapabilityFilter
@@ -260,28 +268,29 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
-	Debug                      bool
-	TLS                        bool
-	TLSCertFile                string
-	TLSKeyFile                 string
-	TLSVerify                  bool
-	MasterUsername             []byte
-	MasterPassword             []byte
-	MasterSASLUsername         []byte
-	MasterSASLPassword         []byte
-	AppendLimit                int64
-	MaxConnections             int
-	MaxConnectionsPerIP        int
-	MaxConnectionsPerUser      int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
-	MaxConnectionsPerUserPerIP int      // Maximum connections per user per IP (0=unlimited)
-	ListenBacklog              int      // TCP listen backlog size (0 = use default 1024)
-	ProxyProtocol              bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout       string   // Timeout for reading PROXY headers
-	TrustedNetworks            []string // Global trusted networks for parameter forwarding
-	AuthRateLimit              serverPkg.AuthRateLimiterConfig
-	SearchRateLimitPerMin      int           // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow      time.Duration // Search rate limit time window
-	SessionMemoryLimit         int64         // Per-session memory limit in bytes (0=unlimited)
+	Debug                       bool
+	TLS                         bool
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	TLSVerify                   bool
+	MasterUsername              []byte
+	MasterPassword              []byte
+	MasterSASLUsername          []byte
+	MasterSASLPassword          []byte
+	AppendLimit                 int64
+	MaxConnections              int
+	MaxConnectionsPerIP         int
+	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	MaxConnectionsPerUserPerIP  int      // Maximum connections per user per IP (0=unlimited)
+	ListenBacklog               int      // TCP listen backlog size (0 = use default 1024)
+	ProxyProtocol               bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout        string   // Timeout for reading PROXY headers
+	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
+	TrustedNetworks             []string // Global trusted networks for parameter forwarding
+	AuthRateLimit               serverPkg.AuthRateLimiterConfig
+	SearchRateLimitPerMin       int           // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow       time.Duration // Search rate limit time window
+	SessionMemoryLimit          int64         // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -330,7 +339,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		proxyConfig := serverPkg.ProxyProtocolConfig{
 			Enabled:        true,
 			Mode:           "required",
-			TrustedProxies: options.TrustedNetworks,
+			TrustedProxies: getProxyProtocolTrustedProxies(options.ProxyProtocolTrustedProxies, options.TrustedNetworks),
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 

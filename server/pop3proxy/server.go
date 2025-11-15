@@ -63,6 +63,9 @@ type POP3ProxyServer struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
 	activeSessions   map[*POP3ProxySession]struct{}
+
+	// PROXY protocol support for incoming connections
+	proxyReader *server.ProxyProtocolReader
 }
 
 // maskingWriter wraps an io.Writer to mask sensitive information in POP3 commands
@@ -139,6 +142,10 @@ type POP3ProxyServerOptions struct {
 	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
+
+	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
+	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
 
 	// Connection limiting
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
@@ -237,6 +244,27 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		listenBacklog = 1024 // Default backlog
 	}
 
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if options.ProxyProtocol {
+		// Build config from flat fields (matching backend format)
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        options.ProxyProtocolTimeout,
+			TrustedProxies: options.TrustedNetworks, // Proxies always use trusted_networks
+		}
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("POP3-PROXY", proxyConfig)
+		if err != nil {
+			if routingLookup != nil {
+				routingLookup.Close()
+			}
+			serverCancel()
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "proxy", options.Name)
+	}
+
 	server := &POP3ProxyServer{
 		name:                   options.Name,
 		hostname:               hostname,
@@ -265,6 +293,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debug:                  options.Debug,
 		debugWriter:            debugWriter,
 		activeSessions:         make(map[*POP3ProxySession]struct{}),
+		proxyReader:            proxyReader,
 	}
 
 	// Setup TLS: Three scenarios
@@ -391,6 +420,23 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			}
 		}
 
+		// Read PROXY protocol header if enabled
+		var proxyInfo *server.ProxyProtocolInfo
+		var wrappedConn net.Conn
+		if s.proxyReader != nil {
+			var err error
+			proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
+			if err != nil {
+				logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+				conn.Close()
+				if releaseConn != nil {
+					releaseConn()
+				}
+				continue // Try to accept the next connection
+			}
+			conn = wrappedConn // Use wrapped connection that has buffered reader
+		}
+
 		// Create a new context for this session that inherits from app context
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
@@ -400,9 +446,15 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			ctx:         sessionCtx,
 			cancel:      sessionCancel,
 			releaseConn: releaseConn, // Set cleanup function on session
+			proxyInfo:   proxyInfo,
 		}
 
-		session.RemoteIP = server.GetAddrString(conn.RemoteAddr())
+		// Use real client IP from PROXY protocol if available
+		if proxyInfo != nil && proxyInfo.SrcIP != "" {
+			session.RemoteIP = proxyInfo.SrcIP
+		} else {
+			session.RemoteIP = server.GetAddrString(conn.RemoteAddr())
+		}
 		if s.debug {
 			logger.Debug("POP3 proxy: New connection", "proxy", s.name, "remote", session.RemoteIP)
 		}

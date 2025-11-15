@@ -40,8 +40,9 @@ type Session struct {
 	routingInfo        *proxy.UserRoutingInfo
 	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
-	sessionID          string // Proxy session ID for end-to-end tracing
-	clientAddr         string // Cached client address to avoid touching closed connection
+	sessionID          string                    // Proxy session ID for end-to-end tracing
+	clientAddr         string                    // Cached client address to avoid touching closed connection
+	proxyInfo          *server.ProxyProtocolInfo // PROXY protocol info (real client IP/port)
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -53,12 +54,32 @@ type Session struct {
 // newSession creates a new IMAP proxy session.
 func newSession(s *Server, conn net.Conn) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
+
+	// Read PROXY protocol header if enabled
+	var proxyInfo *server.ProxyProtocolInfo
+	var wrappedConn net.Conn
+	if s.proxyReader != nil {
+		var err error
+		proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
+		if err != nil {
+			logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+			sessionCancel()
+			conn.Close()
+			return nil
+		}
+		conn = wrappedConn // Use wrapped connection that has buffered reader
+	}
+
+	// Determine real client address (from PROXY header or direct connection)
+	clientAddr := server.GetRealClientIP(conn, proxyInfo)
+
 	return &Session{
 		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
-		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
+		clientAddr:   clientAddr,
+		proxyInfo:    proxyInfo,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		errorCount:   0,
@@ -823,7 +844,15 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// Use real client IP from PROXY protocol if available
+	var clientHost string
+	var clientPort int
+	if s.proxyInfo != nil && s.proxyInfo.SrcIP != "" {
+		clientHost = s.proxyInfo.SrcIP
+		clientPort = s.proxyInfo.SrcPort
+	} else {
+		clientHost, clientPort = server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	}
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

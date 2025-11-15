@@ -15,9 +15,9 @@ import (
 // with forwarding parameters containing the real client information
 func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Writer, reader *bufio.Reader) error {
 	// Create forwarding parameters using the helper function.
-	// The session does not have proxyInfo, so we pass nil.
-	// NewForwardingParams will extract IPs from the connection itself.
-	forwardingParams := server.NewForwardingParams(s.clientConn, nil)
+	// Pass proxyInfo if available from PROXY protocol header.
+	// NewForwardingParams will extract real client IP from PROXY protocol or connection.
+	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
 	// Add session-specific details not handled by NewForwardingParams
 	forwardingParams.SessionID = s.generateSessionID()

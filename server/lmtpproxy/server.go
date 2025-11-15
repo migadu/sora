@@ -62,6 +62,9 @@ type Server struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
 	activeSessions   map[*Session]struct{}
+
+	// PROXY protocol support for incoming connections
+	proxyReader *server.ProxyProtocolReader
 }
 
 // ServerOptions holds options for creating a new LMTP proxy server.
@@ -93,6 +96,10 @@ type ServerOptions struct {
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
 	ListenBacklog  int // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+
+	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
+	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
 
 	// Debug logging
 	Debug bool // Enable debug logging
@@ -193,6 +200,27 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		listenBacklog = 1024 // Default backlog
 	}
 
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if opts.ProxyProtocol {
+		// Build config from flat fields (matching backend format)
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        opts.ProxyProtocolTimeout,
+			TrustedProxies: opts.TrustedProxies, // Proxies use trusted_proxies for PROXY protocol validation
+		}
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("LMTP-PROXY", proxyConfig)
+		if err != nil {
+			if routingLookup != nil {
+				routingLookup.Close()
+			}
+			cancel()
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "proxy", opts.Name)
+	}
+
 	s := &Server{
 		rdb:                rdb,
 		name:               opts.Name,
@@ -220,6 +248,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debug:              opts.Debug,
 		debugWriter:        debugWriter,
 		activeSessions:     make(map[*Session]struct{}),
+		proxyReader:        proxyReader,
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
@@ -409,6 +438,23 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
+		// Read PROXY protocol header if enabled
+		var proxyInfo *server.ProxyProtocolInfo
+		var wrappedConn net.Conn
+		if s.proxyReader != nil {
+			var err error
+			proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
+			if err != nil {
+				logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+				conn.Close()
+				if releaseConn != nil {
+					releaseConn()
+				}
+				continue // Try to accept the next connection
+			}
+			conn = wrappedConn // Use wrapped connection that has buffered reader
+		}
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -417,7 +463,7 @@ func (s *Server) acceptConnections() error {
 			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy").Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Inc()
 
-			session := newSession(s, conn)
+			session := newSession(s, conn, proxyInfo)
 
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {

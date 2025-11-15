@@ -52,6 +52,9 @@ type Server struct {
 
 	// Shared HTTP transport (prevents connection pool leaks)
 	transport *http.Transport
+
+	// PROXY protocol support for incoming connections
+	proxyReader *server.ProxyProtocolReader
 }
 
 // ServerOptions holds configuration options for the User API proxy server
@@ -76,6 +79,10 @@ type ServerOptions struct {
 	PreLookup           *config.PreLookupConfig // PreLookup configuration for user routing
 	AffinityManager     *server.AffinityManager // Affinity manager for sticky routing (optional)
 	ClusterManager      *cluster.Manager        // Optional: enables cluster-wide per-IP limiting
+
+	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
+	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
 }
 
 // New creates a new User API proxy server
@@ -163,6 +170,30 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if opts.ProxyProtocol {
+		// Build config from flat fields (matching backend format)
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        opts.ProxyProtocolTimeout,
+			TrustedProxies: opts.TrustedNetworks, // Proxies always use trusted_networks
+		}
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("USER-API-PROXY", proxyConfig)
+		if err != nil {
+			if routingLookup != nil {
+				// Close prelookup client on error
+				if closer, ok := routingLookup.(interface{ Close() error }); ok {
+					closer.Close()
+				}
+			}
+			cancel()
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "proxy", opts.Name)
+	}
+
 	return &Server{
 		name:            opts.Name,
 		addr:            opts.Addr,
@@ -179,6 +210,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		trustedProxies:  opts.TrustedProxies,
 		limiter:         limiter,
 		transport:       transport,
+		proxyReader:     proxyReader,
 		ctx:             ctx,
 		cancel:          cancel,
 	}, nil
@@ -186,7 +218,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 // Start starts the User API proxy server
 func (s *Server) Start() error {
-	// Setup HTTP handler
+	// Setup HTTP handler (with PROXY protocol support if enabled)
 	handler := s.setupHandler()
 
 	// Create HTTP server
@@ -198,6 +230,9 @@ func (s *Server) Start() error {
 		IdleTimeout:  120 * time.Second,
 		ConnState:    s.connStateHandler,
 	}
+
+	// Note: PROXY protocol is handled by wrapping the listener in Start(),
+	// not via ConnContext, because we need to replace the connection before HTTP server sees it
 
 	// Configure TLS
 	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
@@ -252,13 +287,25 @@ func (s *Server) Start() error {
 	}
 	logger.Info("User API Proxy: Starting server", "name", s.name, "protocol", protocol, "addr", s.addr)
 
-	if s.tls {
-		if s.tlsCertFile != "" && s.tlsKeyFile != "" {
-			return s.httpServer.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
-		}
-		return s.httpServer.ListenAndServeTLS("", "")
+	// Create listener
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
 	}
-	return s.httpServer.ListenAndServe()
+
+	// Wrap listener with PROXY protocol support if enabled
+	if s.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: s.proxyReader,
+		}
+	}
+
+	// Start serving
+	if s.tls {
+		return s.httpServer.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+	}
+	return s.httpServer.Serve(listener)
 }
 
 // setupHandler creates the HTTP handler with reverse proxy logic
@@ -381,6 +428,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
 	r.Host = target.Host
 
+	// Get real client IP (from PROXY protocol or RemoteAddr)
+	realClientIP := s.getRealClientIP(r)
+
+	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers
+	// Backend should trust these headers from trusted proxy networks
+	r.Header.Set("X-Real-IP", realClientIP)
+	r.Header.Set("X-Forwarded-For", realClientIP)
+
 	// Add headers for backend to identify the authenticated user (if authenticated)
 	// Backend should trust these headers from trusted proxy networks
 	if userEmail != nil {
@@ -442,6 +497,50 @@ func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	return claims, nil
 }
 
+// handleProxyProtocol wraps connections with PROXY protocol support for HTTP
+// This is called via http.Server.ConnContext to read PROXY protocol headers
+func (s *Server) handleProxyProtocol(ctx context.Context, conn net.Conn) context.Context {
+	if s.proxyReader == nil {
+		return ctx
+	}
+
+	// Read PROXY protocol header
+	proxyInfo, wrappedConn, err := s.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+		// Close connection on error
+		conn.Close()
+		return ctx
+	}
+
+	// Store proxy info in context for later use in handlers
+	if proxyInfo != nil {
+		ctx = context.WithValue(ctx, "proxyInfo", proxyInfo)
+		// Also replace the connection with wrapped version
+		ctx = context.WithValue(ctx, "wrappedConn", wrappedConn)
+	}
+
+	return ctx
+}
+
+// getRealClientIP extracts the real client IP from request context (PROXY protocol) or request
+func (s *Server) getRealClientIP(r *http.Request) string {
+	// First check if we have PROXY protocol info in context
+	if proxyInfo, ok := r.Context().Value("proxyInfo").(*server.ProxyProtocolInfo); ok && proxyInfo != nil {
+		if proxyInfo.SrcIP != "" {
+			return proxyInfo.SrcIP
+		}
+	}
+
+	// Fall back to RemoteAddr (r.RemoteAddr is already a string)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If splitting fails, return as-is
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // connStateHandler handles connection state changes for tracking
 func (s *Server) connStateHandler(conn net.Conn, state http.ConnState) {
 	switch state {
@@ -485,4 +584,56 @@ func (s *Server) Stop() error {
 	}
 
 	return nil
+}
+
+// proxyProtocolListener wraps a net.Listener to read PROXY protocol headers
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *server.ProxyProtocolReader
+}
+
+// Accept wraps the underlying Accept to read PROXY protocol headers
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read PROXY protocol header (this validates the connection is from trusted proxy)
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		// Log with original connection's remote address (the proxy's IP)
+		logger.Error("PROXY protocol error", "proxy", "userapi_proxy", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+		conn.Close()
+		return nil, err
+	}
+
+	// Only wrap if we got proxy info - this preserves the real client IP in RemoteAddr()
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
+
+	// No proxy info, return wrapped connection as-is
+	return wrappedConn, nil
+}
+
+// proxyProtocolConn wraps a net.Conn to carry PROXY protocol info
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+// RemoteAddr returns the real client address from PROXY protocol if available
+func (c *proxyProtocolConn) RemoteAddr() net.Addr {
+	if c.proxyInfo != nil && c.proxyInfo.SrcIP != "" {
+		// Return a custom address with the real client IP
+		return &net.TCPAddr{
+			IP:   net.ParseIP(c.proxyInfo.SrcIP),
+			Port: c.proxyInfo.SrcPort,
+		}
+	}
+	return c.Conn.RemoteAddr()
 }

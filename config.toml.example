@@ -735,6 +735,10 @@ tls_verify = false                        # Verify client certificates (mutual T
 # Enable if this server is behind a load balancer or reverse proxy
 proxy_protocol = false            # Enable PROXY protocol support (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
+# proxy_protocol_trusted_proxies = []  # CIDR blocks allowed to send PROXY headers (defaults to trusted_networks if empty)
+                                  # Use this to specify which IPs can send PROXY protocol headers
+                                  # If not set, falls back to [servers] trusted_networks setting
+                                  # Example: ["10.0.0.0/8", "192.168.1.0/24"]
 
 # --- GLOBAL CAPABILITY CONFIGURATION ---
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
@@ -893,6 +897,7 @@ tls_verify = false
 # tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
@@ -920,6 +925,7 @@ tls_verify = false
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -971,6 +977,7 @@ tls_key_file = "/path/to/your/managesieve.key"
 tls_verify = true
 proxy_protocol = false        # Enable PROXY protocol support for ManageSieve
 proxy_protocol_timeout = "5s"
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1009,8 +1016,45 @@ tls_verify = true
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
+
+# --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
+# Enable PROXY protocol v2 support for incoming connections from HAProxy, nginx, or other load balancers.
+# This preserves the real client IP when a load balancer is placed in front of the Sora proxy.
+#
+# FLOW WITH HAPROXY:
+#   Client (203.0.113.42) → HAProxy → Sora Proxy (reads PROXY header) → Backend (sees 203.0.113.42)
+#
+# Without this setting:
+#   Client (203.0.113.42) → HAProxy (10.0.0.5) → Sora Proxy → Backend (sees 10.0.0.5) ❌
+#
+# With proxy_protocol enabled:
+#   Client (203.0.113.42) → HAProxy → Sora Proxy → Backend (sees 203.0.113.42) ✅
+#
+# REQUIREMENTS:
+# - HAProxy/nginx must send PROXY protocol v2 headers (send-proxy-v2 in HAProxy)
+# - Connections must originate from trusted_networks (security requirement)
+# - Both proxy_protocol (incoming) and remote_use_proxy_protocol (outgoing) should be enabled
+#
+# HAPROXY CONFIGURATION EXAMPLE:
+#   backend sora_proxy
+#       mode tcp
+#       server proxy1 10.0.0.10:1143 send-proxy-v2
+#
+# SECURITY:
+# - PROXY headers are ONLY accepted from IPs in trusted_networks
+# - When enabled, PROXY protocol is REQUIRED (not optional)
+# - Invalid PROXY headers immediately terminate the connection
+# - 5-second timeout prevents DoS attacks
+#
+# NOTE: This is different from remote_use_proxy_protocol:
+# - proxy_protocol = INCOMING connections (from HAProxy → Sora Proxy)
+# - remote_use_proxy_protocol = OUTGOING connections (from Sora Proxy → Backend)
+#
+proxy_protocol = false                # Enable PROXY protocol support for incoming connections (HAProxy, nginx, etc.)
+proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -1386,8 +1430,14 @@ tls_verify = true
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+
+# --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
+# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
+proxy_protocol = false                # Enable PROXY protocol support for incoming connections
+proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -1434,7 +1484,13 @@ tls_verify = true
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
+
+# --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
+# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
+proxy_protocol = false                # Enable PROXY protocol support for incoming connections
+proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -1491,8 +1547,14 @@ tls_verify = true
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
+remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+
+# --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
+# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
+proxy_protocol = false                # Enable PROXY protocol support for incoming connections
+proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -1538,6 +1600,7 @@ tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connectio
 tls_verify = false
 proxy_protocol = false        # Enable PROXY protocol support for HTTP API
 proxy_protocol_timeout = "5s"
+# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section

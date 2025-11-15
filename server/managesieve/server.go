@@ -20,6 +20,14 @@ import (
 	"github.com/migadu/sora/server/idgen"
 )
 
+// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
+	if len(proxyProtocolTrusted) > 0 {
+		return proxyProtocolTrusted
+	}
+	return trustedNetworks
+}
+
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
 type ManageSieveServer struct {
@@ -71,34 +79,35 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
-	InsecureAuth               bool
-	Debug                      bool
-	TLS                        bool
-	TLSCertFile                string
-	TLSKeyFile                 string
-	TLSVerify                  bool
-	TLSUseStartTLS             bool
-	TLSConfig                  *tls.Config // Global TLS config from TLS manager (optional)
-	MaxScriptSize              int64
-	SupportedExtensions        []string // List of supported Sieve extensions
-	MasterUsername             string
-	MasterPassword             string
-	MasterSASLUsername         string
-	MasterSASLPassword         string
-	MaxConnections             int
-	MaxConnectionsPerIP        int
-	MaxConnectionsPerUser      int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
-	MaxConnectionsPerUserPerIP int      // Maximum connections per user per IP (0=unlimited)
-	ListenBacklog              int      // TCP listen backlog size (0 = use default 1024)
-	ProxyProtocol              bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout       string   // Timeout for reading PROXY headers
-	TrustedNetworks            []string // Global trusted networks for parameter forwarding
-	AuthRateLimit              serverPkg.AuthRateLimiterConfig
-	AuthIdleTimeout            time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout             time.Duration  // Maximum idle time before disconnection
-	AbsoluteSessionTimeout     time.Duration  // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute          int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
-	Config                     *config.Config // Full config for shared settings like connection tracking timeouts
+	InsecureAuth                bool
+	Debug                       bool
+	TLS                         bool
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	TLSVerify                   bool
+	TLSUseStartTLS              bool
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
+	MaxScriptSize               int64
+	SupportedExtensions         []string // List of supported Sieve extensions
+	MasterUsername              string
+	MasterPassword              string
+	MasterSASLUsername          string
+	MasterSASLPassword          string
+	MaxConnections              int
+	MaxConnectionsPerIP         int
+	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
+	MaxConnectionsPerUserPerIP  int      // Maximum connections per user per IP (0=unlimited)
+	ListenBacklog               int      // TCP listen backlog size (0 = use default 1024)
+	ProxyProtocol               bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout        string   // Timeout for reading PROXY headers
+	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
+	TrustedNetworks             []string // Global trusted networks for parameter forwarding
+	AuthRateLimit               serverPkg.AuthRateLimiterConfig
+	AuthIdleTimeout             time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	CommandTimeout              time.Duration  // Maximum idle time before disconnection
+	AbsoluteSessionTimeout      time.Duration  // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute           int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	Config                      *config.Config // Full config for shared settings like connection tracking timeouts
 }
 
 func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -111,7 +120,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		proxyConfig := serverPkg.ProxyProtocolConfig{
 			Enabled:        true,
 			Mode:           "required",
-			TrustedProxies: options.TrustedNetworks,
+			TrustedProxies: getProxyProtocolTrustedProxies(options.ProxyProtocolTrustedProxies, options.TrustedNetworks),
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 

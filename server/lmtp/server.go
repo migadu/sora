@@ -110,6 +110,14 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
+	if len(proxyProtocolTrusted) > 0 {
+		return proxyProtocolTrusted
+	}
+	return trustedNetworks
+}
+
 // connectionLimitingListener wraps a net.Listener to enforce connection limits at the TCP level
 type connectionLimitingListener struct {
 	net.Listener
@@ -215,23 +223,24 @@ type RelayWorkerNotifier interface {
 }
 
 type LMTPServerOptions struct {
-	RelayQueue           delivery.RelayQueue // Global relay queue for Sieve redirect/vacation
-	RelayWorker          RelayWorkerNotifier // Optional: notifies worker for immediate processing
-	Debug                bool
-	TLS                  bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	TLSVerify            bool
-	TLSUseStartTLS       bool
-	TLSConfig            *tls.Config // Global TLS config from TLS manager (optional)
-	MaxConnections       int
-	MaxConnectionsPerIP  int
-	ListenBacklog        int      // TCP listen backlog size (0 = use default 1024)
-	ProxyProtocol        bool     // Enable PROXY protocol support (always required when enabled)
-	ProxyProtocolTimeout string   // Timeout for reading PROXY headers
-	TrustedNetworks      []string // Global trusted networks for parameter forwarding
-	FTSRetention         time.Duration
-	MaxMessageSize       int64 // Maximum size for incoming messages in bytes
+	RelayQueue                  delivery.RelayQueue // Global relay queue for Sieve redirect/vacation
+	RelayWorker                 RelayWorkerNotifier // Optional: notifies worker for immediate processing
+	Debug                       bool
+	TLS                         bool
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	TLSVerify                   bool
+	TLSUseStartTLS              bool
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
+	MaxConnections              int
+	MaxConnectionsPerIP         int
+	ListenBacklog               int      // TCP listen backlog size (0 = use default 1024)
+	ProxyProtocol               bool     // Enable PROXY protocol support (always required when enabled)
+	ProxyProtocolTimeout        string   // Timeout for reading PROXY headers
+	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
+	TrustedNetworks             []string // Global trusted networks for parameter forwarding
+	FTSRetention                time.Duration
+	MaxMessageSize              int64 // Maximum size for incoming messages in bytes
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -242,7 +251,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		proxyConfig := server.ProxyProtocolConfig{
 			Enabled:        true,
 			Mode:           "required",
-			TrustedProxies: options.TrustedNetworks,
+			TrustedProxies: getProxyProtocolTrustedProxies(options.ProxyProtocolTrustedProxies, options.TrustedNetworks),
 			Timeout:        options.ProxyProtocolTimeout,
 		}
 

@@ -26,6 +26,14 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
+	if len(proxyProtocolTrusted) > 0 {
+		return proxyProtocolTrusted
+	}
+	return trustedNetworks
+}
+
 // Server represents the HTTP API server
 type Server struct {
 	name               string
@@ -48,6 +56,7 @@ type Server struct {
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
 	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
+	proxyReader        *server.ProxyProtocolReader          // PROXY protocol support
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -70,6 +79,12 @@ type ServerOptions struct {
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
 	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
+
+	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
+	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout        string   // Timeout for reading PROXY protocol headers (e.g., "5s")
+	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
+	TrustedNetworks             []string // CIDR blocks for trusted networks (for PROXY protocol validation)
 }
 
 // AffinityManager interface for managing user-to-backend affinity
@@ -95,6 +110,22 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		}
 	}
 
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if options.ProxyProtocol {
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        options.ProxyProtocolTimeout,
+			TrustedProxies: getProxyProtocolTrustedProxies(options.ProxyProtocolTrustedProxies, options.TrustedNetworks),
+		}
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("ADMIN-API", proxyConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "server", options.Name)
+	}
+
 	s := &Server{
 		name:               options.Name,
 		addr:               options.Addr,
@@ -115,6 +146,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,
 		connectionTrackers: options.ConnectionTrackers,
+		proxyReader:        proxyReader,
 	}
 
 	return s, nil
@@ -162,6 +194,20 @@ func (s *Server) start(ctx context.Context) error {
 		}
 	}()
 
+	// Create listener
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
+	}
+
+	// Wrap listener with PROXY protocol support if enabled
+	if s.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: s.proxyReader,
+		}
+	}
+
 	// Start server with or without TLS
 	if s.tls {
 		// Use TLS config from manager if provided, otherwise create one for static certs
@@ -184,15 +230,10 @@ func (s *Server) start(ctx context.Context) error {
 		}
 		s.server.TLSConfig = tlsConfig
 
-		// If using TLS manager (tlsConfig from manager), pass empty cert files
-		// The GetCertificate callback in the config will handle certificate retrieval
-		if s.tlsConfig != nil {
-			return s.server.ListenAndServeTLS("", "")
-		}
-		// Otherwise use static certificate files
-		return s.server.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
+		// Serve with TLS using the listener
+		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
 	}
-	return s.server.ListenAndServe()
+	return s.server.Serve(listener)
 }
 
 // setupRoutes configures all HTTP routes and middleware
@@ -1653,4 +1694,56 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	})
+}
+
+// proxyProtocolListener wraps a net.Listener to read PROXY protocol headers
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *server.ProxyProtocolReader
+}
+
+// Accept wraps the underlying Accept to read PROXY protocol headers
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read PROXY protocol header (this validates the connection is from trusted proxy)
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		// Log with original connection's remote address (the proxy's IP)
+		logger.Error("PROXY protocol error", "server", "admin_api", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+		conn.Close()
+		return nil, err
+	}
+
+	// Only wrap if we got proxy info - this preserves the real client IP in RemoteAddr()
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
+
+	// No proxy info, return wrapped connection as-is
+	return wrappedConn, nil
+}
+
+// proxyProtocolConn wraps a net.Conn to carry PROXY protocol info
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+// RemoteAddr returns the real client address from PROXY protocol if available
+func (c *proxyProtocolConn) RemoteAddr() net.Addr {
+	if c.proxyInfo != nil && c.proxyInfo.SrcIP != "" {
+		// Return a custom address with the real client IP
+		return &net.TCPAddr{
+			IP:   net.ParseIP(c.proxyInfo.SrcIP),
+			Port: c.proxyInfo.SrcPort,
+		}
+	}
+	return c.Conn.RemoteAddr()
 }

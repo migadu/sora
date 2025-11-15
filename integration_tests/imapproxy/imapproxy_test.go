@@ -191,7 +191,10 @@ func setupIMAPProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},
-		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
+		TrustedProxies:  []string{"127.0.0.0/8", "::1/128"},
+		TrustedNetworks: []string{"127.0.0.0/8", "::1/128"},
+		// PROXY protocol disabled for incoming connections in this test
+		// (test clients don't send PROXY headers)
 	}
 
 	proxy, err := imapproxy.New(context.Background(), rdb, hostname, opts)

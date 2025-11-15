@@ -41,20 +41,29 @@ type Session struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	startTime          time.Time
+	proxyInfo          *server.ProxyProtocolInfo
 }
 
 // newSession creates a new LMTP proxy session.
-func newSession(s *Server, conn net.Conn) *Session {
+func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
+
+	// Determine client address (use PROXY protocol info if available)
+	clientAddr := server.GetAddrString(conn.RemoteAddr())
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		clientAddr = proxyInfo.SrcIP
+	}
+
 	return &Session{
 		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
-		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
+		clientAddr:   clientAddr, // Use real client IP from PROXY protocol or connection
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		startTime:    time.Now(),
+		proxyInfo:    proxyInfo,
 	}
 }
 

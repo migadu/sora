@@ -48,24 +48,33 @@ type Session struct {
 	errorCount         int
 	startTime          time.Time
 	releaseConn        func() // Connection limiter cleanup function
+	proxyInfo          *server.ProxyProtocolInfo
 }
 
 // newSession creates a new ManageSieve proxy session.
-func newSession(s *Server, conn net.Conn) *Session {
+func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 	// Check if connection is already TLS (implicit TLS)
 	_, isTLS := conn.(*tls.Conn)
+
+	// Determine client address (use PROXY protocol info if available)
+	clientAddr := server.GetAddrString(conn.RemoteAddr())
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		clientAddr = proxyInfo.SrcIP
+	}
+
 	return &Session{
 		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
-		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
+		clientAddr:   clientAddr, // Use real client IP from PROXY protocol or connection
 		isTLS:        isTLS,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		errorCount:   0,
 		startTime:    time.Now(),
+		proxyInfo:    proxyInfo,
 	}
 }
 

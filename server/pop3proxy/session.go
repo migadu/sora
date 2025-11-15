@@ -43,6 +43,7 @@ type POP3ProxySession struct {
 	errorCount         int
 	startTime          time.Time
 	releaseConn        func() // Connection limiter cleanup function
+	proxyInfo          *server.ProxyProtocolInfo
 }
 
 func (s *POP3ProxySession) handleConnection() {
