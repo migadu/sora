@@ -1013,27 +1013,27 @@ func (s *Session) startProxy() {
 			panic(r)
 		}
 	}()
-	logger.Info("startProxy() called", "proxy", s.server.name, "username", s.username)
+	logger.Debug("startProxy() called", "proxy", s.server.name, "username", s.username)
 	if s.backendConn == nil {
 		logger.Error("Backend connection not established", "proxy", s.server.name, "user", s.username)
 		return
 	}
 
 	var wg sync.WaitGroup
-	logger.Info("Created waitgroup", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Created waitgroup", "proxy", s.server.name, "username", s.username)
 
 	// Start activity updater
 	activityCtx, activityCancel := context.WithCancel(s.ctx)
 	defer activityCancel()
-	logger.Info("Starting activity updater", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Starting activity updater", "proxy", s.server.name, "username", s.username)
 	go s.updateActivityPeriodically(activityCtx)
 
 	// Client to backend
-	logger.Info("Starting client-to-backend copy goroutine", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Starting client-to-backend copy goroutine", "proxy", s.server.name, "username", s.username)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer logger.Info("Client-to-backend copy goroutine exiting", "proxy", s.server.name, "username", s.username)
+		defer logger.Debug("Client-to-backend copy goroutine exiting", "proxy", s.server.name, "username", s.username)
 		// If this copy returns, it means the client has closed the connection or there was an error.
 		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
@@ -1046,11 +1046,11 @@ func (s *Session) startProxy() {
 	}()
 
 	// Backend to client
-	logger.Info("Starting backend-to-client copy goroutine", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Starting backend-to-client copy goroutine", "proxy", s.server.name, "username", s.username)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer logger.Info("Backend-to-client copy goroutine exiting", "proxy", s.server.name, "username", s.username)
+		defer logger.Debug("Backend-to-client copy goroutine exiting", "proxy", s.server.name, "username", s.username)
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
@@ -1080,19 +1080,19 @@ func (s *Session) startProxy() {
 	//   - this goroutine waits for ctx.Done()
 	//   - ctx.Done() fires when handleConnection() returns
 	//   - handleConnection() can't return because it's blocked in wg.Wait()
-	logger.Info("Starting context cancellation handler goroutine", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Starting context cancellation handler goroutine", "proxy", s.server.name, "username", s.username)
 	go func() {
-		defer logger.Info("Context cancellation handler goroutine exiting", "proxy", s.server.name, "username", s.username)
-		logger.Info("Context cancellation handler waiting for ctx.Done()", "proxy", s.server.name, "username", s.username)
+		defer logger.Debug("Context cancellation handler goroutine exiting", "proxy", s.server.name, "username", s.username)
+		logger.Debug("Context cancellation handler waiting for ctx.Done()", "proxy", s.server.name, "username", s.username)
 		<-s.ctx.Done()
-		logger.Info("Context cancelled - closing connections", "proxy", s.server.name, "username", s.username)
+		logger.Debug("Context cancelled - closing connections", "proxy", s.server.name, "username", s.username)
 		s.clientConn.Close()
 		s.backendConn.Close()
 	}()
 
-	logger.Info("Waiting for copy goroutines to finish", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Waiting for copy goroutines to finish", "proxy", s.server.name, "username", s.username)
 	wg.Wait()
-	logger.Info("Copy goroutines finished - startProxy() returning", "proxy", s.server.name, "username", s.username)
+	logger.Debug("Copy goroutines finished - startProxy() returning", "proxy", s.server.name, "username", s.username)
 }
 
 // close closes all connections.
