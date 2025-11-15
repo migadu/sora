@@ -57,12 +57,3 @@ func getStatusColor(status interface{}) string {
 		return "\033[0m" // reset
 	}
 }
-
-// showComponentHistory shows historical status for a component
-// Returns nil to match expected signature
-func showComponentHistory(ctx interface{}, rdb interface{}, hostname, component string, since time.Time) error {
-	// This function needs to be implemented based on requirements
-	fmt.Printf("Component history for %s/%s since %s\n", hostname, component, since)
-	fmt.Println("(History feature not yet implemented)")
-	return nil
-}

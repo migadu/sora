@@ -38,7 +38,7 @@ type Server struct {
 	tlsVerify              bool
 	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
 	connManager            *proxy.ConnectionManager
-	connTracker            *proxy.ConnectionTracker
+	connTracker            *server.ConnectionTracker
 	wg                     sync.WaitGroup
 	ctx                    context.Context
 	cancel                 context.CancelFunc
@@ -144,7 +144,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize prelookup client if configured
-	routingLookup, err := proxy.InitializePrelookup(opts.PreLookup)
+	routingLookup, err := proxy.InitializePrelookup("managesieve", opts.PreLookup)
 	if err != nil {
 		logger.Debug("ManageSieve Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
 		if opts.PreLookup != nil && !opts.PreLookup.FallbackDefault {
@@ -369,6 +369,9 @@ func (s *Server) Start() error {
 		s.limiter.StartCleanup(s.ctx)
 	}
 
+	// Start session monitoring routine
+	go s.monitorActiveSessions()
+
 	return s.acceptConnections()
 }
 
@@ -421,13 +424,16 @@ func (s *Server) acceptConnections() error {
 
 			session := newSession(s, conn)
 			s.addSession(session)
+			// Ensure session is always removed from map, even if handleConnection panics
+			// or never completes. This prevents memory leaks in the activeSessions map.
+			defer s.removeSession(session)
 			session.handleConnection()
 		}()
 	}
 }
 
 // SetConnectionTracker sets the connection tracker for the server.
-func (s *Server) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
+func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
@@ -546,4 +552,25 @@ func (s *Server) sendGracefulShutdownBye() {
 	}
 
 	logger.Debug("ManageSieve Proxy: Proceeding with connection cleanup", "name", s.name)
+}
+
+// monitorActiveSessions periodically logs active session count for monitoring
+func (s *Server) monitorActiveSessions() {
+	// Log every 5 minutes (similar to connection tracker cleanup interval)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.activeSessionsMu.RLock()
+			count := len(s.activeSessions)
+			s.activeSessionsMu.RUnlock()
+
+			logger.Info("ManageSieve proxy active sessions", "proxy", s.name, "active_sessions", count)
+
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }

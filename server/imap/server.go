@@ -27,7 +27,6 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -216,7 +215,7 @@ type IMAPServer struct {
 	authenticatedConnections atomic.Int64
 
 	// Connection tracking
-	connTracker *proxy.ConnectionTracker
+	connTracker *serverPkg.ConnectionTracker
 
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
@@ -574,6 +573,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Start connection limiter cleanup
 	s.limiter.StartCleanup(appCtx)
 
+	// Start active connections monitoring
+	go s.monitorActiveConnections()
+
 	// Initialize command timeout metrics
 	if s.commandTimeout > 0 {
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
@@ -586,7 +588,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		instanceID := fmt.Sprintf("imap-%s-%d", name, time.Now().UnixNano())
 
 		// Create ConnectionTracker with nil cluster manager (local mode only)
-		s.connTracker = proxy.NewConnectionTracker(
+		s.connTracker = serverPkg.NewConnectionTracker(
 			"IMAP",                             // protocol name
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
@@ -872,7 +874,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 }
 
 // SetConnTracker sets the connection tracker for this server
-func (s *IMAPServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
@@ -1213,4 +1215,24 @@ func (s *IMAPServer) clientMatches(clientName, clientVersion, tlsFingerprint str
 
 	// If we reach here, no filter criteria were specified (shouldn't happen due to validation)
 	return false
+}
+
+// monitorActiveConnections periodically logs active connection count for monitoring
+func (s *IMAPServer) monitorActiveConnections() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.activeConnsMutex.RLock()
+			count := len(s.activeConns)
+			s.activeConnsMutex.RUnlock()
+
+			logger.Info("IMAP server active connections", "name", s.name, "active_connections", count)
+
+		case <-s.appCtx.Done():
+			return
+		}
+	}
 }

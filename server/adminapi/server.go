@@ -20,8 +20,8 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -47,7 +47,7 @@ type Server struct {
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
-	connectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker
+	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -68,8 +68,8 @@ type ServerOptions struct {
 	Hostname           string
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
-	ValidBackends      map[string][]string                 // Map of protocol -> valid backend addresses
-	ConnectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker (for gossip-based kick)
+	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
+	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
 }
 
 // AffinityManager interface for managing user-to-backend affinity

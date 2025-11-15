@@ -13,14 +13,14 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
 // SetupIMAPServerWithConnectionTracking creates an IMAP server with local connection tracking enabled
-func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser int) (*common.TestServer, common.TestAccount, *proxy.ConnectionTracker) {
+func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser int) (*common.TestServer, common.TestAccount, *serverPkg.ConnectionTracker) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -83,7 +83,7 @@ func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser i
 	}
 
 	// Create and set connection tracker in local mode (no cluster manager)
-	tracker := proxy.NewConnectionTracker("IMAP", "test-backend-instance", nil, maxConnectionsPerUser, 0, 0)
+	tracker := serverPkg.NewConnectionTracker("IMAP", "test-backend-instance", nil, maxConnectionsPerUser, 0, 0)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}

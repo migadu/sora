@@ -597,7 +597,8 @@ func (s *LMTPSession) Logout() error {
 
 	metrics.ConnectionDuration.WithLabelValues("lmtp").Observe(time.Since(s.startTime).Seconds())
 
-	totalCount := s.backend.totalConnections.Add(-1)
+	// Decrement active connections (not total - total is cumulative)
+	activeCount := s.backend.activeConnections.Add(-1)
 
 	// Prometheus metrics - connection closed
 	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Dec()
@@ -606,7 +607,7 @@ func (s *LMTPSession) Logout() error {
 		s.cancel()
 	}
 
-	s.InfoLog("session logout completed (connections: total=%d)", totalCount)
+	s.InfoLog("session logout completed (connections: active=%d)", activeCount)
 
 	return &smtp.SMTPError{
 		Code:         221,

@@ -1,4 +1,4 @@
-package proxy
+package server
 
 import (
 	"bytes"
@@ -300,6 +300,10 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	}
 	if count := info.LocalInstances[ct.instanceID]; count > 0 {
 		info.LocalInstances[ct.instanceID] = count - 1
+		// Clean up zero counts immediately (consistent with PerIPCount cleanup)
+		if info.LocalInstances[ct.instanceID] == 0 {
+			delete(info.LocalInstances, ct.instanceID)
+		}
 	}
 
 	// Decrement per-IP count (if tracking enabled)
@@ -523,20 +527,89 @@ func (ct *ConnectionTracker) UnregisterSession(accountID int64, ch <-chan struct
 	}
 }
 
-// queueEvent adds an event to the broadcast queue with bounded size
+// queueEvent adds an event to the broadcast queue with bounded size.
+// Prioritizes kick events - they are never dropped to ensure security.
 func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
 	ct.queueMu.Lock()
 	defer ct.queueMu.Unlock()
 
-	// If queue is full, drop oldest events (FIFO)
+	// If queue is full, drop oldest non-critical events
 	if len(ct.broadcastQueue) >= ct.maxEventQueueSize {
-		// Drop the oldest 10% of events to make room
+		// Try to drop non-kick events (Register/Unregister/StateSnapshot)
+		// Kick events are critical for security and must not be dropped
 		dropCount := ct.maxEventQueueSize / 10
-		logger.Warn("Gossip tracker: Event queue overflow - dropping oldest events", "name", ct.name, "current", len(ct.broadcastQueue), "max", ct.maxEventQueueSize, "dropping", dropCount)
-		ct.broadcastQueue = ct.broadcastQueue[dropCount:]
+		droppedEvents := ct.dropNonCriticalEvents(dropCount)
+
+		if droppedEvents > 0 {
+			logger.Warn("Gossip tracker: Event queue overflow - dropped non-critical events",
+				"name", ct.name, "current", len(ct.broadcastQueue),
+				"max", ct.maxEventQueueSize, "dropped", droppedEvents)
+		} else {
+			// Queue is full of critical events (kicks) - cannot drop
+			// This is a serious situation but we must preserve kick events
+			logger.Error("Gossip tracker: Event queue overflow with critical events - cannot drop",
+				"name", ct.name, "current", len(ct.broadcastQueue),
+				"max", ct.maxEventQueueSize, "event_type", event.Type,
+				"recommendation", "Increase maxEventQueueSize or investigate gossip performance")
+
+			// For kick events, we MUST queue them even if over limit (security critical)
+			// For other events when queue is all kicks, drop the new event
+			if event.Type != ConnectionEventKick {
+				logger.Warn("Gossip tracker: Dropping new non-critical event due to critical queue overflow",
+					"name", ct.name, "event_type", event.Type)
+				return // Don't queue this event
+			}
+			// Allow kick event to be queued even over limit
+		}
 	}
 
 	ct.broadcastQueue = append(ct.broadcastQueue, event)
+}
+
+// dropNonCriticalEvents removes up to maxDrop non-critical events from the queue.
+// Returns the number of events actually dropped.
+// Critical events (ConnectionEventKick) are never dropped.
+func (ct *ConnectionTracker) dropNonCriticalEvents(maxDrop int) int {
+	dropped := 0
+	writeIdx := 0
+
+	// Single pass: iterate through queue, keep kicks, drop others until maxDrop reached
+	for readIdx := 0; readIdx < len(ct.broadcastQueue); readIdx++ {
+		event := ct.broadcastQueue[readIdx]
+
+		// Always keep kick events (critical)
+		if event.Type == ConnectionEventKick {
+			if writeIdx != readIdx {
+				ct.broadcastQueue[writeIdx] = event
+			}
+			writeIdx++
+			continue
+		}
+
+		// For non-critical events: keep if we haven't dropped enough yet
+		if dropped < maxDrop {
+			// Drop this non-critical event
+			dropped++
+			switch event.Type {
+			case ConnectionEventRegister:
+				logger.Debug("Gossip tracker: Dropped register event", "name", ct.name, "user", event.Username)
+			case ConnectionEventUnregister:
+				logger.Debug("Gossip tracker: Dropped unregister event", "name", ct.name, "user", event.Username)
+			case ConnectionEventStateSnapshot:
+				logger.Debug("Gossip tracker: Dropped state snapshot", "name", ct.name)
+			}
+		} else {
+			// Keep this event (already dropped enough)
+			if writeIdx != readIdx {
+				ct.broadcastQueue[writeIdx] = event
+			}
+			writeIdx++
+		}
+	}
+
+	// Truncate queue to new size
+	ct.broadcastQueue = ct.broadcastQueue[:writeIdx]
+	return dropped
 }
 
 // GetBroadcasts returns events to broadcast (called by cluster manager)
@@ -677,6 +750,10 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 	}
 	if count := info.LocalInstances[event.InstanceID]; count > 0 {
 		info.LocalInstances[event.InstanceID] = count - 1
+		// Clean up zero counts immediately (consistent with PerIPCount cleanup)
+		if info.LocalInstances[event.InstanceID] == 0 {
+			delete(info.LocalInstances, event.InstanceID)
+		}
 	}
 
 	// Decrement per-IP count (cluster-wide tracking via gossip)
@@ -835,7 +912,7 @@ func (ct *ConnectionTracker) cleanup() {
 	// This helps monitor for memory leaks without flooding logs
 	ct.cleanupCounter++
 	if ct.cleanupCounter%10 == 0 {
-		logger.Info("Connection tracker: Memory usage stats", "protocol", ct.name,
+		logger.Info("Connection tracker stats", "protocol", ct.name,
 			"total_users", totalUsers,
 			"total_instance_ids", totalInstanceIDs,
 			"total_ips", totalIPs,

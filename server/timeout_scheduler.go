@@ -79,8 +79,7 @@ var globalScheduler = &TimeoutScheduler{}
 // the public Start method with a custom interval.
 var DefaultTimeoutSchedulerInterval = 100 * time.Millisecond
 
-// stopTimeoutScheduler stops the global scheduler and clears legacy shard state
-// so tests that depend on timeoutShards/timeoutShardCount see a clean state.
+// stopTimeoutScheduler stops the global scheduler.
 func stopTimeoutScheduler() {
 	_ = globalScheduler.Stop()
 }

@@ -813,8 +813,11 @@ func (s *POP3ProxySession) startProxying() {
 		}
 	}()
 
-	// This goroutine will unblock the io.Copy operations when the session context is cancelled.
+	// Context cancellation handler - ensures connections are closed when context is cancelled
+	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		<-s.ctx.Done()
 		s.clientConn.Close()
 		s.backendConn.Close()

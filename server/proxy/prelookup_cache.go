@@ -29,6 +29,7 @@ type prelookupCache struct {
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	cleanupStopped  chan struct{}
+	protocol        string // Protocol name for logging/metrics (imap, pop3, managesieve, lmtp, userapi)
 
 	// Metrics
 	hits   uint64
@@ -39,7 +40,7 @@ type prelookupCache struct {
 }
 
 // newPrelookupCache creates a new cache instance
-func newPrelookupCache(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration) *prelookupCache {
+func newPrelookupCache(protocol string, positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration) *prelookupCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
@@ -52,12 +53,13 @@ func newPrelookupCache(positiveTTL, negativeTTL time.Duration, maxSize int, clea
 		cleanupInterval: cleanupInterval,
 		stopCleanup:     make(chan struct{}),
 		cleanupStopped:  make(chan struct{}),
+		protocol:        protocol,
 	}
 
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	logger.Info("Prelookup cache initialized", "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval)
+	logger.Info("Prelookup cache initialized", "protocol", protocol, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval)
 
 	return cache
 }
@@ -252,12 +254,13 @@ func (c *prelookupCache) cleanup() {
 			hitRate = float64(hits) / float64(hits+misses) * 100
 		}
 
-		logger.Info("Prelookup cache: Memory usage stats",
+		logger.Info("Prelookup cache stats",
+			"protocol", c.protocol,
 			"total_entries", totalEntries,
 			"positive_entries", positiveEntries,
 			"negative_entries", negativeEntries,
 			"max_size", c.maxSize,
-			"hit_rate_pct", hitRate,
+			"hit_rate_pct", roundToTwoDecimals(hitRate),
 			"removed_this_cycle", removed)
 	}
 }
@@ -281,4 +284,9 @@ func (c *prelookupCache) GetStats() (hits, misses uint64, size int) {
 	defer c.mu.RUnlock()
 
 	return atomic.LoadUint64(&c.hits), atomic.LoadUint64(&c.misses), len(c.entries)
+}
+
+// roundToTwoDecimals rounds a float to 2 decimal places
+func roundToTwoDecimals(val float64) float64 {
+	return float64(int(val*100+0.5)) / 100
 }

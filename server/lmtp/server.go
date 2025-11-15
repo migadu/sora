@@ -189,7 +189,8 @@ type LMTPServerBackend struct {
 	relayWorker    RelayWorkerNotifier // Optional: notifies worker for immediate processing
 
 	// Connection counters
-	totalConnections atomic.Int64
+	totalConnections  atomic.Int64
+	activeConnections atomic.Int64
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -442,6 +443,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	// Increment connection counters (in LMTP all connections are considered authenticated)
 	b.totalConnections.Add(1)
+	b.activeConnections.Add(1)
 
 	// Prometheus metrics - connection established
 	metrics.ConnectionsTotal.WithLabelValues("lmtp").Inc()
@@ -496,9 +498,9 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", logFunc)
 
 	// Log connection with connection counters
-	totalCount := b.totalConnections.Load()
-	s.InfoLog("new session remote=%s id=%s (connections: total=%d)",
-		s.RemoteIP, s.Id, totalCount)
+	activeCount := b.activeConnections.Load()
+	s.InfoLog("new session remote=%s id=%s (connections: active=%d)",
+		s.RemoteIP, s.Id, activeCount)
 
 	return s, nil
 }
@@ -506,6 +508,9 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 func (b *LMTPServerBackend) Start(errChan chan error) {
 	var listener net.Listener
 	var err error
+
+	// Start active connections monitoring
+	go b.monitorActiveConnections()
 
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", b.server.Addr, b.listenBacklog)
@@ -561,9 +566,14 @@ func (b *LMTPServerBackend) Close() error {
 	return nil
 }
 
-// GetTotalConnections returns the current total connection count
+// GetTotalConnections returns the cumulative total of all connections ever made
 func (b *LMTPServerBackend) GetTotalConnections() int64 {
 	return b.totalConnections.Load()
+}
+
+// GetActiveConnections returns the current number of active connections
+func (b *LMTPServerBackend) GetActiveConnections() int64 {
+	return b.activeConnections.Load()
 }
 
 // GetAuthenticatedConnections returns the current authenticated connection count
@@ -621,4 +631,21 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
 	return c.proxyInfo
+}
+
+// monitorActiveConnections periodically logs active connection count for monitoring
+func (b *LMTPServerBackend) monitorActiveConnections() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			count := b.activeConnections.Load()
+			logger.Info("LMTP server active connections", "name", b.name, "active_connections", count)
+
+		case <-b.appCtx.Done():
+			return
+		}
+	}
 }

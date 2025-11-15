@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"net"
 
 	"github.com/migadu/sora/logger"
@@ -20,14 +19,19 @@ type ProxySessionLogger struct {
 // log is the common logging implementation for all log levels
 func (l *ProxySessionLogger) log(logFn logFunc, msg string, keysAndValues ...any) {
 	remoteAddr := GetAddrString(l.ClientConn.RemoteAddr())
-	user := "none"
-	if l.Username != "" && l.AccountID > 0 {
-		user = l.Username + "/" + fmt.Sprint(l.AccountID)
-	} else if l.Username != "" {
-		user = l.Username
+
+	allKeyvals := []any{"proto", l.Protocol, "name", l.ServerName, "remote", remoteAddr}
+
+	// Add user email if available
+	if l.Username != "" {
+		allKeyvals = append(allKeyvals, "user", l.Username)
 	}
 
-	allKeyvals := []any{"proto", l.Protocol, "name", l.ServerName, "remote", remoteAddr, "user", user}
+	// Add account_id if available
+	if l.AccountID > 0 {
+		allKeyvals = append(allKeyvals, "account_id", l.AccountID)
+	}
+
 	allKeyvals = append(allKeyvals, keysAndValues...)
 	logFn(msg, allKeyvals...)
 }

@@ -9,7 +9,7 @@ import (
 
 func TestPrelookupCache(t *testing.T) {
 	// Create cache with short TTLs for testing
-	cache := newPrelookupCache(2*time.Second, 1*time.Second, 10, 500*time.Millisecond)
+	cache := newPrelookupCache("test", 2*time.Second, 1*time.Second, 10, 500*time.Millisecond)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -95,7 +95,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test max size eviction
 	t.Run("MaxSizeEviction", func(t *testing.T) {
-		smallCache := newPrelookupCache(10*time.Second, 10*time.Second, 3, 10*time.Second)
+		smallCache := newPrelookupCache("test", 10*time.Second, 10*time.Second, 3, 10*time.Second)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -117,7 +117,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test stats
 	t.Run("Stats", func(t *testing.T) {
-		statsCache := newPrelookupCache(10*time.Second, 10*time.Second, 100, 10*time.Second)
+		statsCache := newPrelookupCache("test", 10*time.Second, 10*time.Second, 100, 10*time.Second)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -206,7 +206,7 @@ func TestPrelookupCache(t *testing.T) {
 	// Test cleanup removes expired entries and prevents memory growth
 	t.Run("CleanupRemovesExpiredEntries", func(t *testing.T) {
 		// Create cache with very short TTL and fast cleanup
-		cleanupCache := newPrelookupCache(500*time.Millisecond, 500*time.Millisecond, 1000, 100*time.Millisecond)
+		cleanupCache := newPrelookupCache("test", 500*time.Millisecond, 500*time.Millisecond, 1000, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -248,7 +248,7 @@ func TestPrelookupCache(t *testing.T) {
 	// Test continuous cleanup doesn't let memory grow
 	t.Run("ContinuousCleanupPreventsMemoryGrowth", func(t *testing.T) {
 		// Create cache with short TTL and frequent cleanup
-		growthCache := newPrelookupCache(200*time.Millisecond, 200*time.Millisecond, 10000, 50*time.Millisecond)
+		growthCache := newPrelookupCache("test", 200*time.Millisecond, 200*time.Millisecond, 10000, 50*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -288,7 +288,7 @@ func TestPrelookupCache(t *testing.T) {
 	// Test memory growth monitoring - useful for debugging production issues
 	t.Run("MemoryGrowthMonitoring", func(t *testing.T) {
 		// Simulate production config: 5min TTL, 1min cleanup
-		monitorCache := newPrelookupCache(5*time.Minute, 1*time.Minute, 10000, 1*time.Minute)
+		monitorCache := newPrelookupCache("test", 5*time.Minute, 1*time.Minute, 10000, 1*time.Minute)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -332,7 +332,7 @@ func TestPrelookupCache(t *testing.T) {
 	// Test that cleanup actually removes entries over multiple cycles
 	t.Run("CleanupCyclesRemoveEntries", func(t *testing.T) {
 		// Short TTL and very fast cleanup to see multiple cycles
-		cycleCache := newPrelookupCache(200*time.Millisecond, 200*time.Millisecond, 1000, 50*time.Millisecond)
+		cycleCache := newPrelookupCache("test", 200*time.Millisecond, 200*time.Millisecond, 1000, 50*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -370,7 +370,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test password hash verification and cache invalidation
 	t.Run("PasswordHashVerification", func(t *testing.T) {
-		cache := newPrelookupCache(5*time.Second, 1*time.Second, 10, 1*time.Second)
+		cache := newPrelookupCache("test", 5*time.Second, 1*time.Second, 10, 1*time.Second)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -440,7 +440,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test concurrent access and race condition scenario
 	t.Run("ConcurrentAccessRaceCondition", func(t *testing.T) {
-		cache := newPrelookupCache(100*time.Millisecond, 50*time.Millisecond, 10, 10*time.Millisecond)
+		cache := newPrelookupCache("test", 100*time.Millisecond, 50*time.Millisecond, 10, 10*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -486,7 +486,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test that GetPasswordHash respects expiration
 	t.Run("GetPasswordHashRespectsExpiration", func(t *testing.T) {
-		cache := newPrelookupCache(50*time.Millisecond, 25*time.Millisecond, 10, 100*time.Millisecond)
+		cache := newPrelookupCache("test", 50*time.Millisecond, 25*time.Millisecond, 10, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -521,7 +521,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test that we don't accidentally cache nil password hashes
 	t.Run("DoNotCacheNilPasswordHash", func(t *testing.T) {
-		cache := newPrelookupCache(5*time.Second, 1*time.Second, 10, 1*time.Second)
+		cache := newPrelookupCache("test", 5*time.Second, 1*time.Second, 10, 1*time.Second)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -555,7 +555,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test multiple concurrent readers and writers
 	t.Run("ConcurrentReadersAndWriters", func(t *testing.T) {
-		cache := newPrelookupCache(2*time.Second, 1*time.Second, 100, 500*time.Millisecond)
+		cache := newPrelookupCache("test", 2*time.Second, 1*time.Second, 100, 500*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -610,7 +610,7 @@ func TestPrelookupCache(t *testing.T) {
 	// Test that eviction during GetPasswordHash/Get sequence causes race condition
 	t.Run("EvictionRaceCondition", func(t *testing.T) {
 		// Create cache with very small max size to trigger eviction frequently
-		cache := newPrelookupCache(10*time.Second, 5*time.Second, 3, 100*time.Millisecond)
+		cache := newPrelookupCache("test", 10*time.Second, 5*time.Second, 3, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -660,7 +660,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test concurrent eviction and lookups
 	t.Run("ConcurrentEvictionAndLookups", func(t *testing.T) {
-		cache := newPrelookupCache(5*time.Second, 1*time.Second, 10, 100*time.Millisecond)
+		cache := newPrelookupCache("test", 5*time.Second, 1*time.Second, 10, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -755,7 +755,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test that GetWithPasswordHash prevents the eviction race condition
 	t.Run("AtomicGetWithPasswordHashPreventsRace", func(t *testing.T) {
-		cache := newPrelookupCache(5*time.Second, 1*time.Second, 10, 100*time.Millisecond)
+		cache := newPrelookupCache("test", 5*time.Second, 1*time.Second, 10, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -841,7 +841,7 @@ func TestPrelookupCache(t *testing.T) {
 
 	// Test that concurrent wrong password attempts don't poison cache for correct ones
 	t.Run("ConcurrentWrongPasswordDoesNotPoisonCache", func(t *testing.T) {
-		cache := newPrelookupCache(10*time.Second, 5*time.Second, 100, 100*time.Millisecond)
+		cache := newPrelookupCache("test", 10*time.Second, 5*time.Second, 100, 100*time.Millisecond)
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

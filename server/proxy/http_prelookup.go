@@ -137,10 +137,10 @@ func NewHTTPPreLookupClient(
 		return counts.Requests >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		logger.Warn("Prelookup circuit breaker state changed", "name", name, "from", from, "to", to)
+		logger.Warn("prelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
 	}
 	breaker := circuitbreaker.NewCircuitBreaker(settings)
-	logger.Info("Initialized prelookup circuit breaker", "max_requests", cbSettings.MaxRequests, "timeout", cbSettings.Timeout, "failure_ratio", fmt.Sprintf("%.0f%%", cbSettings.FailureRatio*100), "min_requests", cbSettings.MinRequests)
+	logger.Info("prelookup: Initialized circuit breaker", "max_requests", cbSettings.MaxRequests, "timeout", cbSettings.Timeout, "failure_ratio", fmt.Sprintf("%.0f%%", cbSettings.FailureRatio*100), "min_requests", cbSettings.MinRequests)
 
 	// Apply defaults for transport settings if not provided
 	if transportSettings == nil {
@@ -267,12 +267,12 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 			if len(hashPrefix) > 30 {
 				hashPrefix = hashPrefix[:30] + "..."
 			}
-			logger.Info("Prelookup cache lookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
+			logger.Info("prelookup: Cache lookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
 
 			// Verify submitted password against cached hash
 			if c.verifyPassword(password, cachedHash) {
 				// Password matches cached hash - return cached result
-				logger.Info("Prelookup cache HIT - password verified against cached hash", "user", authEmail, "password_len", len(password))
+				logger.Info("prelookup: Cache HIT - password verified against cached hash", "user", authEmail, "password_len", len(password))
 				// Mark as from cache if we have routing info
 				if info != nil {
 					info.FromCache = true
@@ -282,11 +282,11 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 				// Password doesn't match cached hash - fall through to fresh prelookup
 				// DO NOT delete cache here! Concurrent wrong password attempts should not
 				// invalidate cache for other threads. We'll update cache only if prelookup succeeds.
-				logger.Info("Prelookup cache STALE - password mismatch, verifying with prelookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
+				logger.Info("prelookup: Cache STALE - password mismatch, verifying with prelookup", "user", authEmail, "password_len", len(password), "cached_hash_prefix", hashPrefix)
 				// Note: We intentionally do NOT call c.cache.Delete(cacheKey) here
 			}
 		} else {
-			logger.Info("Prelookup cache MISS - no cached entry", "user", authEmail, "password_len", len(password))
+			logger.Info("prelookup: Cache MISS - no cached entry", "user", authEmail, "password_len", len(password))
 		}
 	}
 
@@ -658,7 +658,7 @@ func (c *HTTPPreLookupClient) Close() error {
 		hits, misses, size := c.cache.GetStats()
 		if hits+misses > 0 {
 			hitRate := float64(hits) / float64(hits+misses) * 100
-			logger.Info("Prelookup cache final stats", "hits", hits, "misses", misses, "hit_rate", fmt.Sprintf("%.2f%%", hitRate), "size", size)
+			logger.Info("prelookup: Cache final stats", "hits", hits, "misses", misses, "hit_rate", fmt.Sprintf("%.2f%%", hitRate), "size", size)
 		}
 	}
 

@@ -443,7 +443,7 @@ func (am *AffinityManager) cleanup() {
 	// Log memory usage stats every 10 cleanup cycles (~10 hours with 1h cleanup interval)
 	am.cleanupCounter++
 	if am.cleanupCounter%10 == 0 {
-		logger.Info("Affinity manager: Memory usage stats",
+		logger.Info("Affinity manager stats",
 			"total_entries", len(am.affinityMap),
 			"broadcast_queue_size", queueSize,
 			"broadcast_queue_limit", 5000,

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -163,12 +164,78 @@ func TestCopyWithDeadline_SlowClientTimeout(t *testing.T) {
 	}
 }
 
-// TestCopyWithDeadline_ContextCancellation tests that context cancellation stops the copy
-// Note: Context cancellation only works between read/write operations, not during a blocking read.
-// This test is skipped because net.Pipe.Read() blocks and doesn't respect context cancellation.
-// In real proxy scenarios, the connection will be closed from outside when context is cancelled.
+// TestCopyWithDeadline_ContextCancellation tests that context cancellation stops the copy.
+// Context cancellation is checked between read/write operations. During a blocking read,
+// cancellation won't be detected until the read completes. To properly test context handling,
+// we need to ensure data is available so the read doesn't block indefinitely.
 func TestCopyWithDeadline_ContextCancellation(t *testing.T) {
-	t.Skip("Context cancellation only checked between read/write operations, not during blocking reads")
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Create two pipes
+	srcRead, srcWrite := net.Pipe()
+	dstRead, dstWrite := net.Pipe()
+
+	defer srcRead.Close()
+	defer srcWrite.Close()
+	defer dstRead.Close()
+	defer dstWrite.Close()
+
+	done := make(chan error, 1)
+
+	// Drain destination in background to prevent pipe from blocking
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			_, err := dstRead.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Write data continuously in background to keep copy busy
+	go func() {
+		buf := make([]byte, 1024)
+		for i := range buf {
+			buf[i] = byte(i % 256)
+		}
+		for {
+			_, err := srcWrite.Write(buf)
+			if err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond) // Small delay between writes
+		}
+	}()
+
+	// Start copying in background
+	go func() {
+		_, err := CopyWithDeadline(ctx, dstWrite, srcRead, "test")
+		done <- err
+	}()
+
+	// Give copy goroutine time to start and process data
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel context - this should be detected in the next loop iteration
+	cancel()
+
+	// Wait for copy to finish
+	select {
+	case err := <-done:
+		// Should get context.Canceled error
+		if err == nil {
+			t.Fatal("Expected context.Canceled error, got nil")
+		}
+		if errors.Is(err, context.Canceled) {
+			t.Logf("✅ Got expected context.Canceled error: %v", err)
+		} else {
+			// Any error indicating the copy stopped is acceptable
+			t.Logf("✅ Copy stopped with error (acceptable): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CopyWithDeadline didn't stop after context cancellation")
+	}
 }
 
 // TestCopyWithDeadline_LargeTransfer tests copying large amounts of data

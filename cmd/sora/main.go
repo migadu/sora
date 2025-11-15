@@ -22,6 +22,7 @@ import (
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
@@ -34,7 +35,6 @@ import (
 	"github.com/migadu/sora/server/managesieveproxy"
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/pop3proxy"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/relayqueue"
 	"github.com/migadu/sora/server/uploader"
 	mailapi "github.com/migadu/sora/server/userapi"
@@ -90,7 +90,7 @@ type serverDependencies struct {
 	hostname           string
 	config             config.Config
 	serverManager      *serverManager
-	connectionTrackers map[string]*proxy.ConnectionTracker // protocol -> tracker (for admin API kick)
+	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for admin API kick)
 }
 
 func main() {
@@ -309,7 +309,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		hostname:           hostname,
 		config:             cfg,
 		serverManager:      &serverManager{}, // Initialize server manager for coordinated shutdown
-		connectionTrackers: make(map[string]*proxy.ConnectionTracker),
+		connectionTrackers: make(map[string]*server.ConnectionTracker),
 	}
 
 	// Initialize S3 storage if needed
@@ -797,8 +797,8 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, server interface {
-	SetConnectionTracker(*proxy.ConnectionTracker)
-}) *proxy.ConnectionTracker {
+	SetConnectionTracker(*server.ConnectionTracker)
+}) *server.ConnectionTracker {
 	if clusterMgr == nil {
 		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
 		return nil
@@ -814,7 +814,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
 
-	tracker := proxy.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
+	tracker := serverPkg.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
 	if tracker != nil {
 		server.SetConnectionTracker(tracker)
 	}
@@ -920,7 +920,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1069,7 +1069,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := serverPkg.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1165,7 +1165,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := proxy.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := serverPkg.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1779,18 +1779,12 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		MaxConnectionsPerIP: serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:     deps.config.Servers.TrustedNetworks,
 		TrustedProxies:      deps.config.Servers.TrustedNetworks,
+		PreLookup:           serverConfig.PreLookup,
+		AffinityManager:     deps.affinityManager,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)
 		return
-	}
-
-	// Set affinity manager on connection manager if cluster is enabled
-	if connMgr := server.GetConnectionManager(); connMgr != nil {
-		if deps.affinityManager != nil {
-			connMgr.SetAffinityManager(deps.affinityManager)
-			logger.Info("User API Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
-		}
 	}
 
 	go func() {

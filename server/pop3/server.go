@@ -19,7 +19,6 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -69,7 +68,7 @@ type POP3Server struct {
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 
 	// Connection tracking
-	connTracker *proxy.ConnectionTracker
+	connTracker *serverPkg.ConnectionTracker
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
@@ -226,7 +225,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		instanceID := fmt.Sprintf("pop3-%s-%d", name, time.Now().UnixNano())
 
 		// Create ConnectionTracker with nil cluster manager (local mode only)
-		server.connTracker = proxy.NewConnectionTracker(
+		server.connTracker = serverPkg.NewConnectionTracker(
 			"POP3",                             // protocol name
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
@@ -326,6 +325,9 @@ func (s *POP3Server) Start(errChan chan error) {
 		logger.Debug("POP3: stopping", "name", s.name)
 		listener.Close()
 	}()
+
+	// Start session monitoring routine
+	go s.monitorActiveSessions()
 
 	for {
 		conn, err := listener.Accept()
@@ -435,13 +437,16 @@ func (s *POP3Server) Start(errChan chan error) {
 
 		go func() {
 			defer s.sessionsWg.Done()
+			// Ensure session is always removed from map, even if handleConnection panics
+			// or never completes. This prevents memory leaks in the activeSessions map.
+			defer s.removeSession(session)
 			session.handleConnection()
 		}()
 	}
 }
 
 // SetConnTracker sets the connection tracker for this server
-func (s *POP3Server) SetConnTracker(tracker *proxy.ConnectionTracker) {
+func (s *POP3Server) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
@@ -599,4 +604,25 @@ func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 // Unwrap returns the underlying connection for connection unwrapping
 func (c *proxyProtocolConn) Unwrap() net.Conn {
 	return c.Conn
+}
+
+// monitorActiveSessions periodically logs active session count for monitoring
+func (s *POP3Server) monitorActiveSessions() {
+	// Log every 5 minutes (similar to connection tracker cleanup interval)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.activeSessionsMutex.RLock()
+			count := len(s.activeSessions)
+			s.activeSessionsMutex.RUnlock()
+
+			logger.Info("POP3 server active sessions", "name", s.name, "active_sessions", count)
+
+		case <-s.appCtx.Done():
+			return
+		}
+	}
 }

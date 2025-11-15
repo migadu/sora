@@ -95,7 +95,7 @@ func TestClusterRateLimiter_QueueEvictionPreservesNewest(t *testing.T) {
 	defer limiter.Stop()
 
 	crl := &ClusterRateLimiter{
-		limiter:        limiter,
+		// limiter:        limiter,
 		broadcastQueue: make([]RateLimitEvent, 0, 100),
 	}
 

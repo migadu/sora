@@ -13,14 +13,14 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
-	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
 // setupServerWithPerUserPerIPLimit creates a test server with per-user-per-IP limiting
-func setupServerWithPerUserPerIPLimit(t *testing.T, maxPerUser, maxPerUserPerIP int) (*common.TestServer, common.TestAccount, *proxy.ConnectionTracker) {
+func setupServerWithPerUserPerIPLimit(t *testing.T, maxPerUser, maxPerUserPerIP int) (*common.TestServer, common.TestAccount, *serverPkg.ConnectionTracker) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -81,7 +81,7 @@ func setupServerWithPerUserPerIPLimit(t *testing.T, maxPerUser, maxPerUserPerIP 
 
 	// Create connection tracker with per-user-per-IP limit
 	instanceID := fmt.Sprintf("test-per-user-per-ip-%d", time.Now().UnixNano())
-	tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, maxPerUser, maxPerUserPerIP, 0)
+	tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, maxPerUser, maxPerUserPerIP, 0)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}
@@ -272,7 +272,7 @@ func TestPerUserPerIPLimit_MultipleUsers(t *testing.T) {
 	}
 
 	instanceID := fmt.Sprintf("test-multi-user-%d", time.Now().UnixNano())
-	tracker := proxy.NewConnectionTracker("IMAP", instanceID, nil, 20, 2, 0)
+	tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, 20, 2, 0)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}

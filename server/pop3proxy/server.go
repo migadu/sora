@@ -35,7 +35,7 @@ type POP3ProxyServer struct {
 	masterSASLUsername     string
 	masterSASLPassword     string
 	connManager            *proxy.ConnectionManager
-	connTracker            *proxy.ConnectionTracker
+	connTracker            *server.ConnectionTracker
 	wg                     sync.WaitGroup
 	enableAffinity         bool
 	affinityValidity       time.Duration
@@ -158,7 +158,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize prelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if options.PreLookup != nil && options.PreLookup.Enabled {
-		prelookupClient, err := proxy.InitializePrelookup(options.PreLookup)
+		prelookupClient, err := proxy.InitializePrelookup("pop3", options.PreLookup)
 		if err != nil {
 			logger.Debug("POP3 Proxy: Failed to initialize prelookup client", "proxy", options.Name, "error", err)
 			if !options.PreLookup.FallbackDefault {
@@ -349,6 +349,9 @@ func (s *POP3ProxyServer) Start() error {
 		listener.Close()
 	}()
 
+	// Start session monitoring routine
+	go s.monitorActiveSessions()
+
 	return s.acceptConnections(listener)
 }
 
@@ -414,13 +417,16 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 					conn.Close()
 				}
 			}()
+			// Ensure session is always removed from map, even if handleConnection panics
+			// or never completes. This prevents memory leaks in the activeSessions map.
+			defer s.removeSession(session)
 			session.handleConnection()
 		}()
 	}
 }
 
 // SetConnectionTracker sets the connection tracker for the server.
-func (s *POP3ProxyServer) SetConnectionTracker(tracker *proxy.ConnectionTracker) {
+func (s *POP3ProxyServer) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
@@ -531,4 +537,25 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	}
 
 	logger.Debug("POP3 Proxy: Proceeding with connection cleanup", "proxy", s.name)
+}
+
+// monitorActiveSessions periodically logs active session count for monitoring
+func (s *POP3ProxyServer) monitorActiveSessions() {
+	// Log every 5 minutes (similar to connection tracker cleanup interval)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.activeSessionsMu.RLock()
+			count := len(s.activeSessions)
+			s.activeSessionsMu.RUnlock()
+
+			logger.Info("POP3 proxy active sessions", "proxy", s.name, "active_sessions", count)
+
+		case <-s.appCtx.Done():
+			return
+		}
+	}
 }

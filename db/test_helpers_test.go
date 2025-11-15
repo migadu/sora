@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,16 +40,19 @@ func setupTestDatabase(t *testing.T) *Database {
 	require.NoError(t, err, "Failed to load test config. Please check config-test.toml syntax")
 
 	// Create database connection using test config
-	host := "localhost"
-	if len(cfg.Database.Write.Hosts) > 0 {
-		host = cfg.Database.Write.Hosts[0]
-	}
-	port := "5432"
-	if cfg.Database.Write.Port != 0 {
-		port = fmt.Sprintf("%d", cfg.Database.Write.Port)
+	// Convert test config to DatabaseConfig format
+	dbConfig := &config.DatabaseConfig{
+		Write: &config.DatabaseEndpointConfig{
+			Hosts:    cfg.Database.Write.Hosts,
+			Port:     cfg.Database.Write.Port,
+			User:     cfg.Database.Write.User,
+			Password: cfg.Database.Write.Password,
+			Name:     cfg.Database.Write.Name,
+			TLSMode:  cfg.Database.Write.TLS,
+		},
 	}
 
-	database, err := NewDatabase(ctx, host, port, cfg.Database.Write.User, cfg.Database.Write.Password, cfg.Database.Write.Name, cfg.Database.Write.TLS, false)
+	database, err := NewDatabaseFromConfig(ctx, dbConfig, true, false)
 	require.NoError(t, err, "Failed to connect to test database. Please ensure PostgreSQL is running and %s database exists", cfg.Database.Write.Name)
 
 	// Verify pg_trgm extension is available

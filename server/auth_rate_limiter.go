@@ -812,7 +812,7 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	// This helps monitor for memory leaks and effectiveness of size caps
 	a.cleanupCounter++
 	if a.cleanupCounter%10 == 0 {
-		logger.Info("Auth rate limiter: Memory usage stats", "protocol", a.protocol,
+		logger.Info("Auth rate limiter stats", "protocol", a.protocol,
 			"ip_username_entries", totalIPUsername,
 			"ip_username_limit", a.config.MaxIPUsernameEntries,
 			"blocked_ips", totalBlockedIPs,
@@ -856,9 +856,9 @@ func (a *AuthRateLimiter) GetStats(ctx context.Context, windowDuration time.Dura
 			"ip_limit":                a.config.MaxIPEntries,
 			"username_entries":        trackedUsernames,
 			"username_limit":          a.config.MaxUsernameEntries,
-			"ip_username_utilization": float64(blockedIPUsernameCount) / float64(max(a.config.MaxIPUsernameEntries, 1)) * 100,
-			"ip_utilization":          float64(trackedIPs) / float64(max(a.config.MaxIPEntries, 1)) * 100,
-			"username_utilization":    float64(trackedUsernames) / float64(max(a.config.MaxUsernameEntries, 1)) * 100,
+			"ip_username_utilization": roundToTwoDecimals(float64(blockedIPUsernameCount) / float64(max(a.config.MaxIPUsernameEntries, 1)) * 100),
+			"ip_utilization":          roundToTwoDecimals(float64(trackedIPs) / float64(max(a.config.MaxIPEntries, 1)) * 100),
+			"username_utilization":    roundToTwoDecimals(float64(trackedUsernames) / float64(max(a.config.MaxUsernameEntries, 1)) * 100),
 		},
 		"config": map[string]any{
 			"max_attempts_per_ip_username": a.config.MaxAttemptsPerIPUsername,
@@ -957,4 +957,9 @@ func (a *AuthRateLimiter) evictOldestUsername() {
 		delete(a.usernameFailureCounts, oldestUsername)
 		logger.Debug("Auth limiter: Evicted oldest username entry (size limit)", "protocol", a.protocol, "username", oldestUsername, "first_failure", oldestTime)
 	}
+}
+
+// roundToTwoDecimals rounds a float to 2 decimal places
+func roundToTwoDecimals(val float64) float64 {
+	return float64(int(val*100+0.5)) / 100
 }

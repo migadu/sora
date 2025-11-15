@@ -8,7 +8,7 @@ import (
 )
 
 // InitializePrelookup creates an HTTP prelookup client from configuration
-func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error) {
+func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRoutingLookup, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
@@ -76,7 +76,7 @@ func InitializePrelookup(cfg *config.PreLookupConfig) (UserRoutingLookup, error)
 			maxSize = 10000 // Default
 		}
 
-		cache = newPrelookupCache(positiveTTL, negativeTTL, maxSize, cleanupInterval)
+		cache = newPrelookupCache(protocol, positiveTTL, negativeTTL, maxSize, cleanupInterval)
 	}
 
 	hasAuth := cfg.AuthToken != ""

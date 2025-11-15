@@ -19,13 +19,15 @@
 // The package uses pgxpool for efficient connection pooling:
 //
 //	cfg := &config.DatabaseConfig{
-//		Endpoints: []config.DatabaseEndpointConfig{
-//			{Hosts: []string{"localhost:5432"}},
+//		Write: &config.DatabaseEndpointConfig{
+//			Hosts: []string{"localhost"},
+//			Port: 5432,
+//			User: "postgres",
+//			Password: "password",
+//			Name: "sora_mail_db",
 //		},
-//		Database: "sora_mail_db",
-//		MaxConns: 50,
 //	}
-//	db, err := NewDatabase(ctx, cfg)
+//	db, err := NewDatabaseFromConfig(ctx, cfg, true, false)
 //
 // # Message Operations
 //
@@ -124,71 +126,6 @@ type Database struct {
 	WriteFailover *FailoverManager // Failover manager for write operations
 	ReadFailover  *FailoverManager // Failover manager for read operations
 	lockConn      *pgxpool.Conn    // Connection holding the advisory lock
-}
-
-// DatabasePoolConfig holds configuration for the database connection pool.
-type DatabasePoolConfig struct {
-	MaxConns        int32
-	MinConns        int32
-	MaxConnLifetime time.Duration
-	MaxConnIdleTime time.Duration
-}
-
-// NewDatabase initializes a new SQL database connection using default pool settings.
-func NewDatabase(ctx context.Context, host, port, user, password, dbname string, tlsMode bool, logQueries bool) (*Database, error) {
-	return NewDatabaseWithPoolConfig(ctx, host, port, user, password, dbname, tlsMode, logQueries, nil, true)
-}
-
-func NewDatabaseWithPoolConfig(ctx context.Context, host, port, user, password, dbname string, tlsMode bool, logQueries bool, poolConfig *DatabasePoolConfig, runMigrations bool) (*Database, error) {
-	sslMode := "disable"
-	if tlsMode {
-		sslMode = "require"
-	}
-
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		user, password, host, port, dbname, sslMode)
-
-	log.Printf("Database: connecting to database: postgres://%s@%s:%s/%s?sslmode=%s",
-		user, host, port, dbname, sslMode)
-
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		log.Fatalf("unable to parse connection string: %v", err)
-	}
-
-	if logQueries {
-		config.ConnConfig.Tracer = &CustomTracer{}
-	}
-
-	if poolConfig != nil {
-		config.MaxConns = poolConfig.MaxConns
-		config.MinConns = poolConfig.MinConns
-		config.MaxConnLifetime = poolConfig.MaxConnLifetime
-		config.MaxConnIdleTime = poolConfig.MaxConnIdleTime
-	}
-
-	dbPool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create connection pool: %v", err)
-	}
-
-	if err := dbPool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("failed to connect to the database: %v", err)
-	}
-
-	db := &Database{
-		WritePool: dbPool,
-		ReadPool:  dbPool, // Default to same pool if no read/write split
-	}
-
-	if runMigrations {
-		// Use default 2-minute timeout for legacy function
-		if err := db.migrate(ctx, 2*time.Minute); err != nil {
-			return nil, err
-		}
-	}
-
-	return db, nil
 }
 
 func (db *Database) Close() {

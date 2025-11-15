@@ -18,7 +18,6 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
-	"github.com/migadu/sora/server/proxy"
 )
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
@@ -63,7 +62,7 @@ type ManageSieveServer struct {
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 
 	// Connection tracking
-	connTracker *proxy.ConnectionTracker
+	connTracker *serverPkg.ConnectionTracker
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
@@ -246,7 +245,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		instanceID := fmt.Sprintf("managesieve-%s-%d", name, time.Now().UnixNano())
 
 		// Create ConnectionTracker with nil cluster manager (local mode only)
-		serverInstance.connTracker = proxy.NewConnectionTracker(
+		serverInstance.connTracker = serverPkg.NewConnectionTracker(
 			"ManageSieve",                      // protocol name
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
@@ -345,6 +344,9 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		logger.Debug("ManageSieve: stopping", "name", s.name)
 		listener.Close()
 	}()
+
+	// Start session monitoring routine
+	go s.monitorActiveSessions()
 
 	for {
 		conn, err := listener.Accept()
@@ -459,13 +461,16 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		go func() {
 			defer s.sessionsWg.Done()
+			// Ensure session is always removed from map, even if handleConnection panics
+			// or never completes. This prevents memory leaks in the activeSessions map.
+			defer s.removeSession(session)
 			session.handleConnection()
 		}()
 	}
 }
 
 // SetConnTracker sets the connection tracker for this server
-func (s *ManageSieveServer) SetConnTracker(tracker *proxy.ConnectionTracker) {
+func (s *ManageSieveServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 	s.connTracker = tracker
 }
 
@@ -617,4 +622,25 @@ type proxyProtocolConn struct {
 
 func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
+}
+
+// monitorActiveSessions periodically logs active session count for monitoring
+func (s *ManageSieveServer) monitorActiveSessions() {
+	// Log every 5 minutes (similar to connection tracker cleanup interval)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.activeSessionsMutex.RLock()
+			count := len(s.activeSessions)
+			s.activeSessionsMutex.RUnlock()
+
+			logger.Info("ManageSieve server active sessions", "name", s.name, "active_sessions", count)
+
+		case <-s.appCtx.Done():
+			return
+		}
+	}
 }

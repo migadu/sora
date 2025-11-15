@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -30,22 +30,24 @@ type JWTClaims struct {
 
 // Server represents a User API proxy server
 type Server struct {
-	name           string
-	addr           string
-	connManager    *proxy.ConnectionManager
-	rdb            *resilient.ResilientDatabase
-	jwtSecret      string // JWT secret for token validation
-	tls            bool
-	tlsCertFile    string
-	tlsKeyFile     string
-	tlsVerify      bool
-	tlsConfig      *tls.Config // Global TLS config from TLS manager (optional)
-	trustedProxies []string    // CIDR blocks for trusted proxies
-	limiter        *server.ConnectionLimiter
-	httpServer     *http.Server
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	name            string
+	addr            string
+	connManager     *proxy.ConnectionManager
+	rdb             *resilient.ResilientDatabase
+	routingLookup   proxy.UserRoutingLookup // PreLookup client for user routing (optional)
+	affinityManager *server.AffinityManager // Affinity manager for sticky routing (optional)
+	jwtSecret       string                  // JWT secret for token validation
+	tls             bool
+	tlsCertFile     string
+	tlsKeyFile      string
+	tlsVerify       bool
+	tlsConfig       *tls.Config // Global TLS config from TLS manager (optional)
+	trustedProxies  []string    // CIDR blocks for trusted proxies
+	limiter         *server.ConnectionLimiter
+	httpServer      *http.Server
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 
 	// Shared HTTP transport (prevents connection pool leaks)
 	transport *http.Transport
@@ -66,10 +68,12 @@ type ServerOptions struct {
 	RemoteTLS           bool
 	RemoteTLSVerify     bool
 	ConnectTimeout      time.Duration
-	MaxConnections      int      // Maximum total connections (0 = unlimited)
-	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
-	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	TrustedProxies      []string // CIDR blocks for trusted proxies
+	MaxConnections      int                     // Maximum total connections (0 = unlimited)
+	MaxConnectionsPerIP int                     // Maximum connections per client IP (0 = unlimited)
+	TrustedNetworks     []string                // CIDR blocks for trusted networks that bypass per-IP limits
+	TrustedProxies      []string                // CIDR blocks for trusted proxies
+	PreLookup           *config.PreLookupConfig // PreLookup configuration for user routing
+	AffinityManager     *server.AffinityManager // Affinity manager for sticky routing (optional)
 }
 
 // New creates a new User API proxy server
@@ -92,9 +96,32 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		connectTimeout = 10 * time.Second
 	}
 
-	// Create connection manager (no routing lookup needed for User API)
-	connManager, err := proxy.NewConnectionManager(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSVerify, false, connectTimeout)
+	// Initialize prelookup client if configured
+	var routingLookup proxy.UserRoutingLookup
+	if opts.PreLookup != nil && opts.PreLookup.Enabled {
+		prelookupClient, err := proxy.InitializePrelookup("userapi", opts.PreLookup)
+		if err != nil {
+			logger.Warn("User API Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
+			if !opts.PreLookup.FallbackDefault {
+				cancel()
+				return nil, fmt.Errorf("prelookup initialization failed and fallback disabled: %w", err)
+			}
+			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
+		} else {
+			routingLookup = prelookupClient
+			logger.Info("User API Proxy: Prelookup enabled", "name", opts.Name)
+		}
+	}
+
+	// Create connection manager with routing lookup
+	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSVerify, false, connectTimeout, routingLookup, opts.Name)
 	if err != nil {
+		if routingLookup != nil {
+			// Close prelookup client on error
+			if closer, ok := routingLookup.(interface{ Close() error }); ok {
+				closer.Close()
+			}
+		}
 		cancel()
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
@@ -128,21 +155,23 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	}
 
 	return &Server{
-		name:           opts.Name,
-		addr:           opts.Addr,
-		connManager:    connManager,
-		rdb:            rdb,
-		jwtSecret:      opts.JWTSecret,
-		tls:            opts.TLS,
-		tlsCertFile:    opts.TLSCertFile,
-		tlsKeyFile:     opts.TLSKeyFile,
-		tlsVerify:      opts.TLSVerify,
-		tlsConfig:      opts.TLSConfig,
-		trustedProxies: opts.TrustedProxies,
-		limiter:        limiter,
-		transport:      transport,
-		ctx:            ctx,
-		cancel:         cancel,
+		name:            opts.Name,
+		addr:            opts.Addr,
+		connManager:     connManager,
+		rdb:             rdb,
+		routingLookup:   routingLookup,
+		affinityManager: opts.AffinityManager,
+		jwtSecret:       opts.JWTSecret,
+		tls:             opts.TLS,
+		tlsCertFile:     opts.TLSCertFile,
+		tlsKeyFile:      opts.TLSKeyFile,
+		tlsVerify:       opts.TLSVerify,
+		tlsConfig:       opts.TLSConfig,
+		trustedProxies:  opts.TrustedProxies,
+		limiter:         limiter,
+		transport:       transport,
+		ctx:             ctx,
+		cancel:          cancel,
 	}, nil
 }
 
@@ -243,10 +272,10 @@ func (s *Server) setupHandler() http.Handler {
 				return
 			}
 
-			// Get backend for this user using consistent hash
-			backendAddr := s.connManager.GetBackendByConsistentHash(claims.Email)
-			if backendAddr == "" {
-				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email)
+			// Get backend for this user
+			backendAddr, err := s.getBackendForUser(claims.Email, claims.AccountID)
+			if err != nil {
+				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email, "error", err)
 				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
@@ -269,6 +298,53 @@ func (s *Server) setupHandler() http.Handler {
 		// Proxy unauthenticated request (no user headers)
 		s.proxyRequest(w, r, backendAddr, nil, nil)
 	})
+}
+
+// getBackendForUser determines the backend server for a user using affinity and prelookup
+func (s *Server) getBackendForUser(email string, accountID int64) (string, error) {
+	ctx := context.Background()
+
+	// 1. Check affinity first (if configured)
+	if s.affinityManager != nil {
+		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
+			logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend)
+			return backend, nil
+		}
+	}
+
+	// 2. Use prelookup if configured
+	if s.routingLookup != nil {
+		// Use routeOnly=true since user is already authenticated via JWT
+		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
+		if err != nil {
+			logger.Warn("User API Proxy: Prelookup failed", "name", s.name, "user", email, "error", err)
+			// Fall through to consistent hash
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+			logger.Debug("User API Proxy: Using prelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
+
+			// Set affinity for future requests
+			if s.affinityManager != nil {
+				s.affinityManager.SetBackend(email, routingInfo.ServerAddress, "userapi")
+			}
+
+			return routingInfo.ServerAddress, nil
+		}
+	}
+
+	// 3. Fall back to consistent hash
+	backendAddr := s.connManager.GetBackendByConsistentHash(email)
+	if backendAddr == "" {
+		return "", fmt.Errorf("no backend available")
+	}
+
+	logger.Debug("User API Proxy: Using consistent hash backend", "name", s.name, "user", email, "backend", backendAddr)
+
+	// Set affinity for future requests
+	if s.affinityManager != nil {
+		s.affinityManager.SetBackend(email, backendAddr, "userapi")
+	}
+
+	return backendAddr, nil
 }
 
 // proxyRequest proxies the request to the backend

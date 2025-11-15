@@ -43,8 +43,6 @@ func handleHealthStatus(ctx context.Context) {
 	hostname := fs.String("hostname", "", "Show health status for specific hostname")
 	component := fs.String("component", "", "Show health status for specific component")
 	detailed := fs.Bool("detailed", false, "Show detailed health information including metadata")
-	history := fs.Bool("history", false, "Show health status history")
-	since := fs.String("since", "1h", "Time window for history (e.g., 1h, 24h, 7d)")
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
 
 	// Configuration
@@ -59,8 +57,6 @@ Options:
   --hostname string     Show health status for specific hostname
   --component string    Show health status for specific component
   --detailed            Show detailed health information including metadata
-  --history             Show health status history
-  --since string        Time window for history, e.g. 1h, 24h, 7d (default: 1h)
   --json                Output in JSON format
   --config string        Path to TOML configuration file (required)
 
@@ -68,14 +64,12 @@ This command shows:
   - Overall system health status
   - Component health status (database, S3, circuit breakers)
   - Server-specific health information
-  - Health status history and trends
   - Component failure rates and error details
 
 Examples:
   sora-admin health status
   sora-admin health status --hostname server1.example.com
   sora-admin health status --component database --detailed
-  sora-admin health status --history --since 24h
   sora-admin health status --json
 `)
 	}
@@ -86,28 +80,6 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
-	// Validate time window format for history
-	var sinceTime time.Time
-	if *history {
-		duration, err := time.ParseDuration(*since)
-		if err != nil {
-			// time.ParseDuration doesn't support 'd' for days, so we handle it by converting to hours.
-			if strings.HasSuffix(*since, "d") {
-				sinceInHours := strings.Replace(*since, "d", "h", 1)
-				if d, err := time.ParseDuration(sinceInHours); err == nil {
-					duration = d * 24
-				} else {
-					// The inner parse failed, so the format is invalid.
-					logger.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
-				}
-			} else {
-				// The original parse failed and it's not a 'd' unit we can handle.
-				logger.Fatalf("Invalid time format for --since '%s'. Use a duration string like '1h', '24h', or '7d'.", *since)
-			}
-		}
-		sinceTime = time.Now().Add(-duration)
-	}
-
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
 	if err != nil {
@@ -116,11 +88,11 @@ Examples:
 	defer rdb.Close()
 
 	if *jsonOutput {
-		if err := showHealthStatusJSON(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+		if err := showHealthStatusJSON(ctx, rdb, *hostname, *component, *detailed); err != nil {
 			logger.Fatalf("Failed to show health status: %v", err)
 		}
 	} else {
-		if err := showHealthStatus(ctx, rdb, *hostname, *component, *detailed, *history, sinceTime); err != nil {
+		if err := showHealthStatus(ctx, rdb, *hostname, *component, *detailed); err != nil {
 			logger.Fatalf("Failed to show health status: %v", err)
 		}
 	}
@@ -138,17 +110,14 @@ Subcommands:
 Examples:
   sora-admin health status
   sora-admin health status --hostname server1.example.com
-  sora-admin health status --component database --detailed
+  sora-admin health status --component database
+  sora-admin health status --detailed --json
 
 Use 'sora-admin health <subcommand> --help' for detailed help.
 `)
 }
 
-func showHealthStatus(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed, history bool, sinceTime time.Time) error {
-	if history && component != "" {
-		return showComponentHistory(ctx, rdb, hostname, component, sinceTime)
-	}
-
+func showHealthStatus(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed bool) error {
 	// Show overview first
 	overview, err := rdb.GetSystemHealthOverviewWithRetry(ctx, hostname)
 	if err != nil {
@@ -274,11 +243,10 @@ func showHealthStatus(ctx context.Context, rdb *resilient.ResilientDatabase, hos
 	return nil
 }
 
-func showHealthStatusJSON(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed, history bool, sinceTime time.Time) error {
+func showHealthStatusJSON(ctx context.Context, rdb *resilient.ResilientDatabase, hostname, component string, detailed bool) error {
 	type JSONHealthOutput struct {
 		Overview   *db.SystemHealthOverview `json:"overview"`
 		Components []*db.HealthStatus       `json:"components,omitempty"`
-		History    []*db.HealthStatus       `json:"history,omitempty"`
 		Timestamp  time.Time                `json:"timestamp"`
 		Filter     map[string]string        `json:"filter,omitempty"`
 	}
@@ -302,58 +270,28 @@ func showHealthStatusJSON(ctx context.Context, rdb *resilient.ResilientDatabase,
 	}
 	output.Overview = overview
 
-	if history && component != "" {
-		// Get history for specific component
-		if hostname == "" {
-			// Get all hostnames for this component first
-			allStatuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, "")
-			if err != nil {
-				return fmt.Errorf("failed to get health statuses: %w", err)
-			}
-
-			for _, status := range allStatuses {
-				if status.ComponentName == component {
-					hist, err := rdb.GetHealthHistoryWithRetry(ctx, status.ServerHostname, component, sinceTime, 50)
-					if err != nil {
-						continue
-					}
-					output.History = append(output.History, hist...)
-				}
-			}
-		} else {
-			hist, err := rdb.GetHealthHistoryWithRetry(ctx, hostname, component, sinceTime, 50)
-			if err != nil {
-				return fmt.Errorf("failed to get health history: %w", err)
-			}
-			output.History = hist
-		}
-	} else {
-		// Get current component status
-		statuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
-		if err != nil {
-			return fmt.Errorf("failed to get health statuses: %w", err)
-		}
-
-		// Filter by component if specified
-		if component != "" {
-			filteredStatuses := []*db.HealthStatus{}
-			for _, status := range statuses {
-				if status.ComponentName == component {
-					filteredStatuses = append(filteredStatuses, status)
-				}
-			}
-			statuses = filteredStatuses
-		}
-
-		output.Components = statuses
+	// Get current component status
+	statuses, err := rdb.GetAllHealthStatusesWithRetry(ctx, hostname)
+	if err != nil {
+		return fmt.Errorf("failed to get health statuses: %w", err)
 	}
+
+	// Filter by component if specified
+	if component != "" {
+		filteredStatuses := []*db.HealthStatus{}
+		for _, status := range statuses {
+			if status.ComponentName == component {
+				filteredStatuses = append(filteredStatuses, status)
+			}
+		}
+		statuses = filteredStatuses
+	}
+
+	output.Components = statuses
 
 	// Remove metadata if not detailed mode
 	if !detailed {
 		for _, status := range output.Components {
-			status.Metadata = nil
-		}
-		for _, status := range output.History {
 			status.Metadata = nil
 		}
 	}

@@ -772,7 +772,11 @@ func (s *Session) startProxy(initialCommand string) {
 		}
 	}()
 
+	// Context cancellation handler - ensures connections are closed when context is cancelled
+	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		<-s.ctx.Done()
 		s.clientConn.Close()
 		s.backendConn.Close()

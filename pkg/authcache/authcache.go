@@ -267,13 +267,13 @@ func (c *AuthCache) cleanup() {
 			hitRate = float64(c.hits) / float64(total) * 100
 		}
 
-		logger.Info("AuthCache: Memory usage stats",
+		logger.Info("AuthCache stats",
 			"total_entries", len(c.entries),
 			"success_entries", successEntries,
 			"user_not_found", userNotFoundEntries,
 			"invalid_password", invalidPasswordEntries,
 			"max_size", c.maxSize,
-			"hit_rate_pct", hitRate,
+			"hit_rate_pct", roundToTwoDecimals(hitRate),
 			"removed_this_cycle", removed)
 	}
 }
@@ -325,4 +325,9 @@ func (c *AuthCache) Clear() {
 	c.misses = 0
 
 	logger.Info("AuthCache: Cache cleared")
+}
+
+// roundToTwoDecimals rounds a float to 2 decimal places
+func roundToTwoDecimals(val float64) float64 {
+	return float64(int(val*100+0.5)) / 100
 }
