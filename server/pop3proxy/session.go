@@ -773,27 +773,33 @@ func (s *POP3ProxySession) startProxying() {
 
 	defer s.backendConn.Close()
 
-	s.DebugLog("starting bidirectional proxy")
+	s.DebugLog("startProxying() called")
 
 	var wg sync.WaitGroup
+
+	s.DebugLog("Created waitgroup")
 
 	// Start activity updater
 	activityCtx, activityCancel := context.WithCancel(s.ctx)
 	defer activityCancel()
+	s.DebugLog("Starting activity updater")
 	go s.updateActivityPeriodically(activityCtx)
 
 	// Copy from client to backend with command filtering
 	wg.Add(1)
+	s.DebugLog("Starting client-to-backend copy goroutine")
 	go func() {
 		defer wg.Done()
 		// If this copy returns, it means the client has closed the connection or there was an error.
 		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
 		s.filteredCopyClientToBackend()
+		s.DebugLog("Client-to-backend copy goroutine exiting")
 	}()
 
 	// Copy from backend to client with write deadline protection
 	wg.Add(1)
+	s.DebugLog("Starting backend-to-client copy goroutine")
 	go func() {
 		defer wg.Done()
 		// If this copy returns, it means the backend has closed the connection or there was an error.
@@ -821,6 +827,7 @@ func (s *POP3ProxySession) startProxying() {
 		} else {
 			s.DebugLog("backend-to-client copy completed successfully", "bytes_copied", bytesOut)
 		}
+		s.DebugLog("Backend-to-client copy goroutine exiting")
 	}()
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
@@ -830,14 +837,19 @@ func (s *POP3ProxySession) startProxying() {
 	//   - this goroutine waits for ctx.Done()
 	//   - ctx.Done() fires when handleConnection() returns
 	//   - handleConnection() can't return because it's blocked in wg.Wait()
+	s.DebugLog("Starting context cancellation handler goroutine")
 	go func() {
+		s.DebugLog("Context cancellation handler waiting for ctx.Done()")
 		<-s.ctx.Done()
+		s.DebugLog("Context cancelled - closing connections")
 		s.clientConn.Close()
 		s.backendConn.Close()
+		s.DebugLog("Context cancellation handler goroutine exiting")
 	}()
 
+	s.DebugLog("Waiting for copy goroutines to finish")
 	wg.Wait() // Wait for both copy operations to finish
-	s.DebugLog("proxy session ended")
+	s.DebugLog("Copy goroutines finished - startProxying() returning")
 }
 
 // close closes all connections and unregisters from tracking.
