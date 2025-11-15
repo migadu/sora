@@ -714,6 +714,8 @@ func (s *Session) startProxy(initialCommand string) {
 		return
 	}
 
+	s.DebugLog("startProxy() called")
+
 	// First, send the RCPT TO command that triggered proxying
 	_, err := s.backendWriter.WriteString(initialCommand + "\r\n")
 	if err != nil {
@@ -736,23 +738,30 @@ func (s *Session) startProxy(initialCommand string) {
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "prelookup_cached", prelookupCached, "sender", s.sender, "recipient", s.to)
+
 	var wg sync.WaitGroup
+
+	s.DebugLog("Created waitgroup")
 
 	// Start activity updater
 	activityCtx, activityCancel := context.WithCancel(s.ctx)
 	defer activityCancel()
+	s.DebugLog("Starting activity updater")
 	go s.updateActivityPeriodically(activityCtx)
 
 	// Client to backend
 	wg.Add(1)
+	s.DebugLog("Starting client-to-backend copy goroutine")
 	go func() {
 		defer wg.Done()
 		defer s.backendConn.Close()
 		s.proxyClientToBackend()
+		s.DebugLog("Client-to-backend copy goroutine exiting")
 	}()
 
 	// Backend to client
 	wg.Add(1)
+	s.DebugLog("Starting backend-to-client copy goroutine")
 	go func() {
 		defer wg.Done()
 		// If this copy returns, it means the backend has closed the connection or there was an error.
@@ -772,6 +781,7 @@ func (s *Session) startProxy(initialCommand string) {
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("Error copying from backend to client", "error", err)
 		}
+		s.DebugLog("Backend-to-client copy goroutine exiting")
 	}()
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
@@ -781,13 +791,19 @@ func (s *Session) startProxy(initialCommand string) {
 	//   - this goroutine waits for ctx.Done()
 	//   - ctx.Done() fires when handleConnection() returns
 	//   - handleConnection() can't return because it's blocked in wg.Wait()
+	s.DebugLog("Starting context cancellation handler goroutine")
 	go func() {
+		s.DebugLog("Context cancellation handler waiting for ctx.Done()")
 		<-s.ctx.Done()
+		s.DebugLog("Context cancelled - closing connections")
 		s.clientConn.Close()
 		s.backendConn.Close()
+		s.DebugLog("Context cancellation handler goroutine exiting")
 	}()
 
+	s.DebugLog("Waiting for copy goroutines to finish")
 	wg.Wait()
+	s.DebugLog("Copy goroutines finished - startProxy() returning")
 }
 
 // proxyClientToBackend handles copying data from the client to the backend,
