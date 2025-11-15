@@ -34,9 +34,9 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "bad request"}`, http.StatusBadRequest)
 			},
-			expectAuthResult: AuthUserNotFound,
-			expectErrorType:  nil,
-			description:      "4xx errors should be treated as user not found",
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrPrelookupTransient,
+			description:      "4xx errors (except 401/403/404) should be treated as temporarily unavailable",
 		},
 		{
 			name: "500_ServerError",

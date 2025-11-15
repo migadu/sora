@@ -344,14 +344,15 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 		// 401 Unauthorized and 403 Forbidden mean authentication failed (user exists but access denied)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			logger.Debug("prelookup: Authentication failed", "status", resp.StatusCode, "user", lookupEmail)
+			logger.Debug("prelookup: API returned auth failed", "status", resp.StatusCode, "user", lookupEmail)
 			return map[string]any{"result": AuthFailed}, nil
 		}
 
-		// Other 4xx errors mean user lookup failed - treat as user not found to allow fallback
+		// Other 4xx errors mean user lookup failed - treat as temporarily unavailable
+		// This respects fallback_to_default setting (unlike AuthUserNotFound which always falls back)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Debug("prelookup: Client error - treating as user not found", "status", resp.StatusCode, "user", lookupEmail)
-			return map[string]any{"result": AuthUserNotFound}, nil
+			logger.Warn("prelookup: Client error - treating as temporarily unavailable", "status", resp.StatusCode, "user", lookupEmail)
+			return nil, fmt.Errorf("%w: client error %d", ErrPrelookupTransient, resp.StatusCode)
 		}
 
 		// 5xx errors are transient - fallback controlled by config
@@ -468,7 +469,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		if !c.verifyPassword(password, lookupResp.PasswordHash) {
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
-			logger.Info("prelookup: FAILED", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
+			logger.Info("prelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
 			return nil, AuthFailed, nil
 		}
 	}

@@ -584,13 +584,12 @@ func (s *Server) monitorActiveSessions() {
 			s.activeSessionsMu.RUnlock()
 
 			// Also log connection limiter stats
-			var limiterStats string
 			if s.limiter != nil {
 				stats := s.limiter.GetStats()
-				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+				logger.Info("LMTP proxy active sessions", "proxy", s.name, "active_sessions", count, "limiter_total", stats.TotalConnections, "limiter_max", stats.MaxConnections)
+			} else {
+				logger.Info("LMTP proxy active sessions", "proxy", s.name, "active_sessions", count)
 			}
-
-			logger.Info("LMTP proxy active sessions", "proxy", s.name, "active_sessions", count, "limiter_stats", limiterStats)
 
 		case <-s.ctx.Done():
 			return

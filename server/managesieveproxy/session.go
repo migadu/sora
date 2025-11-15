@@ -632,16 +632,16 @@ func (s *Session) authenticateUser(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("prelookup failed but master auth was already validated - routing issue?")
+					s.WarnLog("prelookup failed but master auth was already validated - routing issue", "user", username)
 				}
-				s.InfoLog("prelookup auth failed - bad password")
+				s.InfoLog("prelookup authentication failed - bad password", "user", username)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 				return fmt.Errorf("authentication failed")
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
-				s.WarnLog("Prelookup service temporarily unavailable")
+				s.WarnLog("prelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 

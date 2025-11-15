@@ -1086,7 +1086,9 @@ timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 =
 # - HTTP GET request is made for each authentication attempt
 # - Circuit breaker protects against service failures (60% failure rate triggers open state)
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
-# - If HTTP endpoint returns 404 or 5xx → falls back to default routing (if fallback_to_default=true)
+# - If HTTP endpoint returns 404 → always falls back to default routing (partitioning support)
+# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
+# - If HTTP endpoint returns other 4xx/5xx → respects fallback_to_default setting
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
 # - Timeout for HTTP requests is configurable (default: 5s)
@@ -1115,7 +1117,7 @@ timeout = "10s"                             # HTTP response timeout (default: 10
                                             # Use this to secure your prelookup endpoint
 
 fallback_to_default = true            # Controls behavior when prelookup service has TRANSIENT errors
-                                      # (network issues, timeouts, 5xx errors, circuit breaker open).
+                                      # (network issues, timeouts, 4xx errors except 401/403/404, 5xx errors, circuit breaker open).
                                       #
                                       # IMPORTANT: User-not-found (404 or empty response) ALWAYS falls back to main DB
                                       # regardless of this setting. This supports PARTITIONING scenarios where some
