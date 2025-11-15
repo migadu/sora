@@ -580,7 +580,14 @@ func (s *POP3ProxyServer) monitorActiveSessions() {
 				uniqueUsers = s.connTracker.GetUniqueUserCount()
 			}
 
-			logger.Info("POP3 proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers)
+			// Also log connection limiter stats
+			var limiterStats string
+			if s.limiter != nil {
+				stats := s.limiter.GetStats()
+				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+			}
+
+			logger.Info("POP3 proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers, "limiter_stats", limiterStats)
 
 		case <-s.appCtx.Done():
 			return
