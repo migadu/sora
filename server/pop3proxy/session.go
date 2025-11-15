@@ -42,6 +42,7 @@ type POP3ProxySession struct {
 	mutex              sync.Mutex
 	errorCount         int
 	startTime          time.Time
+	releaseConn        func() // Connection limiter cleanup function
 }
 
 func (s *POP3ProxySession) handleConnection() {
@@ -834,6 +835,13 @@ func (s *POP3ProxySession) close() {
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
+
+	// Release connection limiter slot IMMEDIATELY (don't wait for goroutine to exit)
+	if s.releaseConn != nil {
+		s.releaseConn()
+		s.releaseConn = nil // Prevent double-release
+		logger.Debug("Connection limit released in close()", "proxy", s.server.name)
+	}
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)

@@ -1229,7 +1229,14 @@ func (s *IMAPServer) monitorActiveConnections() {
 			count := len(s.activeConns)
 			s.activeConnsMutex.RUnlock()
 
-			logger.Info("IMAP server active connections", "name", s.name, "active_connections", count)
+			// Also log connection limiter stats
+			var limiterStats string
+			if s.limiter != nil {
+				stats := s.limiter.GetStats()
+				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+			}
+
+			logger.Info("IMAP server active connections", "name", s.name, "active_connections", count, "limiter_stats", limiterStats)
 
 		case <-s.appCtx.Done():
 			return

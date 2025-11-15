@@ -642,7 +642,14 @@ func (b *LMTPServerBackend) monitorActiveConnections() {
 		select {
 		case <-ticker.C:
 			count := b.activeConnections.Load()
-			logger.Info("LMTP server active connections", "name", b.name, "active_connections", count)
+
+			// Also log connection limiter stats
+			var limiterStats string
+			if b.limiter != nil {
+				stats := b.limiter.GetStats()
+				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+			}
+			logger.Info("LMTP server active connections", "name", b.name, "active_connections", count, "limiter_stats", limiterStats)
 
 		case <-b.appCtx.Done():
 			return

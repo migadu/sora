@@ -637,7 +637,13 @@ func (s *ManageSieveServer) monitorActiveSessions() {
 			count := len(s.activeSessions)
 			s.activeSessionsMutex.RUnlock()
 
-			logger.Info("ManageSieve server active sessions", "name", s.name, "active_sessions", count)
+			// Also log connection limiter stats
+			var limiterStats string
+			if s.limiter != nil {
+				stats := s.limiter.GetStats()
+				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+			}
+			logger.Info("ManageSieve server active sessions", "name", s.name, "active_sessions", count, "limiter_stats", limiterStats)
 
 		case <-s.appCtx.Done():
 			return

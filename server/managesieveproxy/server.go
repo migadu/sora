@@ -423,10 +423,10 @@ func (s *Server) acceptConnections() error {
 			metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Inc()
 
 			session := newSession(s, conn)
+			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
-			// Ensure session is always removed from map, even if handleConnection panics
-			// or never completes. This prevents memory leaks in the activeSessions map.
-			defer s.removeSession(session)
+			// Note: removeSession is called in session.close(), which is deferred in handleConnection()
+			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
 		}()
 	}
@@ -567,7 +567,14 @@ func (s *Server) monitorActiveSessions() {
 			count := len(s.activeSessions)
 			s.activeSessionsMu.RUnlock()
 
-			logger.Info("ManageSieve proxy active sessions", "proxy", s.name, "active_sessions", count)
+			// Also log connection limiter stats
+			var limiterStats string
+			if s.limiter != nil {
+				stats := s.limiter.GetStats()
+				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
+			}
+
+			logger.Info("ManageSieve proxy active sessions", "proxy", s.name, "active_sessions", count, "limiter_stats", limiterStats)
 
 		case <-s.ctx.Done():
 			return
