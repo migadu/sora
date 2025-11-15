@@ -407,18 +407,12 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		go func() {
 			defer s.wg.Done()
 			defer func() {
-				// Release connection limit when session ends
-				if releaseConn != nil {
-					releaseConn()
-				}
-			}()
-			defer func() {
 				if r := recover(); r != nil {
 					logger.Debug("POP3 Proxy: Session panic recovered", "proxy", s.name, "panic", r)
 					conn.Close()
 				}
 			}()
-			// Note: removeSession is called in session.close(), which is deferred in handleConnection()
+			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
 		}()

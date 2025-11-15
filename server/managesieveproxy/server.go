@@ -406,12 +406,6 @@ func (s *Server) acceptConnections() error {
 		go func() {
 			defer s.wg.Done()
 			defer func() {
-				// Release connection limit when session ends
-				if releaseConn != nil {
-					releaseConn()
-				}
-			}()
-			defer func() {
 				if r := recover(); r != nil {
 					logger.Debug("ManageSieve Proxy: Session panic recovered", "name", s.name, "panic", r)
 					conn.Close()
@@ -425,7 +419,7 @@ func (s *Server) acceptConnections() error {
 			session := newSession(s, conn)
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
-			// Note: removeSession is called in session.close(), which is deferred in handleConnection()
+			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
 		}()
