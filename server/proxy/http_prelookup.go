@@ -270,7 +270,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 			if c.verifyPassword(password, cachedHash) {
 				// Password matches cached hash - return cached result
-				logger.Info("prelookup: SUCCESS", "user", authEmail, "source", "cache", "hash_prefix", hashPrefix)
+				logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", "cache", "hash_prefix", hashPrefix)
 				// Mark as from cache if we have routing info
 				if info != nil {
 					info.FromCache = true
@@ -499,7 +499,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Info("prelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "cached", c.cache != nil)
+	logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "cached", c.cache != nil)
 
 	if c.cache != nil {
 		c.cache.SetWithHash(cacheKey, info, AuthSuccess, lookupResp.PasswordHash)

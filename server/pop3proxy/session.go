@@ -458,9 +458,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
 		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		if err != nil {
-			logger.Info("prelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+			logger.Debug("prelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
-			logger.Info("prelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+			logger.Debug("prelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
 		}
 
 		if err != nil {
@@ -500,7 +500,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.InfoLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 				metrics.PrelookupResult.WithLabelValues("pop3", "success").Inc()
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount

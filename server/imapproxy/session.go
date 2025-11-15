@@ -611,9 +611,9 @@ func (s *Session) authenticateUser(username, password string) error {
 		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
 		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		if err != nil {
-			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+			logger.Debug("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
-			logger.Info("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+			logger.Debug("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
 		}
 
 		if err != nil {
@@ -653,7 +653,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// Prelookup returned success - use routing info
-				s.InfoLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
 				metrics.PrelookupResult.WithLabelValues("imap", "success").Inc()
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
@@ -1038,7 +1038,7 @@ func (s *Session) startProxy() {
 		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
 		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
-		logger.Info("Client-to-backend copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesIn, "error", err)
+		logger.Debug("Client-to-backend copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesIn, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from client to backend", "error", err)
@@ -1066,7 +1066,7 @@ func (s *Session) startProxy() {
 			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)
 			bytesOut, err = server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		}
-		logger.Info("Backend-to-client copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesOut, "error", err)
+		logger.Debug("Backend-to-client copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesOut, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from backend to client", "error", err)
@@ -1100,7 +1100,6 @@ func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// DEBUG: Log entry to close() to track if it's being called
 	logger.Debug("Session close() called", "proxy", s.server.name, "username", s.username, "account_id", s.accountID)
 
 	// Remove session from active tracking
@@ -1133,18 +1132,17 @@ func (s *Session) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		// DEBUG: Log before unregister attempt
-		logger.Info("Attempting to unregister connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username, "client_addr", s.clientAddr)
+		logger.Debug("Attempting to unregister connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username, "client_addr", s.clientAddr)
 
 		// Use cached client address to avoid race with connection close
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "IMAP", s.clientAddr); err != nil {
 			// Connection tracking is non-critical monitoring data, so log but continue
 			s.WarnLog("Failed to unregister connection", "error", err)
 		} else {
-			logger.Info("Successfully unregistered connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username)
+			logger.Debug("Successfully unregistered connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username)
 		}
 	} else {
-		logger.Info("Skipping unregister - no accountID or connTracker", "proxy", s.server.name, "account_id", s.accountID, "has_tracker", s.server.connTracker != nil)
+		logger.Debug("Skipping unregister - no accountID or connTracker", "proxy", s.server.name, "account_id", s.accountID, "has_tracker", s.server.connTracker != nil)
 	}
 
 	if s.clientConn != nil {
