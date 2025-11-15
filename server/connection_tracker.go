@@ -424,6 +424,25 @@ func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
 	return result
 }
 
+// GetUniqueUserCount returns the number of unique users with active connections (cluster-wide)
+func (ct *ConnectionTracker) GetUniqueUserCount() int {
+	if ct == nil {
+		return 0
+	}
+
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	// Count unique users with at least one connection
+	count := 0
+	for _, info := range ct.connections {
+		if info.TotalCount > 0 {
+			count++
+		}
+	}
+	return count
+}
+
 // KickUser kicks a user's connections.
 // In cluster mode, broadcasts kick event via gossip.
 // In local mode, directly closes all sessions for the user.
@@ -675,6 +694,14 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 	age := time.Since(event.Timestamp)
 	if age > 5*time.Minute {
 		logger.Debug("Gossip tracker: Ignoring stale event", "name", ct.name, "node_id", event.NodeID, "age", age)
+		return
+	}
+
+	// CRITICAL: Filter events by protocol to prevent cross-protocol contamination
+	// All connection trackers receive all gossip events, but each should only process its own protocol
+	// Without this check, IMAP events get counted in LMTP tracker, causing massive ghost connection leaks
+	if event.Protocol != "" && event.Protocol != ct.name {
+		logger.Debug("Gossip tracker: Ignoring event for different protocol", "tracker_protocol", ct.name, "event_protocol", event.Protocol, "event_type", event.Type)
 		return
 	}
 
@@ -1002,6 +1029,7 @@ func (ct *ConnectionTracker) broadcastStateSnapshot() {
 	// Queue the snapshot event
 	ct.queueEvent(ConnectionEvent{
 		Type:          ConnectionEventStateSnapshot,
+		Protocol:      ct.name, // CRITICAL: Set protocol so receiving trackers can filter
 		Timestamp:     snapshot.Timestamp,
 		InstanceID:    ct.instanceID,
 		StateSnapshot: snapshot,

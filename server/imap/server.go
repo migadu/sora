@@ -1243,3 +1243,8 @@ func (s *IMAPServer) monitorActiveConnections() {
 		}
 	}
 }
+
+// GetLimiter returns the connection limiter for testing purposes
+func (s *IMAPServer) GetLimiter() *serverPkg.ConnectionLimiter {
+	return s.limiter
+}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
@@ -68,12 +69,13 @@ type ServerOptions struct {
 	RemoteTLS           bool
 	RemoteTLSVerify     bool
 	ConnectTimeout      time.Duration
-	MaxConnections      int                     // Maximum total connections (0 = unlimited)
-	MaxConnectionsPerIP int                     // Maximum connections per client IP (0 = unlimited)
+	MaxConnections      int                     // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP int                     // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string                // CIDR blocks for trusted networks that bypass per-IP limits
 	TrustedProxies      []string                // CIDR blocks for trusted proxies
 	PreLookup           *config.PreLookupConfig // PreLookup configuration for user routing
 	AffinityManager     *server.AffinityManager // Affinity manager for sticky routing (optional)
+	ClusterManager      *cluster.Manager        // Optional: enables cluster-wide per-IP limiting
 }
 
 // New creates a new User API proxy server
@@ -134,7 +136,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
 	if opts.MaxConnections > 0 || opts.MaxConnectionsPerIP > 0 {
-		limiter = server.NewConnectionLimiterWithTrustedNets("USER-API-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		if opts.ClusterManager != nil {
+			// Cluster mode: use cluster-wide per-IP limiting
+			instanceID := fmt.Sprintf("user-api-proxy-%s-%d", opts.Name, time.Now().UnixNano())
+			limiter = server.NewConnectionLimiterWithCluster("USER-API-PROXY", instanceID, opts.ClusterManager, opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		} else {
+			// Local mode: use local-only limiting
+			limiter = server.NewConnectionLimiterWithTrustedNets("USER-API-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		}
 	}
 
 	// Create shared HTTP transport (reused for all proxied requests to prevent connection pool leaks)

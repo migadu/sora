@@ -656,3 +656,8 @@ func (b *LMTPServerBackend) monitorActiveConnections() {
 		}
 	}
 }
+
+// GetLimiter returns the connection limiter for testing purposes
+func (b *LMTPServerBackend) GetLimiter() *server.ConnectionLimiter {
+	return b.limiter
+}

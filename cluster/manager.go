@@ -48,6 +48,12 @@ type Manager struct {
 	connectionMu          sync.RWMutex
 	connectionBroadcasts  []func(int, int) [][]byte
 	connectionBroadcastMu sync.RWMutex
+
+	// Per-IP connection limit event handling
+	ipLimitHandlers    []func([]byte)
+	ipLimitMu          sync.RWMutex
+	ipLimitBroadcasts  []func(int, int) [][]byte
+	ipLimitBroadcastMu sync.RWMutex
 }
 
 // clusterDelegate implements memberlist.Delegate for custom cluster behavior
@@ -654,6 +660,92 @@ func (m *Manager) GetMembers() []MemberInfo {
 	return result
 }
 
+// RegisterIPLimitHandler registers a callback to handle per-IP limit events from the cluster
+func (m *Manager) RegisterIPLimitHandler(handler func([]byte)) {
+	m.ipLimitMu.Lock()
+	defer m.ipLimitMu.Unlock()
+	m.ipLimitHandlers = append(m.ipLimitHandlers, handler)
+	logger.Info("Cluster: RegisterIPLimitHandler", "handlers", len(m.ipLimitHandlers))
+}
+
+// notifyIPLimitHandlers calls all registered IP limit handlers
+func (m *Manager) notifyIPLimitHandlers(data []byte) {
+	m.ipLimitMu.RLock()
+	handlers := make([]func([]byte), len(m.ipLimitHandlers))
+	copy(handlers, m.ipLimitHandlers)
+	handlerCount := len(m.ipLimitHandlers)
+	m.ipLimitMu.RUnlock()
+
+	logger.Debug("Cluster: Notifying IP limit handlers", "handlers", handlerCount, "data_len", len(data))
+
+	// Call handlers asynchronously to avoid blocking gossip receive
+	// Use timeout to prevent goroutine leaks from blocked handlers
+	for _, handler := range handlers {
+		go func(h func([]byte)) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				h(data)
+			}()
+
+			select {
+			case <-done:
+				// Handler completed successfully
+			case <-time.After(5 * time.Second):
+				logger.Warn("Cluster: IP limit handler timed out after 5s")
+			case <-m.ctx.Done():
+				// Manager shutting down
+			}
+		}(handler)
+	}
+}
+
+// RegisterIPLimitBroadcaster registers a callback to generate per-IP limit broadcasts
+func (m *Manager) RegisterIPLimitBroadcaster(broadcaster func(int, int) [][]byte) {
+	m.ipLimitBroadcastMu.Lock()
+	defer m.ipLimitBroadcastMu.Unlock()
+	m.ipLimitBroadcasts = append(m.ipLimitBroadcasts, broadcaster)
+	logger.Debug("Cluster: RegisterIPLimitBroadcaster", "count", len(m.ipLimitBroadcasts))
+}
+
+// getIPLimitBroadcasts collects broadcasts from all registered per-IP limit broadcasters
+func (m *Manager) getIPLimitBroadcasts(overhead, limit int) [][]byte {
+	m.ipLimitBroadcastMu.RLock()
+	broadcasters := make([]func(int, int) [][]byte, len(m.ipLimitBroadcasts))
+	copy(broadcasters, m.ipLimitBroadcasts)
+	broadcasterCount := len(m.ipLimitBroadcasts)
+	m.ipLimitBroadcastMu.RUnlock()
+
+	logger.Debug("Cluster: getIPLimitBroadcasts called", "broadcasters", broadcasterCount)
+
+	var allBroadcasts [][]byte
+	totalSize := 0
+
+	for idx, broadcaster := range broadcasters {
+		broadcasts := broadcaster(overhead, limit-totalSize)
+		logger.Debug("Cluster: IP limit broadcaster returned messages", "idx", idx, "count", len(broadcasts))
+		for _, msg := range broadcasts {
+			// Add 'IP' magic marker to identify per-IP limit messages
+			marked := make([]byte, len(msg)+2)
+			marked[0] = 0x49 // 'I'
+			marked[1] = 0x50 // 'P'
+			copy(marked[2:], msg)
+
+			msgSize := overhead + len(marked)
+			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
+				logger.Debug("Cluster: IP limit broadcast limit reached", "count", len(allBroadcasts))
+				return allBroadcasts
+			}
+
+			allBroadcasts = append(allBroadcasts, marked)
+			totalSize += msgSize
+		}
+	}
+
+	logger.Debug("Cluster: getIPLimitBroadcasts returning messages", "total", len(allBroadcasts))
+	return allBroadcasts
+}
+
 // MemberInfo holds information about a cluster member
 type MemberInfo struct {
 	Name string
@@ -725,6 +817,10 @@ func (d *clusterDelegate) NotifyMsg(msg []byte) {
 		logger.Debug("Cluster: Received connection tracking message", "len", len(msg))
 		// Strip marker and forward to connection handlers
 		d.manager.notifyConnectionHandlers(msg[2:])
+	} else if msg[0] == 0x49 && msg[1] == 0x50 { // 'I' 'P' - IP Limit
+		logger.Debug("Cluster: Received per-IP limit message", "len", len(msg))
+		// Strip marker and forward to IP limit handlers
+		d.manager.notifyIPLimitHandlers(msg[2:])
 	} else {
 		logger.Warn("Cluster: Received unknown message type", "type", fmt.Sprintf("0x%02x%02x", msg[0], msg[1]), "len", len(msg))
 	}
@@ -762,6 +858,17 @@ func (d *clusterDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 	// Get connection broadcasts
 	connectionBroadcasts := d.manager.getConnectionBroadcasts(overhead, limit-totalSize)
 	for _, msg := range connectionBroadcasts {
+		msgSize := overhead + len(msg)
+		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
+			return allBroadcasts
+		}
+		allBroadcasts = append(allBroadcasts, msg)
+		totalSize += msgSize
+	}
+
+	// Get per-IP limit broadcasts
+	ipLimitBroadcasts := d.manager.getIPLimitBroadcasts(overhead, limit-totalSize)
+	for _, msg := range ipLimitBroadcasts {
 		msgSize := overhead + len(msg)
 		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
 			return allBroadcasts

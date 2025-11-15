@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/migadu/sora/cluster"
+	"github.com/migadu/sora/logger"
 )
 
 // ConnectionLimiter manages connection limits for protocol servers
@@ -15,10 +17,12 @@ type ConnectionLimiter struct {
 	maxConnections   int
 	maxPerIP         int
 	currentTotal     atomic.Int64
-	perIPConnections sync.Map // map[string]*atomic.Int64 - lock-free for better concurrency
+	perIPConnections sync.Map // map[string]*atomic.Int64 - lock-free for better concurrency (local only)
 	cleanupInterval  time.Duration
 	protocol         string
-	trustedNets      []*net.IPNet // Trusted networks that bypass per-IP limits
+	trustedNets      []*net.IPNet    // Trusted networks that bypass per-IP limits
+	ipTracker        *IPLimitTracker // Cluster-wide per-IP tracking (nil if cluster disabled)
+	instanceID       string          // Unique instance identifier for cluster mode
 }
 
 // NewConnectionLimiter creates a new connection limiter
@@ -46,6 +50,34 @@ func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPer
 		cleanupInterval: 5 * time.Minute, // Clean up stale IP entries
 		protocol:        protocol,
 		trustedNets:     trustedNets,
+		ipTracker:       nil, // No cluster tracking
+		instanceID:      "",
+	}
+}
+
+// NewConnectionLimiterWithCluster creates a new connection limiter with cluster-wide per-IP tracking
+func NewConnectionLimiterWithCluster(protocol string, instanceID string, clusterMgr *cluster.Manager, maxConnections, maxPerIP int, trustedProxies []string) *ConnectionLimiter {
+	trustedNets, err := ParseTrustedNetworks(trustedProxies)
+	if err != nil {
+		logger.Debug("Connection limiter: WARNING - failed to parse trusted networks", "protocol", protocol, "error", err)
+		trustedNets = []*net.IPNet{}
+	}
+
+	var ipTracker *IPLimitTracker
+	if clusterMgr != nil && maxPerIP > 0 {
+		// Create IP tracker with cluster support
+		ipTracker = NewIPLimitTracker(protocol, instanceID, clusterMgr, defaultMaxIPEventQueueSize)
+		logger.Info("Connection limiter: Cluster-wide per-IP limiting enabled", "protocol", protocol, "max_per_ip", maxPerIP)
+	}
+
+	return &ConnectionLimiter{
+		maxConnections:  maxConnections,
+		maxPerIP:        maxPerIP,
+		cleanupInterval: 5 * time.Minute, // Clean up stale IP entries
+		protocol:        protocol,
+		trustedNets:     trustedNets,
+		ipTracker:       ipTracker,
+		instanceID:      instanceID,
 	}
 }
 
@@ -167,15 +199,27 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 	// Increment total counter
 	total := cl.currentTotal.Add(1)
 
+	// Log every 1000th accept to track connection rate
+	if total%1000 == 0 {
+		logger.Info("Connection limiter: Connections accepted", "protocol", cl.protocol, "current_total", total, "max", cl.maxConnections)
+	}
+
 	var perIP int64 = 0
 	var ipCounter *atomic.Int64
 
 	// Only track per-IP if limits are enabled (maxPerIP > 0) and not from trusted network
 	if cl.maxPerIP > 0 && !isTrusted {
-		// Increment per-IP counter using lock-free LoadOrStore
-		value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
-		ipCounter = value.(*atomic.Int64)
-		perIP = ipCounter.Add(1)
+		// Use cluster-wide tracking if available, otherwise use local tracking
+		if cl.ipTracker != nil {
+			// Cluster mode: increment cluster-wide counter
+			cl.ipTracker.IncrementIP(trackingIP)
+			perIP = int64(cl.ipTracker.GetIPCount(trackingIP))
+		} else {
+			// Local mode: increment local counter using lock-free LoadOrStore
+			value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
+			ipCounter = value.(*atomic.Int64)
+			perIP = ipCounter.Add(1)
+		}
 
 		if realClientIP != "" {
 			logger.Debug("Connection limiter: Connection accepted", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", total, "max_total", cl.maxConnections, "per_ip", perIP, "max_per_ip", cl.maxPerIP)
@@ -193,41 +237,60 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		logger.Debug("Connection limiter: Connection accepted - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", total, "max_total", cl.maxConnections)
 	}
 
-	// Return cleanup function
+	// Return cleanup function with sync.Once to prevent double-decrement
+	// This can happen if both session.close() and panic recovery try to call releaseConn()
+	var releaseOnce sync.Once
 	return func() {
-		cl.currentTotal.Add(-1)
+		releaseOnce.Do(func() {
+			newTotal := cl.currentTotal.Add(-1)
 
-		if cl.maxPerIP > 0 && !isTrusted && ipCounter != nil {
-			remaining := ipCounter.Add(-1)
+			// Log every 1000th release to track if releases are happening
+			if newTotal%1000 == 0 {
+				logger.Info("Connection limiter: Connections released", "protocol", cl.protocol, "current_total", newTotal, "max", cl.maxConnections)
+			}
 
-			// Clean up IP entry if no connections remain (lazy cleanup)
-			if remaining <= 0 {
-				// Double-check after a brief moment to avoid race with new connections
-				// If a new connection arrives between Add(-1) and this check, we'll see count > 0
-				if ipCounter.Load() <= 0 {
-					// Final check: only delete if we can confirm the counter is still at the same address
-					// and still has zero value. This prevents deleting an entry that was just incremented
-					// by a racing new connection.
-					if loaded, ok := cl.perIPConnections.Load(trackingIP); ok {
-						if loadedCounter, ok := loaded.(*atomic.Int64); ok && loadedCounter == ipCounter && loadedCounter.Load() <= 0 {
-							cl.perIPConnections.CompareAndDelete(trackingIP, ipCounter)
+			if cl.maxPerIP > 0 && !isTrusted {
+				var remaining int64
+
+				// Use cluster-wide tracking if available, otherwise use local tracking
+				if cl.ipTracker != nil {
+					// Cluster mode: decrement cluster-wide counter
+					cl.ipTracker.DecrementIP(trackingIP)
+					remaining = int64(cl.ipTracker.GetIPCount(trackingIP))
+				} else if ipCounter != nil {
+					// Local mode: decrement local counter
+					remaining = ipCounter.Add(-1)
+
+					// Clean up IP entry if no connections remain (lazy cleanup)
+					if remaining <= 0 {
+						// Double-check after a brief moment to avoid race with new connections
+						// If a new connection arrives between Add(-1) and this check, we'll see count > 0
+						if ipCounter.Load() <= 0 {
+							// Final check: only delete if we can confirm the counter is still at the same address
+							// and still has zero value. This prevents deleting an entry that was just incremented
+							// by a racing new connection.
+							if loaded, ok := cl.perIPConnections.Load(trackingIP); ok {
+								if loadedCounter, ok := loaded.(*atomic.Int64); ok && loadedCounter == ipCounter && loadedCounter.Load() <= 0 {
+									cl.perIPConnections.CompareAndDelete(trackingIP, ipCounter)
+								}
+							}
 						}
 					}
 				}
-			}
 
-			if realClientIP != "" {
-				logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
+				if realClientIP != "" {
+					logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
+				} else {
+					logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
+				}
 			} else {
-				logger.Debug("Connection limiter: Connection released", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load(), "per_ip", remaining)
+				if realClientIP != "" {
+					logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", cl.currentTotal.Load())
+				} else {
+					logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load())
+				}
 			}
-		} else {
-			if realClientIP != "" {
-				logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "remote", GetAddrString(remoteAddr), "real_client", realClientIP, "total", cl.currentTotal.Load())
-			} else {
-				logger.Debug("Connection limiter: Connection released - unlimited", "protocol", cl.protocol, "ip", trackingIP, "total", cl.currentTotal.Load())
-			}
-		}
+		})
 	}, nil
 }
 
@@ -283,17 +346,26 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 			}
 		}
 
-		if value, exists := cl.perIPConnections.Load(checkIP); exists {
-			ipCounter := value.(*atomic.Int64)
-			current := ipCounter.Load()
-			if current >= int64(cl.maxPerIP) {
-				if realClientIP != "" {
-					logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "proxy_addr", GetAddrString(remoteAddr), "real_client", realClientIP, "current", current, "max", cl.maxPerIP)
-				} else {
-					logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", checkIP, "current", current, "max", cl.maxPerIP)
-				}
-				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
+		// Use cluster-wide count if tracker is available, otherwise use local count
+		var current int64
+		if cl.ipTracker != nil {
+			// Cluster mode: check cluster-wide count
+			current = int64(cl.ipTracker.GetIPCount(checkIP))
+		} else {
+			// Local mode: check local count
+			if value, exists := cl.perIPConnections.Load(checkIP); exists {
+				ipCounter := value.(*atomic.Int64)
+				current = ipCounter.Load()
 			}
+		}
+
+		if current >= int64(cl.maxPerIP) {
+			if realClientIP != "" {
+				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "proxy_addr", GetAddrString(remoteAddr), "real_client", realClientIP, "current", current, "max", cl.maxPerIP)
+			} else {
+				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", checkIP, "current", current, "max", cl.maxPerIP)
+			}
+			return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
 		}
 	}
 
@@ -310,12 +382,25 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 		IPConnections:    make(map[string]int64),
 	}
 
-	cl.perIPConnections.Range(func(key, value interface{}) bool {
-		ip := key.(string)
-		counter := value.(*atomic.Int64)
-		stats.IPConnections[ip] = counter.Load()
-		return true
-	})
+	// Get per-IP counts from cluster tracker if available, otherwise from local map
+	if cl.ipTracker != nil {
+		// Cluster mode: get cluster-wide IP counts from tracker
+		cl.ipTracker.mu.RLock()
+		for ip, info := range cl.ipTracker.connections {
+			if info.TotalCount > 0 {
+				stats.IPConnections[ip] = int64(info.TotalCount)
+			}
+		}
+		cl.ipTracker.mu.RUnlock()
+	} else {
+		// Local mode: get local IP counts from map
+		cl.perIPConnections.Range(func(key, value interface{}) bool {
+			ip := key.(string)
+			counter := value.(*atomic.Int64)
+			stats.IPConnections[ip] = counter.Load()
+			return true
+		})
+	}
 
 	return stats
 }

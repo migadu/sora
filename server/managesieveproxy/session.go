@@ -1034,28 +1034,20 @@ func (s *Session) close() {
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
 
-	// Unregister connection asynchronously - don't block session cleanup
-	if s.accountID > 0 {
-		accountID := s.accountID
+	// Unregister connection SYNCHRONOUSLY to prevent leak
+	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
+	// Background goroutine was causing leaks when server shutdown or high load prevented execution
+	if s.accountID > 0 && s.server.connTracker != nil {
+		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
+		// UnregisterConnection is fast (in-memory only), so this won't block for long
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
 		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		connTracker := s.server.connTracker
-
-		// Fire-and-forget: unregister in background to avoid blocking session teardown
-		go func() {
-			// Check if connection tracker is available before using it
-			if connTracker == nil {
-				return
-			}
-
-			// Use a new background context for this final operation, as s.ctx is likely already cancelled.
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			if err := connTracker.UnregisterConnection(ctx, accountID, "ManageSieve", clientAddr); err != nil {
-				// Connection tracking is non-critical monitoring data, so log but continue
-				s.DebugLog("Failed to unregister connection", "error", err)
-			}
-		}()
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "ManageSieve", clientAddr); err != nil {
+			// Connection tracking is non-critical monitoring data, so log but continue
+			s.WarnLog("Failed to unregister connection", "error", err)
+		}
 	}
 
 	if s.clientConn != nil {

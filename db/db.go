@@ -789,11 +789,11 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		}
 
 		// Apply pool configuration
-		if endpoint.MaxConns > 0 {
-			config.MaxConns = int32(endpoint.MaxConns)
+		if endpoint.MaxConnections > 0 {
+			config.MaxConns = int32(endpoint.MaxConnections)
 		}
-		if endpoint.MinConns > 0 {
-			config.MinConns = int32(endpoint.MinConns)
+		if endpoint.MinConnections > 0 {
+			config.MinConns = int32(endpoint.MinConnections)
 		}
 
 		if endpoint.MaxConnLifetime != "" {

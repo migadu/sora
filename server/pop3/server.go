@@ -632,3 +632,8 @@ func (s *POP3Server) monitorActiveSessions() {
 		}
 	}
 }
+
+// GetLimiter returns the connection limiter for testing purposes
+func (s *POP3Server) GetLimiter() *serverPkg.ConnectionLimiter {
+	return s.limiter
+}

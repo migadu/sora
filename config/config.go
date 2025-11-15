@@ -43,8 +43,8 @@ type DatabaseEndpointConfig struct {
 	Password        string   `toml:"password"`
 	Name            string   `toml:"name"`
 	TLSMode         bool     `toml:"tls"`
-	MaxConns        int      `toml:"max_conns"`          // Maximum number of connections in the pool
-	MinConns        int      `toml:"min_conns"`          // Minimum number of connections in the pool
+	MaxConnections  int      `toml:"max_connections"`    // Maximum number of connections in the pool
+	MinConnections  int      `toml:"min_connections"`    // Minimum number of connections in the pool
 	MaxConnLifetime string   `toml:"max_conn_lifetime"`  // Maximum lifetime of a connection
 	MaxConnIdleTime string   `toml:"max_conn_idle_time"` // Maximum idle time before a connection is closed
 	QueryTimeout    string   `toml:"query_timeout"`      // Per-endpoint timeout for individual database queries (e.g., "30s")
@@ -1362,8 +1362,8 @@ func NewDefaultConfig() Config {
 				Password:        "",
 				Name:            "sora_mail_db",
 				TLSMode:         false,
-				MaxConns:        100,
-				MinConns:        10,
+				MaxConnections:  100,
+				MinConnections:  10,
 				MaxConnLifetime: "1h",
 				MaxConnIdleTime: "30m",
 				QueryTimeout:    "30s",
@@ -1375,8 +1375,8 @@ func NewDefaultConfig() Config {
 				Password:        "",
 				Name:            "sora_mail_db",
 				TLSMode:         false,
-				MaxConns:        100,
-				MinConns:        10,
+				MaxConnections:  100,
+				MinConnections:  10,
 				MaxConnLifetime: "1h",
 				MaxConnIdleTime: "30m",
 				QueryTimeout:    "30s",

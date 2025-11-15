@@ -650,3 +650,8 @@ func (s *ManageSieveServer) monitorActiveSessions() {
 		}
 	}
 }
+
+// GetLimiter returns the connection limiter for testing purposes
+func (s *ManageSieveServer) GetLimiter() *serverPkg.ConnectionLimiter {
+	return s.limiter
+}

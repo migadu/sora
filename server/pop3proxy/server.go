@@ -14,6 +14,7 @@ import (
 
 	"github.com/migadu/sora/logger"
 
+	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
@@ -140,10 +141,13 @@ type POP3ProxyServerOptions struct {
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 
 	// Connection limiting
-	MaxConnections      int      // Maximum total connections (0 = unlimited)
-	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
+	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
 	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+
+	// Cluster support
+	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -211,7 +215,14 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
 	if options.MaxConnections > 0 || options.MaxConnectionsPerIP > 0 {
-		limiter = server.NewConnectionLimiterWithTrustedNets("POP3-PROXY", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
+		if options.ClusterManager != nil {
+			// Cluster mode: use cluster-wide per-IP limiting
+			instanceID := fmt.Sprintf("pop3-proxy-%s-%d", hostname, time.Now().UnixNano())
+			limiter = server.NewConnectionLimiterWithCluster("POP3-PROXY", instanceID, options.ClusterManager, options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
+		} else {
+			// Local mode: use local-only limiting
+			limiter = server.NewConnectionLimiterWithTrustedNets("POP3-PROXY", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
+		}
 	}
 
 	// Setup debug writer with password masking if debug is enabled
@@ -546,6 +557,12 @@ func (s *POP3ProxyServer) monitorActiveSessions() {
 			count := len(s.activeSessions)
 			s.activeSessionsMu.RUnlock()
 
+			// Get unique user count from connection tracker (cluster-wide)
+			var uniqueUsers int
+			if s.connTracker != nil {
+				uniqueUsers = s.connTracker.GetUniqueUserCount()
+			}
+
 			// Also log connection limiter stats
 			var limiterStats string
 			if s.limiter != nil {
@@ -553,10 +570,15 @@ func (s *POP3ProxyServer) monitorActiveSessions() {
 				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
 			}
 
-			logger.Info("POP3 proxy active sessions", "proxy", s.name, "active_sessions", count, "limiter_stats", limiterStats)
+			logger.Info("POP3 proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers, "limiter_stats", limiterStats)
 
 		case <-s.appCtx.Done():
 			return
 		}
 	}
+}
+
+// GetLimiter returns the connection limiter for testing purposes
+func (s *POP3ProxyServer) GetLimiter() *server.ConnectionLimiter {
+	return s.limiter
 }

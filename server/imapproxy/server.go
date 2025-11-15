@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -142,10 +143,11 @@ type ServerOptions struct {
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
 
 	// Connection limiting
-	MaxConnections      int      // Maximum total connections (0 = unlimited)
-	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited)
-	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	MaxConnections      int              // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP int              // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
+	TrustedNetworks     []string         // CIDR blocks for trusted networks that bypass per-IP limits
+	ListenBacklog       int              // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ClusterManager      *cluster.Manager // Optional: enables cluster-wide per-IP limiting
 
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
@@ -211,7 +213,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
 	if opts.MaxConnections > 0 || opts.MaxConnectionsPerIP > 0 {
-		limiter = server.NewConnectionLimiterWithTrustedNets("IMAP-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		if opts.ClusterManager != nil {
+			// Cluster mode: use cluster-wide per-IP limiting
+			instanceID := fmt.Sprintf("imap-proxy-%s-%d", hostname, time.Now().UnixNano())
+			limiter = server.NewConnectionLimiterWithCluster("IMAP-PROXY", instanceID, opts.ClusterManager, opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		} else {
+			// Local mode: use local-only limiting
+			limiter = server.NewConnectionLimiterWithTrustedNets("IMAP-PROXY", opts.MaxConnections, opts.MaxConnectionsPerIP, opts.TrustedNetworks)
+		}
 	}
 
 	// Setup debug writer with password masking if debug is enabled
@@ -444,6 +453,10 @@ func (s *Server) acceptConnections() error {
 				if r := recover(); r != nil {
 					logger.Error("Session panic recovered", "proxy", s.name, "error", r)
 					conn.Close()
+					// Ensure connection limiter is released on panic
+					if releaseConn != nil {
+						releaseConn()
+					}
 				}
 			}()
 
@@ -600,6 +613,12 @@ func (s *Server) monitorActiveSessions() {
 			count := len(s.activeSessions)
 			s.activeSessionsMu.RUnlock()
 
+			// Get unique user count from connection tracker (cluster-wide)
+			var uniqueUsers int
+			if s.connTracker != nil {
+				uniqueUsers = s.connTracker.GetUniqueUserCount()
+			}
+
 			// Also log connection limiter stats
 			var limiterStats string
 			if s.limiter != nil {
@@ -607,10 +626,15 @@ func (s *Server) monitorActiveSessions() {
 				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
 			}
 
-			logger.Info("IMAP proxy active sessions", "proxy", s.name, "active_sessions", count, "limiter_stats", limiterStats)
+			logger.Info("IMAP proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers, "limiter_stats", limiterStats)
 
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+// GetLimiter returns the connection limiter for testing purposes
+func (s *Server) GetLimiter() *server.ConnectionLimiter {
+	return s.limiter
 }
