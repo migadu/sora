@@ -461,6 +461,22 @@ func (t *IPLimitTracker) performCleanup() {
 	if cleaned > 0 {
 		logger.Debug("IP limit tracker: Cleaned up stale IPs", "protocol", t.protocol, "count", cleaned)
 	}
+
+	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
+	// This helps monitor for memory leaks without flooding logs
+	t.cleanupCounter++
+	if t.cleanupCounter%10 == 0 {
+		totalIPs := len(t.connections)
+		totalInstances := 0
+		for _, info := range t.connections {
+			totalInstances += len(info.LocalInstances)
+		}
+
+		logger.Info("IP limit tracker stats", "protocol", t.protocol,
+			"total_ips", totalIPs,
+			"total_instances", totalInstances,
+			"cleanup_cycles", t.cleanupCounter)
+	}
 }
 
 // stateSnapshotRoutine periodically broadcasts full state snapshots

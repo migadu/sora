@@ -4,6 +4,7 @@ package common
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -1311,4 +1312,160 @@ func SetupManageSieveServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 		cleanup:     cleanup,
 		ResilientDB: rdb,
 	}, account
+}
+
+// DialPOP3 connects to a POP3 server and reads the greeting
+func DialPOP3(address string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// Read greeting (+OK ...)
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read greeting: %w", err)
+	}
+
+	greeting := string(buf[:n])
+	if !strings.HasPrefix(greeting, "+OK") {
+		conn.Close()
+		return nil, fmt.Errorf("invalid greeting: %s", greeting)
+	}
+
+	return conn, nil
+}
+
+// POP3Login authenticates with USER/PASS commands
+func POP3Login(conn net.Conn, email, password string) error {
+	// Send USER command
+	if _, err := fmt.Fprintf(conn, "USER %s\r\n", email); err != nil {
+		return fmt.Errorf("failed to send USER: %w", err)
+	}
+
+	// Read USER response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("failed to read USER response: %w", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "+OK") {
+		return fmt.Errorf("USER failed: %s", string(buf[:n]))
+	}
+
+	// Send PASS command
+	if _, err := fmt.Fprintf(conn, "PASS %s\r\n", password); err != nil {
+		return fmt.Errorf("failed to send PASS: %w", err)
+	}
+
+	// Read PASS response
+	n, err = conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("failed to read PASS response: %w", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "+OK") {
+		return fmt.Errorf("PASS failed: %s", string(buf[:n]))
+	}
+
+	return nil
+}
+
+// POP3Quit sends QUIT command and closes connection
+func POP3Quit(conn net.Conn) error {
+	if _, err := fmt.Fprintf(conn, "QUIT\r\n"); err != nil {
+		return fmt.Errorf("failed to send QUIT: %w", err)
+	}
+
+	// Read QUIT response
+	buf := make([]byte, 1024)
+	_, _ = conn.Read(buf) // Ignore errors on quit
+
+	return conn.Close()
+}
+
+// DialManageSieve connects to a ManageSieve server and reads the greeting
+func DialManageSieve(address string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// Read greeting (OK ...)
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read greeting: %w", err)
+	}
+
+	greeting := string(buf[:n])
+	if !strings.Contains(greeting, "OK") {
+		conn.Close()
+		return nil, fmt.Errorf("invalid greeting: %s", greeting)
+	}
+
+	return conn, nil
+}
+
+// ManageSieveLogin authenticates with AUTHENTICATE PLAIN (one-line form)
+func ManageSieveLogin(conn net.Conn, email, password string) error {
+	// Encode credentials: base64(\0email\0password)
+	credentials := fmt.Sprintf("\x00%s\x00%s", email, password)
+	encoded := base64.StdEncoding.EncodeToString([]byte(credentials))
+
+	// Send AUTHENTICATE PLAIN command with credentials in one line
+	if _, err := fmt.Fprintf(conn, "AUTHENTICATE \"PLAIN\" \"%s\"\r\n", encoded); err != nil {
+		return fmt.Errorf("failed to send AUTHENTICATE: %w", err)
+	}
+
+	// Read authentication response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return fmt.Errorf("failed to read auth response: %w", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "OK") {
+		return fmt.Errorf("authentication failed: %s", string(buf[:n]))
+	}
+
+	return nil
+}
+
+// ManageSieveLogout sends LOGOUT command and closes connection
+func ManageSieveLogout(conn net.Conn) error {
+	if _, err := fmt.Fprintf(conn, "LOGOUT\r\n"); err != nil {
+		return fmt.Errorf("failed to send LOGOUT: %w", err)
+	}
+
+	// Read LOGOUT response
+	buf := make([]byte, 1024)
+	_, _ = conn.Read(buf) // Ignore errors on logout
+
+	return conn.Close()
+}
+
+// DialLMTP connects to an LMTP server and reads the greeting
+func DialLMTP(address string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// Read greeting (220 ...)
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to read greeting: %w", err)
+	}
+
+	greeting := string(buf[:n])
+	if !strings.HasPrefix(greeting, "220") {
+		conn.Close()
+		return nil, fmt.Errorf("invalid greeting: %s", greeting)
+	}
+
+	return conn, nil
 }

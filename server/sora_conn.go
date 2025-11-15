@@ -65,6 +65,13 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 	var totalBytes int64
 	nextDeadline := time.Now()
 
+	// Enable TCP keepalive to detect dead connections without disrupting IDLE
+	// Keepalive probes detect truly dead TCP connections while allowing legitimate silence
+	if tcpConn, ok := src.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(2 * time.Minute) // Send keepalive probe every 2 minutes
+	}
+
 	for {
 		select {
 		case <-ctx.Done():

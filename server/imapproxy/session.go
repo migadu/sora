@@ -41,6 +41,7 @@ type Session struct {
 	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
 	sessionID          string // Proxy session ID for end-to-end tracing
+	clientAddr         string // Cached client address to avoid touching closed connection
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -50,13 +51,14 @@ type Session struct {
 }
 
 // newSession creates a new IMAP proxy session.
-func newSession(server *Server, conn net.Conn) *Session {
-	sessionCtx, sessionCancel := context.WithCancel(server.ctx)
+func newSession(s *Server, conn net.Conn) *Session {
+	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 	return &Session{
-		server:       server,
+		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
+		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		errorCount:   0,
@@ -68,6 +70,16 @@ func newSession(server *Server, conn net.Conn) *Session {
 func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
+	defer logger.Debug("handleConnection() returning", "proxy", s.server.name, "username", s.username)
+
+	// Enforce absolute session timeout to prevent hung sessions from leaking
+	if s.server.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
+			logger.Info("Absolute session timeout reached - force closing", "proxy", s.server.name, "duration", s.server.absoluteSessionTimeout, "username", s.username)
+			s.cancel() // Force cancel context to unblock any stuck I/O
+		})
+		defer timeout.Stop()
+	}
 
 	s.InfoLog("connected")
 
@@ -994,26 +1006,39 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 
 // startProxy starts bidirectional proxying between client and backend.
 func (s *Session) startProxy() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("PANIC in startProxy()", "proxy", s.server.name, "username", s.username, "panic", r)
+			// Re-panic to preserve stack trace
+			panic(r)
+		}
+	}()
+	logger.Info("startProxy() called", "proxy", s.server.name, "username", s.username)
 	if s.backendConn == nil {
 		logger.Error("Backend connection not established", "proxy", s.server.name, "user", s.username)
 		return
 	}
 
 	var wg sync.WaitGroup
+	logger.Info("Created waitgroup", "proxy", s.server.name, "username", s.username)
 
 	// Start activity updater
 	activityCtx, activityCancel := context.WithCancel(s.ctx)
 	defer activityCancel()
+	logger.Info("Starting activity updater", "proxy", s.server.name, "username", s.username)
 	go s.updateActivityPeriodically(activityCtx)
 
 	// Client to backend
+	logger.Info("Starting client-to-backend copy goroutine", "proxy", s.server.name, "username", s.username)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer logger.Info("Client-to-backend copy goroutine exiting", "proxy", s.server.name, "username", s.username)
 		// If this copy returns, it means the client has closed the connection or there was an error.
 		// We must close the backend connection to unblock the other copy operation.
 		defer s.backendConn.Close()
 		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
+		logger.Info("Client-to-backend copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesIn, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from client to backend", "error", err)
@@ -1021,9 +1046,11 @@ func (s *Session) startProxy() {
 	}()
 
 	// Backend to client
+	logger.Info("Starting backend-to-client copy goroutine", "proxy", s.server.name, "username", s.username)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer logger.Info("Backend-to-client copy goroutine exiting", "proxy", s.server.name, "username", s.username)
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We must close the client connection to unblock the other copy operation.
 		defer s.clientConn.Close()
@@ -1039,6 +1066,7 @@ func (s *Session) startProxy() {
 			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)
 			bytesOut, err = server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		}
+		logger.Info("Backend-to-client copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesOut, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from backend to client", "error", err)
@@ -1047,21 +1075,33 @@ func (s *Session) startProxy() {
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
 	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
-	wg.Add(1)
+	// NOTE: This is NOT part of the waitgroup to avoid circular dependency where:
+	//   - wg.Wait() waits for this goroutine
+	//   - this goroutine waits for ctx.Done()
+	//   - ctx.Done() fires when handleConnection() returns
+	//   - handleConnection() can't return because it's blocked in wg.Wait()
+	logger.Info("Starting context cancellation handler goroutine", "proxy", s.server.name, "username", s.username)
 	go func() {
-		defer wg.Done()
+		defer logger.Info("Context cancellation handler goroutine exiting", "proxy", s.server.name, "username", s.username)
+		logger.Info("Context cancellation handler waiting for ctx.Done()", "proxy", s.server.name, "username", s.username)
 		<-s.ctx.Done()
+		logger.Info("Context cancelled - closing connections", "proxy", s.server.name, "username", s.username)
 		s.clientConn.Close()
 		s.backendConn.Close()
 	}()
 
+	logger.Info("Waiting for copy goroutines to finish", "proxy", s.server.name, "username", s.username)
 	wg.Wait()
+	logger.Info("Copy goroutines finished - startProxy() returning", "proxy", s.server.name, "username", s.username)
 }
 
 // close closes all connections.
 func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// DEBUG: Log entry to close() to track if it's being called
+	logger.Debug("Session close() called", "proxy", s.server.name, "username", s.username, "account_id", s.accountID)
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
@@ -1093,11 +1133,18 @@ func (s *Session) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "IMAP", clientAddr); err != nil {
+		// DEBUG: Log before unregister attempt
+		logger.Info("Attempting to unregister connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username, "client_addr", s.clientAddr)
+
+		// Use cached client address to avoid race with connection close
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "IMAP", s.clientAddr); err != nil {
 			// Connection tracking is non-critical monitoring data, so log but continue
 			s.WarnLog("Failed to unregister connection", "error", err)
+		} else {
+			logger.Info("Successfully unregistered connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username)
 		}
+	} else {
+		logger.Info("Skipping unregister - no accountID or connTracker", "proxy", s.server.name, "account_id", s.accountID, "has_tracker", s.server.connTracker != nil)
 	}
 
 	if s.clientConn != nil {

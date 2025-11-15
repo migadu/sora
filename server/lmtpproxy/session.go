@@ -36,6 +36,7 @@ type Session struct {
 	accountID          int64
 	serverAddr         string
 	routingMethod      string
+	clientAddr         string // Cached client address to avoid race with connection close
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -43,13 +44,14 @@ type Session struct {
 }
 
 // newSession creates a new LMTP proxy session.
-func newSession(server *Server, conn net.Conn) *Session {
-	sessionCtx, sessionCancel := context.WithCancel(server.ctx)
+func newSession(s *Server, conn net.Conn) *Session {
+	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 	return &Session{
-		server:       server,
+		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
+		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
 		startTime:    time.Now(),
@@ -774,9 +776,12 @@ func (s *Session) startProxy(initialCommand string) {
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
 	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
-	wg.Add(1)
+	// NOTE: This is NOT part of the waitgroup to avoid circular dependency where:
+	//   - wg.Wait() waits for this goroutine
+	//   - this goroutine waits for ctx.Done()
+	//   - ctx.Done() fires when handleConnection() returns
+	//   - handleConnection() can't return because it's blocked in wg.Wait()
 	go func() {
-		defer wg.Done()
 		<-s.ctx.Done()
 		s.clientConn.Close()
 		s.backendConn.Close()
@@ -880,8 +885,8 @@ func (s *Session) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "LMTP", clientAddr); err != nil {
+		// Use cached client address to avoid race with connection close
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "LMTP", s.clientAddr); err != nil {
 			// Connection tracking is non-critical monitoring data, so log but continue
 			s.WarnLog("Failed to unregister connection", "error", err)
 		}

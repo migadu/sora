@@ -40,7 +40,8 @@ type Session struct {
 	routingInfo        *proxy.UserRoutingInfo
 	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
 	serverAddr         string
-	isTLS              bool // Whether the client connection is over TLS
+	clientAddr         string // Cached client address to avoid race with connection close
+	isTLS              bool   // Whether the client connection is over TLS
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -50,15 +51,16 @@ type Session struct {
 }
 
 // newSession creates a new ManageSieve proxy session.
-func newSession(server *Server, conn net.Conn) *Session {
-	sessionCtx, sessionCancel := context.WithCancel(server.ctx)
+func newSession(s *Server, conn net.Conn) *Session {
+	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 	// Check if connection is already TLS (implicit TLS)
 	_, isTLS := conn.(*tls.Conn)
 	return &Session{
-		server:       server,
+		server:       s,
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
+		clientAddr:   server.GetAddrString(conn.RemoteAddr()), // Cache address to avoid race with connection close
 		isTLS:        isTLS,
 		ctx:          sessionCtx,
 		cancel:       sessionCancel,
@@ -71,6 +73,15 @@ func newSession(server *Server, conn net.Conn) *Session {
 func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
+
+	// Enforce absolute session timeout to prevent hung sessions from leaking
+	if s.server.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
+			logger.Info("Absolute session timeout reached - force closing", "name", s.server.name, "duration", s.server.absoluteSessionTimeout, "username", s.username)
+			s.cancel() // Force cancel context to unblock any stuck I/O
+		})
+		defer timeout.Stop()
+	}
 
 	s.InfoLog("connected")
 
@@ -1001,9 +1012,12 @@ func (s *Session) startProxy() {
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
 	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
-	wg.Add(1)
+	// NOTE: This is NOT part of the waitgroup to avoid circular dependency where:
+	//   - wg.Wait() waits for this goroutine
+	//   - this goroutine waits for ctx.Done()
+	//   - ctx.Done() fires when handleConnection() returns
+	//   - handleConnection() can't return because it's blocked in wg.Wait()
 	go func() {
-		defer wg.Done()
 		<-s.ctx.Done()
 		s.clientConn.Close()
 		s.backendConn.Close()
@@ -1043,8 +1057,8 @@ func (s *Session) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "ManageSieve", clientAddr); err != nil {
+		// Use cached client address to avoid race with connection close
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "ManageSieve", s.clientAddr); err != nil {
 			// Connection tracking is non-critical monitoring data, so log but continue
 			s.WarnLog("Failed to unregister connection", "error", err)
 		}

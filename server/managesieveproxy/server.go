@@ -416,12 +416,6 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Debug("ManageSieve Proxy: Session panic recovered", "name", s.name, "panic", r)
-					conn.Close()
-				}
-			}()
 
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("managesieve_proxy").Inc()
@@ -430,6 +424,24 @@ func (s *Server) acceptConnections() error {
 			session := newSession(s, conn)
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.addSession(session)
+
+			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Debug("ManageSieve Proxy: Session panic recovered", "name", s.name, "panic", r)
+					// Clean up session from active tracking
+					s.removeSession(session)
+					// Decrement metrics
+					metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
+					// Close connection
+					conn.Close()
+					// Ensure connection limiter is released on panic
+					if releaseConn != nil {
+						releaseConn()
+					}
+				}
+			}()
+
 			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
@@ -440,6 +452,11 @@ func (s *Server) acceptConnections() error {
 // SetConnectionTracker sets the connection tracker for the server.
 func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	s.connTracker = tracker
+}
+
+// GetConnectionTracker returns the connection tracker for the server.
+func (s *Server) GetConnectionTracker() *server.ConnectionTracker {
+	return s.connTracker
 }
 
 // GetConnectionManager returns the connection manager for health checks
@@ -578,14 +595,7 @@ func (s *Server) monitorActiveSessions() {
 				uniqueUsers = s.connTracker.GetUniqueUserCount()
 			}
 
-			// Also log connection limiter stats
-			var limiterStats string
-			if s.limiter != nil {
-				stats := s.limiter.GetStats()
-				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
-			}
-
-			logger.Info("ManageSieve proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers, "limiter_stats", limiterStats)
+			logger.Info("ManageSieve proxy active sessions", "proxy", s.name, "active_sessions", count, "unique_users", uniqueUsers)
 
 		case <-s.ctx.Done():
 			return

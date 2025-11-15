@@ -51,6 +51,15 @@ func (s *POP3ProxySession) handleConnection() {
 
 	s.startTime = time.Now()
 
+	// Enforce absolute session timeout to prevent hung sessions from leaking
+	if s.server.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
+			logger.Info("Absolute session timeout reached - force closing", "proxy", s.server.name, "duration", s.server.absoluteSessionTimeout, "username", s.username)
+			s.cancel() // Force cancel context to unblock any stuck I/O
+		})
+		defer timeout.Stop()
+	}
+
 	// Log connection at INFO level
 	s.InfoLog("connected")
 
@@ -816,9 +825,12 @@ func (s *POP3ProxySession) startProxying() {
 
 	// Context cancellation handler - ensures connections are closed when context is cancelled
 	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
-	wg.Add(1)
+	// NOTE: This is NOT part of the waitgroup to avoid circular dependency where:
+	//   - wg.Wait() waits for this goroutine
+	//   - this goroutine waits for ctx.Done()
+	//   - ctx.Done() fires when handleConnection() returns
+	//   - handleConnection() can't return because it's blocked in wg.Wait()
 	go func() {
-		defer wg.Done()
 		<-s.ctx.Done()
 		s.clientConn.Close()
 		s.backendConn.Close()

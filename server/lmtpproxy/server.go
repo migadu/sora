@@ -412,24 +412,28 @@ func (s *Server) acceptConnections() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer func() {
-				// Release connection limit when session ends
-				if releaseConn != nil {
-					releaseConn()
-				}
-			}()
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Debug("LMTP Proxy: Session panic recovered", "name", s.name, "panic", r)
-					conn.Close()
-				}
-			}()
 
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy").Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Inc()
 
 			session := newSession(s, conn)
+
+			// CRITICAL: Panic recovery MUST clean up metrics and limiter
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Debug("LMTP Proxy: Session panic recovered", "name", s.name, "panic", r)
+					// Decrement metrics (session never registered itself due to panic)
+					metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
+					// Close connection
+					conn.Close()
+					// Release connection limit
+					if releaseConn != nil {
+						releaseConn()
+					}
+				}
+			}()
+
 			session.handleConnection()
 		}()
 	}
@@ -438,6 +442,11 @@ func (s *Server) acceptConnections() error {
 // SetConnectionTracker sets the connection tracker for the server.
 func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	s.connTracker = tracker
+}
+
+// GetConnectionTracker returns the connection tracker for the server.
+func (s *Server) GetConnectionTracker() *server.ConnectionTracker {
+	return s.connTracker
 }
 
 // GetConnectionManager returns the connection manager for health checks
