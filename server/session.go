@@ -31,11 +31,6 @@ type logFunc func(msg string, keyvals ...any)
 
 // log is the common logging implementation for all log levels
 func (s *Session) log(logFn logFunc, format string, args ...any) {
-	user := "none"
-	if s.User != nil {
-		user = fmt.Sprintf("%s/%d", s.FullAddress(), s.AccountID())
-	}
-
 	// Build connection info - show proxy= when proxied, remote= when direct
 	var connInfo string
 	if s.ProxyIP != "" {
@@ -52,16 +47,31 @@ func (s *Session) log(logFn logFunc, format string, args ...any) {
 		protocolPrefix = s.Protocol
 	}
 
+	// Build base keyvals
+	baseKeyvals := []any{"protocol", protocolPrefix, "conn", connInfo}
+
+	// Add user and account_id separately if authenticated
+	if s.User != nil {
+		baseKeyvals = append(baseKeyvals, "user", s.FullAddress(), "account_id", s.AccountID())
+	}
+
+	// Add session ID
+	baseKeyvals = append(baseKeyvals, "session", s.Id)
+
+	// Add stats if available
 	if s.Stats != nil {
 		if s.Protocol == "LMTP" {
 			// LMTP has no authenticated sessions
-			logFn("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "msg", fmt.Sprintf(format, args...))
+			baseKeyvals = append(baseKeyvals, "conn_total", s.Stats.GetTotalConnections())
 		} else {
-			logFn("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "conn_total", s.Stats.GetTotalConnections(), "conn_auth", s.Stats.GetAuthenticatedConnections(), "msg", fmt.Sprintf(format, args...))
+			baseKeyvals = append(baseKeyvals, "conn_total", s.Stats.GetTotalConnections(), "conn_auth", s.Stats.GetAuthenticatedConnections())
 		}
-	} else {
-		logFn("Session", "protocol", protocolPrefix, "conn", connInfo, "user", user, "session", s.Id, "msg", fmt.Sprintf(format, args...))
 	}
+
+	// Add the formatted message
+	baseKeyvals = append(baseKeyvals, "msg", fmt.Sprintf(format, args...))
+
+	logFn("Session", baseKeyvals...)
 }
 
 func (s *Session) InfoLog(format string, args ...any) {
