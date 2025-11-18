@@ -2,9 +2,13 @@ package authcache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
@@ -19,24 +23,44 @@ const (
 	AuthInvalidPassword
 )
 
-// cacheEntry represents a cached authentication result
-type cacheEntry struct {
-	accountID      int64
-	hashedPassword string
-	result         AuthResult
-	expiresAt      time.Time
+// CacheEntry represents a cached authentication and routing result
+type CacheEntry struct {
+	// Authentication data
+	AccountID      int64
+	HashedPassword string // Stored password hash from database (for backend auth)
+	PasswordHash   string // SHA-256 hash of plaintext password for comparison
+
+	// Routing data (for proxy)
+	ServerAddress          string
+	RemoteTLS              bool
+	RemoteTLSUseStartTLS   bool
+	RemoteTLSVerify        bool
+	RemoteUseProxyProtocol bool
+	RemoteUseIDCommand     bool
+	RemoteUseXCLIENT       bool
+
+	// Metadata
+	Result        AuthResult
+	FromPrelookup bool // True if this came from prelookup API
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	IsNegative    bool
 }
 
 // AuthCache provides in-memory caching for authentication results
 type AuthCache struct {
 	mu              sync.RWMutex
-	entries         map[string]*cacheEntry
+	entries         map[string]*CacheEntry
 	positiveTTL     time.Duration
 	negativeTTL     time.Duration
 	maxSize         int
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	cleanupStopped  chan struct{}
+
+	// Revalidation windows for password change detection
+	negativeRevalidationWindow time.Duration
+	positiveRevalidationWindow time.Duration
 
 	// Metrics
 	hits   uint64
@@ -47,87 +71,142 @@ type AuthCache struct {
 }
 
 // New creates a new authentication cache instance
-func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration) *AuthCache {
+func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, negativeRevalidationWindow, positiveRevalidationWindow time.Duration) *AuthCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
 	if cleanupInterval <= 0 {
 		cleanupInterval = 5 * time.Minute
 	}
+	if negativeRevalidationWindow <= 0 {
+		negativeRevalidationWindow = 5 * time.Second
+	}
+	if positiveRevalidationWindow <= 0 {
+		positiveRevalidationWindow = 30 * time.Second
+	}
 
 	cache := &AuthCache{
-		entries:         make(map[string]*cacheEntry),
-		positiveTTL:     positiveTTL,
-		negativeTTL:     negativeTTL,
-		maxSize:         maxSize,
-		cleanupInterval: cleanupInterval,
-		stopCleanup:     make(chan struct{}),
-		cleanupStopped:  make(chan struct{}),
+		entries:                    make(map[string]*CacheEntry),
+		positiveTTL:                positiveTTL,
+		negativeTTL:                negativeTTL,
+		maxSize:                    maxSize,
+		cleanupInterval:            cleanupInterval,
+		negativeRevalidationWindow: negativeRevalidationWindow,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		stopCleanup:                make(chan struct{}),
+		cleanupStopped:             make(chan struct{}),
 	}
 
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
 	logger.Info("AuthCache: Initialized", "positive_ttl", positiveTTL,
-		"negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval)
+		"negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval,
+		"negative_revalidation_window", negativeRevalidationWindow, "positive_revalidation_window", positiveRevalidationWindow)
 
 	return cache
 }
 
+// HashPassword creates a SHA-256 hash of the password for cache comparison.
+// This is used to detect password changes without storing plaintext passwords in the cache.
+func HashPassword(password string) string {
+	if password == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(hash[:])
+}
+
+// IsOld checks if a cache entry is older than the given duration
+func (e *CacheEntry) IsOld(duration time.Duration) bool {
+	return time.Since(e.CreatedAt) > duration
+}
+
 // Authenticate attempts to authenticate using cached data
-// Returns (accountID, nil) on success, or (0, error) if not in cache or cache miss
-// If credentials are in cache, it verifies the password against the cached hash
-// If password doesn't match cached hash, invalidates the cache (password changed)
-func (c *AuthCache) Authenticate(address, password string) (int64, bool) {
+// Returns:
+//   - (accountID, true, nil) on cache hit with successful authentication
+//   - (0, false, nil) if not in cache or needs revalidation (caller should check database)
+//   - (0, false, error) on cached authentication failure (caller should NOT check database)
+//
+// Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
+func (c *AuthCache) Authenticate(address, password string) (accountID int64, found bool, err error) {
 	c.mu.RLock()
 	entry, exists := c.entries[address]
 	if !exists {
 		c.mu.RUnlock()
 		c.misses++
 		metrics.AuthCacheMissesTotal.Inc()
-		return 0, false
+		return 0, false, nil
 	}
 
 	// Check if expired
-	if time.Now().After(entry.expiresAt) {
+	if time.Now().After(entry.ExpiresAt) {
 		c.mu.RUnlock()
 		c.misses++
 		metrics.AuthCacheMissesTotal.Inc()
-		return 0, false
+		return 0, false, nil
 	}
 
 	c.hits++
 	metrics.AuthCacheHitsTotal.Inc()
 
-	// If it's a negative cache entry (user not found or previous auth failed)
-	if entry.result != AuthSuccess {
-		c.mu.RUnlock()
-		return 0, false
-	}
+	// Hash the provided password for comparison
+	passwordHash := HashPassword(password)
 
-	// Verify password against cached hash
-	if err := db.VerifyPassword(entry.hashedPassword, password); err != nil {
-		// Password verification failed - password likely changed
-		// Release read lock and acquire write lock to invalidate
+	// Check if password matches cached hash
+	// Note: entry.PasswordHash should never be empty for valid entries, but we check defensively
+	passwordMatches := (entry.PasswordHash != "" && entry.PasswordHash == passwordHash)
+
+	// Handle negative cache entries (failed authentication)
+	if entry.Result != AuthSuccess {
 		c.mu.RUnlock()
-		c.mu.Lock()
-		// Double-check entry still exists and hasn't changed
-		if currentEntry, stillExists := c.entries[address]; stillExists && currentEntry == entry {
-			logger.Debug("AuthCache: Password mismatch - invalidating cache", "address", address)
-			delete(c.entries, address)
-			metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+		if passwordMatches {
+			// Same wrong password - return cached failure WITHOUT going to database
+			logger.Info("Authentication failed (cached)", "address", address, "cache", "hit", "age", time.Since(entry.CreatedAt))
+			// Return error to signal cached failure (don't query database)
+			return 0, false, consts.ErrAuthenticationFailed
+		} else {
+			// Different password - allow revalidation if entry is old enough
+			if entry.IsOld(c.negativeRevalidationWindow) {
+				// Entry is old enough - allow revalidation
+				logger.Debug("Auth cache: negative entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+				return 0, false, nil
+			} else {
+				// Entry is too fresh - likely brute force attempt, block revalidation
+				logger.Info("Authentication failed (cached, different password blocked)", "address", address, "cache", "hit", "age", time.Since(entry.CreatedAt))
+				return 0, false, consts.ErrAuthenticationFailed
+			}
 		}
-		c.mu.Unlock()
-		return 0, false
 	}
 
-	c.mu.RUnlock()
-	// Password verified successfully
-	return entry.accountID, true
+	// Positive cache entry - successful authentication previously cached
+	if passwordMatches {
+		// Same password - verify against bcrypt hash and return success
+		if err := db.VerifyPassword(entry.HashedPassword, password); err != nil {
+			// Bcrypt verification failed even though password hash matched
+			// This shouldn't happen, but handle it by invalidating the cache
+			c.mu.RUnlock()
+			c.Invalidate(address)
+			return 0, false, nil
+		}
+		c.mu.RUnlock()
+		return entry.AccountID, true, nil
+	} else {
+		// Different password on positive entry - allow revalidation if old enough
+		c.mu.RUnlock()
+		if entry.IsOld(c.positiveRevalidationWindow) {
+			// Entry is old enough - allow revalidation
+			return 0, false, nil
+		} else {
+			// Entry is too fresh - likely wrong password attempt
+			logger.Info("Authentication failed (cached positive entry, wrong password)", "address", address, "cache", "hit")
+			return 0, false, consts.ErrAuthenticationFailed
+		}
+	}
 }
 
 // SetSuccess caches a successful authentication result
-func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword string) {
+func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword string, password string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -136,11 +215,14 @@ func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword s
 		c.evictOldest()
 	}
 
-	c.entries[address] = &cacheEntry{
-		accountID:      accountID,
-		hashedPassword: hashedPassword,
-		result:         AuthSuccess,
-		expiresAt:      time.Now().Add(c.positiveTTL),
+	now := time.Now()
+	c.entries[address] = &CacheEntry{
+		AccountID:      accountID,
+		HashedPassword: hashedPassword,
+		PasswordHash:   HashPassword(password),
+		Result:         AuthSuccess,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(c.positiveTTL),
 	}
 
 	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
@@ -148,7 +230,8 @@ func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword s
 
 // SetFailure caches a failed authentication result (user not found or invalid password)
 // result parameter: 0 = success (ignored), 1 = user not found, 2 = invalid password
-func (c *AuthCache) SetFailure(address string, result int) {
+// password parameter is optional - used for password-aware negative caching
+func (c *AuthCache) SetFailure(address string, result int, password string) {
 	authResult := AuthResult(result)
 	if authResult == AuthSuccess {
 		return // Don't cache success as failure
@@ -162,9 +245,13 @@ func (c *AuthCache) SetFailure(address string, result int) {
 		c.evictOldest()
 	}
 
-	c.entries[address] = &cacheEntry{
-		result:    authResult,
-		expiresAt: time.Now().Add(c.negativeTTL),
+	now := time.Now()
+	c.entries[address] = &CacheEntry{
+		PasswordHash: HashPassword(password),
+		Result:       authResult,
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(c.negativeTTL),
+		IsNegative:   true,
 	}
 
 	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
@@ -191,9 +278,9 @@ func (c *AuthCache) evictOldest() {
 	first := true
 
 	for key, entry := range c.entries {
-		if first || entry.expiresAt.Before(oldestTime) {
+		if first || entry.ExpiresAt.Before(oldestTime) {
 			oldestKey = key
-			oldestTime = entry.expiresAt
+			oldestTime = entry.ExpiresAt
 			first = false
 		}
 	}
@@ -229,7 +316,7 @@ func (c *AuthCache) cleanup() {
 	removed := 0
 
 	for key, entry := range c.entries {
-		if now.After(entry.expiresAt) {
+		if now.After(entry.ExpiresAt) {
 			delete(c.entries, key)
 			removed++
 		}
@@ -248,7 +335,7 @@ func (c *AuthCache) cleanup() {
 	userNotFoundEntries := 0
 	invalidPasswordEntries := 0
 	for _, entry := range c.entries {
-		switch entry.result {
+		switch entry.Result {
 		case AuthSuccess:
 			successEntries++
 		case AuthUserNotFound:
@@ -320,7 +407,7 @@ func (c *AuthCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = make(map[string]*cacheEntry)
+	c.entries = make(map[string]*CacheEntry)
 	c.hits = 0
 	c.misses = 0
 
@@ -330,4 +417,96 @@ func (c *AuthCache) Clear() {
 // roundToTwoDecimals rounds a float to 2 decimal places
 func roundToTwoDecimals(val float64) float64 {
 	return float64(int(val*100+0.5)) / 100
+}
+
+// --- Methods for Proxy Usage ---
+
+// Get retrieves a cached entry
+// serverName should be the unique server name (e.g., "imap-proxy-1", "imap-backend")
+// Returns the entry and whether it was found (and not expired)
+func (c *AuthCache) Get(serverName, username string) (*CacheEntry, bool) {
+	key := makeKey(serverName, username)
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[key]
+	if !exists {
+		c.misses++
+		metrics.AuthCacheMissesTotal.Inc()
+		return nil, false
+	}
+
+	// Check if expired
+	if time.Now().After(entry.ExpiresAt) {
+		c.misses++
+		metrics.AuthCacheMissesTotal.Inc()
+		return nil, false
+	}
+
+	c.hits++
+	metrics.AuthCacheHitsTotal.Inc()
+	return entry, true
+}
+
+// Set stores an entry in the cache
+func (c *AuthCache) Set(serverName, username string, entry *CacheEntry) {
+	key := makeKey(serverName, username)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Enforce max size with simple eviction (oldest entries first)
+	if len(c.entries) >= c.maxSize {
+		c.evictOldest()
+	}
+
+	// Determine TTL based on result type if not already set
+	if entry.ExpiresAt.IsZero() {
+		var ttl time.Duration
+		if entry.IsNegative {
+			ttl = c.negativeTTL
+		} else {
+			ttl = c.positiveTTL
+		}
+		entry.CreatedAt = time.Now()
+		entry.ExpiresAt = time.Now().Add(ttl)
+	}
+
+	c.entries[key] = entry
+	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+}
+
+// Refresh extends the TTL of an existing cache entry
+// This is called when the same password is used again to keep frequently-used entries fresh
+func (c *AuthCache) Refresh(serverName, username string) bool {
+	key := makeKey(serverName, username)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, exists := c.entries[key]
+	if !exists {
+		return false
+	}
+
+	// Extend TTL based on entry type
+	var ttl time.Duration
+	if entry.IsNegative {
+		ttl = c.negativeTTL
+	} else {
+		ttl = c.positiveTTL
+	}
+
+	entry.ExpiresAt = time.Now().Add(ttl)
+	return true
+}
+
+// makeKey creates a cache key from server name and username
+func makeKey(serverName, username string) string {
+	// If serverName is empty, just use username (backward compatibility for backend)
+	if serverName == "" {
+		return username
+	}
+	return fmt.Sprintf("%s:%s", serverName, username)
 }

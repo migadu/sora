@@ -44,14 +44,14 @@ const (
 )
 
 // HTTPPreLookupClient performs user routing lookups via HTTP GET requests
+// NOTE: This client does NOT cache results - caching is handled at the ConnectionManager level
 type HTTPPreLookupClient struct {
 	baseURL                string
 	timeout                time.Duration
 	authToken              string // Bearer token for HTTP authentication
 	client                 *http.Client
 	breaker                *circuitbreaker.CircuitBreaker
-	cache                  *prelookupCache // In-memory cache for lookup results
-	remotePort             int             // Default port for backend connections when not in server address
+	remotePort             int // Default port for backend connections when not in server address
 	remoteTLS              bool
 	remoteTLSUseStartTLS   bool
 	remoteTLSVerify        bool
@@ -93,6 +93,7 @@ type TransportSettings struct {
 }
 
 // NewHTTPPreLookupClient creates a new HTTP-based prelookup client
+// NOTE: Cache parameter removed - caching is handled at ConnectionManager level
 func NewHTTPPreLookupClient(
 	baseURL string,
 	timeout time.Duration,
@@ -104,7 +105,6 @@ func NewHTTPPreLookupClient(
 	remoteUseProxyProtocol bool,
 	remoteUseIDCommand bool,
 	remoteUseXCLIENT bool,
-	cache *prelookupCache,
 	cbSettings *CircuitBreakerSettings,
 	transportSettings *TransportSettings,
 ) *HTTPPreLookupClient {
@@ -204,7 +204,6 @@ func NewHTTPPreLookupClient(
 			Transport: transport,
 		},
 		breaker:                breaker,
-		cache:                  cache,
 		remotePort:             remotePort,
 		remoteTLS:              remoteTLS,
 		remoteTLSUseStartTLS:   remoteTLSUseStartTLS,
@@ -255,40 +254,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		logger.Debug("prelookup: Stripping +detail for authentication", "from", email, "to", lookupEmail)
 	}
 
-	// Cache key is just the email address (base address without +detail or @TOKEN)
-	cacheKey := authEmail
-
-	// Check cache first - atomically get both password hash and entry to avoid race condition
-	if c.cache != nil {
-		cachedHash, info, authResult, found := c.cache.GetWithPasswordHash(cacheKey)
-		if found {
-			// Verify submitted password against cached hash
-			hashPrefix := cachedHash
-			if len(hashPrefix) > 30 {
-				hashPrefix = hashPrefix[:30] + "..."
-			}
-
-			if c.verifyPassword(password, cachedHash) {
-				// Password matches cached hash - return cached result
-				logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", "cache", "hash_prefix", hashPrefix)
-				// Mark as from cache if we have routing info
-				if info != nil {
-					info.FromCache = true
-				}
-				return info, authResult, nil
-			} else {
-				// Password doesn't match cached hash - fall through to fresh prelookup
-				// DO NOT delete cache here! Concurrent wrong password attempts should not
-				// invalidate cache for other threads. We'll update cache only if prelookup succeeds.
-				logger.Info("prelookup: Cache stale (password mismatch), checking API", "user", authEmail, "cached_hash_prefix", hashPrefix)
-				// Note: We intentionally do NOT call c.cache.Delete(cacheKey) here
-			}
-		} else {
-			logger.Debug("prelookup: Cache miss, checking API", "user", authEmail)
-		}
-	}
-
-	// Execute HTTP request through circuit breaker
+	// Execute HTTP request through circuit breaker (NO caching - handled at ConnectionManager level)
 	result, err := c.breaker.Execute(func() (any, error) {
 		// Build request URL by interpolating placeholders:
 		// - $email: user email (MasterAddress - includes master token but not +detail)
@@ -495,16 +461,12 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
 	}
 
-	// Store successful result in cache with password hash for invalidation on change
+	// Log success (no caching - handled at ConnectionManager level)
 	source := "api"
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "cached", c.cache != nil)
-
-	if c.cache != nil {
-		c.cache.SetWithHash(cacheKey, info, AuthSuccess, lookupResp.PasswordHash)
-	}
+	logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix)
 
 	return info, AuthSuccess, nil
 }
@@ -627,22 +589,5 @@ func (c *HTTPPreLookupClient) GetHealth() map[string]any {
 // Close cleans up resources
 func (c *HTTPPreLookupClient) Close() error {
 	logger.Debug("prelookup: Closing HTTP prelookup client")
-
-	// Stop cache cleanup goroutine
-	if c.cache != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := c.cache.Stop(ctx); err != nil {
-			logger.Debug("prelookup: Cache cleanup stop error", "error", err)
-		}
-
-		// Log final cache stats
-		hits, misses, size := c.cache.GetStats()
-		if hits+misses > 0 {
-			hitRate := float64(hits) / float64(hits+misses) * 100
-			logger.Info("prelookup: Cache final stats", "hits", hits, "misses", misses, "hit_rate", fmt.Sprintf("%.2f%%", hitRate), "size", size)
-		}
-	}
-
 	return nil
 }

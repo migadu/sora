@@ -6,9 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/authcache"
 	"github.com/migadu/sora/pkg/retry"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -56,11 +58,18 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
 	// Check auth cache first if enabled
 	if rd.authCache != nil {
-		if cachedAccountID, found := rd.authCache.Authenticate(address, password); found {
+		cachedAccountID, found, cacheErr := rd.authCache.Authenticate(address, password)
+		if cacheErr != nil {
+			// Cached authentication failure - return immediately without querying database
+			return 0, cacheErr
+		}
+		if found {
 			// Cache hit with successful authentication
+			logger.Info("Authentication successful", "address", address, "account_id", cachedAccountID, "cache", "hit")
 			return cachedAccountID, nil
 		}
-		// Cache miss or auth failure - continue to database
+		// Cache miss - continue to database
+		logger.Debug("Authentication: cache miss, checking database", "address", address)
 	}
 
 	config := retry.BackoffConfig{
@@ -90,8 +99,9 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		// Cache negative result if enabled
 		if rd.authCache != nil {
 			// AuthUserNotFound = 1 (from authcache package)
-			rd.authCache.SetFailure(address, 1)
+			rd.authCache.SetFailure(address, 1, password)
 		}
+		logger.Info("Authentication failed", "address", address, "error", err, "cache", "miss")
 		return 0, err // Return error from fetching credentials
 	}
 
@@ -104,15 +114,18 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		// Cache negative result for invalid password if enabled
 		if rd.authCache != nil {
 			// AuthInvalidPassword = 2 (from authcache package)
-			rd.authCache.SetFailure(address, 2)
+			rd.authCache.SetFailure(address, 2, password)
 		}
+		logger.Info("Authentication failed", "address", address, "error", "invalid password", "cache", "miss")
 		return 0, err // Invalid password
 	}
 
 	// Cache successful authentication if enabled
 	if rd.authCache != nil {
-		rd.authCache.SetSuccess(address, accountID, hashedPassword)
+		rd.authCache.SetSuccess(address, accountID, hashedPassword, password)
 	}
+
+	logger.Info("Authentication successful", "address", address, "account_id", accountID, "cache", "miss")
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {
@@ -150,4 +163,76 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	}
 
 	return accountID, nil
+}
+
+// InitializeAuthCache is a helper function for backend servers (IMAP, POP3, ManageSieve)
+// to initialize authentication cache with consistent logging and configuration handling.
+//
+// This centralizes the common auth cache initialization logic that would otherwise be
+// duplicated across all backend server implementations.
+//
+// Parameters:
+//   - protocol: Protocol name for logging (e.g., "IMAP", "POP3", "ManageSieve")
+//   - serverName: Server name for logging
+//   - authCacheConfig: Auth cache configuration from server config (can be nil, defaults will be applied)
+//   - rdb: ResilientDatabase instance to set the cache on
+//
+// The function applies default configuration if authCacheConfig is nil, parses TTL durations with fallback
+// to defaults, creates the auth cache, and sets it on the ResilientDatabase instance.
+func InitializeAuthCache(protocol string, serverName string, authCacheConfig *config.AuthCacheConfig, rdb *ResilientDatabase) {
+	// Apply defaults if not configured (enabled by default for performance)
+	if authCacheConfig == nil {
+		defaultConfig := config.DefaultAuthCacheConfig()
+		authCacheConfig = &defaultConfig
+	}
+
+	if !authCacheConfig.Enabled {
+		logger.Info(protocol+": Authentication cache disabled", "name", serverName)
+		return
+	}
+
+	// Parse positive TTL with fallback to default
+	positiveTTL, err := time.ParseDuration(authCacheConfig.PositiveTTL)
+	if err != nil || authCacheConfig.PositiveTTL == "" {
+		logger.Info(protocol+": Using default positive TTL (5m)", "name", serverName)
+		positiveTTL = 5 * time.Minute
+	}
+
+	// Parse negative TTL with fallback to default
+	negativeTTL, err := time.ParseDuration(authCacheConfig.NegativeTTL)
+	if err != nil || authCacheConfig.NegativeTTL == "" {
+		logger.Info(protocol+": Using default negative TTL (1m)", "name", serverName)
+		negativeTTL = 1 * time.Minute
+	}
+
+	// Parse cleanup interval with fallback to default
+	cleanupInterval, err := time.ParseDuration(authCacheConfig.CleanupInterval)
+	if err != nil || authCacheConfig.CleanupInterval == "" {
+		logger.Info(protocol+": Using default cleanup interval (5m)", "name", serverName)
+		cleanupInterval = 5 * time.Minute
+	}
+
+	// Get max size with fallback to default
+	maxSize := authCacheConfig.MaxSize
+	if maxSize == 0 {
+		maxSize = 10000
+	}
+
+	// Parse revalidation windows from config
+	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
+	if err != nil {
+		logger.Info(protocol+": Invalid negative revalidation window in auth cache config, using default (5s)", "name", serverName, "error", err)
+		negativeRevalidationWindow = 5 * time.Second
+	}
+	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	if err != nil {
+		logger.Info(protocol+": Invalid positive revalidation window in auth cache config, using default (30s)", "name", serverName, "error", err)
+		positiveRevalidationWindow = 30 * time.Second
+	}
+
+	// Create auth cache and set it on ResilientDatabase
+	cache := authcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, negativeRevalidationWindow, positiveRevalidationWindow)
+	rdb.SetAuthCache(cache)
+	logger.Info(protocol+": Authentication cache enabled", "name", serverName, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize,
+		"negative_revalidation_window", negativeRevalidationWindow, "positive_revalidation_window", positiveRevalidationWindow)
 }

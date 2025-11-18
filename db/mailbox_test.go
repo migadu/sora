@@ -342,6 +342,22 @@ func TestCreateDefaultMailboxes(t *testing.T) {
 	}
 
 	t.Logf("Successfully tested CreateDefaultMailboxes with accountID: %d, created %d mailboxes", accountID, len(mailboxes))
+
+	// Test 3: Verify early exit optimization - calling again should be fast (no inserts)
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	err = db.CreateDefaultMailboxes(ctx, tx2, accountID)
+	assert.NoError(t, err, "Second call should succeed with early exit")
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify mailbox count hasn't changed
+	mailboxes2, err := db.GetMailboxes(ctx, accountID, false)
+	assert.NoError(t, err)
+	assert.Equal(t, len(mailboxes), len(mailboxes2), "Mailbox count should not change on second call")
 }
 
 // TestSetMailboxSubscribed tests mailbox subscription management

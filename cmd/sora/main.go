@@ -17,13 +17,11 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/authcache"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/server/delivery"
@@ -86,7 +84,7 @@ type serverDependencies struct {
 	metricsCollector   *metrics.Collector
 	clusterManager     *cluster.Manager
 	tlsManager         *tlsmanager.Manager
-	affinityManager    *serverPkg.AffinityManager
+	affinityManager    *server.AffinityManager
 	hostname           string
 	config             config.Config
 	serverManager      *serverManager
@@ -140,15 +138,16 @@ func main() {
 
 	// Initialize global timeout scheduler with configured shard count
 	shardCount := cfg.TimeoutScheduler.ShardCount
-	if err := serverPkg.InitializeGlobalTimeoutScheduler(shardCount); err != nil {
+	if err := server.InitializeGlobalTimeoutScheduler(shardCount); err != nil {
 		errorHandler.FatalError("initialize timeout scheduler", err)
 		os.Exit(errorHandler.WaitForExit())
 	}
-	if shardCount == 0 {
+	switch shardCount {
+	case 0:
 		logger.Info("Timeout scheduler initialized", "mode", "default", "shards", "runtime.NumCPU()")
-	} else if shardCount == -1 {
+	case -1:
 		logger.Info("Timeout scheduler initialized", "mode", "physical_cores", "shards", "runtime.NumCPU()/2")
-	} else {
+	default:
 		logger.Info("Timeout scheduler initialized", "mode", "custom", "shards", shardCount)
 	}
 
@@ -356,36 +355,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	deps.resilientDB.StartPoolMetrics(ctx)
 	deps.resilientDB.StartPoolHealthMonitoring(ctx)
 	logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
-
-	// Initialize authentication cache if enabled
-	if cfg.AuthCache.Enabled {
-		logger.Info("Initializing authentication cache...")
-
-		positiveTTL, err := time.ParseDuration(cfg.AuthCache.PositiveTTL)
-		if err != nil {
-			logger.Error("Invalid auth_cache.positive_ttl - using default 30s", "error", err)
-			positiveTTL = 30 * time.Second
-		}
-
-		negativeTTL, err := time.ParseDuration(cfg.AuthCache.NegativeTTL)
-		if err != nil {
-			logger.Error("Invalid auth_cache.negative_ttl - using default 5m", "error", err)
-			negativeTTL = 5 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(cfg.AuthCache.CleanupInterval)
-		if err != nil {
-			logger.Error("Invalid auth_cache.cleanup_interval - using default 5m", "error", err)
-			cleanupInterval = 5 * time.Minute
-		}
-
-		authCache := authcache.New(positiveTTL, negativeTTL, cfg.AuthCache.MaxSize, cleanupInterval)
-		deps.resilientDB.SetAuthCache(authCache)
-
-		logger.Info("Authentication cache enabled", "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", cfg.AuthCache.MaxSize)
-	} else {
-		logger.Info("Authentication cache is disabled")
-	}
 
 	// Initialize health monitoring
 	logger.Info("Initializing health monitoring")
@@ -689,7 +658,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		// Initialize affinity manager for cluster-wide user-to-backend affinity
 		// Default TTL: 1 hour, Cleanup interval: 10 minutes
-		deps.affinityManager = serverPkg.NewAffinityManager(deps.clusterManager, true, 1*time.Hour, 10*time.Minute)
+		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, true, 1*time.Hour, 10*time.Minute)
 		logger.Info("Affinity manager initialized for cluster-wide user routing")
 	}
 
@@ -796,7 +765,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
-func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, server interface {
+func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) *server.ConnectionTracker {
 	if clusterMgr == nil {
@@ -814,9 +783,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
 
-	tracker := serverPkg.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
+	tracker := server.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
 	if tracker != nil {
-		server.SetConnectionTracker(tracker)
+		srv.SetConnectionTracker(tracker)
 	}
 	return tracker
 }
@@ -829,7 +798,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	appendLimit := serverConfig.GetAppendLimitWithDefault()
 	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -890,6 +859,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			ProxyProtocolTimeout:         proxyProtocolTimeout,
 			TrustedNetworks:              deps.config.Servers.TrustedNetworks,
 			AuthRateLimit:                authRateLimit,
+			AuthCache:                    serverConfig.AuthCache,
 			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SessionMemoryLimit:           sessionMemoryLimit,
@@ -920,7 +890,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1003,7 +973,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -1053,6 +1023,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		ProxyProtocolTimeout:   proxyProtocolTimeout,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
+		AuthCache:              serverConfig.AuthCache,
 		SessionMemoryLimit:     sessionMemoryLimit,
 		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
@@ -1069,7 +1040,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := serverPkg.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1095,7 +1066,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	maxSize := serverConfig.GetMaxScriptSizeWithDefault()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -1150,6 +1121,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTimeout:   proxyProtocolTimeout,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
+		AuthCache:              serverConfig.AuthCache,
 		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
@@ -1165,7 +1137,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := serverPkg.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1219,7 +1191,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -1276,12 +1248,14 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AuthRateLimit:          authRateLimit,
+		AuthCache:              serverConfig.AuthCache,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		ListenBacklog:          serverConfig.ListenBacklog,
+		MaxAuthErrors:          serverConfig.GetMaxAuthErrors(),
 		Debug:                  serverConfig.Debug,
 	})
 	if err != nil {
@@ -1329,7 +1303,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -1392,6 +1366,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		ListenBacklog:          serverConfig.ListenBacklog,
+		AuthCache:              serverConfig.AuthCache,
+		MaxAuthErrors:          serverConfig.GetMaxAuthErrors(),
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -1436,7 +1412,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	authRateLimit := serverPkg.DefaultAuthRateLimiterConfig()
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
 	}
@@ -1503,6 +1479,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		ListenBacklog:          serverConfig.ListenBacklog,
 		Debug:                  serverConfig.Debug,
 		SupportedExtensions:    serverConfig.SupportedExtensions,
+		AuthCache:              serverConfig.AuthCache,
+		MaxAuthErrors:          serverConfig.GetMaxAuthErrors(),
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create ManageSieve proxy server: %w", err)
@@ -1581,6 +1559,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		ConnectTimeout:         connectTimeout,
 		AuthIdleTimeout:        authIdleTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
+		AuthCache:              serverConfig.AuthCache,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,
@@ -1794,7 +1773,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	}()
 
 	if err := server.Start(); err != nil && ctx.Err() == nil {
-		errChan <- fmt.Errorf("User API proxy server error: %w", err)
+		errChan <- fmt.Errorf("user API proxy server error: %w", err)
 	}
 }
 

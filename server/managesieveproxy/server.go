@@ -15,6 +15,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
@@ -57,6 +58,11 @@ type Server struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Auth cache for routing and password validation
+	authCache                  *cache.AuthCache
+	negativeRevalidationWindow time.Duration
+	positiveRevalidationWindow time.Duration
+
 	// Listen backlog
 	listenBacklog int
 
@@ -65,6 +71,9 @@ type Server struct {
 
 	// SIEVE extensions (additional to builtin)
 	supportedExtensions []string
+
+	// Authentication limits
+	maxAuthErrors int // Maximum authentication errors before disconnection
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -112,6 +121,12 @@ type ServerOptions struct {
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
 	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+
+	// Auth cache configuration
+	AuthCache *config.AuthCacheConfig
+
+	// Authentication limits
+	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
 	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
@@ -235,40 +250,93 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Info("PROXY protocol enabled for incoming connections", "proxy", opts.Name)
 	}
 
+	// Initialize auth cache for user authentication and routing
+	// Initialize authentication cache from config
+	// Apply defaults if not configured (enabled by default for performance)
+	var authCache *cache.AuthCache
+	authCacheConfig := opts.AuthCache
+	if authCacheConfig == nil {
+		defaultConfig := config.DefaultAuthCacheConfig()
+		authCacheConfig = &defaultConfig
+	}
+
+	if authCacheConfig.Enabled {
+		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+		if err != nil {
+			logger.Info("ManageSieve Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
+			positiveTTL = 5 * time.Minute
+		}
+		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		if err != nil {
+			logger.Info("ManageSieve Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
+			negativeTTL = 1 * time.Minute
+		}
+		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		if err != nil {
+			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
+			cleanupInterval = 5 * time.Minute
+		}
+		maxSize := authCacheConfig.MaxSize
+		if maxSize <= 0 {
+			maxSize = 10000
+		}
+
+		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
+		logger.Info("ManageSieve Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+	} else {
+		logger.Info("ManageSieve Proxy: Authentication cache disabled", "name", opts.Name)
+	}
+
+	// Parse revalidation windows from config (used for password change detection)
+	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
+	if err != nil {
+		logger.Info("ManageSieve Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", opts.Name, "error", err)
+		negativeRevalidationWindow = 5 * time.Second
+	}
+	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	if err != nil {
+		logger.Info("ManageSieve Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
+		positiveRevalidationWindow = 30 * time.Second
+	}
+
 	s := &Server{
-		rdb:                    rdb,
-		name:                   opts.Name,
-		addr:                   opts.Addr,
-		hostname:               hostname,
-		insecureAuth:           opts.InsecureAuth,
-		masterUsername:         []byte(opts.MasterUsername),
-		masterPassword:         []byte(opts.MasterPassword),
-		masterSASLUsername:     []byte(opts.MasterSASLUsername),
-		masterSASLPassword:     []byte(opts.MasterSASLPassword),
-		tls:                    opts.TLS,
-		tlsUseStartTLS:         opts.TLSUseStartTLS,
-		tlsCertFile:            opts.TLSCertFile,
-		tlsKeyFile:             opts.TLSKeyFile,
-		tlsVerify:              opts.TLSVerify,
-		connManager:            connManager,
-		ctx:                    ctx,
-		cancel:                 cancel,
-		enableAffinity:         opts.EnableAffinity,
-		affinityValidity:       opts.AffinityValidity,
-		affinityStickiness:     stickiness,
-		authLimiter:            authLimiter,
-		trustedProxies:         opts.TrustedProxies,
-		prelookupConfig:        opts.PreLookup,
-		authIdleTimeout:        opts.AuthIdleTimeout,
-		commandTimeout:         opts.CommandTimeout,
-		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
-		minBytesPerMinute:      opts.MinBytesPerMinute,
-		limiter:                limiter,
-		listenBacklog:          listenBacklog,
-		debug:                  opts.Debug,
-		supportedExtensions:    opts.SupportedExtensions,
-		activeSessions:         make(map[*Session]struct{}),
-		proxyReader:            proxyReader,
+		rdb:                        rdb,
+		name:                       opts.Name,
+		addr:                       opts.Addr,
+		hostname:                   hostname,
+		insecureAuth:               opts.InsecureAuth,
+		masterUsername:             []byte(opts.MasterUsername),
+		masterPassword:             []byte(opts.MasterPassword),
+		masterSASLUsername:         []byte(opts.MasterSASLUsername),
+		masterSASLPassword:         []byte(opts.MasterSASLPassword),
+		tls:                        opts.TLS,
+		tlsUseStartTLS:             opts.TLSUseStartTLS,
+		tlsCertFile:                opts.TLSCertFile,
+		tlsKeyFile:                 opts.TLSKeyFile,
+		tlsVerify:                  opts.TLSVerify,
+		connManager:                connManager,
+		ctx:                        ctx,
+		cancel:                     cancel,
+		enableAffinity:             opts.EnableAffinity,
+		affinityValidity:           opts.AffinityValidity,
+		affinityStickiness:         stickiness,
+		authLimiter:                authLimiter,
+		trustedProxies:             opts.TrustedProxies,
+		prelookupConfig:            opts.PreLookup,
+		authIdleTimeout:            opts.AuthIdleTimeout,
+		commandTimeout:             opts.CommandTimeout,
+		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
+		minBytesPerMinute:          opts.MinBytesPerMinute,
+		limiter:                    limiter,
+		authCache:                  authCache,
+		negativeRevalidationWindow: negativeRevalidationWindow,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		listenBacklog:              listenBacklog,
+		maxAuthErrors:              opts.MaxAuthErrors,
+		debug:                      opts.Debug,
+		supportedExtensions:        opts.SupportedExtensions,
+		activeSessions:             make(map[*Session]struct{}),
+		proxyReader:                proxyReader,
 	}
 
 	// Use all supported extensions by default if none are configured
@@ -552,6 +620,15 @@ func (s *Server) Stop() error {
 			if err := routingLookup.Close(); err != nil {
 				logger.Debug("ManageSieve Proxy: Error closing prelookup client", "name", s.name, "error", err)
 			}
+		}
+	}
+
+	// Stop auth cache
+	if s.authCache != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := s.authCache.Stop(stopCtx); err != nil {
+			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}
 

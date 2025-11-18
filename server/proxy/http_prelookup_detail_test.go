@@ -90,7 +90,6 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				false, // remoteUseIDCommand
 				false, // remoteUseXCLIENT
-				nil,   // cache
 				nil,   // circuit breaker settings
 				nil,   // transport settings
 			)
@@ -160,7 +159,7 @@ func TestHTTPPrelookupURLEncoding(t *testing.T) {
 				"test-token",
 				143,
 				false, false, false, false, false, false,
-				nil, nil, nil,
+				nil, nil,
 			)
 
 			ctx := context.Background()

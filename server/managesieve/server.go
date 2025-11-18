@@ -103,11 +103,12 @@ type ManageSieveServerOptions struct {
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
 	AuthRateLimit               serverPkg.AuthRateLimiterConfig
-	AuthIdleTimeout             time.Duration  // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout              time.Duration  // Maximum idle time before disconnection
-	AbsoluteSessionTimeout      time.Duration  // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute           int64          // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
-	Config                      *config.Config // Full config for shared settings like connection tracking timeouts
+	AuthCache                   *config.AuthCacheConfig // Authentication cache configuration
+	AuthIdleTimeout             time.Duration           // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	CommandTimeout              time.Duration           // Maximum idle time before disconnection
+	AbsoluteSessionTimeout      time.Duration           // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute           int64                   // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	Config                      *config.Config          // Full config for shared settings like connection tracking timeouts
 }
 
 func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.ResilientDatabase, options ManageSieveServerOptions) (*ManageSieveServer, error) {
@@ -149,6 +150,9 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, options.TrustedNetworks)
+
+	// Initialize authentication cache from config
+	resilient.InitializeAuthCache("ManageSieve", name, options.AuthCache, rdb)
 
 	serverInstance := &ManageSieveServer{
 		hostname:               hostname,

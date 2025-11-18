@@ -294,19 +294,11 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 	// Configure HTTP prelookup with caching and authentication
 	// Note: Master token logic is now handled by the HTTP endpoint, not the client
 	prelookupConfig := &config.PreLookupConfig{
-		Enabled:   true,
-		URL:       prelookupURL + "/lookup?email=$email", // Use $email placeholder for interpolation
-		Timeout:   "5s",
-		AuthToken: "test-secret-token", // Bearer token for authentication
-		// Enable caching for testing
-		Cache: &config.PreLookupCacheConfig{
-			Enabled:         true,
-			PositiveTTL:     "10s",
-			NegativeTTL:     "5s",
-			MaxSize:         100,
-			CleanupInterval: "30s",
-		},
-		RemoteUseProxyProtocol: true, // Match the backend server configuration
+		Enabled:                true,
+		URL:                    prelookupURL + "/lookup?email=$email", // Use $email placeholder for interpolation
+		Timeout:                "5s",
+		AuthToken:              "test-secret-token", // Bearer token for authentication
+		RemoteUseProxyProtocol: true,                // Match the backend server configuration
 	}
 
 	opts := imapproxy.ServerOptions{

@@ -171,7 +171,6 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				false, // remoteUseIDCommand
 				false, // remoteUseXCLIENT
-				nil,   // cache
 				nil,   // circuit breaker settings (use defaults)
 				nil,   // transport settings (use defaults)
 			)
@@ -221,7 +220,6 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
-		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -268,7 +266,6 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
-		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -353,7 +350,6 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
-		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -410,7 +406,6 @@ func TestHTTPPrelookupInvalidEmail(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
-		nil,   // cache
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -520,7 +515,6 @@ func TestHTTPPrelookupInvalidEmail(t *testing.T) {
 			false, // remoteUseProxyProtocol
 			false, // remoteUseIDCommand
 			false, // remoteUseXCLIENT
-			nil,   // cache
 			nil,   // circuit breaker settings (use defaults)
 			nil,   // transport settings (use defaults)
 		)

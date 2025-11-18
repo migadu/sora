@@ -434,25 +434,20 @@ var (
 		},
 	)
 
-	// Prelookup cache memory usage
-	PrelookupCacheEntries = promauto.NewGauge(
+	// Auth cache metrics
+	CacheSize = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "sora_prelookup_cache_entries",
-			Help: "Number of entries in prelookup cache",
+			Name: "sora_cache_entries",
+			Help: "Number of entries in cache by type",
 		},
+		[]string{"type"}, // auth, etc
 	)
 
-	PrelookupCachePositiveEntries = promauto.NewGauge(
+	CacheHitRatio = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "sora_prelookup_cache_positive_entries",
-			Help: "Number of positive (found) entries in prelookup cache",
+			Name: "sora_cache_hit_ratio",
+			Help: "Cache hit ratio (0-1) by type",
 		},
-	)
-
-	PrelookupCacheNegativeEntries = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "sora_prelookup_cache_negative_entries",
-			Help: "Number of negative (not found) entries in prelookup cache",
-		},
+		[]string{"type"},
 	)
 )

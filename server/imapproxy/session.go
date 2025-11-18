@@ -15,15 +15,13 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
-
-// maxAuthErrors is the number of invalid commands tolerated during the
-// authentication phase before the connection is dropped.
-const maxAuthErrors = 2
 
 // Session represents an IMAP proxy session.
 type Session struct {
@@ -471,7 +469,7 @@ func (s *Session) handleConnection() {
 func (s *Session) handleAuthError(response string) bool {
 	s.errorCount++
 	s.sendResponse(response)
-	if s.errorCount >= maxAuthErrors {
+	if s.errorCount >= s.server.maxAuthErrors {
 		s.WarnLog("too many authentication errors, dropping connection")
 		// Send a final BYE message before closing.
 		s.sendResponse("* BYE Too many invalid commands")
@@ -534,6 +532,12 @@ func (s *Session) WarnLog(msg string, keysAndValues ...any) {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
+	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
+	// Empty passwords are never valid under any condition
+	if password == "" {
+		return consts.ErrAuthenticationFailed
+	}
+
 	// Use configured prelookup timeout instead of hardcoded value
 	// This allows slow networks enough time for initial TLS handshake while reusing connections
 	authTimeout := s.server.connManager.GetPrelookupTimeout()
@@ -543,6 +547,99 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := s.clientConn.RemoteAddr()
 	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-PROXY")
+
+	// Check cache first (before rate limiter to avoid delays for cached successful auth)
+	// Use server name as cache key to avoid collisions between different proxies/servers
+	if cached, found := s.server.authCache.Get(s.server.name, username); found {
+		// Hash the password (never empty - validated at function start)
+		passwordHash := cache.HashPassword(password)
+
+		// Check password hash match
+		// Note: cached.PasswordHash should also never be empty, but we check defensively
+		// in case of cache corruption or edge cases
+		passwordMatches := (cached.PasswordHash != "" && cached.PasswordHash == passwordHash)
+
+		if cached.IsNegative {
+			// Negative cache entry - authentication previously failed
+			if passwordMatches {
+				// Same wrong password - return cached failure and refresh TTL
+				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
+				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+				s.server.authCache.Refresh(s.server.name, username)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
+				return consts.ErrAuthenticationFailed
+			} else {
+				// Different password - always revalidate (user might have fixed their password)
+				// Use configured window: revalidate if entry is older than negativeRevalidationWindow
+				if cached.IsOld(s.server.negativeRevalidationWindow) {
+					s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
+					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+					// Fall through to full auth
+				} else {
+					// Entry is very fresh - likely rapid retry with wrong password
+					s.DebugLog("cache hit - negative entry with different password (very fresh)", "username", username)
+					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative_different_pw").Inc()
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
+					return consts.ErrAuthenticationFailed
+				}
+			}
+		} else {
+			// Positive cache entry (successful auth)
+			if passwordMatches {
+				// Same password - use cached routing info and refresh TTL
+				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+				metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+
+				s.accountID = cached.AccountID
+				s.isPrelookupAccount = cached.FromPrelookup
+				s.routingInfo = &proxy.UserRoutingInfo{
+					AccountID:              cached.AccountID,
+					ServerAddress:          cached.ServerAddress,
+					RemoteTLS:              cached.RemoteTLS,
+					RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
+					RemoteTLSVerify:        cached.RemoteTLSVerify,
+					RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
+					RemoteUseIDCommand:     cached.RemoteUseIDCommand,
+					ClientConn:             s.clientConn, // Always set current client connection for JA4
+				}
+				s.username = username
+
+				// Refresh TTL since password matched
+				s.server.authCache.Refresh(s.server.name, username)
+
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
+
+				// Track domain and user activity
+				if addr, err := server.NewAddress(username); err == nil {
+					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
+					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
+				}
+
+				return nil
+			} else {
+				// Different password on positive entry - always revalidate
+				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
+				if cached.IsOld(s.server.positiveRevalidationWindow) {
+					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
+					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_positive_different_pw").Inc()
+					// Fall through to full auth
+				} else {
+					// Entry is fresh - likely wrong password attempt
+					s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
+					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
+					return consts.ErrAuthenticationFailed
+				}
+			}
+		}
+	} else {
+		s.DebugLog("cache miss", "username", username)
+		metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
+	}
 
 	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
 	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, nil, username); err != nil {
@@ -591,7 +688,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Wrong master password - fail immediately
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
-				return fmt.Errorf("authentication failed")
+				return consts.ErrAuthenticationFailed
 			}
 			// Master credentials validated - use base address (without @MASTER suffix) for prelookup
 			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
@@ -631,11 +728,7 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
 		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		if err != nil {
-			logger.Debug("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
-		} else {
-			logger.Debug("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
-		}
+		logger.Debug("prelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
@@ -694,6 +787,28 @@ func (s *Session) authenticateUser(username, password string) error {
 					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
 					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
 				}
+
+				// Cache successful prelookup authentication
+				// Always hash the password for cache matching, even for master auth
+				// This ensures different passwords don't match the same cache entry
+				passwordHash := ""
+				if password != "" {
+					passwordHash = cache.HashPassword(password)
+				}
+				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					AccountID:              routingInfo.AccountID,
+					PasswordHash:           passwordHash,
+					ServerAddress:          routingInfo.ServerAddress,
+					RemoteTLS:              routingInfo.RemoteTLS,
+					RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
+					RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
+					RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
+					RemoteUseIDCommand:     routingInfo.RemoteUseIDCommand,
+					AuthResult:             cache.AuthSuccess,
+					FromPrelookup:          true,
+					IsNegative:             false,
+				})
+
 				return nil // Authentication complete
 
 			case proxy.AuthFailed:
@@ -703,10 +818,24 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue", "user", username)
 				}
-				s.InfoLog("prelookup authentication failed - bad password", "user", username)
+				s.InfoLog("prelookup authentication failed - bad password", "user", username, "cache", "miss")
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
-				return fmt.Errorf("authentication failed")
+
+				// Cache negative result (failed authentication) WITH password hash
+				// This allows us to detect repeated wrong passwords vs different wrong passwords
+				// Always hash password, even for master auth, to prevent cache bypass
+				passwordHash := ""
+				if password != "" {
+					passwordHash = cache.HashPassword(password)
+				}
+				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					PasswordHash: passwordHash,
+					AuthResult:   cache.AuthFailed,
+					IsNegative:   true,
+				})
+
+				return consts.ErrAuthenticationFailed
 
 			case proxy.AuthTemporarilyUnavailable:
 				// Prelookup service is temporarily unavailable - tell user to retry later
@@ -757,7 +886,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			return fmt.Errorf("account not found: %w", err)
 		}
 	} else {
-		// Regular authentication via main DB
+		// Regular authentication via main DB (may use DB-level auth cache internally)
 		s.DebugLog("authenticating user via main database")
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
@@ -768,10 +897,35 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err)
+			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err, "cache", "miss")
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
-			return fmt.Errorf("authentication failed: %w", err)
+
+			// Only cache definitive authentication failures, NOT transient errors
+			// Definitive failures: user not found, wrong password (from bcrypt.CompareHashAndPassword)
+			// Do NOT cache: DB connection errors, timeouts, etc (let circuit breakers handle those)
+			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
+				strings.Contains(err.Error(), "hashedPassword is not the hash") || // bcrypt wrong password
+				strings.Contains(err.Error(), "user not found")
+
+			if isDefinitiveFailure {
+				s.DebugLog("caching definitive auth failure", "username", username)
+				// Cache WITH password hash to detect repeated wrong passwords
+				// Always hash password, even for master auth, to prevent cache bypass
+				passwordHash := ""
+				if password != "" {
+					passwordHash = cache.HashPassword(password)
+				}
+				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					PasswordHash: passwordHash,
+					AuthResult:   cache.AuthFailed,
+					IsNegative:   true,
+				})
+			} else {
+				s.DebugLog("NOT caching transient error - circuit breaker will handle", "username", username, "error", err)
+			}
+
+			return fmt.Errorf("%w: %w", consts.ErrAuthenticationFailed, err)
 		}
 	}
 
@@ -789,6 +943,22 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Track domain and user connection activity for the login event.
 	metrics.TrackDomainConnection("imap_proxy", address.Domain())
 	metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+
+	// Cache successful DB authentication
+	// ServerAddress will be determined later by DetermineRoute in connectToBackend
+	// Always hash password, even for master auth, to prevent cache bypass
+	passwordHash := ""
+	if password != "" {
+		passwordHash = cache.HashPassword(password)
+	}
+	s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+		AccountID:     accountID,
+		PasswordHash:  passwordHash,
+		ServerAddress: "", // Will be populated by affinity/routing in next connection
+		AuthResult:    cache.AuthSuccess,
+		FromPrelookup: false,
+		IsNegative:    false,
+	})
 
 	return nil
 }
@@ -1017,9 +1187,8 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 		s.InfoLog("rejected connection registration", "error", err)
 	}
 
-	// Log authentication at INFO level with routing method and cache status
-	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
-	s.InfoLog("authenticated", "backend", s.serverAddr, "method", s.routingMethod, "prelookup_cached", prelookupCached)
+	// Log authentication at INFO level with routing method
+	s.InfoLog("authenticated", "backend", s.serverAddr, "method", s.routingMethod)
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string

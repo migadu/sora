@@ -3,6 +3,7 @@
 package imap_test
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -202,9 +203,12 @@ func TestIMAP_RaceConditions(t *testing.T) {
 
 				// Rapidly append messages
 				for msgID := 0; msgID < messagesPerClient; msgID++ {
+					// Generate unique Message-ID to avoid duplicate detection conflicts
+					uniqueMessageID := fmt.Sprintf("<race-test-client%d-msg%d-%d@example.com>", id, msgID, time.Now().UnixNano())
 					testMessage := "From: race@example.com\r\n" +
 						"To: " + account.Email + "\r\n" +
 						"Subject: Race Test Client " + string(rune('0'+id)) + " Message " + string(rune('0'+msgID)) + "\r\n" +
+						"Message-ID: " + uniqueMessageID + "\r\n" +
 						"Date: " + time.Now().Format(time.RFC1123) + "\r\n" +
 						"\r\n" +
 						"Race condition test message.\r\n"

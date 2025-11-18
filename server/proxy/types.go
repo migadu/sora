@@ -47,6 +47,7 @@ var (
 )
 
 // UserRoutingLookup interface for routing lookups
+// NOTE: No caching - prelookup is just a data source, caching happens at higher level
 type UserRoutingLookup interface {
 	LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error)
 	LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error)

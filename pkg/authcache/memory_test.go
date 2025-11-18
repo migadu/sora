@@ -17,7 +17,7 @@ func TestAuthCache_MemoryCleanup(t *testing.T) {
 	}
 
 	// Create cache with very short TTLs and frequent cleanup
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 10000, 100*time.Millisecond)
+	cache := New(50*time.Millisecond, 50*time.Millisecond, 10000, 100*time.Millisecond, 5*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -27,7 +27,7 @@ func TestAuthCache_MemoryCleanup(t *testing.T) {
 	numEntries := 1000
 	for i := 0; i < numEntries; i++ {
 		address := fmt.Sprintf("user%d@example.com", i)
-		cache.SetSuccess(address, int64(i), string(hash))
+		cache.SetSuccess(address, int64(i), string(hash), password)
 	}
 
 	// Verify all entries are cached
@@ -49,7 +49,7 @@ func TestAuthCache_MemoryCleanup(t *testing.T) {
 // TestAuthCache_MaxSizeEnforcement verifies that cache never exceeds max size
 func TestAuthCache_MaxSizeEnforcement(t *testing.T) {
 	maxSize := 100
-	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Second)
+	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Second, 5*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
@@ -58,7 +58,7 @@ func TestAuthCache_MaxSizeEnforcement(t *testing.T) {
 	// Add way more entries than max size
 	for i := 0; i < maxSize*3; i++ {
 		address := fmt.Sprintf("user%d@example.com", i)
-		cache.SetSuccess(address, int64(i), string(hash))
+		cache.SetSuccess(address, int64(i), string(hash), password)
 
 		// Verify size never exceeds max
 		_, _, size, _ := cache.GetStats()
@@ -88,14 +88,14 @@ func TestAuthCache_NoLeakAfterStop(t *testing.T) {
 	// Create and stop many caches
 	numCaches := 10
 	for i := 0; i < numCaches; i++ {
-		cache := New(1*time.Second, 1*time.Second, 100, 100*time.Millisecond)
+		cache := New(1*time.Second, 1*time.Second, 100, 100*time.Millisecond, 5*time.Second, 30*time.Second)
 
 		// Add some entries
 		password := "testpassword"
 		hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		for j := 0; j < 10; j++ {
 			address := fmt.Sprintf("user%d@example.com", j)
-			cache.SetSuccess(address, int64(j), string(hash))
+			cache.SetSuccess(address, int64(j), string(hash), password)
 		}
 
 		// Stop the cache
@@ -125,14 +125,14 @@ func TestAuthCache_NoLeakAfterStop(t *testing.T) {
 // TestAuthCache_ExpiredNotRemovedOnRead verifies that expired entries remain in map until cleanup
 // This is a performance optimization - we don't delete on every read, only during periodic cleanup
 func TestAuthCache_ExpiredNotRemovedOnRead(t *testing.T) {
-	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 10*time.Second) // Long cleanup interval
+	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 10*time.Second, 5*time.Second, 30*time.Second) // Long cleanup interval
 	defer cache.Stop(context.Background())
 
 	password := "testpassword"
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 
 	// Add an entry
-	cache.SetSuccess("test@example.com", 123, string(hash))
+	cache.SetSuccess("test@example.com", 123, string(hash), password)
 
 	// Verify it's cached
 	_, _, size, _ := cache.GetStats()
@@ -144,7 +144,7 @@ func TestAuthCache_ExpiredNotRemovedOnRead(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Try to authenticate - should fail (expired)
-	if _, found := cache.Authenticate("test@example.com", password); found {
+	if _, found, _ := cache.Authenticate("test@example.com", password); found {
 		t.Error("Expected cache miss for expired entry")
 	}
 

@@ -33,10 +33,37 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 	defer tx.Rollback(ctx)
 
+	// OPTIMIZATION: Early exit if modseq hasn't changed
+	// This avoids expensive window functions when mailbox is idle
+	var currentModSeq uint64
+	var messageCount int
+	err = tx.QueryRow(ctx, `
+		SELECT
+			COALESCE(ms.highest_modseq, 0) AS highest_modseq,
+			COALESCE(ms.message_count, 0) AS message_count
+		FROM mailboxes mb
+		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+		WHERE mb.id = $1
+	`, mailboxID).Scan(&currentModSeq, &messageCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get mailbox stats: %w", err)
+	}
+
+	// If modseq hasn't changed, return early with no updates
+	if currentModSeq <= sinceModSeq {
+		return &MailboxPoll{
+			Updates:     []MessageUpdate{},
+			NumMessages: uint32(messageCount),
+			ModSeq:      currentModSeq,
+		}, nil
+	}
+
+	// OPTIMIZATION: Use message_sequences table instead of ROW_NUMBER()
+	// The message_sequences table is already maintained by triggers and cached
 	rows, err := tx.Query(ctx, `
 		SELECT * FROM (
 			WITH
-			  global_stats AS ( -- Use the mailbox_stats cache for high-performance stat retrieval.
+			  global_stats AS (
 				SELECT
 					COALESCE(ms.message_count, 0) AS total_messages,
 					COALESCE(ms.highest_modseq, 0) AS highest_mailbox_modseq
@@ -47,32 +74,41 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  current_mailbox_state AS (
 			    SELECT
 			        m.uid,
-			        -- Sequence number within the set of messages that existed before the current changes (for expunges)
-			        ROW_NUMBER() OVER (ORDER BY m.uid) AS pre_change_seq_num,
-			        -- Sequence number within the set of messages that exist now (for fetches)
-			        ROW_NUMBER() OVER (PARTITION BY (m.expunged_modseq IS NULL) ORDER BY m.uid) AS post_change_seq_num,
+			        -- Use the cached sequence numbers from message_sequences table
+			        -- For expunged messages, we need to calculate their pre-expunge sequence number
+			        CASE
+			            WHEN m.expunged_modseq IS NOT NULL THEN
+			                -- For expunged messages, count all messages with lower or equal UIDs
+			                -- This gives us the sequence number BEFORE the expunge
+			                (SELECT COUNT(*) FROM messages m2
+			                 WHERE m2.mailbox_id = m.mailbox_id
+			                   AND m2.uid <= m.uid
+			                   AND (m2.expunged_modseq IS NULL OR m2.expunged_modseq > $2))
+			            ELSE
+			                -- For non-expunged messages, use the cached sequence number
+			                COALESCE(ms.seqnum, 0)
+			        END AS seq_num,
 			        m.flags,
 			        m.custom_flags,
 			        m.created_modseq,
-			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val, -- Use COALESCE for GREATEST
+			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val,
 			        m.expunged_modseq
 			    FROM messages m
-			    WHERE m.mailbox_id = $1 AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2) -- $2 is sinceModSeq
+			    LEFT JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
+			    WHERE m.mailbox_id = $1
+			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
+			      AND (m.created_modseq > $2 OR COALESCE(m.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
 			  ),
 			  changed_messages AS (
 			    SELECT
 			        cms.uid,
-			        CASE
-			            WHEN cms.expunged_modseq IS NOT NULL THEN cms.pre_change_seq_num
-			            ELSE cms.post_change_seq_num
-			        END AS seq_num,
+			        cms.seq_num,
 			        cms.flags,
 			        cms.custom_flags,
 			        cms.expunged_modseq,
 			        GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) AS effective_modseq,
 			        true AS is_message_update
 			    FROM current_mailbox_state cms
-			    WHERE (cms.created_modseq > $2 OR cms.updated_modseq_val > $2 OR COALESCE(cms.expunged_modseq, 0) > $2) -- $2 is sinceModSeq
 			  )
 			SELECT
 			    cm.uid,
@@ -100,9 +136,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			WHERE NOT EXISTS (SELECT 1 FROM changed_messages)
 		) AS combined_results
 		ORDER BY
-		    is_message_update DESC,             -- Process actual message updates first
-		    (expunged_modseq IS NOT NULL) DESC, -- Process expunges before flag changes within message updates
-		    CASE WHEN expunged_modseq IS NOT NULL THEN -seq_num ELSE seq_num END ASC -- Expunges by seq_num DESC, others by seq_num ASC
+		    is_message_update DESC,
+		    (expunged_modseq IS NOT NULL) DESC,
+		    CASE WHEN expunged_modseq IS NOT NULL THEN -seq_num ELSE seq_num END ASC
 	`, mailboxID, sinceModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query combined mailbox poll: %w", err)

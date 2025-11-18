@@ -251,6 +251,15 @@ func (s *POP3Session) handleConnection() {
 			// Remove quotes from password if present for compatibility
 			password := server.UnquoteString(parts[1])
 
+			// Reject empty passwords immediately - no rate limiting needed
+			// Empty passwords are never valid under any condition
+			if password == "" {
+				if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
+					return
+				}
+				continue
+			}
+
 			// Get connection and proxy info for rate limiting
 			netConn := *s.conn
 			var proxyInfo *server.ProxyProtocolInfo

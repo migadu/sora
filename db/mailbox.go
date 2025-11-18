@@ -522,6 +522,21 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 }
 
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
+	// OPTIMIZATION: Early exit if INBOX already exists
+	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist
+	var inboxExists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND name = 'INBOX')
+	`, AccountID).Scan(&inboxExists)
+	if err != nil {
+		return fmt.Errorf("failed to check for INBOX existence: %w", err)
+	}
+
+	// If INBOX exists, assume all default mailboxes exist (they're created together)
+	if inboxExists {
+		return nil
+	}
+
 	// Use a base timestamp and an increment to guarantee unique UIDVALIDITY values
 	// for all default mailboxes created in this single transaction.
 	baseUidValidity := time.Now().Unix()
@@ -533,7 +548,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 		// The DO UPDATE clause with a no-op is a common way to get RETURNING to work with conflicts.
 		err := tx.QueryRow(ctx, `
 			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
-			ON CONFLICT (account_id, name) DO UPDATE 
+			ON CONFLICT (account_id, name) DO UPDATE
 			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
 			RETURNING id
 		`, AccountID, mailboxName, int64(uidValidity)).Scan(&mailboxID)

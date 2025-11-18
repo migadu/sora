@@ -1136,6 +1136,13 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	authnID := parts[1]  // Authentication identity (who is authenticating)
 	password := parts[2] // Password
 
+	// Reject empty passwords immediately - no rate limiting needed
+	// Empty passwords are never valid under any condition
+	if password == "" {
+		s.sendResponse("NO Authentication failed\r\n")
+		return false
+	}
+
 	s.DebugLog("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
 
 	// Parse authentication-identity to check for suffix (master username or prelookup token)

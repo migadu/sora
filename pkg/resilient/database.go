@@ -164,9 +164,9 @@ type ResilientDatabase struct {
 
 // AuthCache interface for authentication caching
 type AuthCache interface {
-	Authenticate(address, password string) (int64, bool)
-	SetSuccess(address string, accountID int64, hashedPassword string)
-	SetFailure(address string, result int)
+	Authenticate(address, password string) (accountID int64, found bool, err error)
+	SetSuccess(address string, accountID int64, hashedPassword string, password string)
+	SetFailure(address string, result int, password string)
 	Invalidate(address string)
 	GetStats() (hits, misses uint64, size int, hitRate float64)
 	Stop(ctx context.Context) error

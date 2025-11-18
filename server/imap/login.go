@@ -13,6 +13,16 @@ import (
 )
 
 func (s *IMAPSession) Login(address, password string) error {
+	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
+	// Empty passwords are never valid under any condition
+	if password == "" {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAuthenticationFailed,
+			Text: "Authentication failed",
+		}
+	}
+
 	// Get the underlying net.Conn for proxy-aware rate limiting
 	netConn := s.conn.NetConn()
 

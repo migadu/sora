@@ -453,34 +453,69 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 
 // AuthCacheConfig holds configuration for authentication result caching
 type AuthCacheConfig struct {
-	Enabled         bool   `toml:"enabled"`          // Enable in-memory caching of authentication results
-	PositiveTTL     string `toml:"positive_ttl"`     // TTL for successful auth (default: "30s")
-	NegativeTTL     string `toml:"negative_ttl"`     // TTL for failed auth (default: "5m")
-	MaxSize         int    `toml:"max_size"`         // Maximum number of cached entries (default: 10000)
-	CleanupInterval string `toml:"cleanup_interval"` // How often to clean expired entries (default: "5m")
+	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results
+	PositiveTTL                string `toml:"positive_ttl"`                 // TTL for successful auth (default: "5m")
+	NegativeTTL                string `toml:"negative_ttl"`                 // TTL for failed auth (default: "1m")
+	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
+	CleanupInterval            string `toml:"cleanup_interval"`             // How often to clean expired entries (default: "5m")
+	NegativeRevalidationWindow string `toml:"negative_revalidation_window"` // How long to wait before revalidating negative cache with different password (default: "5s")
+	PositiveRevalidationWindow string `toml:"positive_revalidation_window"` // How long to wait before revalidating positive cache with different password (default: "30s")
 }
 
 // DefaultAuthCacheConfig returns sensible defaults for authentication caching
 func DefaultAuthCacheConfig() AuthCacheConfig {
 	return AuthCacheConfig{
-		Enabled:         false,
-		PositiveTTL:     "30s",
-		NegativeTTL:     "5m",
-		MaxSize:         10000,
-		CleanupInterval: "5m",
+		Enabled:                    true,  // Enable by default for better performance
+		PositiveTTL:                "5m",  // Cache successful auth for 5 minutes (avoid expensive bcrypt)
+		NegativeTTL:                "1m",  // Cache failed auth for 1 minute (limit brute force impact)
+		MaxSize:                    50000, // 50k entries = ~10MB memory (80% positive, 20% negative)
+		CleanupInterval:            "5m",  // Clean up expired entries every 5 minutes
+		NegativeRevalidationWindow: "5s",  // Allow password correction after 5 seconds
+		PositiveRevalidationWindow: "30s", // Allow password change detection after 30 seconds
 	}
 }
 
-// PreLookupConfig holds configuration for HTTP-based user routing
-// PreLookupCacheConfig holds caching configuration for prelookup
-type PreLookupCacheConfig struct {
-	Enabled         bool   `toml:"enabled"`          // Enable in-memory caching of lookup results
-	PositiveTTL     string `toml:"positive_ttl"`     // TTL for successful lookups (default: "5m")
-	NegativeTTL     string `toml:"negative_ttl"`     // TTL for failed lookups (default: "1m")
-	MaxSize         int    `toml:"max_size"`         // Maximum number of cached entries (default: 10000)
-	CleanupInterval string `toml:"cleanup_interval"` // How often to clean expired entries (default: "1m")
+// GetPositiveTTL parses and returns the positive TTL duration
+func (c *AuthCacheConfig) GetPositiveTTL() (time.Duration, error) {
+	if c.PositiveTTL == "" {
+		return 5 * time.Minute, nil
+	}
+	return time.ParseDuration(c.PositiveTTL)
 }
 
+// GetNegativeTTL parses and returns the negative TTL duration
+func (c *AuthCacheConfig) GetNegativeTTL() (time.Duration, error) {
+	if c.NegativeTTL == "" {
+		return 1 * time.Minute, nil
+	}
+	return time.ParseDuration(c.NegativeTTL)
+}
+
+// GetCleanupInterval parses and returns the cleanup interval duration
+func (c *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
+	if c.CleanupInterval == "" {
+		return 5 * time.Minute, nil
+	}
+	return time.ParseDuration(c.CleanupInterval)
+}
+
+// GetNegativeRevalidationWindow parses and returns the negative revalidation window duration
+func (c *AuthCacheConfig) GetNegativeRevalidationWindow() (time.Duration, error) {
+	if c.NegativeRevalidationWindow == "" {
+		return 5 * time.Second, nil
+	}
+	return time.ParseDuration(c.NegativeRevalidationWindow)
+}
+
+// GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
+func (c *AuthCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
+	if c.PositiveRevalidationWindow == "" {
+		return 30 * time.Second, nil
+	}
+	return time.ParseDuration(c.PositiveRevalidationWindow)
+}
+
+// PreLookupConfig holds configuration for HTTP-based user routing
 type PreLookupConfig struct {
 	Enabled   bool   `toml:"enabled"`
 	URL       string `toml:"url"`        // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
@@ -496,9 +531,6 @@ type PreLookupConfig struct {
 	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
 	RemoteUseXCLIENT       bool  `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
-
-	// Cache configuration
-	Cache *PreLookupCacheConfig `toml:"cache"` // Caching configuration
 
 	// Circuit breaker configuration
 	CircuitBreaker *PreLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
@@ -534,30 +566,6 @@ func (c *PreLookupConfig) GetTimeout() (time.Duration, error) {
 		return 5 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.Timeout)
-}
-
-// GetPositiveTTL returns the positive cache TTL duration
-func (c *PreLookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
-	if c.PositiveTTL == "" {
-		return 5 * time.Minute, nil
-	}
-	return helpers.ParseDuration(c.PositiveTTL)
-}
-
-// GetNegativeTTL returns the negative cache TTL duration
-func (c *PreLookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
-	if c.NegativeTTL == "" {
-		return 1 * time.Minute, nil
-	}
-	return helpers.ParseDuration(c.NegativeTTL)
-}
-
-// GetCleanupInterval returns the cache cleanup interval
-func (c *PreLookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
-	if c.CleanupInterval == "" {
-		return 1 * time.Minute, nil
-	}
-	return helpers.ParseDuration(c.CleanupInterval)
 }
 
 // Circuit breaker configuration helpers
@@ -1154,6 +1162,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitPerMin int    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
+	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
 }
 
 // ServerTimeoutsConfig holds timeout settings for a server
@@ -1241,6 +1250,9 @@ type ServerConfig struct {
 
 	// Auth rate limiting (embedded)
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
+
+	// Auth caching (embedded) - for proxies
+	AuthCache *AuthCacheConfig `toml:"auth_cache,omitempty"`
 
 	// Resource limits (embedded)
 	Limits *ServerLimitsConfig `toml:"limits,omitempty"`
@@ -1334,7 +1346,6 @@ type Config struct {
 	Uploader         UploaderConfig         `toml:"uploader"`
 	Metadata         MetadataConfig         `toml:"metadata"`
 	SharedMailboxes  SharedMailboxesConfig  `toml:"shared_mailboxes"`
-	AuthCache        AuthCacheConfig        `toml:"auth_cache"`
 	Relay            RelayConfig            `toml:"relay"`
 	AdminCLI         AdminCLIConfig         `toml:"admin_cli"`         // Admin CLI tool configuration
 	TimeoutScheduler TimeoutSchedulerConfig `toml:"timeout_scheduler"` // Global timeout scheduler configuration
@@ -1878,6 +1889,14 @@ func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 		return 52428800 // 50MB default
 	}
 	return size
+}
+
+// GetMaxAuthErrors returns the max auth errors with a default of 2
+func (s *ServerConfig) GetMaxAuthErrors() int {
+	if s.Limits == nil || s.Limits.MaxAuthErrors <= 0 {
+		return 2 // Default: 2 authentication errors before disconnection
+	}
+	return s.Limits.MaxAuthErrors
 }
 
 func (s *ServerConfig) GetProxyProtocolTimeoutWithDefault() string {

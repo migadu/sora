@@ -51,36 +51,8 @@ func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRout
 		}
 	}
 
-	// Initialize cache if enabled
-	var cache *prelookupCache
-	cacheEnabled := false
-	if cfg.Cache != nil && cfg.Cache.Enabled {
-		cacheEnabled = true
-		positiveTTL, err := cfg.Cache.GetPositiveTTL()
-		if err != nil {
-			return nil, fmt.Errorf("invalid cache.positive_ttl: %w", err)
-		}
-
-		negativeTTL, err := cfg.Cache.GetNegativeTTL()
-		if err != nil {
-			return nil, fmt.Errorf("invalid cache.negative_ttl: %w", err)
-		}
-
-		cleanupInterval, err := cfg.Cache.GetCleanupInterval()
-		if err != nil {
-			return nil, fmt.Errorf("invalid cache.cleanup_interval: %w", err)
-		}
-
-		maxSize := cfg.Cache.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000 // Default
-		}
-
-		cache = newPrelookupCache(protocol, positiveTTL, negativeTTL, maxSize, cleanupInterval)
-	}
-
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("Prelookup: Initializing HTTP prelookup", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "cache_enabled", cacheEnabled, "auth_enabled", hasAuth)
+	logger.Debug("Prelookup: Initializing HTTP prelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings
@@ -152,7 +124,6 @@ func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRout
 		cfg.RemoteUseProxyProtocol,
 		cfg.RemoteUseIDCommand,
 		cfg.RemoteUseXCLIENT,
-		cache,
 		cbSettings,
 		transportSettings,
 	)

@@ -13,6 +13,7 @@ var (
 	ErrMalformedMessage     = errors.New("malformed message")
 	ErrMessageNotAvailable  = errors.New("message not available")
 	ErrEmptyMessageID       = errors.New("empty message ID")
+	ErrAuthenticationFailed = errors.New("authentication failed")
 
 	ErrDBNotFound                = errors.New("not found")
 	ErrDBUniqueViolation         = errors.New("unique violation")

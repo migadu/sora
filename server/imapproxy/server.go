@@ -18,6 +18,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -54,6 +55,11 @@ type Server struct {
 	remoteUseIDCommand     bool                        // Whether backend supports IMAP ID command for forwarding
 	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
+	// Authentication cache
+	authCache                  *cache.AuthCache
+	negativeRevalidationWindow time.Duration // How long to wait before revalidating negative cache with different password
+	positiveRevalidationWindow time.Duration // How long to wait before revalidating positive cache with different password
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
@@ -63,6 +69,9 @@ type Server struct {
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
+
+	// Authentication limits
+	maxAuthErrors int // Maximum authentication errors before disconnection
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -139,6 +148,7 @@ type ServerOptions struct {
 	MinBytesPerMinute      int64         // Minimum throughput
 	EnableAffinity         bool
 	AuthRateLimit          server.AuthRateLimiterConfig
+	AuthCache              *config.AuthCacheConfig // Authentication cache configuration
 	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
@@ -153,6 +163,9 @@ type ServerOptions struct {
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
 	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
+
+	// Authentication limits
+	MaxAuthErrors int // Maximum authentication errors before disconnection (default: 2)
 
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
@@ -260,38 +273,90 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		listenBacklog = 1024 // Default backlog
 	}
 
+	// Initialize authentication cache from config
+	// Apply defaults if not configured (enabled by default for performance)
+	var authCache *cache.AuthCache
+	authCacheConfig := opts.AuthCache
+	if authCacheConfig == nil {
+		defaultConfig := config.DefaultAuthCacheConfig()
+		authCacheConfig = &defaultConfig
+	}
+
+	// Parse revalidation windows
+	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
+	if err != nil {
+		logger.Info("IMAP Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", opts.Name, "error", err)
+		negativeRevalidationWindow = 5 * time.Second
+	}
+	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	if err != nil {
+		logger.Info("IMAP Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
+		positiveRevalidationWindow = 30 * time.Second
+	}
+
+	if authCacheConfig.Enabled {
+		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+		if err != nil {
+			logger.Info("IMAP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
+			positiveTTL = 5 * time.Minute
+		}
+		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		if err != nil {
+			logger.Info("IMAP Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
+			negativeTTL = 1 * time.Minute
+		}
+		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		if err != nil {
+			logger.Info("IMAP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
+			cleanupInterval = 5 * time.Minute
+		}
+		maxSize := authCacheConfig.MaxSize
+		if maxSize <= 0 {
+			maxSize = 10000
+		}
+
+		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
+		logger.Info("IMAP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+	} else {
+		logger.Info("IMAP Proxy: Authentication cache disabled", "name", opts.Name)
+	}
+
 	return &Server{
-		rdb:                    rdb,
-		name:                   opts.Name,
-		addr:                   opts.Addr,
-		hostname:               hostname,
-		connManager:            connManager,
-		masterUsername:         []byte(opts.MasterUsername),
-		masterPassword:         []byte(opts.MasterPassword),
-		masterSASLUsername:     []byte(opts.MasterSASLUsername),
-		masterSASLPassword:     []byte(opts.MasterSASLPassword),
-		tls:                    opts.TLS,
-		tlsCertFile:            opts.TLSCertFile,
-		tlsKeyFile:             opts.TLSKeyFile,
-		tlsVerify:              opts.TLSVerify,
-		tlsConfig:              opts.TLSConfig,
-		enableAffinity:         opts.EnableAffinity,
-		authIdleTimeout:        opts.AuthIdleTimeout,
-		commandTimeout:         opts.CommandTimeout,
-		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
-		minBytesPerMinute:      opts.MinBytesPerMinute,
-		ctx:                    ctx,
-		cancel:                 cancel,
-		authLimiter:            authLimiter,
-		trustedProxies:         opts.TrustedProxies,
-		prelookupConfig:        opts.PreLookup,
-		remoteUseIDCommand:     opts.RemoteUseIDCommand,
-		proxyReader:            proxyReader,
-		limiter:                limiter,
-		listenBacklog:          listenBacklog,
-		debug:                  opts.Debug,
-		debugWriter:            debugWriter,
-		activeSessions:         make(map[*Session]struct{}),
+		rdb:                        rdb,
+		name:                       opts.Name,
+		addr:                       opts.Addr,
+		hostname:                   hostname,
+		connManager:                connManager,
+		masterUsername:             []byte(opts.MasterUsername),
+		masterPassword:             []byte(opts.MasterPassword),
+		masterSASLUsername:         []byte(opts.MasterSASLUsername),
+		masterSASLPassword:         []byte(opts.MasterSASLPassword),
+		tls:                        opts.TLS,
+		tlsCertFile:                opts.TLSCertFile,
+		tlsKeyFile:                 opts.TLSKeyFile,
+		tlsVerify:                  opts.TLSVerify,
+		tlsConfig:                  opts.TLSConfig,
+		enableAffinity:             opts.EnableAffinity,
+		authIdleTimeout:            opts.AuthIdleTimeout,
+		commandTimeout:             opts.CommandTimeout,
+		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
+		minBytesPerMinute:          opts.MinBytesPerMinute,
+		ctx:                        ctx,
+		cancel:                     cancel,
+		authLimiter:                authLimiter,
+		trustedProxies:             opts.TrustedProxies,
+		prelookupConfig:            opts.PreLookup,
+		remoteUseIDCommand:         opts.RemoteUseIDCommand,
+		proxyReader:                proxyReader,
+		authCache:                  authCache,
+		negativeRevalidationWindow: negativeRevalidationWindow,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		limiter:                    limiter,
+		listenBacklog:              listenBacklog,
+		debug:                      opts.Debug,
+		debugWriter:                debugWriter,
+		maxAuthErrors:              opts.MaxAuthErrors,
+		activeSessions:             make(map[*Session]struct{}),
 	}, nil
 }
 
@@ -573,6 +638,15 @@ func (s *Server) Stop() error {
 			if err := routingLookup.Close(); err != nil {
 				logger.Error("Error closing prelookup client", "proxy", s.name, "error", err)
 			}
+		}
+	}
+
+	// Stop auth cache
+	if s.authCache != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := s.authCache.Stop(stopCtx); err != nil {
+			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}
 

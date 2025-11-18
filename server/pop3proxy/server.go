@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -53,12 +54,20 @@ type POP3ProxyServer struct {
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
+	// Auth cache for routing and password validation
+	authCache                  *cache.AuthCache
+	negativeRevalidationWindow time.Duration
+	positiveRevalidationWindow time.Duration
+
 	// Listen backlog
 	listenBacklog int
 
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
+
+	// Authentication limits
+	maxAuthErrors int // Maximum authentication errors before disconnection
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -152,6 +161,12 @@ type POP3ProxyServerOptions struct {
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
 	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+
+	// Auth cache configuration
+	AuthCache *config.AuthCacheConfig
+
+	// Authentication limits
+	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
 	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
@@ -265,35 +280,88 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		logger.Info("PROXY protocol enabled for incoming connections", "proxy", options.Name)
 	}
 
+	// Initialize auth cache for user authentication and routing
+	// Initialize authentication cache from config
+	// Apply defaults if not configured (enabled by default for performance)
+	var authCache *cache.AuthCache
+	authCacheConfig := options.AuthCache
+	if authCacheConfig == nil {
+		defaultConfig := config.DefaultAuthCacheConfig()
+		authCacheConfig = &defaultConfig
+	}
+
+	if authCacheConfig.Enabled {
+		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+		if err != nil {
+			logger.Info("POP3 Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", options.Name, "error", err)
+			positiveTTL = 5 * time.Minute
+		}
+		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		if err != nil {
+			logger.Info("POP3 Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", options.Name, "error", err)
+			negativeTTL = 1 * time.Minute
+		}
+		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		if err != nil {
+			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
+			cleanupInterval = 5 * time.Minute
+		}
+		maxSize := authCacheConfig.MaxSize
+		if maxSize <= 0 {
+			maxSize = 10000
+		}
+
+		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
+		logger.Info("POP3 Proxy: Authentication cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+	} else {
+		logger.Info("POP3 Proxy: Authentication cache disabled", "name", options.Name)
+	}
+
+	// Parse revalidation windows from config (used for password change detection)
+	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
+	if err != nil {
+		logger.Info("POP3 Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", options.Name, "error", err)
+		negativeRevalidationWindow = 5 * time.Second
+	}
+	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	if err != nil {
+		logger.Info("POP3 Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
+		positiveRevalidationWindow = 30 * time.Second
+	}
+
 	server := &POP3ProxyServer{
-		name:                   options.Name,
-		hostname:               hostname,
-		addr:                   addr,
-		rdb:                    rdb,
-		appCtx:                 serverCtx,
-		cancel:                 serverCancel,
-		masterUsername:         options.MasterUsername,
-		masterPassword:         options.MasterPassword,
-		masterSASLUsername:     options.MasterSASLUsername,
-		masterSASLPassword:     options.MasterSASLPassword,
-		connManager:            connManager,
-		enableAffinity:         options.EnableAffinity,
-		affinityValidity:       options.AffinityValidity,
-		affinityStickiness:     stickiness,
-		authLimiter:            authLimiter,
-		trustedProxies:         options.TrustedProxies,
-		prelookupConfig:        options.PreLookup,
-		authIdleTimeout:        options.AuthIdleTimeout,
-		commandTimeout:         options.CommandTimeout,
-		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
-		minBytesPerMinute:      options.MinBytesPerMinute,
-		remoteUseXCLIENT:       options.RemoteUseXCLIENT,
-		limiter:                limiter,
-		listenBacklog:          listenBacklog,
-		debug:                  options.Debug,
-		debugWriter:            debugWriter,
-		activeSessions:         make(map[*POP3ProxySession]struct{}),
-		proxyReader:            proxyReader,
+		name:                       options.Name,
+		hostname:                   hostname,
+		addr:                       addr,
+		rdb:                        rdb,
+		appCtx:                     serverCtx,
+		cancel:                     serverCancel,
+		masterUsername:             options.MasterUsername,
+		masterPassword:             options.MasterPassword,
+		masterSASLUsername:         options.MasterSASLUsername,
+		masterSASLPassword:         options.MasterSASLPassword,
+		connManager:                connManager,
+		enableAffinity:             options.EnableAffinity,
+		affinityValidity:           options.AffinityValidity,
+		affinityStickiness:         stickiness,
+		authLimiter:                authLimiter,
+		trustedProxies:             options.TrustedProxies,
+		prelookupConfig:            options.PreLookup,
+		authIdleTimeout:            options.AuthIdleTimeout,
+		commandTimeout:             options.CommandTimeout,
+		absoluteSessionTimeout:     options.AbsoluteSessionTimeout,
+		minBytesPerMinute:          options.MinBytesPerMinute,
+		remoteUseXCLIENT:           options.RemoteUseXCLIENT,
+		limiter:                    limiter,
+		authCache:                  authCache,
+		negativeRevalidationWindow: negativeRevalidationWindow,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		listenBacklog:              listenBacklog,
+		maxAuthErrors:              options.MaxAuthErrors,
+		debug:                      options.Debug,
+		debugWriter:                debugWriter,
+		activeSessions:             make(map[*POP3ProxySession]struct{}),
+		proxyReader:                proxyReader,
 	}
 
 	// Setup TLS: Three scenarios
@@ -544,6 +612,15 @@ func (s *POP3ProxyServer) Stop() error {
 			if err := routingLookup.Close(); err != nil {
 				logger.Debug("POP3 Proxy: Error closing prelookup client", "proxy", s.name, "error", err)
 			}
+		}
+	}
+
+	// Stop auth cache
+	if s.authCache != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := s.authCache.Stop(stopCtx); err != nil {
+			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}
 

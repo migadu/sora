@@ -15,6 +15,7 @@ import (
 
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -404,20 +405,49 @@ func (s *Session) handleRecipient(to string) error {
 		soraConn.SetUsername(s.username)
 	}
 
+	// Check cache first (for routing info - no password validation needed)
+	if cached, found := s.server.authCache.Get(s.server.name, s.username); found {
+		if cached.IsNegative {
+			// User previously not found - return cached failure
+			// Note: Do NOT refresh negative entries - let them expire naturally so we can
+			// re-check the database in case the user was created since last check
+			s.InfoLog("user not found", "username", s.username, "cache", "hit")
+			metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+			return fmt.Errorf("user not found")
+		} else {
+			// User found - use cached routing info
+			s.InfoLog("using cached routing", "username", s.username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "cache", "hit")
+			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+
+			s.accountID = cached.AccountID
+			s.isPrelookupAccount = cached.FromPrelookup
+			s.routingInfo = &proxy.UserRoutingInfo{
+				AccountID:              cached.AccountID,
+				ServerAddress:          cached.ServerAddress,
+				RemoteTLS:              cached.RemoteTLS,
+				RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
+				RemoteTLSVerify:        cached.RemoteTLSVerify,
+				RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
+				RemoteUseXCLIENT:       cached.RemoteUseXCLIENT,
+			}
+
+			s.server.authCache.Refresh(s.server.name, s.username)
+			return nil
+		}
+	}
+
 	// 1. Try prelookup first
 	hasRouting := s.server.connManager.HasRouting()
-	s.InfoLog("checking prelookup availability", "username", s.username, "has_routing", hasRouting)
 
 	if hasRouting {
-		// Use configured prelookup timeout instead of hardcoded value
+		// Call prelookup API
 		routingTimeout := s.server.connManager.GetPrelookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, routingTimeout)
 		defer routingCancel()
 
-		s.InfoLog("calling prelookup", "username", s.username)
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			s.InfoLog("prelookup failed", "username", s.username, "error", lookupErr)
+			s.InfoLog("prelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
 
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(lookupErr, server.ErrServerShuttingDown) {
@@ -435,12 +465,32 @@ func (s *Session) handleRecipient(to string) error {
 			}
 			s.InfoLog("prelookup transient error - fallback_to_default=true, falling back to main DB", "username", s.username)
 			metrics.PrelookupResult.WithLabelValues("lmtp", "transient_error_fallback").Inc()
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			s.InfoLog("prelookup succeeded", "username", s.username, "server", routingInfo.ServerAddress, "cached", routingInfo.FromCache)
+		} else if routingInfo != nil {
+			// Prelookup succeeded - may or may not have ServerAddress
+			// If no ServerAddress, backend selection will use consistent hash/round-robin
+			serverAddr := routingInfo.ServerAddress
+			if serverAddr == "" {
+				serverAddr = "(use consistent hash)"
+			}
+			s.InfoLog("prelookup succeeded", "username", s.username, "server", serverAddr, "account_id", routingInfo.AccountID, "cache", "miss")
 			metrics.PrelookupResult.WithLabelValues("lmtp", "success").Inc()
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
+
+			// Cache positive result (routing info found)
+			s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
+				AccountID:              routingInfo.AccountID,
+				ServerAddress:          routingInfo.ServerAddress,
+				RemoteTLS:              routingInfo.RemoteTLS,
+				RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
+				RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
+				RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
+				RemoteUseXCLIENT:       routingInfo.RemoteUseXCLIENT,
+				AuthResult:             cache.AuthSuccess,
+				FromPrelookup:          true,
+			})
+
 			return nil
 		} else {
 			// User not found in prelookup (404 or empty response).
@@ -467,8 +517,32 @@ func (s *Session) handleRecipient(to string) error {
 			s.InfoLog("database lookup cancelled due to server shutdown")
 			return server.ErrServerShuttingDown
 		}
+
+		// Cache negative result (user not found)
+		s.InfoLog("user not found in main database", "username", s.username, "cache", "miss")
+		s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
+			AuthResult: cache.AuthUserNotFound,
+			IsNegative: true,
+		})
+
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
+
+	// Set routing info so connectToBackend doesn't call prelookup again
+	// Preserve global proxy settings (XCLIENT support) since we're not using prelookup routing
+	s.routingInfo = &proxy.UserRoutingInfo{
+		AccountID:        s.accountID,
+		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
+	}
+
+	// Cache positive result (routing info from DB)
+	s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
+		AccountID:        s.accountID,
+		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
+		AuthResult:       cache.AuthSuccess,
+		FromPrelookup:    false,
+	})
+
 	return nil
 }
 
@@ -745,8 +819,7 @@ func (s *Session) startProxy(initialCommand string) {
 	s.clientWriter.Flush()
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
-	prelookupCached := s.routingInfo != nil && s.routingInfo.FromCache
-	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "prelookup_cached", prelookupCached, "sender", s.sender, "recipient", s.to)
+	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "sender", s.sender, "recipient", s.to)
 
 	var wg sync.WaitGroup
 
