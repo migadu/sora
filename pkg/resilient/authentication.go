@@ -10,7 +10,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/authcache"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/retry"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -174,65 +174,60 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 // Parameters:
 //   - protocol: Protocol name for logging (e.g., "IMAP", "POP3", "ManageSieve")
 //   - serverName: Server name for logging
-//   - authCacheConfig: Auth cache configuration from server config (can be nil, defaults will be applied)
+//   - lookupCacheConfig: Auth cache configuration from server config (can be nil, defaults will be applied)
 //   - rdb: ResilientDatabase instance to set the cache on
 //
-// The function applies default configuration if authCacheConfig is nil, parses TTL durations with fallback
+// The function applies default configuration if lookupCacheConfig is nil, parses TTL durations with fallback
 // to defaults, creates the auth cache, and sets it on the ResilientDatabase instance.
-func InitializeAuthCache(protocol string, serverName string, authCacheConfig *config.AuthCacheConfig, rdb *ResilientDatabase) {
+func InitializeAuthCache(protocol string, serverName string, lookupCacheConfig *config.LookupCacheConfig, rdb *ResilientDatabase) {
 	// Apply defaults if not configured (enabled by default for performance)
-	if authCacheConfig == nil {
-		defaultConfig := config.DefaultAuthCacheConfig()
-		authCacheConfig = &defaultConfig
+	if lookupCacheConfig == nil {
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
-	if !authCacheConfig.Enabled {
+	if !lookupCacheConfig.Enabled {
 		logger.Info(protocol+": Authentication cache disabled", "name", serverName)
 		return
 	}
 
 	// Parse positive TTL with fallback to default
-	positiveTTL, err := time.ParseDuration(authCacheConfig.PositiveTTL)
-	if err != nil || authCacheConfig.PositiveTTL == "" {
+	positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
+	if err != nil || lookupCacheConfig.PositiveTTL == "" {
 		logger.Info(protocol+": Using default positive TTL (5m)", "name", serverName)
 		positiveTTL = 5 * time.Minute
 	}
 
 	// Parse negative TTL with fallback to default
-	negativeTTL, err := time.ParseDuration(authCacheConfig.NegativeTTL)
-	if err != nil || authCacheConfig.NegativeTTL == "" {
+	negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
+	if err != nil || lookupCacheConfig.NegativeTTL == "" {
 		logger.Info(protocol+": Using default negative TTL (1m)", "name", serverName)
 		negativeTTL = 1 * time.Minute
 	}
 
 	// Parse cleanup interval with fallback to default
-	cleanupInterval, err := time.ParseDuration(authCacheConfig.CleanupInterval)
-	if err != nil || authCacheConfig.CleanupInterval == "" {
+	cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
+	if err != nil || lookupCacheConfig.CleanupInterval == "" {
 		logger.Info(protocol+": Using default cleanup interval (5m)", "name", serverName)
 		cleanupInterval = 5 * time.Minute
 	}
 
 	// Get max size with fallback to default
-	maxSize := authCacheConfig.MaxSize
+	maxSize := lookupCacheConfig.MaxSize
 	if maxSize == 0 {
 		maxSize = 10000
 	}
 
-	// Parse revalidation windows from config
-	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
-	if err != nil {
-		logger.Info(protocol+": Invalid negative revalidation window in auth cache config, using default (5s)", "name", serverName, "error", err)
-		negativeRevalidationWindow = 5 * time.Second
-	}
-	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	// Parse positive revalidation window from config
+	positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
 	if err != nil {
 		logger.Info(protocol+": Invalid positive revalidation window in auth cache config, using default (30s)", "name", serverName, "error", err)
 		positiveRevalidationWindow = 30 * time.Second
 	}
 
 	// Create auth cache and set it on ResilientDatabase
-	cache := authcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, negativeRevalidationWindow, positiveRevalidationWindow)
+	cache := lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 	rdb.SetAuthCache(cache)
 	logger.Info(protocol+": Authentication cache enabled", "name", serverName, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize,
-		"negative_revalidation_window", negativeRevalidationWindow, "positive_revalidation_window", positiveRevalidationWindow)
+		"positive_revalidation_window", positiveRevalidationWindow)
 }

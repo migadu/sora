@@ -288,10 +288,10 @@ type IMAPServerOptions struct {
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
 	AuthRateLimit               serverPkg.AuthRateLimiterConfig
-	AuthCache                   *config.AuthCacheConfig // Authentication cache configuration
-	SearchRateLimitPerMin       int                     // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow       time.Duration           // Search rate limit time window
-	SessionMemoryLimit          int64                   // Per-session memory limit in bytes (0=unlimited)
+	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
+	SearchRateLimitPerMin       int                       // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow       time.Duration             // Search rate limit time window
+	SessionMemoryLimit          int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -360,7 +360,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
 
 	// Initialize authentication cache from config
-	resilient.InitializeAuthCache("IMAP", name, options.AuthCache, rdb)
+	resilient.InitializeAuthCache("IMAP", name, options.LookupCache, rdb)
 
 	// Parse warmup timeout with default fallback
 	warmupTimeout := 5 * time.Minute // Default timeout

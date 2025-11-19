@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -479,7 +479,7 @@ func (s *Session) handleRecipient(to string) error {
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
 
 			// Cache positive result (routing info found)
-			s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
+			s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 				AccountID:              routingInfo.AccountID,
 				ServerAddress:          routingInfo.ServerAddress,
 				RemoteTLS:              routingInfo.RemoteTLS,
@@ -487,7 +487,7 @@ func (s *Session) handleRecipient(to string) error {
 				RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
 				RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
 				RemoteUseXCLIENT:       routingInfo.RemoteUseXCLIENT,
-				AuthResult:             cache.AuthSuccess,
+				Result:                 lookupcache.AuthSuccess,
 				FromPrelookup:          true,
 			})
 
@@ -520,8 +520,8 @@ func (s *Session) handleRecipient(to string) error {
 
 		// Cache negative result (user not found)
 		s.InfoLog("user not found in main database", "username", s.username, "cache", "miss")
-		s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
-			AuthResult: cache.AuthUserNotFound,
+		s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+			Result:     lookupcache.AuthUserNotFound,
 			IsNegative: true,
 		})
 
@@ -536,10 +536,10 @@ func (s *Session) handleRecipient(to string) error {
 	}
 
 	// Cache positive result (routing info from DB)
-	s.server.authCache.Set(s.server.name, s.username, &cache.CacheEntry{
+	s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
-		AuthResult:       cache.AuthSuccess,
+		Result:           lookupcache.AuthSuccess,
 		FromPrelookup:    false,
 	})
 

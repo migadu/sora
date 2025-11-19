@@ -497,7 +497,7 @@ health_status_retention = "30d" # How long to retain health status history in th
 
 # AUTHENTICATION CACHE CONFIGURATION
 # =============================================================================
-# In-memory authentication result caching to reduce database load.
+# In-memory authentication and routing lookup caching to reduce database load.
 # Particularly useful for:
 # - Parallel client connections (mail clients often open 3-5+ IMAP connections)
 # - Mitigating DoS attacks from non-existent account lookups
@@ -863,17 +863,15 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # --- AUTHENTICATION CACHE (OPTIONAL) ---
 # Cache authentication results to reduce database queries and improve performance.
 # ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable.
-# [server.auth_cache]
-# enabled = true                          # Enable authentication result caching for this server (default: true)
+# [server.lookup_cache]
+# enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
 #                                         # Longer TTL = better performance, but password changes take time to propagate
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
-#                                         # Helps mitigate brute force attacks
-# max_size = 10000                        # Maximum cached entries (default: 10000, LRU eviction)
+#                                         # Helps mitigate brute force attacks by preventing repeated database queries
+#                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
+# max_size = 50000                        # Maximum cached entries (default: 10000, LRU eviction)
 # cleanup_interval = "5m"                 # How often to remove expired entries (default: 5m)
-# negative_revalidation_window = "5s"     # Revalidation window for failed auth with different password (default: 5s)
-#                                         # Prevents rapid password guessing by delaying revalidation of negative cache entries
-#                                         # If a different password is tried within this window, authentication is rejected
 # positive_revalidation_window = "30s"    # Revalidation window for successful auth with different password (default: 30s)
 #                                         # Protects against unauthorized access when password changes
 #                                         # If a different password is tried within this window on a cached success, authentication is rejected
@@ -1415,66 +1413,6 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
 # All logic for token splitting, validation, alias resolution, etc. is handled by your HTTP endpoint.
 #
 # See test_prelookup_server.go for a working example implementation.
-
-# --- AUTHENTICATION CACHING ---
-# In-memory caching of authentication results to reduce expensive bcrypt operations
-# and improve proxy performance under high load.
-#
-# CACHE BEHAVIOR:
-# - Positive results (successful auth): Cached with longer TTL (default: 5 minutes)
-# - Negative results (failed auth): Cached with shorter TTL (default: 1 minute)
-# - Cache key: Combination of server name and username
-# - Password hash stored in cache to detect password changes
-# - Separate size limits for positive (80%) and negative (20%) entries
-# - Thread-safe with read/write locks
-# - Background cleanup of expired entries
-# - LRU-style eviction when max size exceeded
-#
-# SMART REVALIDATION:
-# - TTL refresh: Repeated successful auth extends cache lifetime
-# - Password change detection: Different password triggers revalidation
-# - Selective caching: Only caches definitive failures (wrong password, user not found)
-# - Transient errors NOT cached (DB unavailable, network errors) - circuit breakers handle those
-#
-# BENEFITS:
-# - Reduced latency: Sub-millisecond cache lookups vs expensive bcrypt (~100-300ms)
-# - Reduced CPU: Avoids repeated bcrypt operations for same credentials
-# - DDoS protection: Negative caching prevents repeated failed auth attempts
-# - Better scalability: Can handle 10x more auth requests with same hardware
-#
-# EXAMPLE SCENARIOS:
-# - User authenticates successfully → cached for 5 minutes, bcrypt skipped on subsequent auth
-# - Same user authenticates again within 5 minutes → instant cache hit (~1ms vs ~100ms)
-# - Attacker tries wrong password → cached as failed for 1 minute
-# - Attacker retries same wrong password → instant rejection from cache
-# - User changes password → cache detects mismatch and revalidates immediately
-# - Database unavailable → NOT cached, circuit breaker handles retry logic
-#
-# MEMORY USAGE:
-# - ~200 bytes per entry
-# - 10000 entries ≈ 2 MB memory
-# - 100000 entries ≈ 20 MB memory
-#
-[server.auth_cache]
-enabled = true                  # Enable authentication caching (default: true)
-positive_ttl = "5m"             # TTL for successful authentication (default: 5m)
-                                # How long to cache valid credentials
-                                # Longer TTL = better performance, but password changes take longer to take effect
-negative_ttl = "1m"             # TTL for failed auth (default: 1m)
-                                # Shorter TTL avoids caching temporary issues (e.g., typos)
-                                # Provides DDoS protection while allowing quick recovery
-max_size = 10000                # Maximum number of cached entries (default: 10000)
-                                # Automatically split: 80% for positive results, 20% for negative
-                                # When exceeded, oldest entries (by LRU) are evicted
-cleanup_interval = "5m"         # How often to scan and remove expired entries (default: 5m)
-                                # More frequent = lower memory usage, slightly higher CPU
-                                # Less frequent = higher memory usage, lower CPU
-negative_revalidation_window = "5s"   # Revalidation window for failed auth with different password (default: 5s)
-                                      # Prevents rapid password guessing by delaying revalidation of negative cache entries
-                                      # If a different password is tried within this window, authentication is rejected
-positive_revalidation_window = "30s"  # Revalidation window for successful auth with different password (default: 30s)
-                                      # Protects against unauthorized access when password changes
-                                      # If a different password is tried within this window on a cached success, authentication is rejected
 
 
 # POP3 PROXY EXAMPLE

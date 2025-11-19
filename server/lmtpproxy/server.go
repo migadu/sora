@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -54,7 +54,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Routing cache (for user lookups - no password validation needed)
-	authCache *cache.AuthCache
+	authCache *lookupcache.LookupCache
 
 	// Listen backlog
 	listenBacklog int
@@ -102,7 +102,7 @@ type ServerOptions struct {
 	ListenBacklog  int // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 
 	// Routing cache configuration (for user lookups)
-	AuthCache *config.AuthCacheConfig
+	LookupCache *config.LookupCacheConfig
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -232,35 +232,36 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// This caches both positive (user found) and negative (user not found) results
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *cache.AuthCache
-	authCacheConfig := opts.AuthCache
-	if authCacheConfig == nil {
-		defaultConfig := config.DefaultAuthCacheConfig()
-		authCacheConfig = &defaultConfig
+	var authCache *lookupcache.LookupCache
+	lookupCacheConfig := opts.LookupCache
+	if lookupCacheConfig == nil {
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
-	if authCacheConfig.Enabled {
-		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+	if lookupCacheConfig.Enabled {
+		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("LMTP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			positiveTTL = 5 * time.Minute
 		}
-		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
 		if err != nil {
 			logger.Info("LMTP Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
 			negativeTTL = 1 * time.Minute
 		}
-		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
 		if err != nil {
 			logger.Info("LMTP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := authCacheConfig.MaxSize
+		maxSize := lookupCacheConfig.MaxSize
 		if maxSize <= 0 {
 			maxSize = 10000
 		}
 
-		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
+		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
+		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
 		logger.Info("LMTP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	} else {
 		logger.Info("LMTP Proxy: Authentication cache disabled", "name", opts.Name)

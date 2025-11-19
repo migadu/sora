@@ -17,9 +17,9 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
@@ -497,7 +497,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	if s.server.authCache != nil {
 		if cached, found := s.server.authCache.Get(s.server.name, username); found {
 			// Hash the password (never empty - validated at function start)
-			passwordHash := cache.HashPassword(password)
+			passwordHash := lookupcache.HashPassword(password)
 
 			// Check password hash match
 			// Note: cached.PasswordHash should also never be empty, but we check defensively
@@ -513,17 +513,11 @@ func (s *Session) authenticateUser(username, password string) error {
 					s.server.authCache.Refresh(s.server.name, username)
 					return consts.ErrAuthenticationFailed
 				} else {
-					// Different password - revalidate if cache entry is old enough
-					if cached.IsOld(s.server.negativeRevalidationWindow) {
-						s.DebugLog("cache hit - negative entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative_revalidate").Inc()
-						// Fall through to full authentication
-					} else {
-						// Different password but too fresh - likely brute force
-						s.DebugLog("cache hit - negative entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative_fresh").Inc()
-						return consts.ErrAuthenticationFailed
-					}
+					// Different password - ALWAYS revalidate (user might have fixed their password)
+					// Brute force protection is handled by protocol-level rate limiting
+					s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
+					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+					// Fall through to full authentication
 				}
 			} else {
 				// Positive cache entry - successful authentication previously cached
@@ -732,9 +726,9 @@ func (s *Session) authenticateUser(username, password string) error {
 				if s.server.authCache != nil {
 					passwordHash := ""
 					if password != "" {
-						passwordHash = cache.HashPassword(password)
+						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
 						PasswordHash:           passwordHash,
 						ServerAddress:          routingInfo.ServerAddress,
@@ -742,7 +736,7 @@ func (s *Session) authenticateUser(username, password string) error {
 						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
 						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
 						RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-						AuthResult:             cache.AuthSuccess,
+						Result:                 lookupcache.AuthSuccess,
 						FromPrelookup:          true,
 						IsNegative:             false,
 					})
@@ -770,11 +764,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				if s.server.authCache != nil {
 					passwordHash := ""
 					if password != "" {
-						passwordHash = cache.HashPassword(password)
+						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
-						AuthResult:   cache.AuthFailed,
+						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
 					})
 				}
@@ -851,11 +845,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				if s.server.authCache != nil {
 					passwordHash := ""
 					if password != "" {
-						passwordHash = cache.HashPassword(password)
+						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
-						AuthResult:   cache.AuthFailed,
+						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
 					})
 				}
@@ -882,13 +876,13 @@ func (s *Session) authenticateUser(username, password string) error {
 	if s.server.authCache != nil {
 		passwordHash := ""
 		if password != "" {
-			passwordHash = cache.HashPassword(password)
+			passwordHash = lookupcache.HashPassword(password)
 		}
-		s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+		s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:     accountID,
 			PasswordHash:  passwordHash,
 			ServerAddress: "", // Will be populated by affinity/routing in next connection
-			AuthResult:    cache.AuthSuccess,
+			Result:        lookupcache.AuthSuccess,
 			FromPrelookup: false,
 			IsNegative:    false,
 		})

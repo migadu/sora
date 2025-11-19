@@ -17,9 +17,9 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -552,7 +552,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if cached, found := s.server.authCache.Get(s.server.name, username); found {
 		// Hash the password (never empty - validated at function start)
-		passwordHash := cache.HashPassword(password)
+		passwordHash := lookupcache.HashPassword(password)
 
 		// Check password hash match
 		// Note: cached.PasswordHash should also never be empty, but we check defensively
@@ -570,20 +570,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			} else {
-				// Different password - always revalidate (user might have fixed their password)
-				// Use configured window: revalidate if entry is older than negativeRevalidationWindow
-				if cached.IsOld(s.server.negativeRevalidationWindow) {
-					s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
-					// Fall through to full auth
-				} else {
-					// Entry is very fresh - likely rapid retry with wrong password
-					s.DebugLog("cache hit - negative entry with different password (very fresh)", "username", username)
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative_different_pw").Inc()
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
-					return consts.ErrAuthenticationFailed
-				}
+				// Different password - ALWAYS revalidate (user might have fixed their password)
+				// Brute force protection is handled by protocol-level rate limiting
+				s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
+				metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+				// Fall through to full auth
 			}
 		} else {
 			// Positive cache entry (successful auth)
@@ -793,9 +784,9 @@ func (s *Session) authenticateUser(username, password string) error {
 				// This ensures different passwords don't match the same cache entry
 				passwordHash := ""
 				if password != "" {
-					passwordHash = cache.HashPassword(password)
+					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					AccountID:              routingInfo.AccountID,
 					PasswordHash:           passwordHash,
 					ServerAddress:          routingInfo.ServerAddress,
@@ -804,7 +795,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
 					RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
 					RemoteUseIDCommand:     routingInfo.RemoteUseIDCommand,
-					AuthResult:             cache.AuthSuccess,
+					Result:                 lookupcache.AuthSuccess,
 					FromPrelookup:          true,
 					IsNegative:             false,
 				})
@@ -827,11 +818,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Always hash password, even for master auth, to prevent cache bypass
 				passwordHash := ""
 				if password != "" {
-					passwordHash = cache.HashPassword(password)
+					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					PasswordHash: passwordHash,
-					AuthResult:   cache.AuthFailed,
+					Result:       lookupcache.AuthFailed,
 					IsNegative:   true,
 				})
 
@@ -914,11 +905,11 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Always hash password, even for master auth, to prevent cache bypass
 				passwordHash := ""
 				if password != "" {
-					passwordHash = cache.HashPassword(password)
+					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					PasswordHash: passwordHash,
-					AuthResult:   cache.AuthFailed,
+					Result:       lookupcache.AuthFailed,
 					IsNegative:   true,
 				})
 			} else {
@@ -949,13 +940,13 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Always hash password, even for master auth, to prevent cache bypass
 	passwordHash := ""
 	if password != "" {
-		passwordHash = cache.HashPassword(password)
+		passwordHash = lookupcache.HashPassword(password)
 	}
-	s.server.authCache.Set(s.server.name, username, &cache.CacheEntry{
+	s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 		AccountID:     accountID,
 		PasswordHash:  passwordHash,
 		ServerAddress: "", // Will be populated by affinity/routing in next connection
-		AuthResult:    cache.AuthSuccess,
+		Result:        lookupcache.AuthSuccess,
 		FromPrelookup: false,
 		IsNegative:    false,
 	})

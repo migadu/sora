@@ -12,7 +12,7 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
-	"github.com/migadu/sora/pkg/authcache"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -220,10 +220,10 @@ func TestIMAPBackendAuthCache_PasswordChange(t *testing.T) {
 		if err := c.Login(account.Email, "oldpassword").Wait(); err == nil {
 			t.Fatal("Login with old password should have failed after password change")
 		}
-		t.Log("✓ Old password rejected (cache invalidated)")
+		t.Log("✓ Old password rejected (negative cache entry created)")
 	})
 
-	// Login with new password - should succeed and re-cache
+	// Login with new password - should succeed immediately and re-cache
 	t.Run("LoginWithNewPassword", func(t *testing.T) {
 		c, err := imapclient.DialInsecure(server.Address, nil)
 		if err != nil {
@@ -485,7 +485,7 @@ type authCacheStats struct {
 	hitRate float64
 }
 
-func getCacheStats(cache *authcache.AuthCache) authCacheStats {
+func getCacheStats(cache *lookupcache.LookupCache) authCacheStats {
 	if cache == nil {
 		return authCacheStats{}
 	}
@@ -499,7 +499,11 @@ func getCacheStats(cache *authcache.AuthCache) authCacheStats {
 	}
 }
 
-func setupIMAPServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *authcache.AuthCache, *resilient.ResilientDatabase) {
+func setupIMAPServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
+	return setupIMAPServerWithAuthCacheCustom(t, enabled, positiveTTL, negativeTTL, 30*time.Second)
+}
+
+func setupIMAPServerWithAuthCacheCustom(t *testing.T, enabled bool, positiveTTL, negativeTTL string, positiveRevalidationWindow time.Duration) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
 	t.Helper()
 
 	// Use existing setup
@@ -508,7 +512,7 @@ func setupIMAPServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negat
 	// Get the resilient DB from server
 	rdb := server.ResilientDB
 
-	var cache *authcache.AuthCache
+	var cache *lookupcache.LookupCache
 
 	// Configure auth cache
 	if enabled {
@@ -517,7 +521,7 @@ func setupIMAPServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negat
 		negTTL, _ := time.ParseDuration(negativeTTL)
 		cleanupInterval, _ := time.ParseDuration("5m")
 
-		cache = authcache.New(posTTL, negTTL, 10000, cleanupInterval, 5*time.Second, 30*time.Second)
+		cache = lookupcache.New(posTTL, negTTL, 10000, cleanupInterval, positiveRevalidationWindow)
 		rdb.SetAuthCache(cache)
 	}
 	// If disabled, don't set any cache (nil = disabled)

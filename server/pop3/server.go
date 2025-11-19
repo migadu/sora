@@ -104,13 +104,13 @@ type POP3ServerOptions struct {
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
 	AuthRateLimit               serverPkg.AuthRateLimiterConfig
-	AuthCache                   *config.AuthCacheConfig // Authentication cache configuration
-	SessionMemoryLimit          int64                   // Memory limit per session in bytes
-	AuthIdleTimeout             time.Duration           // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout              time.Duration           // Maximum idle time before disconnection
-	AbsoluteSessionTimeout      time.Duration           // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute           int64                   // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
-	Config                      *config.Config          // Full config for shared settings like connection tracking timeouts
+	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
+	SessionMemoryLimit          int64                     // Memory limit per session in bytes
+	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	CommandTimeout              time.Duration             // Maximum idle time before disconnection
+	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
 func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, cache *cache.Cache, options POP3ServerOptions) (*POP3Server, error) {
@@ -145,7 +145,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, options.TrustedNetworks)
 
 	// Initialize authentication cache from config
-	resilient.InitializeAuthCache("POP3", name, options.AuthCache, rdb)
+	resilient.InitializeAuthCache("POP3", name, options.LookupCache, rdb)
 
 	server := &POP3Server{
 		hostname:               hostname,

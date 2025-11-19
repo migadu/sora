@@ -138,31 +138,38 @@ var (
 
 // Authentication cache metrics
 var (
-	AuthCacheHitsTotal = promauto.NewCounter(
+	LookupCacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "sora_auth_cache_hits_total",
+			Name: "sora_lookup_cache_hits_total",
 			Help: "Total number of authentication cache hits",
 		},
 	)
 
-	AuthCacheMissesTotal = promauto.NewCounter(
+	LookupCacheMissesTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "sora_auth_cache_misses_total",
+			Name: "sora_lookup_cache_misses_total",
 			Help: "Total number of authentication cache misses",
 		},
 	)
 
-	AuthCacheEntriesTotal = promauto.NewGauge(
+	LookupCacheEntriesTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "sora_auth_cache_entries_total",
+			Name: "sora_lookup_cache_entries_total",
 			Help: "Current number of entries in authentication cache",
 		},
 	)
 
-	AuthCacheHitRate = promauto.NewGauge(
+	LookupCacheHitRate = promauto.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "sora_auth_cache_hit_rate",
+			Name: "sora_lookup_cache_hit_rate",
 			Help: "Authentication cache hit rate percentage (0-100)",
+		},
+	)
+
+	LookupCacheSharedFetchesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_lookup_cache_shared_fetches_total",
+			Help: "Total number of shared fetches (thundering herd prevented)",
 		},
 	)
 )

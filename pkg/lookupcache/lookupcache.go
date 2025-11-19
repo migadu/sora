@@ -1,4 +1,4 @@
-package authcache
+package lookupcache
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"golang.org/x/sync/singleflight"
 )
 
 // AuthResult represents the result of an authentication attempt
@@ -19,8 +20,10 @@ type AuthResult int
 
 const (
 	AuthSuccess AuthResult = iota
+	AuthFailed
 	AuthUserNotFound
 	AuthInvalidPassword
+	AuthUnavailable
 )
 
 // CacheEntry represents a cached authentication and routing result
@@ -47,8 +50,8 @@ type CacheEntry struct {
 	IsNegative    bool
 }
 
-// AuthCache provides in-memory caching for authentication results
-type AuthCache struct {
+// LookupCache provides in-memory caching for authentication results
+type LookupCache struct {
 	mu              sync.RWMutex
 	entries         map[string]*CacheEntry
 	positiveTTL     time.Duration
@@ -57,10 +60,13 @@ type AuthCache struct {
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	cleanupStopped  chan struct{}
+	stopped         bool // Track if Stop() has been called
 
-	// Revalidation windows for password change detection
-	negativeRevalidationWindow time.Duration
+	// Revalidation window for password change detection
 	positiveRevalidationWindow time.Duration
+
+	// Singleflight prevents thundering herd on cache miss
+	sfGroup singleflight.Group
 
 	// Metrics
 	hits   uint64
@@ -71,27 +77,23 @@ type AuthCache struct {
 }
 
 // New creates a new authentication cache instance
-func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, negativeRevalidationWindow, positiveRevalidationWindow time.Duration) *AuthCache {
+func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, positiveRevalidationWindow time.Duration) *LookupCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
 	if cleanupInterval <= 0 {
 		cleanupInterval = 5 * time.Minute
 	}
-	if negativeRevalidationWindow <= 0 {
-		negativeRevalidationWindow = 5 * time.Second
-	}
 	if positiveRevalidationWindow <= 0 {
 		positiveRevalidationWindow = 30 * time.Second
 	}
 
-	cache := &AuthCache{
+	cache := &LookupCache{
 		entries:                    make(map[string]*CacheEntry),
 		positiveTTL:                positiveTTL,
 		negativeTTL:                negativeTTL,
 		maxSize:                    maxSize,
 		cleanupInterval:            cleanupInterval,
-		negativeRevalidationWindow: negativeRevalidationWindow,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		stopCleanup:                make(chan struct{}),
 		cleanupStopped:             make(chan struct{}),
@@ -100,9 +102,9 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	logger.Info("AuthCache: Initialized", "positive_ttl", positiveTTL,
+	logger.Info("LookupCache: Initialized", "positive_ttl", positiveTTL,
 		"negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval,
-		"negative_revalidation_window", negativeRevalidationWindow, "positive_revalidation_window", positiveRevalidationWindow)
+		"positive_revalidation_window", positiveRevalidationWindow)
 
 	return cache
 }
@@ -129,13 +131,13 @@ func (e *CacheEntry) IsOld(duration time.Duration) bool {
 //   - (0, false, error) on cached authentication failure (caller should NOT check database)
 //
 // Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
-func (c *AuthCache) Authenticate(address, password string) (accountID int64, found bool, err error) {
+func (c *LookupCache) Authenticate(address, password string) (accountID int64, found bool, err error) {
 	c.mu.RLock()
 	entry, exists := c.entries[address]
 	if !exists {
 		c.mu.RUnlock()
 		c.misses++
-		metrics.AuthCacheMissesTotal.Inc()
+		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
 	}
 
@@ -143,12 +145,12 @@ func (c *AuthCache) Authenticate(address, password string) (accountID int64, fou
 	if time.Now().After(entry.ExpiresAt) {
 		c.mu.RUnlock()
 		c.misses++
-		metrics.AuthCacheMissesTotal.Inc()
+		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
 	}
 
 	c.hits++
-	metrics.AuthCacheHitsTotal.Inc()
+	metrics.LookupCacheHitsTotal.Inc()
 
 	// Hash the provided password for comparison
 	passwordHash := HashPassword(password)
@@ -162,20 +164,17 @@ func (c *AuthCache) Authenticate(address, password string) (accountID int64, fou
 		c.mu.RUnlock()
 		if passwordMatches {
 			// Same wrong password - return cached failure WITHOUT going to database
+			// This prevents repeated attempts with the same wrong password (reduces DB load)
 			logger.Info("Authentication failed (cached)", "address", address, "cache", "hit", "age", time.Since(entry.CreatedAt))
 			// Return error to signal cached failure (don't query database)
 			return 0, false, consts.ErrAuthenticationFailed
 		} else {
-			// Different password - allow revalidation if entry is old enough
-			if entry.IsOld(c.negativeRevalidationWindow) {
-				// Entry is old enough - allow revalidation
-				logger.Debug("Auth cache: negative entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
-				return 0, false, nil
-			} else {
-				// Entry is too fresh - likely brute force attempt, block revalidation
-				logger.Info("Authentication failed (cached, different password blocked)", "address", address, "cache", "hit", "age", time.Since(entry.CreatedAt))
-				return 0, false, consts.ErrAuthenticationFailed
-			}
+			// Different password - ALWAYS allow revalidation
+			// User might have typed wrong password and is now trying the correct one,
+			// or password was changed and user is trying the new password.
+			// Brute force protection is handled by protocol-level rate limiting.
+			logger.Debug("Auth cache: negative entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+			return 0, false, nil
 		}
 	}
 
@@ -206,7 +205,7 @@ func (c *AuthCache) Authenticate(address, password string) (accountID int64, fou
 }
 
 // SetSuccess caches a successful authentication result
-func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword string, password string) {
+func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword string, password string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -225,13 +224,13 @@ func (c *AuthCache) SetSuccess(address string, accountID int64, hashedPassword s
 		ExpiresAt:      now.Add(c.positiveTTL),
 	}
 
-	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 }
 
 // SetFailure caches a failed authentication result (user not found or invalid password)
 // result parameter: 0 = success (ignored), 1 = user not found, 2 = invalid password
 // password parameter is optional - used for password-aware negative caching
-func (c *AuthCache) SetFailure(address string, result int, password string) {
+func (c *LookupCache) SetFailure(address string, result int, password string) {
 	authResult := AuthResult(result)
 	if authResult == AuthSuccess {
 		return // Don't cache success as failure
@@ -254,21 +253,21 @@ func (c *AuthCache) SetFailure(address string, result int, password string) {
 		IsNegative:   true,
 	}
 
-	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 }
 
 // Invalidate removes a specific entry from the cache (e.g., after password change)
-func (c *AuthCache) Invalidate(address string) {
+func (c *LookupCache) Invalidate(address string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	delete(c.entries, address)
-	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 }
 
 // evictOldest removes the oldest entry from the cache
 // Caller must hold the write lock
-func (c *AuthCache) evictOldest() {
+func (c *LookupCache) evictOldest() {
 	if len(c.entries) == 0 {
 		return
 	}
@@ -291,7 +290,7 @@ func (c *AuthCache) evictOldest() {
 }
 
 // cleanupLoop periodically removes expired entries
-func (c *AuthCache) cleanupLoop() {
+func (c *LookupCache) cleanupLoop() {
 	defer close(c.cleanupStopped)
 
 	ticker := time.NewTicker(c.cleanupInterval)
@@ -308,7 +307,7 @@ func (c *AuthCache) cleanupLoop() {
 }
 
 // cleanup removes expired entries
-func (c *AuthCache) cleanup() {
+func (c *LookupCache) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -323,8 +322,8 @@ func (c *AuthCache) cleanup() {
 	}
 
 	if removed > 0 {
-		logger.Info("AuthCache: Cleanup removed expired entries", "removed", removed, "remaining", len(c.entries))
-		metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+		logger.Info("LookupCache: Cleanup removed expired entries", "removed", removed, "remaining", len(c.entries))
+		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 	}
 
 	// Update hit rate metric
@@ -354,7 +353,7 @@ func (c *AuthCache) cleanup() {
 			hitRate = float64(c.hits) / float64(total) * 100
 		}
 
-		logger.Info("AuthCache stats",
+		logger.Info("LookupCache stats",
 			"total_entries", len(c.entries),
 			"success_entries", successEntries,
 			"user_not_found", userNotFoundEntries,
@@ -367,16 +366,24 @@ func (c *AuthCache) cleanup() {
 
 // updateHitRateMetric updates the Prometheus hit rate gauge
 // Caller must hold at least the read lock
-func (c *AuthCache) updateHitRateMetric() {
+func (c *LookupCache) updateHitRateMetric() {
 	total := c.hits + c.misses
 	if total > 0 {
 		hitRate := float64(c.hits) / float64(total) * 100
-		metrics.AuthCacheHitRate.Set(hitRate)
+		metrics.LookupCacheHitRate.Set(hitRate)
 	}
 }
 
 // Stop stops the cleanup goroutine
-func (c *AuthCache) Stop(ctx context.Context) error {
+func (c *LookupCache) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		return nil // Already stopped
+	}
+	c.stopped = true
+	c.mu.Unlock()
+
 	close(c.stopCleanup)
 
 	// Wait for cleanup to stop with timeout
@@ -389,7 +396,7 @@ func (c *AuthCache) Stop(ctx context.Context) error {
 }
 
 // GetStats returns cache statistics
-func (c *AuthCache) GetStats() (hits, misses uint64, size int, hitRate float64) {
+func (c *LookupCache) GetStats() (hits, misses uint64, size int, hitRate float64) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -403,7 +410,7 @@ func (c *AuthCache) GetStats() (hits, misses uint64, size int, hitRate float64) 
 }
 
 // Clear removes all entries from the cache
-func (c *AuthCache) Clear() {
+func (c *LookupCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -411,7 +418,7 @@ func (c *AuthCache) Clear() {
 	c.hits = 0
 	c.misses = 0
 
-	logger.Info("AuthCache: Cache cleared")
+	logger.Info("LookupCache: Cache cleared")
 }
 
 // roundToTwoDecimals rounds a float to 2 decimal places
@@ -424,7 +431,7 @@ func roundToTwoDecimals(val float64) float64 {
 // Get retrieves a cached entry
 // serverName should be the unique server name (e.g., "imap-proxy-1", "imap-backend")
 // Returns the entry and whether it was found (and not expired)
-func (c *AuthCache) Get(serverName, username string) (*CacheEntry, bool) {
+func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 	key := makeKey(serverName, username)
 
 	c.mu.RLock()
@@ -433,24 +440,24 @@ func (c *AuthCache) Get(serverName, username string) (*CacheEntry, bool) {
 	entry, exists := c.entries[key]
 	if !exists {
 		c.misses++
-		metrics.AuthCacheMissesTotal.Inc()
+		metrics.LookupCacheMissesTotal.Inc()
 		return nil, false
 	}
 
 	// Check if expired
 	if time.Now().After(entry.ExpiresAt) {
 		c.misses++
-		metrics.AuthCacheMissesTotal.Inc()
+		metrics.LookupCacheMissesTotal.Inc()
 		return nil, false
 	}
 
 	c.hits++
-	metrics.AuthCacheHitsTotal.Inc()
+	metrics.LookupCacheHitsTotal.Inc()
 	return entry, true
 }
 
 // Set stores an entry in the cache
-func (c *AuthCache) Set(serverName, username string, entry *CacheEntry) {
+func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 	key := makeKey(serverName, username)
 
 	c.mu.Lock()
@@ -474,12 +481,12 @@ func (c *AuthCache) Set(serverName, username string, entry *CacheEntry) {
 	}
 
 	c.entries[key] = entry
-	metrics.AuthCacheEntriesTotal.Set(float64(len(c.entries)))
+	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 }
 
 // Refresh extends the TTL of an existing cache entry
 // This is called when the same password is used again to keep frequently-used entries fresh
-func (c *AuthCache) Refresh(serverName, username string) bool {
+func (c *LookupCache) Refresh(serverName, username string) bool {
 	key := makeKey(serverName, username)
 
 	c.mu.Lock()
@@ -509,4 +516,79 @@ func makeKey(serverName, username string) string {
 		return username
 	}
 	return fmt.Sprintf("%s:%s", serverName, username)
+}
+
+// GetOrFetch retrieves a cached entry, or if not found/expired, executes the fetchFn
+// using singleflight to prevent thundering herd on cache misses.
+//
+// The fetchFn should return a *CacheEntry that will be cached automatically.
+// Multiple concurrent requests for the same key will share the same fetchFn execution.
+//
+// This method is useful for both backends and proxies to prevent multiple simultaneous
+// database/API queries when cache is cold or expired.
+//
+// Returns:
+//   - entry: The cached or freshly fetched entry
+//   - fromCache: true if retrieved from cache, false if fetched
+//   - err: Any error from fetchFn
+func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*CacheEntry, error)) (*CacheEntry, bool, error) {
+	key := makeKey(serverName, username)
+
+	// Try cache first
+	c.mu.RLock()
+	entry, exists := c.entries[key]
+	c.mu.RUnlock()
+
+	if exists && !time.Now().After(entry.ExpiresAt) {
+		// Cache hit
+		c.mu.Lock()
+		c.hits++
+		c.mu.Unlock()
+		metrics.LookupCacheHitsTotal.Inc()
+		return entry, true, nil
+	}
+
+	// Cache miss or expired - use singleflight to prevent thundering herd
+	c.mu.Lock()
+	c.misses++
+	c.mu.Unlock()
+	metrics.LookupCacheMissesTotal.Inc()
+
+	// Use singleflight to ensure only one fetch per key
+	result, err, shared := c.sfGroup.Do(key, func() (interface{}, error) {
+		// Execute the fetch function
+		fetchedEntry, fetchErr := fetchFn()
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+
+		// Cache the result
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		// Enforce max size with simple eviction (oldest entries first)
+		if len(c.entries) >= c.maxSize {
+			c.evictOldest()
+		}
+
+		// Store in cache
+		c.entries[key] = fetchedEntry
+		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+
+		return fetchedEntry, nil
+	})
+
+	if err != nil {
+		return nil, false, err
+	}
+
+	entry = result.(*CacheEntry)
+
+	// Log if this was a shared fetch (thundering herd prevented)
+	if shared {
+		logger.Debug("LookupCache: prevented thundering herd", "key", key)
+		metrics.LookupCacheSharedFetchesTotal.Inc()
+	}
+
+	return entry, false, nil
 }

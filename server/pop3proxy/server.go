@@ -17,10 +17,10 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -55,7 +55,7 @@ type POP3ProxyServer struct {
 	limiter *server.ConnectionLimiter
 
 	// Auth cache for routing and password validation
-	authCache                  *cache.AuthCache
+	authCache                  *lookupcache.LookupCache
 	negativeRevalidationWindow time.Duration
 	positiveRevalidationWindow time.Duration
 
@@ -163,7 +163,7 @@ type POP3ProxyServerOptions struct {
 	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 
 	// Auth cache configuration
-	AuthCache *config.AuthCacheConfig
+	LookupCache *config.LookupCacheConfig
 
 	// Authentication limits
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
@@ -283,50 +283,46 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize auth cache for user authentication and routing
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *cache.AuthCache
-	authCacheConfig := options.AuthCache
-	if authCacheConfig == nil {
-		defaultConfig := config.DefaultAuthCacheConfig()
-		authCacheConfig = &defaultConfig
+	var authCache *lookupcache.LookupCache
+	var positiveRevalidationWindow time.Duration
+	lookupCacheConfig := options.LookupCache
+	if lookupCacheConfig == nil {
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
-	if authCacheConfig.Enabled {
-		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+	if lookupCacheConfig.Enabled {
+		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("POP3 Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", options.Name, "error", err)
 			positiveTTL = 5 * time.Minute
 		}
-		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
 		if err != nil {
 			logger.Info("POP3 Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", options.Name, "error", err)
 			negativeTTL = 1 * time.Minute
 		}
-		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
 		if err != nil {
 			logger.Info("POP3 Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", options.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := authCacheConfig.MaxSize
+		maxSize := lookupCacheConfig.MaxSize
 		if maxSize <= 0 {
 			maxSize = 10000
 		}
 
-		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
-		logger.Info("POP3 Proxy: Authentication cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+		// Parse positive revalidation window from config (used for password change detection)
+		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
+		if err != nil {
+			logger.Info("POP3 Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
+			positiveRevalidationWindow = 30 * time.Second
+		}
+
+		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("POP3 Proxy: Authentication cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("POP3 Proxy: Authentication cache disabled", "name", options.Name)
-	}
-
-	// Parse revalidation windows from config (used for password change detection)
-	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
-	if err != nil {
-		logger.Info("POP3 Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", options.Name, "error", err)
-		negativeRevalidationWindow = 5 * time.Second
-	}
-	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
-	if err != nil {
-		logger.Info("POP3 Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
-		positiveRevalidationWindow = 30 * time.Second
 	}
 
 	server := &POP3ProxyServer{
@@ -354,7 +350,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		remoteUseXCLIENT:           options.RemoteUseXCLIENT,
 		limiter:                    limiter,
 		authCache:                  authCache,
-		negativeRevalidationWindow: negativeRevalidationWindow,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
 		maxAuthErrors:              options.MaxAuthErrors,

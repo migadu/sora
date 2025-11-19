@@ -15,10 +15,10 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -56,8 +56,7 @@ type Server struct {
 	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
 	// Authentication cache
-	authCache                  *cache.AuthCache
-	negativeRevalidationWindow time.Duration // How long to wait before revalidating negative cache with different password
+	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration // How long to wait before revalidating positive cache with different password
 
 	// Connection limiting
@@ -148,7 +147,7 @@ type ServerOptions struct {
 	MinBytesPerMinute      int64         // Minimum throughput
 	EnableAffinity         bool
 	AuthRateLimit          server.AuthRateLimiterConfig
-	AuthCache              *config.AuthCacheConfig // Authentication cache configuration
+	LookupCache            *config.LookupCacheConfig // Authentication cache configuration
 	PreLookup              *config.PreLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
@@ -275,48 +274,43 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *cache.AuthCache
-	authCacheConfig := opts.AuthCache
-	if authCacheConfig == nil {
-		defaultConfig := config.DefaultAuthCacheConfig()
-		authCacheConfig = &defaultConfig
+	var authCache *lookupcache.LookupCache
+	lookupCacheConfig := opts.LookupCache
+	if lookupCacheConfig == nil {
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
-	// Parse revalidation windows
-	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
-	if err != nil {
-		logger.Info("IMAP Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", opts.Name, "error", err)
-		negativeRevalidationWindow = 5 * time.Second
-	}
-	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
+	// Parse positive revalidation window
+	positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
 	if err != nil {
 		logger.Info("IMAP Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
 		positiveRevalidationWindow = 30 * time.Second
 	}
 
-	if authCacheConfig.Enabled {
-		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+	if lookupCacheConfig.Enabled {
+		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("IMAP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			positiveTTL = 5 * time.Minute
 		}
-		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
 		if err != nil {
 			logger.Info("IMAP Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
 			negativeTTL = 1 * time.Minute
 		}
-		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
 		if err != nil {
 			logger.Info("IMAP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := authCacheConfig.MaxSize
+		maxSize := lookupCacheConfig.MaxSize
 		if maxSize <= 0 {
 			maxSize = 10000
 		}
 
-		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
-		logger.Info("IMAP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("IMAP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("IMAP Proxy: Authentication cache disabled", "name", opts.Name)
 	}
@@ -349,7 +343,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		remoteUseIDCommand:         opts.RemoteUseIDCommand,
 		proxyReader:                proxyReader,
 		authCache:                  authCache,
-		negativeRevalidationWindow: negativeRevalidationWindow,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		limiter:                    limiter,
 		listenBacklog:              listenBacklog,

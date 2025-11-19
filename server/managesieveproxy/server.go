@@ -12,10 +12,10 @@ import (
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/cache"
 	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
@@ -59,8 +59,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Auth cache for routing and password validation
-	authCache                  *cache.AuthCache
-	negativeRevalidationWindow time.Duration
+	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
 
 	// Listen backlog
@@ -123,7 +122,7 @@ type ServerOptions struct {
 	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
 
 	// Auth cache configuration
-	AuthCache *config.AuthCacheConfig
+	LookupCache *config.LookupCacheConfig
 
 	// Authentication limits
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
@@ -253,50 +252,46 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize auth cache for user authentication and routing
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *cache.AuthCache
-	authCacheConfig := opts.AuthCache
-	if authCacheConfig == nil {
-		defaultConfig := config.DefaultAuthCacheConfig()
-		authCacheConfig = &defaultConfig
+	var authCache *lookupcache.LookupCache
+	var positiveRevalidationWindow time.Duration
+	lookupCacheConfig := opts.LookupCache
+	if lookupCacheConfig == nil {
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
-	if authCacheConfig.Enabled {
-		positiveTTL, err := authCacheConfig.GetPositiveTTL()
+	if lookupCacheConfig.Enabled {
+		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("ManageSieve Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			positiveTTL = 5 * time.Minute
 		}
-		negativeTTL, err := authCacheConfig.GetNegativeTTL()
+		negativeTTL, err := lookupCacheConfig.GetNegativeTTL()
 		if err != nil {
 			logger.Info("ManageSieve Proxy: Invalid negative TTL in auth cache config, using default (1m)", "name", opts.Name, "error", err)
 			negativeTTL = 1 * time.Minute
 		}
-		cleanupInterval, err := authCacheConfig.GetCleanupInterval()
+		cleanupInterval, err := lookupCacheConfig.GetCleanupInterval()
 		if err != nil {
 			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := authCacheConfig.MaxSize
+		maxSize := lookupCacheConfig.MaxSize
 		if maxSize <= 0 {
 			maxSize = 10000
 		}
 
-		authCache = cache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval)
-		logger.Info("ManageSieve Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+		// Parse positive revalidation window from config (used for password change detection)
+		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
+		if err != nil {
+			logger.Info("ManageSieve Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
+			positiveRevalidationWindow = 30 * time.Second
+		}
+
+		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("ManageSieve Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("ManageSieve Proxy: Authentication cache disabled", "name", opts.Name)
-	}
-
-	// Parse revalidation windows from config (used for password change detection)
-	negativeRevalidationWindow, err := authCacheConfig.GetNegativeRevalidationWindow()
-	if err != nil {
-		logger.Info("ManageSieve Proxy: Invalid negative revalidation window in auth cache config, using default (5s)", "name", opts.Name, "error", err)
-		negativeRevalidationWindow = 5 * time.Second
-	}
-	positiveRevalidationWindow, err := authCacheConfig.GetPositiveRevalidationWindow()
-	if err != nil {
-		logger.Info("ManageSieve Proxy: Invalid positive revalidation window in auth cache config, using default (30s)", "name", opts.Name, "error", err)
-		positiveRevalidationWindow = 30 * time.Second
 	}
 
 	s := &Server{
@@ -329,7 +324,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		minBytesPerMinute:          opts.MinBytesPerMinute,
 		limiter:                    limiter,
 		authCache:                  authCache,
-		negativeRevalidationWindow: negativeRevalidationWindow,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
 		maxAuthErrors:              opts.MaxAuthErrors,

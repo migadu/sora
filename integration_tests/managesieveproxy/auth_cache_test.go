@@ -408,7 +408,7 @@ func setupManageSieveProxyWithMasterAuthAndCache(t *testing.T, rdb *common.TestS
 		EnableAffinity:     true,
 		AuthRateLimit:      server.AuthRateLimiterConfig{Enabled: false},
 		TrustedProxies:     []string{"127.0.0.0/8", "::1/128"},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
 			NegativeTTL:     "1m",
@@ -461,7 +461,7 @@ func setupManageSieveProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
 			NegativeTTL:     "1s", // SHORT negative TTL
@@ -514,7 +514,7 @@ func setupManageSieveProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "3s", // SHORT positive TTL
 			NegativeTTL:     "1m",

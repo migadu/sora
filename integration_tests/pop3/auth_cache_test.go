@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
-	"github.com/migadu/sora/pkg/authcache"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -491,7 +491,7 @@ type authCacheStats struct {
 	hitRate float64
 }
 
-func getCacheStats(cache *authcache.AuthCache) authCacheStats {
+func getCacheStats(cache *lookupcache.LookupCache) authCacheStats {
 	if cache == nil {
 		return authCacheStats{}
 	}
@@ -505,7 +505,7 @@ func getCacheStats(cache *authcache.AuthCache) authCacheStats {
 	}
 }
 
-func setupPOP3ServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *authcache.AuthCache, *resilient.ResilientDatabase) {
+func setupPOP3ServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
 	t.Helper()
 
 	// Use existing setup
@@ -514,7 +514,7 @@ func setupPOP3ServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negat
 	// Get the resilient DB from server
 	rdb := server.ResilientDB
 
-	var cache *authcache.AuthCache
+	var cache *lookupcache.LookupCache
 
 	// Configure auth cache
 	if enabled {
@@ -523,7 +523,7 @@ func setupPOP3ServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negat
 		negTTL, _ := time.ParseDuration(negativeTTL)
 		cleanupInterval, _ := time.ParseDuration("5m")
 
-		cache = authcache.New(posTTL, negTTL, 10000, cleanupInterval, 5*time.Second, 30*time.Second)
+		cache = lookupcache.New(posTTL, negTTL, 10000, cleanupInterval, 30*time.Second)
 		rdb.SetAuthCache(cache)
 	}
 	// If disabled, don't set any cache (nil = disabled)

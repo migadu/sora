@@ -316,7 +316,7 @@ func setupIMAPProxyWithMasterAuthAndCache(t *testing.T, rdb *resilient.Resilient
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
 			NegativeTTL:     "1m",
@@ -378,7 +378,7 @@ func setupIMAPProxyWithHTTPPrelookupAndCache(t *testing.T, rdb *resilient.Resili
 			FallbackDefault:        false,
 			RemoteUseProxyProtocol: true,
 		},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
 			NegativeTTL:     "1m",
@@ -440,7 +440,7 @@ func setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 			FallbackDefault:        false,
 			RemoteUseProxyProtocol: true,
 		},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
 			NegativeTTL:     "1s", // Very short for testing
@@ -502,7 +502,7 @@ func setupIMAPProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resil
 			FallbackDefault:        false,
 			RemoteUseProxyProtocol: true,
 		},
-		AuthCache: &config.AuthCacheConfig{
+		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "3s", // Very short for testing
 			NegativeTTL:     "1m",

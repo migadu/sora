@@ -452,31 +452,29 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 }
 
 // AuthCacheConfig holds configuration for authentication result caching
-type AuthCacheConfig struct {
+type LookupCacheConfig struct {
 	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results
 	PositiveTTL                string `toml:"positive_ttl"`                 // TTL for successful auth (default: "5m")
 	NegativeTTL                string `toml:"negative_ttl"`                 // TTL for failed auth (default: "1m")
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
 	CleanupInterval            string `toml:"cleanup_interval"`             // How often to clean expired entries (default: "5m")
-	NegativeRevalidationWindow string `toml:"negative_revalidation_window"` // How long to wait before revalidating negative cache with different password (default: "5s")
 	PositiveRevalidationWindow string `toml:"positive_revalidation_window"` // How long to wait before revalidating positive cache with different password (default: "30s")
 }
 
-// DefaultAuthCacheConfig returns sensible defaults for authentication caching
-func DefaultAuthCacheConfig() AuthCacheConfig {
-	return AuthCacheConfig{
+// DefaultLookupCacheConfig returns sensible defaults for authentication and routing lookup caching
+func DefaultLookupCacheConfig() LookupCacheConfig {
+	return LookupCacheConfig{
 		Enabled:                    true,  // Enable by default for better performance
 		PositiveTTL:                "5m",  // Cache successful auth for 5 minutes (avoid expensive bcrypt)
 		NegativeTTL:                "1m",  // Cache failed auth for 1 minute (limit brute force impact)
 		MaxSize:                    50000, // 50k entries = ~10MB memory (80% positive, 20% negative)
 		CleanupInterval:            "5m",  // Clean up expired entries every 5 minutes
-		NegativeRevalidationWindow: "5s",  // Allow password correction after 5 seconds
 		PositiveRevalidationWindow: "30s", // Allow password change detection after 30 seconds
 	}
 }
 
 // GetPositiveTTL parses and returns the positive TTL duration
-func (c *AuthCacheConfig) GetPositiveTTL() (time.Duration, error) {
+func (c *LookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
 	if c.PositiveTTL == "" {
 		return 5 * time.Minute, nil
 	}
@@ -484,7 +482,7 @@ func (c *AuthCacheConfig) GetPositiveTTL() (time.Duration, error) {
 }
 
 // GetNegativeTTL parses and returns the negative TTL duration
-func (c *AuthCacheConfig) GetNegativeTTL() (time.Duration, error) {
+func (c *LookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
 	if c.NegativeTTL == "" {
 		return 1 * time.Minute, nil
 	}
@@ -492,23 +490,15 @@ func (c *AuthCacheConfig) GetNegativeTTL() (time.Duration, error) {
 }
 
 // GetCleanupInterval parses and returns the cleanup interval duration
-func (c *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
+func (c *LookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
 	if c.CleanupInterval == "" {
 		return 5 * time.Minute, nil
 	}
 	return time.ParseDuration(c.CleanupInterval)
 }
 
-// GetNegativeRevalidationWindow parses and returns the negative revalidation window duration
-func (c *AuthCacheConfig) GetNegativeRevalidationWindow() (time.Duration, error) {
-	if c.NegativeRevalidationWindow == "" {
-		return 5 * time.Second, nil
-	}
-	return time.ParseDuration(c.NegativeRevalidationWindow)
-}
-
 // GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
-func (c *AuthCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
+func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
 	if c.PositiveRevalidationWindow == "" {
 		return 30 * time.Second, nil
 	}
@@ -1252,7 +1242,7 @@ type ServerConfig struct {
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
 
 	// Auth caching (embedded) - for proxies
-	AuthCache *AuthCacheConfig `toml:"auth_cache,omitempty"`
+	AuthCache *LookupCacheConfig `toml:"lookup_cache,omitempty"`
 
 	// Resource limits (embedded)
 	Limits *ServerLimitsConfig `toml:"limits,omitempty"`
