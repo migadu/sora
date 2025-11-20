@@ -12,6 +12,8 @@ import (
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
@@ -19,23 +21,25 @@ import (
 
 // Server represents the HTTP Mail API server for user operations
 type Server struct {
-	name           string
-	addr           string
-	jwtSecret      string
-	tokenDuration  time.Duration
-	tokenIssuer    string
-	allowedOrigins []string
-	allowedHosts   []string
-	rdb            *resilient.ResilientDatabase
-	storage        *storage.S3Storage
-	cache          *cache.Cache
-	authLimiter    *server.AuthRateLimiter
-	server         *http.Server
-	tls            bool
-	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile    string
-	tlsKeyFile     string
-	tlsVerify      bool
+	name                       string
+	addr                       string
+	jwtSecret                  string
+	tokenDuration              time.Duration
+	tokenIssuer                string
+	allowedOrigins             []string
+	allowedHosts               []string
+	rdb                        *resilient.ResilientDatabase
+	storage                    *storage.S3Storage
+	cache                      *cache.Cache
+	authCache                  *lookupcache.LookupCache
+	positiveRevalidationWindow time.Duration
+	authLimiter                *server.AuthRateLimiter
+	server                     *http.Server
+	tls                        bool
+	tlsConfig                  *tls.Config // TLS config from manager (takes precedence) or nil
+	tlsCertFile                string
+	tlsKeyFile                 string
+	tlsVerify                  bool
 }
 
 // ServerOptions holds configuration options for the HTTP Mail API server
@@ -50,6 +54,7 @@ type ServerOptions struct {
 	Storage        *storage.S3Storage
 	Cache          *cache.Cache
 	AuthRateLimit  server.AuthRateLimiterConfig
+	LookupCache    *config.LookupCacheConfig // Authentication cache configuration
 	TLS            bool
 	TLSConfig      *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile    string
@@ -84,23 +89,65 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	// Create auth rate limiter
 	authLimiter := server.NewAuthRateLimiter("user-api", options.AuthRateLimit)
 
+	// Initialize authentication cache if configured
+	var authCache *lookupcache.LookupCache
+	var positiveRevalidationWindow time.Duration
+	if options.LookupCache != nil && options.LookupCache.Enabled {
+		// Parse TTL and other config values
+		lookupCacheConfig := options.LookupCache
+
+		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
+		if err != nil || lookupCacheConfig.PositiveTTL == "" {
+			logger.Info("User API: Using default positive TTL (5m)", "name", options.Name)
+			positiveTTL = 5 * time.Minute
+		}
+
+		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
+		if err != nil || lookupCacheConfig.NegativeTTL == "" {
+			logger.Info("User API: Using default negative TTL (1m)", "name", options.Name)
+			negativeTTL = 1 * time.Minute
+		}
+
+		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
+		if err != nil || lookupCacheConfig.CleanupInterval == "" {
+			logger.Info("User API: Using default cleanup interval (5m)", "name", options.Name)
+			cleanupInterval = 5 * time.Minute
+		}
+
+		maxSize := lookupCacheConfig.MaxSize
+		if maxSize == 0 {
+			maxSize = 10000
+		}
+
+		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
+		if err != nil {
+			logger.Info("User API: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
+			positiveRevalidationWindow = 30 * time.Second
+		}
+
+		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+	}
+
 	s := &Server{
-		name:           options.Name,
-		addr:           options.Addr,
-		jwtSecret:      options.JWTSecret,
-		tokenDuration:  options.TokenDuration,
-		tokenIssuer:    options.TokenIssuer,
-		allowedOrigins: options.AllowedOrigins,
-		allowedHosts:   options.AllowedHosts,
-		rdb:            rdb,
-		storage:        options.Storage,
-		cache:          options.Cache,
-		authLimiter:    authLimiter,
-		tls:            options.TLS,
-		tlsConfig:      options.TLSConfig,
-		tlsCertFile:    options.TLSCertFile,
-		tlsKeyFile:     options.TLSKeyFile,
-		tlsVerify:      options.TLSVerify,
+		name:                       options.Name,
+		addr:                       options.Addr,
+		jwtSecret:                  options.JWTSecret,
+		tokenDuration:              options.TokenDuration,
+		tokenIssuer:                options.TokenIssuer,
+		allowedOrigins:             options.AllowedOrigins,
+		allowedHosts:               options.AllowedHosts,
+		rdb:                        rdb,
+		storage:                    options.Storage,
+		cache:                      options.Cache,
+		authCache:                  authCache,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		authLimiter:                authLimiter,
+		tls:                        options.TLS,
+		tlsConfig:                  options.TLSConfig,
+		tlsCertFile:                options.TLSCertFile,
+		tlsKeyFile:                 options.TLSKeyFile,
+		tlsVerify:                  options.TLSVerify,
 	}
 
 	return s, nil

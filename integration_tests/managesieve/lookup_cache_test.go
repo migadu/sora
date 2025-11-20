@@ -14,22 +14,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/managesieve"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestManageSieveBackendAuthCache_BasicCaching tests basic auth cache hit/miss behavior
-func TestManageSieveBackendAuthCache_BasicCaching(t *testing.T) {
+// TestManageSieveBackendLookupCache_BasicCaching tests basic auth cache hit/miss behavior
+func TestManageSieveBackendLookupCache_BasicCaching(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create ManageSieve server with auth cache enabled
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, true, "5m", "1m")
+	server, cache, rdb := setupManageSieveServerWithLookupCache(t, true, "5m", "1m")
 	defer server.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-basic-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-basic-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, rdb, uniqueEmail, "testpass123")
 
 	// Test 1: First login - should be cache MISS (DB query)
@@ -89,16 +91,16 @@ func TestManageSieveBackendAuthCache_BasicCaching(t *testing.T) {
 	})
 }
 
-// TestManageSieveBackendAuthCache_TTLExpiration tests cache expiration behavior
-func TestManageSieveBackendAuthCache_TTLExpiration(t *testing.T) {
+// TestManageSieveBackendLookupCache_TTLExpiration tests cache expiration behavior
+func TestManageSieveBackendLookupCache_TTLExpiration(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create ManageSieve server with SHORT positive TTL (2s) for testing
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, true, "2s", "1m")
+	server, cache, rdb := setupManageSieveServerWithLookupCache(t, true, "2s", "1m")
 	defer server.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-ttl-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-ttl-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, rdb, uniqueEmail, "testpass123")
 
 	// First login - populate cache
@@ -152,15 +154,16 @@ func TestManageSieveBackendAuthCache_TTLExpiration(t *testing.T) {
 	})
 }
 
-// TestManageSieveBackendAuthCache_PasswordChange tests cache invalidation on password change
-func TestManageSieveBackendAuthCache_PasswordChange(t *testing.T) {
+// TestManageSieveBackendLookupCache_PasswordChange tests cache invalidation on password change
+func TestManageSieveBackendLookupCache_PasswordChange(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, true, "5m", "1m")
+	// Use very short revalidation window (1 second) so cache revalidates to detect password change
+	server, cache, rdb := setupManageSieveServerWithLookupCacheCustom(t, true, "5m", "1m", 1*time.Second)
 	defer server.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-pwchange-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-pwchange-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, rdb, uniqueEmail, "oldpassword")
 
 	// Login with old password - populate cache
@@ -186,11 +189,13 @@ func TestManageSieveBackendAuthCache_PasswordChange(t *testing.T) {
 			t.Fatalf("Failed to update password: %v", err)
 		}
 		t.Log("✓ Password changed in database")
+
+		// Wait for revalidation window to expire (1 second + margin)
+		time.Sleep(1100 * time.Millisecond)
 	})
 
-	// Try old password - should fail and invalidate cache
+	// Try old password - should fail because cache will revalidate and detect password change
 	t.Run("LoginWithOldPassword_AfterChange", func(t *testing.T) {
-		time.Sleep(100 * time.Millisecond)
 
 		conn, reader, writer := connectManageSieve(t, server.Address)
 		defer conn.Close()
@@ -232,15 +237,15 @@ func TestManageSieveBackendAuthCache_PasswordChange(t *testing.T) {
 	})
 }
 
-// TestManageSieveBackendAuthCache_ConcurrentAuth tests concurrent authentication requests
-func TestManageSieveBackendAuthCache_ConcurrentAuth(t *testing.T) {
+// TestManageSieveBackendLookupCache_ConcurrentAuth tests concurrent authentication requests
+func TestManageSieveBackendLookupCache_ConcurrentAuth(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, true, "5m", "1m")
+	server, cache, rdb := setupManageSieveServerWithLookupCache(t, true, "5m", "1m")
 	defer server.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-concurrent-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-concurrent-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, rdb, uniqueEmail, "testpass123")
 
 	// Launch 50 concurrent login attempts
@@ -286,18 +291,18 @@ func TestManageSieveBackendAuthCache_ConcurrentAuth(t *testing.T) {
 	})
 }
 
-// TestManageSieveBackendAuthCache_MultiUser tests cache with multiple users
-func TestManageSieveBackendAuthCache_MultiUser(t *testing.T) {
+// TestManageSieveBackendLookupCache_MultiUser tests cache with multiple users
+func TestManageSieveBackendLookupCache_MultiUser(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, true, "5m", "1m")
+	server, cache, rdb := setupManageSieveServerWithLookupCache(t, true, "5m", "1m")
 	defer server.Close()
 
 	// Create 20 test accounts
 	userCount := 20
 	accounts := make([]common.TestAccount, userCount)
 	for i := 0; i < userCount; i++ {
-		email := fmt.Sprintf("authcache-multi-%d-%d@example.com", time.Now().UnixNano(), i)
+		email := fmt.Sprintf("lookupcache-multi-%d-%d@example.com", time.Now().UnixNano(), i)
 		accounts[i] = common.CreateTestAccountWithEmail(t, rdb, email, fmt.Sprintf("pass%d", i))
 	}
 
@@ -341,16 +346,16 @@ func TestManageSieveBackendAuthCache_MultiUser(t *testing.T) {
 	})
 }
 
-// TestManageSieveBackendAuthCache_Disabled tests behavior when cache is disabled
-func TestManageSieveBackendAuthCache_Disabled(t *testing.T) {
+// TestManageSieveBackendLookupCache_Disabled tests behavior when cache is disabled
+func TestManageSieveBackendLookupCache_Disabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create server with auth cache DISABLED
-	server, cache, rdb := setupManageSieveServerWithAuthCache(t, false, "5m", "1m")
+	server, cache, rdb := setupManageSieveServerWithLookupCache(t, false, "5m", "1m")
 	defer server.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-disabled-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-disabled-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, rdb, uniqueEmail, "testpass123")
 
 	// Verify cache is nil (disabled)
@@ -382,20 +387,20 @@ func TestManageSieveBackendAuthCache_Disabled(t *testing.T) {
 
 // Helper functions
 
-type authCacheStats struct {
+type lookupCacheStats struct {
 	hits    int64
 	misses  int64
 	size    int
 	hitRate float64
 }
 
-func getCacheStats(cache *lookupcache.LookupCache) authCacheStats {
+func getCacheStats(cache *lookupcache.LookupCache) lookupCacheStats {
 	if cache == nil {
-		return authCacheStats{}
+		return lookupCacheStats{}
 	}
 
 	hits, misses, size, hitRate := cache.GetStats()
-	return authCacheStats{
+	return lookupCacheStats{
 		hits:    int64(hits),
 		misses:  int64(misses),
 		size:    size,
@@ -403,30 +408,150 @@ func getCacheStats(cache *lookupcache.LookupCache) authCacheStats {
 	}
 }
 
-func setupManageSieveServerWithAuthCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
+func setupManageSieveServerWithLookupCache(t *testing.T, enabled bool, positiveTTL, negativeTTL string) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
 	t.Helper()
 
-	// Use existing setup
-	server, _ := common.SetupManageSieveServer(t)
+	// Create custom server with specific cache configuration
+	rdb := common.SetupTestDatabase(t)
+	address := common.GetRandomAddress(t)
 
-	// Get the resilient DB from server
-	rdb := server.ResilientDB
-
-	var cache *lookupcache.LookupCache
-
-	// Configure auth cache
+	// Create lookup cache config based on parameters
+	var lookupCacheConfig *config.LookupCacheConfig
 	if enabled {
-		// Initialize and set auth cache on ResilientDB
-		posTTL, _ := time.ParseDuration(positiveTTL)
-		negTTL, _ := time.ParseDuration(negativeTTL)
-		cleanupInterval, _ := time.ParseDuration("5m")
-
-		cache = lookupcache.New(posTTL, negTTL, 10000, cleanupInterval, 30*time.Second)
-		rdb.SetAuthCache(cache)
+		lookupCacheConfig = &config.LookupCacheConfig{
+			Enabled:                    true,
+			PositiveTTL:                positiveTTL,
+			NegativeTTL:                negativeTTL,
+			MaxSize:                    10000,
+			CleanupInterval:            "5m",
+			PositiveRevalidationWindow: "30s",
+		}
+	} else {
+		// Explicitly disable cache
+		lookupCacheConfig = &config.LookupCacheConfig{
+			Enabled: false,
+		}
 	}
-	// If disabled, don't set any cache (nil = disabled)
 
-	return server, cache, rdb
+	server, err := managesieve.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth: true, // Enable PLAIN auth for testing
+			LookupCache:  lookupCacheConfig,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Setup cleanup via t.Cleanup (will be called when test ends)
+	t.Cleanup(func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("ManageSieve server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	testServer := &common.TestServer{
+		Address:     address,
+		Server:      server,
+		ResilientDB: rdb,
+	}
+
+	// Get the cache from the server
+	cache := server.GetLookupCache()
+
+	return testServer, cache, rdb
+}
+
+func setupManageSieveServerWithLookupCacheCustom(t *testing.T, enabled bool, positiveTTL, negativeTTL string, positiveRevalidationWindow time.Duration) (*common.TestServer, *lookupcache.LookupCache, *resilient.ResilientDatabase) {
+	t.Helper()
+
+	// Create custom server with specific cache configuration including custom revalidation window
+	rdb := common.SetupTestDatabase(t)
+	address := common.GetRandomAddress(t)
+
+	// Create lookup cache config based on parameters
+	var lookupCacheConfig *config.LookupCacheConfig
+	if enabled {
+		lookupCacheConfig = &config.LookupCacheConfig{
+			Enabled:                    true,
+			PositiveTTL:                positiveTTL,
+			NegativeTTL:                negativeTTL,
+			MaxSize:                    10000,
+			CleanupInterval:            "5m",
+			PositiveRevalidationWindow: positiveRevalidationWindow.String(),
+		}
+	} else {
+		// Explicitly disable cache
+		lookupCacheConfig = &config.LookupCacheConfig{
+			Enabled: false,
+		}
+	}
+
+	server, err := managesieve.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth: true, // Enable PLAIN auth for testing
+			LookupCache:  lookupCacheConfig,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Setup cleanup via t.Cleanup (will be called when test ends)
+	t.Cleanup(func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("ManageSieve server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	})
+
+	testServer := &common.TestServer{
+		Address:     address,
+		Server:      server,
+		ResilientDB: rdb,
+	}
+
+	// Get the cache from the server
+	cache := server.GetLookupCache()
+
+	return testServer, cache, rdb
 }
 
 func connectManageSieve(t *testing.T, address string) (net.Conn, *bufio.Reader, *bufio.Writer) {

@@ -859,7 +859,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			ProxyProtocolTimeout:         proxyProtocolTimeout,
 			TrustedNetworks:              deps.config.Servers.TrustedNetworks,
 			AuthRateLimit:                authRateLimit,
-			LookupCache:                  serverConfig.AuthCache,
+			LookupCache:                  serverConfig.LookupCache,
 			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SessionMemoryLimit:           sessionMemoryLimit,
@@ -1023,7 +1023,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		ProxyProtocolTimeout:   proxyProtocolTimeout,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		SessionMemoryLimit:     sessionMemoryLimit,
 		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
@@ -1121,7 +1121,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		ProxyProtocolTimeout:   proxyProtocolTimeout,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		AuthRateLimit:          authRateLimit,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		AuthIdleTimeout:        authIdleTimeout,
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
@@ -1248,7 +1248,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AuthRateLimit:          authRateLimit,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
@@ -1366,7 +1366,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:        deps.config.Servers.TrustedNetworks,
 		ListenBacklog:          serverConfig.ListenBacklog,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		MaxAuthErrors:          serverConfig.GetMaxAuthErrors(),
 	})
 	if err != nil {
@@ -1479,7 +1479,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		ListenBacklog:          serverConfig.ListenBacklog,
 		Debug:                  serverConfig.Debug,
 		SupportedExtensions:    serverConfig.SupportedExtensions,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		MaxAuthErrors:          serverConfig.GetMaxAuthErrors(),
 	})
 	if err != nil {
@@ -1559,7 +1559,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		ConnectTimeout:         connectTimeout,
 		AuthIdleTimeout:        authIdleTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
-		LookupCache:            serverConfig.AuthCache,
+		LookupCache:            serverConfig.LookupCache,
 		PreLookup:              serverConfig.PreLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,
@@ -1686,6 +1686,12 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		}
 	}
 
+	// Get auth rate limit config
+	authRateLimit := server.DefaultAuthRateLimiterConfig()
+	if serverConfig.AuthRateLimit != nil {
+		authRateLimit = *serverConfig.AuthRateLimit
+	}
+
 	// Get TLS config from manager if TLS is enabled
 	var tlsConfig *tls.Config
 	if serverConfig.TLS && deps.tlsManager != nil {
@@ -1705,6 +1711,8 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:   serverConfig.AllowedHosts,
 		Storage:        deps.storage,
 		Cache:          deps.cacheInstance,
+		AuthRateLimit:  authRateLimit,
+		LookupCache:    serverConfig.LookupCache,
 		TLS:            serverConfig.TLS,
 		TLSConfig:      tlsConfig, // From TLS manager (if available)
 		TLSCertFile:    serverConfig.TLSCertFile,
@@ -1759,6 +1767,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		TrustedNetworks:     deps.config.Servers.TrustedNetworks,
 		TrustedProxies:      deps.config.Servers.TrustedNetworks,
 		PreLookup:           serverConfig.PreLookup,
+		LookupCache:         serverConfig.LookupCache,
 		AffinityManager:     deps.affinityManager,
 	})
 	if err != nil {

@@ -550,7 +550,7 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers
-	if cached, found := s.server.authCache.Get(s.server.name, username); found {
+	if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
 		// Hash the password (never empty - validated at function start)
 		passwordHash := lookupcache.HashPassword(password)
 
@@ -565,7 +565,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Same wrong password - return cached failure and refresh TTL
 				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-				s.server.authCache.Refresh(s.server.name, username)
+				s.server.lookupCache.Refresh(s.server.name, username)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return consts.ErrAuthenticationFailed
@@ -598,7 +598,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.username = username
 
 				// Refresh TTL since password matched
-				s.server.authCache.Refresh(s.server.name, username)
+				s.server.lookupCache.Refresh(s.server.name, username)
 
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
@@ -786,7 +786,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if password != "" {
 					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					AccountID:              routingInfo.AccountID,
 					PasswordHash:           passwordHash,
 					ServerAddress:          routingInfo.ServerAddress,
@@ -820,7 +820,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if password != "" {
 					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					PasswordHash: passwordHash,
 					Result:       lookupcache.AuthFailed,
 					IsNegative:   true,
@@ -907,7 +907,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				if password != "" {
 					passwordHash = lookupcache.HashPassword(password)
 				}
-				s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					PasswordHash: passwordHash,
 					Result:       lookupcache.AuthFailed,
 					IsNegative:   true,
@@ -942,7 +942,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	if password != "" {
 		passwordHash = lookupcache.HashPassword(password)
 	}
-	s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 		AccountID:     accountID,
 		PasswordHash:  passwordHash,
 		ServerAddress: "", // Will be populated by affinity/routing in next connection

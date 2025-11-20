@@ -9,7 +9,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-func TestAuthCache_SuccessfulAuth(t *testing.T) {
+func TestLookupCache_SuccessfulAuth(t *testing.T) {
 	// Use long TTLs and cleanup interval to prevent race with cleanup goroutine
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -66,7 +66,7 @@ func TestAuthCache_SuccessfulAuth(t *testing.T) {
 	}
 }
 
-func TestAuthCache_FailureCache(t *testing.T) {
+func TestLookupCache_FailureCache(t *testing.T) {
 	// Use long TTLs and cleanup interval to prevent race with cleanup goroutine
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -89,7 +89,7 @@ func TestAuthCache_FailureCache(t *testing.T) {
 	}
 }
 
-func TestAuthCache_Expiration(t *testing.T) {
+func TestLookupCache_Expiration(t *testing.T) {
 	cache := New(50*time.Millisecond, 100*time.Millisecond, 100, 1*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
 
@@ -115,7 +115,7 @@ func TestAuthCache_Expiration(t *testing.T) {
 	}
 }
 
-func TestAuthCache_Invalidation(t *testing.T) {
+func TestLookupCache_Invalidation(t *testing.T) {
 	// Use long cleanup interval to prevent race with cleanup goroutine
 	cache := New(1*time.Second, 1*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -148,7 +148,7 @@ func TestAuthCache_Invalidation(t *testing.T) {
 	}
 }
 
-func TestAuthCache_MaxSize(t *testing.T) {
+func TestLookupCache_MaxSize(t *testing.T) {
 	maxSize := 5
 	// Use long cleanup interval to prevent race with cleanup goroutine
 	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Hour, 30*time.Second)
@@ -170,7 +170,7 @@ func TestAuthCache_MaxSize(t *testing.T) {
 	}
 }
 
-func TestAuthCache_CleanupExpired(t *testing.T) {
+func TestLookupCache_CleanupExpired(t *testing.T) {
 	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
 
@@ -199,7 +199,7 @@ func TestAuthCache_CleanupExpired(t *testing.T) {
 	}
 }
 
-func TestAuthCache_PasswordChangeInvalidation(t *testing.T) {
+func TestLookupCache_PasswordChangeInvalidation(t *testing.T) {
 	// Use long TTL and cleanup interval to prevent race with cleanup
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -265,7 +265,7 @@ func TestAuthCache_PasswordChangeInvalidation(t *testing.T) {
 	}
 }
 
-func TestAuthCache_MemoryGrowthPrevention(t *testing.T) {
+func TestLookupCache_MemoryGrowthPrevention(t *testing.T) {
 	// Simulate production config: 30s TTL, 5min cleanup
 	cache := New(30*time.Second, 5*time.Second, 10000, 5*time.Minute, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -292,7 +292,7 @@ func TestAuthCache_MemoryGrowthPrevention(t *testing.T) {
 	}
 }
 
-func TestAuthCache_CleanupRemovesExpiredEntries(t *testing.T) {
+func TestLookupCache_CleanupRemovesExpiredEntries(t *testing.T) {
 	// Use short TTL and fast cleanup to test cleanup loop
 	cache := New(500*time.Millisecond, 500*time.Millisecond, 1000, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -328,7 +328,7 @@ func TestAuthCache_CleanupRemovesExpiredEntries(t *testing.T) {
 	t.Logf("Cache size after cleanup: %d", sizeAfter)
 }
 
-func TestAuthCache_ContinuousCleanupPreventsGrowth(t *testing.T) {
+func TestLookupCache_ContinuousCleanupPreventsGrowth(t *testing.T) {
 	// Create cache with short TTL and frequent cleanup
 	cache := New(200*time.Millisecond, 200*time.Millisecond, 10000, 50*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -362,7 +362,7 @@ func TestAuthCache_ContinuousCleanupPreventsGrowth(t *testing.T) {
 	t.Logf("Final cache size: %d (expected < 50)", finalSize)
 }
 
-func TestAuthCache_CleanupLogsRemovedEntries(t *testing.T) {
+func TestLookupCache_CleanupLogsRemovedEntries(t *testing.T) {
 	// Test that cleanup actually logs when it removes entries
 	cache := New(100*time.Millisecond, 100*time.Millisecond, 100, 100*time.Millisecond, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -393,9 +393,9 @@ func TestAuthCache_CleanupLogsRemovedEntries(t *testing.T) {
 	}
 }
 
-// TestAuthCache_NegativeCacheReturnsError verifies that negative cache hits
+// TestLookupCache_NegativeCacheReturnsError verifies that negative cache hits
 // return an error immediately without requiring a database lookup
-func TestAuthCache_NegativeCacheReturnsError(t *testing.T) {
+func TestLookupCache_NegativeCacheReturnsError(t *testing.T) {
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
@@ -447,9 +447,9 @@ func TestAuthCache_NegativeCacheReturnsError(t *testing.T) {
 	}
 }
 
-// TestAuthCache_PositiveCacheWrongPasswordReturnsError verifies that trying
-// wrong password on a cached positive entry returns error without database lookup
-func TestAuthCache_PositiveCacheWrongPasswordReturnsError(t *testing.T) {
+// TestLookupCache_PositiveCacheDifferentPasswordAllowsRevalidation verifies that trying
+// a different password on a cached positive entry always allows revalidation (no brute force protection in cache)
+func TestLookupCache_PositiveCacheDifferentPasswordAllowsRevalidation(t *testing.T) {
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
@@ -480,43 +480,20 @@ func TestAuthCache_PositiveCacheWrongPasswordReturnsError(t *testing.T) {
 		t.Errorf("Expected accountID=%d, got %d", accountID, cachedID)
 	}
 
-	// Try wrong password on positive entry (within revalidation window)
-	// Should return error to prevent database lookup
+	// Try wrong password on positive entry
+	// Should return (0, false, nil) to allow revalidation, regardless of revalidation window
+	// Brute force protection is handled by protocol-level rate limiting, not by cache
 	cachedID2, found2, err2 := cache.Authenticate(address, wrongPassword)
 
-	if err2 == nil {
-		t.Error("Expected error for wrong password on fresh positive entry, got nil")
+	if err2 != nil {
+		t.Errorf("Expected nil error to allow revalidation, got %v", err2)
 	}
 
 	if found2 {
-		t.Error("Expected found=false for wrong password")
-	}
-
-	if cachedID2 != 0 {
-		t.Errorf("Expected accountID=0 for wrong password, got %d", cachedID2)
-	}
-
-	// Test with expired revalidation window
-	cache2 := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 50*time.Millisecond)
-	defer cache2.Stop(context.Background())
-
-	cache2.SetSuccess(address, accountID, string(hash), correctPassword)
-
-	// Wait for positive revalidation window to pass
-	time.Sleep(60 * time.Millisecond)
-
-	// Now try wrong password - should return (0, false, nil) to allow revalidation
-	cachedID3, found3, err3 := cache2.Authenticate(address, wrongPassword)
-
-	if err3 != nil {
-		t.Errorf("Expected nil error for revalidation allowed, got %v", err3)
-	}
-
-	if found3 {
 		t.Error("Expected found=false to signal revalidation needed")
 	}
 
-	if cachedID3 != 0 {
-		t.Errorf("Expected accountID=0 for revalidation, got %d", cachedID3)
+	if cachedID2 != 0 {
+		t.Errorf("Expected accountID=0 for revalidation, got %d", cachedID2)
 	}
 }

@@ -14,15 +14,16 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/imapproxy"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestIMAPProxyAuthCache_MasterPasswordCaching tests that master password authentication
+// TestIMAPProxyLookupCache_MasterPasswordCaching tests that master password authentication
 // is properly cached and subsequent logins use the cache
-func TestIMAPProxyAuthCache_MasterPasswordCaching(t *testing.T) {
+func TestIMAPProxyLookupCache_MasterPasswordCaching(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend IMAP server
@@ -30,7 +31,7 @@ func TestIMAPProxyAuthCache_MasterPasswordCaching(t *testing.T) {
 	defer backendServer.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
 	// Set up IMAP proxy with auth cache enabled
@@ -88,9 +89,9 @@ func TestIMAPProxyAuthCache_MasterPasswordCaching(t *testing.T) {
 	})
 }
 
-// TestIMAPProxyAuthCache_BadPasswordHandling tests that bad password attempts
+// TestIMAPProxyLookupCache_BadPasswordHandling tests that bad password attempts
 // are cached in the negative cache with proper expiry
-func TestIMAPProxyAuthCache_BadPasswordHandling(t *testing.T) {
+func TestIMAPProxyLookupCache_BadPasswordHandling(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend IMAP server
@@ -98,7 +99,7 @@ func TestIMAPProxyAuthCache_BadPasswordHandling(t *testing.T) {
 	defer backendServer.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-bad-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-bad-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
 	// Generate password hash for prelookup response
@@ -178,9 +179,9 @@ func TestIMAPProxyAuthCache_BadPasswordHandling(t *testing.T) {
 	})
 }
 
-// TestIMAPProxyAuthCache_SuccessfulAuthExpiry tests that successful auth cache entries
+// TestIMAPProxyLookupCache_SuccessfulAuthExpiry tests that successful auth cache entries
 // expire correctly and get revalidated
-func TestIMAPProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
+func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend IMAP server
@@ -188,7 +189,7 @@ func TestIMAPProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
 	defer backendServer.Close()
 
 	// Create test account
-	uniqueEmail := fmt.Sprintf("authcache-expiry-%d@example.com", time.Now().UnixNano())
+	uniqueEmail := fmt.Sprintf("lookupcache-expiry-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
 	// Generate password hash for prelookup response
@@ -289,6 +290,204 @@ func TestIMAPProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
 		} else {
 			t.Log("✓ Third login revalidated (prelookup called after expiry)")
 		}
+	})
+}
+
+// TestIMAPProxyLookupCache_NegativeCacheRevalidation tests that a correct password
+// works immediately after a wrong password (cache miss on negative entry with diff password)
+func TestIMAPProxyLookupCache_NegativeCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create backend IMAP server
+	backendServer, _ := common.SetupIMAPServerWithPROXY(t)
+	defer backendServer.Close()
+
+	// Create test account
+	uniqueEmail := fmt.Sprintf("lookupcache-neg-reval-%d@example.com", time.Now().UnixNano())
+	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
+
+	// Set up IMAP proxy with auth cache enabled
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupIMAPProxyWithMasterAuthAndCache(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address})
+	defer proxy.Close()
+
+	// Test 1: Wrong password - should fail and cache negative
+	t.Run("WrongPassword_CachedNegative", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial IMAP proxy: %v", err)
+		}
+		defer c.Close()
+
+		if err := c.Login(account.Email, "wrongpassword").Wait(); err == nil {
+			t.Fatal("Login with wrong password should have failed")
+		}
+		t.Log("✓ Wrong password failed (cached negative)")
+	})
+
+	// Test 2: Correct password immediately - should succeed (revalidate)
+	t.Run("CorrectPassword_RevalidatesImmediately", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial IMAP proxy: %v", err)
+		}
+		defer c.Logout()
+
+		// Should succeed immediately despite negative cache, because password differs
+		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+			t.Fatalf("Login with correct password failed: %v", err)
+		}
+		t.Log("✓ Correct password succeeded immediately (revalidated)")
+	})
+}
+
+// TestIMAPProxyLookupCache_PositiveCacheRevalidation tests that a new password
+// works after positiveRevalidationWindow, but fails before that
+func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Create backend IMAP server
+	backendServer, _ := common.SetupIMAPServerWithPROXY(t)
+	defer backendServer.Close()
+
+	// Create test account
+	uniqueEmail := fmt.Sprintf("lookupcache-pos-reval-%d@example.com", time.Now().UnixNano())
+	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "oldpassword")
+
+	// Generate password hash for prelookup response
+	// We need to update this when password changes
+	var currentPasswordHash string
+	updateHash := func(pwd string) {
+		hashBytes, _ := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
+		currentPasswordHash = string(hashBytes)
+	}
+	updateHash("oldpassword")
+
+	// Track prelookup calls
+	prelookupCalls := 0
+	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prelookupCalls++
+		response := map[string]interface{}{
+			"address":       account.Email,
+			"password_hash": currentPasswordHash,
+			"server":        backendServer.Address,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer prelookupServer.Close()
+
+	// Set up IMAP proxy with short positive revalidation window (2 seconds)
+	// Note: PositiveTTL is longer (5m) to ensure entry stays in cache
+	proxyAddress := common.GetRandomAddress(t)
+
+	hostname := "test-proxy-pos-reval"
+	masterUsername := "proxyuser"
+	masterPassword := "proxypass"
+
+	opts := imapproxy.ServerOptions{
+		Name:                   hostname,
+		Addr:                   proxyAddress,
+		RemoteAddrs:            []string{backendServer.Address},
+		RemotePort:             143,
+		MasterSASLUsername:     masterUsername,
+		MasterSASLPassword:     masterPassword,
+		TLS:                    false,
+		RemoteUseProxyProtocol: true,
+		ConnectTimeout:         10 * time.Second,
+		AuthIdleTimeout:        30 * time.Minute,
+		EnableAffinity:         true,
+		PreLookup: &config.PreLookupConfig{
+			Enabled:                true,
+			URL:                    prelookupServer.URL,
+			Timeout:                "5s",
+			FallbackDefault:        false,
+			RemoteUseProxyProtocol: true,
+		},
+		LookupCache: &config.LookupCacheConfig{
+			Enabled:         true,
+			PositiveTTL:     "5m",
+			NegativeTTL:     "1m",
+			MaxSize:         10000,
+			CleanupInterval: "5m",
+			// Short revalidation window for testing
+			PositiveRevalidationWindow: "2s",
+		},
+	}
+
+	proxy, err := imapproxy.New(context.Background(), backendServer.ResilientDB, hostname, opts)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP proxy: %v", err)
+	}
+	go proxy.Start()
+	defer proxy.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 1: Login with old password - populates cache
+	t.Run("LoginOldPassword_PopulatesCache", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial: %v", err)
+		}
+		defer c.Logout()
+
+		if err := c.Login(account.Email, "oldpassword").Wait(); err != nil {
+			t.Fatalf("Login failed: %v", err)
+		}
+		if prelookupCalls != 1 {
+			t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls)
+		}
+	})
+
+	// Change password in backend (and update our mock hash)
+	newPassword := "newpassword"
+	// Update backend DB
+	hashedPassword, _ := db.GenerateBcryptHash(newPassword)
+	backendServer.ResilientDB.UpdatePasswordWithRetry(context.Background(), account.Email, hashedPassword)
+	// Update mock prelookup hash
+	updateHash(newPassword)
+
+	// Test 2: Login with new password immediately - should fail (cache hit, hash mismatch, fresh entry)
+	t.Run("LoginNewPassword_Immediate_Fails", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial: %v", err)
+		}
+		defer c.Close()
+
+		// Should fail because cache has old hash and entry is fresh (< 2s)
+		if err := c.Login(account.Email, newPassword).Wait(); err == nil {
+			t.Fatal("Login with new password should have failed (cached old hash)")
+		}
+		// Prelookup should NOT be called again
+		if prelookupCalls != 1 {
+			t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls)
+		}
+		t.Log("✓ Login with new password failed immediately (cached old hash)")
+	})
+
+	// Wait for revalidation window to pass
+	time.Sleep(2500 * time.Millisecond)
+
+	// Test 3: Login with new password after window - should succeed (revalidate)
+	t.Run("LoginNewPassword_AfterWindow_Succeeds", func(t *testing.T) {
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial: %v", err)
+		}
+		defer c.Logout()
+
+		// Should succeed because entry is old (> 2s) so it revalidates
+		if err := c.Login(account.Email, newPassword).Wait(); err != nil {
+			t.Fatalf("Login with new password failed after window: %v", err)
+		}
+		// Prelookup SHOULD be called again
+		if prelookupCalls != 2 {
+			t.Fatalf("Expected 2 prelookup calls, got %d", prelookupCalls)
+		}
+		t.Log("✓ Login with new password succeeded after window (revalidated)")
 	})
 }
 

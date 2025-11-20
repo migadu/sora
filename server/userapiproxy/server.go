@@ -16,6 +16,7 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -31,24 +32,26 @@ type JWTClaims struct {
 
 // Server represents a User API proxy server
 type Server struct {
-	name            string
-	addr            string
-	connManager     *proxy.ConnectionManager
-	rdb             *resilient.ResilientDatabase
-	routingLookup   proxy.UserRoutingLookup // PreLookup client for user routing (optional)
-	affinityManager *server.AffinityManager // Affinity manager for sticky routing (optional)
-	jwtSecret       string                  // JWT secret for token validation
-	tls             bool
-	tlsCertFile     string
-	tlsKeyFile      string
-	tlsVerify       bool
-	tlsConfig       *tls.Config // Global TLS config from TLS manager (optional)
-	trustedProxies  []string    // CIDR blocks for trusted proxies
-	limiter         *server.ConnectionLimiter
-	httpServer      *http.Server
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	name                       string
+	addr                       string
+	connManager                *proxy.ConnectionManager
+	rdb                        *resilient.ResilientDatabase
+	routingLookup              proxy.UserRoutingLookup  // PreLookup client for user routing (optional)
+	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
+	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
+	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
+	jwtSecret                  string                   // JWT secret for token validation
+	tls                        bool
+	tlsCertFile                string
+	tlsKeyFile                 string
+	tlsVerify                  bool
+	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
+	trustedProxies             []string    // CIDR blocks for trusted proxies
+	limiter                    *server.ConnectionLimiter
+	httpServer                 *http.Server
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	wg                         sync.WaitGroup
 
 	// Shared HTTP transport (prevents connection pool leaks)
 	transport *http.Transport
@@ -72,13 +75,14 @@ type ServerOptions struct {
 	RemoteTLS           bool
 	RemoteTLSVerify     bool
 	ConnectTimeout      time.Duration
-	MaxConnections      int                     // Maximum total connections per instance (0 = unlimited, local only)
-	MaxConnectionsPerIP int                     // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
-	TrustedNetworks     []string                // CIDR blocks for trusted networks that bypass per-IP limits
-	TrustedProxies      []string                // CIDR blocks for trusted proxies
-	PreLookup           *config.PreLookupConfig // PreLookup configuration for user routing
-	AffinityManager     *server.AffinityManager // Affinity manager for sticky routing (optional)
-	ClusterManager      *cluster.Manager        // Optional: enables cluster-wide per-IP limiting
+	MaxConnections      int                       // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP int                       // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
+	TrustedNetworks     []string                  // CIDR blocks for trusted networks that bypass per-IP limits
+	TrustedProxies      []string                  // CIDR blocks for trusted proxies
+	PreLookup           *config.PreLookupConfig   // PreLookup configuration for user routing
+	LookupCache         *config.LookupCacheConfig // Route lookup cache configuration
+	AffinityManager     *server.AffinityManager   // Affinity manager for sticky routing (optional)
+	ClusterManager      *cluster.Manager          // Optional: enables cluster-wide per-IP limiting
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -194,25 +198,66 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		logger.Info("PROXY protocol enabled for incoming connections", "proxy", opts.Name)
 	}
 
+	// Initialize route lookup cache if configured
+	var lookupCache *lookupcache.LookupCache
+	var positiveRevalidationWindow time.Duration
+	if opts.LookupCache != nil && opts.LookupCache.Enabled {
+		lookupCacheConfig := opts.LookupCache
+
+		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
+		if err != nil || lookupCacheConfig.PositiveTTL == "" {
+			logger.Info("User API Proxy: Using default positive TTL (5m)", "name", opts.Name)
+			positiveTTL = 5 * time.Minute
+		}
+
+		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
+		if err != nil || lookupCacheConfig.NegativeTTL == "" {
+			logger.Info("User API Proxy: Using default negative TTL (1m)", "name", opts.Name)
+			negativeTTL = 1 * time.Minute
+		}
+
+		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
+		if err != nil || lookupCacheConfig.CleanupInterval == "" {
+			logger.Info("User API Proxy: Using default cleanup interval (5m)", "name", opts.Name)
+			cleanupInterval = 5 * time.Minute
+		}
+
+		maxSize := lookupCacheConfig.MaxSize
+		if maxSize == 0 {
+			maxSize = 10000
+		}
+
+		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
+		if err != nil {
+			logger.Info("User API Proxy: Invalid positive revalidation window in lookup cache config, using default (30s)", "name", opts.Name, "error", err)
+			positiveRevalidationWindow = 30 * time.Second
+		}
+
+		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+	}
+
 	return &Server{
-		name:            opts.Name,
-		addr:            opts.Addr,
-		connManager:     connManager,
-		rdb:             rdb,
-		routingLookup:   routingLookup,
-		affinityManager: opts.AffinityManager,
-		jwtSecret:       opts.JWTSecret,
-		tls:             opts.TLS,
-		tlsCertFile:     opts.TLSCertFile,
-		tlsKeyFile:      opts.TLSKeyFile,
-		tlsVerify:       opts.TLSVerify,
-		tlsConfig:       opts.TLSConfig,
-		trustedProxies:  opts.TrustedProxies,
-		limiter:         limiter,
-		transport:       transport,
-		proxyReader:     proxyReader,
-		ctx:             ctx,
-		cancel:          cancel,
+		name:                       opts.Name,
+		addr:                       opts.Addr,
+		connManager:                connManager,
+		rdb:                        rdb,
+		routingLookup:              routingLookup,
+		affinityManager:            opts.AffinityManager,
+		lookupCache:                lookupCache,
+		positiveRevalidationWindow: positiveRevalidationWindow,
+		jwtSecret:                  opts.JWTSecret,
+		tls:                        opts.TLS,
+		tlsCertFile:                opts.TLSCertFile,
+		tlsKeyFile:                 opts.TLSKeyFile,
+		tlsVerify:                  opts.TLSVerify,
+		tlsConfig:                  opts.TLSConfig,
+		trustedProxies:             opts.TrustedProxies,
+		limiter:                    limiter,
+		transport:                  transport,
+		proxyReader:                proxyReader,
+		ctx:                        ctx,
+		cancel:                     cancel,
 	}, nil
 }
 
@@ -356,19 +401,46 @@ func (s *Server) setupHandler() http.Handler {
 	})
 }
 
-// getBackendForUser determines the backend server for a user using affinity and prelookup
+// getBackendForUser determines the backend server for a user using cache, affinity and prelookup
 func (s *Server) getBackendForUser(email string, accountID int64) (string, error) {
 	ctx := context.Background()
 
-	// 1. Check affinity first (if configured)
+	// 1. Check lookup cache first (if enabled)
+	if s.lookupCache != nil {
+		cached, found := s.lookupCache.Get(s.name, email)
+		if found && !cached.IsNegative {
+			// Positive cache entry - use cached route
+			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+			metrics.LookupCacheHitsTotal.Inc()
+			s.lookupCache.Refresh(s.name, email)
+			return cached.ServerAddress, nil
+		}
+		// Cache miss or negative entry - fall through to lookup
+		if found {
+			logger.Debug("User API Proxy: Cache miss (negative entry)", "name", s.name, "user", email)
+		}
+		metrics.LookupCacheMissesTotal.Inc()
+	}
+
+	// 2. Check affinity (if configured)
 	if s.affinityManager != nil {
 		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
 			logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend)
+			// Cache the route if lookup cache is enabled
+			if s.lookupCache != nil {
+				entry := &lookupcache.CacheEntry{
+					AccountID:     accountID,
+					ServerAddress: backend,
+					CreatedAt:     time.Now(),
+					ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+				}
+				s.lookupCache.Set(s.name, email, entry)
+			}
 			return backend, nil
 		}
 	}
 
-	// 2. Use prelookup if configured
+	// 3. Use prelookup if configured
 	if s.routingLookup != nil {
 		// Use routeOnly=true since user is already authenticated via JWT
 		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
@@ -383,11 +455,22 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 				s.affinityManager.SetBackend(email, routingInfo.ServerAddress, "userapi")
 			}
 
+			// Cache the route if lookup cache is enabled
+			if s.lookupCache != nil {
+				entry := &lookupcache.CacheEntry{
+					AccountID:     accountID,
+					ServerAddress: routingInfo.ServerAddress,
+					CreatedAt:     time.Now(),
+					ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+				}
+				s.lookupCache.Set(s.name, email, entry)
+			}
+
 			return routingInfo.ServerAddress, nil
 		}
 	}
 
-	// 3. Fall back to consistent hash
+	// 4. Fall back to consistent hash
 	backendAddr := s.connManager.GetBackendByConsistentHash(email)
 	if backendAddr == "" {
 		return "", fmt.Errorf("no backend available")
@@ -398,6 +481,17 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 	// Set affinity for future requests
 	if s.affinityManager != nil {
 		s.affinityManager.SetBackend(email, backendAddr, "userapi")
+	}
+
+	// Cache the route if lookup cache is enabled
+	if s.lookupCache != nil {
+		entry := &lookupcache.CacheEntry{
+			AccountID:     accountID,
+			ServerAddress: backendAddr,
+			CreatedAt:     time.Now(),
+			ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+		}
+		s.lookupCache.Set(s.name, email, entry)
 	}
 
 	return backendAddr, nil

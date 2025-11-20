@@ -72,10 +72,46 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
 	remoteAddr := &server.StringAddr{Addr: clientIP}
 
+	// Reject empty passwords immediately
+	if req.Password == "" {
+		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+		return
+	}
+
 	// Apply progressive authentication delay BEFORE any other checks
 	server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN")
 
-	// Check authentication rate limiting
+	var accountID int64
+	var hashedPassword string
+	var err error
+
+	// Check cache first (if enabled)
+	if s.authCache != nil {
+		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
+		if cacheErr != nil {
+			// Cached failure (same wrong password)
+			logger.Debug("User API: Cache hit - authentication failed", "name", s.name, "email", req.Email)
+			if s.authLimiter != nil {
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+			}
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+		if found {
+			// Cache hit - successful authentication
+			logger.Debug("User API: Cache hit - using cached auth", "name", s.name, "email", req.Email, "account_id", cachedAccountID)
+			accountID = cachedAccountID
+			if s.authLimiter != nil {
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, true)
+			}
+			// Skip database lookup - use cached account ID
+			goto generateToken
+		}
+		// Cache miss or revalidation needed - fall through to full auth
+		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", req.Email)
+	}
+
+	// Check authentication rate limiting (after cache check to avoid delays for cached hits)
 	if s.authLimiter != nil {
 		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, req.Email); err != nil {
 			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
@@ -84,10 +120,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Authenticate user
-	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
+	// Authenticate user (full database lookup)
+	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
+			// Cache negative result if cache enabled (result=1 for user not found)
+			if s.authCache != nil {
+				s.authCache.SetFailure(req.Email, 1, req.Password)
+			}
 			// Record failed attempt
 			if s.authLimiter != nil {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
@@ -103,6 +143,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
+		// Cache negative result if cache enabled (result=2 for invalid password)
+		if s.authCache != nil {
+			s.authCache.SetFailure(req.Email, 2, req.Password)
+		}
 		// Record failed attempt
 		if s.authLimiter != nil {
 			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
@@ -111,10 +155,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cache positive result if cache enabled
+	if s.authCache != nil {
+		s.authCache.SetSuccess(req.Email, accountID, hashedPassword, req.Password)
+	}
+
 	// Record successful attempt
 	if s.authLimiter != nil {
 		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, true)
 	}
+
+generateToken:
 
 	// Generate JWT token
 	token, expiresAt, err := s.generateToken(req.Email, accountID)

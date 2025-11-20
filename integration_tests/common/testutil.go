@@ -1314,6 +1314,66 @@ func SetupManageSieveServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	}, account
 }
 
+// SetupManageSieveServerWithPROXY sets up a ManageSieve server with PROXY protocol support for proxy testing
+func SetupManageSieveServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	// Create ManageSieve server with PROXY protocol support and master SASL credentials
+	masterSASLUsername := "master_sasl"
+	masterSASLPassword := "master_sasl_secret"
+
+	server, err := managesieve.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth:                true,
+			ProxyProtocol:               true,                               // Enable PROXY protocol support
+			ProxyProtocolTimeout:        "5s",                               // Timeout for PROXY headers
+			ProxyProtocolTrustedProxies: []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
+			TrustedNetworks:             []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
+			MasterSASLUsername:          masterSASLUsername,                 // Master username for proxy authentication
+			MasterSASLPassword:          masterSASLPassword,                 // Master password for proxy authentication
+			SupportedExtensions:         []string{"fileinto", "vacation", "envelope", "variables"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server with PROXY support: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("ManageSieve server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+		}
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}
+
 // DialPOP3 connects to a POP3 server and reads the greeting
 func DialPOP3(address string) (net.Conn, error) {
 	conn, err := net.Dial("tcp", address)

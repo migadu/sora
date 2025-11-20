@@ -10,8 +10,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestAuthCache_MemoryCleanup verifies that expired entries are cleaned up and memory doesn't grow indefinitely
-func TestAuthCache_MemoryCleanup(t *testing.T) {
+// TestLookupCache_MemoryCleanup verifies that expired entries are cleaned up and memory doesn't grow indefinitely
+func TestLookupCache_MemoryCleanup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping memory test in short mode")
 	}
@@ -46,8 +46,8 @@ func TestAuthCache_MemoryCleanup(t *testing.T) {
 	}
 }
 
-// TestAuthCache_MaxSizeEnforcement verifies that cache never exceeds max size
-func TestAuthCache_MaxSizeEnforcement(t *testing.T) {
+// TestLookupCache_MaxSizeEnforcement verifies that cache never exceeds max size
+func TestLookupCache_MaxSizeEnforcement(t *testing.T) {
 	maxSize := 100
 	cache := New(1*time.Second, 1*time.Second, maxSize, 1*time.Second, 30*time.Second)
 	defer cache.Stop(context.Background())
@@ -74,8 +74,8 @@ func TestAuthCache_MaxSizeEnforcement(t *testing.T) {
 	}
 }
 
-// TestAuthCache_NoLeakAfterStop verifies cache properly stops and doesn't leak goroutines
-func TestAuthCache_NoLeakAfterStop(t *testing.T) {
+// TestLookupCache_NoLeakAfterStop verifies cache properly stops and doesn't leak goroutines
+func TestLookupCache_NoLeakAfterStop(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping goroutine leak test in short mode")
 	}
@@ -122,9 +122,9 @@ func TestAuthCache_NoLeakAfterStop(t *testing.T) {
 	}
 }
 
-// TestAuthCache_ExpiredNotRemovedOnRead verifies that expired entries remain in map until cleanup
+// TestLookupCache_ExpiredNotRemovedOnRead verifies that expired entries remain in map until cleanup
 // This is a performance optimization - we don't delete on every read, only during periodic cleanup
-func TestAuthCache_ExpiredNotRemovedOnRead(t *testing.T) {
+func TestLookupCache_ExpiredNotRemovedOnRead(t *testing.T) {
 	cache := New(50*time.Millisecond, 50*time.Millisecond, 100, 10*time.Second, 30*time.Second) // Long cleanup interval
 	defer cache.Stop(context.Background())
 

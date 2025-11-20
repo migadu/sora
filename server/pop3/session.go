@@ -364,7 +364,7 @@ func (s *POP3Session) handleConnection() {
 			// If master password didn't work, try regular authentication
 			if !authSuccess {
 				// Use base address (without +detail) for authentication
-				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, userAddress.BaseAddress(), password)
+				accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
 				if err != nil {
 					// Check if error is due to context cancellation (server shutdown)
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1535,7 +1535,7 @@ func (s *POP3Session) handleConnection() {
 					}
 				}
 
-				accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+				accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 				if err != nil {
 					// Check if error is due to context cancellation (server shutdown)
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

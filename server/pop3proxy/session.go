@@ -381,8 +381,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers
-	if s.server.authCache != nil {
-		if cached, found := s.server.authCache.Get(s.server.name, username); found {
+	if s.server.lookupCache != nil {
+		if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
 			// Hash the password (never empty - validated at function start)
 			passwordHash := lookupcache.HashPassword(password)
 
@@ -397,7 +397,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// Same wrong password - return cached failure and refresh TTL
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-					s.server.authCache.Refresh(s.server.name, username)
+					s.server.lookupCache.Refresh(s.server.name, username)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
 					return consts.ErrAuthenticationFailed
@@ -428,7 +428,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					s.username = username
 
 					// Refresh TTL since password matched
-					s.server.authCache.Refresh(s.server.name, username)
+					s.server.lookupCache.Refresh(s.server.name, username)
 
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
@@ -444,7 +444,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					// Different password on positive entry - always revalidate
 					// Use configured window: revalidate if entry is older than positiveRevalidationWindow
 					if cached.IsOld(s.server.positiveRevalidationWindow) {
-						s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
+						s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt), "window", s.server.positiveRevalidationWindow)
 						metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_positive_different_pw").Inc()
 						// Fall through to full auth
 					} else {
@@ -608,12 +608,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// Cache successful authentication with routing info
 				// Always hash password, even for master auth, to prevent cache bypass
 				// This ensures different passwords don't match the same cache entry
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
 						PasswordHash:           passwordHash,
 						ServerAddress:          routingInfo.ServerAddress,
@@ -652,12 +652,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				s.InfoLog("prelookup authentication failed - bad password", "user", username, "cache", "miss")
 
 				// Cache negative result (wrong password)
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
 						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
@@ -732,12 +732,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
 						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
@@ -762,12 +762,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
 
 	// Cache successful authentication (main DB)
-	if s.server.authCache != nil {
+	if s.server.lookupCache != nil {
 		passwordHash := ""
 		if password != "" {
 			passwordHash = lookupcache.HashPassword(password)
 		}
-		s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:     accountID,
 			PasswordHash:  passwordHash,
 			ServerAddress: "", // Will be populated by affinity/routing in next connection
@@ -830,6 +830,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
 	)
 	if err != nil {
+		s.DebugLog("Failed to connect to backend", "error", err, "addr", preferredAddr)
 		metrics.ProxyBackendConnections.WithLabelValues("pop3", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}

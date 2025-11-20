@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -79,6 +80,8 @@ type connectionLimitingConn struct {
 	net.Conn
 	releaseFunc func()
 	proxyInfo   *server.ProxyProtocolInfo
+	closeMu     sync.Mutex
+	closed      bool
 }
 
 // GetProxyInfo implements the same interface as proxyProtocolConn
@@ -87,6 +90,14 @@ func (c *connectionLimitingConn) GetProxyInfo() *server.ProxyProtocolInfo {
 }
 
 func (c *connectionLimitingConn) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+
+	if c.closed {
+		return nil // Already closed
+	}
+	c.closed = true
+
 	if c.releaseFunc != nil {
 		c.releaseFunc()
 		c.releaseFunc = nil // Prevent double release

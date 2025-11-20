@@ -388,9 +388,10 @@ func TestConnectionLimiterConcurrent(t *testing.T) {
 				results[index] = false // No data read
 			}
 
-			// Hold connection briefly if successful
+			// Hold connection open to prevent it from being released before concurrent goroutines complete
+			// This ensures the limit is actually enforced during the concurrent connection phase
 			if results[index] {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
 			}
 		}(i)
 	}

@@ -155,21 +155,8 @@ type ResilientDatabase struct {
 	// Database configuration for timeouts
 	config *config.DatabaseConfig
 
-	// Authentication cache (optional, set if enabled in config)
-	authCache AuthCache
-
 	// Close synchronization to prevent race with health checker
 	closeOnce sync.Once
-}
-
-// AuthCache interface for authentication caching
-type AuthCache interface {
-	Authenticate(address, password string) (accountID int64, found bool, err error)
-	SetSuccess(address string, accountID int64, hashedPassword string, password string)
-	SetFailure(address string, result int, password string)
-	Invalidate(address string)
-	GetStats() (hits, misses uint64, size int, hitRate float64)
-	Stop(ctx context.Context) error
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
@@ -585,17 +572,7 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
 
-	// Invalidate cache entry on successful password update
-	if err == nil && rd.authCache != nil {
-		rd.authCache.Invalidate(address)
-	}
-
 	return err
-}
-
-// SetAuthCache sets the authentication cache for this database instance
-func (rd *ResilientDatabase) SetAuthCache(cache AuthCache) {
-	rd.authCache = cache
 }
 
 func (rd *ResilientDatabase) Close() {
@@ -607,16 +584,6 @@ func (rd *ResilientDatabase) Close() {
 
 	// Use sync.Once to ensure Close() is only executed once to prevent race with health checker
 	rd.closeOnce.Do(func() {
-		// Stop auth cache if enabled
-		if rd.authCache != nil {
-			logger.Info("Stopping authentication cache...", "component", "RESILIENT-FAILOVER")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := rd.authCache.Stop(ctx); err != nil {
-				logger.Error("Error stopping authentication cache", "component", "RESILIENT-FAILOVER", "error", err)
-			}
-		}
-
 		// Stop the health checker
 		close(rd.failoverManager.healthCheckStop)
 

@@ -16,14 +16,15 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/managesieveproxy"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestManageSieveProxyAuthCache_MasterPasswordCaching tests that master password authentication is cached correctly
-func TestManageSieveProxyAuthCache_MasterPasswordCaching(t *testing.T) {
+// TestManageSieveProxyLookupCache_MasterPasswordCaching tests that master password authentication is cached correctly
+func TestManageSieveProxyLookupCache_MasterPasswordCaching(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend ManageSieve server with master SASL credentials
@@ -129,11 +130,227 @@ func TestManageSieveProxyAuthCache_MasterPasswordCaching(t *testing.T) {
 	})
 }
 
+// TestManageSieveProxyLookupCache_NegativeCacheRevalidation tests that a correct password
+// works immediately after a wrong password (cache miss on negative entry with diff password)
+func TestManageSieveProxyLookupCache_NegativeCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Enable debug logging
+	logger.Initialize(config.LoggingConfig{Level: "debug", Output: "stdout"})
+
+	// Create backend ManageSieve server
+	backendServer, account := common.SetupManageSieveServerWithMaster(t)
+	defer backendServer.Close()
+
+	// Set up proxy with auth cache enabled
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupManageSieveProxyWithMasterAuthAndCache(t, backendServer, proxyAddress, []string{backendServer.Address})
+	defer proxy.Close()
+
+	// Test 1: Wrong password - should fail and cache negative
+	t.Run("WrongPassword_CachedNegative", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
+		}
+		defer client.Close()
+
+		authString := fmt.Sprintf("\x00%s\x00%s", account.Email, "wrong_password")
+		authB64 := base64.StdEncoding.EncodeToString([]byte(authString))
+		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", authB64))
+		resp, _ := client.ReadResponse()
+
+		if strings.HasPrefix(resp, "OK") {
+			t.Fatal("Expected login to fail with wrong password")
+		}
+		t.Log("✓ Wrong password failed (cached negative)")
+	})
+
+	// Test 2: Correct password immediately - should succeed (revalidate)
+	t.Run("CorrectPassword_RevalidatesImmediately", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
+		}
+		defer client.Close()
+
+		authString := fmt.Sprintf("\x00%s\x00%s", account.Email, account.Password)
+		authB64 := base64.StdEncoding.EncodeToString([]byte(authString))
+		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", authB64))
+		resp, _ := client.ReadResponse()
+
+		if !strings.HasPrefix(resp, "OK") {
+			t.Fatalf("Login with correct password failed: %s", resp)
+		}
+		t.Log("✓ Correct password succeeded immediately (revalidated)")
+	})
+}
+
+// TestManageSieveProxyLookupCache_PositiveCacheRevalidation tests that a new password
+// works after positiveRevalidationWindow, but fails before that
+func TestManageSieveProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Enable debug logging
+	logger.Initialize(config.LoggingConfig{Level: "debug", Output: "stdout"})
+
+	// Create backend ManageSieve server with PROXY protocol support
+	backendServer, account := common.SetupManageSieveServerWithPROXY(t)
+	defer backendServer.Close()
+
+	// Generate password hash for prelookup response
+	var currentPasswordHash string
+	updateHash := func(pwd string) {
+		hashBytes, _ := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
+		currentPasswordHash = string(hashBytes)
+	}
+	updateHash(account.Password)
+
+	// Track prelookup calls
+	var prelookupCalls atomic.Int32
+	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prelookupCalls.Add(1)
+		response := map[string]interface{}{
+			"address":       account.Email,
+			"password_hash": currentPasswordHash,
+			"server":        backendServer.Address,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer prelookupServer.Close()
+
+	// Set up proxy with short positive revalidation window (2 seconds)
+	proxyAddress := common.GetRandomAddress(t)
+
+	opts := managesieveproxy.ServerOptions{
+		Name:                   "test-managesieve-proxy-pos-reval",
+		Addr:                   proxyAddress,
+		RemoteAddrs:            []string{backendServer.Address},
+		RemotePort:             4190,
+		InsecureAuth:           true,
+		MasterSASLUsername:     "master_sasl",
+		MasterSASLPassword:     "master_sasl_secret",
+		TLS:                    false,
+		RemoteUseProxyProtocol: true,
+		ConnectTimeout:         10 * time.Second,
+		AuthIdleTimeout:        30 * time.Minute,
+		EnableAffinity:         true,
+		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
+		PreLookup: &config.PreLookupConfig{
+			Enabled:                true,
+			URL:                    prelookupServer.URL + "/$email",
+			Timeout:                "5s",
+			RemoteUseProxyProtocol: true,
+		},
+		LookupCache: &config.LookupCacheConfig{
+			Enabled:         true,
+			PositiveTTL:     "5m",
+			NegativeTTL:     "1m",
+			MaxSize:         10000,
+			CleanupInterval: "5m",
+			// Short revalidation window for testing
+			PositiveRevalidationWindow: "2s",
+		},
+		Debug: true,
+	}
+
+	proxy, err := managesieveproxy.New(context.Background(), backendServer.ResilientDB, "test-host", opts)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve proxy: %v", err)
+	}
+	go proxy.Start()
+	defer proxy.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 1: Login with old password - populates cache
+	t.Run("LoginOldPassword_PopulatesCache", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		authString := fmt.Sprintf("\x00%s\x00%s", account.Email, account.Password)
+		authB64 := base64.StdEncoding.EncodeToString([]byte(authString))
+		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", authB64))
+		resp, _ := client.ReadResponse()
+
+		if !strings.HasPrefix(resp, "OK") {
+			t.Fatalf("Login failed: %s", resp)
+		}
+		if prelookupCalls.Load() != 1 {
+			t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls.Load())
+		}
+	})
+
+	// Change password
+	newPassword := "newpassword"
+	// Update backend DB
+	newHashBytes, _ := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	newHashedPassword := "{BLF-CRYPT}" + string(newHashBytes)
+	backendServer.ResilientDB.UpdatePasswordWithRetry(context.Background(), account.Email, newHashedPassword)
+	// Update mock prelookup hash
+	updateHash(newPassword)
+
+	// Test 2: Login with new password immediately - should fail (cache hit, hash mismatch, fresh entry)
+	t.Run("LoginNewPassword_Immediate_Fails", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		authString := fmt.Sprintf("\x00%s\x00%s", account.Email, newPassword)
+		authB64 := base64.StdEncoding.EncodeToString([]byte(authString))
+		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", authB64))
+		resp, _ := client.ReadResponse()
+
+		// Should fail because cache has old hash and entry is fresh (< 2s)
+		if strings.HasPrefix(resp, "OK") {
+			t.Fatal("Login with new password should have failed (cached old hash)")
+		}
+		// Prelookup should NOT be called again
+		if prelookupCalls.Load() != 1 {
+			t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls.Load())
+		}
+		t.Log("✓ Login with new password failed immediately (cached old hash)")
+	})
+
+	// Wait for revalidation window to pass
+	time.Sleep(2500 * time.Millisecond)
+
+	// Test 3: Login with new password after window - should succeed (revalidate)
+	t.Run("LoginNewPassword_AfterWindow_Succeeds", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		authString := fmt.Sprintf("\x00%s\x00%s", account.Email, newPassword)
+		authB64 := base64.StdEncoding.EncodeToString([]byte(authString))
+		client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", authB64))
+		resp, _ := client.ReadResponse()
+
+		// Should succeed because entry is old (> 2s) so it revalidates
+		if !strings.HasPrefix(resp, "OK") {
+			t.Fatalf("Login with new password failed after window: %s", resp)
+		}
+		// Prelookup SHOULD be called again
+		if prelookupCalls.Load() != 2 {
+			t.Fatalf("Expected 2 prelookup calls, got %d", prelookupCalls.Load())
+		}
+		t.Log("✓ Login with new password succeeded after window (revalidated)")
+	})
+}
+
 // NOTE: Prelookup tests for ManageSieve require special backend setup with proxy protocol support
 // The basic master auth test above validates cache functionality
 
-// TestManageSieveProxyAuthCache_BadPasswordHandling tests that bad passwords are cached with short TTL
-func DISABLED_TestManageSieveProxyAuthCache_BadPasswordHandling(t *testing.T) {
+// TestManageSieveProxyLookupCache_BadPasswordHandling tests that bad passwords are cached with short TTL
+func DISABLED_TestManageSieveProxyLookupCache_BadPasswordHandling(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend ManageSieve server
@@ -235,8 +452,8 @@ func DISABLED_TestManageSieveProxyAuthCache_BadPasswordHandling(t *testing.T) {
 	})
 }
 
-// TestManageSieveProxyAuthCache_SuccessfulAuthExpiry tests cache expiry and renewal for successful auth
-func DISABLED_TestManageSieveProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
+// TestManageSieveProxyLookupCache_SuccessfulAuthExpiry tests cache expiry and renewal for successful auth
+func DISABLED_TestManageSieveProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend ManageSieve server
@@ -459,7 +676,7 @@ func setupManageSieveProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb
 			Enabled:                true,
 			URL:                    prelookupURL + "/$email",
 			Timeout:                "5s",
-			RemoteUseProxyProtocol: true,
+			RemoteUseProxyProtocol: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
@@ -503,7 +720,7 @@ func setupManageSieveProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb
 		MasterSASLPassword:     "master_sasl_secret",
 		TLS:                    false,
 		RemoteTLS:              false,
-		RemoteUseProxyProtocol: true,
+		RemoteUseProxyProtocol: false, // Disable PROXY protocol as backend doesn't support it
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
@@ -512,7 +729,7 @@ func setupManageSieveProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb
 			Enabled:                true,
 			URL:                    prelookupURL + "/$email",
 			Timeout:                "5s",
-			RemoteUseProxyProtocol: true,
+			RemoteUseProxyProtocol: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,

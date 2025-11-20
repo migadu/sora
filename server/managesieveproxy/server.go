@@ -5,10 +5,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
@@ -59,7 +60,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Auth cache for routing and password validation
-	authCache                  *lookupcache.LookupCache
+	lookupCache                *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
 
 	// Listen backlog
@@ -252,7 +253,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize auth cache for user authentication and routing
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *lookupcache.LookupCache
+	var lookupCache *lookupcache.LookupCache
 	var positiveRevalidationWindow time.Duration
 	lookupCacheConfig := opts.LookupCache
 	if lookupCacheConfig == nil {
@@ -288,10 +289,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			positiveRevalidationWindow = 30 * time.Second
 		}
 
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("ManageSieve Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
-		logger.Info("ManageSieve Proxy: Authentication cache disabled", "name", opts.Name)
+		logger.Info("ManageSieve Proxy: Lookup cache disabled", "name", opts.Name)
 	}
 
 	s := &Server{
@@ -323,7 +324,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
 		minBytesPerMinute:          opts.MinBytesPerMinute,
 		limiter:                    limiter,
-		authCache:                  authCache,
+		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
 		maxAuthErrors:              opts.MaxAuthErrors,
@@ -618,10 +619,10 @@ func (s *Server) Stop() error {
 	}
 
 	// Stop auth cache
-	if s.authCache != nil {
+	if s.lookupCache != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		if err := s.authCache.Stop(stopCtx); err != nil {
+		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}

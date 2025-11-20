@@ -38,6 +38,7 @@ type Session struct {
 	serverAddr         string
 	routingMethod      string
 	clientAddr         string // Cached client address to avoid race with connection close
+	releaseConn        func() // Connection limiter cleanup function
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -406,7 +407,7 @@ func (s *Session) handleRecipient(to string) error {
 	}
 
 	// Check cache first (for routing info - no password validation needed)
-	if cached, found := s.server.authCache.Get(s.server.name, s.username); found {
+	if cached, found := s.server.lookupCache.Get(s.server.name, s.username); found {
 		if cached.IsNegative {
 			// User previously not found - return cached failure
 			// Note: Do NOT refresh negative entries - let them expire naturally so we can
@@ -431,7 +432,7 @@ func (s *Session) handleRecipient(to string) error {
 				RemoteUseXCLIENT:       cached.RemoteUseXCLIENT,
 			}
 
-			s.server.authCache.Refresh(s.server.name, s.username)
+			s.server.lookupCache.Refresh(s.server.name, s.username)
 			return nil
 		}
 	}
@@ -479,7 +480,7 @@ func (s *Session) handleRecipient(to string) error {
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
 
 			// Cache positive result (routing info found)
-			s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 				AccountID:              routingInfo.AccountID,
 				ServerAddress:          routingInfo.ServerAddress,
 				RemoteTLS:              routingInfo.RemoteTLS,
@@ -520,7 +521,7 @@ func (s *Session) handleRecipient(to string) error {
 
 		// Cache negative result (user not found)
 		s.InfoLog("user not found in main database", "username", s.username, "cache", "miss")
-		s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+		s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 			Result:     lookupcache.AuthUserNotFound,
 			IsNegative: true,
 		})
@@ -536,7 +537,7 @@ func (s *Session) handleRecipient(to string) error {
 	}
 
 	// Cache positive result (routing info from DB)
-	s.server.authCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+	s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
 		Result:           lookupcache.AuthSuccess,
@@ -969,6 +970,12 @@ func (s *Session) proxyClientToBackend() {
 func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Release connection limiter slot IMMEDIATELY (don't wait for goroutine to exit)
+	if s.releaseConn != nil {
+		s.releaseConn()
+		s.releaseConn = nil // Prevent double-release
+	}
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)

@@ -22,13 +22,16 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const DefaultAppendLimit = 25 * 1024 * 1024 // 25MB
@@ -125,6 +128,8 @@ type connectionLimitingConn struct {
 	net.Conn
 	releaseFunc func()
 	proxyInfo   *serverPkg.ProxyProtocolInfo
+	closeMu     sync.Mutex
+	closed      bool
 }
 
 // GetProxyInfo implements the same interface as proxyProtocolConn
@@ -138,6 +143,14 @@ func (c *connectionLimitingConn) Unwrap() net.Conn {
 }
 
 func (c *connectionLimitingConn) Close() error {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+
+	if c.closed {
+		return nil // Already closed
+	}
+	c.closed = true
+
 	if c.releaseFunc != nil {
 		c.releaseFunc()
 		c.releaseFunc = nil // Prevent double release
@@ -200,6 +213,7 @@ type IMAPServer struct {
 	server             *imapserver.Server
 	uploader           *uploader.UploadWorker
 	cache              *cache.Cache
+	lookupCache        *lookupcache.LookupCache // Authentication cache (wraps database authentication calls)
 	appCtx             context.Context
 	caps               imap.CapSet
 	tlsConfig          *tls.Config
@@ -360,7 +374,58 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
 
 	// Initialize authentication cache from config
-	resilient.InitializeAuthCache("IMAP", name, options.LookupCache, rdb)
+	// Default to enabled if not explicitly configured
+	var lookupCache *lookupcache.LookupCache
+	lookupCacheConfig := options.LookupCache
+
+	// If no config provided, use defaults and enable cache
+	if lookupCacheConfig == nil {
+		lookupCacheConfig = &config.LookupCacheConfig{
+			Enabled:                    true,
+			PositiveTTL:                "5m",
+			NegativeTTL:                "1m",
+			MaxSize:                    10000,
+			CleanupInterval:            "5m",
+			PositiveRevalidationWindow: "30s",
+		}
+	}
+
+	// Only disable if explicitly set to false
+	if !lookupCacheConfig.Enabled {
+		logger.Info("IMAP: Lookup cache disabled", "name", name)
+	} else {
+		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
+		if err != nil || lookupCacheConfig.PositiveTTL == "" {
+			logger.Info("IMAP: Using default positive TTL (5m)", "name", name)
+			positiveTTL = 5 * time.Minute
+		}
+
+		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
+		if err != nil || lookupCacheConfig.NegativeTTL == "" {
+			logger.Info("IMAP: Using default negative TTL (1m)", "name", name)
+			negativeTTL = 1 * time.Minute
+		}
+
+		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
+		if err != nil || lookupCacheConfig.CleanupInterval == "" {
+			logger.Info("IMAP: Using default cleanup interval (5m)", "name", name)
+			cleanupInterval = 5 * time.Minute
+		}
+
+		maxSize := lookupCacheConfig.MaxSize
+		if maxSize == 0 {
+			maxSize = 10000
+		}
+
+		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
+		if err != nil {
+			logger.Info("IMAP: Invalid positive revalidation window in auth cache config, using default (30s)", "name", name, "error", err)
+			positiveRevalidationWindow = 30 * time.Second
+		}
+
+		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+	}
 
 	// Parse warmup timeout with default fallback
 	warmupTimeout := 5 * time.Minute // Default timeout
@@ -391,6 +456,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s3:                           resilientS3,
 		uploader:                     uploadWorker,
 		cache:                        cache,
+		lookupCache:                  lookupCache,
 		appendLimit:                  options.AppendLimit,
 		ftsRetention:                 options.FTSRetention,
 		version:                      options.Version,
@@ -1260,4 +1326,105 @@ func (s *IMAPServer) monitorActiveConnections() {
 // GetLimiter returns the connection limiter for testing purposes
 func (s *IMAPServer) GetLimiter() *serverPkg.ConnectionLimiter {
 	return s.limiter
+}
+
+// GetLookupCache returns the lookup cache for testing purposes
+func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
+}
+
+// Authenticate authenticates a user with caching support.
+// This method wraps the database authentication with an optional lookup cache layer.
+// The cache decorates the database call - this is the proper architectural pattern.
+func (s *IMAPServer) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
+	// Check context before any work
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	// Check cache first if enabled
+	if s.lookupCache != nil {
+		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
+		if cacheErr != nil {
+			// Cached authentication failure - return immediately without querying database
+			logger.Debug("Authentication failed (cached)", "address", address, "cache", "hit")
+			return 0, cacheErr
+		}
+		if found {
+			// Cache hit with successful authentication - but check context is still valid
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			logger.Info("Authentication successful", "address", address, "account_id", cachedAccountID, "cache", "hit")
+			return cachedAccountID, nil
+		}
+		// Cache miss - continue to database
+		logger.Debug("Authentication: cache miss, checking database", "address", address)
+	}
+
+	// Fetch credentials from database (no caching - we handle that here)
+	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
+	if err != nil {
+		// Cache negative result if enabled (user not found)
+		if s.lookupCache != nil {
+			// AuthUserNotFound = 1 (from lookupcache package)
+			s.lookupCache.SetFailure(address, 1, password)
+		}
+		logger.Info("Authentication failed", "address", address, "error", err, "cache", "miss")
+		return 0, err
+	}
+
+	// Verify password
+	if err := db.VerifyPassword(hashedPassword, password); err != nil {
+		// Cache negative result for invalid password if enabled
+		if s.lookupCache != nil {
+			// AuthInvalidPassword = 2 (from lookupcache package)
+			s.lookupCache.SetFailure(address, 2, password)
+		}
+		logger.Info("Authentication failed", "address", address, "error", "invalid password", "cache", "miss")
+		return 0, err
+	}
+
+	// Cache successful authentication if enabled
+	if s.lookupCache != nil {
+		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
+	}
+
+	logger.Info("Authentication successful", "address", address, "account_id", accountID, "cache", "miss")
+
+	// Asynchronously rehash if needed
+	if db.NeedsRehash(hashedPassword) {
+		go func() {
+			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if hashErr != nil {
+				logger.Error("Rehash: Failed to generate new hash", "address", address, "error", hashErr)
+				return
+			}
+
+			// If it's a BLF-CRYPT format, preserve the prefix
+			var newHashedPassword string
+			if strings.HasPrefix(hashedPassword, "{BLF-CRYPT}") {
+				newHashedPassword = "{BLF-CRYPT}" + string(newHash)
+			} else {
+				newHashedPassword = string(newHash)
+			}
+
+			// Use a new context for this background task
+			updateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			// Update password in database
+			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
+			} else {
+				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
+				// Invalidate cache entry since password hash changed
+				if s.lookupCache != nil {
+					s.lookupCache.Invalidate(address)
+				}
+			}
+		}()
+	}
+
+	return accountID, nil
 }

@@ -451,7 +451,7 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	}
 }
 
-// AuthCacheConfig holds configuration for authentication result caching
+// LookupCacheConfig holds configuration for authentication result caching
 type LookupCacheConfig struct {
 	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results
 	PositiveTTL                string `toml:"positive_ttl"`                 // TTL for successful auth (default: "5m")
@@ -1242,7 +1242,7 @@ type ServerConfig struct {
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
 
 	// Auth caching (embedded) - for proxies
-	AuthCache *LookupCacheConfig `toml:"lookup_cache,omitempty"`
+	LookupCache *LookupCacheConfig `toml:"lookup_cache,omitempty"`
 
 	// Resource limits (embedded)
 	Limits *ServerLimitsConfig `toml:"limits,omitempty"`

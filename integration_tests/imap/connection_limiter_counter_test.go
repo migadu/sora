@@ -49,6 +49,9 @@ func TestIMAPBackendConnectionLimiterCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("First connection failed: %v", err)
 	}
+	// Read greeting to keep connection alive
+	buf := make([]byte, 1024)
+	_, _ = conn1.Read(buf)
 	time.Sleep(100 * time.Millisecond) // Allow counter to update
 
 	stats = limiter.GetStats()
@@ -77,6 +80,9 @@ func TestIMAPBackendConnectionLimiterCounters(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Connection %d failed: %v", i+1, err)
 		}
+		// Read greeting to keep connection alive
+		buf := make([]byte, 1024)
+		_, _ = conn.Read(buf)
 		conns = append(conns, conn)
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -114,6 +120,9 @@ func TestIMAPBackendConnectionLimiterCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connection failed: %v", err)
 	}
+	// Read greeting to keep connection alive
+	buf = make([]byte, 1024)
+	_, _ = conn2.Read(buf)
 	time.Sleep(100 * time.Millisecond)
 
 	stats = limiter.GetStats()

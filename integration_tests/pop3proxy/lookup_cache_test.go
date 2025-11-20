@@ -14,18 +14,19 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/pop3proxy"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestPOP3ProxyAuthCache_MasterPasswordCaching tests that master password authentication is cached correctly
-func TestPOP3ProxyAuthCache_MasterPasswordCaching(t *testing.T) {
+// TestPOP3ProxyLookupCache_MasterPasswordCaching tests that master password authentication is cached correctly
+func TestPOP3ProxyLookupCache_MasterPasswordCaching(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Create backend POP3 server with master SASL credentials
-	backendServer, account := common.SetupPOP3ServerWithMaster(t)
+	// Create backend POP3 server with PROXY protocol support
+	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
 	// Create proxy with master username/password and auth cache enabled
@@ -129,8 +130,8 @@ func TestPOP3ProxyAuthCache_MasterPasswordCaching(t *testing.T) {
 	})
 }
 
-// TestPOP3ProxyAuthCache_BadPasswordHandling tests that bad passwords are cached with short TTL
-func TestPOP3ProxyAuthCache_BadPasswordHandling(t *testing.T) {
+// TestPOP3ProxyLookupCache_BadPasswordHandling tests that bad passwords are cached with short TTL
+func TestPOP3ProxyLookupCache_BadPasswordHandling(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend POP3 server
@@ -232,8 +233,8 @@ func TestPOP3ProxyAuthCache_BadPasswordHandling(t *testing.T) {
 	})
 }
 
-// TestPOP3ProxyAuthCache_SuccessfulAuthExpiry tests cache expiry and renewal for successful auth
-func TestPOP3ProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
+// TestPOP3ProxyLookupCache_SuccessfulAuthExpiry tests cache expiry and renewal for successful auth
+func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend POP3 server
@@ -381,28 +382,261 @@ func TestPOP3ProxyAuthCache_SuccessfulAuthExpiry(t *testing.T) {
 	})
 }
 
+// TestPOP3ProxyLookupCache_NegativeCacheRevalidation tests that a correct password
+// works immediately after a wrong password (cache miss on negative entry with diff password)
+func TestPOP3ProxyLookupCache_NegativeCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Enable debug logging
+	logger.Initialize(config.LoggingConfig{Level: "debug", Output: "stdout"})
+
+	// Create backend POP3 server
+	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
+	defer backendServer.Close()
+
+	// Set up proxy with auth cache enabled
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupPOP3ProxyWithMasterAuthAndCache(t, backendServer, proxyAddress, []string{backendServer.Address})
+	defer proxy.Stop()
+
+	// Test 1: Wrong password - should fail and cache negative
+	t.Run("WrongPassword_CachedNegative", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to POP3 proxy: %v", err)
+		}
+		defer client.Close()
+
+		client.SendCommand("USER " + account.Email)
+		client.ReadResponse()
+		client.SendCommand("PASS wrong_password")
+		resp, _ := client.ReadResponse()
+
+		if strings.HasPrefix(resp, "+OK") {
+			t.Fatal("Expected login to fail with wrong password")
+		}
+		t.Log("✓ Wrong password failed (cached negative)")
+	})
+
+	// Test 2: Correct password immediately - should succeed (revalidate)
+	t.Run("CorrectPassword_RevalidatesImmediately", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to POP3 proxy: %v", err)
+		}
+		defer client.Close()
+
+		client.SendCommand("USER " + account.Email)
+		client.ReadResponse()
+		client.SendCommand("PASS " + account.Password)
+		resp, _ := client.ReadResponse()
+
+		if !strings.HasPrefix(resp, "+OK") {
+			t.Fatalf("Login with correct password failed: %s", resp)
+		}
+		t.Log("✓ Correct password succeeded immediately (revalidated)")
+	})
+}
+
+// TestPOP3ProxyLookupCache_PositiveCacheRevalidation tests that a new password
+// works after positiveRevalidationWindow, but fails before that
+func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Enable debug logging
+	logger.Initialize(config.LoggingConfig{Level: "debug", Output: "stdout"})
+
+	// Create backend POP3 server
+	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
+	defer backendServer.Close()
+
+	// Generate password hash for prelookup response
+	var currentPasswordHash string
+	updateHash := func(pwd string) {
+		hashBytes, _ := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
+		currentPasswordHash = string(hashBytes)
+	}
+	updateHash(account.Password)
+
+	// Track prelookup calls
+	var prelookupCalls atomic.Int32
+	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prelookupCalls.Add(1)
+		response := map[string]interface{}{
+			"address":       account.Email,
+			"password_hash": currentPasswordHash,
+			"server":        backendServer.Address,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer prelookupServer.Close()
+
+	// Set up proxy with short positive revalidation window (2 seconds)
+	proxyAddress := common.GetRandomAddress(t)
+
+	opts := pop3proxy.POP3ProxyServerOptions{
+		Name:                   "test-pop3-proxy-pos-reval",
+		Debug:                  true,
+		RemoteAddrs:            []string{backendServer.Address},
+		RemotePort:             110,
+		MasterSASLUsername:     "proxyuser",
+		MasterSASLPassword:     "proxypass",
+		TLS:                    false,
+		RemoteUseProxyProtocol: true,
+		ConnectTimeout:         10 * time.Second,
+		AuthIdleTimeout:        30 * time.Minute,
+		EnableAffinity:         true,
+		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
+		PreLookup: &config.PreLookupConfig{
+			Enabled:                true,
+			URL:                    prelookupServer.URL + "/$email",
+			Timeout:                "5s",
+			RemoteUseProxyProtocol: true,
+		},
+		LookupCache: &config.LookupCacheConfig{
+			Enabled:         true,
+			PositiveTTL:     "5m",
+			NegativeTTL:     "1m",
+			MaxSize:         10000,
+			CleanupInterval: "5m",
+			// Short revalidation window for testing
+			PositiveRevalidationWindow: "2s",
+		},
+	}
+
+	proxy, err := pop3proxy.New(context.Background(), "test-host", proxyAddress, backendServer.ResilientDB, opts)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 proxy: %v", err)
+	}
+	go proxy.Start()
+	defer proxy.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	// Test 1: Login with old password - populates cache
+	t.Run("LoginOldPassword_PopulatesCache", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		client.SendCommand("USER " + account.Email)
+		client.ReadResponse()
+		client.SendCommand("PASS " + account.Password)
+		resp, _ := client.ReadResponse()
+
+		if !strings.HasPrefix(resp, "+OK") {
+			t.Fatalf("Login failed: %s", resp)
+		}
+		if prelookupCalls.Load() != 1 {
+			t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls.Load())
+		}
+	})
+
+	// Change password
+	newPassword := "newpassword"
+	// Update backend DB (using db package directly as resilient wrapper might not expose it easily for tests)
+	// Actually, we can use the helper from common if available, or just update the DB directly
+	// But wait, common.SetupPOP3ServerWithPROXY returns *common.TestServer which has ResilientDB
+	// We need to update the password in the DB so the backend accepts it
+	// AND update our mock prelookup hash so the proxy accepts it
+
+	// Update backend DB
+	// We need to import "github.com/migadu/sora/db" to generate hash
+	// But we can't easily add import with replace_in_file if it's not already there.
+	// Let's check imports. "golang.org/x/crypto/bcrypt" is there.
+	// We can use bcrypt directly.
+	newHashBytes, _ := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	// We need to update the password in the DB.
+	// backendServer.ResilientDB.UpdatePasswordWithRetry takes a hashed password.
+	// But wait, the DB expects {BLF-CRYPT} prefix for bcrypt?
+	// db/auth.go: GenerateBcryptHash adds prefix.
+	// We should try to use db.GenerateBcryptHash if we can import db.
+	// Or just manually add prefix.
+	newHashedPassword := "{BLF-CRYPT}" + string(newHashBytes)
+	backendServer.ResilientDB.UpdatePasswordWithRetry(context.Background(), account.Email, newHashedPassword)
+
+	// Update mock prelookup hash
+	updateHash(newPassword)
+
+	// Test 2: Login with new password immediately - should fail (cache hit, hash mismatch, fresh entry)
+	t.Run("LoginNewPassword_Immediate_Fails", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		client.SendCommand("USER " + account.Email)
+		client.ReadResponse()
+		client.SendCommand("PASS " + newPassword)
+		resp, _ := client.ReadResponse()
+
+		// Should fail because cache has old hash and entry is fresh (< 2s)
+		if strings.HasPrefix(resp, "+OK") {
+			t.Fatal("Login with new password should have failed (cached old hash)")
+		}
+		// Prelookup should NOT be called again
+		if prelookupCalls.Load() != 1 {
+			t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls.Load())
+		}
+		t.Log("✓ Login with new password failed immediately (cached old hash)")
+	})
+
+	// Wait for revalidation window to pass
+	time.Sleep(2500 * time.Millisecond)
+
+	// Test 3: Login with new password after window - should succeed (revalidate)
+	t.Run("LoginNewPassword_AfterWindow_Succeeds", func(t *testing.T) {
+		client, err := NewPOP3Client(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+		defer client.Close()
+
+		client.SendCommand("USER " + account.Email)
+		client.ReadResponse()
+		client.SendCommand("PASS " + newPassword)
+		resp, _ := client.ReadResponse()
+
+		// Should succeed because entry is old (> 2s) so it revalidates
+		if !strings.HasPrefix(resp, "+OK") {
+			t.Fatalf("Login with new password failed after window: %s", resp)
+		}
+		// Prelookup SHOULD be called again
+		if prelookupCalls.Load() != 2 {
+			t.Fatalf("Expected 2 prelookup calls, got %d", prelookupCalls.Load())
+		}
+		t.Log("✓ Login with new password succeeded after window (revalidated)")
+	})
+}
+
 // Helper functions
 
 func setupPOP3ProxyWithMasterAuthAndCache(t *testing.T, rdb *common.TestServer, proxyAddr string, backendAddrs []string) *POP3ProxyWrapper {
 	t.Helper()
 
 	opts := pop3proxy.POP3ProxyServerOptions{
-		Name:               "test-pop3-proxy-master-cache",
-		RemoteAddrs:        backendAddrs,
-		RemotePort:         110,
-		MasterUsername:     proxyMasterUsername,
-		MasterPassword:     proxyMasterPassword,
-		MasterSASLUsername: proxyMasterSASLUsername,
-		MasterSASLPassword: proxyMasterSASLPassword,
-		TLS:                false,
-		TLSVerify:          false,
-		RemoteTLS:          false,
-		RemoteTLSVerify:    false,
-		ConnectTimeout:     10 * time.Second,
-		AuthIdleTimeout:    30 * time.Minute,
-		EnableAffinity:     true,
-		AuthRateLimit:      server.AuthRateLimiterConfig{Enabled: false},
-		TrustedProxies:     []string{"127.0.0.0/8", "::1/128"},
+		Name:                   "test-pop3-proxy-master-cache",
+		Debug:                  true,
+		RemoteAddrs:            backendAddrs,
+		RemotePort:             110,
+		MasterUsername:         proxyMasterUsername,
+		MasterPassword:         proxyMasterPassword,
+		MasterSASLUsername:     proxyMasterSASLUsername,
+		MasterSASLPassword:     proxyMasterSASLPassword,
+		TLS:                    false,
+		TLSVerify:              false,
+		RemoteTLS:              false,
+		RemoteTLSVerify:        false,
+		RemoteUseProxyProtocol: true,
+		ConnectTimeout:         10 * time.Second,
+		AuthIdleTimeout:        30 * time.Minute,
+		EnableAffinity:         true,
+		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
+		TrustedProxies:         []string{"127.0.0.0/8", "::1/128"},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,
 			PositiveTTL:     "5m",
@@ -437,6 +671,7 @@ func setupPOP3ProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 
 	opts := pop3proxy.POP3ProxyServerOptions{
 		Name:                   "test-pop3-proxy-short-negative-ttl",
+		Debug:                  true,
 		RemoteAddrs:            backendAddrs,
 		RemotePort:             110,
 		MasterSASLUsername:     "proxyuser",
@@ -488,6 +723,7 @@ func setupPOP3ProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resil
 
 	opts := pop3proxy.POP3ProxyServerOptions{
 		Name:                   "test-pop3-proxy-short-positive-ttl",
+		Debug:                  true,
 		RemoteAddrs:            backendAddrs,
 		RemotePort:             110,
 		MasterSASLUsername:     "proxyuser",

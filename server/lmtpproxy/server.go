@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/migadu/sora/logger"
 	"io"
 	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/lookupcache"
@@ -54,7 +55,7 @@ type Server struct {
 	limiter *server.ConnectionLimiter
 
 	// Routing cache (for user lookups - no password validation needed)
-	authCache *lookupcache.LookupCache
+	lookupCache *lookupcache.LookupCache
 
 	// Listen backlog
 	listenBacklog int
@@ -232,7 +233,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// This caches both positive (user found) and negative (user not found) results
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *lookupcache.LookupCache
+	var lookupCache *lookupcache.LookupCache
 	lookupCacheConfig := opts.LookupCache
 	if lookupCacheConfig == nil {
 		defaultConfig := config.DefaultLookupCacheConfig()
@@ -261,10 +262,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		}
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
-		logger.Info("LMTP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
+		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
+		logger.Info("LMTP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	} else {
-		logger.Info("LMTP Proxy: Authentication cache disabled", "name", opts.Name)
+		logger.Info("LMTP Proxy: Lookup cache disabled", "name", opts.Name)
 	}
 
 	s := &Server{
@@ -290,7 +291,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxMessageSize:     opts.MaxMessageSize,
 		trustedNetworks:    trustedNets,
 		limiter:            limiter,
-		authCache:          authCache,
+		lookupCache:        lookupCache,
 		listenBacklog:      listenBacklog,
 		debug:              opts.Debug,
 		debugWriter:        debugWriter,
@@ -511,22 +512,28 @@ func (s *Server) acceptConnections() error {
 			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Inc()
 
 			session := newSession(s, conn, proxyInfo)
+			session.releaseConn = releaseConn // Set cleanup function on session
+			s.registerSession(session)
 
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Debug("LMTP Proxy: Session panic recovered", "name", s.name, "panic", r)
-					// Decrement metrics (session never registered itself due to panic)
+					// Unregister session from active tracking
+					s.unregisterSession(session)
+					// Decrement metrics
 					metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 					// Close connection
 					conn.Close()
-					// Release connection limit
+					// Ensure connection limiter is released on panic
 					if releaseConn != nil {
 						releaseConn()
 					}
 				}
 			}()
 
+			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
+			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
 		}()
 	}
@@ -661,10 +668,10 @@ func (s *Server) Stop() error {
 	}
 
 	// Stop auth cache
-	if s.authCache != nil {
+	if s.lookupCache != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		if err := s.authCache.Stop(stopCtx); err != nil {
+		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}

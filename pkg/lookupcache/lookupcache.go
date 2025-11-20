@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/consts"
@@ -102,10 +103,7 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	// Start background cleanup goroutine
 	go cache.cleanupLoop()
 
-	logger.Info("LookupCache: Initialized", "positive_ttl", positiveTTL,
-		"negative_ttl", negativeTTL, "max_size", maxSize, "cleanup_interval", cleanupInterval,
-		"positive_revalidation_window", positiveRevalidationWindow)
-
+	// Note: Logging is handled by the caller (server) for better context
 	return cache
 }
 
@@ -136,7 +134,7 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	entry, exists := c.entries[address]
 	if !exists {
 		c.mu.RUnlock()
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
 	}
@@ -144,12 +142,12 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	// Check if expired
 	if time.Now().After(entry.ExpiresAt) {
 		c.mu.RUnlock()
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
 	}
 
-	c.hits++
+	atomic.AddUint64(&c.hits, 1)
 	metrics.LookupCacheHitsTotal.Inc()
 
 	// Hash the provided password for comparison
@@ -180,7 +178,15 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 
 	// Positive cache entry - successful authentication previously cached
 	if passwordMatches {
-		// Same password - verify against bcrypt hash and return success
+		// Same password - check if entry is old enough to require revalidation
+		if entry.IsOld(c.positiveRevalidationWindow) {
+			// Entry is old - revalidate with database to detect password changes
+			c.mu.RUnlock()
+			logger.Debug("Auth cache: positive entry revalidation needed (entry too old)", "address", address, "age", time.Since(entry.CreatedAt))
+			return 0, false, nil
+		}
+
+		// Entry is fresh - verify against cached bcrypt hash and return success
 		if err := db.VerifyPassword(entry.HashedPassword, password); err != nil {
 			// Bcrypt verification failed even though password hash matched
 			// This shouldn't happen, but handle it by invalidating the cache
@@ -191,16 +197,13 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 		c.mu.RUnlock()
 		return entry.AccountID, true, nil
 	} else {
-		// Different password on positive entry - allow revalidation if old enough
+		// Different password on positive entry - ALWAYS allow revalidation
+		// User might have changed their password, or they're trying a wrong password.
+		// Either way, we need to check with the database to verify.
+		// Brute force protection is handled by protocol-level rate limiting, not by the cache.
 		c.mu.RUnlock()
-		if entry.IsOld(c.positiveRevalidationWindow) {
-			// Entry is old enough - allow revalidation
-			return 0, false, nil
-		} else {
-			// Entry is too fresh - likely wrong password attempt
-			logger.Info("Authentication failed (cached positive entry, wrong password)", "address", address, "cache", "hit")
-			return 0, false, consts.ErrAuthenticationFailed
-		}
+		logger.Debug("Auth cache: positive entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+		return 0, false, nil
 	}
 }
 
@@ -345,12 +348,14 @@ func (c *LookupCache) cleanup() {
 	}
 
 	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
-	c.cleanupCounter++
-	if c.cleanupCounter%10 == 0 {
-		total := c.hits + c.misses
+	counter := atomic.AddUint64(&c.cleanupCounter, 1)
+	if counter%10 == 0 {
+		hits := atomic.LoadUint64(&c.hits)
+		misses := atomic.LoadUint64(&c.misses)
+		total := hits + misses
 		var hitRate float64
 		if total > 0 {
-			hitRate = float64(c.hits) / float64(total) * 100
+			hitRate = float64(hits) / float64(total) * 100
 		}
 
 		logger.Info("LookupCache stats",
@@ -365,11 +370,13 @@ func (c *LookupCache) cleanup() {
 }
 
 // updateHitRateMetric updates the Prometheus hit rate gauge
-// Caller must hold at least the read lock
+// No lock required - uses atomic operations
 func (c *LookupCache) updateHitRateMetric() {
-	total := c.hits + c.misses
+	hits := atomic.LoadUint64(&c.hits)
+	misses := atomic.LoadUint64(&c.misses)
+	total := hits + misses
 	if total > 0 {
-		hitRate := float64(c.hits) / float64(total) * 100
+		hitRate := float64(hits) / float64(total) * 100
 		metrics.LookupCacheHitRate.Set(hitRate)
 	}
 }
@@ -400,13 +407,15 @@ func (c *LookupCache) GetStats() (hits, misses uint64, size int, hitRate float64
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	total := c.hits + c.misses
+	hits = atomic.LoadUint64(&c.hits)
+	misses = atomic.LoadUint64(&c.misses)
+	total := hits + misses
 	var rate float64
 	if total > 0 {
-		rate = float64(c.hits) / float64(total) * 100
+		rate = float64(hits) / float64(total) * 100
 	}
 
-	return c.hits, c.misses, len(c.entries), rate
+	return hits, misses, len(c.entries), rate
 }
 
 // Clear removes all entries from the cache
@@ -415,8 +424,8 @@ func (c *LookupCache) Clear() {
 	defer c.mu.Unlock()
 
 	c.entries = make(map[string]*CacheEntry)
-	c.hits = 0
-	c.misses = 0
+	atomic.StoreUint64(&c.hits, 0)
+	atomic.StoreUint64(&c.misses, 0)
 
 	logger.Info("LookupCache: Cache cleared")
 }
@@ -435,25 +444,29 @@ func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 	key := makeKey(serverName, username)
 
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	entry, exists := c.entries[key]
+	var entryCopy CacheEntry
+	if exists {
+		entryCopy = *entry
+	}
+	c.mu.RUnlock()
+
 	if !exists {
-		c.misses++
+		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return nil, false
 	}
 
 	// Check if expired
-	if time.Now().After(entry.ExpiresAt) {
-		c.misses++
+	if time.Now().After(entryCopy.ExpiresAt) {
+		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return nil, false
 	}
 
-	c.hits++
+	atomic.AddUint64(&c.hits, 1)
 	metrics.LookupCacheHitsTotal.Inc()
-	return entry, true
+	return &entryCopy, true
 }
 
 // Set stores an entry in the cache
@@ -537,21 +550,21 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 	// Try cache first
 	c.mu.RLock()
 	entry, exists := c.entries[key]
+	var entryCopy CacheEntry
+	if exists {
+		entryCopy = *entry
+	}
 	c.mu.RUnlock()
 
-	if exists && !time.Now().After(entry.ExpiresAt) {
+	if exists && !time.Now().After(entryCopy.ExpiresAt) {
 		// Cache hit
-		c.mu.Lock()
-		c.hits++
-		c.mu.Unlock()
+		atomic.AddUint64(&c.hits, 1)
 		metrics.LookupCacheHitsTotal.Inc()
-		return entry, true, nil
+		return &entryCopy, true, nil
 	}
 
 	// Cache miss or expired - use singleflight to prevent thundering herd
-	c.mu.Lock()
-	c.misses++
-	c.mu.Unlock()
+	atomic.AddUint64(&c.misses, 1)
 	metrics.LookupCacheMissesTotal.Inc()
 
 	// Use singleflight to ensure only one fetch per key
@@ -583,6 +596,7 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 	}
 
 	entry = result.(*CacheEntry)
+	entryCopy = *entry
 
 	// Log if this was a shared fetch (thundering herd prevented)
 	if shared {
@@ -590,5 +604,5 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 		metrics.LookupCacheSharedFetchesTotal.Inc()
 	}
 
-	return entry, false, nil
+	return &entryCopy, false, nil
 }

@@ -494,8 +494,8 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers
-	if s.server.authCache != nil {
-		if cached, found := s.server.authCache.Get(s.server.name, username); found {
+	if s.server.lookupCache != nil {
+		if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
 			// Hash the password (never empty - validated at function start)
 			passwordHash := lookupcache.HashPassword(password)
 
@@ -510,7 +510,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					// Same wrong password - return cached failure and refresh TTL
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-					s.server.authCache.Refresh(s.server.name, username)
+					s.server.lookupCache.Refresh(s.server.name, username)
 					return consts.ErrAuthenticationFailed
 				} else {
 					// Different password - ALWAYS revalidate (user might have fixed their password)
@@ -525,7 +525,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					// Same password - use cached routing info and refresh TTL
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive").Inc()
-					s.server.authCache.Refresh(s.server.name, username)
+					s.server.lookupCache.Refresh(s.server.name, username)
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
@@ -723,12 +723,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Cache successful authentication with routing info
 				// Always hash password, even for master auth, to prevent cache bypass
 				// This ensures different passwords don't match the same cache entry
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
 						PasswordHash:           passwordHash,
 						ServerAddress:          routingInfo.ServerAddress,
@@ -761,12 +761,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.InfoLog("prelookup authentication failed - bad password", "user", username, "cache", "miss")
 
 				// Cache negative result (wrong password)
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
 						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
@@ -842,12 +842,12 @@ func (s *Session) authenticateUser(username, password string) error {
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				if s.server.authCache != nil {
+				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
 						passwordHash = lookupcache.HashPassword(password)
 					}
-					s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						PasswordHash: passwordHash,
 						Result:       lookupcache.AuthFailed,
 						IsNegative:   true,
@@ -873,12 +873,12 @@ func (s *Session) authenticateUser(username, password string) error {
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
 
 	// Cache successful authentication (main DB)
-	if s.server.authCache != nil {
+	if s.server.lookupCache != nil {
 		passwordHash := ""
 		if password != "" {
 			passwordHash = lookupcache.HashPassword(password)
 		}
-		s.server.authCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:     accountID,
 			PasswordHash:  passwordHash,
 			ServerAddress: "", // Will be populated by affinity/routing in next connection

@@ -495,17 +495,6 @@ max_age_restriction = ""      # Max message age before auto-expungement. Empty =
 fts_retention = "730d"        # How long to keep full-text search content in DB. Older messages lose searchability.
 health_status_retention = "30d" # How long to retain health status history in the database.
 
-# AUTHENTICATION CACHE CONFIGURATION
-# =============================================================================
-# In-memory authentication and routing lookup caching to reduce database load.
-# Particularly useful for:
-# - Parallel client connections (mail clients often open 3-5+ IMAP connections)
-# - Mitigating DoS attacks from non-existent account lookups
-# - Reducing latency for repeated authentication attempts
-#
-# Security note: Cached credentials are verified on every use. Only successful
-# credential lookups are cached temporarily to avoid repeated DB queries.
-
 # EXTERNAL RELAY CONFIGURATION
 # =============================================================================
 # Global configuration for external SMTP/HTTP relay used by Sieve redirect and vacation actions.
@@ -860,7 +849,7 @@ auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking ent
 auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (0 = unlimited, default: 50000)
 auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (0 = unlimited, default: 50000)
 
-# --- AUTHENTICATION CACHE (OPTIONAL) ---
+# --- LOOKUP CACHE ---
 # Cache authentication results to reduce database queries and improve performance.
 # ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable.
 # [server.lookup_cache]
@@ -1211,44 +1200,6 @@ remote_tls_verify = true              # Verify backend TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
 
-  # --- PRELOOKUP CACHING ---
-  # In-memory caching of HTTP prelookup results for improved performance.
-  # Significantly reduces HTTP requests by caching authentication results.
-  #
-  # CACHE BEHAVIOR:
-  # - Positive results (successful auth): Cached with longer TTL
-  # - Negative results (failed auth, user not found): Cached with shorter TTL
-  # - Cache key: Combination of email and password hash
-  # - Thread-safe with read/write locks
-  # - Background cleanup of expired entries
-  # - LRU-style eviction when max size exceeded
-  #
-  # BENEFITS:
-  # - Reduced latency: Sub-millisecond cache lookups vs HTTP roundtrip
-  # - Reduced load: Fewer requests to prelookup HTTP endpoint
-  # - DDoS protection: Negative caching prevents repeated failed auth attempts
-  # - Configurable: Separate TTLs for positive/negative results
-  #
-  # EXAMPLE SCENARIOS:
-  # - User authenticates successfully → cached for 5 minutes
-  # - Same user authenticates again within 5 minutes → instant cache hit
-  # - Attacker tries wrong password → cached as failed for 1 minute
-  # - Attacker retries same wrong password → instant rejection from cache
-  #
-  # [server.prelookup.cache]
-  # enabled = false                 # Enable in-memory caching of prelookup results (default: false)
-  # positive_ttl = "5m"             # TTL for successful authentication (default: 5m)
-                                    # How long to cache valid credentials
-                                    # Longer TTL = fewer HTTP requests, but password changes take longer to take effect
-  # negative_ttl = "1m"             # TTL for failed auth or user not found (default: 1m)
-                                    # Shorter TTL avoids caching temporary issues (e.g., typos, transient failures)
-                                    # Provides DDoS protection while allowing quick recovery
-  # max_size = 10000                # Maximum number of cached entries (default: 10000)
-                                    # When exceeded, oldest entries (by expiration time) are evicted
-                                    # Memory usage: ~1-2 KB per entry, so 10000 entries ≈ 10-20 MB
-  # cleanup_interval = "1m"         # How often to scan and remove expired entries (default: 1m)
-                                    # More frequent = lower memory usage, slightly higher CPU
-                                    # Less frequent = higher memory usage, lower CPU
 
   # --- CIRCUIT BREAKER FOR PRELOOKUP ENDPOINT ---
   # Protects the system from cascading failures when the HTTP prelookup endpoint becomes unavailable.

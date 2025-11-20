@@ -32,6 +32,13 @@ func (l *ProxySessionLogger) log(logFn logFunc, msg string, keysAndValues ...any
 		allKeyvals = append(allKeyvals, "account_id", l.AccountID)
 	}
 
+	// Add JA4 fingerprint if available
+	if ja4Provider, ok := l.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
+		if ja4, err := ja4Provider.GetJA4Fingerprint(); err == nil && ja4 != "" {
+			allKeyvals = append(allKeyvals, "ja4", ja4)
+		}
+	}
+
 	allKeyvals = append(allKeyvals, keysAndValues...)
 	logFn(msg, allKeyvals...)
 }

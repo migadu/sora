@@ -56,7 +56,7 @@ type Server struct {
 	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
 	// Authentication cache
-	authCache                  *lookupcache.LookupCache
+	lookupCache                *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration // How long to wait before revalidating positive cache with different password
 
 	// Connection limiting
@@ -274,7 +274,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
-	var authCache *lookupcache.LookupCache
+	var lookupCache *lookupcache.LookupCache
 	lookupCacheConfig := opts.LookupCache
 	if lookupCacheConfig == nil {
 		defaultConfig := config.DefaultLookupCacheConfig()
@@ -309,10 +309,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			maxSize = 10000
 		}
 
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("IMAP Proxy: Authentication cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		logger.Info("IMAP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
-		logger.Info("IMAP Proxy: Authentication cache disabled", "name", opts.Name)
+		logger.Info("IMAP Proxy: Lookup cache disabled", "name", opts.Name)
 	}
 
 	return &Server{
@@ -342,7 +342,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		prelookupConfig:            opts.PreLookup,
 		remoteUseIDCommand:         opts.RemoteUseIDCommand,
 		proxyReader:                proxyReader,
-		authCache:                  authCache,
+		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		limiter:                    limiter,
 		listenBacklog:              listenBacklog,
@@ -635,10 +635,10 @@ func (s *Server) Stop() error {
 	}
 
 	// Stop auth cache
-	if s.authCache != nil {
+	if s.lookupCache != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		if err := s.authCache.Stop(stopCtx); err != nil {
+		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
 	}
