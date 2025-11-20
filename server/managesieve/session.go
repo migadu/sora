@@ -312,7 +312,8 @@ func (s *ManageSieveSession) handleConnection() {
 			// Note: Regular auth via Authenticate() already logs in server.go with cached/method
 			// For master password auth, we log here with method=master
 			if masterAuthUsed {
-				s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
+				duration := time.Since(start)
+				s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
 			}
 
 			// Track successful authentication
@@ -1315,7 +1316,8 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// Note: Regular auth via Authenticate() already logs in server.go with cached/method
 	// For master SASL auth, we log here with method=master
 	if impersonating {
-		s.InfoLog("authentication successful", "address", targetAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
+		duration := time.Since(start)
+		s.InfoLog("authentication successful", "address", targetAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
 	}
 
 	// Track successful authentication

@@ -18,6 +18,7 @@ func (s *IMAPSession) AuthenticateMechanisms() []string {
 
 // Authenticate handles SASL authentication for the IMAPSession
 func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
+	authStart := time.Now()
 	s.DebugLog("authentication attempt", "mechanism", mechanism)
 
 	switch mechanism {
@@ -120,7 +121,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					s.server.authenticatedConnections.Add(1)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master")
+					duration := time.Since(authStart)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -216,7 +218,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					s.server.authenticatedConnections.Add(1)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master")
+					duration := time.Since(authStart)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()

@@ -422,7 +422,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"reason", "user_not_found",
 				"cached", true,
 				"method", "cache",
-				"duration", duration.Seconds())
+				"duration", float64(int(duration.Seconds()*1000))/1000)
 
 			return fmt.Errorf("user not found")
 		} else {
@@ -453,7 +453,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"address", s.username,
 				"cached", true,
 				"method", "cache",
-				"duration", duration.Seconds())
+				"duration", float64(int(duration.Seconds()*1000))/1000)
 
 			return nil
 		}
@@ -527,7 +527,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"address", s.username,
 				"cached", false,
 				"method", "prelookup",
-				"duration", duration.Seconds())
+				"duration", float64(int(duration.Seconds()*1000))/1000)
 
 			return nil
 		} else {
@@ -569,7 +569,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			"reason", "user_not_found",
 			"cached", false,
 			"method", "main_db",
-			"duration", duration.Seconds())
+			"duration", float64(int(duration.Seconds()*1000))/1000)
 
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
@@ -595,7 +595,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		"address", s.username,
 		"cached", false,
 		"method", "main_db",
-		"duration", duration.Seconds())
+		"duration", float64(int(duration.Seconds()*1000))/1000)
 
 	return nil
 }

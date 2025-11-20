@@ -13,6 +13,8 @@ import (
 )
 
 func (s *IMAPSession) Login(address, password string) error {
+	authStart := time.Now()
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -106,7 +108,8 @@ func (s *IMAPSession) Login(address, password string) error {
 			s.Session.User = &s.IMAPUser.User
 
 			s.server.authenticatedConnections.Add(1)
-			s.InfoLog("authenticated with master username", "master_username", addressParsed.Suffix())
+			duration := time.Since(authStart)
+			s.InfoLog("authentication successful", "address", addressParsed.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
 
 			// Prometheus metrics - successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
@@ -203,7 +206,8 @@ func (s *IMAPSession) Login(address, password string) error {
 	s.Session.User = &s.IMAPUser.User
 
 	s.server.authenticatedConnections.Add(1)
-	s.InfoLog("authenticated")
+	duration := time.Since(authStart)
+	s.InfoLog("authentication successful", "address", addressParsed.BaseAddress(), "account_id", AccountID, "cached", false, "method", "main_db", "duration", float64(int(duration.Seconds()*1000))/1000)
 
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
