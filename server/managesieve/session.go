@@ -313,7 +313,7 @@ func (s *ManageSieveSession) handleConnection() {
 			// For master password auth, we log here with method=master
 			if masterAuthUsed {
 				duration := time.Since(start)
-				s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+				s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 			}
 
 			// Track successful authentication
@@ -1317,7 +1317,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// For master SASL auth, we log here with method=master
 	if impersonating {
 		duration := time.Since(start)
-		s.InfoLog("authentication successful", "address", targetAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+		s.InfoLog("authentication successful", "address", targetAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
 
 	// Track successful authentication

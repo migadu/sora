@@ -178,7 +178,7 @@ func (s *POP3ProxySession) handleConnection() {
 				"address", s.username,
 				"backend", s.serverAddr,
 				"routing", s.routingMethod,
-				"duration", float64(int(duration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {
@@ -300,7 +300,7 @@ func (s *POP3ProxySession) handleConnection() {
 				"address", s.username,
 				"backend", s.serverAddr,
 				"routing", s.routingMethod,
-				"duration", float64(int(duration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {

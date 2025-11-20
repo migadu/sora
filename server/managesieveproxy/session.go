@@ -296,7 +296,7 @@ func (s *Session) handleConnection() {
 				"address", s.username,
 				"backend", s.serverAddr,
 				"routing", s.routingMethod,
-				"duration", float64(int(backendDuration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", backendDuration.Seconds()))
 
 			s.sendResponse(`OK "Authenticated"`)
 			authenticated = true
@@ -577,7 +577,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						"backend", "none", // Cache hit - no backend yet
 						"method", "cache",
 						"cached", true,
-						"duration", float64(int(duration.Seconds()*1000))/1000)
+						"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 					return nil // Authentication complete from cache
 				} else {
@@ -790,7 +790,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					"backend", "none", // Backend not connected yet at this point
 					"method", method,
 					"cached", false,
-					"duration", float64(int(duration.Seconds()*1000))/1000)
+					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 				return nil // Authentication complete
 
@@ -942,7 +942,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		"backend", "none", // Backend not connected yet at this point
 		"method", method,
 		"cached", false,
-		"duration", float64(int(duration.Seconds()*1000))/1000)
+		"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {

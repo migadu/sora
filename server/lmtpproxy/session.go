@@ -422,7 +422,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"reason", "user_not_found",
 				"cached", true,
 				"method", "cache",
-				"duration", float64(int(duration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			return fmt.Errorf("user not found")
 		} else {
@@ -453,7 +453,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"address", s.username,
 				"cached", true,
 				"method", "cache",
-				"duration", float64(int(duration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			return nil
 		}
@@ -527,7 +527,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"address", s.username,
 				"cached", false,
 				"method", "prelookup",
-				"duration", float64(int(duration.Seconds()*1000))/1000)
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			return nil
 		} else {
@@ -569,7 +569,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			"reason", "user_not_found",
 			"cached", false,
 			"method", "main_db",
-			"duration", float64(int(duration.Seconds()*1000))/1000)
+			"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 		return fmt.Errorf("user not found in main database: %w", err)
 	}

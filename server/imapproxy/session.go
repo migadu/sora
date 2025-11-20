@@ -1248,7 +1248,7 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		"address", s.username,
 		"backend", s.serverAddr,
 		"routing", s.routingMethod,
-		"duration", float64(int(duration.Seconds()*1000))/1000)
+		"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string

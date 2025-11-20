@@ -444,7 +444,7 @@ func (s *POP3Session) handleConnection() {
 			// For master password auth, we log here with method=master
 			if masterAuthUsed {
 				duration := time.Since(start)
-				s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+				s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 			}
 
 			// Track successful authentication
@@ -1624,7 +1624,7 @@ func (s *POP3Session) handleConnection() {
 			// For master SASL auth, we log here with method=master
 			if impersonating {
 				duration := time.Since(start)
-				s.InfoLog("authentication successful", "address", authzID, "account_id", accountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+				s.InfoLog("authentication successful", "address", authzID, "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				// Register connection for tracking with the impersonated user's email
 				s.registerConnection(authzID)
 			} else {

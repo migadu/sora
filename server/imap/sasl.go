@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -122,7 +123,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					s.server.authenticatedConnections.Add(1)
 					duration := time.Since(authStart)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -219,7 +220,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					s.server.authenticatedConnections.Add(1)
 					duration := time.Since(authStart)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", float64(int(duration.Seconds()*1000))/1000)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
