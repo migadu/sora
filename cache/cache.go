@@ -828,33 +828,49 @@ func (c *Cache) RemoveStaleDBEntries(ctx context.Context) error {
 		return nil // Nothing to do.
 	}
 
-	// Phase 3: Remove stale entries from the index in a single batch (write, short lock).
+	// Phase 3: Remove stale entries from the index in batches (write, short lock).
+	logger.Info("Cache: Removing stale entries from index", "total", len(stalePaths))
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction for stale entry removal: %w", err)
-	}
-	defer tx.Rollback()
+	const batchSize = 500 // SQLite variable limit is typically 999, use 500 for safety
+	totalRemoved := int64(0)
 
-	// Use the same batch delete pattern as other purge functions.
-	query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(stalePaths)-1) + `)`
-	args := make([]any, len(stalePaths))
-	for i, p := range stalePaths {
-		args[i] = p
+	for i := 0; i < len(stalePaths); i += batchSize {
+		end := i + batchSize
+		if end > len(stalePaths) {
+			end = len(stalePaths)
+		}
+		batch := stalePaths[i:end]
+
+		tx, err := c.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction for stale entry removal (batch %d): %w", i/batchSize, err)
+		}
+
+		query := `DELETE FROM cache_index WHERE path IN (?` + strings.Repeat(",?", len(batch)-1) + `)`
+		args := make([]any, len(batch))
+		for j, p := range batch {
+			args[j] = p
+		}
+
+		result, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to batch delete stale entries from index (batch %d): %w", i/batchSize, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit stale entry deletions (batch %d): %w", i/batchSize, err)
+		}
+
+		if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+			totalRemoved += rowsAffected
+		}
 	}
 
-	result, err := tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to batch delete stale entries from index: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit stale entry deletions: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	logger.Info("Cache: Removed stale entries from index", "count", rowsAffected)
+	logger.Info("Cache: Removed stale entries from index", "count", totalRemoved)
 	return nil
 }
 
