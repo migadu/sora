@@ -430,7 +430,7 @@ func TestLMTPProxyWithXCLIENT(t *testing.T) {
 	}
 
 	// Verify basic proxy functionality works
-	if strings.Contains(logOutput, "message delivered successfully") {
+	if strings.Contains(logOutput, "message delivered") {
 		t.Logf("Message was delivered successfully through LMTP proxy")
 	} else {
 		t.Errorf("Expected successful message delivery through proxy")
@@ -553,7 +553,7 @@ func TestLMTPProxyXCLIENTShouldWork(t *testing.T) {
 	}
 
 	// Verify backend processed XCLIENT command
-	if !strings.Contains(logOutput, "[XCLIENT] Backend received XCLIENT command") {
+	if !strings.Contains(logOutput, "xclient command received") {
 		t.Errorf("Expected backend to process XCLIENT command")
 		t.Errorf("This indicates XCLIENT command never reached the backend handler")
 	}
@@ -699,8 +699,8 @@ func TestLMTPProxyWithXRCPTFORWARD(t *testing.T) {
 
 	// Verify that XRCPTFORWARD was processed successfully
 	logOutput := logCapture.GetOutput()
-	if !strings.Contains(logOutput, "Processed XRCPTFORWARD parameters") {
-		t.Errorf("Expected to find 'Processed XRCPTFORWARD parameters' in logs, but didn't find it.\nLog output:\n%s", logOutput)
+	if !strings.Contains(logOutput, "processed xrcptforward parameters") {
+		t.Errorf("Expected to find 'processed xrcptforward parameters' in logs, but didn't find it.\nLog output:\n%s", logOutput)
 	}
 
 	// Just like XCLIENT, XRCPTFORWARD should show proxy= in session logs
@@ -709,7 +709,7 @@ func TestLMTPProxyWithXRCPTFORWARD(t *testing.T) {
 	}
 
 	// Verify XRCPTFORWARD processing
-	if strings.Contains(logOutput, "Processed XRCPTFORWARD parameters") {
+	if strings.Contains(logOutput, "processed xrcptforward parameters") {
 		t.Logf("XRCPTFORWARD parameters were processed successfully")
 	} else {
 		t.Logf("XRCPTFORWARD parameters may not have been processed (could be expected if proxy doesn't forward them)")
@@ -950,7 +950,7 @@ func TestLMTPDirectXRCPTFORWARD(t *testing.T) {
 
 	// Check logs for XRCPTFORWARD processing
 	logOutput := logCapture.GetOutput()
-	if strings.Contains(logOutput, "Processed XRCPTFORWARD parameters") {
+	if strings.Contains(logOutput, "processed xrcptforward parameters") {
 		t.Logf("XRCPTFORWARD was processed successfully")
 		if strings.Contains(logOutput, "proxy=127.0.0.1") {
 			t.Logf("Proxy information found in logs")

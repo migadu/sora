@@ -18,7 +18,7 @@ func (s *IMAPSession) AuthenticateMechanisms() []string {
 
 // Authenticate handles SASL authentication for the IMAPSession
 func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
-	s.DebugLog("Authentication: authentication attempt with mechanism %s", mechanism)
+	s.DebugLog("authentication attempt", "mechanism", mechanism)
 
 	switch mechanism {
 	case "PLAIN":
@@ -51,7 +51,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					targetUser = identity // Use authorization identity if provided
 				}
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, targetUser); err != nil {
-					s.DebugLog("Authentication: SASL PLAIN rate limited: %v", err)
+					s.DebugLog("SASL PLAIN rate limited", "error", err)
 					return &imap.Error{
 						Type: imap.StatusResponseTypeNo,
 						Code: imap.ResponseCodeAuthenticationFailed,
@@ -60,7 +60,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				}
 			}
 
-			s.DebugLog("Authentication: SASL PLAIN AuthorizationID: '%s', AuthenticationID: '%s'", identity, username)
+			s.DebugLog("SASL PLAIN", "authorization_id", identity, "authentication_id", username)
 
 			// Parse username to check for suffix (master username or prelookup token)
 			usernameParsed, parseErr := server.NewAddress(username)
@@ -76,12 +76,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						targetUserToImpersonate = usernameParsed.BaseAddress()
 					}
 
-					s.DebugLog("Authentication: master username '%s' authenticated. Attempting to impersonate '%s'.", usernameParsed.Suffix(), targetUserToImpersonate)
+					s.DebugLog("master username authenticated, attempting to impersonate", "master_username", usernameParsed.Suffix(), "target_user", targetUserToImpersonate)
 
 					// Parse target user address
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						s.DebugLog("Authentication: failed to parse impersonation target user '%s' as address: %v", targetUserToImpersonate, err)
+						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -92,11 +92,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.DebugLog("Authentication: failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("Authentication: master username auth cancelled due to server shutdown")
+							s.InfoLog("master username auth cancelled due to server shutdown")
 							return &imap.Error{
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
@@ -119,9 +119,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					authCount := s.server.authenticatedConnections.Add(1)
-					totalCount := s.server.totalConnections.Load()
-					s.InfoLog("Authentication: session established for impersonated user '%s' (ID: %d) via master username login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
+					s.server.authenticatedConnections.Add(1)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master")
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -133,7 +132,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Post-auth timeouts are handled by SoraConn (command_timeout)
 					if s.server.authIdleTimeout > 0 {
 						if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-							s.WarnLog("Authentication: failed to clear auth idle timeout: %v", err)
+							s.WarnLog("failed to clear auth idle timeout", "error", err)
 						}
 					}
 
@@ -163,7 +162,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Master SASL credentials match. The user to log in as is the authorization-identity.
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {
-						s.DebugLog("Authentication: Master SASL authentication for '%s' successful, but no authorization identity (target user to impersonate) provided.", username)
+						s.DebugLog("master SASL authentication successful but no authorization identity provided", "username", username)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -172,13 +171,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					s.DebugLog("Authentication: master SASL user '%s' authenticated. Attempting to impersonate '%s'.", username, targetUserToImpersonate)
+					s.DebugLog("master SASL user authenticated, attempting to impersonate", "username", username, "target_user", targetUserToImpersonate)
 
 					// Log in as the targetUserToImpersonate.
 					// For master impersonation, we directly establish the session for them.
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						s.DebugLog("Authentication: failed to parse impersonation target user '%s' as address: %v", targetUserToImpersonate, err)
+						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
@@ -189,11 +188,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.DebugLog("Authentication: failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							s.InfoLog("Authentication: master SASL auth cancelled due to server shutdown")
+							s.InfoLog("master SASL auth cancelled due to server shutdown")
 							return &imap.Error{
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
@@ -216,9 +215,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					authCount := s.server.authenticatedConnections.Add(1)
-					totalCount := s.server.totalConnections.Load()
-					s.InfoLog("Authentication: session established for impersonated user '%s' (ID: %d) via master SASL login (connections: total=%d, authenticated=%d)", address.BaseAddress(), AccountID, totalCount, authCount)
+					s.server.authenticatedConnections.Add(1)
+					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master")
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -230,7 +228,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Post-auth timeouts are handled by SoraConn (command_timeout)
 					if s.server.authIdleTimeout > 0 {
 						if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-							s.WarnLog("Authentication: failed to clear auth idle timeout: %v", err)
+							s.WarnLog("failed to clear auth idle timeout", "error", err)
 						}
 					}
 
@@ -243,7 +241,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// If `identity` (authorization-identity) is provided and is different from `username`,
 			// it's a proxy request by a non-master user. This is typically disallowed.
 			if identity != "" && identity != username {
-				s.DebugLog("Authentication: attempt by '%s' to authorize as '%s' is not allowed for non-master users.", username, identity)
+				s.DebugLog("proxy login not allowed for non-master users", "username", username, "identity", identity)
 				return &imap.Error{
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeAuthorizationFailed,
@@ -252,11 +250,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			}
 
 			// Authenticate as `username` (authentication-identity).
-			s.DebugLog("Authentication: proceeding with regular authentication for user '%s'", username)
+			s.DebugLog("proceeding with regular authentication", "username", username)
 			return s.Login(username, password)
 		}), nil
 	default:
-		s.DebugLog("Authentication: unsupported authentication mechanism: %s", mechanism)
+		s.DebugLog("unsupported authentication mechanism", "mechanism", mechanism)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthenticationFailed,

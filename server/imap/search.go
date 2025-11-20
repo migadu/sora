@@ -10,7 +10,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// Check search rate limit first (before any expensive operations)
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
 		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
-			s.InfoLog("[SEARCH] Rate limited for user %s (account_id=%d): %v", s.IMAPUser.FullAddress(), s.IMAPUser.AccountID(), err)
+			s.InfoLog("rate limited", "user", s.IMAPUser.FullAddress(), "account_id", s.IMAPUser.AccountID(), "error", err)
 			metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "rate_limited", "client_error").Inc()
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -26,14 +26,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	// If the session is closing, don't try to search.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[SEARCH] Session context is cancelled, skipping search.")
+		s.DebugLog("session context is cancelled, skipping search")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
 
 	// Acquire read mutex to safely read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[SEARCH] Failed to acquire read lock within timeout")
+		s.DebugLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -43,7 +43,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	if s.selectedMailbox == nil {
 		release() // Release read lock
-		s.DebugLog("[SEARCH] no mailbox selected")
+		s.DebugLog("no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -59,7 +59,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	criteria = s.decodeSearchCriteria(criteria)
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
-		s.DebugLog("[SEARCH] skipping SEARCH because mailbox is empty")
+		s.DebugLog("skipping SEARCH because mailbox is empty")
 		if numKind == imapserver.NumKindUID {
 			return &imap.SearchData{All: imap.UIDSet{}, Count: 0}, nil
 		} else {
@@ -95,7 +95,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// If client uses ESEARCH syntax but ESEARCH capability is filtered, return error
 	// RFC 5530 defines CLIENTBUG for when client violates server's advertised capabilities
 	if isESEARCH && !s.GetCapabilities().Has(imap.CapESearch) {
-		s.DebugLog("[SEARCH] Client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
+		s.DebugLog("client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
 		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -105,8 +105,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	if isESEARCH && options != nil {
-		s.InfoLog("[SEARCH ESEARCH] ESEARCH options provided: Min=%v, Max=%v, All=%v, CountReturnOpt=%v",
-			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount)
+		s.InfoLog("ESEARCH options provided", "min", options.ReturnMin, "max", options.ReturnMax, "all", options.ReturnAll, "count", options.ReturnCount)
 
 		// At this point, isESEARCH is true and capability is verified
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
@@ -156,7 +155,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			// All ReturnMin, ReturnMax, ReturnAll, ReturnCount are false.
 			// This means client used ESEARCH form (e.g. SEARCH RETURN ()) and expects default.
 			// RFC 4731: "server SHOULD behave as if RETURN (COUNT) was specified."
-			s.InfoLog("[SEARCH ESEARCH] No specific RETURN options (MIN/MAX/ALL/COUNT) requested, defaulting to COUNT only.")
+			s.InfoLog("no specific RETURN options requested, defaulting to COUNT only")
 			// Set count for default ESEARCH responses
 			searchData.Count = uint32(len(messages))
 
@@ -189,7 +188,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// The go-imap/v2 library will correctly generate an untagged `* SEARCH` response.
 	// If we populated `Count`, it would incorrectly generate an `* ESEARCH` response.
 	if !isESEARCH {
-		s.DebugLog("[SEARCH] Standard SEARCH command, preparing untagged `* SEARCH` response.")
+		s.DebugLog("standard SEARCH command, preparing untagged SEARCH response")
 
 		if len(messages) > 0 {
 			var uids imap.UIDSet
@@ -276,14 +275,14 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 // decodeSearchCriteria safely acquires the read mutex and translates sequence numbers in search criteria.
 func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
 	if s.ctx.Err() != nil {
-		s.DebugLog("[SEARCH] Session context is cancelled, skipping decodeSearchCriteria.")
+		s.DebugLog("session context is cancelled, skipping decodeSearchCriteria")
 		// Return unmodified criteria if context is cancelled
 		return criteria
 	}
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[SEARCH] Failed to acquire read lock for decodeSearchCriteria within timeout")
+		s.DebugLog("failed to acquire read lock for decodeSearchCriteria within timeout")
 		// Return unmodified criteria if we can't acquire the lock
 		return criteria
 	}

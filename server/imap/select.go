@@ -12,10 +12,10 @@ import (
 )
 
 func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
-	s.DebugLog("[SELECT] attempting to select mailbox: %s", mboxName)
+	s.DebugLog("attempting to select mailbox", "mailbox", mboxName)
 
 	if s.ctx.Err() != nil {
-		s.DebugLog("[SELECT] request aborted before selecting mailbox '%s'", mboxName)
+		s.DebugLog("request aborted before selecting mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
 
@@ -24,7 +24,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
 		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
 		if mboxName == sharedPrefix {
-			s.DebugLog("[SELECT] cannot select shared namespace root '%s'", mboxName)
+			s.DebugLog("cannot select shared namespace root", "mailbox", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeCannot,
@@ -36,7 +36,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Phase 1: Read session state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[SELECT] Failed to acquire read lock within timeout")
+		s.WarnLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -56,7 +56,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[SELECT] mailbox '%s' does not exist for user %d", mboxName, s.AccountID())
+			s.DebugLog("mailbox does not exist", "mailbox", mboxName, "account_id", s.AccountID())
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -74,7 +74,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		return nil, s.internalError("failed to check read permission for mailbox '%s': %v", mboxName, err)
 	}
 	if !hasReadRight {
-		s.DebugLog("[SELECT] user %d does not have read permission on mailbox '%s'", AccountID, mboxName)
+		s.DebugLog("user does not have read permission on mailbox", "account_id", AccountID, "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -90,7 +90,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// First, acquire the read lock once to read necessary session state
 	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[SELECT] Failed to acquire second read lock within timeout")
+		s.WarnLog("failed to acquire second read lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -105,7 +105,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Check if the context is already cancelled before proceeding with DB operations
 	if s.ctx.Err() != nil {
 		release()
-		s.DebugLog("[SELECT] context already cancelled before selecting mailbox '%s'", mboxName)
+		s.DebugLog("context already cancelled before selecting mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 	release()
@@ -114,12 +114,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	var numRecent uint32
 
 	if isReselectOfPrevious {
-		s.DebugLog("[SELECT] mailbox %s reselected", mboxName)
+		s.DebugLog("mailbox reselected", "mailbox", mboxName)
 		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
 		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
 		count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, uidToCompareAgainst)
 		if dbErr != nil {
-			s.DebugLog("[SELECT] Error counting messages greater than UID %d for mailbox %d: %v. Defaulting RECENT to total.", uidToCompareAgainst, mailbox.ID, dbErr)
+			s.DebugLog("error counting messages greater than UID, defaulting RECENT to total", "uid", uidToCompareAgainst, "mailbox_id", mailbox.ID, "error", dbErr)
 			numRecent = uint32(currentSummary.NumMessages) // Fallback
 		} else {
 			numRecent = count
@@ -133,7 +133,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Acquire the lock once after all DB operations to update session state
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[SELECT] Failed to acquire write lock within timeout")
+		s.WarnLog("failed to acquire write lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -144,7 +144,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	// Check again if the context was cancelled during DB operations
 	if s.ctx.Err() != nil {
-		s.DebugLog("[SELECT] request aborted during mailbox '%s' selection, aborting state update", mboxName)
+		s.DebugLog("request aborted during mailbox selection, aborting state update", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 
@@ -164,7 +164,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Store the first unseen message sequence number from the mailbox summary
 	s.firstUnseenSeqNum.Store(currentSummary.FirstUnseenSeqNum)
 	if currentSummary.FirstUnseenSeqNum > 0 {
-		s.DebugLog("[SELECT] First unseen message is at sequence number %d", currentSummary.FirstUnseenSeqNum)
+		s.DebugLog("first unseen message", "seq", currentSummary.FirstUnseenSeqNum)
 	}
 
 	s.selectedMailbox = mailbox
@@ -200,13 +200,13 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 func (s *IMAPSession) Unselect() error {
 	// If the session is closing, don't try to unselect.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[UNSELECT] Session context is cancelled, skipping unselect.")
+		s.DebugLog("session context is cancelled, skipping unselect")
 		return nil
 	}
 
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[UNSELECT] Failed to acquire write lock within timeout")
+		s.WarnLog("failed to acquire write lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -216,7 +216,7 @@ func (s *IMAPSession) Unselect() error {
 	defer release()
 
 	if s.selectedMailbox != nil {
-		s.DebugLog("[UNSELECT] mailbox %s (ID: %d) cleared from session state.", s.selectedMailbox.Name, s.selectedMailbox.ID)
+		s.DebugLog("mailbox cleared from session state", "mailbox", s.selectedMailbox.Name, "mailbox_id", s.selectedMailbox.ID)
 		// The s.lastSelectedMailboxID and s.lastHighestUID fields are intentionally *not* cleared here.
 		// They hold the state of the mailbox that was just active, so the next Select
 		// can use them to determine "new" messages for that specific mailbox.

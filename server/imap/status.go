@@ -11,7 +11,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[STATUS] Failed to acquire read lock")
+		s.WarnLog("failed to acquire read lock")
 		return nil, s.internalError("failed to acquire lock for status")
 	}
 	AccountID := s.AccountID()
@@ -21,7 +21,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[STATUS] mailbox '%s' does not exist", mboxName)
+			s.DebugLog("mailbox does not exist", "mailbox", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -37,7 +37,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		return nil, s.internalError("failed to check read permission: %v", err)
 	}
 	if !hasReadRight {
-		s.DebugLog("[STATUS] user does not have read permission on mailbox '%s'", mboxName)
+		s.DebugLog("user does not have read permission on mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -87,11 +87,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		numMessagesStr = fmt.Sprint(*statusData.NumMessages)
 	}
 
-	s.DebugLog("[STATUS] mailbox '%s': NumMessages=%s, UIDNext=%v, HighestModSeq=%v",
-		mboxName,
-		numMessagesStr,
-		statusData.UIDNext,
-		statusData.HighestModSeq)
+	s.DebugLog("mailbox status", "mailbox", mboxName, "num_messages", numMessagesStr, "uid_next", statusData.UIDNext, "highest_modseq", statusData.HighestModSeq)
 
 	return statusData, nil
 }

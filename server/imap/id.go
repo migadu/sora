@@ -14,8 +14,7 @@ import (
 // Also supports Dovecot-style parameter forwarding via x-* fields
 func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	if clientID != nil {
-		s.DebugLog("[ID] Client identified itself with: Name=%s Version=%s OS=%s OSVersion=%s Vendor=%s",
-			clientID.Name, clientID.Version, clientID.OS, clientID.OSVersion, clientID.Vendor)
+		s.DebugLog("client identified itself", "name", clientID.Name, "version", clientID.Version, "os", clientID.OS, "os_version", clientID.OSVersion, "vendor", clientID.Vendor)
 
 		// Store client ID and apply capability filtering
 		s.SetClientID(clientID)
@@ -35,7 +34,7 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 			}
 		}
 	} else {
-		s.DebugLog("[ID] Client sent empty ID command")
+		s.DebugLog("client sent empty ID command")
 	}
 
 	// Build server response with basic server information
@@ -93,7 +92,7 @@ func (s *IMAPSession) logAdditionalIDFields(rawFields map[string]string) {
 	}
 
 	if len(nonForwardingFields) > 0 {
-		s.DebugLog("[ID] Client identified as: %s", strings.Join(nonForwardingFields, ", "))
+		s.DebugLog("client identified", "fields", strings.Join(nonForwardingFields, ", "))
 	}
 }
 
@@ -115,13 +114,13 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {
-		s.DebugLog("[ID] Invalid forwarding parameters: %v", err)
+		s.DebugLog("invalid forwarding parameters", "error", err)
 		return
 	}
 
 	// Decrement TTL to prevent loops. This is for proxy-chaining.
 	if !forwardingParams.DecrementTTL() {
-		s.DebugLog("[ID] Proxy TTL expired, dropping connection to prevent loop")
+		s.DebugLog("proxy TTL expired, dropping connection to prevent loop")
 		s.Close() // Close the connection to prevent loops
 		return
 	}
@@ -154,17 +153,15 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 	if ja4Fingerprint, ok := forwardingParams.Variables["ja4-fingerprint"]; ok && ja4Fingerprint != "" {
 		if s.ja4Fingerprint == "" {
 			s.ja4Fingerprint = ja4Fingerprint
-			s.DebugLog("[ID] Received JA4 fingerprint from proxy ID command: %s", ja4Fingerprint)
+			s.DebugLog("received JA4 fingerprint from proxy ID command", "ja4", ja4Fingerprint)
 			// Apply capability filters based on the forwarded fingerprint
 			s.applyCapabilityFilters()
 		} else {
-			s.DebugLog("[ID] Ignoring JA4 from ID command (already have %s from PROXY TLV)", s.ja4Fingerprint)
+			s.DebugLog("ignoring JA4 from ID command, already have from PROXY TLV", "existing_ja4", s.ja4Fingerprint)
 		}
 	}
 
-	s.DebugLog("[ID] Processed forwarding parameters: client=%s:%d, proxy=%s, session=%s, ttl=%d, ja4=%s",
-		forwardingParams.OriginatingIP, forwardingParams.OriginatingPort, s.ProxyIP,
-		forwardingParams.SessionID, forwardingParams.ProxyTTL, s.ja4Fingerprint)
+	s.DebugLog("processed forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "proxy_ip", s.ProxyIP, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "ja4", s.ja4Fingerprint)
 }
 
 // addForwardingToIMAPID adds forwarding parameters to IMAP ID response
@@ -185,5 +182,5 @@ func (s *IMAPSession) addForwardingToIMAPID(serverID *imap.IDData) {
 		serverID.Raw[k] = v
 	}
 
-	s.DebugLog("[ID] Added %d forwarding parameters to server ID response for proxy chaining", len(forwardingMap))
+	s.DebugLog("added forwarding parameters to server ID response", "count", len(forwardingMap))
 }

@@ -137,6 +137,7 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.Flush()
 
 		case "PASS":
+			authStart := time.Now()
 			if s.username == "" {
 				if s.handleAuthError(writer, "-ERR Must provide USER first\r\n") {
 					return
@@ -171,8 +172,13 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
-			// Log authentication at INFO level with routing method
-			s.InfoLog("authenticated", "method", s.routingMethod)
+			// Log authentication at INFO level with all required fields
+			duration := time.Since(authStart)
+			s.InfoLog("authenticated via USER/PASS",
+				"address", s.username,
+				"backend", s.serverAddr,
+				"routing", s.routingMethod,
+				"duration", duration.Seconds())
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {
@@ -191,6 +197,7 @@ func (s *POP3ProxySession) handleConnection() {
 			return
 
 		case "AUTH":
+			authStart := time.Now()
 			if len(parts) < 2 {
 				if s.handleAuthError(writer, "-ERR Missing authentication mechanism\r\n") {
 					return
@@ -273,6 +280,7 @@ func (s *POP3ProxySession) handleConnection() {
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				} else if server.IsBackendError(err) {
 					// Backend connection or authentication issues
+					s.WarnLog("Backend error during SASL authentication", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
 				} else {
 					// Actual authentication failure (wrong password, etc.)
@@ -286,8 +294,13 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.WriteString("+OK Authentication successful\r\n")
 			writer.Flush()
 
-			// Log authentication at INFO level with routing method
-			s.InfoLog("authenticated via SASL PLAIN", "method", s.routingMethod)
+			// Log authentication at INFO level with all required fields
+			duration := time.Since(authStart)
+			s.InfoLog("authenticated via SASL PLAIN",
+				"address", s.username,
+				"backend", s.serverAddr,
+				"routing", s.routingMethod,
+				"duration", duration.Seconds())
 
 			// Clear the read deadline before moving to the proxying phase, which sets its own.
 			if s.server.authIdleTimeout > 0 {
@@ -425,21 +438,42 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						RemoteTLSVerify:        cached.RemoteTLSVerify,
 						RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
 					}
-					s.username = username
+					if cached.ActualEmail != "" {
+						s.username = cached.ActualEmail
+					} else {
+						s.username = username
+					}
 
 					// Refresh TTL since password matched
 					s.server.lookupCache.Refresh(s.server.name, username)
 
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
+					// Use resolved username for rate limiting and metrics
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, s.username, true)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
 
-					// Track domain and user activity
-					if addr, err := server.NewAddress(username); err == nil {
+					// Track domain and user activity using resolved email
+					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("pop3_proxy", addr.Domain())
 						metrics.TrackUserActivity("pop3_proxy", addr.FullAddress(), "connection", 1)
 					}
 
-					// Single consolidated log for authentication success
+					// Set username on client connection for timeout logging
+					if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+						soraConn.SetUsername(s.username)
+					}
+
+					// Check if context is cancelled (server shutting down) before attempting backend connection
+					if err := s.ctx.Err(); err != nil {
+						s.WarnLog("context cancelled during cache hit, cannot connect to backend", "error", err)
+						return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
+					}
+
+					// Connect to backend to set routing method and establish connection
+					if err := s.connectToBackend(); err != nil {
+						return fmt.Errorf("failed to connect to backend: %w", err)
+					}
+
+					// Single consolidated log for authentication success (AFTER backend connection succeeds)
 					s.InfoLog("authentication successful", "cached", true, "method", "cache")
 
 					return nil
@@ -594,14 +628,18 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
-				// Use the actual email (without token) for backend impersonation
+
+				// Determine the resolved email for caching and backend impersonation
+				// Use ActualEmail from prelookup response if available, otherwise derive from username
+				var resolvedEmail string
 				if routingInfo.ActualEmail != "" {
-					s.username = routingInfo.ActualEmail
+					resolvedEmail = routingInfo.ActualEmail
 				} else if masterAuthValidated {
-					s.username = usernameForPrelookup // Base address already
+					resolvedEmail = usernameForPrelookup // Base address already
 				} else {
-					s.username = username // Fallback to original
+					resolvedEmail = username // Fallback to original
 				}
+				s.username = resolvedEmail // Use for backend impersonation
 
 				// Set username on client connection for timeout logging
 				if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
@@ -609,8 +647,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				}
 
 				// Cache successful authentication with routing info
+				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
+				// BUT store ActualEmail so cache hits can use the resolved address
 				// Always hash password, even for master auth, to prevent cache bypass
-				// This ensures different passwords don't match the same cache entry
 				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
@@ -619,6 +658,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
 						PasswordHash:           passwordHash,
+						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 						ServerAddress:          routingInfo.ServerAddress,
 						RemoteTLS:              routingInfo.RemoteTLS,
 						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
@@ -631,10 +671,12 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				}
 
 				s.authenticated = true
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, true)
+				// Use resolvedEmail for rate limiting (not submitted username with token)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, resolvedEmail, true)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "success").Inc()
-				// For metrics, use username as-is (may contain token, but that's ok for tracking)
-				if addr, err := server.NewAddress(username); err == nil {
+
+				// For metrics, use resolvedEmail for accurate tracking
+				if addr, err := server.NewAddress(resolvedEmail); err == nil {
 					metrics.TrackDomainConnection("pop3_proxy", addr.Domain())
 					metrics.TrackUserActivity("pop3_proxy", addr.FullAddress(), "connection", 1)
 				}
@@ -879,6 +921,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	metrics.ProxyBackendConnections.WithLabelValues("pop3", "success").Inc()
 	s.backendConn = backendConn
 	s.serverAddr = actualAddr
+	s.DebugLog("Backend connection established in connectToBackend()", "backend", actualAddr)
 
 	// Record successful connection for future affinity if enabled
 	// Auth-only prelookup users (IsPrelookupAccount=true but ServerAddress="") should get affinity
@@ -958,13 +1001,13 @@ func (s *POP3ProxySession) connectToBackend() error {
 
 func (s *POP3ProxySession) startProxying() {
 	if s.backendConn == nil {
-		s.DebugLog("Backend connection not established")
+		s.WarnLog("Backend connection not established - startProxying() returning early")
 		return
 	}
 
 	defer s.backendConn.Close()
 
-	s.DebugLog("startProxying() called")
+	s.DebugLog("startProxying() called - backend connected to", "backend", s.serverAddr)
 
 	var wg sync.WaitGroup
 
@@ -1060,11 +1103,7 @@ func (s *POP3ProxySession) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	if s.username != "" {
-		s.InfoLog("disconnected", "duration", duration)
-	} else {
-		s.InfoLog("disconnected unauthenticated", "duration", duration)
-	}
+	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Dec()

@@ -61,7 +61,7 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		// Check connection limits with PROXY protocol support
 		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if limitErr != nil {
-			logger.Debug("LMTP: Connection rejected", "name", l.name, "error", limitErr)
+			logger.Debug("connection rejected", "name", l.name, "error", limitErr)
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -191,7 +191,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
 	if !options.TLS && options.TLSUseStartTLS {
-		logger.Debug("LMTP: WARNING - tls_use_starttls ignored", "name", name)
+		logger.Debug("tls_use_starttls ignored", "name", name)
 		// Force TLSUseStartTLS to false to avoid confusion
 		options.TLSUseStartTLS = false
 	}
@@ -234,7 +234,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}
 	backend.defaultSieveExecutor = defaultExecutor
-	logger.Debug("LMTP: Default Sieve script parsed and cached", "name", backend.name)
+	logger.Debug("default sieve script parsed and cached", "name", backend.name)
 
 	// Set up TLS config: Support both file-based certificates and global TLS manager
 	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
@@ -258,7 +258,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 		if !options.TLSVerify {
 			backend.tlsConfig.InsecureSkipVerify = true
-			logger.Debug("LMTP: WARNING - TLS certificate verification disabled", "name", name)
+			logger.Debug("tls certificate verification disabled", "name", name)
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
@@ -300,7 +300,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	trustedNets, err := server.ParseTrustedNetworks(trustedProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
-		logger.Debug("LMTP: WARNING - failed to parse trusted networks, XCLIENT disabled", "name", name, "error", err)
+		logger.Debug("failed to parse trusted networks, xclient disabled", "name", name, "error", err)
 		trustedNets = []*net.IPNet{}
 	}
 	s.XCLIENTTrustedNets = trustedNets
@@ -311,7 +311,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Configure StartTLS if enabled and TLS config is available
 	if options.TLSUseStartTLS && backend.tlsConfig != nil {
 		s.TLSConfig = backend.tlsConfig
-		logger.Debug("LMTP: StartTLS is enabled", "name", name)
+		logger.Debug("starttls enabled", "name", name)
 		// Force AllowInsecureAuth to true when StartTLS is enabled
 		// This is necessary because with StartTLS, initial connections are unencrypted
 		s.AllowInsecureAuth = true
@@ -357,18 +357,18 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		// Try to parse as string
 		host, _, err := net.SplitHostPort(remoteAddr.String())
 		if err != nil {
-			logger.Debug("LMTP: Connection rejected - invalid address format", "name", b.name, "remote", remoteAddr)
+			logger.Debug("connection rejected - invalid address format", "name", b.name, "remote_addr", remoteAddr)
 			return nil, fmt.Errorf("invalid remote address format")
 		}
 		ip = net.ParseIP(host)
 		if ip == nil {
-			logger.Debug("LMTP: Connection rejected - could not parse IP", "name", b.name, "remote", remoteAddr)
+			logger.Debug("connection rejected - could not parse ip", "name", b.name, "remote_addr", remoteAddr)
 			return nil, fmt.Errorf("could not parse remote IP address")
 		}
 	}
 
 	if !b.isFromTrustedNetwork(ip) {
-		logger.Warn("LMTP: Connection rejected - not from trusted network", "name", b.name, "ip", ip, "remote", remoteAddr)
+		logger.Warn("connection rejected - not from trusted network", "name", b.name, "ip", ip, "remote_addr", remoteAddr)
 		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
 	}
 
@@ -433,8 +433,7 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	// Log connection with connection counters
 	activeCount := b.activeConnections.Load()
-	s.InfoLog("new session remote=%s id=%s (connections: active=%d)",
-		s.RemoteIP, s.Id, activeCount)
+	s.InfoLog("new session", "id", s.Id, "active_count", activeCount)
 
 	return s, nil
 }
@@ -452,16 +451,16 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 		errChan <- fmt.Errorf("failed to create listener: %w", err)
 		return
 	}
-	logger.Debug("LMTP: Using custom listen backlog", "server", b.name, "backlog", b.listenBacklog)
+	logger.Debug("using custom listen backlog", "server", b.name, "backlog", b.listenBacklog)
 
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if b.tlsConfig != nil && b.server.TLSConfig == nil {
 		// Implicit TLS - wrap TCP listener with TLS
 		listener = tls.NewListener(tcpListener, b.tlsConfig)
-		logger.Info("LMTP server listening with TLS", "name", b.name, "addr", b.server.Addr)
+		logger.Info("lmtp server listening with tls", "name", b.name, "addr", b.server.Addr)
 	} else {
 		listener = tcpListener
-		logger.Info("LMTP server listening", "name", b.name, "addr", b.server.Addr, "tls", false)
+		logger.Info("lmtp server listening", "name", b.name, "addr", b.server.Addr, "tls", false)
 	}
 	defer listener.Close()
 
@@ -483,13 +482,13 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	if err := b.server.Serve(limitedListener); err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		if b.appCtx.Err() != nil {
-			logger.Info("LMTP server stopped gracefully", "name", b.name)
+			logger.Info("lmtp server stopped gracefully", "name", b.name)
 		} else {
 			errChan <- fmt.Errorf("LMTP server error: %w", err)
 		}
 	} else {
 		// Server closed without error (shouldn't normally happen, but handle gracefully)
-		logger.Info("LMTP server stopped gracefully", "name", b.name)
+		logger.Info("lmtp server stopped gracefully", "name", b.name)
 	}
 }
 
@@ -544,7 +543,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// and to not consume bytes from the connection if no header is found.
 		if l.proxyReader.IsOptionalMode() && errors.Is(err, server.ErrNoProxyHeader) {
 			// Note: We don't have access to server name in this listener, use generic LMTP
-			logger.Debug("LMTP: No PROXY protocol header - treating as direct", "remote", conn.RemoteAddr())
+			logger.Debug("no proxy protocol header - treating as direct", "remote_addr", conn.RemoteAddr())
 			// The wrappedConn should be the original connection, possibly with a buffered reader.
 			return wrappedConn, nil
 		}
@@ -552,7 +551,7 @@ func (l *proxyProtocolListener) Accept() (net.Conn, error) {
 		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
 		conn.Close()
 		// Note: We don't have access to server name in this listener, use generic LMTP
-		logger.Debug("LMTP: PROXY protocol error - rejecting", "remote", conn.RemoteAddr(), "error", err)
+		logger.Debug("proxy protocol error - rejecting", "remote_addr", conn.RemoteAddr(), "error", err)
 		continue
 	}
 }
@@ -583,7 +582,7 @@ func (b *LMTPServerBackend) monitorActiveConnections() {
 				stats := b.limiter.GetStats()
 				limiterStats = fmt.Sprintf(" limiter_total=%d limiter_max=%d", stats.TotalConnections, stats.MaxConnections)
 			}
-			logger.Info("LMTP server active connections", "name", b.name, "active_connections", count, "limiter_stats", limiterStats)
+			logger.Info("lmtp server active connections", "name", b.name, "active_connections", count, "limiter_stats", limiterStats)
 
 		case <-b.appCtx.Done():
 			return

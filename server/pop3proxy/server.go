@@ -56,7 +56,6 @@ type POP3ProxyServer struct {
 
 	// Auth cache for routing and password validation
 	lookupCache                *lookupcache.LookupCache
-	negativeRevalidationWindow time.Duration
 	positiveRevalidationWindow time.Duration
 
 	// Listen backlog

@@ -12,14 +12,14 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[RENAME] Failed to acquire read lock")
+		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for rename")
 	}
 	AccountID := s.AccountID()
 	release()
 
 	if existingName == newName {
-		s.DebugLog("[RENAME] the new mailbox name is the same as the current one.")
+		s.DebugLog("new mailbox name is the same as current one", "mailbox", existingName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
@@ -31,7 +31,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	oldMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, existingName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[RENAME] mailbox '%s' does not exist", existingName)
+			s.DebugLog("mailbox does not exist", "mailbox", existingName)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -47,7 +47,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		return s.internalError("failed to check delete permission: %v", err)
 	}
 	if !hasDeleteRight {
-		s.DebugLog("[RENAME] user does not have delete permission on mailbox '%s'", existingName)
+		s.DebugLog("user does not have delete permission on mailbox", "mailbox", existingName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -57,7 +57,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 
 	_, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, newName)
 	if err == nil {
-		s.DebugLog("[RENAME] mailbox '%s' already exists", newName)
+		s.DebugLog("mailbox already exists", "mailbox", newName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
@@ -78,7 +78,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		if err == consts.ErrMailboxNotFound {
 			// Parent does not exist, so we need to create it.
 			// This is a common expectation for IMAP clients.
-			s.DebugLog("[RENAME] new parent mailbox '%s' for '%s' does not exist, auto-creating", newParentPath, newName)
+			s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath, "target", newName)
 			createErr := s.server.rdb.CreateMailboxWithRetry(s.ctx, AccountID, newParentPath, nil)
 			if createErr != nil {
 				return s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
@@ -100,6 +100,6 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
 
-	s.DebugLog("[RENAME] mailbox renamed: %s -> %s", existingName, newName)
+	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
 	return nil
 }

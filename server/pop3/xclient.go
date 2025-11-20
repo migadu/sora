@@ -21,21 +21,21 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 	forwardingParams, err := server.ParsePOP3XCLIENT(args)
 	if err != nil {
 		writer.WriteString("-ERR Invalid XCLIENT parameters\r\n")
-		s.DebugLog("[XCLIENT] Failed to parse parameters: %v", err)
+		s.DebugLog("failed to parse xclient parameters", "error", err)
 		return
 	}
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {
 		writer.WriteString("-ERR Invalid forwarding parameters\r\n")
-		s.DebugLog("[XCLIENT] Invalid parameters: %v", err)
+		s.DebugLog("invalid xclient parameters", "error", err)
 		return
 	}
 
 	// Check TTL to prevent loops
 	if !forwardingParams.DecrementTTL() {
 		writer.WriteString("-ERR Proxy TTL expired\r\n")
-		s.DebugLog("[XCLIENT] TTL expired, possible forwarding loop")
+		s.DebugLog("xclient ttl expired, possible forwarding loop")
 		return
 	}
 
@@ -45,7 +45,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 	// Update session's RemoteIP if forwarding parameters provide it
 	if forwardingParams.OriginatingIP != "" {
 		s.RemoteIP = forwardingParams.OriginatingIP
-		s.DebugLog("[XCLIENT] Updated client IP from forwarding parameters: %s", forwardingParams.OriginatingIP)
+		s.DebugLog("updated client ip from xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP)
 	}
 
 	// The proxy might also send its own source IP. Let's check for that.
@@ -56,9 +56,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) {
 		}
 	}
 
-	s.DebugLog("[XCLIENT] Processed forwarding parameters: client=%s:%d session=%s ttl=%d variables=%d",
-		forwardingParams.OriginatingIP, forwardingParams.OriginatingPort,
-		forwardingParams.SessionID, forwardingParams.ProxyTTL, len(forwardingParams.Variables))
+	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
 
 	writer.WriteString("+OK XCLIENT parameters accepted\r\n")
 }

@@ -187,7 +187,8 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			if err := s.handleRecipient(to); err != nil {
+			lookupStart := time.Now() // Start account lookup timing
+			if err := s.handleRecipient(to, lookupStart); err != nil {
 				s.DebugLog("Recipient rejected", "recipient", to, "error", err)
 				// Check if error is due to server shutdown
 				if errors.Is(err, server.ErrServerShuttingDown) {
@@ -392,7 +393,7 @@ func (s *Session) extractAddress(param string) string {
 }
 
 // handleRecipient looks up the recipient, determines routing, and sets session state.
-func (s *Session) handleRecipient(to string) error {
+func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	address, err := server.NewAddress(to)
 	if err != nil {
 		return fmt.Errorf("invalid address format: %w", err)
@@ -415,7 +416,13 @@ func (s *Session) handleRecipient(to string) error {
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
 
 			// Single consolidated log for lookup failure
-			s.InfoLog("account lookup failed", "reason", "user_not_found", "cached", true, "method", "cache")
+			duration := time.Since(lookupStart)
+			s.InfoLog("account lookup failed",
+				"address", s.username,
+				"reason", "user_not_found",
+				"cached", true,
+				"method", "cache",
+				"duration", duration.Seconds())
 
 			return fmt.Errorf("user not found")
 		} else {
@@ -434,10 +441,19 @@ func (s *Session) handleRecipient(to string) error {
 				RemoteUseXCLIENT:       cached.RemoteUseXCLIENT,
 			}
 
+			if cached.ActualEmail != "" {
+				s.username = cached.ActualEmail
+			}
+
 			s.server.lookupCache.Refresh(s.server.name, s.username)
 
 			// Single consolidated log for lookup success
-			s.InfoLog("account lookup successful", "cached", true, "method", "cache")
+			duration := time.Since(lookupStart)
+			s.InfoLog("account lookup successful",
+				"address", s.username,
+				"cached", true,
+				"method", "cache",
+				"duration", duration.Seconds())
 
 			return nil
 		}
@@ -480,9 +496,21 @@ func (s *Session) handleRecipient(to string) error {
 			s.isPrelookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
 
+			// Use ActualEmail from prelookup if available (for token resolution)
+			var resolvedEmail string
+			if routingInfo.ActualEmail != "" {
+				resolvedEmail = routingInfo.ActualEmail
+				s.username = resolvedEmail // Update username with resolved email
+			} else {
+				resolvedEmail = s.username // Use already-set username (BaseAddress)
+			}
+
 			// Cache positive result (routing info found)
+			// Cache key is s.username (BaseAddress of submitted recipient)
+			// Store ActualEmail if prelookup resolved to a different address
 			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 				AccountID:              routingInfo.AccountID,
+				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 				ServerAddress:          routingInfo.ServerAddress,
 				RemoteTLS:              routingInfo.RemoteTLS,
 				RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
@@ -494,7 +522,12 @@ func (s *Session) handleRecipient(to string) error {
 			})
 
 			// Single consolidated log for lookup success
-			s.InfoLog("account lookup successful", "cached", false, "method", "prelookup")
+			duration := time.Since(lookupStart)
+			s.InfoLog("account lookup successful",
+				"address", s.username,
+				"cached", false,
+				"method", "prelookup",
+				"duration", duration.Seconds())
 
 			return nil
 		} else {
@@ -530,7 +563,13 @@ func (s *Session) handleRecipient(to string) error {
 		})
 
 		// Single consolidated log for lookup failure
-		s.InfoLog("account lookup failed", "reason", "user_not_found", "cached", false, "method", "main_db")
+		duration := time.Since(lookupStart)
+		s.InfoLog("account lookup failed",
+			"address", s.username,
+			"reason", "user_not_found",
+			"cached", false,
+			"method", "main_db",
+			"duration", duration.Seconds())
 
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
@@ -551,7 +590,12 @@ func (s *Session) handleRecipient(to string) error {
 	})
 
 	// Single consolidated log for lookup success
-	s.InfoLog("account lookup successful", "cached", false, "method", "main_db")
+	duration := time.Since(lookupStart)
+	s.InfoLog("account lookup successful",
+		"address", s.username,
+		"cached", false,
+		"method", "main_db",
+		"duration", duration.Seconds())
 
 	return nil
 }
@@ -988,7 +1032,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.InfoLog("disconnected", "duration", duration)
+	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits

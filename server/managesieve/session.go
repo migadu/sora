@@ -47,7 +47,7 @@ func (s *ManageSieveSession) sendRawLine(line string) {
 func (s *ManageSieveSession) sendCapabilities() {
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for sendCapabilities")
+		s.WarnLog("failed to acquire read lock", "operation", "sendCapabilities")
 		// Send minimal capabilities if lock fails
 		s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
 		s.sendRawLine("\"SIEVE\" \"fileinto vacation\"")
@@ -81,7 +81,7 @@ func (s *ManageSieveSession) handleConnection() {
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := (*s.conn).(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			s.WarnLog("TLS handshake failed: %v", err)
+			s.WarnLog("tls handshake failed", "error", err)
 			return
 		}
 	}
@@ -110,7 +110,7 @@ func (s *ManageSieveSession) handleConnection() {
 			} else if err == io.EOF {
 				s.DebugLog("client dropped connection")
 			} else {
-				s.WarnLog("read error: %v", err)
+				s.WarnLog("read error", "error", err)
 			}
 			return
 		}
@@ -126,7 +126,7 @@ func (s *ManageSieveSession) handleConnection() {
 		// If debug logging is active, it might log the raw command.
 		// This ensures that if any such logging exists, it will be of a masked line.
 		// This is a defensive change as the direct logging is not visible in this file.
-		s.DebugLog("C: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		s.DebugLog("client command", "line", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 
 		// Set command execution deadline (for processing the command, not reading it)
 		commandDeadline := time.Time{} // Zero time means no deadline
@@ -171,7 +171,7 @@ func (s *ManageSieveSession) handleConnection() {
 
 			address, err := server.NewAddress(userAddress)
 			if err != nil {
-				s.DebugLog("error: %v", err)
+				s.DebugLog("invalid address", "error", err)
 				s.sendResponse("NO Invalid address\r\n")
 				continue
 			}
@@ -202,7 +202,7 @@ func (s *ManageSieveSession) handleConnection() {
 							"failure_count", rateLimitErr.FailureCount,
 							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
 					} else {
-						s.DebugLog("[LOGIN] rate limited: %v", err)
+						s.DebugLog("rate limited", "error", err)
 					}
 
 					s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
@@ -213,16 +213,18 @@ func (s *ManageSieveSession) handleConnection() {
 			// Master username authentication: user@domain.com@MASTER_USERNAME
 			// Check if suffix matches configured MasterUsername
 			authSuccess := false
+			masterAuthUsed := false
 			var accountID int64
 			if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
 				if checkMasterCredential(password, s.server.masterPassword) {
-					s.DebugLog("[LOGIN] Master username authentication successful for '%s' with master username '%s'", address.BaseAddress(), address.Suffix())
+					s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 					authSuccess = true
+					masterAuthUsed = true
 					// Use base address (without suffix) to get account
 					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.WarnLog("[LOGIN] Failed to get account ID for user '%s': %v", address.BaseAddress(), err)
+						s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
@@ -247,12 +249,13 @@ func (s *ManageSieveSession) handleConnection() {
 			// Try master SASL password authentication (traditional)
 			if !authSuccess && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				if address.BaseAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
-					s.DebugLog("[LOGIN] Master SASL password authentication successful for '%s'", address.BaseAddress())
+					s.DebugLog("master sasl password authentication successful", "address", address.BaseAddress())
 					authSuccess = true
+					masterAuthUsed = true
 					// For master password, we need to get the user ID
 					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.WarnLog("[LOGIN] Failed to get account ID for master user '%s': %v", address.BaseAddress(), err)
+						s.WarnLog("failed to get account id for master user", "address", address.BaseAddress(), "error", err)
 						// Record failed attempt
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
@@ -286,14 +289,14 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// Check if the context was cancelled during authentication logic
 			if s.ctx.Err() != nil {
-				s.DebugLog("[LOGIN] request aborted, aborting session update")
+				s.DebugLog("request aborted, aborting session update")
 				continue
 			}
 
 			// Acquire write lock for updating session authentication state
 			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.WarnLog("failed to acquire write lock for Login command")
+				s.WarnLog("failed to acquire write lock", "command", "LOGIN")
 				s.sendResponse("NO Server busy, try again later\r\n")
 				continue
 			}
@@ -303,10 +306,14 @@ func (s *ManageSieveSession) handleConnection() {
 			s.User = server.NewUser(address, accountID)
 
 			// Increment authenticated connections counter
-			authCount := s.server.authenticatedConnections.Add(1)
-			totalCount := s.server.totalConnections.Load()
-			s.InfoLog("user %s authenticated (connections: total=%d, authenticated=%d)",
-				address.FullAddress(), totalCount, authCount)
+			s.server.authenticatedConnections.Add(1)
+
+			// Log authentication success
+			// Note: Regular auth via Authenticate() already logs in server.go with cached/method
+			// For master password auth, we log here with method=master
+			if masterAuthUsed {
+				s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
+			}
 
 			// Track successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", "success").Inc()
@@ -500,21 +507,21 @@ func (s *ManageSieveSession) handleConnection() {
 			// Upgrade the connection to TLS
 			tlsConn := tls.Server(*s.conn, s.server.tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				s.WarnLog("TLS handshake failed: %v", err)
+				s.WarnLog("tls handshake failed", "error", err)
 				s.sendResponse("NO TLS handshake failed\r\n")
 				continue
 			}
 
 			// Check if context was cancelled during handshake
 			if s.ctx.Err() != nil {
-				s.DebugLog("[STARTTLS] request aborted after handshake, aborting session update")
+				s.DebugLog("request aborted after handshake")
 				return
 			}
 
 			// Acquire write lock for updating connection state
 			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 			if !acquired {
-				s.WarnLog("failed to acquire write lock for STARTTLS command")
+				s.WarnLog("failed to acquire write lock", "command", "STARTTLS")
 				s.sendResponse("NO Server busy, try again later\r\n")
 				continue
 			}
@@ -528,7 +535,7 @@ func (s *ManageSieveSession) handleConnection() {
 			// Release lock immediately after updating connection state
 			release()
 
-			s.DebugLog("TLS negotiation successful")
+			s.DebugLog("tls negotiation successful")
 			success = true
 
 		case "NOOP":
@@ -579,7 +586,7 @@ func (s *ManageSieveSession) handleConnection() {
 		// Flush response and check for timeout
 		if err := s.writer.Flush(); err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.WarnLog("command %s exceeded timeout (%v)", command, s.server.commandTimeout)
+				s.WarnLog("command exceeded timeout", "command", command, "timeout", s.server.commandTimeout)
 
 				// Track timeout event in metrics
 				metrics.CommandTimeoutsTotal.WithLabelValues("managesieve", command).Inc()
@@ -590,7 +597,7 @@ func (s *ManageSieveSession) handleConnection() {
 				s.writer.Flush()
 				return
 			}
-			s.WarnLog("error flushing response for %s: %v", command, err)
+			s.WarnLog("error flushing response", "command", command, "error", err)
 			return
 		}
 
@@ -629,7 +636,7 @@ func (s *ManageSieveSession) handleCapability() bool {
 func (s *ManageSieveSession) handleListScripts() bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[LISTSCRIPTS] request aborted, aborting command")
+		s.DebugLog("request aborted", "command", "LISTSCRIPTS")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -638,7 +645,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 	// A write lock is not needed for a read-only command.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for ListScripts command")
+		s.WarnLog("failed to acquire read lock", "command", "LISTSCRIPTS")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -679,7 +686,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 func (s *ManageSieveSession) handleGetScript(name string) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[GETSCRIPT] request aborted, aborting command")
+		s.DebugLog("request aborted", "command", "GETSCRIPT")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -690,7 +697,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 	// Acquire a read lock only to get the necessary session state.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for GetScript command")
+		s.WarnLog("failed to acquire read lock", "command", "GETSCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -721,7 +728,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	start := time.Now()
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[PUTSCRIPT] request aborted, aborting command")
+		s.DebugLog("request aborted", "command", "PUTSCRIPT")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -736,7 +743,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for PutScript command")
+		s.WarnLog("failed to acquire read lock", "command", "PUTSCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -806,7 +813,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	// Phase 3: Update session state
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire write lock for PutScript command to pin session")
+		s.WarnLog("failed to acquire write lock", "command", "PUTSCRIPT", "purpose", "pin_session")
 	} else {
 		s.useMasterDB = true
 		release()
@@ -829,7 +836,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	start := time.Now()
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[SETACTIVE] request aborted, aborting command")
+		s.DebugLog("request aborted", "command", "SETACTIVE")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -840,7 +847,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for SetActive command")
+		s.WarnLog("failed to acquire read lock", "command", "SETACTIVE")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -885,7 +892,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	// Phase 3: Update session state
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire write lock for SetActive command to pin session")
+		s.WarnLog("failed to acquire write lock", "command", "SETACTIVE", "purpose", "pin_session")
 	} else {
 		s.useMasterDB = true
 		release()
@@ -902,7 +909,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
-		s.DebugLog("[DELETESCRIPT] request aborted, aborting command")
+		s.DebugLog("request aborted", "command", "DELETESCRIPT")
 		s.sendResponse("NO Session closed\r\n")
 		return false
 	}
@@ -913,7 +920,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire read lock for DeleteScript command")
+		s.WarnLog("failed to acquire read lock", "command", "DELETESCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -946,7 +953,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	// Phase 3: Update session state
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire write lock for DeleteScript command to pin session")
+		s.WarnLog("failed to acquire write lock", "command", "DELETESCRIPT", "purpose", "pin_session")
 	} else {
 		s.useMasterDB = true
 		release()
@@ -988,8 +995,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		} else {
 			authCount = s.server.authenticatedConnections.Load()
 		}
-		s.InfoLog("session closed (connections: total=%d, authenticated=%d)",
-			totalCount, authCount)
+		s.InfoLog("session closed", "total_connections", totalCount, "authenticated_connections", authCount)
 		s.User = nil
 		s.Id = ""
 		s.authenticated = false
@@ -998,8 +1004,7 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 		}
 	} else {
 		authCount = s.server.authenticatedConnections.Load()
-		s.InfoLog("session closed unauthenticated (connections: total=%d, authenticated=%d)",
-			totalCount, authCount)
+		s.InfoLog("session closed unauthenticated", "total_connections", totalCount, "authenticated_connections", authCount)
 	}
 
 	return nil
@@ -1015,7 +1020,7 @@ func (s *ManageSieveSession) Close() error {
 		// Acquire write lock for cleanup
 		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 		if !acquired {
-			s.InfoLog("failed to acquire write lock within timeout")
+			s.InfoLog("failed to acquire write lock within timeout", "operation", "close")
 			// Continue with close even if we can't get the lock
 			return s.closeWithoutLock()
 		}
@@ -1074,13 +1079,13 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 				return false
 			}
 
-			s.DebugLog("Reading AUTHENTICATE literal of %d bytes", literalSize)
+			s.DebugLog("reading authenticate literal", "size_bytes", literalSize)
 
 			// Read the literal data
 			literalData := make([]byte, literalSize)
 			_, err = io.ReadFull(s.reader, literalData)
 			if err != nil {
-				s.WarnLog("error reading literal data: %v", err)
+				s.WarnLog("error reading literal data", "error", err)
 				s.sendResponse("NO Authentication failed\r\n")
 				return false
 			}
@@ -1100,7 +1105,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		// Read the authentication data
 		authLine, err := s.reader.ReadString('\n')
 		if err != nil {
-			s.WarnLog("error reading auth data: %v", err)
+			s.WarnLog("error reading auth data", "error", err)
 			s.sendResponse("NO Authentication failed\r\n")
 			return false
 		}
@@ -1119,7 +1124,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// Decode base64
 	decoded, err := base64.StdEncoding.DecodeString(authData)
 	if err != nil {
-		s.WarnLog("error decoding auth data: %v", err)
+		s.WarnLog("error decoding auth data", "error", err)
 		s.sendResponse("NO Invalid authentication data\r\n")
 		return false
 	}
@@ -1127,7 +1132,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
 	parts = strings.Split(string(decoded), "\x00")
 	if len(parts) != 3 {
-		s.WarnLog("invalid SASL PLAIN format")
+		s.WarnLog("invalid sasl plain format")
 		s.sendResponse("NO Invalid authentication format\r\n")
 		return false
 	}
@@ -1143,7 +1148,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		return false
 	}
 
-	s.DebugLog("[SASL PLAIN] AuthorizationID: '%s', AuthenticationID: '%s'", authzID, authnID)
+	s.DebugLog("sasl plain authentication", "authz_id", authzID, "authn_id", authnID)
 
 	// Parse authentication-identity to check for suffix (master username or prelookup token)
 	authnParsed, parseErr := server.NewAddress(authnID)
@@ -1163,19 +1168,19 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 				targetUserToImpersonate = authnParsed.BaseAddress()
 			}
 
-			s.DebugLog("[AUTH] Master username '%s' authenticated. Attempting to impersonate '%s'.", authnParsed.Suffix(), targetUserToImpersonate)
+			s.DebugLog("master username authenticated, attempting impersonation", "master_username", authnParsed.Suffix(), "target_user", targetUserToImpersonate)
 
 			// Parse target user address
 			address, err := server.NewAddress(targetUserToImpersonate)
 			if err != nil {
-				s.WarnLog("[AUTH] Failed to parse impersonation target user '%s': %v", targetUserToImpersonate, err)
+				s.WarnLog("failed to parse impersonation target", "target_user", targetUserToImpersonate, "error", err)
 				s.sendResponse("NO Invalid impersonation target user format\r\n")
 				return false
 			}
 
 			accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 			if err != nil {
-				s.WarnLog("[AUTH] Failed to get account ID for impersonation target user '%s': %v", targetUserToImpersonate, err)
+				s.WarnLog("failed to get account id for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 				s.sendResponse("NO Impersonation target user not found\r\n")
 				return false
 			}
@@ -1198,24 +1203,24 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
 			// Master SASL authentication successful
 			if authzID == "" {
-				s.DebugLog("[AUTH] Master SASL authentication for '%s' successful, but no authorization identity provided.", authnID)
+				s.DebugLog("master sasl authentication successful but no authorization identity", "authn_id", authnID)
 				s.sendResponse("NO Master SASL login requires an authorization identity.\r\n")
 				return false
 			}
 
-			s.DebugLog("[AUTH] Master SASL user '%s' authenticated. Attempting to impersonate '%s'.", authnID, authzID)
+			s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
 
 			// Log in as the authzID without a password check
 			address, err := server.NewAddress(authzID)
 			if err != nil {
-				s.WarnLog("[AUTH] Failed to parse impersonation target user '%s': %v", authzID, err)
+				s.WarnLog("failed to parse impersonation target", "target_user", authzID, "error", err)
 				s.sendResponse("NO Invalid impersonation target user format\r\n")
 				return false
 			}
 
 			accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.FullAddress())
 			if err != nil {
-				s.WarnLog("[AUTH] Failed to get account ID for impersonation target user '%s': %v", authzID, err)
+				s.WarnLog("failed to get account id for impersonation target", "target_user", authzID, "error", err)
 				s.sendResponse("NO Impersonation target user not found\r\n")
 				return false
 			}
@@ -1229,7 +1234,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	if !impersonating {
 		// For regular ManageSieve, we don't support proxy authentication
 		if authzID != "" && authzID != authnID {
-			s.DebugLog("proxy authentication requires master credentials: authz='%s', authn='%s'", authzID, authnID)
+			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
 			s.sendResponse("NO Proxy authentication requires master_sasl_username and master_sasl_password to be configured\r\n")
 			return false
 		}
@@ -1237,12 +1242,12 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		// Authenticate the user
 		address, err := server.NewAddress(authnID)
 		if err != nil {
-			s.WarnLog("invalid address format: %v", err)
+			s.WarnLog("invalid address format", "error", err)
 			s.sendResponse("NO Invalid username format\r\n")
 			return false
 		}
 
-		s.DebugLog("authentication attempt for %s", address.FullAddress())
+		s.DebugLog("authentication attempt", "address", address.FullAddress())
 
 		// Get connection and proxy info for rate limiting
 		netConn := *s.conn
@@ -1260,7 +1265,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		// Check authentication rate limiting after delay
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
-				s.DebugLog("[SASL PLAIN] rate limited: %v", err)
+				s.DebugLog("rate limited", "error", err)
 				s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
 				return false
 			}
@@ -1287,14 +1292,14 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 	// Check if the context was cancelled during authentication logic
 	if s.ctx.Err() != nil {
-		s.DebugLog("[AUTH] request aborted, aborting session update")
+		s.DebugLog("request aborted, aborting session update")
 		return false
 	}
 
 	// Acquire write lock for updating session authentication state
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.WarnLog("failed to acquire write lock for Authenticate command")
+		s.WarnLog("failed to acquire write lock", "command", "AUTHENTICATE")
 		s.sendResponse("NO Server busy, try again later\r\n")
 		return false
 	}
@@ -1304,14 +1309,13 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	s.User = server.NewUser(*targetAddress, accountID)
 
 	// Increment authenticated connections counter
-	authCount := s.server.authenticatedConnections.Add(1)
-	totalCount := s.server.totalConnections.Load()
+	s.server.authenticatedConnections.Add(1)
+
+	// Log authentication success with standardized format
+	// Note: Regular auth via Authenticate() already logs in server.go with cached/method
+	// For master SASL auth, we log here with method=master
 	if impersonating {
-		s.InfoLog("authenticated via Master SASL PLAIN as '%s' (connections: total=%d, authenticated=%d)",
-			targetAddress.FullAddress(), totalCount, authCount)
-	} else {
-		s.InfoLog("authenticated via SASL PLAIN (connections: total=%d, authenticated=%d)",
-			totalCount, authCount)
+		s.InfoLog("authentication successful", "address", targetAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
 	}
 
 	// Track successful authentication
@@ -1347,7 +1351,7 @@ func (s *ManageSieveSession) registerConnection(email string) {
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration: %v", err)
+			s.InfoLog("rejected connection registration", "error", err)
 		}
 	}
 }
@@ -1363,7 +1367,7 @@ func (s *ManageSieveSession) unregisterConnection() {
 		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", clientAddr); err != nil {
-			s.WarnLog("Failed to unregister connection: %v", err)
+			s.WarnLog("failed to unregister connection", "error", err)
 		}
 	}
 }
@@ -1384,7 +1388,7 @@ func (s *ManageSieveSession) startTerminationPoller() {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connection
-			s.DebugLog("Connection kicked - disconnecting user")
+			s.DebugLog("connection kicked, disconnecting")
 			(*s.conn).Close()
 		case <-s.ctx.Done():
 			// Session ended normally

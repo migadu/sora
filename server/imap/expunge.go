@@ -12,7 +12,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	// First phase: Read session state with simple read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[EXPUNGE] Failed to acquire read lock")
+		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for expunge")
 	}
 	if s.selectedMailbox == nil {
@@ -34,7 +34,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		return s.internalError("failed to check expunge permission: %v", err)
 	}
 	if !hasExpungeRight {
-		s.DebugLog("[EXPUNGE] user does not have expunge permission")
+		s.DebugLog("user does not have expunge permission")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -89,7 +89,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	// Final phase: Update session state with simple write lock
 	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[EXPUNGE] Failed to acquire write lock")
+		s.DebugLog("failed to acquire write lock")
 		return s.internalError("failed to acquire lock for expunge")
 	}
 
@@ -122,14 +122,14 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 			sessionSeqNum := sessionTrackerSnapshot.EncodeSeqNum(m.seq)
 			if sessionSeqNum > 0 {
 				if err := w.WriteExpunge(sessionSeqNum); err != nil {
-					s.DebugLog("[EXPUNGE] Error writing expunge for sessionSeqNum %d (UID %d, dbSeq %d): %v", sessionSeqNum, m.uid, m.seq, err)
+					s.DebugLog("error writing expunge", "session_seq", sessionSeqNum, "uid", m.uid, "db_seq", m.seq, "error", err)
 					return s.internalError("failed to write expunge notification: %v", err)
 				}
 			}
 		}
 	}
 
-	s.DebugLog("[EXPUNGE] command processed, %d messages expunged from DB. Client notified.", len(messagesToExpunge))
+	s.DebugLog("expunge command processed", "count", len(messagesToExpunge))
 
 	// Track domain and user command activity - EXPUNGE is database intensive!
 	if s.IMAPUser != nil && len(messagesToExpunge) > 0 {

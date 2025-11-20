@@ -68,7 +68,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			}
 
 			// Unknown rate limiting error (shouldn't happen, but handle gracefully)
-			s.DebugLog("[LOGIN] rate limited: %v", err)
+			s.DebugLog("rate limited", "error", err)
 			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -81,7 +81,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Parse address with potential suffix (master username or prelookup token)
 	addressParsed, err := server.NewAddress(address)
 	if err != nil {
-		s.DebugLog("[LOGIN] failed to parse address: %v", err)
+		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
 		return &imap.Error{
@@ -105,10 +105,8 @@ func (s *IMAPSession) Login(address, password string) error {
 			s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
 			s.Session.User = &s.IMAPUser.User
 
-			authCount := s.server.authenticatedConnections.Add(1)
-			totalCount := s.server.totalConnections.Load()
-			s.InfoLog("[LOGIN] user %s authenticated with master username %s (connections: total=%d, authenticated=%d)",
-				addressParsed.BaseAddress(), addressParsed.Suffix(), totalCount, authCount)
+			s.server.authenticatedConnections.Add(1)
+			s.InfoLog("authenticated with master username", "master_username", addressParsed.Suffix())
 
 			// Prometheus metrics - successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
@@ -139,7 +137,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			// Post-auth timeouts are handled by SoraConn (command_timeout)
 			if s.server.authIdleTimeout > 0 {
 				if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-					s.WarnLog("[LOGIN] failed to clear auth idle timeout: %v", err)
+					s.WarnLog("failed to clear auth idle timeout", "error", err)
 				}
 			}
 
@@ -164,17 +162,17 @@ func (s *IMAPSession) Login(address, password string) error {
 	// If it has a suffix but didn't match MasterUsername, fall through to regular auth
 	// (this allows the suffix to be used for prelookup in proxy scenarios)
 
-	s.DebugLog("[LOGIN] authentication attempt with address %s", addressParsed.BaseAddress())
+	s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
 
 	// Use base address (without +detail and without suffix) for authentication
 	AccountID, err := s.server.Authenticate(s.ctx, addressParsed.BaseAddress(), password)
 	if err != nil {
-		s.DebugLog("[LOGIN] authentication failed: %v", err)
+		s.DebugLog("authentication failed", "error", err)
 
 		// Check if error is due to context cancellation (server shutdown)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			// Server is shutting down - return temporary failure without recording as auth failure
-			s.InfoLog("[LOGIN] authentication cancelled due to server shutdown")
+			s.InfoLog("authentication cancelled due to server shutdown")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeUnavailable,
@@ -204,10 +202,8 @@ func (s *IMAPSession) Login(address, password string) error {
 	s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
 	s.Session.User = &s.IMAPUser.User
 
-	authCount := s.server.authenticatedConnections.Add(1)
-	totalCount := s.server.totalConnections.Load()
-	s.InfoLog("[LOGIN] user %s authenticated (connections: total=%d, authenticated=%d)",
-		addressParsed.BaseAddress(), totalCount, authCount)
+	s.server.authenticatedConnections.Add(1)
+	s.InfoLog("authenticated")
 
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
@@ -245,7 +241,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Post-auth timeouts are handled by SoraConn (command_timeout)
 	if s.server.authIdleTimeout > 0 {
 		if err := netConn.SetReadDeadline(time.Time{}); err != nil {
-			s.WarnLog("[LOGIN] failed to clear auth idle timeout: %v", err)
+			s.WarnLog("failed to clear auth idle timeout", "error", err)
 		}
 	}
 

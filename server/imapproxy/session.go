@@ -177,6 +177,7 @@ func (s *Session) handleConnection() {
 
 		switch command {
 		case "LOGIN":
+			authStart := time.Now()
 			var username, password string
 
 			// Handle literals in LOGIN command
@@ -332,10 +333,11 @@ func (s *Session) handleConnection() {
 				soraConn.SetUsername(s.username)
 			}
 
-			s.postAuthenticationSetup(tag)
+			s.postAuthenticationSetup(tag, authStart)
 			authenticated = true
 
 		case "AUTHENTICATE":
+			authStart := time.Now()
 			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
@@ -419,7 +421,7 @@ func (s *Session) handleConnection() {
 				soraConn.SetUsername(s.username)
 			}
 
-			s.postAuthenticationSetup(tag)
+			s.postAuthenticationSetup(tag, authStart)
 			authenticated = true
 
 		case "LOGOUT":
@@ -595,22 +597,45 @@ func (s *Session) authenticateUser(username, password string) error {
 					RemoteUseIDCommand:     cached.RemoteUseIDCommand,
 					ClientConn:             s.clientConn, // Always set current client connection for JA4
 				}
-				s.username = username
+				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
+				// Otherwise fall back to submitted username
+				if cached.ActualEmail != "" {
+					s.username = cached.ActualEmail
+				} else {
+					s.username = username
+				}
 
 				// Refresh TTL since password matched
 				s.server.lookupCache.Refresh(s.server.name, username)
 
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+				// Use actual username (resolved email) for rate limiting and metrics
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, s.username, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
 
-				// Track domain and user activity
-				if addr, err := server.NewAddress(username); err == nil {
+				// Track domain and user activity using resolved email
+				if addr, err := server.NewAddress(s.username); err == nil {
 					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
 					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
 				}
 
+				// Set username on client connection for timeout logging
+				if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+					soraConn.SetUsername(s.username)
+				}
+
 				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", true, "method", "cache")
+
+				// Check if context is cancelled (server shutting down) before attempting backend connection
+				if err := s.ctx.Err(); err != nil {
+					s.WarnLog("context cancelled during cache hit, cannot connect to backend", "error", err)
+					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
+				}
+
+				// Connect to backend to set routing method and establish connection
+				if err := s.connectToBackend(); err != nil {
+					return fmt.Errorf("failed to connect to backend: %w", err)
+				}
 
 				return nil
 			} else {
@@ -766,25 +791,33 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
-				// Use the actual email (without token) for backend impersonation
+
+				// Determine the resolved email for backend impersonation
+				// Use ActualEmail from prelookup response if available, otherwise derive from username
+				var resolvedEmail string
 				if routingInfo.ActualEmail != "" {
-					s.username = routingInfo.ActualEmail
+					resolvedEmail = routingInfo.ActualEmail
 				} else if masterAuthValidated {
-					s.username = usernameForPrelookup // Base address already
+					resolvedEmail = usernameForPrelookup // Base address already
 				} else {
-					s.username = username // Fallback to original
+					resolvedEmail = username // Fallback to original
 				}
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+				s.username = resolvedEmail // Use for backend impersonation
+
+				// Use resolvedEmail for rate limiting and metrics (the actual user)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, resolvedEmail, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "success").Inc()
-				// For metrics, use username as-is (may contain token, but that's ok for tracking)
-				if addr, err := server.NewAddress(username); err == nil {
+
+				// For metrics, use resolvedEmail for accurate tracking
+				if addr, err := server.NewAddress(resolvedEmail); err == nil {
 					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
 					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
 				}
 
 				// Cache successful prelookup authentication
-				// Always hash the password for cache matching, even for master auth
-				// This ensures different passwords don't match the same cache entry
+				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
+				// BUT store ActualEmail so cache hits can use the resolved address
+				// This allows token-based auth to work correctly on cache hits
 				passwordHash := ""
 				if password != "" {
 					passwordHash = lookupcache.HashPassword(password)
@@ -792,6 +825,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					AccountID:              routingInfo.AccountID,
 					PasswordHash:           passwordHash,
+					ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 					ServerAddress:          routingInfo.ServerAddress,
 					RemoteTLS:              routingInfo.RemoteTLS,
 					RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
@@ -1159,7 +1193,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 }
 
 // postAuthenticationSetup handles the common tasks after a user is successfully authenticated.
-func (s *Session) postAuthenticationSetup(clientTag string) {
+func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time) {
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
 		logger.Error("Failed to connect to backend", "proxy", s.server.name, "user", s.username, "error", err)
@@ -1208,8 +1242,13 @@ func (s *Session) postAuthenticationSetup(clientTag string) {
 		s.InfoLog("rejected connection registration", "error", err)
 	}
 
-	// Log authentication at INFO level with routing method
-	s.InfoLog("authenticated", "backend", s.serverAddr, "method", s.routingMethod)
+	// Log authentication at INFO level with all required fields
+	duration := time.Since(authStart)
+	s.InfoLog("IMAP authentication complete",
+		"address", s.username,
+		"backend", s.serverAddr,
+		"routing", s.routingMethod,
+		"duration", duration.Seconds())
 
 	// Forward the backend's success response, replacing the client's tag.
 	var responsePayload string
@@ -1333,11 +1372,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	if s.username != "" {
-		s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
-	} else {
-		s.InfoLog("disconnected", "duration", duration)
-	}
+	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Dec()

@@ -756,6 +756,68 @@ func SetupPOP3ServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	}, account
 }
 
+// SetupPOP3ServerForXCLIENT sets up a POP3 server for XCLIENT proxy testing
+// This server does NOT use PROXY protocol (expects plain connections with XCLIENT command)
+func SetupPOP3ServerForXCLIENT(t *testing.T) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	// Create POP3 server with master credentials and XCLIENT support (no PROXY protocol)
+	masterUsername := "proxyuser"
+	masterPassword := "proxypass"
+
+	server, err := pop3.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		&storage.S3Storage{},
+		rdb,
+		nil, // uploader.UploadWorker
+		nil, // cache.Cache
+		pop3.POP3ServerOptions{
+			ProxyProtocol:        false,                              // Disable PROXY protocol (using XCLIENT instead)
+			ProxyProtocolTimeout: "5s",                               // Not used when ProxyProtocol is false
+			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost for XCLIENT commands
+			MasterSASLUsername:   masterUsername,                     // Master username for proxy authentication
+			MasterSASLPassword:   masterPassword,                     // Master password for proxy authentication
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 server for XCLIENT: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	// Wait for server to start
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("POP3 server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for server to shut down
+		}
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}
+
 // SetupPOP3ServerWithMaster sets up a POP3 server with master credentials (no PROXY protocol)
 func SetupPOP3ServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()

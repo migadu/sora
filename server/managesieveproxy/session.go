@@ -253,7 +253,8 @@ func (s *Session) handleConnection() {
 			authnID := parts[1]
 			password := parts[2]
 
-			if err := s.authenticateUser(authnID, password); err != nil {
+			authStart := time.Now() // Start authentication timing
+			if err := s.authenticateUser(authnID, password, authStart); err != nil {
 				s.DebugLog("authentication failed: %v", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
@@ -267,6 +268,7 @@ func (s *Session) handleConnection() {
 			}
 
 			// Connect to backend and authenticate
+			backendConnStart := time.Now()
 			if err := s.connectToBackendAndAuth(); err != nil {
 				s.DebugLog("backend connection/auth failed: %v", err)
 				// Check if this is a timeout or connection error (backend unavailable)
@@ -287,6 +289,14 @@ func (s *Session) handleConnection() {
 			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
 				soraConn.SetUsername(s.username)
 			}
+
+			// Log backend authentication with total duration
+			backendDuration := time.Since(backendConnStart)
+			s.InfoLog("backend authenticated",
+				"address", s.username,
+				"backend", s.serverAddr,
+				"routing", s.routingMethod,
+				"duration", backendDuration.Seconds())
 
 			s.sendResponse(`OK "Authenticated"`)
 			authenticated = true
@@ -476,7 +486,7 @@ func (s *Session) WarnLog(msg string, keyvals ...any) {
 }
 
 // authenticateUser authenticates the user against the database.
-func (s *Session) authenticateUser(username, password string) error {
+func (s *Session) authenticateUser(username, password string, authStart time.Time) error {
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -531,8 +541,10 @@ func (s *Session) authenticateUser(username, password string) error {
 					s.accountID = cached.AccountID
 					s.isPrelookupAccount = cached.FromPrelookup
 
-					// Parse username to extract base address (same logic as full auth)
-					if parsedAddr, parseErr := server.NewAddress(username); parseErr == nil {
+					// Otherwise parse username to extract base address
+					if cached.ActualEmail != "" {
+						s.username = cached.ActualEmail
+					} else if parsedAddr, parseErr := server.NewAddress(username); parseErr == nil {
 						s.username = parsedAddr.BaseAddress() // Use base address (without @SUFFIX)
 					} else {
 						s.username = username // Fallback
@@ -550,16 +562,22 @@ func (s *Session) authenticateUser(username, password string) error {
 						}
 					}
 
-					// Track successful authentication
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+					// Track successful authentication using resolved email
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, s.username, true)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
-					if addr, err := server.NewAddress(username); err == nil {
+					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
 						metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
 					}
 
 					// Single consolidated log for authentication success
-					s.InfoLog("authentication successful", "cached", true, "method", "cache")
+					duration := time.Since(authStart)
+					s.InfoLog("authentication successful",
+						"address", s.username,
+						"backend", "none", // Cache hit - no backend yet
+						"method", "cache",
+						"cached", true,
+						"duration", duration.Seconds())
 
 					return nil // Authentication complete from cache
 				} else {
@@ -714,18 +732,23 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.accountID = routingInfo.AccountID
 				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
 				s.routingInfo = routingInfo
-				// Use the actual email (without token) for backend impersonation
+
+				// Determine the resolved email for caching and backend impersonation
+				// Use ActualEmail from prelookup response if available, otherwise derive from username
+				var resolvedEmail string
 				if routingInfo.ActualEmail != "" {
-					s.username = routingInfo.ActualEmail
+					resolvedEmail = routingInfo.ActualEmail
 				} else if masterAuthValidated {
-					s.username = usernameForPrelookup // Base address already
+					resolvedEmail = usernameForPrelookup // Base address already
 				} else {
-					s.username = username // Fallback to original
+					resolvedEmail = username // Fallback to original
 				}
+				s.username = resolvedEmail // Use for backend impersonation
 
 				// Cache successful authentication with routing info
+				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
+				// BUT store ActualEmail so cache hits can use the resolved address
 				// Always hash password, even for master auth, to prevent cache bypass
-				// This ensures different passwords don't match the same cache entry
 				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
@@ -734,6 +757,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
 						PasswordHash:           passwordHash,
+						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 						ServerAddress:          routingInfo.ServerAddress,
 						RemoteTLS:              routingInfo.RemoteTLS,
 						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
@@ -745,10 +769,12 @@ func (s *Session) authenticateUser(username, password string) error {
 					})
 				}
 
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
+				// Use resolvedEmail for rate limiting (not submitted username with token)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, resolvedEmail, true)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
-				// For metrics, use username as-is (may contain token, but that's ok for tracking)
-				if addr, err := server.NewAddress(username); err == nil {
+
+				// For metrics, use resolvedEmail for accurate tracking
+				if addr, err := server.NewAddress(resolvedEmail); err == nil {
 					metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
 					metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
 				}
@@ -758,7 +784,13 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					method = "master"
 				}
-				s.InfoLog("authentication successful", "cached", false, "method", method)
+				duration := time.Since(authStart)
+				s.InfoLog("authentication successful",
+					"address", s.username,
+					"backend", "none", // Backend not connected yet at this point
+					"method", method,
+					"cached", false,
+					"duration", duration.Seconds())
 
 				return nil // Authentication complete
 
@@ -904,7 +936,13 @@ func (s *Session) authenticateUser(username, password string) error {
 	if masterAuthValidated {
 		method = "master"
 	}
-	s.InfoLog("authentication successful", "cached", false, "method", method)
+	duration := time.Since(authStart)
+	s.InfoLog("authentication successful",
+		"address", s.username,
+		"backend", "none", // Backend not connected yet at this point
+		"method", method,
+		"cached", false,
+		"duration", duration.Seconds())
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
@@ -1158,9 +1196,6 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend authentication successful")
 
-	// Log authentication at INFO level with routing method
-	s.InfoLog("authenticated", "method", s.routingMethod)
-
 	return nil
 }
 
@@ -1265,7 +1300,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.InfoLog("disconnected", "duration", duration)
+	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 
 	// Decrement current connections metric
 	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()

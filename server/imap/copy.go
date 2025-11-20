@@ -11,7 +11,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	// First phase: Read session state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[COPY] Failed to acquire read lock within timeout")
+		s.DebugLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -21,7 +21,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 
 	if s.selectedMailbox == nil {
 		release()
-		s.DebugLog("[COPY] copy failed: no mailbox selected")
+		s.DebugLog("copy failed: no mailbox selected")
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -40,7 +40,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[COPY] copy failed: destination mailbox '%s' does not exist", mboxName)
+			s.DebugLog("copy failed: destination mailbox does not exist", "mailbox", mboxName)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeTryCreate,
@@ -56,7 +56,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to check insert permission on destination: %v", err)
 	}
 	if !hasInsertRight {
-		s.DebugLog("[COPY] user does not have insert permission on destination mailbox '%s'", mboxName)
+		s.DebugLog("user does not have insert permission on destination", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -100,7 +100,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		DestUIDs:    destUIDSet,
 	}
 
-	s.DebugLog("[COPY] messages copied from %s to %s", selectedMailboxName, mboxName)
+	s.DebugLog("messages copied", "from", selectedMailboxName, "to", mboxName)
 
 	return copyData, nil
 }

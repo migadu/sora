@@ -13,13 +13,13 @@ import (
 // GetMetadata implements the GETMETADATA command (RFC 5464).
 // If mailbox is empty string "", retrieves server metadata.
 func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
-	s.DebugLog("[GETMETADATA] Called with mailbox=%q, entries=%v, options=%+v", mailbox, entries, options)
+	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
 
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
 	// SnappyMail webmail incorrectly sends "*" as the mailbox parameter
 	// Reject wildcards with a clear error message
 	if strings.ContainsAny(mailbox, "*%") {
-		s.DebugLog("[GETMETADATA] Rejected wildcard mailbox: %q", mailbox)
+		s.DebugLog("rejected wildcard mailbox", "mailbox", mailbox)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeClientBug,
@@ -41,7 +41,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	if mailbox != "" {
 		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 		if !acquired {
-			s.DebugLog("[GETMETADATA] failed to acquire read lock")
+			s.DebugLog("failed to acquire read lock")
 			return nil, fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
@@ -60,7 +60,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 			return nil, fmt.Errorf("failed to check read permission: %w", err)
 		}
 		if !hasReadRight {
-			s.DebugLog("[GETMETADATA] user does not have read permission on mailbox '%s'", mailbox)
+			s.DebugLog("user does not have read permission", "mailbox", mailbox)
 			return nil, fmt.Errorf("you do not have permission to get metadata for this mailbox")
 		}
 
@@ -71,7 +71,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	// Fetch metadata from database
 	result, err := s.server.rdb.GetMetadataWithRetry(s.ctx, s.AccountID(), mailboxID, entries, options)
 	if err != nil {
-		s.DebugLog("[GETMETADATA] failed to get metadata: %v", err)
+		s.DebugLog("failed to get metadata", "error", err)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -108,7 +108,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 	if mailbox != "" {
 		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 		if !acquired {
-			s.DebugLog("[SETMETADATA] failed to acquire read lock")
+			s.DebugLog("failed to acquire read lock")
 			return fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
@@ -138,7 +138,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 				return fmt.Errorf("failed to check write permission: %w", err)
 			}
 			if !hasWriteRight {
-				s.DebugLog("[SETMETADATA] user does not have write permission on mailbox '%s'", mailbox)
+				s.DebugLog("user does not have write permission", "mailbox", mailbox)
 				return fmt.Errorf("you do not have permission to set shared metadata for this mailbox")
 			}
 		} else {
@@ -148,7 +148,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 				return fmt.Errorf("failed to check lookup permission: %w", err)
 			}
 			if !hasLookupRight {
-				s.DebugLog("[SETMETADATA] user does not have lookup permission on mailbox '%s'", mailbox)
+				s.DebugLog("user does not have lookup permission", "mailbox", mailbox)
 				return fmt.Errorf("you do not have permission to set metadata for this mailbox")
 			}
 		}
@@ -170,7 +170,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 		// Check if it's a metadata-specific error
 		var metaErr *db.MetadataError
 		if errors.As(err, &metaErr) {
-			s.DebugLog("[SETMETADATA] metadata limit exceeded: %v", metaErr)
+			s.DebugLog("metadata limit exceeded", "error", metaErr)
 
 			// Map MetadataError types to proper IMAP response codes
 			var responseCode imap.ResponseCode
@@ -193,7 +193,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 		}
 
-		s.DebugLog("[SETMETADATA] failed to set metadata: %v", err)
+		s.DebugLog("failed to set metadata", "error", err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,

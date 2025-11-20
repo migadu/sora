@@ -42,7 +42,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[APPEND] mailbox '%s' does not exist", mboxName)
+			s.DebugLog("mailbox does not exist", "mailbox", mboxName)
 			imapErr := &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeTryCreate,
@@ -62,7 +62,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to check insert permission: %v", err)
 	}
 	if !hasInsertRight {
-		s.DebugLog("[APPEND] user does not have insert permission on mailbox '%s'", mboxName)
+		s.DebugLog("user does not have insert permission", "mailbox", mboxName)
 		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -84,7 +84,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// Check if the message exceeds the configured APPENDLIMIT
 	if s.server.appendLimit > 0 && int64(len(fullMessageBytes)) > s.server.appendLimit {
-		s.DebugLog("[APPEND] message size %d bytes exceeds APPENDLIMIT of %d bytes", len(fullMessageBytes), s.server.appendLimit)
+		s.DebugLog("message size exceeds APPENDLIMIT", "size", len(fullMessageBytes), "limit", s.server.appendLimit)
 		s.classifyAndTrackError("APPEND", nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig})
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -102,7 +102,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	} else {
 		// Log if headers are not clearly separated. rawHeadersText will be empty.
 		// This might indicate a malformed email or an email with only headers and no body separator.
-		s.DebugLog("[APPEND] Could not find standard header/body separator (\\r\\n\\r\\n) in message. Raw headers field will be empty.")
+		s.DebugLog("could not find standard header/body separator in message")
 	}
 
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
@@ -136,7 +136,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	extractedPlaintext, err := helpers.ExtractPlaintextBody(messageContent)
 	var actualPlaintextBody string
 	if err != nil {
-		s.DebugLog("[APPEND] failed to extract plaintext body: %v. Using empty string for database.", err)
+		s.DebugLog("failed to extract plaintext body, using empty string", "error", err)
 		// Continue with the append operation even if plaintext body extraction fails,
 		// actualPlaintextBody is already initialized to an empty string.
 	} else if extractedPlaintext != nil {
@@ -199,7 +199,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection
 	if s.ctx.Err() != nil {
-		s.DebugLog("[APPEND] request aborted after message insertion, aborting session state update")
+		s.DebugLog("request aborted after message insertion")
 		// We've already inserted the message successfully, so still return success
 		success = true
 		return &imap.AppendData{
@@ -211,7 +211,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Update the session's message count and notify the tracker if needed
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[APPEND] Failed to acquire write lock within timeout, returning success without session state update")
+		s.DebugLog("failed to acquire write lock within timeout")
 		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
@@ -225,7 +225,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {
-		s.DebugLog("[APPEND] request aborted during mutex acquisition, aborting session state update")
+		s.DebugLog("request aborted during mutex acquisition")
 		success = true
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
@@ -242,7 +242,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		// See test: TestIMAP_AppendOperation/Draft_Replacement_-_Same_Message-ID
 		actualCount, _, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(s.ctx, mailbox.ID)
 		if err != nil {
-			s.DebugLog("[APPEND] Failed to get message count after append: %v", err)
+			s.DebugLog("failed to get message count after append", "error", err)
 			// Fall back to incrementing, which may be incorrect but prevents complete failure
 			actualCount = int(s.currentNumMessages.Add(1))
 		} else {
@@ -253,7 +253,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			s.mailboxTracker.QueueNumMessages(uint32(actualCount))
 		} else {
 			// This would indicate an inconsistent state if a mailbox is selected but has no tracker.
-			s.DebugLog("[APPEND] Inconsistent state: selectedMailbox ID %d is set, but mailboxTracker is nil.", s.selectedMailbox.ID)
+			s.DebugLog("inconsistent state: mailbox selected but tracker is nil", "mailbox_id", s.selectedMailbox.ID)
 		}
 	}
 
@@ -271,7 +271,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	success = true
 
-	s.DebugLog("[APPEND] Successfully appended message to '%s': UID=%d, UIDValidity=%d", mboxName, messageUID, mailbox.UIDValidity)
+	s.DebugLog("successfully appended message", "mailbox", mboxName, "uid", messageUID, "uidvalidity", mailbox.UIDValidity)
 
 	return &imap.AppendData{
 		UID:         imap.UID(messageUID),

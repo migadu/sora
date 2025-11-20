@@ -32,6 +32,7 @@ type CacheEntry struct {
 	AccountID      int64
 	HashedPassword string // Stored password hash from database (for backend auth)
 	PasswordHash   string // SHA-256 hash of plaintext password for comparison
+	ActualEmail    string // Resolved email address (different from cache key if token-based auth)
 
 	// Routing data (for proxy)
 	ServerAddress          string

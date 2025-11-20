@@ -33,7 +33,7 @@ import (
 //
 // This command does not require any special permissions.
 func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
-	s.DebugLog("[MYRIGHTS] mailbox: %s", mailbox)
+	s.DebugLog("MYRIGHTS command", "mailbox", mailbox)
 
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -75,7 +75,7 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 	// Convert string rights to RightSet
 	rightSet := stringToRightSet(rights)
 
-	s.DebugLog("[MYRIGHTS] user has rights '%s' on mailbox '%s'", rights, mailbox)
+	s.DebugLog("user rights retrieved", "rights", rights, "mailbox", mailbox)
 
 	return &imap.MyRightsData{
 		Mailbox: mailbox,
@@ -88,7 +88,7 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 //
 // The user must have either the 'l' (lookup) or 'a' (admin) right on the mailbox.
 func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
-	s.DebugLog("[GETACL] mailbox: %s", mailbox)
+	s.DebugLog("GETACL command", "mailbox", mailbox)
 
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -132,7 +132,7 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 	}
 
 	if !hasLookup && !hasAdmin {
-		s.DebugLog("[GETACL] user does not have permission to view ACL for mailbox '%s'", mailbox)
+		s.DebugLog("user does not have permission to view ACL", "mailbox", mailbox)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -156,7 +156,7 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 		})
 	}
 
-	s.DebugLog("[GETACL] returning %d ACL entries for mailbox '%s'", len(aclList), mailbox)
+	s.DebugLog("returning ACL entries", "count", len(aclList), "mailbox", mailbox)
 
 	return &imap.GetACLData{
 		Mailbox: mailbox,
@@ -169,7 +169,7 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 //
 // The user must have the 'a' (admin) right on the mailbox.
 func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
-	s.DebugLog("[SETACL] mailbox: %s, identifier: %s, modification: %v, rights: %v", mailbox, identifier, modification, rights)
+	s.DebugLog("SETACL command", "mailbox", mailbox, "identifier", identifier, "modification", modification, "rights", rights)
 
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -208,7 +208,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 		return s.internalError("failed to check admin permission: %v", err)
 	}
 	if !hasAdmin {
-		s.DebugLog("[SETACL] user does not have admin permission on mailbox '%s'", mailbox)
+		s.DebugLog("user does not have admin permission", "mailbox", mailbox)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -289,7 +289,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 		if err != nil {
 			return s.internalError("failed to revoke access: %v", err)
 		}
-		s.DebugLog("[SETACL] revoked all rights for identifier '%s' on mailbox '%s'", identifierStr, mailbox)
+		s.DebugLog("revoked all rights", "identifier", identifierStr, "mailbox", mailbox)
 		return nil
 	}
 
@@ -299,7 +299,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 		return s.internalError("failed to grant access: %v", err)
 	}
 
-	s.DebugLog("[SETACL] granted rights '%s' to identifier '%s' on mailbox '%s'", finalRights, identifierStr, mailbox)
+	s.DebugLog("granted rights", "rights", finalRights, "identifier", identifierStr, "mailbox", mailbox)
 	return nil
 }
 
@@ -309,7 +309,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 // This is equivalent to SetACL with RightModificationReplace and empty rights.
 // The user must have the 'a' (admin) right on the mailbox.
 func (s *IMAPSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier) error {
-	s.DebugLog("[DELETEACL] mailbox: %s, identifier: %s", mailbox, identifier)
+	s.DebugLog("DELETEACL command", "mailbox", mailbox, "identifier", identifier)
 
 	// Use SetACL with empty rights and replace modification
 	return s.SetACL(mailbox, identifier, imap.RightModificationReplace, imap.RightSet{})
@@ -320,7 +320,7 @@ func (s *IMAPSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier
 //
 // The user must have the 'a' (admin) right on the mailbox.
 func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
-	s.DebugLog("[LISTRIGHTS] mailbox: %s, identifier: %s", mailbox, identifier)
+	s.DebugLog("LISTRIGHTS command", "mailbox", mailbox, "identifier", identifier)
 
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -359,7 +359,7 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 		return nil, s.internalError("failed to check admin permission: %v", err)
 	}
 	if !hasAdmin {
-		s.DebugLog("[LISTRIGHTS] user does not have admin permission on mailbox '%s'", mailbox)
+		s.DebugLog("user does not have admin permission", "mailbox", mailbox)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -386,7 +386,7 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 	// Optional rights: all ACL rights (lrswipkxtea)
 	allRights := stringToRightSet(db.AllACLRights)
 
-	s.DebugLog("[LISTRIGHTS] returning available rights for '%s' on mailbox '%s'", identifierEmail, mailbox)
+	s.DebugLog("returning available rights", "identifier", identifierEmail, "mailbox", mailbox)
 
 	return &imap.ListRightsData{
 		Mailbox:        mailbox,

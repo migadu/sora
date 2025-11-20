@@ -29,16 +29,8 @@ type Session struct {
 // logFunc is the type for logger functions (Info, Debug, Warn, Error)
 type logFunc func(msg string, keyvals ...any)
 
-// log is the common logging implementation for all log levels
-func (s *Session) log(logFn logFunc, format string, args ...any) {
-	// Build connection info - show proxy= when proxied, remote= when direct
-	var connInfo string
-	if s.ProxyIP != "" {
-		connInfo = fmt.Sprintf("remote=%s proxy=%s", s.RemoteIP, s.ProxyIP)
-	} else {
-		connInfo = fmt.Sprintf("remote=%s", s.RemoteIP)
-	}
-
+// log is the common logging implementation for all log levels with structured key-value pairs
+func (s *Session) log(logFn logFunc, msg string, keysAndValues ...any) {
 	// Build protocol prefix with server name if available
 	var protocolPrefix string
 	if s.ServerName != "" {
@@ -48,11 +40,18 @@ func (s *Session) log(logFn logFunc, format string, args ...any) {
 	}
 
 	// Build base keyvals
-	baseKeyvals := []any{"protocol", protocolPrefix, "conn", connInfo}
+	baseKeyvals := []any{"protocol", protocolPrefix, "remote", s.RemoteIP}
 
-	// Add user and account_id separately if authenticated
+	// Add proxy IP if connection came through PROXY protocol
+	if s.ProxyIP != "" {
+		baseKeyvals = append(baseKeyvals, "proxy", s.ProxyIP)
+	}
+
+	// Always add user and account_id for consistent log structure (empty string/0 if not authenticated)
 	if s.User != nil {
 		baseKeyvals = append(baseKeyvals, "user", s.FullAddress(), "account_id", s.AccountID())
+	} else {
+		baseKeyvals = append(baseKeyvals, "user", "", "account_id", 0)
 	}
 
 	// Add session ID
@@ -68,20 +67,23 @@ func (s *Session) log(logFn logFunc, format string, args ...any) {
 		}
 	}
 
-	// Add the formatted message
-	baseKeyvals = append(baseKeyvals, "msg", fmt.Sprintf(format, args...))
+	// Add the provided key-value pairs
+	baseKeyvals = append(baseKeyvals, keysAndValues...)
 
-	logFn("Session", baseKeyvals...)
+	logFn(msg, baseKeyvals...)
 }
 
-func (s *Session) InfoLog(format string, args ...any) {
-	s.log(logger.Info, format, args...)
+// InfoLog logs at INFO level with session context and structured key-value pairs
+func (s *Session) InfoLog(msg string, keysAndValues ...any) {
+	s.log(logger.Info, msg, keysAndValues...)
 }
 
-func (s *Session) DebugLog(format string, args ...any) {
-	s.log(logger.Debug, format, args...)
+// DebugLog logs at DEBUG level with session context and structured key-value pairs
+func (s *Session) DebugLog(msg string, keysAndValues ...any) {
+	s.log(logger.Debug, msg, keysAndValues...)
 }
 
-func (s *Session) WarnLog(format string, args ...any) {
-	s.log(logger.Warn, format, args...)
+// WarnLog logs at WARN level with session context and structured key-value pairs
+func (s *Session) WarnLog(msg string, keysAndValues ...any) {
+	s.log(logger.Warn, msg, keysAndValues...)
 }

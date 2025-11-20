@@ -22,15 +22,11 @@ func (l *ProxySessionLogger) log(logFn logFunc, msg string, keysAndValues ...any
 
 	allKeyvals := []any{"proto", l.Protocol, "name", l.ServerName, "remote", remoteAddr}
 
-	// Add user email if available
-	if l.Username != "" {
-		allKeyvals = append(allKeyvals, "user", l.Username)
-	}
+	// Always add user email (empty string if not set for consistent log structure)
+	allKeyvals = append(allKeyvals, "user", l.Username)
 
-	// Add account_id if available
-	if l.AccountID > 0 {
-		allKeyvals = append(allKeyvals, "account_id", l.AccountID)
-	}
+	// Always add account_id (0 if not set for consistent log structure)
+	allKeyvals = append(allKeyvals, "account_id", l.AccountID)
 
 	// Add JA4 fingerprint if available
 	if ja4Provider, ok := l.ClientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {

@@ -17,7 +17,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	// Acquire read mutex to safely read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[MOVE] Failed to acquire read lock within timeout")
+		s.DebugLog("failed to acquire read lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -27,7 +27,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	if s.selectedMailbox == nil {
 		release() // Release read lock
-		s.DebugLog("[MOVE] no mailbox selected")
+		s.DebugLog("no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -43,7 +43,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	// Perform database operations outside of lock
 	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), dest)
 	if err != nil {
-		s.DebugLog("[MOVE] destination mailbox '%s' not found: %v", dest, err)
+		s.DebugLog("destination mailbox not found", "mailbox", dest, "error", err)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTryCreate,
@@ -57,7 +57,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		return s.internalError("failed to check insert permission on destination: %v", err)
 	}
 	if !hasInsertRight {
-		s.DebugLog("[MOVE] user does not have insert permission on destination mailbox '%s'", dest)
+		s.DebugLog("user does not have insert permission on destination mailbox", "mailbox", dest)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -75,7 +75,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		return s.internalError("failed to check expunge permission on source: %v", err)
 	}
 	if !hasDeleteRight || !hasExpungeRight {
-		s.DebugLog("[MOVE] user does not have delete/expunge permission on source mailbox")
+		s.DebugLog("user does not have delete/expunge permission on source mailbox")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -85,7 +85,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before proceeding
 	if s.ctx.Err() != nil {
-		s.DebugLog("[MOVE] request aborted before message retrieval, aborting operation")
+		s.DebugLog("request aborted before message retrieval")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",
@@ -104,7 +104,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Check if the context is still valid before attempting the move
 	if s.ctx.Err() != nil {
-		s.DebugLog("[MOVE] request aborted before moving messages, aborting operation")
+		s.DebugLog("request aborted before moving messages")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Session closed during move operation",
@@ -135,17 +135,17 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			return s.internalError("failed to write COPYUID: %v", err)
 		}
 	} else {
-		s.DebugLog("[MOVE] no messages were moved (potentially already expunged), skipping COPYUID response")
+		s.DebugLog("no messages were moved, skipping COPYUID response")
 	}
 
 	isTrashFolder := strings.EqualFold(dest, "Trash") || dest == consts.MailboxTrash
 	if isTrashFolder && len(mappedDestUIDs) > 0 {
-		s.DebugLog("[MOVE] automatically marking %d moved messages as seen in Trash folder", len(mappedDestUIDs))
+		s.DebugLog("automatically marking moved messages as seen in Trash folder", "count", len(mappedDestUIDs))
 
 		for _, uid := range mappedDestUIDs {
 			_, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
 			if err != nil {
-				s.DebugLog("[MOVE] failed to mark message UID %d as seen in Trash: %v", uid, err)
+				s.DebugLog("failed to mark message as seen in Trash", "uid", uid, "error", err)
 				// Continue with other messages even if one fails
 			}
 		}

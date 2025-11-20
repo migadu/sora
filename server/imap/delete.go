@@ -12,7 +12,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	// First phase: Read-only validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[DELETE] Failed to acquire read lock")
+		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for delete")
 	}
 	AccountID := s.AccountID()
@@ -21,7 +21,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	// Check if special mailbox - no lock needed
 	for _, specialMailbox := range consts.DefaultMailboxes {
 		if strings.EqualFold(mboxName, specialMailbox) {
-			s.DebugLog("[DELETE] attempt to delete special mailbox '%s'", mboxName)
+			s.DebugLog("attempt to delete special mailbox", "mailbox", mboxName)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
@@ -34,7 +34,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.DebugLog("[DELETE] mailbox '%s' not found", mboxName)
+			s.DebugLog("mailbox not found", "mailbox", mboxName)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -50,7 +50,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		return s.internalError("failed to check delete permission: %v", err)
 	}
 	if !hasDeleteRight {
-		s.DebugLog("[DELETE] user does not have delete permission on mailbox '%s'", mboxName)
+		s.DebugLog("user does not have delete permission on mailbox", "mailbox", mboxName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -61,7 +61,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	// RFC 3501 Section 6.3.4: It is an error to delete a mailbox that has
 	// inferior hierarchical names.
 	if mailbox.HasChildren {
-		s.DebugLog("[DELETE] attempt to delete mailbox '%s' which has children", mboxName)
+		s.DebugLog("attempt to delete mailbox which has children", "mailbox", mboxName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: fmt.Sprintf("Mailbox '%s' has children and cannot be deleted.", mboxName),
@@ -75,6 +75,6 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}
 
-	s.DebugLog("[DELETE] mailbox deleted: %s", mboxName)
+	s.DebugLog("mailbox deleted", "mailbox", mboxName)
 	return nil
 }

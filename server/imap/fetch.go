@@ -56,7 +56,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.WarnLog("[FETCH] Failed to acquire read lock within timeout")
+		s.WarnLog("failed to acquire read lock within timeout")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
@@ -66,7 +66,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	if s.selectedMailbox == nil {
 		release()
-		s.DebugLog("[FETCH] no mailbox selected")
+		s.DebugLog("no mailbox selected")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
@@ -91,8 +91,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	// Check if mailbox changed during our operation
 	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.WarnLog("[FETCH] WARNING: Mailbox changed during FETCH operation (modseq %d -> %d)",
-			modSeqSnapshot, s.currentHighestModSeq.Load())
+		s.WarnLog("mailbox changed during FETCH operation", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
 		// For sequence sets, this could mean we fetched wrong messages
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
 			// Re-decode and re-fetch to ensure consistency
@@ -111,7 +110,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	// CONDSTORE functionality - only process if capability is enabled
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
-		s.DebugLog("[FETCH] CONDSTORE: FETCH with CHANGEDSINCE %d", options.ChangedSince)
+		s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
 		var filteredMessages []db.Message
 
 		for _, msg := range messages {
@@ -127,12 +126,10 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			}
 
 			if uint64(highestModSeq) > options.ChangedSince {
-				s.DebugLog("[FETCH] CONDSTORE: Including message UID %d with MODSEQ %d > CHANGEDSINCE %d",
-					msg.UID, highestModSeq, options.ChangedSince)
+				s.DebugLog("CONDSTORE including message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
 				filteredMessages = append(filteredMessages, msg)
 			} else {
-				s.DebugLog("[FETCH] CONDSTORE: Skipping message UID %d with MODSEQ %d <= CHANGEDSINCE %d",
-					msg.UID, highestModSeq, options.ChangedSince)
+				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
 			}
 		}
 
@@ -143,7 +140,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	// and will detect any issues with the individual message sequence numbers
 
 	if sessionTrackerSnapshot == nil {
-		s.DebugLog("[FETCH] session tracker is nil, cannot process messages")
+		s.DebugLog("session tracker is nil, cannot process messages")
 		return nil
 	}
 
@@ -171,13 +168,13 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
 func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, sessionTracker *imapserver.SessionTracker) error {
-	s.DebugLog("[FETCH] fetching message UID %d SEQNUM %d", msg.UID, msg.Seq)
+	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 	encodedSeqNum := sessionTracker.EncodeSeqNum(msg.Seq)
 
 	if encodedSeqNum == 0 {
 		// The sequence number from the database doesn't map to a valid client sequence number
 		// This can happen when the mailbox has been modified by another session
-		s.DebugLog("[FETCH] Skipping message UID %d with unmappable sequence number %d", msg.UID, msg.Seq)
+		s.DebugLog("skipping message with unmappable sequence number", "uid", msg.UID, "seq", msg.Seq)
 		return nil
 	}
 
@@ -191,7 +188,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 	if markSeen {
 		newFlagsComplete, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 		if err != nil {
-			s.DebugLog("[FETCH] failed to set \\Seen flag for message UID %d: %v", msg.UID, err)
+			s.DebugLog("failed to set seen flag", "uid", msg.UID, "error", err)
 		} else {
 			systemFlags, customKeywords := db.SplitFlags(newFlagsComplete)
 			msg.BitwiseFlags = db.FlagsToBitwise(systemFlags)
@@ -207,7 +204,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 	// Ensure m.Close() is called for this message, even if errors occur mid-processing.
 	defer func() {
 		if closeErr := m.Close(); closeErr != nil {
-			s.DebugLog("[FETCH] error closing FetchResponseWriter for UID %d (seq %d): %v", msg.UID, encodedSeqNum, closeErr)
+			s.DebugLog("error closing FetchResponseWriter", "uid", msg.UID, "seq", encodedSeqNum, "error", closeErr)
 		}
 	}()
 
@@ -251,7 +248,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 					return err
 				}
 			} else {
-				s.DebugLog("[FETCH] BINARY section requests ignored due to capability filtering")
+				s.DebugLog("BINARY section requests ignored due to capability filtering")
 			}
 		}
 
@@ -261,7 +258,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 					return err
 				}
 			} else {
-				s.DebugLog("[FETCH] BINARY section size requests ignored due to capability filtering")
+				s.DebugLog("BINARY section size requests ignored due to capability filtering")
 			}
 		}
 	}
@@ -278,7 +275,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 			highestModSeq = *msg.ExpungedModSeq
 		}
 
-		s.DebugLog("[FETCH] writing MODSEQ %d for message UID %d", highestModSeq, msg.UID)
+		s.DebugLog("writing MODSEQ", "modseq", highestModSeq, "uid", msg.UID)
 
 		m.WriteModSeq(uint64(highestModSeq))
 	}
@@ -326,7 +323,7 @@ func (s *IMAPSession) ensureBodyDataLoaded(msg *db.Message, bodyData *[]byte, bo
 		*bodyData, fetchErr = s.getMessageBody(msg)
 		*bodyDataFetched = true // Mark as fetched even if error or nil data, to prevent re-fetching.
 		if fetchErr != nil {
-			s.DebugLog("[FETCH] UID %d: Failed to get message body: %v", msg.UID, fetchErr)
+			s.DebugLog("failed to get message body", "uid", msg.UID, "error", fetchErr)
 			return fetchErr // Propagate error to allow handlers to decide how to proceed (e.g., return NIL)
 		}
 	}
@@ -399,17 +396,17 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 						sectionContent = extractPartial(sectionContent, section.Partial)
 					}
 					satisfiedFromDB = true
-					s.DebugLog("[FETCH] UID %d: Served BODY[HEADER.FIELDS (...)] from message_contents.headers", msg.UID)
+					s.DebugLog("served BODY HEADER.FIELDS from database", "uid", msg.UID)
 				} else {
-					s.DebugLog("[FETCH] UID %d: Error parsing DB headers for HEADER.FIELDS: %v. Falling back.", msg.UID, parseErr)
+					s.DebugLog("error parsing DB headers for HEADER.FIELDS, falling back", "uid", msg.UID, "error", parseErr)
 					extractionErr = parseErr // Signal to fallback to full body parsing
 				}
 			} else {
 				if dbErr != nil {
-					s.DebugLog("[FETCH] UID %d: Failed to get headers from DB for BODY[HEADER.FIELDS] ('%v'). Falling back.", msg.UID, dbErr)
+					s.DebugLog("failed to get headers from DB for BODY HEADER.FIELDS, falling back", "uid", msg.UID, "error", dbErr)
 					extractionErr = dbErr // Signal to fallback
 				} else {
-					s.DebugLog("[FETCH] UID %d: Headers from DB for BODY[HEADER.FIELDS] are empty. Falling back.", msg.UID)
+					s.DebugLog("headers from DB for BODY HEADER.FIELDS are empty, falling back", "uid", msg.UID)
 					// extractionErr remains nil, fallback will happen due to !satisfiedFromDB
 				}
 			}
@@ -427,12 +424,12 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 					sectionContent = extractPartial(sectionContent, section.Partial)
 				}
 				satisfiedFromDB = true
-				s.DebugLog("[FETCH] UID %d: Served BODY[HEADER] from message_contents.headers", msg.UID)
+				s.DebugLog("served BODY HEADER from database", "uid", msg.UID)
 			} else {
 				if dbErr != nil {
-					s.DebugLog("[FETCH] UID %d: Failed to get headers from DB for BODY[HEADER] ('%v'). Falling back.", msg.UID, dbErr)
+					s.DebugLog("failed to get headers from DB for BODY HEADER, falling back", "uid", msg.UID, "error", dbErr)
 				} else {
-					s.DebugLog("[FETCH] UID %d: Headers from DB for BODY[HEADER] are empty. Falling back.", msg.UID)
+					s.DebugLog("headers from DB for BODY HEADER are empty, falling back", "uid", msg.UID)
 				}
 			}
 		}
@@ -446,14 +443,14 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		// or if it's a complex section type that always requires full body.
 		if !satisfiedFromDB || extractionErr != nil {
 			if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
-				s.DebugLog("[FETCH] UID %d: Error ensuring body data loaded for section %v: %v", msg.UID, section, loadErr)
+				s.DebugLog("error ensuring body data loaded", "uid", msg.UID, "error", loadErr)
 				// sectionContent will be nil, handled below
 			}
 
 			if *bodyData != nil { // Only extract if bodyData was successfully loaded
 				sectionContent = imapserver.ExtractBodySection(bytes.NewReader(*bodyData), section) // section is *FetchItemBodySection
 			} else {
-				s.DebugLog("[FETCH] UID %d: Body data is nil for section %v. Returning empty.", msg.UID, section)
+				s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
 				// sectionContent remains nil, will be set to []byte{} below
 			}
 		}
@@ -480,7 +477,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		// Try cache first
 		data, err := s.server.cache.Get(msg.ContentHash)
 		if err == nil && data != nil {
-			s.DebugLog("[FETCH] cache hit for UID %d", msg.UID)
+			s.DebugLog("cache hit", "uid", msg.UID)
 			// Track memory usage for cached data
 			if s.memTracker != nil {
 				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
@@ -492,7 +489,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		}
 
 		// Fallback to S3
-		s.DebugLog("[FETCH] cache miss fetching UID %d from S3 (%s)", msg.UID, msg.ContentHash)
+		s.DebugLog("cache miss, fetching from S3", "uid", msg.UID, "content_hash", msg.ContentHash)
 		// Use the stored S3 key components from the message record to prevent race conditions
 		// if the user's primary email has changed since the message was stored.
 		if msg.S3Domain == "" || msg.S3Localpart == "" {
@@ -523,7 +520,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 
 	// If not uploaded to S3, fetch from local disk
-	s.DebugLog("[FETCH] fetching not yet uploaded message UID %d from disk", msg.UID)
+	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 	data, err := os.ReadFile(filePath)
 	if err != nil {

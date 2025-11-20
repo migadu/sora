@@ -71,7 +71,7 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 		if fingerprint, err := s.ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 			s.ja4Fingerprint = fingerprint
 			s.ja4Conn = nil
-			s.InfoLog("[JA4] Captured fingerprint during lazy evaluation: %s", s.ja4Fingerprint)
+			s.InfoLog("JA4 fingerprint captured during lazy evaluation", "fingerprint", s.ja4Fingerprint)
 
 			// Re-initialize capabilities from server defaults
 			s.sessionCaps = make(imap.CapSet)
@@ -113,8 +113,7 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		} else {
 			clientInfo = "unknown client"
 		}
-		s.InfoLog("Applied capability filters for %s: disabled %v, %d/%d capabilities enabled",
-			clientInfo, disabledCaps, len(s.sessionCaps), originalCapCount)
+		s.InfoLog("capability filters applied", "client", clientInfo, "disabled", disabledCaps, "enabled", len(s.sessionCaps), "total", originalCapCount)
 	}
 }
 
@@ -217,21 +216,19 @@ func (s *IMAPSession) Close() error {
 		peak := s.memTracker.Peak()
 		metrics.SessionMemoryPeakBytes.WithLabelValues("imap").Observe(float64(peak))
 		if peak > 0 {
-			s.InfoLog("session memory - peak: %s", server.FormatBytes(peak))
+			s.InfoLog("session memory peak", "bytes", server.FormatBytes(peak))
 		}
 	}
 
-	totalCount := s.server.totalConnections.Add(-1)
-	var authCount int64 = 0
+	s.server.totalConnections.Add(-1)
 
 	// Prometheus metrics - connection closed
 	metrics.ConnectionsCurrent.WithLabelValues("imap").Dec()
 
 	if s.IMAPUser != nil {
-		authCount = s.server.authenticatedConnections.Add(-1)
+		s.server.authenticatedConnections.Add(-1)
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
-		s.InfoLog("closing session for user: %v (connections: total=%d, authenticated=%d)",
-			s.IMAPUser.FullAddress(), totalCount, authCount)
+		s.InfoLog("closing session")
 
 		// Unregister connection from tracker
 		s.unregisterConnection()
@@ -239,9 +236,7 @@ func (s *IMAPSession) Close() error {
 		s.IMAPUser = nil
 		s.Session.User = nil
 	} else {
-		authCount = s.server.authenticatedConnections.Load()
-		s.InfoLog("client dropped unauthenticated connection (connections: total=%d, authenticated=%d)",
-			totalCount, authCount)
+		s.InfoLog("unauthenticated connection dropped")
 	}
 
 	s.clearSelectedMailboxStateLocked()
@@ -338,14 +333,14 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 	// Acquire read mutex with timeout to protect access to session state
 	if s.ctx.Err() != nil {
-		s.DebugLog("[DECODE] Session context is cancelled, skipping decodeNumSet.")
+		s.DebugLog("session context cancelled, skipping decodeNumSet")
 		// Return unmodified set if context is cancelled
 		return numSet
 	}
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.DebugLog("[DECODE] Failed to acquire read lock for decodeNumSet within timeout")
+		s.DebugLog("failed to acquire read lock for decodeNumSet within timeout")
 		// Return unmodified set if we can't acquire the lock
 		return numSet
 	}
@@ -359,7 +354,7 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 // It uses the server's warmup settings and ensures it only runs once per session.
 func (s *IMAPSession) triggerCacheWarmup() {
 	if s.IMAPUser == nil {
-		s.InfoLog("warmup skipped: no user in session")
+		s.InfoLog("warmup skipped, no user in session")
 		return // Should not happen if called after authentication
 	}
 
@@ -378,7 +373,7 @@ func (s *IMAPSession) triggerCacheWarmup() {
 	err := s.server.WarmupCache(s.server.appCtx, s.AccountID(), s.server.warmupMailboxes, s.server.warmupMessageCount, s.server.warmupAsync)
 	if err != nil {
 		// The WarmupCache method already logs its own errors, so just log a generic failure here.
-		s.InfoLog("cache warmup trigger failed: %v", err)
+		s.InfoLog("cache warmup trigger failed", "error", err)
 	}
 }
 
@@ -393,7 +388,7 @@ func (s *IMAPSession) registerConnection(email string) error {
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration: %v", err)
+			s.InfoLog("connection registration rejected", "error", err)
 			return err
 		}
 	}
@@ -411,7 +406,7 @@ func (s *IMAPSession) unregisterConnection() {
 		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
-			s.InfoLog("Failed to unregister connection: %v", err)
+			s.InfoLog("failed to unregister connection", "error", err)
 		}
 	}
 }
@@ -432,7 +427,7 @@ func (s *IMAPSession) startTerminationPoller() {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connection
-			s.InfoLog("Connection kicked - disconnecting user")
+			s.InfoLog("connection kicked, disconnecting user")
 			s.conn.NetConn().Close()
 		case <-s.ctx.Done():
 			// Session ended normally

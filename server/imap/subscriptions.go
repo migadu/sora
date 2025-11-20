@@ -19,7 +19,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
-		s.InfoLog("[SUBSCRIBE/UNSUBSCRIBE] Failed to acquire read lock")
+		s.InfoLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for subscription update")
 	}
 	AccountID := s.AccountID()
@@ -29,7 +29,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
-			s.InfoLog("Mailbox '%s' does not exist", mailboxName)
+			s.InfoLog("mailbox does not exist", "mailbox", mailboxName)
 			return nil
 		}
 		return s.internalError("failed to fetch mailbox '%s': %v", mailboxName, err)
@@ -45,7 +45,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	if !subscribe {
 		action = "unsubscribed"
 	}
-	s.DebugLog("[SUBSCRIBE] mailbox '%s' %s", mailboxName, action)
+	s.DebugLog("mailbox subscription changed", "mailbox", mailboxName, "action", action)
 
 	return nil
 }
