@@ -1355,7 +1355,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 			if err := ctx.Err(); err != nil {
 				return 0, err
 			}
-			logger.Info("Authentication successful", "address", address, "account_id", cachedAccountID, "cache", "hit")
+			logger.Info("authentication successful", "address", address, "account_id", cachedAccountID, "cached", true, "method", "cache")
 			return cachedAccountID, nil
 		}
 		// Cache miss - continue to database
@@ -1370,7 +1370,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 			// AuthUserNotFound = 1 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 1, password)
 		}
-		logger.Info("Authentication failed", "address", address, "error", err, "cache", "miss")
+		logger.Info("authentication failed", "address", address, "reason", "user_not_found", "cached", false, "method", "main_db")
 		return 0, err
 	}
 
@@ -1381,7 +1381,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2, password)
 		}
-		logger.Info("Authentication failed", "address", address, "error", "invalid password", "cache", "miss")
+		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
 		return 0, err
 	}
 
@@ -1390,7 +1390,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
 	}
 
-	logger.Info("Authentication successful", "address", address, "account_id", accountID, "cache", "miss")
+	logger.Info("authentication successful", "address", address, "account_id", accountID, "cached", false, "method", "main_db")
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {

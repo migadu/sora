@@ -558,6 +558,9 @@ func (s *Session) authenticateUser(username, password string) error {
 						metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
 					}
 
+					// Single consolidated log for authentication success
+					s.InfoLog("authentication successful", "cached", true, "method", "cache")
+
 					return nil // Authentication complete from cache
 				} else {
 					// Different password on positive cache - revalidate if old enough
@@ -749,6 +752,14 @@ func (s *Session) authenticateUser(username, password string) error {
 					metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
 					metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
 				}
+
+				// Single consolidated log for authentication success
+				method := "prelookup"
+				if masterAuthValidated {
+					method = "master"
+				}
+				s.InfoLog("authentication successful", "cached", false, "method", method)
+
 				return nil // Authentication complete
 
 			case proxy.AuthFailed:
@@ -758,7 +769,6 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("prelookup failed but master auth was already validated - routing issue", "user", username)
 				}
-				s.InfoLog("prelookup authentication failed - bad password", "user", username, "cache", "miss")
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
@@ -775,6 +785,10 @@ func (s *Session) authenticateUser(username, password string) error {
 
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+
+				// Single consolidated log for authentication failure
+				s.InfoLog("authentication failed", "reason", "invalid_password", "cached", false, "method", "prelookup")
+
 				return consts.ErrAuthenticationFailed
 
 			case proxy.AuthTemporarilyUnavailable:
@@ -837,11 +851,21 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			s.InfoLog("main DB authentication failed", "user", address.BaseAddress(), "error", err, "cache", "miss")
+			// Determine failure reason for logging
+			reason := "transient_error"
+			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
+				reason = "user_not_found"
+			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
+				reason = "invalid_password"
+			}
 
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
+				strings.Contains(err.Error(), "hashedPassword is not the hash") ||
+				strings.Contains(err.Error(), "user not found")
+
+			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
 					passwordHash := ""
 					if password != "" {
@@ -853,8 +877,12 @@ func (s *Session) authenticateUser(username, password string) error {
 						IsNegative:   true,
 					})
 				}
+				// Single consolidated log for authentication failure
+				s.InfoLog("authentication failed", "reason", reason, "cached", false, "method", "main_db")
 			} else {
-				s.DebugLog("NOT caching transient error - context cancelled", "username", username, "error", err)
+				s.DebugLog("NOT caching transient error - circuit breaker will handle", "username", username, "error", err)
+				// Single consolidated log for authentication failure (transient)
+				s.InfoLog("authentication failed", "reason", reason, "cached", false, "method", "main_db")
 			}
 
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
@@ -867,10 +895,16 @@ func (s *Session) authenticateUser(username, password string) error {
 	s.isPrelookupAccount = false
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
-	s.InfoLog("main DB auth successful", "user", address.BaseAddress(), "account_id", accountID)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
+
+	// Single consolidated log for authentication success
+	method := "main_db"
+	if masterAuthValidated {
+		method = "master"
+	}
+	s.InfoLog("authentication successful", "cached", false, "method", method)
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {

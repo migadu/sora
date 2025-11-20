@@ -393,9 +393,9 @@ func TestLookupCache_CleanupLogsRemovedEntries(t *testing.T) {
 	}
 }
 
-// TestLookupCache_NegativeCacheReturnsError verifies that negative cache hits
-// return an error immediately without requiring a database lookup
-func TestLookupCache_NegativeCacheReturnsError(t *testing.T) {
+// TestLookupCache_NegativeCacheAllowsRevalidation verifies that negative cache entries
+// ALWAYS allow revalidation to handle cases where users are created or passwords changed
+func TestLookupCache_NegativeCacheAllowsRevalidation(t *testing.T) {
 	cache := New(10*time.Second, 10*time.Second, 100, 1*time.Hour, 30*time.Second)
 	defer cache.Stop(context.Background())
 
@@ -405,33 +405,34 @@ func TestLookupCache_NegativeCacheReturnsError(t *testing.T) {
 	// Simulate a failed authentication - cache negative result
 	cache.SetFailure(address, int(AuthUserNotFound), password)
 
-	// First retry with same password - should return error WITHOUT cache miss
+	// Retry with same password - should ALWAYS allow revalidation
+	// This is critical because:
+	// 1. User might not have existed when cached, but could be created later
+	// 2. Password might have been wrong, but could be changed to match
 	cachedID, found, err := cache.Authenticate(address, password)
 
-	// Should return error (cached failure)
-	if err == nil {
-		t.Error("Expected error from cached negative result, got nil")
+	// Should return nil error (allowing revalidation)
+	if err != nil {
+		t.Errorf("Expected nil error (revalidation allowed), got %v", err)
 	}
 
-	// Should NOT be found (no valid positive entry)
+	// Should NOT be found (signals caller to check database)
 	if found {
-		t.Error("Expected found=false for negative cache hit")
+		t.Error("Expected found=false to signal revalidation needed")
 	}
 
 	// Should return 0 account ID
 	if cachedID != 0 {
-		t.Errorf("Expected accountID=0 for negative cache hit, got %d", cachedID)
+		t.Errorf("Expected accountID=0 for revalidation, got %d", cachedID)
 	}
 
-	// Verify stats show a hit (not a miss)
+	// Verify stats show a hit (we found the entry, even though we're allowing revalidation)
 	hits, _, _, _ := cache.GetStats()
 	if hits == 0 {
-		t.Error("Expected cache hit for negative entry, got miss")
+		t.Error("Expected cache hit for negative entry found")
 	}
 
-	// Second retry with different password - should ALWAYS allow revalidation
-	// This is important for legitimate users who mistype and immediately retry with correct password,
-	// or for password change scenarios. Brute force protection is handled at protocol level.
+	// Retry with different password - should also allow revalidation
 	cachedID2, found2, err2 := cache.Authenticate(address, "differentwrongpassword")
 
 	if err2 != nil {
@@ -439,11 +440,11 @@ func TestLookupCache_NegativeCacheReturnsError(t *testing.T) {
 	}
 
 	if found2 {
-		t.Error("Expected found=false (cache miss) for different password")
+		t.Error("Expected found=false (revalidation needed) for different password")
 	}
 
 	if cachedID2 != 0 {
-		t.Errorf("Expected accountID=0 for cache miss, got %d", cachedID2)
+		t.Errorf("Expected accountID=0 for revalidation, got %d", cachedID2)
 	}
 }
 

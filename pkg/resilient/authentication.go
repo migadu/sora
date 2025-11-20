@@ -79,7 +79,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
-		logger.Info("Authentication failed", "address", address, "error", err)
+		// NOTE: No logging here - let the calling server log with proper context
 		return 0, err // Return error from fetching credentials
 	}
 
@@ -89,11 +89,13 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		logger.Info("Authentication failed", "address", address, "error", "invalid password")
+		// NOTE: No logging here - let the calling server log with proper context
+		// (protocol, server name, cached status, etc)
 		return 0, err // Invalid password
 	}
 
-	logger.Info("Authentication successful", "address", address, "account_id", accountID)
+	// NOTE: No logging here - let the calling server log with proper context
+	// Backend servers log with cache=hit/miss, proxy servers log with method and cached status
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {

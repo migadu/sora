@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
@@ -160,20 +159,14 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	// Handle negative cache entries (failed authentication)
 	if entry.Result != AuthSuccess {
 		c.mu.RUnlock()
-		if passwordMatches {
-			// Same wrong password - return cached failure WITHOUT going to database
-			// This prevents repeated attempts with the same wrong password (reduces DB load)
-			logger.Info("Authentication failed (cached)", "address", address, "cache", "hit", "age", time.Since(entry.CreatedAt))
-			// Return error to signal cached failure (don't query database)
-			return 0, false, consts.ErrAuthenticationFailed
-		} else {
-			// Different password - ALWAYS allow revalidation
-			// User might have typed wrong password and is now trying the correct one,
-			// or password was changed and user is trying the new password.
-			// Brute force protection is handled by protocol-level rate limiting.
-			logger.Debug("Auth cache: negative entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
-			return 0, false, nil
-		}
+		// ALWAYS allow revalidation for negative entries, regardless of password match
+		// This is critical because:
+		// 1. User might not have existed when first cached, but could be created later
+		// 2. User's password might have been wrong, but could be changed to match what they tried
+		// 3. We rely on the negative TTL (typically 1 minute) to expire stale failures
+		// 4. Brute force protection is handled by protocol-level rate limiting
+		logger.Debug("Auth cache: negative entry revalidation allowed", "address", address, "same_password", passwordMatches, "age", time.Since(entry.CreatedAt))
+		return 0, false, nil
 	}
 
 	// Positive cache entry - successful authentication previously cached

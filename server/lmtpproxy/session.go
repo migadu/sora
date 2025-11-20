@@ -412,12 +412,14 @@ func (s *Session) handleRecipient(to string) error {
 			// User previously not found - return cached failure
 			// Note: Do NOT refresh negative entries - let them expire naturally so we can
 			// re-check the database in case the user was created since last check
-			s.InfoLog("user not found", "username", s.username, "cache", "hit")
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+
+			// Single consolidated log for lookup failure
+			s.InfoLog("account lookup failed", "reason", "user_not_found", "cached", true, "method", "cache")
+
 			return fmt.Errorf("user not found")
 		} else {
 			// User found - use cached routing info
-			s.InfoLog("using cached routing", "username", s.username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "cache", "hit")
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
 
 			s.accountID = cached.AccountID
@@ -433,6 +435,10 @@ func (s *Session) handleRecipient(to string) error {
 			}
 
 			s.server.lookupCache.Refresh(s.server.name, s.username)
+
+			// Single consolidated log for lookup success
+			s.InfoLog("account lookup successful", "cached", true, "method", "cache")
+
 			return nil
 		}
 	}
@@ -469,11 +475,6 @@ func (s *Session) handleRecipient(to string) error {
 		} else if routingInfo != nil {
 			// Prelookup succeeded - may or may not have ServerAddress
 			// If no ServerAddress, backend selection will use consistent hash/round-robin
-			serverAddr := routingInfo.ServerAddress
-			if serverAddr == "" {
-				serverAddr = "(use consistent hash)"
-			}
-			s.InfoLog("prelookup succeeded", "username", s.username, "server", serverAddr, "account_id", routingInfo.AccountID, "cache", "miss")
 			metrics.PrelookupResult.WithLabelValues("lmtp", "success").Inc()
 			s.routingInfo = routingInfo
 			s.isPrelookupAccount = true
@@ -491,6 +492,9 @@ func (s *Session) handleRecipient(to string) error {
 				Result:                 lookupcache.AuthSuccess,
 				FromPrelookup:          true,
 			})
+
+			// Single consolidated log for lookup success
+			s.InfoLog("account lookup successful", "cached", false, "method", "prelookup")
 
 			return nil
 		} else {
@@ -520,11 +524,13 @@ func (s *Session) handleRecipient(to string) error {
 		}
 
 		// Cache negative result (user not found)
-		s.InfoLog("user not found in main database", "username", s.username, "cache", "miss")
 		s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 			Result:     lookupcache.AuthUserNotFound,
 			IsNegative: true,
 		})
+
+		// Single consolidated log for lookup failure
+		s.InfoLog("account lookup failed", "reason", "user_not_found", "cached", false, "method", "main_db")
 
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
@@ -543,6 +549,9 @@ func (s *Session) handleRecipient(to string) error {
 		Result:           lookupcache.AuthSuccess,
 		FromPrelookup:    false,
 	})
+
+	// Single consolidated log for lookup success
+	s.InfoLog("account lookup successful", "cached", false, "method", "main_db")
 
 	return nil
 }
