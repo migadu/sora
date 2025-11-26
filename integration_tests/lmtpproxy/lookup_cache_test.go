@@ -162,8 +162,8 @@ func TestLMTPProxyLookupCache_NegativeCaching(t *testing.T) {
 	t.Log("✓ Second delivery failed as expected (cache hit)")
 }
 
-// TestLMTPProxyLookupCache_PrelookupCaching verifies that prelookup results are cached
-func TestLMTPProxyLookupCache_PrelookupCaching(t *testing.T) {
+// TestLMTPProxyLookupCache_RemoteLookupCaching verifies that remotelookup results are cached
+func TestLMTPProxyLookupCache_RemoteLookupCaching(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend LMTP server
@@ -174,10 +174,10 @@ func TestLMTPProxyLookupCache_PrelookupCaching(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("lmtpcache-pre-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
-	// Track prelookup calls
-	prelookupCalls := 0
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls++
+	// Track remotelookup calls
+	remotelookupCalls := 0
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls++
 		response := map[string]interface{}{
 			"address": account.Email,
 			"server":  backendServer.Address,
@@ -186,12 +186,12 @@ func TestLMTPProxyLookupCache_PrelookupCaching(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up LMTP proxy with prelookup and cache
+	// Set up LMTP proxy with remotelookup and cache
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupLMTPProxyWithPrelookupAndCache(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupLMTPProxyWithRemoteLookupAndCache(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
 	// Helper to perform LMTP delivery attempt
@@ -228,23 +228,23 @@ func TestLMTPProxyLookupCache_PrelookupCaching(t *testing.T) {
 		return nil
 	}
 
-	// Test 1: First delivery - calls prelookup
+	// Test 1: First delivery - calls remotelookup
 	if err := checkDelivery(); err != nil {
 		t.Fatalf("First delivery failed: %v", err)
 	}
-	if prelookupCalls != 1 {
-		t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls)
+	if remotelookupCalls != 1 {
+		t.Fatalf("Expected 1 remotelookup call, got %d", remotelookupCalls)
 	}
-	t.Log("✓ First delivery succeeded (prelookup called)")
+	t.Log("✓ First delivery succeeded (remotelookup called)")
 
-	// Test 2: Second delivery - uses cache (no prelookup)
+	// Test 2: Second delivery - uses cache (no remotelookup)
 	if err := checkDelivery(); err != nil {
 		t.Fatalf("Second delivery failed: %v", err)
 	}
-	if prelookupCalls != 1 {
-		t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls)
+	if remotelookupCalls != 1 {
+		t.Fatalf("Expected remotelookup calls to remain 1, got %d", remotelookupCalls)
 	}
-	t.Log("✓ Second delivery succeeded (cache hit, no prelookup)")
+	t.Log("✓ Second delivery succeeded (cache hit, no remotelookup)")
 }
 
 // setupLMTPProxyWithCache creates LMTP proxy with caching enabled
@@ -287,11 +287,11 @@ func setupLMTPProxyWithCache(t *testing.T, rdb *resilient.ResilientDatabase, pro
 	}
 }
 
-// setupLMTPProxyWithPrelookupAndCache creates LMTP proxy with prelookup and caching
-func setupLMTPProxyWithPrelookupAndCache(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupLMTPProxyWithRemoteLookupAndCache creates LMTP proxy with remotelookup and caching
+func setupLMTPProxyWithRemoteLookupAndCache(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
-	hostname := "test-lmtp-prelookup-cache"
+	hostname := "test-lmtp-remotelookup-cache"
 	opts := lmtpproxy.ServerOptions{
 		Name:           hostname,
 		Addr:           proxyAddr,
@@ -299,11 +299,11 @@ func setupLMTPProxyWithPrelookupAndCache(t *testing.T, rdb *resilient.ResilientD
 		RemotePort:     0,
 		ConnectTimeout: 10 * time.Second,
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupURL,
-			Timeout:         "5s",
-			FallbackDefault: false,
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupURL,
+			Timeout:      "5s",
+			FallbackToDB: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,

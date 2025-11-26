@@ -22,14 +22,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestManageSieveProxyActualEmailCaching tests that when prelookup returns an "address" field
+// TestManageSieveProxyActualEmailCaching tests that when remotelookup returns an "address" field
 // (ActualEmail) that differs from the submitted username (e.g., token-based auth),
 // the cache stores ActualEmail so cache hits can use the resolved address.
 //
 // Bug: Cache wasn't storing ActualEmail, so cache hits used submitted username for backend
 //
 // Expected behavior:
-// 1. Login with user@example.com@TOKEN → prelookup returns address="user@example.com"
+// 1. Login with user@example.com@TOKEN → remotelookup returns address="user@example.com"
 // 2. Cache key: "user@example.com@TOKEN", Cache value includes ActualEmail="user@example.com"
 // 3. Subsequent login with same TOKEN → cache hit, uses stored ActualEmail for backend
 func TestManageSieveProxyActualEmailCaching(t *testing.T) {
@@ -39,20 +39,20 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 	backendServer, account := common.SetupManageSieveServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Track prelookup calls
-	var prelookupCalls atomic.Int32
+	// Track remotelookup calls
+	var remotelookupCalls atomic.Int32
 
-	// Create prelookup server
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := prelookupCalls.Add(1)
-		t.Logf("Prelookup call #%d: %s", count, r.URL.Path)
+	// Create remotelookup server
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := remotelookupCalls.Add(1)
+		t.Logf("RemoteLookup call #%d: %s", count, r.URL.Path)
 
 		response := map[string]interface{}{
 			"address":       account.Email, // Resolved email (without token)
@@ -63,19 +63,19 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
-		t.Logf("Prelookup returned address=%s", account.Email)
+		t.Logf("RemoteLookup returned address=%s", account.Email)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up ManageSieve proxy with prelookup
+	// Set up ManageSieve proxy with remotelookup
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupManageSieveProxyWithPrelookupForActualEmailTest(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupManageSieveProxyWithRemoteLookupForActualEmailTest(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
 	// Test 1: Login with token - should populate cache with TOKEN as key, ActualEmail in value
 	t.Run("LoginWithToken_PopulatesCache", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewManageSieveClient(proxyAddress)
 		if err != nil {
@@ -99,9 +99,9 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 		}
 		t.Logf("✓ Login with token succeeded (username=%s@TOKEN, resolved=%s)", account.Email, account.Email)
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter <= callsBefore {
-			t.Fatalf("Expected prelookup to be called")
+			t.Fatalf("Expected remotelookup to be called")
 		}
 	})
 
@@ -109,7 +109,7 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 
 	// Test 2: Login with same token - should hit cache and use stored ActualEmail
 	t.Run("LoginWithTokenAgain_ShouldHitCache", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewManageSieveClient(proxyAddress)
 		if err != nil {
@@ -130,18 +130,18 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 		}
 		t.Log("✓ Login with token (second time) succeeded")
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
-			t.Errorf("Prelookup was called %d time(s) - cache MISS (expected cache HIT)",
+			t.Errorf("RemoteLookup was called %d time(s) - cache MISS (expected cache HIT)",
 				callsAfter-callsBefore)
 		} else {
 			t.Log("✓ Cache hit with token - using stored ActualEmail")
 		}
 	})
 
-	// Test 3: Login with resolved email (without token) - will call prelookup (different cache key)
-	t.Run("LoginWithResolvedEmail_CallsPrelookup", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+	// Test 3: Login with resolved email (without token) - will call remotelookup (different cache key)
+	t.Run("LoginWithResolvedEmail_CallsRemoteLookup", func(t *testing.T) {
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewManageSieveClient(proxyAddress)
 		if err != nil {
@@ -161,16 +161,16 @@ func TestManageSieveProxyActualEmailCaching(t *testing.T) {
 		}
 		t.Log("✓ Login with resolved email succeeded")
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
-			t.Logf("NOTE: Prelookup was called (expected - different cache key: '%s' vs '%s@TOKEN')",
+			t.Logf("NOTE: RemoteLookup was called (expected - different cache key: '%s' vs '%s@TOKEN')",
 				account.Email, account.Email)
 		}
 	})
 }
 
-// setupManageSieveProxyWithPrelookupForActualEmailTest sets up a ManageSieve proxy with prelookup enabled
-func setupManageSieveProxyWithPrelookupForActualEmailTest(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupManageSieveProxyWithRemoteLookupForActualEmailTest sets up a ManageSieve proxy with remotelookup enabled
+func setupManageSieveProxyWithRemoteLookupForActualEmailTest(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	opts := managesieveproxy.ServerOptions{
@@ -188,9 +188,9 @@ func setupManageSieveProxyWithPrelookupForActualEmailTest(t *testing.T, rdb *res
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL + "/$email",
+			URL:                    remotelookupURL + "/$email",
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},

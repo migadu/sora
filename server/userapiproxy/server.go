@@ -36,7 +36,7 @@ type Server struct {
 	addr                       string
 	connManager                *proxy.ConnectionManager
 	rdb                        *resilient.ResilientDatabase
-	routingLookup              proxy.UserRoutingLookup  // PreLookup client for user routing (optional)
+	routingLookup              proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
 	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
 	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
 	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
@@ -75,14 +75,14 @@ type ServerOptions struct {
 	RemoteTLS           bool
 	RemoteTLSVerify     bool
 	ConnectTimeout      time.Duration
-	MaxConnections      int                       // Maximum total connections per instance (0 = unlimited, local only)
-	MaxConnectionsPerIP int                       // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
-	TrustedNetworks     []string                  // CIDR blocks for trusted networks that bypass per-IP limits
-	TrustedProxies      []string                  // CIDR blocks for trusted proxies
-	PreLookup           *config.PreLookupConfig   // PreLookup configuration for user routing
-	LookupCache         *config.LookupCacheConfig // Route lookup cache configuration
-	AffinityManager     *server.AffinityManager   // Affinity manager for sticky routing (optional)
-	ClusterManager      *cluster.Manager          // Optional: enables cluster-wide per-IP limiting
+	MaxConnections      int                        // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP int                        // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
+	TrustedNetworks     []string                   // CIDR blocks for trusted networks that bypass per-IP limits
+	TrustedProxies      []string                   // CIDR blocks for trusted proxies
+	RemoteLookup        *config.RemoteLookupConfig // RemoteLookup configuration for user routing
+	LookupCache         *config.LookupCacheConfig  // Route lookup cache configuration
+	AffinityManager     *server.AffinityManager    // Affinity manager for sticky routing (optional)
+	ClusterManager      *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -109,20 +109,20 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		connectTimeout = 10 * time.Second
 	}
 
-	// Initialize prelookup client if configured
+	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup != nil && opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.InitializePrelookup("userapi", opts.PreLookup)
+	if opts.RemoteLookup != nil && opts.RemoteLookup.Enabled {
+		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
 		if err != nil {
-			logger.Warn("User API Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
-			if !opts.PreLookup.FallbackDefault {
+			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
+			if !opts.RemoteLookup.FallbackToDB {
 				cancel()
-				return nil, fmt.Errorf("prelookup initialization failed and fallback disabled: %w", err)
+				return nil, fmt.Errorf("remotelookup initialization failed and fallback disabled: %w", err)
 			}
 			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
 		} else {
-			routingLookup = prelookupClient
-			logger.Info("User API Proxy: Prelookup enabled", "name", opts.Name)
+			routingLookup = remotelookupClient
+			logger.Info("User API Proxy: RemoteLookup enabled", "name", opts.Name)
 		}
 	}
 
@@ -130,7 +130,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	connManager, err := proxy.NewConnectionManagerWithRouting(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSVerify, false, connectTimeout, routingLookup, opts.Name)
 	if err != nil {
 		if routingLookup != nil {
-			// Close prelookup client on error
+			// Close remotelookup client on error
 			if closer, ok := routingLookup.(interface{ Close() error }); ok {
 				closer.Close()
 			}
@@ -187,7 +187,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		proxyReader, err = server.NewProxyProtocolReader("USER-API-PROXY", proxyConfig)
 		if err != nil {
 			if routingLookup != nil {
-				// Close prelookup client on error
+				// Close remotelookup client on error
 				if closer, ok := routingLookup.(interface{ Close() error }); ok {
 					closer.Close()
 				}
@@ -401,7 +401,7 @@ func (s *Server) setupHandler() http.Handler {
 	})
 }
 
-// getBackendForUser determines the backend server for a user using cache, affinity and prelookup
+// getBackendForUser determines the backend server for a user using cache, affinity and remotelookup
 func (s *Server) getBackendForUser(email string, accountID int64) (string, error) {
 	ctx := context.Background()
 
@@ -440,15 +440,15 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 		}
 	}
 
-	// 3. Use prelookup if configured
+	// 3. Use remotelookup if configured
 	if s.routingLookup != nil {
 		// Use routeOnly=true since user is already authenticated via JWT
 		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
 		if err != nil {
-			logger.Warn("User API Proxy: Prelookup failed", "name", s.name, "user", email, "error", err)
+			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
 			// Fall through to consistent hash
 		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
-			logger.Debug("User API Proxy: Using prelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
+			logger.Debug("User API Proxy: Using remotelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 
 			// Set affinity for future requests
 			if s.affinityManager != nil {

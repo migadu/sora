@@ -6,45 +6,45 @@ import (
 	"github.com/migadu/sora/config"
 )
 
-// TestPrelookupStartTLSConfiguration verifies that prelookup correctly propagates
+// TestRemoteLookupStartTLSConfiguration verifies that remotelookup correctly propagates
 // StartTLS configuration to routing information.
-func TestPrelookupStartTLSConfiguration(t *testing.T) {
+func TestRemoteLookupStartTLSConfiguration(t *testing.T) {
 	tests := []struct {
 		name                    string
-		prelookupRemoteTLS      bool
-		prelookupStartTLS       bool
+		remotelookupRemoteTLS   bool
+		remotelookupStartTLS    bool
 		expectedRoutingTLS      bool
 		expectedRoutingStartTLS bool
 		description             string
 	}{
 		{
-			name:                    "No TLS in prelookup",
-			prelookupRemoteTLS:      false,
-			prelookupStartTLS:       false,
+			name:                    "No TLS in remotelookup",
+			remotelookupRemoteTLS:   false,
+			remotelookupStartTLS:    false,
 			expectedRoutingTLS:      false,
 			expectedRoutingStartTLS: false,
-			description:             "Plain connection from prelookup-routed backends",
+			description:             "Plain connection from remotelookup-routed backends",
 		},
 		{
-			name:                    "Implicit TLS in prelookup",
-			prelookupRemoteTLS:      true,
-			prelookupStartTLS:       false,
+			name:                    "Implicit TLS in remotelookup",
+			remotelookupRemoteTLS:   true,
+			remotelookupStartTLS:    false,
 			expectedRoutingTLS:      true,
 			expectedRoutingStartTLS: false,
-			description:             "Immediate TLS connection from prelookup-routed backends",
+			description:             "Immediate TLS connection from remotelookup-routed backends",
 		},
 		{
-			name:                    "StartTLS in prelookup",
-			prelookupRemoteTLS:      true,
-			prelookupStartTLS:       true,
+			name:                    "StartTLS in remotelookup",
+			remotelookupRemoteTLS:   true,
+			remotelookupStartTLS:    true,
 			expectedRoutingTLS:      true,
 			expectedRoutingStartTLS: true,
-			description:             "StartTLS negotiation from prelookup-routed backends",
+			description:             "StartTLS negotiation from remotelookup-routed backends",
 		},
 		{
 			name:                    "StartTLS without TLS (invalid config)",
-			prelookupRemoteTLS:      false,
-			prelookupStartTLS:       true,
+			remotelookupRemoteTLS:   false,
+			remotelookupStartTLS:    true,
 			expectedRoutingTLS:      false,
 			expectedRoutingStartTLS: true, // Config honors setting even if invalid
 			description:             "StartTLS requires remote_tls=true, but config is preserved",
@@ -53,23 +53,23 @@ func TestPrelookupStartTLSConfiguration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a minimal PreLookupConfig with TLS settings
-			cfg := &config.PreLookupConfig{
-				RemoteTLS:            tt.prelookupRemoteTLS,
-				RemoteTLSUseStartTLS: tt.prelookupStartTLS,
+			// Create a minimal RemoteLookupConfig with TLS settings
+			cfg := &config.RemoteLookupConfig{
+				RemoteTLS:            tt.remotelookupRemoteTLS,
+				RemoteTLSUseStartTLS: tt.remotelookupStartTLS,
 			}
 
 			// Verify the config fields are set correctly
-			if cfg.RemoteTLS != tt.prelookupRemoteTLS {
-				t.Errorf("PreLookupConfig.RemoteTLS = %v, want %v",
-					cfg.RemoteTLS, tt.prelookupRemoteTLS)
+			if cfg.RemoteTLS != tt.remotelookupRemoteTLS {
+				t.Errorf("RemoteLookupConfig.RemoteTLS = %v, want %v",
+					cfg.RemoteTLS, tt.remotelookupRemoteTLS)
 			}
-			if cfg.RemoteTLSUseStartTLS != tt.prelookupStartTLS {
-				t.Errorf("PreLookupConfig.RemoteTLSUseStartTLS = %v, want %v",
-					cfg.RemoteTLSUseStartTLS, tt.prelookupStartTLS)
+			if cfg.RemoteTLSUseStartTLS != tt.remotelookupStartTLS {
+				t.Errorf("RemoteLookupConfig.RemoteTLSUseStartTLS = %v, want %v",
+					cfg.RemoteTLSUseStartTLS, tt.remotelookupStartTLS)
 			}
 
-			// Simulate what PreLookupClient does when creating UserRoutingInfo
+			// Simulate what RemoteLookupClient does when creating UserRoutingInfo
 			routingInfo := &UserRoutingInfo{
 				RemoteTLS:            cfg.RemoteTLS,
 				RemoteTLSUseStartTLS: cfg.RemoteTLSUseStartTLS,
@@ -85,70 +85,70 @@ func TestPrelookupStartTLSConfiguration(t *testing.T) {
 					tt.description, routingInfo.RemoteTLSUseStartTLS, tt.expectedRoutingStartTLS)
 			}
 
-			t.Logf("%s: prelookup remote_tls=%v, remote_tls_use_starttls=%v -> routing RemoteTLS=%v, RemoteTLSUseStartTLS=%v",
-				tt.description, tt.prelookupRemoteTLS, tt.prelookupStartTLS,
+			t.Logf("%s: remotelookup remote_tls=%v, remote_tls_use_starttls=%v -> routing RemoteTLS=%v, RemoteTLSUseStartTLS=%v",
+				tt.description, tt.remotelookupRemoteTLS, tt.remotelookupStartTLS,
 				routingInfo.RemoteTLS, routingInfo.RemoteTLSUseStartTLS)
 		})
 	}
 }
 
-// TestPrelookupRoutingInfoOverridesGlobalSettings verifies that prelookup routing
+// TestRemoteLookupRoutingInfoOverridesGlobalSettings verifies that remotelookup routing
 // information correctly overrides global connection manager settings for TLS.
-func TestPrelookupRoutingInfoOverridesGlobalSettings(t *testing.T) {
+func TestRemoteLookupRoutingInfoOverridesGlobalSettings(t *testing.T) {
 	tests := []struct {
 		name                      string
 		globalTLS                 bool
 		globalStartTLS            bool
-		prelookupTLS              bool
-		prelookupStartTLS         bool
+		remotelookupTLS           bool
+		remotelookupStartTLS      bool
 		expectOverride            bool
 		expectedEffectiveTLS      bool
 		expectedEffectiveStartTLS bool
 		description               string
 	}{
 		{
-			name:                      "Prelookup requires StartTLS, global uses implicit TLS",
+			name:                      "RemoteLookup requires StartTLS, global uses implicit TLS",
 			globalTLS:                 true,
 			globalStartTLS:            false,
-			prelookupTLS:              true,
-			prelookupStartTLS:         true,
+			remotelookupTLS:           true,
+			remotelookupStartTLS:      true,
 			expectOverride:            true,
 			expectedEffectiveTLS:      true,
 			expectedEffectiveStartTLS: true,
-			description:               "Prelookup StartTLS should override global implicit TLS",
+			description:               "RemoteLookup StartTLS should override global implicit TLS",
 		},
 		{
-			name:                      "Prelookup requires implicit TLS, global uses StartTLS",
+			name:                      "RemoteLookup requires implicit TLS, global uses StartTLS",
 			globalTLS:                 true,
 			globalStartTLS:            true,
-			prelookupTLS:              true,
-			prelookupStartTLS:         false,
+			remotelookupTLS:           true,
+			remotelookupStartTLS:      false,
 			expectOverride:            true,
 			expectedEffectiveTLS:      true,
 			expectedEffectiveStartTLS: false,
-			description:               "Prelookup implicit TLS should override global StartTLS",
+			description:               "RemoteLookup implicit TLS should override global StartTLS",
 		},
 		{
-			name:                      "Prelookup requires plain, global uses TLS",
+			name:                      "RemoteLookup requires plain, global uses TLS",
 			globalTLS:                 true,
 			globalStartTLS:            false,
-			prelookupTLS:              false,
-			prelookupStartTLS:         false,
+			remotelookupTLS:           false,
+			remotelookupStartTLS:      false,
 			expectOverride:            true,
 			expectedEffectiveTLS:      false,
 			expectedEffectiveStartTLS: false,
-			description:               "Prelookup plain should override global TLS settings",
+			description:               "RemoteLookup plain should override global TLS settings",
 		},
 		{
-			name:                      "No prelookup override - use global settings",
+			name:                      "No remotelookup override - use global settings",
 			globalTLS:                 true,
 			globalStartTLS:            true,
-			prelookupTLS:              false,
-			prelookupStartTLS:         false,
+			remotelookupTLS:           false,
+			remotelookupStartTLS:      false,
 			expectOverride:            false,
 			expectedEffectiveTLS:      true,
 			expectedEffectiveStartTLS: true,
-			description:               "Without prelookup routing, global settings should be used",
+			description:               "Without remotelookup routing, global settings should be used",
 		},
 	}
 
@@ -157,15 +157,15 @@ func TestPrelookupRoutingInfoOverridesGlobalSettings(t *testing.T) {
 			var effectiveTLS, effectiveStartTLS bool
 
 			if tt.expectOverride {
-				// Simulate prelookup override logic from connection_manager.go dialWithProxy
+				// Simulate remotelookup override logic from connection_manager.go dialWithProxy
 				routingInfo := &UserRoutingInfo{
-					RemoteTLS:            tt.prelookupTLS,
-					RemoteTLSUseStartTLS: tt.prelookupStartTLS,
+					RemoteTLS:            tt.remotelookupTLS,
+					RemoteTLSUseStartTLS: tt.remotelookupStartTLS,
 				}
 				effectiveTLS = routingInfo.RemoteTLS
 				effectiveStartTLS = routingInfo.RemoteTLSUseStartTLS
 			} else {
-				// Use global settings (no prelookup override)
+				// Use global settings (no remotelookup override)
 				effectiveTLS = tt.globalTLS
 				effectiveStartTLS = tt.globalStartTLS
 			}
@@ -180,9 +180,9 @@ func TestPrelookupRoutingInfoOverridesGlobalSettings(t *testing.T) {
 					tt.description, effectiveStartTLS, tt.expectedEffectiveStartTLS)
 			}
 
-			t.Logf("%s: global(TLS=%v,StartTLS=%v) prelookup(TLS=%v,StartTLS=%v) override=%v -> effective(TLS=%v,StartTLS=%v)",
+			t.Logf("%s: global(TLS=%v,StartTLS=%v) remotelookup(TLS=%v,StartTLS=%v) override=%v -> effective(TLS=%v,StartTLS=%v)",
 				tt.description, tt.globalTLS, tt.globalStartTLS,
-				tt.prelookupTLS, tt.prelookupStartTLS, tt.expectOverride,
+				tt.remotelookupTLS, tt.remotelookupStartTLS, tt.expectOverride,
 				effectiveTLS, effectiveStartTLS)
 		})
 	}
@@ -192,10 +192,10 @@ func TestPrelookupRoutingInfoOverridesGlobalSettings(t *testing.T) {
 // correctly stores and exposes StartTLS configuration.
 func TestUserRoutingInfoStartTLSFields(t *testing.T) {
 	routingInfo := &UserRoutingInfo{
-		IsPrelookupAccount:   true,
-		RemoteTLS:            true,
-		RemoteTLSUseStartTLS: true,
-		RemoteTLSVerify:      true,
+		IsRemoteLookupAccount: true,
+		RemoteTLS:             true,
+		RemoteTLSUseStartTLS:  true,
+		RemoteTLSVerify:       true,
 	}
 
 	// Verify all fields are accessible and correct
@@ -208,8 +208,8 @@ func TestUserRoutingInfoStartTLSFields(t *testing.T) {
 	if !routingInfo.RemoteTLSVerify {
 		t.Error("Expected RemoteTLSVerify to be true")
 	}
-	if !routingInfo.IsPrelookupAccount {
-		t.Error("Expected IsPrelookupAccount to be true")
+	if !routingInfo.IsRemoteLookupAccount {
+		t.Error("Expected IsRemoteLookupAccount to be true")
 	}
 
 	t.Logf("UserRoutingInfo fields verified: RemoteTLS=%v, RemoteTLSUseStartTLS=%v, RemoteTLSVerify=%v",

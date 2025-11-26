@@ -43,7 +43,7 @@ type Server struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig    *config.PreLookupConfig
+	remotelookupConfig *config.RemoteLookupConfig
 	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
 	authIdleTimeout    time.Duration
 	maxMessageSize     int64
@@ -93,7 +93,7 @@ type ServerOptions struct {
 	EnableAffinity         bool
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
-	PreLookup              *config.PreLookupConfig
+	RemoteLookup           *config.RemoteLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 	MaxMessageSize         int64
@@ -128,9 +128,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connectTimeout = 10 * time.Second
 	}
 
-	// Ensure PreLookup config has a default value to avoid nil panics.
-	if opts.PreLookup == nil {
-		opts.PreLookup = &config.PreLookupConfig{}
+	// Ensure RemoteLookup config has a default value to avoid nil panics.
+	if opts.RemoteLookup == nil {
+		opts.RemoteLookup = &config.RemoteLookupConfig{}
 	}
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
@@ -140,21 +140,21 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		opts.TLSUseStartTLS = false
 	}
 
-	// Initialize prelookup client if configured
+	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.InitializePrelookup("lmtp", opts.PreLookup)
+	if opts.RemoteLookup.Enabled {
+		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup)
 		if err != nil {
-			logger.Debug("LMTP Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
-			if !opts.PreLookup.FallbackDefault {
+			logger.Debug("LMTP Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
+			if !opts.RemoteLookup.FallbackToDB {
 				cancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 			}
-			logger.Debug("LMTP Proxy: Continuing without prelookup - fallback enabled", "name", opts.Name)
+			logger.Debug("LMTP Proxy: Continuing without remotelookup - fallback enabled", "name", opts.Name)
 		} else {
-			routingLookup = prelookupClient
+			routingLookup = remotelookupClient
 			if opts.Debug {
-				logger.Debug("LMTP Proxy: Prelookup client initialized successfully", "name", opts.Name)
+				logger.Debug("LMTP Proxy: RemoteLookup client initialized successfully", "name", opts.Name)
 			}
 		}
 	}
@@ -285,7 +285,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		ctx:                ctx,
 		cancel:             cancel,
 		trustedProxies:     opts.TrustedProxies,
-		prelookupConfig:    opts.PreLookup,
+		remotelookupConfig: opts.RemoteLookup,
 		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
 		authIdleTimeout:    opts.AuthIdleTimeout,
 		maxMessageSize:     opts.MaxMessageSize,
@@ -657,12 +657,12 @@ func (s *Server) Stop() error {
 		logger.Debug("LMTP Proxy: Server stop timeout", "name", s.name)
 	}
 
-	// Close prelookup client if it exists
+	// Close remotelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			logger.Debug("LMTP Proxy: Closing prelookup client", "name", s.name)
+			logger.Debug("LMTP Proxy: Closing remotelookup client", "name", s.name)
 			if err := routingLookup.Close(); err != nil {
-				logger.Debug("LMTP Proxy: Error closing prelookup client", "name", s.name, "error", err)
+				logger.Debug("LMTP Proxy: Error closing remotelookup client", "name", s.name, "error", err)
 			}
 		}
 	}

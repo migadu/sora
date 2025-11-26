@@ -19,8 +19,8 @@ import (
 	"github.com/migadu/sora/server/imapproxy"
 )
 
-// TestIMAPProxyFallbackToDefaultEnabled tests that when fallback_to_default=true,
-// proxy falls back to regular backend routing when prelookup fails
+// TestIMAPProxyFallbackToDefaultEnabled tests that when fallback_to_db=true,
+// proxy falls back to regular backend routing when remotelookup fails
 func TestIMAPProxyFallbackToDefaultEnabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -28,16 +28,16 @@ func TestIMAPProxyFallbackToDefaultEnabled(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that always returns 500 (simulating failure)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that always returns 500 (simulating failure)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up IMAP proxy with prelookup enabled and fallback_to_default=true
+	// Set up IMAP proxy with remotelookup enabled and fallback_to_db=true
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, true)
+	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
 
 	// Test that authentication works (falls back to default routing)
@@ -51,7 +51,7 @@ func TestIMAPProxyFallbackToDefaultEnabled(t *testing.T) {
 	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
 		t.Fatalf("Login failed through proxy with fallback enabled: %v", err)
 	}
-	t.Log("✓ Login succeeded with fallback_to_default=true (prelookup failed)")
+	t.Log("✓ Login succeeded with fallback_to_db=true (remotelookup failed)")
 
 	// Verify we can perform IMAP operations
 	selectCmd := c.Select("INBOX", nil)
@@ -62,8 +62,8 @@ func TestIMAPProxyFallbackToDefaultEnabled(t *testing.T) {
 	t.Log("✓ IMAP operations work after fallback")
 }
 
-// TestIMAPProxyFallbackToDefaultDisabled tests that when fallback_to_default=false,
-// proxy rejects authentication when prelookup fails
+// TestIMAPProxyFallbackToDefaultDisabled tests that when fallback_to_db=false,
+// proxy rejects authentication when remotelookup fails
 func TestIMAPProxyFallbackToDefaultDisabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -71,16 +71,16 @@ func TestIMAPProxyFallbackToDefaultDisabled(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that always returns 500 (simulating failure)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that always returns 500 (simulating failure)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up IMAP proxy with prelookup enabled and fallback_to_default=false
+	// Set up IMAP proxy with remotelookup enabled and fallback_to_db=false
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, false)
+	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 	defer proxy.Close()
 
 	// Test that authentication fails (no fallback allowed)
@@ -90,16 +90,15 @@ func TestIMAPProxyFallbackToDefaultDisabled(t *testing.T) {
 	}
 	defer c.Logout()
 
-	// Login should fail because fallback is disabled and prelookup is failing
+	// Login should fail because fallback is disabled and remotelookup is failing
 	err = c.Login(account.Email, account.Password).Wait()
 	if err == nil {
-		t.Fatal("Expected login to fail with fallback_to_default=false when prelookup fails, but it succeeded")
+		t.Fatal("Expected login to fail with fallback_to_db=false when remotelookup fails, but it succeeded")
 	}
-	t.Logf("✓ Login correctly failed with fallback_to_default=false: %v", err)
+	t.Logf("✓ Login correctly failed with fallback_to_db=false: %v", err)
 }
 
-// TestIMAPProxyFallbackUserNotFound tests that user-not-found (404) ALWAYS allows fallback
-// regardless of fallback_to_default setting (this supports partitioning scenarios)
+// TestIMAPProxyFallbackUserNotFound tests user-not-found (404) behavior based on fallback_to_db setting
 func TestIMAPProxyFallbackUserNotFound(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -107,18 +106,18 @@ func TestIMAPProxyFallbackUserNotFound(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that returns 404 (user not found)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that returns 404 (user not found)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	t.Run("AlwaysFallbackEvenWhenDisabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_default=false
-		// User-not-found should STILL allow fallback (partitioning use case)
+	t.Run("FallbackEnabled", func(t *testing.T) {
+		// Set up proxy with fallback_to_db=true
+		// User-not-found should fall back to main DB
 		proxyAddress := common.GetRandomAddress(t)
-		proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, false)
+		proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 		defer proxy.Close()
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
@@ -127,12 +126,32 @@ func TestIMAPProxyFallbackUserNotFound(t *testing.T) {
 		}
 		defer c.Logout()
 
-		// Login should succeed by falling back to default backend
-		// even though fallback_to_default=false (404 always allows fallback)
+		// Login should succeed by falling back to main DB
 		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-			t.Fatalf("Login failed when user not found (should always fallback for partitioning): %v", err)
+			t.Fatalf("Login failed when user not found with fallback enabled: %v", err)
 		}
-		t.Log("✓ Login succeeded when user not found (404 always allows fallback for partitioning)")
+		t.Log("✓ Login succeeded when user not found with fallback_to_db=true")
+	})
+
+	t.Run("FallbackDisabled", func(t *testing.T) {
+		// Set up proxy with fallback_to_db=false
+		// User-not-found should reject (remotelookup is authoritative)
+		proxyAddress := common.GetRandomAddress(t)
+		proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
+		defer proxy.Close()
+
+		c, err := imapclient.DialInsecure(proxyAddress, nil)
+		if err != nil {
+			t.Fatalf("Failed to dial IMAP proxy: %v", err)
+		}
+		defer c.Logout()
+
+		// Login should fail because fallback is disabled and user not found in remotelookup
+		err = c.Login(account.Email, account.Password).Wait()
+		if err == nil {
+			t.Fatal("Expected login to fail with fallback_to_db=false when user not found, but it succeeded")
+		}
+		t.Logf("✓ Login correctly failed when user not found with fallback_to_db=false: %v", err)
 	})
 }
 
@@ -144,16 +163,16 @@ func TestIMAPProxyFallback403Forbidden(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that returns 403 Forbidden
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that returns 403 Forbidden
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(map[string]string{"error": "access denied"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up proxy with fallback_to_default=true (shouldn't matter for 403)
+	// Set up proxy with fallback_to_db=true (shouldn't matter for 403)
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, true)
+	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
 
 	c, err := imapclient.DialInsecure(proxyAddress, nil)
@@ -178,16 +197,16 @@ func TestIMAPProxyFallback401Unauthorized(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that returns 401 Unauthorized
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that returns 401 Unauthorized
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up proxy with fallback_to_default=true (shouldn't matter for 401)
+	// Set up proxy with fallback_to_db=true (shouldn't matter for 401)
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, true)
+	proxy := setupIMAPProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
 
 	c, err := imapclient.DialInsecure(proxyAddress, nil)
@@ -204,8 +223,8 @@ func TestIMAPProxyFallback401Unauthorized(t *testing.T) {
 	t.Logf("✓ Login correctly failed with HTTP 401 Unauthorized (AuthFailed): %v", err)
 }
 
-// setupIMAPProxyWithFallback creates IMAP proxy with prelookup and configurable fallback
-func setupIMAPProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string, fallbackToDefault bool) *common.TestServer {
+// setupIMAPProxyWithFallback creates IMAP proxy with remotelookup and configurable fallback
+func setupIMAPProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string, fallbackToDefault bool) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-proxy-fallback"
@@ -232,11 +251,11 @@ func setupIMAPProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, 
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupURL,
-			Timeout:         "5s",
-			FallbackDefault: fallbackToDefault,
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupURL,
+			Timeout:      "5s",
+			FallbackToDB: fallbackToDefault,
 		},
 	}
 

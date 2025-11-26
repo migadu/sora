@@ -138,13 +138,13 @@ func TestPOP3ProxyLookupCache_BadPasswordHandling(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Track prelookup calls
-	var prelookupCalls atomic.Int32
+	// Track remotelookup calls
+	var remotelookupCalls atomic.Int32
 
-	// Set up prelookup server
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls.Add(1)
-		t.Logf("Prelookup call #%d", prelookupCalls.Load())
+	// Set up remotelookup server
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls.Add(1)
+		t.Logf("RemoteLookup call #%d", remotelookupCalls.Load())
 
 		passwordHashBytes, _ := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 		response := map[string]interface{}{
@@ -157,11 +157,11 @@ func TestPOP3ProxyLookupCache_BadPasswordHandling(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up proxy with SHORT negative TTL (1 second for testing)
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupPOP3ProxyWithHTTPPrelookupAndShortNegativeTTL(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupPOP3ProxyWithHTTPRemoteLookupAndShortNegativeTTL(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Stop()
 
 	// Test 1: Bad password should be rejected
@@ -185,7 +185,7 @@ func TestPOP3ProxyLookupCache_BadPasswordHandling(t *testing.T) {
 
 	// Test 2: Immediate retry with bad password should hit cache
 	t.Run("ImmediateRetry_CacheHit", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewPOP3Client(proxyAddress)
 		if err != nil {
@@ -202,11 +202,11 @@ func TestPOP3ProxyLookupCache_BadPasswordHandling(t *testing.T) {
 			t.Fatal("Expected login to fail with bad password")
 		}
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
-			t.Logf("NOTE: Prelookup was called on retry: %d -> %d", callsBefore, callsAfter)
+			t.Logf("NOTE: RemoteLookup was called on retry: %d -> %d", callsBefore, callsAfter)
 		} else {
-			t.Log("✓ Immediate retry hit cache (no new prelookup)")
+			t.Log("✓ Immediate retry hit cache (no new remotelookup)")
 		}
 	})
 
@@ -241,12 +241,12 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Track prelookup calls
-	var prelookupCalls atomic.Int32
+	// Track remotelookup calls
+	var remotelookupCalls atomic.Int32
 
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := prelookupCalls.Add(1)
-		t.Logf("Prelookup call #%d", count)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := remotelookupCalls.Add(1)
+		t.Logf("RemoteLookup call #%d", count)
 
 		passwordHashBytes, _ := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 		response := map[string]interface{}{
@@ -259,11 +259,11 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up proxy with SHORT positive TTL (3 seconds for testing)
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupPOP3ProxyWithHTTPPrelookupAndShortPositiveTTL(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupPOP3ProxyWithHTTPRemoteLookupAndShortPositiveTTL(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Stop()
 
 	// Test 1: First login
@@ -288,7 +288,7 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	// Test 2: Immediate second login (should hit cache)
 	t.Run("ImmediateSecondLogin_CacheHit", func(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewPOP3Client(proxyAddress)
 		if err != nil {
@@ -305,11 +305,11 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			t.Fatalf("Second login failed: %s", resp)
 		}
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
-			t.Logf("NOTE: Prelookup was called: %d -> %d", callsBefore, callsAfter)
+			t.Logf("NOTE: RemoteLookup was called: %d -> %d", callsBefore, callsAfter)
 		} else {
-			t.Log("✓ Second login hit cache (no prelookup)")
+			t.Log("✓ Second login hit cache (no remotelookup)")
 		}
 	})
 
@@ -318,7 +318,7 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 		t.Log("Waiting 4s for positive cache to expire...")
 		time.Sleep(4 * time.Second)
 
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		client, err := NewPOP3Client(proxyAddress)
 		if err != nil {
@@ -335,7 +335,7 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			t.Fatalf("Login after expiry failed: %s", resp)
 		}
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
 			t.Logf("✓ Cache expired, revalidation occurred: %d -> %d", callsBefore, callsAfter)
 		} else {
@@ -345,7 +345,7 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 
 	// Test 4: Renewal - multiple logins within TTL should refresh cache
 	t.Run("Renewal_MultipleLogins", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		// Login 3 times within TTL window (every 1 second, TTL is 3 seconds)
 		for i := 0; i < 3; i++ {
@@ -370,9 +370,9 @@ func TestPOP3ProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			}
 		}
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		newCalls := callsAfter - callsBefore
-		t.Logf("✓ 3 logins resulted in %d prelookup call(s)", newCalls)
+		t.Logf("✓ 3 logins resulted in %d remotelookup call(s)", newCalls)
 
 		if newCalls <= 1 {
 			t.Log("✓ Cache renewal working (minimal revalidation)")
@@ -450,7 +450,7 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	var currentPasswordHash string
 	updateHash := func(pwd string) {
 		hashBytes, _ := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
@@ -458,10 +458,10 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	}
 	updateHash(account.Password)
 
-	// Track prelookup calls
-	var prelookupCalls atomic.Int32
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls.Add(1)
+	// Track remotelookup calls
+	var remotelookupCalls atomic.Int32
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls.Add(1)
 		response := map[string]interface{}{
 			"address":       account.Email,
 			"password_hash": currentPasswordHash,
@@ -471,7 +471,7 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up proxy with short positive revalidation window (2 seconds)
 	proxyAddress := common.GetRandomAddress(t)
@@ -489,9 +489,9 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupServer.URL + "/$email",
+			URL:                    remotelookupServer.URL + "/$email",
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},
@@ -530,8 +530,8 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if !strings.HasPrefix(resp, "+OK") {
 			t.Fatalf("Login failed: %s", resp)
 		}
-		if prelookupCalls.Load() != 1 {
-			t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls.Load())
+		if remotelookupCalls.Load() != 1 {
+			t.Fatalf("Expected 1 remotelookup call, got %d", remotelookupCalls.Load())
 		}
 	})
 
@@ -541,7 +541,7 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	// Actually, we can use the helper from common if available, or just update the DB directly
 	// But wait, common.SetupPOP3ServerWithPROXY returns *common.TestServer which has ResilientDB
 	// We need to update the password in the DB so the backend accepts it
-	// AND update our mock prelookup hash so the proxy accepts it
+	// AND update our mock remotelookup hash so the proxy accepts it
 
 	// Update backend DB
 	// We need to import "github.com/migadu/sora/db" to generate hash
@@ -558,7 +558,7 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	newHashedPassword := "{BLF-CRYPT}" + string(newHashBytes)
 	backendServer.ResilientDB.UpdatePasswordWithRetry(context.Background(), account.Email, newHashedPassword)
 
-	// Update mock prelookup hash
+	// Update mock remotelookup hash
 	updateHash(newPassword)
 
 	// Test 2: Login with new password immediately - should fail (cache hit, hash mismatch, fresh entry)
@@ -578,9 +578,9 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if strings.HasPrefix(resp, "+OK") {
 			t.Fatal("Login with new password should have failed (cached old hash)")
 		}
-		// Prelookup should NOT be called again
-		if prelookupCalls.Load() != 1 {
-			t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls.Load())
+		// RemoteLookup should NOT be called again
+		if remotelookupCalls.Load() != 1 {
+			t.Fatalf("Expected remotelookup calls to remain 1, got %d", remotelookupCalls.Load())
 		}
 		t.Log("✓ Login with new password failed immediately (cached old hash)")
 	})
@@ -605,9 +605,9 @@ func TestPOP3ProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if !strings.HasPrefix(resp, "+OK") {
 			t.Fatalf("Login with new password failed after window: %s", resp)
 		}
-		// Prelookup SHOULD be called again
-		if prelookupCalls.Load() != 2 {
-			t.Fatalf("Expected 2 prelookup calls, got %d", prelookupCalls.Load())
+		// RemoteLookup SHOULD be called again
+		if remotelookupCalls.Load() != 2 {
+			t.Fatalf("Expected 2 remotelookup calls, got %d", remotelookupCalls.Load())
 		}
 		t.Log("✓ Login with new password succeeded after window (revalidated)")
 	})
@@ -666,7 +666,7 @@ func setupPOP3ProxyWithMasterAuthAndCache(t *testing.T, rdb *common.TestServer, 
 	}
 }
 
-func setupPOP3ProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *POP3ProxyWrapper {
+func setupPOP3ProxyWithHTTPRemoteLookupAndShortNegativeTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *POP3ProxyWrapper {
 	t.Helper()
 
 	opts := pop3proxy.POP3ProxyServerOptions{
@@ -683,9 +683,9 @@ func setupPOP3ProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL + "/$email",
+			URL:                    remotelookupURL + "/$email",
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},
@@ -718,7 +718,7 @@ func setupPOP3ProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 	}
 }
 
-func setupPOP3ProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *POP3ProxyWrapper {
+func setupPOP3ProxyWithHTTPRemoteLookupAndShortPositiveTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *POP3ProxyWrapper {
 	t.Helper()
 
 	opts := pop3proxy.POP3ProxyServerOptions{
@@ -735,9 +735,9 @@ func setupPOP3ProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resil
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
 		AuthRateLimit:          server.AuthRateLimiterConfig{Enabled: false},
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL + "/$email",
+			URL:                    remotelookupURL + "/$email",
 			Timeout:                "5s",
 			RemoteUseProxyProtocol: true,
 		},

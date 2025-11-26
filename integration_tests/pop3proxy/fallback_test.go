@@ -21,8 +21,8 @@ import (
 	"github.com/migadu/sora/server/pop3proxy"
 )
 
-// TestPOP3ProxyFallbackToDefaultEnabled tests that when fallback_to_default=true,
-// proxy falls back to regular backend routing when prelookup fails
+// TestPOP3ProxyFallbackToDefaultEnabled tests that when fallback_to_db=true,
+// proxy falls back to regular backend routing when remotelookup fails
 func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -40,16 +40,16 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that always returns 500 (simulating failure)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that always returns 500 (simulating failure)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up POP3 proxy with prelookup enabled and fallback_to_default=true
+	// Set up POP3 proxy with remotelookup enabled and fallback_to_db=true
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, true)
+	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
 
 	// Test that authentication works (falls back to default routing)
@@ -94,7 +94,7 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	if !strings.HasPrefix(string(response), "+OK") {
 		t.Fatalf("Login failed through proxy with fallback enabled: %s", response)
 	}
-	t.Log("✓ Login succeeded with fallback_to_default=true (prelookup failed)")
+	t.Log("✓ Login succeeded with fallback_to_db=true (remotelookup failed)")
 
 	// Verify we can perform POP3 operations
 	fmt.Fprintf(writer, "STAT\r\n")
@@ -110,8 +110,8 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	t.Log("✓ POP3 operations work after fallback")
 }
 
-// TestPOP3ProxyFallbackToDefaultDisabled tests that when fallback_to_default=false,
-// proxy rejects authentication when prelookup fails
+// TestPOP3ProxyFallbackToDefaultDisabled tests that when fallback_to_db=false,
+// proxy rejects authentication when remotelookup fails
 func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -129,16 +129,16 @@ func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that always returns 500 (simulating failure)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that always returns 500 (simulating failure)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up POP3 proxy with prelookup enabled and fallback_to_default=false
+	// Set up POP3 proxy with remotelookup enabled and fallback_to_db=false
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, false)
+	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 	defer proxy.Close()
 
 	// Test that authentication fails (no fallback allowed)
@@ -180,13 +180,12 @@ func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 		t.Fatalf("Failed to read PASS response: %v", err)
 	}
 	if !strings.HasPrefix(string(response), "-ERR") {
-		t.Fatalf("Expected login to fail with fallback_to_default=false, but got: %s", response)
+		t.Fatalf("Expected login to fail with fallback_to_db=false, but got: %s", response)
 	}
-	t.Logf("✓ Login correctly failed with fallback_to_default=false: %s", response)
+	t.Logf("✓ Login correctly failed with fallback_to_db=false: %s", response)
 }
 
-// TestPOP3ProxyFallbackUserNotFound tests that user-not-found (404) ALWAYS allows fallback
-// regardless of fallback_to_default setting (this supports partitioning scenarios)
+// TestPOP3ProxyFallbackUserNotFound tests user-not-found (404) behavior based on fallback_to_db setting
 func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -204,18 +203,17 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that returns 404 (user not found)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that returns 404 (user not found)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	t.Run("AlwaysFallbackEvenWhenDisabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_default=false
-		// User-not-found should STILL allow fallback (partitioning use case)
+	t.Run("FallbackEnabled", func(t *testing.T) {
+		// Set up proxy with fallback_to_db=true
 		proxyAddress := common.GetRandomAddress(t)
-		proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL, false)
+		proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 		defer proxy.Close()
 
 		conn, err := net.Dial("tcp", proxyAddress)
@@ -230,8 +228,7 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 		// Read greeting
 		reader.ReadLine()
 
-		// Login should succeed by falling back to default backend
-		// even though fallback_to_default=false (404 always allows fallback)
+		// Login should succeed by falling back to main DB
 		fmt.Fprintf(writer, "USER %s\r\n", account.Email)
 		writer.Flush()
 		reader.ReadLine()
@@ -241,14 +238,47 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 		response, _, _ := reader.ReadLine()
 
 		if !strings.HasPrefix(string(response), "+OK") {
-			t.Fatalf("Login failed when user not found (should always fallback for partitioning): %s", response)
+			t.Fatalf("Login failed when user not found with fallback enabled: %s", response)
 		}
-		t.Log("✓ Login succeeded when user not found (404 always allows fallback for partitioning)")
+		t.Log("✓ Login succeeded when user not found with fallback_to_db=true")
+	})
+
+	t.Run("FallbackDisabled", func(t *testing.T) {
+		// Set up proxy with fallback_to_db=false
+		proxyAddress := common.GetRandomAddress(t)
+		proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
+		defer proxy.Close()
+
+		conn, err := net.Dial("tcp", proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to dial POP3 proxy: %v", err)
+		}
+		defer conn.Close()
+
+		reader := bufio.NewReader(conn)
+		writer := bufio.NewWriter(conn)
+
+		// Read greeting
+		reader.ReadLine()
+
+		// Login should fail because fallback is disabled
+		fmt.Fprintf(writer, "USER %s\r\n", account.Email)
+		writer.Flush()
+		reader.ReadLine()
+
+		fmt.Fprintf(writer, "PASS %s\r\n", account.Password)
+		writer.Flush()
+		response, _, _ := reader.ReadLine()
+
+		if strings.HasPrefix(string(response), "+OK") {
+			t.Fatal("Expected login to fail with fallback_to_db=false when user not found, but it succeeded")
+		}
+		t.Logf("✓ Login correctly failed when user not found with fallback_to_db=false: %s", response)
 	})
 }
 
-// setupPOP3ProxyWithFallback creates POP3 proxy with prelookup and configurable fallback
-func setupPOP3ProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string, fallbackToDefault bool) *common.TestServer {
+// setupPOP3ProxyWithFallback creates POP3 proxy with remotelookup and configurable fallback
+func setupPOP3ProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string, fallbackToDefault bool) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-proxy-fallback"
@@ -276,11 +306,11 @@ func setupPOP3ProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, 
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupURL,
-			Timeout:         "5s",
-			FallbackDefault: fallbackToDefault,
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupURL,
+			Timeout:      "5s",
+			FallbackToDB: fallbackToDefault,
 		},
 	}
 

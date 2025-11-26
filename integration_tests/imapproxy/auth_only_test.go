@@ -21,9 +21,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestIMAPProxyAuthOnlyMode tests that prelookup can be used for authentication only
-// When the prelookup response omits the "server" field, the proxy should:
-// 1. Authenticate the user via prelookup
+// TestIMAPProxyAuthOnlyMode tests that remotelookup can be used for authentication only
+// When the remotelookup response omits the "server" field, the proxy should:
+// 1. Authenticate the user via remotelookup
 // 2. Select backend using local routing (affinity/consistent-hash/round-robin)
 // 3. Build affinity over time like regular accounts
 func TestIMAPProxyAuthOnlyMode(t *testing.T) {
@@ -40,18 +40,18 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("authonly-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer1.ResilientDB, uniqueEmail, "test123")
 
-	// Generate password hash for prelookup response (same way accounts are created)
+	// Generate password hash for remotelookup response (same way accounts are created)
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Create a prelookup server that returns auth-only response (no "server" field)
+	// Create a remotelookup server that returns auth-only response (no "server" field)
 	requestCount := 0
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
-		t.Logf("Prelookup request #%d: %s", requestCount, r.URL.Path)
+		t.Logf("RemoteLookup request #%d: %s", requestCount, r.URL.Path)
 
 		// Return auth-only response (no server field)
 		response := map[string]interface{}{
@@ -63,31 +63,31 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(response); err != nil {
-			t.Errorf("Failed to encode prelookup response: %v", err)
+			t.Errorf("Failed to encode remotelookup response: %v", err)
 		}
-		t.Logf("Prelookup returned auth-only response for %s", account.Email)
+		t.Logf("RemoteLookup returned auth-only response for %s", account.Email)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up IMAP proxy with auth-only prelookup
+	// Set up IMAP proxy with auth-only remotelookup
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupIMAPProxyWithAuthOnly(t, backendServer1.ResilientDB, proxyAddress,
-		[]string{backendServer1.Address, backendServer2.Address}, prelookupServer.URL)
+		[]string{backendServer1.Address, backendServer2.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
-	// Test 1: First login - should authenticate via prelookup, route via consistent hash/round-robin
-	t.Run("FirstLogin_AuthViaPreLookup", func(t *testing.T) {
+	// Test 1: First login - should authenticate via remotelookup, route via consistent hash/round-robin
+	t.Run("FirstLogin_AuthViaRemoteLookup", func(t *testing.T) {
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP proxy: %v", err)
 		}
 		defer c.Logout()
 
-		// Login should succeed (auth via prelookup, routing via local selection)
+		// Login should succeed (auth via remotelookup, routing via local selection)
 		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-			t.Fatalf("Login failed with auth-only prelookup: %v", err)
+			t.Fatalf("Login failed with auth-only remotelookup: %v", err)
 		}
-		t.Log("✓ Login succeeded with auth-only prelookup mode")
+		t.Log("✓ Login succeeded with auth-only remotelookup mode")
 
 		// Verify we can perform IMAP operations
 		selectCmd := c.Select("INBOX", nil)
@@ -95,17 +95,17 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Select INBOX failed: %v", err)
 		}
-		t.Log("✓ IMAP operations work with auth-only prelookup")
+		t.Log("✓ IMAP operations work with auth-only remotelookup")
 
-		// Verify prelookup was called (auth-only mode)
+		// Verify remotelookup was called (auth-only mode)
 		if requestCount < 1 {
-			t.Errorf("Expected prelookup to be called, but got %d requests", requestCount)
+			t.Errorf("Expected remotelookup to be called, but got %d requests", requestCount)
 		}
 	})
 
 	// Test 2: Second login - should use affinity (same backend as first login)
 	t.Run("SecondLogin_UseAffinity", func(t *testing.T) {
-		// Reset request count to track if prelookup is called again
+		// Reset request count to track if remotelookup is called again
 		requestCountBefore := requestCount
 
 		// Wait a bit to ensure first connection is fully established and affinity is set
@@ -123,13 +123,13 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 		}
 		t.Log("✓ Second login succeeded (should use affinity)")
 
-		// Verify prelookup was NOT called again (should use auth cache)
+		// Verify remotelookup was NOT called again (should use auth cache)
 		// The auth cache stores routing info from first login and reuses it
 		// This is expected behavior for performance optimization
 		if requestCount > requestCountBefore {
-			t.Logf("NOTE: Prelookup was called %d time(s) on second login (cache miss or revalidation)", requestCount-requestCountBefore)
+			t.Logf("NOTE: RemoteLookup was called %d time(s) on second login (cache miss or revalidation)", requestCount-requestCountBefore)
 		} else {
-			t.Log("✓ Auth cache prevented unnecessary prelookup call (expected behavior)")
+			t.Log("✓ Auth cache prevented unnecessary remotelookup call (expected behavior)")
 		}
 
 		// Verify IMAP operations still work
@@ -142,7 +142,7 @@ func TestIMAPProxyAuthOnlyMode(t *testing.T) {
 	})
 }
 
-// TestIMAPProxyMixedMode tests that prelookup can handle both modes:
+// TestIMAPProxyMixedMode tests that remotelookup can handle both modes:
 // - Some users with explicit backend routing (server field present)
 // - Some users with auth-only mode (server field omitted)
 func TestIMAPProxyMixedMode(t *testing.T) {
@@ -164,7 +164,7 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 	authOnlyAccount := common.CreateTestAccountWithEmail(t, rdb, fmt.Sprintf("authonly-mixed-%d@example.com", timestamp), "test123")
 	routedAccount := common.CreateTestAccountWithEmail(t, rdb, fmt.Sprintf("routed-mixed-%d@example.com", timestamp), "test456")
 
-	// Generate password hashes for prelookup response
+	// Generate password hashes for remotelookup response
 	authOnlyHashBytes, err := bcrypt.GenerateFromPassword([]byte(authOnlyAccount.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash auth-only password: %v", err)
@@ -176,10 +176,10 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 	authOnlyHash := string(authOnlyHashBytes)
 	routedHash := string(routedHashBytes)
 
-	// Create prelookup server that returns different responses based on user
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create remotelookup server that returns different responses based on user
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		email := strings.TrimPrefix(r.URL.Path, "/")
-		t.Logf("Prelookup request for: %s", email)
+		t.Logf("RemoteLookup request for: %s", email)
 
 		var response map[string]interface{}
 		if strings.Contains(email, "authonly") {
@@ -208,12 +208,12 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up IMAP proxy
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupIMAPProxyWithAuthOnly(t, rdb, proxyAddress,
-		[]string{backendServer1.Address, backendServer2.Address}, prelookupServer.URL+"/$email")
+		[]string{backendServer1.Address, backendServer2.Address}, remotelookupServer.URL+"/$email")
 	defer proxy.Close()
 
 	// Test auth-only user
@@ -254,8 +254,8 @@ func TestIMAPProxyMixedMode(t *testing.T) {
 	})
 }
 
-// setupIMAPProxyWithAuthOnly creates IMAP proxy with auth-only prelookup configured
-func setupIMAPProxyWithAuthOnly(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithAuthOnly creates IMAP proxy with auth-only remotelookup configured
+func setupIMAPProxyWithAuthOnly(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-proxy-authonly"
@@ -282,18 +282,18 @@ func setupIMAPProxyWithAuthOnly(t *testing.T, rdb *resilient.ResilientDatabase, 
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL,
+			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackDefault:        false, // Not needed for auth-only mode
+			FallbackToDB:           false, // Not needed for auth-only mode
 			RemoteUseProxyProtocol: true,  // Backend servers expect PROXY protocol
 		},
 	}
 
 	proxy, err := imapproxy.New(context.Background(), rdb, hostname, opts)
 	if err != nil {
-		t.Fatalf("Failed to create IMAP proxy with auth-only prelookup: %v", err)
+		t.Fatalf("Failed to create IMAP proxy with auth-only remotelookup: %v", err)
 	}
 
 	// Start proxy in background

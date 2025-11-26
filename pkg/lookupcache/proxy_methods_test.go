@@ -36,7 +36,7 @@ func TestProxyMethods_GetSetRefresh(t *testing.T) {
 		RemoteUseIDCommand:     true,
 		RemoteUseXCLIENT:       false,
 		Result:                 AuthSuccess,
-		FromPrelookup:          true,
+		FromRemoteLookup:       true,
 		CreatedAt:              time.Now(),
 		ExpiresAt:              time.Now().Add(5 * time.Minute),
 		IsNegative:             false,
@@ -66,8 +66,8 @@ func TestProxyMethods_GetSetRefresh(t *testing.T) {
 	if !entry.RemoteUseIDCommand {
 		t.Error("Expected RemoteUseIDCommand to be true")
 	}
-	if !entry.FromPrelookup {
-		t.Error("Expected FromPrelookup to be true")
+	if !entry.FromRemoteLookup {
+		t.Error("Expected FromRemoteLookup to be true")
 	}
 
 	// Test different server name (should be different cache entry)

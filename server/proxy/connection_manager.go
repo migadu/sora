@@ -266,7 +266,7 @@ func (cm *ConnectionManager) AuthenticateAndRouteWithOptions(ctx context.Context
 }
 
 // AuthenticateAndRouteWithClientIP performs authentication and routing with client IP and additional options
-// clientIP: client IP address to include in prelookup URL (supports $ip placeholder)
+// clientIP: client IP address to include in remotelookup URL (supports $ip placeholder)
 // routeOnly: if true, skip password validation and only return routing info (for master username auth)
 func (cm *ConnectionManager) AuthenticateAndRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	if cm.routingLookup == nil {
@@ -280,7 +280,7 @@ func (cm *ConnectionManager) GetRoutingLookup() UserRoutingLookup {
 	return cm.routingLookup
 }
 
-// GetPrelookupTimeout returns the timeout for prelookup HTTP requests including connection establishment
+// GetRemoteLookupTimeout returns the timeout for remotelookup HTTP requests including connection establishment
 // This automatically calculates a context timeout that allows enough time for:
 // - DNS resolution + TCP dial (dial_timeout)
 // - TLS handshake (tls_handshake_timeout)
@@ -294,13 +294,13 @@ func (cm *ConnectionManager) GetRoutingLookup() UserRoutingLookup {
 // - First request to new host: Has time for full connection setup
 // - Subsequent requests: Reuse connection, complete within HTTP timeout
 // - Context never cancels before HTTP client timeouts complete
-func (cm *ConnectionManager) GetPrelookupTimeout() time.Duration {
+func (cm *ConnectionManager) GetRemoteLookupTimeout() time.Duration {
 	if cm.routingLookup == nil {
-		return 10 * time.Second // Default if no prelookup configured
+		return 10 * time.Second // Default if no remotelookup configured
 	}
 
-	// Type assert to HTTPPreLookupClient to access timeout and transport settings
-	if httpClient, ok := cm.routingLookup.(*HTTPPreLookupClient); ok {
+	// Type assert to HTTPRemoteLookupClient to access timeout and transport settings
+	if httpClient, ok := cm.routingLookup.(*HTTPRemoteLookupClient); ok {
 		baseTimeout := httpClient.GetTimeout()
 		dialTimeout, tlsTimeout := httpClient.GetTransportTimeouts()
 
@@ -382,11 +382,11 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
 }
 
-// tryPreferredAddress attempts to connect to a preferred address (from affinity or prelookup).
+// tryPreferredAddress attempts to connect to a preferred address (from affinity or remotelookup).
 // It returns the connection, address, and an error if it fails.
 // The 'shouldFallback' boolean indicates if the caller should attempt round-robin.
 func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (conn net.Conn, addr string, err error, shouldFallback bool) {
-	isPrelookupRoute := routingInfo != nil && routingInfo.IsPrelookupAccount && routingInfo.ServerAddress == preferredAddr
+	isRemoteLookupRoute := routingInfo != nil && routingInfo.IsRemoteLookupAccount && routingInfo.ServerAddress == preferredAddr
 
 	isInList := false
 	for _, a := range cm.remoteAddrs {
@@ -398,10 +398,10 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// If the server is in our list and marked unhealthy, decide whether to fail hard or fall back.
 	if isInList && !cm.IsBackendHealthy(preferredAddr) {
-		if isPrelookupRoute {
-			// Prelookup routes are definitive; if the server is unhealthy, we fail hard.
-			logger.Debug("ConnectionManager: Prelookup-designated server is marked as unhealthy. NOT falling back to round-robin.", "server", preferredAddr)
-			err = fmt.Errorf("prelookup-designated server %s is marked as unhealthy", preferredAddr)
+		if isRemoteLookupRoute {
+			// RemoteLookup routes are definitive; if the server is unhealthy, we fail hard.
+			logger.Debug("ConnectionManager: RemoteLookup-designated server is marked as unhealthy. NOT falling back to round-robin.", "server", preferredAddr)
+			err = fmt.Errorf("remotelookup-designated server %s is marked as unhealthy", preferredAddr)
 			return nil, "", err, false // No fallback
 		}
 		// For affinity, if the server is unhealthy, we just fall back to round-robin.
@@ -424,10 +424,10 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 		cm.RecordConnectionFailure(preferredAddr)
 	}
 
-	if isPrelookupRoute {
-		// For prelookup routes, do NOT fall back to round-robin.
-		logger.Debug("ConnectionManager: Failed to connect to prelookup-designated server. NOT falling back to round-robin.", "server", preferredAddr, "error", err)
-		err = fmt.Errorf("failed to connect to prelookup-designated server %s: %w", preferredAddr, err)
+	if isRemoteLookupRoute {
+		// For remotelookup routes, do NOT fall back to round-robin.
+		logger.Debug("ConnectionManager: Failed to connect to remotelookup-designated server. NOT falling back to round-robin.", "server", preferredAddr, "error", err)
+		err = fmt.Errorf("failed to connect to remotelookup-designated server %s: %w", preferredAddr, err)
 		return nil, "", err, false // No fallback
 	}
 
@@ -594,13 +594,13 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	remoteTLSVerify := cm.remoteTLSVerify
 
 	// If routingInfo is provided and this connection is for that specific server,
-	// override the TLS settings with the ones from the prelookup config.
+	// override the TLS settings with the ones from the remotelookup config.
 	if routingInfo != nil && routingInfo.ServerAddress == addr {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
 		remoteTLS = routingInfo.RemoteTLS
 		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
 		remoteTLSVerify = routingInfo.RemoteTLSVerify
-		logger.Debug("Using prelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
+		logger.Debug("Using remotelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	} else {
 		logger.Debug("Using global settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	}
@@ -847,26 +847,26 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email string) 
 
 // RouteParams holds all parameters needed to determine a backend route.
 type RouteParams struct {
-	Ctx                context.Context
-	Username           string
-	Protocol           string // "imap", "pop3", "managesieve", "lmtp"
-	IsPrelookupAccount bool
-	RoutingInfo        *UserRoutingInfo
-	ConnManager        *ConnectionManager
-	EnableAffinity     bool
-	ProxyName          string // "IMAP Proxy", "POP3 Proxy", etc. for logging
+	Ctx                   context.Context
+	Username              string
+	Protocol              string // "imap", "pop3", "managesieve", "lmtp"
+	IsRemoteLookupAccount bool
+	RoutingInfo           *UserRoutingInfo
+	ConnManager           *ConnectionManager
+	EnableAffinity        bool
+	ProxyName             string // "IMAP Proxy", "POP3 Proxy", etc. for logging
 }
 
 // RouteResult holds the outcome of a routing decision.
 type RouteResult struct {
-	PreferredAddr    string
-	RoutingMethod    string
-	IsPrelookupRoute bool
-	RoutingInfo      *UserRoutingInfo // Can be updated by the lookup
+	PreferredAddr       string
+	RoutingMethod       string
+	IsRemoteLookupRoute bool
+	RoutingInfo         *UserRoutingInfo // Can be updated by the lookup
 }
 
 // DetermineRoute centralizes the logic for choosing a backend server.
-// The precedence is: Prelookup > Affinity > Consistent Hash > Round-robin.
+// The precedence is: RemoteLookup > Affinity > Consistent Hash > Round-robin.
 func DetermineRoute(params RouteParams) (RouteResult, error) {
 	result := RouteResult{
 		RoutingMethod: "consistent_hash", // Default: consistent hashing
@@ -875,8 +875,8 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 
 	// 1. Try routing lookup first, only if not already available from auth
 	if result.RoutingInfo == nil && params.ConnManager.HasRouting() {
-		// Use prelookup timeout for routing lookup (accounts for dial + TLS + HTTP)
-		lookupTimeout := params.ConnManager.GetPrelookupTimeout()
+		// Use remotelookup timeout for routing lookup (accounts for dial + TLS + HTTP)
+		lookupTimeout := params.ConnManager.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
 		result.RoutingInfo, lookupErr = params.ConnManager.LookupUserRoute(routingCtx, params.Username)
@@ -887,20 +887,20 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
-		// Use server address from routing info (prelookup specified backend)
+		// Use server address from routing info (remotelookup specified backend)
 		result.PreferredAddr = result.RoutingInfo.ServerAddress
 		logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
-		result.RoutingMethod = "prelookup"
-		result.IsPrelookupRoute = true
+		result.RoutingMethod = "remotelookup"
+		result.IsRemoteLookupRoute = true
 	}
 
-	// 2. If no routing info from prelookup, try cluster-wide affinity
-	// Note: For auth-only prelookup (IsPrelookupAccount=true but ServerAddress=""),
-	// we still use affinity/consistent-hash (prelookup only handled auth, not routing)
+	// 2. If no routing info from remotelookup, try cluster-wide affinity
+	// Note: For auth-only remotelookup (IsRemoteLookupAccount=true but ServerAddress=""),
+	// we still use affinity/consistent-hash (remotelookup only handled auth, not routing)
 	if result.PreferredAddr == "" && params.EnableAffinity {
-		// Only skip affinity if prelookup explicitly provided a backend server
+		// Only skip affinity if remotelookup explicitly provided a backend server
 		// Auth-only mode: has routing info but no server address - should use affinity
-		skipAffinity := params.IsPrelookupAccount && result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != ""
+		skipAffinity := params.IsRemoteLookupAccount && result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != ""
 		if !skipAffinity {
 			affinityMgr := params.ConnManager.GetAffinityManager()
 			if affinityMgr != nil && params.Protocol != "" {
@@ -945,10 +945,10 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 // - If backend A fails and user moves to backend B, affinity tracks the failover
 // - Affinity ensures user stays on backend B even after A recovers (session continuity)
 func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, wasAffinityRoute bool) {
-	// Skip affinity updates only for prelookup users with explicit backend routing
-	// Auth-only prelookup (ServerAddress="") should use affinity like regular users
-	if params.IsPrelookupAccount && params.RoutingInfo != nil && params.RoutingInfo.ServerAddress != "" {
-		// Prelookup explicitly specified backend - don't use affinity (prelookup controls routing)
+	// Skip affinity updates only for remotelookup users with explicit backend routing
+	// Auth-only remotelookup (ServerAddress="") should use affinity like regular users
+	if params.IsRemoteLookupAccount && params.RoutingInfo != nil && params.RoutingInfo.ServerAddress != "" {
+		// RemoteLookup explicitly specified backend - don't use affinity (remotelookup controls routing)
 		return
 	}
 

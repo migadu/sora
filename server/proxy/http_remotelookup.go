@@ -20,7 +20,7 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-// HTTP transport timeout defaults for prelookup client
+// HTTP transport timeout defaults for remotelookup client
 // These control different phases of HTTP connection establishment and request lifecycle
 const (
 	// DefaultDialTimeout is the maximum time to establish a TCP connection (includes DNS resolution)
@@ -43,9 +43,9 @@ const (
 	DefaultKeepAlive = 30 * time.Second
 )
 
-// HTTPPreLookupClient performs user routing lookups via HTTP GET requests
+// HTTPRemoteLookupClient performs user routing lookups via HTTP GET requests
 // NOTE: This client does NOT cache results - caching is handled at the ConnectionManager level
-type HTTPPreLookupClient struct {
+type HTTPRemoteLookupClient struct {
 	baseURL                string
 	timeout                time.Duration
 	authToken              string // Bearer token for HTTP authentication
@@ -62,8 +62,8 @@ type HTTPPreLookupClient struct {
 	tlsHandshakeTimeout    time.Duration // Stored for timeout calculation
 }
 
-// HTTPPreLookupResponse represents the JSON response from the HTTP prelookup endpoint
-type HTTPPreLookupResponse struct {
+// HTTPRemoteLookupResponse represents the JSON response from the HTTP remotelookup endpoint
+type HTTPRemoteLookupResponse struct {
 	Address      string `json:"address"`       // Email address for the user (required - used to derive account_id)
 	PasswordHash string `json:"password_hash"` // Password hash to verify against (required)
 	Server       string `json:"server"`        // Backend server IP/hostname:port (optional - if empty, uses auth-only mode)
@@ -92,9 +92,9 @@ type TransportSettings struct {
 	KeepAlive             time.Duration // TCP keep-alive interval
 }
 
-// NewHTTPPreLookupClient creates a new HTTP-based prelookup client
+// NewHTTPRemoteLookupClient creates a new HTTP-based remotelookup client
 // NOTE: Cache parameter removed - caching is handled at ConnectionManager level
-func NewHTTPPreLookupClient(
+func NewHTTPRemoteLookupClient(
 	baseURL string,
 	timeout time.Duration,
 	authToken string,
@@ -107,7 +107,7 @@ func NewHTTPPreLookupClient(
 	remoteUseXCLIENT bool,
 	cbSettings *CircuitBreakerSettings,
 	transportSettings *TransportSettings,
-) *HTTPPreLookupClient {
+) *HTTPRemoteLookupClient {
 	// Apply defaults if settings not provided
 	if cbSettings == nil {
 		cbSettings = &CircuitBreakerSettings{
@@ -121,7 +121,7 @@ func NewHTTPPreLookupClient(
 
 	// Create circuit breaker with configured settings
 	settings := circuitbreaker.Settings{
-		Name:        "http-prelookup",
+		Name:        "http-remotelookup",
 		MaxRequests: cbSettings.MaxRequests,
 		Interval:    cbSettings.Interval,
 		Timeout:     cbSettings.Timeout,
@@ -137,10 +137,10 @@ func NewHTTPPreLookupClient(
 		return counts.Requests >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-		logger.Warn("prelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
+		logger.Warn("remotelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
 	}
 	breaker := circuitbreaker.NewCircuitBreaker(settings)
-	logger.Info("prelookup: Initialized circuit breaker", "max_requests", cbSettings.MaxRequests, "timeout", cbSettings.Timeout, "failure_ratio", fmt.Sprintf("%.0f%%", cbSettings.FailureRatio*100), "min_requests", cbSettings.MinRequests)
+	logger.Info("remotelookup: Initialized circuit breaker", "max_requests", cbSettings.MaxRequests, "timeout", cbSettings.Timeout, "failure_ratio", fmt.Sprintf("%.0f%%", cbSettings.FailureRatio*100), "min_requests", cbSettings.MinRequests)
 
 	// Apply defaults for transport settings if not provided
 	if transportSettings == nil {
@@ -193,9 +193,9 @@ func NewHTTPPreLookupClient(
 		ExpectContinueTimeout: transportSettings.ExpectContinueTimeout, // Don't wait long for 100-continue
 	}
 
-	logger.Info("prelookup: Initialized HTTP transport", "max_idle_conns", transportSettings.MaxIdleConns, "max_idle_conns_per_host", transportSettings.MaxIdleConnsPerHost, "max_conns_per_host", transportSettings.MaxConnsPerHost, "idle_conn_timeout", transportSettings.IdleConnTimeout, "dial_timeout", transportSettings.DialTimeout, "tls_handshake_timeout", transportSettings.TLSHandshakeTimeout, "keep_alive", transportSettings.KeepAlive, "response_header_timeout", timeout)
+	logger.Info("remotelookup: Initialized HTTP transport", "max_idle_conns", transportSettings.MaxIdleConns, "max_idle_conns_per_host", transportSettings.MaxIdleConnsPerHost, "max_conns_per_host", transportSettings.MaxConnsPerHost, "idle_conn_timeout", transportSettings.IdleConnTimeout, "dial_timeout", transportSettings.DialTimeout, "tls_handshake_timeout", transportSettings.TLSHandshakeTimeout, "keep_alive", transportSettings.KeepAlive, "response_header_timeout", timeout)
 
-	return &HTTPPreLookupClient{
+	return &HTTPRemoteLookupClient{
 		baseURL:   baseURL,
 		timeout:   timeout,
 		authToken: authToken,
@@ -217,32 +217,32 @@ func NewHTTPPreLookupClient(
 }
 
 // LookupUserRoute performs an HTTP GET request to lookup user routing information
-func (c *HTTPPreLookupClient) LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
+func (c *HTTPRemoteLookupClient) LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error) {
 	return c.LookupUserRouteWithClientIP(ctx, email, password, "", false)
 }
 
-// LookupUserRouteWithOptions performs prelookup with optional route-only mode
+// LookupUserRouteWithOptions performs remotelookup with optional route-only mode
 // routeOnly: if true, adds ?route_only=true to skip password validation (for master username auth)
-func (c *HTTPPreLookupClient) LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
+func (c *HTTPRemoteLookupClient) LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	return c.LookupUserRouteWithClientIP(ctx, email, password, "", routeOnly)
 }
 
-// LookupUserRouteWithClientIP performs prelookup with client IP and optional route-only mode
+// LookupUserRouteWithClientIP performs remotelookup with client IP and optional route-only mode
 // clientIP: client IP address to include in URL (supports $ip placeholder)
 // routeOnly: if true, adds ?route_only=true to skip password validation (for master username auth)
-func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
+func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context, email, password, clientIP string, routeOnly bool) (*UserRoutingInfo, AuthResult, error) {
 	// Parse and validate email address with master token support
 	// This also handles +detail addressing and validates format
 	addr, err := server.NewAddress(email)
 	if err != nil {
-		logger.Info("prelookup: Invalid email format", "error", err)
+		logger.Info("remotelookup: Invalid email format", "error", err)
 		return nil, AuthFailed, nil
 	}
 
-	// For prelookup, use MasterAddress (base address + master token, without +detail)
+	// For remotelookup, use MasterAddress (base address + master token, without +detail)
 	// This ensures:
 	//   - user+tag@example.com and user@example.com authenticate the same way
-	//   - user@example.com@TOKEN passes the master token to prelookup
+	//   - user@example.com@TOKEN passes the master token to remotelookup
 	//   - user+tag@example.com@TOKEN strips +tag but keeps @TOKEN
 	lookupEmail := addr.MasterAddress()
 
@@ -251,7 +251,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 
 	// Log if we stripped +detail addressing
 	if addr.Detail() != "" {
-		logger.Debug("prelookup: Stripping +detail for authentication", "from", email, "to", lookupEmail)
+		logger.Debug("remotelookup: Stripping +detail for authentication", "from", email, "to", lookupEmail)
 	}
 
 	// Execute HTTP request through circuit breaker (NO caching - handled at ConnectionManager level)
@@ -274,7 +274,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 			}
 		}
 
-		logger.Debug("prelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
+		logger.Debug("remotelookup: Requesting lookup", "user", lookupEmail, "client_ip", clientIP, "url", requestURL, "route_only", routeOnly)
 
 		// Make HTTP request
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
@@ -291,85 +291,85 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		if err != nil {
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				logger.Info("prelookup: Request cancelled due to context cancellation (server shutdown)")
+				logger.Info("remotelookup: Request cancelled due to context cancellation (server shutdown)")
 				// Return temporarily unavailable to avoid penalizing as auth failure
-				// Wrap server.ErrServerShuttingDown with ErrPrelookupTransient so it flows correctly
-				return nil, fmt.Errorf("%w: %w", ErrPrelookupTransient, server.ErrServerShuttingDown)
+				// Wrap server.ErrServerShuttingDown with ErrRemoteLookupTransient so it flows correctly
+				return nil, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, server.ErrServerShuttingDown)
 			}
 			// Network error - this is transient
-			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrPrelookupTransient, err)
+			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, err)
 		}
 		defer resp.Body.Close()
 
 		// Check status code first - for error responses, status code is all we need
 		// Don't waste time reading/parsing body for non-200 responses
 		if resp.StatusCode == http.StatusNotFound {
-			logger.Debug("prelookup: User not found (404)", "user", lookupEmail)
+			logger.Debug("remotelookup: User not found (404)", "user", lookupEmail)
 			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
 		// 401 Unauthorized and 403 Forbidden mean authentication failed (user exists but access denied)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			logger.Debug("prelookup: API returned auth failed", "status", resp.StatusCode, "user", lookupEmail)
+			logger.Debug("remotelookup: API returned auth failed", "status", resp.StatusCode, "user", lookupEmail)
 			return map[string]any{"result": AuthFailed}, nil
 		}
 
 		// Other 4xx errors mean user lookup failed - treat as temporarily unavailable
-		// This respects fallback_to_default setting (unlike AuthUserNotFound which always falls back)
+		// This respects fallback_to_db setting (unlike AuthUserNotFound which always falls back)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Warn("prelookup: Client error - treating as temporarily unavailable", "status", resp.StatusCode, "user", lookupEmail)
-			return nil, fmt.Errorf("%w: client error %d", ErrPrelookupTransient, resp.StatusCode)
+			logger.Warn("remotelookup: Client error - treating as temporarily unavailable", "status", resp.StatusCode, "user", lookupEmail)
+			return nil, fmt.Errorf("%w: client error %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
 		// 5xx errors are transient - fallback controlled by config
 		if resp.StatusCode >= 500 {
-			logger.Warn("prelookup: Server error", "status", resp.StatusCode, "user", lookupEmail)
-			return nil, fmt.Errorf("%w: server error %d", ErrPrelookupTransient, resp.StatusCode)
+			logger.Warn("remotelookup: Server error", "status", resp.StatusCode, "user", lookupEmail)
+			return nil, fmt.Errorf("%w: server error %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
 		// Non-200 2xx responses - treat as transient
 		if resp.StatusCode != http.StatusOK {
-			logger.Warn("prelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail)
-			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrPrelookupTransient, resp.StatusCode)
+			logger.Warn("remotelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail)
+			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
 		// Only read and parse body for 200 OK responses
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			logger.Warn("prelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
-			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrPrelookupTransient, readErr)
+			logger.Warn("remotelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
+			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrRemoteLookupTransient, readErr)
 		}
 
 		// Parse JSON response - if this fails on a 200 response, it's a server bug
-		var lookupResp HTTPPreLookupResponse
+		var lookupResp HTTPRemoteLookupResponse
 		if err := json.Unmarshal(bodyBytes, &lookupResp); err != nil {
-			logger.Warn("prelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
-			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrPrelookupInvalidResponse, err)
+			logger.Warn("remotelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
+			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrRemoteLookupInvalidResponse, err)
 		}
 
 		// Validate required fields - invalid 200 response is a server bug
 		if strings.TrimSpace(lookupResp.Address) == "" {
-			logger.Warn("prelookup: Validation failed - address is empty", "user", lookupEmail)
-			return nil, fmt.Errorf("%w: address is empty in response", ErrPrelookupInvalidResponse)
+			logger.Warn("remotelookup: Validation failed - address is empty", "user", lookupEmail)
+			return nil, fmt.Errorf("%w: address is empty in response", ErrRemoteLookupInvalidResponse)
 		}
 		// Only validate password_hash if NOT route_only mode
 		// In route_only mode (master username auth), password already validated locally
 		if !routeOnly && strings.TrimSpace(lookupResp.PasswordHash) == "" {
-			logger.Warn("prelookup: Validation failed - password_hash is empty", "user", lookupEmail)
-			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrPrelookupInvalidResponse)
+			logger.Warn("remotelookup: Validation failed - password_hash is empty", "user", lookupEmail)
+			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrRemoteLookupInvalidResponse)
 		}
 
-		// If server is null/empty, this is auth-only mode (prelookup handles authentication,
+		// If server is null/empty, this is auth-only mode (remotelookup handles authentication,
 		// Sora handles backend selection via affinity/consistent-hash/round-robin)
 		// We mark this with a special flag in the response so it can be processed differently
 		if strings.TrimSpace(lookupResp.Server) == "" {
-			logger.Debug("prelookup: Server is null/empty - auth-only mode (local backend selection)", "user", lookupEmail)
+			logger.Debug("remotelookup: Server is null/empty - auth-only mode (local backend selection)", "user", lookupEmail)
 			lookupResp.AuthOnlyMode = true
 		}
 
 		// Derive account_id from the address field
 		lookupResp.AccountID = deriveAccountIDFromEmail(lookupResp.Address)
-		logger.Debug("prelookup: Derived account_id from address", "address", lookupResp.Address, "account_id", lookupResp.AccountID)
+		logger.Debug("remotelookup: Derived account_id from address", "address", lookupResp.Address, "account_id", lookupResp.AccountID)
 
 		return lookupResp, nil
 	})
@@ -377,17 +377,17 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	// Handle circuit breaker errors
 	if err != nil {
 		if err == circuitbreaker.ErrCircuitBreakerOpen {
-			logger.Warn("prelookup: Circuit breaker is open", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is open", "url", c.baseURL)
 			// Circuit breaker open is a transient error - return temporarily unavailable
-			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrPrelookupTransient)
+			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker open: too many failures", ErrRemoteLookupTransient)
 		}
 		if err == circuitbreaker.ErrTooManyRequests {
-			logger.Warn("prelookup: Circuit breaker is half-open - rate limiting requests", "url", c.baseURL)
+			logger.Warn("remotelookup: Circuit breaker is half-open - rate limiting requests", "url", c.baseURL)
 			// Too many requests in half-open state is also a transient error - return temporarily unavailable
-			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrPrelookupTransient)
+			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: circuit breaker half-open: too many concurrent requests", ErrRemoteLookupTransient)
 		}
 		// Check if this is a transient error or invalid response
-		if errors.Is(err, ErrPrelookupTransient) {
+		if errors.Is(err, ErrRemoteLookupTransient) {
 			// Transient errors (network, timeout, 5xx) - temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, err
 		}
@@ -399,20 +399,20 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok {
 			if authResult == AuthUserNotFound {
-				// Don't cache user not found - these should always go to prelookup
+				// Don't cache user not found - these should always go to remotelookup
 				// This prevents issues with user creation between cache checks
 				return nil, AuthUserNotFound, nil
 			}
 			if authResult == AuthFailed {
 				// Don't cache auth failures - these could be typos or password changes
-				// Better to always check prelookup for security
+				// Better to always check remotelookup for security
 				return nil, AuthFailed, nil
 			}
 		}
 	}
 
 	// Extract lookup response
-	lookupResp, ok := result.(HTTPPreLookupResponse)
+	lookupResp, ok := result.(HTTPRemoteLookupResponse)
 	if !ok {
 		return nil, AuthFailed, fmt.Errorf("unexpected result type from circuit breaker")
 	}
@@ -420,7 +420,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	// Use the address from response (required field, already validated)
 	actualEmail := strings.TrimSpace(lookupResp.Address)
 	if actualEmail != lookupEmail {
-		logger.Debug("prelookup: Using address from response", "response_email", actualEmail, "query_email", lookupEmail)
+		logger.Debug("remotelookup: Using address from response", "response_email", actualEmail, "query_email", lookupEmail)
 	}
 
 	// Verify password against hash (skip if route_only mode)
@@ -435,7 +435,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 		if !c.verifyPassword(password, lookupResp.PasswordHash) {
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
-			logger.Info("prelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
+			logger.Info("remotelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
 			return nil, AuthFailed, nil
 		}
 	}
@@ -443,7 +443,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	// Build routing info based on mode
 	var normalizedServer string
 	if !lookupResp.AuthOnlyMode {
-		// Normal mode: prelookup specifies backend server
+		// Normal mode: remotelookup specifies backend server
 		normalizedServer = c.normalizeServerAddress(lookupResp.Server)
 	}
 	// else: Auth-only mode - ServerAddress will be empty, backend selected locally
@@ -451,7 +451,7 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedServer,
 		AccountID:              lookupResp.AccountID,
-		IsPrelookupAccount:     true,
+		IsRemoteLookupAccount:  true,
 		ActualEmail:            actualEmail,
 		RemoteTLS:              c.remoteTLS,
 		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
@@ -466,19 +466,19 @@ func (c *HTTPPreLookupClient) LookupUserRouteWithClientIP(ctx context.Context, e
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Debug("prelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix)
+	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix)
 
 	return info, AuthSuccess, nil
 }
 
 // verifyPassword verifies a password against a hash
-func (c *HTTPPreLookupClient) verifyPassword(password, hash string) bool {
+func (c *HTTPRemoteLookupClient) verifyPassword(password, hash string) bool {
 	err := db.VerifyPassword(hash, password)
 	return err == nil
 }
 
 // normalizeServerAddress ensures the server address has a port
-func (c *HTTPPreLookupClient) normalizeServerAddress(addr string) string {
+func (c *HTTPRemoteLookupClient) normalizeServerAddress(addr string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return addr
@@ -498,7 +498,7 @@ func (c *HTTPPreLookupClient) normalizeServerAddress(addr string) string {
 }
 
 // deriveAccountIDFromEmail creates a stable, unique int64 ID from an email address
-// This allows connection tracking even when the prelookup endpoint doesn't provide an account_id
+// This allows connection tracking even when the remotelookup endpoint doesn't provide an account_id
 func deriveAccountIDFromEmail(email string) int64 {
 	// Normalize the email (lowercase, trim spaces)
 	normalized := strings.ToLower(strings.TrimSpace(email))
@@ -521,8 +521,8 @@ func deriveAccountIDFromEmail(email string) int64 {
 	return id
 }
 
-// HealthCheck performs a health check on the HTTP prelookup endpoint
-func (c *HTTPPreLookupClient) HealthCheck(ctx context.Context) error {
+// HealthCheck performs a health check on the HTTP remotelookup endpoint
+func (c *HTTPRemoteLookupClient) HealthCheck(ctx context.Context) error {
 	// Try a simple GET request to the base URL to check if the service is reachable
 	// Note: We're not using a real email here since this is just a health check
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL, nil)
@@ -532,37 +532,37 @@ func (c *HTTPPreLookupClient) HealthCheck(ctx context.Context) error {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("HTTP prelookup endpoint unreachable: %w", err)
+		return fmt.Errorf("HTTP remotelookup endpoint unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Accept any response that's not a 5xx error
 	// (we expect 400 for missing email parameter, which is fine for health check)
 	if resp.StatusCode >= 500 {
-		return fmt.Errorf("HTTP prelookup endpoint returned error: %d", resp.StatusCode)
+		return fmt.Errorf("HTTP remotelookup endpoint returned error: %d", resp.StatusCode)
 	}
 
 	return nil
 }
 
 // GetCircuitBreaker returns the circuit breaker for health monitoring
-func (c *HTTPPreLookupClient) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
+func (c *HTTPRemoteLookupClient) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 	return c.breaker
 }
 
 // GetTimeout returns the configured HTTP request timeout
-func (c *HTTPPreLookupClient) GetTimeout() time.Duration {
+func (c *HTTPRemoteLookupClient) GetTimeout() time.Duration {
 	return c.timeout
 }
 
 // GetTransportTimeouts returns the dial and TLS handshake timeouts
 // Used for calculating total context timeout including connection establishment
-func (c *HTTPPreLookupClient) GetTransportTimeouts() (dialTimeout, tlsHandshakeTimeout time.Duration) {
+func (c *HTTPRemoteLookupClient) GetTransportTimeouts() (dialTimeout, tlsHandshakeTimeout time.Duration) {
 	return c.dialTimeout, c.tlsHandshakeTimeout
 }
 
-// GetHealth returns the health status of the HTTP prelookup service
-func (c *HTTPPreLookupClient) GetHealth() map[string]any {
+// GetHealth returns the health status of the HTTP remotelookup service
+func (c *HTTPRemoteLookupClient) GetHealth() map[string]any {
 	health := make(map[string]any)
 	health["endpoint"] = c.baseURL
 	health["timeout"] = c.timeout.String()
@@ -587,7 +587,7 @@ func (c *HTTPPreLookupClient) GetHealth() map[string]any {
 }
 
 // Close cleans up resources
-func (c *HTTPPreLookupClient) Close() error {
-	logger.Debug("prelookup: Closing HTTP prelookup client")
+func (c *HTTPRemoteLookupClient) Close() error {
+	logger.Debug("remotelookup: Closing HTTP remotelookup client")
 	return nil
 }

@@ -50,7 +50,7 @@ type Server struct {
 	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig        *config.PreLookupConfig
+	remotelookupConfig     *config.RemoteLookupConfig
 	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
@@ -113,7 +113,7 @@ type ServerOptions struct {
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	AuthRateLimit          server.AuthRateLimiterConfig
-	PreLookup              *config.PreLookupConfig
+	RemoteLookup           *config.RemoteLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 
 	// Connection limiting
@@ -157,9 +157,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connectTimeout = 10 * time.Second
 	}
 
-	// Ensure PreLookup config has a default value to avoid nil panics.
-	if opts.PreLookup == nil {
-		opts.PreLookup = &config.PreLookupConfig{}
+	// Ensure RemoteLookup config has a default value to avoid nil panics.
+	if opts.RemoteLookup == nil {
+		opts.RemoteLookup = &config.RemoteLookupConfig{}
 	}
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
@@ -169,15 +169,15 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		opts.TLSUseStartTLS = false
 	}
 
-	// Initialize prelookup client if configured
-	routingLookup, err := proxy.InitializePrelookup("managesieve", opts.PreLookup)
+	// Initialize remotelookup client if configured
+	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup)
 	if err != nil {
-		logger.Debug("ManageSieve Proxy: Failed to initialize prelookup client", "name", opts.Name, "error", err)
-		if opts.PreLookup != nil && !opts.PreLookup.FallbackDefault {
+		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
+		if opts.RemoteLookup != nil && !opts.RemoteLookup.FallbackToDB {
 			cancel()
-			return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Continuing without prelookup - fallback enabled", "name", opts.Name)
+		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - fallback enabled", "name", opts.Name)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)
@@ -318,7 +318,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		affinityStickiness:         stickiness,
 		authLimiter:                authLimiter,
 		trustedProxies:             opts.TrustedProxies,
-		prelookupConfig:            opts.PreLookup,
+		remotelookupConfig:         opts.RemoteLookup,
 		authIdleTimeout:            opts.AuthIdleTimeout,
 		commandTimeout:             opts.CommandTimeout,
 		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
@@ -608,12 +608,12 @@ func (s *Server) Stop() error {
 		logger.Debug("ManageSieve Proxy: Server stop timeout", "name", s.name)
 	}
 
-	// Close prelookup client if it exists
+	// Close remotelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			logger.Debug("ManageSieve Proxy: Closing prelookup client", "name", s.name)
+			logger.Debug("ManageSieve Proxy: Closing remotelookup client", "name", s.name)
 			if err := routingLookup.Close(); err != nil {
-				logger.Debug("ManageSieve Proxy: Error closing prelookup client", "name", s.name, "error", err)
+				logger.Debug("ManageSieve Proxy: Error closing remotelookup client", "name", s.name, "error", err)
 			}
 		}
 	}

@@ -6,44 +6,44 @@ import (
 	"testing"
 )
 
-// TestPrelookupUsernameAssignment verifies that s.username is correctly set
-// based on the authentication method (prelookup vs main DB).
+// TestRemoteLookupUsernameAssignment verifies that s.username is correctly set
+// based on the authentication method (remotelookup vs main DB).
 //
 // This test documents the fix for a bug where s.username was being overwritten
 // after authenticateUser() returned, causing the wrong email to be used for
-// backend authentication when prelookup resolved an alias to a canonical address.
-func TestPrelookupUsernameAssignment(t *testing.T) {
+// backend authentication when remotelookup resolved an alias to a canonical address.
+func TestRemoteLookupUsernameAssignment(t *testing.T) {
 	tests := []struct {
-		name                 string
-		authMethod           string // "prelookup" or "maindb"
-		loginEmail           string // What user logs in with
-		prelookupReturnEmail string // What prelookup returns (if prelookup)
-		expectedUsername     string // What s.username should be after auth
-		description          string
+		name                    string
+		authMethod              string // "remotelookup" or "maindb"
+		loginEmail              string // What user logs in with
+		remotelookupReturnEmail string // What remotelookup returns (if remotelookup)
+		expectedUsername        string // What s.username should be after auth
+		description             string
 	}{
 		{
-			name:                 "prelookup_alias_to_canonical",
-			authMethod:           "prelookup",
-			loginEmail:           "alias@example.com",
-			prelookupReturnEmail: "canonical@example.com",
-			expectedUsername:     "canonical@example.com",
-			description:          "Prelookup: alias should resolve to canonical",
+			name:                    "remotelookup_alias_to_canonical",
+			authMethod:              "remotelookup",
+			loginEmail:              "alias@example.com",
+			remotelookupReturnEmail: "canonical@example.com",
+			expectedUsername:        "canonical@example.com",
+			description:             "RemoteLookup: alias should resolve to canonical",
 		},
 		{
-			name:                 "prelookup_canonical_unchanged",
-			authMethod:           "prelookup",
-			loginEmail:           "user@example.com",
-			prelookupReturnEmail: "user@example.com",
-			expectedUsername:     "user@example.com",
-			description:          "Prelookup: canonical email unchanged",
+			name:                    "remotelookup_canonical_unchanged",
+			authMethod:              "remotelookup",
+			loginEmail:              "user@example.com",
+			remotelookupReturnEmail: "user@example.com",
+			expectedUsername:        "user@example.com",
+			description:             "RemoteLookup: canonical email unchanged",
 		},
 		{
-			name:                 "prelookup_plus_detail_stripped",
-			authMethod:           "prelookup",
-			loginEmail:           "user+tag@example.com",
-			prelookupReturnEmail: "user@example.com",
-			expectedUsername:     "user@example.com",
-			description:          "Prelookup: +detail stripped",
+			name:                    "remotelookup_plus_detail_stripped",
+			authMethod:              "remotelookup",
+			loginEmail:              "user+tag@example.com",
+			remotelookupReturnEmail: "user@example.com",
+			expectedUsername:        "user@example.com",
+			description:             "RemoteLookup: +detail stripped",
 		},
 		{
 			name:             "maindb_base_address",
@@ -66,13 +66,13 @@ func TestPrelookupUsernameAssignment(t *testing.T) {
 			// Simulate what happens in authenticateUser() based on auth method
 			var username string
 
-			if tt.authMethod == "prelookup" {
-				// Prelookup path (session.go lines 500-505):
+			if tt.authMethod == "remotelookup" {
+				// RemoteLookup path (session.go lines 500-505):
 				// if routingInfo.ActualEmail != "" {
 				//     s.username = routingInfo.ActualEmail
 				// }
-				if tt.prelookupReturnEmail != "" {
-					username = tt.prelookupReturnEmail
+				if tt.remotelookupReturnEmail != "" {
+					username = tt.remotelookupReturnEmail
 				} else {
 					username = tt.loginEmail // Fallback
 				}
@@ -125,11 +125,11 @@ func TestPrelookupUsernameAssignment(t *testing.T) {
 	}
 }
 
-// TestMainDBAliasHandling verifies that when prelookup is not used,
+// TestMainDBAliasHandling verifies that when remotelookup is not used,
 // the main DB authentication path correctly sets username to base address
 func TestMainDBAliasHandling(t *testing.T) {
 	// This test verifies the fix ensures s.username is set in the main DB path too
-	// (not just the prelookup path)
+	// (not just the remotelookup path)
 
 	tests := []struct {
 		name             string

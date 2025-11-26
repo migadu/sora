@@ -20,14 +20,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestIMAPProxyActualEmailCaching tests that when prelookup returns an "address" field
+// TestIMAPProxyActualEmailCaching tests that when remotelookup returns an "address" field
 // (ActualEmail) that differs from the submitted username (e.g., token-based auth),
 // the cache stores ActualEmail so cache hits can use the resolved address.
 //
 // Bug: Cache wasn't storing ActualEmail, so cache hits used submitted username for backend
 //
 // Expected behavior:
-// 1. Login with user@example.com@TOKEN → prelookup returns address="user@example.com"
+// 1. Login with user@example.com@TOKEN → remotelookup returns address="user@example.com"
 // 2. Cache key: "user@example.com@TOKEN", Cache value includes ActualEmail="user@example.com"
 // 3. Subsequent login with same TOKEN → cache hit, uses stored ActualEmail for backend
 func TestIMAPProxyActualEmailCaching(t *testing.T) {
@@ -41,27 +41,27 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("actualcache-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Track prelookup calls
-	var prelookupCalls int
+	// Track remotelookup calls
+	var remotelookupCalls int
 
-	// Create prelookup server that:
+	// Create remotelookup server that:
 	// - Accepts "user@example.com@TOKEN" as username
 	// - Returns "user@example.com" as address (ActualEmail)
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls++
-		t.Logf("Prelookup request #%d: %s", prelookupCalls, r.URL.Path)
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls++
+		t.Logf("RemoteLookup request #%d: %s", remotelookupCalls, r.URL.Path)
 
 		// Return response with different address than queried username
 		// This simulates token-based auth where:
 		// - Client sends: user@example.com@TOKEN
-		// - Prelookup resolves to: user@example.com
+		// - RemoteLookup resolves to: user@example.com
 		response := map[string]interface{}{
 			"address":       account.Email, // Resolved email (without token)
 			"password_hash": passwordHash,
@@ -71,21 +71,21 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(response); err != nil {
-			t.Errorf("Failed to encode prelookup response: %v", err)
+			t.Errorf("Failed to encode remotelookup response: %v", err)
 		}
-		t.Logf("Prelookup returned address=%s for token-based auth", account.Email)
+		t.Logf("RemoteLookup returned address=%s for token-based auth", account.Email)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up IMAP proxy with prelookup
+	// Set up IMAP proxy with remotelookup
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithPrelookup(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupIMAPProxyWithRemoteLookup(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
 	// Test 1: Login with token - should populate cache with TOKEN as key, ActualEmail in value
 	t.Run("LoginWithToken_PopulatesCache", func(t *testing.T) {
-		prelookupCallsBefore := prelookupCalls
+		remotelookupCallsBefore := remotelookupCalls
 
 		// Login with username@TOKEN
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
@@ -100,9 +100,9 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 		}
 		t.Logf("✓ Login with token succeeded (username=%s, resolved=%s)", usernameWithToken, account.Email)
 
-		// Verify prelookup was called (first time, cache miss)
-		if prelookupCalls <= prelookupCallsBefore {
-			t.Fatalf("Expected prelookup to be called, but got %d calls", prelookupCalls-prelookupCallsBefore)
+		// Verify remotelookup was called (first time, cache miss)
+		if remotelookupCalls <= remotelookupCallsBefore {
+			t.Fatalf("Expected remotelookup to be called, but got %d calls", remotelookupCalls-remotelookupCallsBefore)
 		}
 	})
 
@@ -111,7 +111,7 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 
 	// Test 2: Login with TOKEN again - should hit cache, use stored ActualEmail
 	t.Run("LoginWithTokenAgain_ShouldHitCache", func(t *testing.T) {
-		prelookupCallsBefore := prelookupCalls
+		remotelookupCallsBefore := remotelookupCalls
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
@@ -126,20 +126,20 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 		t.Log("✓ Login with token (second time) succeeded")
 
 		// This SHOULD hit cache (same token as first login)
-		prelookupCallsAfter := prelookupCalls
-		if prelookupCallsAfter > prelookupCallsBefore {
-			t.Errorf("Prelookup was called %d time(s) - cache MISS (expected cache HIT)",
-				prelookupCallsAfter-prelookupCallsBefore)
+		remotelookupCallsAfter := remotelookupCalls
+		if remotelookupCallsAfter > remotelookupCallsBefore {
+			t.Errorf("RemoteLookup was called %d time(s) - cache MISS (expected cache HIT)",
+				remotelookupCallsAfter-remotelookupCallsBefore)
 			t.Error("Cache should hit for same token")
 		} else {
 			t.Log("✓ Cache hit with token - using stored ActualEmail")
 		}
 	})
 
-	// Test 3: Login with resolved email (without token) - WILL call prelookup (different cache key)
+	// Test 3: Login with resolved email (without token) - WILL call remotelookup (different cache key)
 	// This is EXPECTED because cache key is "user@TOKEN", not "user"
-	t.Run("LoginWithResolvedEmail_CallsPrelookup", func(t *testing.T) {
-		prelookupCallsBefore := prelookupCalls
+	t.Run("LoginWithResolvedEmail_CallsRemoteLookup", func(t *testing.T) {
+		remotelookupCallsBefore := remotelookupCalls
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
@@ -153,18 +153,18 @@ func TestIMAPProxyActualEmailCaching(t *testing.T) {
 		}
 		t.Log("✓ Login with resolved email succeeded")
 
-		// This WILL call prelookup because it's a different cache key
+		// This WILL call remotelookup because it's a different cache key
 		// This is EXPECTED behavior - each unique username gets its own cache entry
-		prelookupCallsAfter := prelookupCalls
-		if prelookupCallsAfter > prelookupCallsBefore {
-			t.Logf("NOTE: Prelookup was called (expected - different cache key: '%s' vs '%s@TOKEN')",
+		remotelookupCallsAfter := remotelookupCalls
+		if remotelookupCallsAfter > remotelookupCallsBefore {
+			t.Logf("NOTE: RemoteLookup was called (expected - different cache key: '%s' vs '%s@TOKEN')",
 				account.Email, account.Email)
 		}
 	})
 }
 
-// setupIMAPProxyWithPrelookup sets up an IMAP proxy with prelookup enabled
-func setupIMAPProxyWithPrelookup(t *testing.T, rdb *resilient.ResilientDatabase, addr string, remoteAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithRemoteLookup sets up an IMAP proxy with remotelookup enabled
+func setupIMAPProxyWithRemoteLookup(t *testing.T, rdb *resilient.ResilientDatabase, addr string, remoteAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	opts := imapproxy.ServerOptions{
@@ -182,11 +182,11 @@ func setupIMAPProxyWithPrelookup(t *testing.T, rdb *resilient.ResilientDatabase,
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL + "/$email",
+			URL:                    remotelookupURL + "/$email",
 			Timeout:                "10s",
-			FallbackDefault:        false,
+			FallbackToDB:           false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{

@@ -7,20 +7,20 @@ import (
 	"github.com/migadu/sora/config"
 )
 
-// InitializePrelookup creates an HTTP prelookup client from configuration
-func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRoutingLookup, error) {
+// InitializeRemoteLookup creates an HTTP remotelookup client from configuration
+func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (UserRoutingLookup, error) {
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
 
 	if cfg.URL == "" {
-		return nil, fmt.Errorf("prelookup.url is required when prelookup is enabled")
+		return nil, fmt.Errorf("remotelookup.url is required when remotelookup is enabled")
 	}
 
 	// Get HTTP timeout
 	timeout, err := cfg.GetTimeout()
 	if err != nil {
-		return nil, fmt.Errorf("invalid prelookup timeout: %w", err)
+		return nil, fmt.Errorf("invalid remotelookup timeout: %w", err)
 	}
 
 	// Get remote TLS verification setting
@@ -42,17 +42,17 @@ func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRout
 			if v != "" {
 				parsed, err := fmt.Sscanf(v, "%d", &remotePort)
 				if err != nil || parsed != 1 {
-					logger.Debug("Prelookup: Warning - failed to parse remote_port, using default", "value", v)
+					logger.Debug("RemoteLookup: Warning - failed to parse remote_port, using default", "value", v)
 					remotePort = 0
 				}
 			}
 		default:
-			logger.Debug("Prelookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
+			logger.Debug("RemoteLookup: Warning - remote_port has unexpected type, using default", "type", fmt.Sprintf("%T", v))
 		}
 	}
 
 	hasAuth := cfg.AuthToken != ""
-	logger.Debug("Prelookup: Initializing HTTP prelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
+	logger.Debug("RemoteLookup: Initializing HTTP remotelookup (NO caching)", "url", cfg.URL, "timeout", timeout, "remote_port", remotePort, "auth_enabled", hasAuth)
 
 	// Parse circuit breaker settings
 	var cbSettings *CircuitBreakerSettings
@@ -74,7 +74,7 @@ func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRout
 			MinRequests:  cfg.CircuitBreaker.GetMinRequests(),
 		}
 	}
-	// If nil, NewHTTPPreLookupClient will use defaults
+	// If nil, NewHTTPRemoteLookupClient will use defaults
 
 	// Parse transport settings
 	var transportSettings *TransportSettings
@@ -111,9 +111,9 @@ func InitializePrelookup(protocol string, cfg *config.PreLookupConfig) (UserRout
 			KeepAlive:             keepAlive,
 		}
 	}
-	// If nil, NewHTTPPreLookupClient will use defaults
+	// If nil, NewHTTPRemoteLookupClient will use defaults
 
-	client := NewHTTPPreLookupClient(
+	client := NewHTTPRemoteLookupClient(
 		cfg.URL,
 		timeout,
 		cfg.AuthToken,

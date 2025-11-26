@@ -13,11 +13,11 @@ const DomainNameRegex = `^(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[
 
 // Separator constant for master authentication
 const (
-	// SuffixSeparator is used for master username and prelookup tokens
-	// Format: user@domain@SUFFIX (where SUFFIX can be master username or prelookup token)
+	// SuffixSeparator is used for master username and remotelookup tokens
+	// Format: user@domain@SUFFIX (where SUFFIX can be master username or remotelookup token)
 	// Used by both backends and proxies:
 	// - If SUFFIX matches configured master username: validated locally
-	// - Otherwise: treated as prelookup token and sent to prelookup service
+	// - Otherwise: treated as remotelookup token and sent to remotelookup service
 	SuffixSeparator = "@"
 )
 
@@ -26,7 +26,7 @@ type Address struct {
 	localPart   string
 	domain      string
 	detail      string
-	suffix      string // Suffix after second @ (can be master username or prelookup token): user@domain.com@SUFFIX
+	suffix      string // Suffix after second @ (can be master username or remotelookup token): user@domain.com@SUFFIX
 }
 
 func (a Address) FullAddress() string {
@@ -59,7 +59,7 @@ func (a Address) BaseAddress() string {
 }
 
 // MasterAddress returns the base address with suffix (without +detail)
-// The suffix can be a master username or prelookup token
+// The suffix can be a master username or remotelookup token
 // Examples:
 //   - "user+tag@domain.com@TOKEN" -> "user@domain.com@TOKEN"
 //   - "user+tag@domain.com" -> "user@domain.com"
@@ -73,7 +73,7 @@ func (a Address) MasterAddress() string {
 }
 
 // Suffix returns the suffix after the second @ if present (from syntax like user@domain.com@SUFFIX)
-// The suffix can be either a master username or a prelookup token depending on context
+// The suffix can be either a master username or a remotelookup token depending on context
 func (a Address) Suffix() string {
 	return a.suffix
 }
@@ -87,7 +87,7 @@ func (a Address) HasSuffix() bool {
 // The suffix uses the syntax: user@domain.com@SUFFIX
 // The SUFFIX can be:
 // - A master username (for master password authentication) - validated locally if it matches config
-// - A prelookup token (for HTTP prelookup authentication) - sent to prelookup if it doesn't match
+// - A remotelookup token (for HTTP remotelookup authentication) - sent to remotelookup if it doesn't match
 // Returns the parsed Address with proper validation, stripping +detail for authentication
 func ParseAddressWithMasterToken(input string) (Address, error) {
 	return NewAddress(input)

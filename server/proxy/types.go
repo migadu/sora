@@ -13,10 +13,10 @@ import (
 type AuthResult int
 
 const (
-	AuthUserNotFound           AuthResult = iota // User doesn't exist in prelookup - fallback allowed
+	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by fallback_to_db
 	AuthSuccess                                  // User found and authenticated - proceed with routing
 	AuthFailed                                   // User found but auth failed - reject, no fallback
-	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - user should retry later
+	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - fallback controlled by fallback_to_db
 )
 
 // String returns a human-readable representation of AuthResult
@@ -35,19 +35,19 @@ func (a AuthResult) String() string {
 	}
 }
 
-// Prelookup error types for distinguishing failure modes
+// RemoteLookup error types for distinguishing failure modes
 var (
-	// ErrPrelookupTransient represents a transient error (network issue, 5xx, circuit breaker open)
-	// Fallback behavior is controlled by fallback_to_default config
-	ErrPrelookupTransient = errors.New("prelookup transient error")
+	// ErrRemoteLookupTransient represents a transient error (network issue, 5xx, circuit breaker open)
+	// Fallback behavior is controlled by fallback_to_db config
+	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
-	// ErrPrelookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)
+	// ErrRemoteLookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)
 	// This is a server bug - should fail hard, no fallback
-	ErrPrelookupInvalidResponse = errors.New("prelookup invalid response")
+	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
 )
 
 // UserRoutingLookup interface for routing lookups
-// NOTE: No caching - prelookup is just a data source, caching happens at higher level
+// NOTE: No caching - remotelookup is just a data source, caching happens at higher level
 type UserRoutingLookup interface {
 	LookupUserRoute(ctx context.Context, email, password string) (*UserRoutingInfo, AuthResult, error)
 	LookupUserRouteWithOptions(ctx context.Context, email, password string, routeOnly bool) (*UserRoutingInfo, AuthResult, error)
@@ -59,9 +59,9 @@ type UserRoutingLookup interface {
 type UserRoutingInfo struct {
 	ServerAddress          string   // Backend server to connect to
 	AccountID              int64    // Account ID for tracking/metrics
-	IsPrelookupAccount     bool     // Whether this came from prelookup
+	IsRemoteLookupAccount  bool     // Whether this came from remotelookup
 	ActualEmail            string   // Actual email address for backend impersonation
-	FromCache              bool     // Whether this result came from prelookup cache
+	FromCache              bool     // Whether this result came from remotelookup cache
 	RemoteTLS              bool     // Use TLS for backend connection
 	RemoteTLSUseStartTLS   bool     // Use STARTTLS (LMTP/ManageSieve only)
 	RemoteTLSVerify        bool     // Verify backend TLS certificate

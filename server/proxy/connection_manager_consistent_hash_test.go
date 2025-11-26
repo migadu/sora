@@ -153,7 +153,7 @@ func TestDetermineRoute_ConsistentHashPrecedence(t *testing.T) {
 	username := "test@example.com"
 	ctx := context.Background()
 
-	// Test 1: No affinity, no prelookup → should use consistent hash
+	// Test 1: No affinity, no remotelookup → should use consistent hash
 	result, err := DetermineRoute(RouteParams{
 		Ctx:            ctx,
 		Username:       username,
@@ -205,11 +205,11 @@ func TestDetermineRoute_ConsistentHashPrecedence(t *testing.T) {
 
 	t.Logf("Affinity selected: %s", affinityBackend)
 
-	// Test 3: With prelookup → should use prelookup (highest priority)
-	prelookupBackend := "backend3:143"
+	// Test 3: With remotelookup → should use remotelookup (highest priority)
+	remotelookupBackend := "backend3:143"
 	routingInfo := &UserRoutingInfo{
-		ServerAddress:      prelookupBackend,
-		IsPrelookupAccount: true,
+		ServerAddress:         remotelookupBackend,
+		IsRemoteLookupAccount: true,
 	}
 
 	result, err = DetermineRoute(RouteParams{
@@ -226,15 +226,15 @@ func TestDetermineRoute_ConsistentHashPrecedence(t *testing.T) {
 		t.Fatalf("DetermineRoute failed: %v", err)
 	}
 
-	if result.RoutingMethod != "prelookup" {
-		t.Errorf("Expected prelookup routing method, got %s", result.RoutingMethod)
+	if result.RoutingMethod != "remotelookup" {
+		t.Errorf("Expected remotelookup routing method, got %s", result.RoutingMethod)
 	}
 
-	if result.PreferredAddr != prelookupBackend {
-		t.Errorf("Expected prelookup backend %s, got %s", prelookupBackend, result.PreferredAddr)
+	if result.PreferredAddr != remotelookupBackend {
+		t.Errorf("Expected remotelookup backend %s, got %s", remotelookupBackend, result.PreferredAddr)
 	}
 
-	t.Logf("Prelookup selected: %s", prelookupBackend)
+	t.Logf("RemoteLookup selected: %s", remotelookupBackend)
 }
 
 // TestUpdateAffinityAfterConnection_ConsistentHashScenarios tests affinity update logic

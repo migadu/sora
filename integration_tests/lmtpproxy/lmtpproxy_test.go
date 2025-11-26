@@ -1206,45 +1206,52 @@ func handleMockLMTPBackendFailDuringDATA(conn net.Conn) {
 	}
 }
 
-// TestLMTPProxyPrelookupFallbackToDefault tests the fallback_to_default setting
-// when prelookup fails or returns empty results
-func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
+// TestLMTPProxyRemoteLookupFallbackToDefault tests the fallback_to_db setting
+// when remotelookup fails or returns empty results
+func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Test cases for different fallback scenarios
-	// Note: User not found (404) always falls through to main DB for partitioning support.
-	// The fallback_to_default setting only controls transient errors (network, 5xx, circuit breaker).
+	// Note: fallback_to_db controls ALL fallback behavior including user not found (404)
 	testCases := []struct {
-		name                string
-		fallbackToDefault   bool
-		prelookupStatusCode int    // HTTP status code for prelookup response
-		prelookupBody       string // HTTP response body
-		expectAccept        bool   // Should RCPT TO succeed?
-		expectLog           string // Expected log message
+		name                   string
+		fallbackToDefault      bool
+		remotelookupStatusCode int    // HTTP status code for remotelookup response
+		remotelookupBody       string // HTTP response body
+		expectAccept           bool   // Should RCPT TO succeed?
+		expectLog              string // Expected log message
 	}{
 		{
-			name:                "fallback_enabled_transient_error_accepts_recipient",
-			fallbackToDefault:   true,
-			prelookupStatusCode: 500,
-			prelookupBody:       `{"error": "internal server error"}`,
-			expectAccept:        true,
-			expectLog:           "prelookup transient error - fallback_to_default=true, falling back to main DB",
+			name:                   "fallback_enabled_transient_error_accepts_recipient",
+			fallbackToDefault:      true,
+			remotelookupStatusCode: 500,
+			remotelookupBody:       `{"error": "internal server error"}`,
+			expectAccept:           true,
+			expectLog:              "remotelookup transient error - fallback_to_db=true, falling back to main DB",
 		},
 		{
-			name:                "fallback_disabled_transient_error_rejects_recipient",
-			fallbackToDefault:   false,
-			prelookupStatusCode: 500,
-			prelookupBody:       `{"error": "internal server error"}`,
-			expectAccept:        false,
-			expectLog:           "prelookup transient error and fallback_to_default=false - rejecting recipient",
+			name:                   "fallback_disabled_transient_error_rejects_recipient",
+			fallbackToDefault:      false,
+			remotelookupStatusCode: 500,
+			remotelookupBody:       `{"error": "internal server error"}`,
+			expectAccept:           false,
+			expectLog:              "remotelookup transient error and fallback_to_db=false - rejecting recipient",
 		},
 		{
-			name:                "user_not_found_always_falls_through",
-			fallbackToDefault:   false, // Even with fallback disabled, user not found always falls through
-			prelookupStatusCode: 404,   // User not found should return 404
-			prelookupBody:       `{"error": "user not found"}`,
-			expectAccept:        true, // Should accept because it falls through to main DB
-			expectLog:           "user not found in prelookup, attempting main DB",
+			name:                   "user_not_found_fallback_enabled",
+			fallbackToDefault:      true,
+			remotelookupStatusCode: 404,
+			remotelookupBody:       `{"error": "user not found"}`,
+			expectAccept:           true,
+			expectLog:              "user not found in remotelookup, fallback enabled - attempting main DB",
+		},
+		{
+			name:                   "user_not_found_fallback_disabled",
+			fallbackToDefault:      false,
+			remotelookupStatusCode: 404,
+			remotelookupBody:       `{"error": "user not found"}`,
+			expectAccept:           false,
+			expectLog:              "user not found in remotelookup, fallback disabled - rejecting",
 		},
 	}
 
@@ -1258,16 +1265,16 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 			backendServer, account := common.SetupLMTPServerWithXCLIENT(t)
 			defer backendServer.Close()
 
-			// Set up mock prelookup HTTP server
-			prelookupAddr := common.GetRandomAddress(t)
-			mockPrelookupServer := setupMockPrelookupServer(t, prelookupAddr, tc.prelookupStatusCode, tc.prelookupBody)
-			defer mockPrelookupServer.Close()
+			// Set up mock remotelookup HTTP server
+			remotelookupAddr := common.GetRandomAddress(t)
+			mockRemoteLookupServer := setupMockRemoteLookupServer(t, remotelookupAddr, tc.remotelookupStatusCode, tc.remotelookupBody)
+			defer mockRemoteLookupServer.Close()
 
-			// Get HTTP URL for prelookup
-			prelookupURL := fmt.Sprintf("http://%s/lookup", prelookupAddr)
+			// Get HTTP URL for remotelookup
+			remotelookupURL := fmt.Sprintf("http://%s/lookup", remotelookupAddr)
 
-			// Set up LMTP proxy with prelookup
-			proxyAddress, proxyWrapper := setupLMTPProxyWithPrelookup(t, backendServer.Address, prelookupURL, tc.fallbackToDefault)
+			// Set up LMTP proxy with remotelookup
+			proxyAddress, proxyWrapper := setupLMTPProxyWithRemoteLookup(t, backendServer.Address, remotelookupURL, tc.fallbackToDefault)
 			defer proxyWrapper.Close()
 
 			// Connect to proxy
@@ -1301,7 +1308,7 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 				t.Fatalf("MAIL FROM failed: %s", response)
 			}
 
-			// Send RCPT TO - this is where prelookup is called
+			// Send RCPT TO - this is where remotelookup is called
 			if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
 				t.Fatalf("Failed to send RCPT TO: %v", err)
 			}
@@ -1335,20 +1342,20 @@ func TestLMTPProxyPrelookupFallbackToDefault(t *testing.T) {
 	}
 }
 
-// setupLMTPProxyWithPrelookup creates an LMTP proxy with prelookup configuration
-func setupLMTPProxyWithPrelookup(t *testing.T, backendAddress string, prelookupURL string, fallbackToDefault bool) (string, *LMTPProxyWrapper) {
+// setupLMTPProxyWithRemoteLookup creates an LMTP proxy with remotelookup configuration
+func setupLMTPProxyWithRemoteLookup(t *testing.T, backendAddress string, remotelookupURL string, fallbackToDefault bool) (string, *LMTPProxyWrapper) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
 	proxyAddress := common.GetRandomAddress(t)
 
-	// Create LMTP proxy server with prelookup
+	// Create LMTP proxy server with remotelookup
 	server, err := lmtpproxy.New(
 		context.Background(),
 		rdb,
 		"localhost",
 		lmtpproxy.ServerOptions{
-			Name:                   "test-proxy-prelookup",
+			Name:                   "test-proxy-remotelookup",
 			Addr:                   proxyAddress,
 			RemoteAddrs:            []string{backendAddress},
 			RemotePort:             25,
@@ -1357,16 +1364,16 @@ func setupLMTPProxyWithPrelookup(t *testing.T, backendAddress string, prelookupU
 			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"},
 			ConnectTimeout:         5 * time.Second,
 			AuthIdleTimeout:        30 * time.Second,
-			PreLookup: &config.PreLookupConfig{
-				Enabled:         true,
-				URL:             prelookupURL,
-				Timeout:         "5s",
-				FallbackDefault: fallbackToDefault,
+			RemoteLookup: &config.RemoteLookupConfig{
+				Enabled:      true,
+				URL:          remotelookupURL,
+				Timeout:      "5s",
+				FallbackToDB: fallbackToDefault,
 			},
 		},
 	)
 	if err != nil {
-		t.Fatalf("Failed to create LMTP proxy with prelookup: %v", err)
+		t.Fatalf("Failed to create LMTP proxy with remotelookup: %v", err)
 	}
 
 	// Start the proxy server
@@ -1382,28 +1389,28 @@ func setupLMTPProxyWithPrelookup(t *testing.T, backendAddress string, prelookupU
 	return proxyAddress, &LMTPProxyWrapper{server: server}
 }
 
-// MockPrelookupServer wraps the mock HTTP server for cleanup
-type MockPrelookupServer struct {
+// MockRemoteLookupServer wraps the mock HTTP server for cleanup
+type MockRemoteLookupServer struct {
 	listener net.Listener
 	done     chan struct{}
 }
 
-func (m *MockPrelookupServer) Close() error {
+func (m *MockRemoteLookupServer) Close() error {
 	close(m.done)
 	return m.listener.Close()
 }
 
-// setupMockPrelookupServer creates a mock HTTP server for prelookup
-func setupMockPrelookupServer(t *testing.T, addr string, statusCode int, responseBody string) *MockPrelookupServer {
+// setupMockRemoteLookupServer creates a mock HTTP server for remotelookup
+func setupMockRemoteLookupServer(t *testing.T, addr string, statusCode int, responseBody string) *MockRemoteLookupServer {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("Failed to create mock prelookup listener: %v", err)
+		t.Fatalf("Failed to create mock remotelookup listener: %v", err)
 	}
 
 	done := make(chan struct{})
-	server := &MockPrelookupServer{
+	server := &MockRemoteLookupServer{
 		listener: listener,
 		done:     done,
 	}
@@ -1422,15 +1429,15 @@ func setupMockPrelookupServer(t *testing.T, addr string, statusCode int, respons
 				return
 			}
 
-			go handleMockPrelookupRequest(conn, statusCode, responseBody)
+			go handleMockRemoteLookupRequest(conn, statusCode, responseBody)
 		}
 	}()
 
 	return server
 }
 
-// handleMockPrelookupRequest handles a mock prelookup HTTP request
-func handleMockPrelookupRequest(conn net.Conn, statusCode int, responseBody string) {
+// handleMockRemoteLookupRequest handles a mock remotelookup HTTP request
+func handleMockRemoteLookupRequest(conn net.Conn, statusCode int, responseBody string) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)

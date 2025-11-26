@@ -125,7 +125,7 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 *   `addr`: The public-facing address the proxy listens on.
 *   `remote_addrs`: A list of backend Sora server addresses.
 *   `enable_affinity`: Enables sticky sessions, ensuring a user is consistently routed to the same backend server.
-*   `prelookup`: An advanced feature for database-driven user routing. When enabled, the proxy queries a database to determine which backend server a user should be routed to. This is powerful for sharded or geo-distributed architectures.
+*   `remote_lookup`: An advanced feature for database-driven user routing. When enabled, the proxy queries a database to determine which backend server a user should be routed to. This is powerful for sharded or geo-distributed architectures.
 
 #### Proxy Timeout Protection
 

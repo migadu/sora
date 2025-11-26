@@ -262,15 +262,15 @@ func TestProxyMetrics(t *testing.T) {
 	})
 
 	t.Run("proxy_routing_method", func(t *testing.T) {
-		methods := []string{"prelookup", "dynamic"}
+		methods := []string{"remotelookup", "dynamic"}
 
 		for _, method := range methods {
 			ProxyRoutingMethod.WithLabelValues("imap", method).Add(50)
 		}
 
-		prelookupCount := testutil.ToFloat64(ProxyRoutingMethod.WithLabelValues("imap", "prelookup"))
-		if prelookupCount != 50 {
-			t.Errorf("Expected 50 prelookup routings, got %f", prelookupCount)
+		remotelookupCount := testutil.ToFloat64(ProxyRoutingMethod.WithLabelValues("imap", "remotelookup"))
+		if remotelookupCount != 50 {
+			t.Errorf("Expected 50 remotelookup routings, got %f", remotelookupCount)
 		}
 	})
 }

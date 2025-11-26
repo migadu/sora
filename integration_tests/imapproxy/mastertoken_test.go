@@ -22,7 +22,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestIMAPProxyMasterToken tests master token authentication through HTTP prelookup
+// TestIMAPProxyMasterToken tests master token authentication through HTTP remotelookup
 func TestIMAPProxyMasterToken(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -30,13 +30,13 @@ func TestIMAPProxyMasterToken(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Set up HTTP prelookup server
-	prelookupServer := setupHTTPPrelookupServer(t, account.Email, account.Password, backendServer.Address)
-	defer prelookupServer.Close()
+	// Set up HTTP remotelookup server
+	remotelookupServer := setupHTTPRemoteLookupServer(t, account.Email, account.Password, backendServer.Address)
+	defer remotelookupServer.Close()
 
-	// Set up IMAP proxy with HTTP prelookup and master token enabled
+	// Set up IMAP proxy with HTTP remotelookup and master token enabled
 	proxyAddress := common.GetRandomAddress(t)
-	proxyServer := setupIMAPProxyWithHTTPPrelookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
+	proxyServer := setupIMAPProxyWithHTTPRemoteLookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL)
 	defer func() {
 		if srv, ok := proxyServer.Server.(*imapproxy.Server); ok {
 			srv.Stop()
@@ -117,7 +117,7 @@ func TestIMAPProxyMasterToken(t *testing.T) {
 
 	t.Run("ResolvedAddress", func(t *testing.T) {
 		// Test that resolved_address is used for routing
-		// The prelookup setup includes a resolved_address that points to the backend
+		// The remotelookup setup includes a resolved_address that points to the backend
 		masterToken := "supersecretmastertoken"
 		emailWithToken := fmt.Sprintf("%s@%s", account.Email, masterToken)
 
@@ -143,13 +143,13 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	backendServer, account := common.SetupIMAPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Set up HTTP prelookup server
-	prelookupServer := setupHTTPPrelookupServer(t, account.Email, account.Password, backendServer.Address)
-	defer prelookupServer.Close()
+	// Set up HTTP remotelookup server
+	remotelookupServer := setupHTTPRemoteLookupServer(t, account.Email, account.Password, backendServer.Address)
+	defer remotelookupServer.Close()
 
 	// Set up IMAP proxy
 	proxyAddress := common.GetRandomAddress(t)
-	proxyServer := setupIMAPProxyWithHTTPPrelookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, prelookupServer.URL)
+	proxyServer := setupIMAPProxyWithHTTPRemoteLookup(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL)
 	defer func() {
 		if srv, ok := proxyServer.Server.(*imapproxy.Server); ok {
 			srv.Stop()
@@ -173,8 +173,8 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	}
 	defer c.Logout()
 
-	// Update the prelookup server to accept this specific token
-	if httpServer, ok := prelookupServer.Config.Handler.(*httpPrelookupHandler); ok {
+	// Update the remotelookup server to accept this specific token
+	if httpServer, ok := remotelookupServer.Config.Handler.(*httpRemoteLookupHandler); ok {
 		httpServer.updateMasterToken(masterToken)
 	}
 
@@ -185,8 +185,8 @@ func TestIMAPProxyMasterTokenAddressValidation(t *testing.T) {
 	t.Logf("✓ Email with multiple @ symbols (%d) accepted successfully", atCount)
 }
 
-// httpPrelookupHandler handles HTTP prelookup requests for testing
-type httpPrelookupHandler struct {
+// httpRemoteLookupHandler handles HTTP remotelookup requests for testing
+type httpRemoteLookupHandler struct {
 	mu               sync.RWMutex
 	userEmail        string
 	userPassword     string
@@ -196,7 +196,7 @@ type httpPrelookupHandler struct {
 	masterTokenHash  string
 }
 
-func (h *httpPrelookupHandler) updateMasterToken(newToken string) {
+func (h *httpRemoteLookupHandler) updateMasterToken(newToken string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.masterToken = newToken
@@ -204,7 +204,7 @@ func (h *httpPrelookupHandler) updateMasterToken(newToken string) {
 	h.masterTokenHash = string(hash)
 }
 
-func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *httpRemoteLookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -252,8 +252,8 @@ func (h *httpPrelookupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(response)
 }
 
-// setupHTTPPrelookupServer creates an HTTP test server for prelookup
-func setupHTTPPrelookupServer(t *testing.T, userEmail, userPassword, backendAddr string) *httptest.Server {
+// setupHTTPRemoteLookupServer creates an HTTP test server for remotelookup
+func setupHTTPRemoteLookupServer(t *testing.T, userEmail, userPassword, backendAddr string) *httptest.Server {
 	t.Helper()
 
 	// Hash user password
@@ -269,7 +269,7 @@ func setupHTTPPrelookupServer(t *testing.T, userEmail, userPassword, backendAddr
 		t.Fatalf("Failed to hash master token: %v", err)
 	}
 
-	handler := &httpPrelookupHandler{
+	handler := &httpRemoteLookupHandler{
 		userEmail:        userEmail,
 		userPassword:     userPassword,
 		masterToken:      masterToken,
@@ -279,23 +279,23 @@ func setupHTTPPrelookupServer(t *testing.T, userEmail, userPassword, backendAddr
 	}
 
 	server := httptest.NewServer(handler)
-	t.Logf("Created HTTP prelookup server at %s for %s", server.URL, userEmail)
+	t.Logf("Created HTTP remotelookup server at %s for %s", server.URL, userEmail)
 	return server
 }
 
-// setupIMAPProxyWithHTTPPrelookup creates IMAP proxy with HTTP prelookup and master token support
-func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithHTTPRemoteLookup creates IMAP proxy with HTTP remotelookup and master token support
+func setupIMAPProxyWithHTTPRemoteLookup(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-master-token"
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
-	// Configure HTTP prelookup with caching and authentication
+	// Configure HTTP remotelookup with caching and authentication
 	// Note: Master token logic is now handled by the HTTP endpoint, not the client
-	prelookupConfig := &config.PreLookupConfig{
+	remotelookupConfig := &config.RemoteLookupConfig{
 		Enabled:                true,
-		URL:                    prelookupURL + "/lookup?email=$email", // Use $email placeholder for interpolation
+		URL:                    remotelookupURL + "/lookup?email=$email", // Use $email placeholder for interpolation
 		Timeout:                "5s",
 		AuthToken:              "test-secret-token", // Bearer token for authentication
 		RemoteUseProxyProtocol: true,                // Match the backend server configuration
@@ -317,7 +317,7 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup:              prelookupConfig,
+		RemoteLookup:           remotelookupConfig,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},
@@ -327,7 +327,7 @@ func setupIMAPProxyWithHTTPPrelookup(t *testing.T, rdb *resilient.ResilientDatab
 	// Create proxy server
 	proxyServer, err := imapproxy.New(context.Background(), rdb, hostname, opts)
 	if err != nil {
-		t.Fatalf("Failed to create IMAP proxy with HTTP prelookup: %v", err)
+		t.Fatalf("Failed to create IMAP proxy with HTTP remotelookup: %v", err)
 	}
 
 	// Start proxy in background

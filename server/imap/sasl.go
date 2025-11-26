@@ -64,7 +64,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 			s.DebugLog("SASL PLAIN", "authorization_id", identity, "authentication_id", username)
 
-			// Parse username to check for suffix (master username or prelookup token)
+			// Parse username to check for suffix (master username or remotelookup token)
 			usernameParsed, parseErr := server.NewAddress(username)
 
 			// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)

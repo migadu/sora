@@ -44,11 +44,11 @@ type CacheEntry struct {
 	RemoteUseXCLIENT       bool
 
 	// Metadata
-	Result        AuthResult
-	FromPrelookup bool // True if this came from prelookup API
-	CreatedAt     time.Time
-	ExpiresAt     time.Time
-	IsNegative    bool
+	Result           AuthResult
+	FromRemoteLookup bool // True if this came from remotelookup API
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	IsNegative       bool
 }
 
 // LookupCache provides in-memory caching for authentication results

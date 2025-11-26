@@ -22,14 +22,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestLMTPProxyActualEmailCaching tests that when prelookup returns an "address" field
+// TestLMTPProxyActualEmailCaching tests that when remotelookup returns an "address" field
 // (ActualEmail) that differs from the submitted recipient,
 // the cache stores ActualEmail so cache hits can use the resolved address.
 //
 // Bug: Cache wasn't storing ActualEmail, so cache hits used submitted recipient for routing
 //
 // Expected behavior:
-// 1. Deliver to user@example.com → prelookup may return different address
+// 1. Deliver to user@example.com → remotelookup may return different address
 // 2. Cache key: BaseAddress of recipient, Cache value includes ActualEmail if different
 // 3. Subsequent delivery → cache hit, uses stored ActualEmail for routing
 //
@@ -45,20 +45,20 @@ func TestLMTPProxyActualEmailCaching(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("lmtpactualcache-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
-	// Generate password hash for prelookup response (not used by LMTP but included for completeness)
+	// Generate password hash for remotelookup response (not used by LMTP but included for completeness)
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Track prelookup calls
-	var prelookupCalls atomic.Int32
+	// Track remotelookup calls
+	var remotelookupCalls atomic.Int32
 
-	// Create prelookup server
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := prelookupCalls.Add(1)
-		t.Logf("Prelookup call #%d: %s", count, r.URL.Path)
+	// Create remotelookup server
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := remotelookupCalls.Add(1)
+		t.Logf("RemoteLookup call #%d: %s", count, r.URL.Path)
 
 		response := map[string]interface{}{
 			"address":       account.Email, // Resolved email
@@ -69,14 +69,14 @@ func TestLMTPProxyActualEmailCaching(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
-		t.Logf("Prelookup returned address=%s", account.Email)
+		t.Logf("RemoteLookup returned address=%s", account.Email)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
-	// Set up LMTP proxy with prelookup
+	// Set up LMTP proxy with remotelookup
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupLMTPProxyWithPrelookupForActualEmailTest(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupLMTPProxyWithRemoteLookupForActualEmailTest(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
 	// Helper to perform LMTP delivery attempt (just RCPT TO, no DATA)
@@ -122,16 +122,16 @@ func TestLMTPProxyActualEmailCaching(t *testing.T) {
 
 	// Test 1: Deliver to recipient - should populate cache
 	t.Run("DeliverFirst_PopulatesCache", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		if err := checkDelivery(account.Email); err != nil {
 			t.Fatalf("First delivery failed: %v", err)
 		}
 		t.Logf("✓ RCPT TO succeeded (recipient=%s)", account.Email)
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter <= callsBefore {
-			t.Fatalf("Expected prelookup to be called")
+			t.Fatalf("Expected remotelookup to be called")
 		}
 	})
 
@@ -139,25 +139,25 @@ func TestLMTPProxyActualEmailCaching(t *testing.T) {
 
 	// Test 2: Deliver again - should hit cache
 	t.Run("DeliverSecond_ShouldHitCache", func(t *testing.T) {
-		callsBefore := prelookupCalls.Load()
+		callsBefore := remotelookupCalls.Load()
 
 		if err := checkDelivery(account.Email); err != nil {
 			t.Fatalf("Second delivery failed: %v", err)
 		}
 		t.Log("✓ RCPT TO (second time) succeeded")
 
-		callsAfter := prelookupCalls.Load()
+		callsAfter := remotelookupCalls.Load()
 		if callsAfter > callsBefore {
-			t.Errorf("Prelookup was called %d time(s) - cache MISS (expected cache HIT)",
+			t.Errorf("RemoteLookup was called %d time(s) - cache MISS (expected cache HIT)",
 				callsAfter-callsBefore)
 		} else {
-			t.Log("✓ Cache hit - prelookup was NOT called")
+			t.Log("✓ Cache hit - remotelookup was NOT called")
 		}
 	})
 }
 
-// setupLMTPProxyWithPrelookupForActualEmailTest sets up an LMTP proxy with prelookup enabled
-func setupLMTPProxyWithPrelookupForActualEmailTest(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupLMTPProxyWithRemoteLookupForActualEmailTest sets up an LMTP proxy with remotelookup enabled
+func setupLMTPProxyWithRemoteLookupForActualEmailTest(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-lmtp-actual-email-cache"
@@ -168,11 +168,11 @@ func setupLMTPProxyWithPrelookupForActualEmailTest(t *testing.T, rdb *resilient.
 		RemotePort:     0,
 		ConnectTimeout: 10 * time.Second,
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupURL + "/$email",
-			Timeout:         "5s",
-			FallbackDefault: false,
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupURL + "/$email",
+			Timeout:      "5s",
+			FallbackToDB: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,

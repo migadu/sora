@@ -505,15 +505,15 @@ func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, erro
 	return time.ParseDuration(c.PositiveRevalidationWindow)
 }
 
-// PreLookupConfig holds configuration for HTTP-based user routing
-type PreLookupConfig struct {
+// RemoteLookupConfig holds configuration for HTTP-based user routing
+type RemoteLookupConfig struct {
 	Enabled   bool   `toml:"enabled"`
 	URL       string `toml:"url"`        // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
 	Timeout   string `toml:"timeout"`    // HTTP request timeout (default: "5s")
 	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	FallbackDefault        bool  `toml:"fallback_to_default"`       // Fallback to default routing if lookup fails
+	FallbackToDB           bool  `toml:"fallback_to_db"`            // Fallback to database auth if remotelookup fails or user not found
 	RemoteTLS              bool  `toml:"remote_tls"`                // Use TLS for backend connections
 	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`         // Verify backend TLS certificate
@@ -523,14 +523,14 @@ type PreLookupConfig struct {
 	RemoteUseXCLIENT       bool  `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
 
 	// Circuit breaker configuration
-	CircuitBreaker *PreLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
+	CircuitBreaker *RemoteLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
 
 	// HTTP transport configuration
-	Transport *PreLookupTransportConfig `toml:"transport"` // HTTP transport connection pooling settings
+	Transport *RemoteLookupTransportConfig `toml:"transport"` // HTTP transport connection pooling settings
 }
 
-// PreLookupCircuitBreakerConfig holds circuit breaker configuration for prelookup
-type PreLookupCircuitBreakerConfig struct {
+// RemoteLookupCircuitBreakerConfig holds circuit breaker configuration for remotelookup
+type RemoteLookupCircuitBreakerConfig struct {
 	MaxRequests  int     `toml:"max_requests"`  // Maximum concurrent requests in half-open state (default: 3)
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
@@ -538,8 +538,8 @@ type PreLookupCircuitBreakerConfig struct {
 	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
 }
 
-// PreLookupTransportConfig holds HTTP transport configuration for prelookup connection pooling and timeouts
-type PreLookupTransportConfig struct {
+// RemoteLookupTransportConfig holds HTTP transport configuration for remotelookup connection pooling and timeouts
+type RemoteLookupTransportConfig struct {
 	MaxIdleConns          int    `toml:"max_idle_conns"`          // Maximum idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
 	MaxConnsPerHost       int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
@@ -551,7 +551,7 @@ type PreLookupTransportConfig struct {
 }
 
 // GetTimeout returns the configured HTTP timeout duration
-func (c *PreLookupConfig) GetTimeout() (time.Duration, error) {
+func (c *RemoteLookupConfig) GetTimeout() (time.Duration, error) {
 	if c.Timeout == "" {
 		return 5 * time.Second, nil
 	}
@@ -561,7 +561,7 @@ func (c *PreLookupConfig) GetTimeout() (time.Duration, error) {
 // Circuit breaker configuration helpers
 
 // GetMaxRequests returns the maximum concurrent requests in half-open state
-func (c *PreLookupCircuitBreakerConfig) GetMaxRequests() uint32 {
+func (c *RemoteLookupCircuitBreakerConfig) GetMaxRequests() uint32 {
 	if c.MaxRequests <= 0 {
 		return 3 // Default: 3 concurrent requests
 	}
@@ -569,7 +569,7 @@ func (c *PreLookupCircuitBreakerConfig) GetMaxRequests() uint32 {
 }
 
 // GetInterval returns the interval before resetting failure counts in closed state
-func (c *PreLookupCircuitBreakerConfig) GetInterval() (time.Duration, error) {
+func (c *RemoteLookupCircuitBreakerConfig) GetInterval() (time.Duration, error) {
 	if c.Interval == "" {
 		return 0, nil // Default: never reset automatically
 	}
@@ -577,7 +577,7 @@ func (c *PreLookupCircuitBreakerConfig) GetInterval() (time.Duration, error) {
 }
 
 // GetTimeout returns the timeout before transitioning from open to half-open
-func (c *PreLookupCircuitBreakerConfig) GetTimeout() (time.Duration, error) {
+func (c *RemoteLookupCircuitBreakerConfig) GetTimeout() (time.Duration, error) {
 	if c.Timeout == "" {
 		return 30 * time.Second, nil // Default: 30 seconds
 	}
@@ -585,7 +585,7 @@ func (c *PreLookupCircuitBreakerConfig) GetTimeout() (time.Duration, error) {
 }
 
 // GetFailureRatio returns the failure ratio threshold to open circuit
-func (c *PreLookupCircuitBreakerConfig) GetFailureRatio() float64 {
+func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	if c.FailureRatio <= 0 || c.FailureRatio > 1 {
 		return 0.6 // Default: 60% failure rate
 	}
@@ -593,7 +593,7 @@ func (c *PreLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 }
 
 // GetMinRequests returns the minimum requests before evaluating failure ratio
-func (c *PreLookupCircuitBreakerConfig) GetMinRequests() uint32 {
+func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
 	}
@@ -603,7 +603,7 @@ func (c *PreLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 // Transport configuration helpers
 
 // GetMaxIdleConns returns the maximum idle connections across all hosts
-func (c *PreLookupTransportConfig) GetMaxIdleConns() int {
+func (c *RemoteLookupTransportConfig) GetMaxIdleConns() int {
 	if c.MaxIdleConns <= 0 {
 		return 100 // Default: 100 idle connections
 	}
@@ -611,7 +611,7 @@ func (c *PreLookupTransportConfig) GetMaxIdleConns() int {
 }
 
 // GetMaxIdleConnsPerHost returns the maximum idle connections per host
-func (c *PreLookupTransportConfig) GetMaxIdleConnsPerHost() int {
+func (c *RemoteLookupTransportConfig) GetMaxIdleConnsPerHost() int {
 	if c.MaxIdleConnsPerHost <= 0 {
 		return 100 // Default: 100 idle connections per host
 	}
@@ -619,12 +619,12 @@ func (c *PreLookupTransportConfig) GetMaxIdleConnsPerHost() int {
 }
 
 // GetMaxConnsPerHost returns the maximum total connections per host (0 = unlimited)
-func (c *PreLookupTransportConfig) GetMaxConnsPerHost() int {
+func (c *RemoteLookupTransportConfig) GetMaxConnsPerHost() int {
 	return c.MaxConnsPerHost // Default: 0 (unlimited)
 }
 
 // GetIdleConnTimeout returns the idle connection timeout duration
-func (c *PreLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
+func (c *RemoteLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
 	if c.IdleConnTimeout == "" {
 		return 90 * time.Second, nil // Default: 90 seconds
 	}
@@ -632,7 +632,7 @@ func (c *PreLookupTransportConfig) GetIdleConnTimeout() (time.Duration, error) {
 }
 
 // GetDialTimeout returns the TCP dial timeout duration (includes DNS resolution)
-func (c *PreLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
+func (c *RemoteLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
 	if c.DialTimeout == "" {
 		return 10 * time.Second, nil // Default: 10 seconds
 	}
@@ -640,7 +640,7 @@ func (c *PreLookupTransportConfig) GetDialTimeout() (time.Duration, error) {
 }
 
 // GetTLSHandshakeTimeout returns the TLS handshake timeout duration
-func (c *PreLookupTransportConfig) GetTLSHandshakeTimeout() (time.Duration, error) {
+func (c *RemoteLookupTransportConfig) GetTLSHandshakeTimeout() (time.Duration, error) {
 	if c.TLSHandshakeTimeout == "" {
 		return 10 * time.Second, nil // Default: 10 seconds
 	}
@@ -648,7 +648,7 @@ func (c *PreLookupTransportConfig) GetTLSHandshakeTimeout() (time.Duration, erro
 }
 
 // GetExpectContinueTimeout returns the expect continue timeout duration
-func (c *PreLookupTransportConfig) GetExpectContinueTimeout() (time.Duration, error) {
+func (c *RemoteLookupTransportConfig) GetExpectContinueTimeout() (time.Duration, error) {
 	if c.ExpectContinueTimeout == "" {
 		return 1 * time.Second, nil // Default: 1 second
 	}
@@ -656,7 +656,7 @@ func (c *PreLookupTransportConfig) GetExpectContinueTimeout() (time.Duration, er
 }
 
 // GetKeepAlive returns the TCP keep-alive interval
-func (c *PreLookupTransportConfig) GetKeepAlive() (time.Duration, error) {
+func (c *RemoteLookupTransportConfig) GetKeepAlive() (time.Duration, error) {
 	if c.KeepAlive == "" {
 		return 30 * time.Second, nil // Default: 30 seconds
 	}
@@ -664,7 +664,7 @@ func (c *PreLookupTransportConfig) GetKeepAlive() (time.Duration, error) {
 }
 
 // GetRemotePort parses the remote port and returns it as an int.
-func (c *PreLookupConfig) GetRemotePort() (int, error) {
+func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	if c.RemotePort == nil {
 		return 0, nil // No port configured
 	}
@@ -999,7 +999,7 @@ type IMAPProxyServerConfig struct {
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`    // Database-driven user routing
 }
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
@@ -1027,7 +1027,7 @@ type POP3ProxyServerConfig struct {
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	PreLookup              *PreLookupConfig      `toml:"prelookup"`       // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`    // Database-driven user routing
 }
 
 // ManageSieveProxyServerConfig holds ManageSieve proxy server configuration.
@@ -1056,7 +1056,7 @@ type ManageSieveProxyServerConfig struct {
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
-	PreLookup              *PreLookupConfig      `toml:"prelookup"`                // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`             // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -1064,29 +1064,29 @@ type ManageSieveProxyServerConfig struct {
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
 type LMTPProxyServerConfig struct {
-	Start                  bool             `toml:"start"`
-	Addr                   string           `toml:"addr"`
-	RemoteAddrs            []string         `toml:"remote_addrs"`
-	RemotePort             any              `toml:"remote_port"`            // Default port for backends if not in address
-	MaxConnections         int              `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP    int              `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                    bool             `toml:"tls"`
-	TLSUseStartTLS         bool             `toml:"tls_use_starttls"` // Use STARTTLS on listening port
-	TLSCertFile            string           `toml:"tls_cert_file"`
-	TLSKeyFile             string           `toml:"tls_key_file"`
-	TLSVerify              bool             `toml:"tls_verify"`
-	RemoteTLS              bool             `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool             `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool             `toml:"remote_tls_verify"`
-	RemoteUseProxyProtocol bool             `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseXCLIENT       bool             `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
-	ConnectTimeout         string           `toml:"connect_timeout"`
-	AuthIdleTimeout        string           `toml:"auth_idle_timeout"` // Idle timeout during authentication phase (pre-auth only)
-	MaxMessageSize         string           `toml:"max_message_size"`  // Maximum message size announced in EHLO
-	EnableAffinity         bool             `toml:"enable_affinity"`
-	AffinityStickiness     float64          `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string           `toml:"affinity_validity"`
-	PreLookup              *PreLookupConfig `toml:"prelookup"` // Database-driven user routing
+	Start                  bool                `toml:"start"`
+	Addr                   string              `toml:"addr"`
+	RemoteAddrs            []string            `toml:"remote_addrs"`
+	RemotePort             any                 `toml:"remote_port"`            // Default port for backends if not in address
+	MaxConnections         int                 `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP    int                 `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                    bool                `toml:"tls"`
+	TLSUseStartTLS         bool                `toml:"tls_use_starttls"` // Use STARTTLS on listening port
+	TLSCertFile            string              `toml:"tls_cert_file"`
+	TLSKeyFile             string              `toml:"tls_key_file"`
+	TLSVerify              bool                `toml:"tls_verify"`
+	RemoteTLS              bool                `toml:"remote_tls"`
+	RemoteTLSUseStartTLS   bool                `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
+	RemoteTLSVerify        bool                `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol bool                `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT       bool                `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
+	ConnectTimeout         string              `toml:"connect_timeout"`
+	AuthIdleTimeout        string              `toml:"auth_idle_timeout"` // Idle timeout during authentication phase (pre-auth only)
+	MaxMessageSize         string              `toml:"max_message_size"`  // Maximum message size announced in EHLO
+	EnableAffinity         bool                `toml:"enable_affinity"`
+	AffinityStickiness     float64             `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity       string              `toml:"affinity_validity"`
+	RemoteLookup           *RemoteLookupConfig `toml:"remotelookup"` // Database-driven user routing
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1251,7 +1251,7 @@ type ServerConfig struct {
 	Timeouts *ServerTimeoutsConfig `toml:"timeouts,omitempty"`
 
 	// Pre-lookup (embedded)
-	PreLookup *PreLookupConfig `toml:"prelookup,omitempty"`
+	RemoteLookup *RemoteLookupConfig `toml:"remotelookup,omitempty"`
 
 	// Client capability filtering (IMAP specific)
 	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`

@@ -325,7 +325,7 @@ max_connections = 10000
 enabled = false
 max_attempts_per_ip = 10
 
-[server.prelookup]
+[server.remotelookup]
 enabled = true
 url = "https://api.example.com/lookup/$email"
 
@@ -339,7 +339,7 @@ max_connections = 10000
 enabled = false
 max_attempts_per_ip = 10
 
-[server.prelookup]
+[server.remotelookup]
 enabled = true
 url = "https://api.example.com/lookup/$email"
 `
@@ -370,8 +370,8 @@ url = "https://api.example.com/lookup/$email"
 	if !strings.Contains(cleaned, "[server.auth_rate_limit]") {
 		t.Error("Expected [server.auth_rate_limit] sections to be preserved")
 	}
-	if !strings.Contains(cleaned, "[server.prelookup]") {
-		t.Error("Expected [server.prelookup] sections to be preserved")
+	if !strings.Contains(cleaned, "[server.remotelookup]") {
+		t.Error("Expected [server.remotelookup] sections to be preserved")
 	}
 }
 

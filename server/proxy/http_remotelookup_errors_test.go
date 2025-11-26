@@ -10,14 +10,14 @@ import (
 	"time"
 )
 
-// TestHTTPPrelookupErrorTypes verifies that the HTTP prelookup client returns
+// TestHTTPRemoteLookupErrorTypes verifies that the HTTP remotelookup client returns
 // the correct error types for different failure scenarios
-func TestHTTPPrelookupErrorTypes(t *testing.T) {
+func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 	tests := []struct {
 		name             string
 		handler          http.HandlerFunc
 		expectAuthResult AuthResult
-		expectErrorType  error // ErrPrelookupTransient, ErrPrelookupInvalidResponse, or nil
+		expectErrorType  error // ErrRemoteLookupTransient, ErrRemoteLookupInvalidResponse, or nil
 		description      string
 	}{
 		{
@@ -35,7 +35,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				http.Error(w, `{"error": "bad request"}`, http.StatusBadRequest)
 			},
 			expectAuthResult: AuthTemporarilyUnavailable,
-			expectErrorType:  ErrPrelookupTransient,
+			expectErrorType:  ErrRemoteLookupTransient,
 			description:      "4xx errors (except 401/403/404) should be treated as temporarily unavailable",
 		},
 		{
@@ -44,8 +44,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
 			},
 			expectAuthResult: AuthTemporarilyUnavailable,
-			expectErrorType:  ErrPrelookupTransient,
-			description:      "5xx errors should return AuthTemporarilyUnavailable with ErrPrelookupTransient",
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "5xx errors should return AuthTemporarilyUnavailable with ErrRemoteLookupTransient",
 		},
 		{
 			name: "503_ServiceUnavailable",
@@ -53,8 +53,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				http.Error(w, `{"error": "service unavailable"}`, http.StatusServiceUnavailable)
 			},
 			expectAuthResult: AuthTemporarilyUnavailable,
-			expectErrorType:  ErrPrelookupTransient,
-			description:      "503 should return AuthTemporarilyUnavailable with ErrPrelookupTransient",
+			expectErrorType:  ErrRemoteLookupTransient,
+			description:      "503 should return AuthTemporarilyUnavailable with ErrRemoteLookupTransient",
 		},
 		{
 			name: "200_InvalidJSON",
@@ -63,8 +63,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				w.Write([]byte("this is not json"))
 			},
 			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with invalid JSON should return ErrPrelookupInvalidResponse",
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with invalid JSON should return ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_MissingAddress",
@@ -77,8 +77,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				})
 			},
 			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with missing address should return ErrPrelookupInvalidResponse",
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with missing address should return ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_EmptyAddress",
@@ -91,8 +91,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				})
 			},
 			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with empty address should return ErrPrelookupInvalidResponse",
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with empty address should return ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_MissingHashedPassword",
@@ -105,8 +105,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				})
 			},
 			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with missing password_hash should return ErrPrelookupInvalidResponse",
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with missing password_hash should return ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_EmptyHashedPassword",
@@ -119,8 +119,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				})
 			},
 			expectAuthResult: AuthFailed,
-			expectErrorType:  ErrPrelookupInvalidResponse,
-			description:      "200 with empty password_hash should return ErrPrelookupInvalidResponse",
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with empty password_hash should return ErrRemoteLookupInvalidResponse",
 		},
 		{
 			name: "200_MissingServerIP_AuthOnlyMode",
@@ -129,7 +129,7 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]any{
 					"address":       "user@example.com",
 					"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", // bcrypt hash of "password"
-					// server is missing - auth-only mode (prelookup authenticates, Sora routes)
+					// server is missing - auth-only mode (remotelookup authenticates, Sora routes)
 				})
 			},
 			expectAuthResult: AuthFailed, // Password verification will fail (testpassword != password)
@@ -159,8 +159,8 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 			server := httptest.NewServer(tt.handler)
 			defer server.Close()
 
-			// Create prelookup client
-			client := NewHTTPPreLookupClient(
+			// Create remotelookup client
+			client := NewHTTPRemoteLookupClient(
 				server.URL+"/lookup?email=$email",
 				5*time.Second,
 				"test-token",
@@ -206,10 +206,10 @@ func TestHTTPPrelookupErrorTypes(t *testing.T) {
 	}
 }
 
-// TestHTTPPrelookupNetworkError verifies that network errors return ErrPrelookupTransient
-func TestHTTPPrelookupNetworkError(t *testing.T) {
-	// Create prelookup client pointing to non-existent server
-	client := NewHTTPPreLookupClient(
+// TestHTTPRemoteLookupNetworkError verifies that network errors return ErrRemoteLookupTransient
+func TestHTTPRemoteLookupNetworkError(t *testing.T) {
+	// Create remotelookup client pointing to non-existent server
+	client := NewHTTPRemoteLookupClient(
 		"http://localhost:9999/lookup?email=$email", // Port that's not listening
 		100*time.Millisecond,                        // Short timeout
 		"test-token",
@@ -228,7 +228,7 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 	ctx := context.Background()
 	_, authResult, err := client.LookupUserRoute(ctx, "test@example.com", "testpassword")
 
-	// Should return AuthTemporarilyUnavailable with ErrPrelookupTransient
+	// Should return AuthTemporarilyUnavailable with ErrRemoteLookupTransient
 	if authResult != AuthTemporarilyUnavailable {
 		t.Errorf("Expected AuthTemporarilyUnavailable for network error, got %v", authResult)
 	}
@@ -237,15 +237,15 @@ func TestHTTPPrelookupNetworkError(t *testing.T) {
 		t.Fatal("Expected error for network failure, got nil")
 	}
 
-	if !errors.Is(err, ErrPrelookupTransient) {
-		t.Errorf("Expected ErrPrelookupTransient for network error, got: %v", err)
+	if !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Errorf("Expected ErrRemoteLookupTransient for network error, got: %v", err)
 	}
 
-	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrPrelookupTransient: %v", err)
+	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrRemoteLookupTransient: %v", err)
 }
 
-// TestHTTPPrelookupCircuitBreaker verifies that circuit breaker open returns ErrPrelookupTransient
-func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
+// TestHTTPRemoteLookupCircuitBreaker verifies that circuit breaker open returns ErrRemoteLookupTransient
+func TestHTTPRemoteLookupCircuitBreaker(t *testing.T) {
 	// Create a server that always fails
 	failCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -254,8 +254,8 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Create prelookup client
-	client := NewHTTPPreLookupClient(
+	// Create remotelookup client
+	client := NewHTTPRemoteLookupClient(
 		server.URL+"/lookup?email=$email",
 		5*time.Second,
 		"test-token",
@@ -282,11 +282,11 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 			t.Errorf("Request %d: Expected AuthTemporarilyUnavailable, got %v", i+1, authResult)
 		}
 
-		// All should have an error with ErrPrelookupTransient
+		// All should have an error with ErrRemoteLookupTransient
 		if err == nil {
 			t.Errorf("Request %d: Expected error, got nil", i+1)
-		} else if !errors.Is(err, ErrPrelookupTransient) {
-			t.Errorf("Request %d: Expected ErrPrelookupTransient, got: %v", i+1, err)
+		} else if !errors.Is(err, ErrRemoteLookupTransient) {
+			t.Errorf("Request %d: Expected ErrRemoteLookupTransient, got: %v", i+1, err)
 		}
 
 		// After enough failures, circuit breaker should open
@@ -298,22 +298,22 @@ func TestHTTPPrelookupCircuitBreaker(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Verify final error is still ErrPrelookupTransient with AuthTemporarilyUnavailable
+	// Verify final error is still ErrRemoteLookupTransient with AuthTemporarilyUnavailable
 	_, authResult, err := client.LookupUserRoute(ctx, "test@example.com", "testpassword")
 	if authResult != AuthTemporarilyUnavailable {
 		t.Errorf("Final request: Expected AuthTemporarilyUnavailable, got %v", authResult)
 	}
-	if !errors.Is(err, ErrPrelookupTransient) {
-		t.Errorf("Final request: Expected ErrPrelookupTransient even with circuit breaker open, got: %v", err)
+	if !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Errorf("Final request: Expected ErrRemoteLookupTransient even with circuit breaker open, got: %v", err)
 	}
 
-	t.Logf("✓ Circuit breaker correctly returns AuthTemporarilyUnavailable with ErrPrelookupTransient when open")
+	t.Logf("✓ Circuit breaker correctly returns AuthTemporarilyUnavailable with ErrRemoteLookupTransient when open")
 	t.Logf("  Total requests made: %d, Circuit breaker state: %s", failCount, client.breaker.State())
 }
 
-// TestHTTPPrelookupCircuitBreakerHalfOpen verifies that ErrTooManyRequests in half-open state
-// is properly wrapped as ErrPrelookupTransient (skipped by default - takes 65 seconds)
-func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
+// TestHTTPRemoteLookupCircuitBreakerHalfOpen verifies that ErrTooManyRequests in half-open state
+// is properly wrapped as ErrRemoteLookupTransient (skipped by default - takes 65 seconds)
+func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping long-running test in short mode")
 	}
@@ -338,8 +338,8 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Create prelookup client with MaxRequests=1 in half-open state
-	client := NewHTTPPreLookupClient(
+	// Create remotelookup client with MaxRequests=1 in half-open state
+	client := NewHTTPRemoteLookupClient(
 		server.URL+"/lookup?email=$email",
 		5*time.Second,
 		"test-token",
@@ -367,22 +367,22 @@ func TestHTTPPrelookupCircuitBreakerHalfOpen(t *testing.T) {
 
 	// First request in half-open should go through
 	_, _, err1 := client.LookupUserRoute(ctx, "test@example.com", "password") // Will fail auth but succeed request
-	if err1 != nil && !errors.Is(err1, ErrPrelookupTransient) {
+	if err1 != nil && !errors.Is(err1, ErrRemoteLookupTransient) {
 		// If it errors due to rate limiting, it should be transient
 		if client.breaker.State().String() == "HALF_OPEN" {
-			if !errors.Is(err1, ErrPrelookupTransient) {
-				t.Errorf("Expected ErrPrelookupTransient in half-open state, got: %v", err1)
+			if !errors.Is(err1, ErrRemoteLookupTransient) {
+				t.Errorf("Expected ErrRemoteLookupTransient in half-open state, got: %v", err1)
 			}
 		}
 	}
 
-	t.Logf("✓ Circuit breaker half-open state correctly returns ErrPrelookupTransient for rate-limited requests")
+	t.Logf("✓ Circuit breaker half-open state correctly returns ErrRemoteLookupTransient for rate-limited requests")
 	t.Logf("  Final state: %s", client.breaker.State())
 }
 
-// TestHTTPPrelookupInvalidEmail verifies that invalid email addresses are rejected early
+// TestHTTPRemoteLookupInvalidEmail verifies that invalid email addresses are rejected early
 // without making HTTP requests
-func TestHTTPPrelookupInvalidEmail(t *testing.T) {
+func TestHTTPRemoteLookupInvalidEmail(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -395,7 +395,7 @@ func TestHTTPPrelookupInvalidEmail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPPreLookupClient(
+	client := NewHTTPRemoteLookupClient(
 		server.URL+"/lookup?email=$email",
 		5*time.Second,
 		"test-token",
@@ -504,7 +504,7 @@ func TestHTTPPrelookupInvalidEmail(t *testing.T) {
 
 	// Verify +detail addressing is stripped before making HTTP request
 	t.Run("plus_addressing_stripped", func(t *testing.T) {
-		client := NewHTTPPreLookupClient(
+		client := NewHTTPRemoteLookupClient(
 			server.URL+"/lookup?email=$email",
 			5*time.Second,
 			"test-token",

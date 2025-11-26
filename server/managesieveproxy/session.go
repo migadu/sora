@@ -26,27 +26,27 @@ import (
 
 // Session represents a ManageSieve proxy session.
 type Session struct {
-	server             *Server
-	clientConn         net.Conn
-	backendConn        net.Conn
-	backendReader      *bufio.Reader // Buffered reader from authentication phase
-	clientReader       *bufio.Reader
-	clientWriter       *bufio.Writer
-	username           string
-	accountID          int64
-	isPrelookupAccount bool
-	routingInfo        *proxy.UserRoutingInfo
-	routingMethod      string // Routing method used: prelookup, affinity, consistent_hash, roundrobin
-	serverAddr         string
-	clientAddr         string // Cached client address to avoid race with connection close
-	isTLS              bool   // Whether the client connection is over TLS
-	mu                 sync.Mutex
-	ctx                context.Context
-	cancel             context.CancelFunc
-	errorCount         int
-	startTime          time.Time
-	releaseConn        func() // Connection limiter cleanup function
-	proxyInfo          *server.ProxyProtocolInfo
+	server                *Server
+	clientConn            net.Conn
+	backendConn           net.Conn
+	backendReader         *bufio.Reader // Buffered reader from authentication phase
+	clientReader          *bufio.Reader
+	clientWriter          *bufio.Writer
+	username              string
+	accountID             int64
+	isRemoteLookupAccount bool
+	routingInfo           *proxy.UserRoutingInfo
+	routingMethod         string // Routing method used: remotelookup, affinity, consistent_hash, roundrobin
+	serverAddr            string
+	clientAddr            string // Cached client address to avoid race with connection close
+	isTLS                 bool   // Whether the client connection is over TLS
+	mu                    sync.Mutex
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	errorCount            int
+	startTime             time.Time
+	releaseConn           func() // Connection limiter cleanup function
+	proxyInfo             *server.ProxyProtocolInfo
 }
 
 // newSession creates a new ManageSieve proxy session.
@@ -292,7 +292,7 @@ func (s *Session) handleConnection() {
 
 			// Log backend authentication with total duration
 			backendDuration := time.Since(backendConnStart)
-			s.InfoLog("backend authenticated",
+			s.InfoLog("authentication complete",
 				"address", s.username,
 				"backend", s.serverAddr,
 				"routing", s.routingMethod,
@@ -493,8 +493,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		return consts.ErrAuthenticationFailed
 	}
 
-	// Use configured prelookup timeout instead of hardcoded value
-	authTimeout := s.server.connManager.GetPrelookupTimeout()
+	// Use configured remotelookup timeout instead of hardcoded value
+	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
 	ctx, cancel := context.WithTimeout(s.ctx, authTimeout)
 	defer cancel()
 
@@ -539,7 +539,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
-					s.isPrelookupAccount = cached.FromPrelookup
+					s.isRemoteLookupAccount = cached.FromRemoteLookup
 
 					// Otherwise parse username to extract base address
 					if cached.ActualEmail != "" {
@@ -558,7 +558,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 							RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
 							RemoteTLSVerify:        cached.RemoteTLSVerify,
 							RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-							IsPrelookupAccount:     cached.FromPrelookup,
+							IsRemoteLookupAccount:  cached.FromRemoteLookup,
 						}
 					}
 
@@ -627,9 +627,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 	// Parse username to check for master username or token suffix
 	// Format: user@domain.com@SUFFIX
-	// If SUFFIX matches configured master username: validate locally, send base address to prelookup
-	// Otherwise: treat as token, send full username (including @SUFFIX) to prelookup
-	var usernameForPrelookup string
+	// If SUFFIX matches configured master username: validate locally, send base address to remotelookup
+	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
+	var usernameForRemoteLookup string
 	var masterAuthValidated bool
 
 	// Parse username (handles both regular addresses and addresses with @SUFFIX)
@@ -645,30 +645,30 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for prelookup
+			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
 			s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
-			usernameForPrelookup = parsedAddr.BaseAddress()
+			usernameForRemoteLookup = parsedAddr.BaseAddress()
 			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
-			// Send FULL username (including @TOKEN) to prelookup for validation
-			s.DebugLog("token detected in username, sending full username to prelookup: %s", username)
-			usernameForPrelookup = username
+			// Send FULL username (including @TOKEN) to remotelookup for validation
+			s.DebugLog("token detected in username, sending full username to remotelookup: %s", username)
+			usernameForRemoteLookup = username
 			masterAuthValidated = false
 		}
 	} else {
 		// No suffix - regular username
-		usernameForPrelookup = username
+		usernameForRemoteLookup = username
 		masterAuthValidated = false
 	}
 
-	// Try prelookup authentication/routing if configured
+	// Try remotelookup authentication/routing if configured
 	// - For master username: sends base address to get routing info (password already validated)
-	// - For others: sends full username (may contain token) for prelookup authentication
+	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForPrelookup, password, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForRemoteLookup, password, masterAuthValidated)
 
-		// Log prelookup response with all details
+		// Log remotelookup response with all details
 		backend := "none"
 		actualEmail := "none"
 		if routingInfo != nil {
@@ -682,64 +682,64 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
 		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		if err != nil {
-			logger.Debug("prelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+			logger.Debug("remotelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
-			logger.Debug("prelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_prelookup", usernameForPrelookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+			logger.Debug("remotelookup authentication", "proto", "managesieve_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
 		}
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrPrelookupInvalidResponse) {
-				// Invalid response from prelookup (malformed 2xx) - this is a server bug, fail hard
-				s.WarnLog("prelookup invalid response - server bug", "error", err)
+			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
+				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
+				s.WarnLog("remotelookup invalid response - server bug", "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-				return fmt.Errorf("prelookup server error: invalid response")
+				return fmt.Errorf("remotelookup server error: invalid response")
 			}
 
-			if errors.Is(err, proxy.ErrPrelookupTransient) {
+			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
 				// Check if this is due to context cancellation (server shutdown)
 				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("prelookup cancelled due to server shutdown")
-					metrics.PrelookupResult.WithLabelValues("managesieve", "shutdown").Inc()
+					s.InfoLog("remotelookup cancelled due to server shutdown")
+					metrics.RemoteLookupResult.WithLabelValues("managesieve", "shutdown").Inc()
 					return server.ErrServerShuttingDown
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - check fallback config
-				if s.server.prelookupConfig != nil && s.server.prelookupConfig.FallbackDefault {
-					s.DebugLog("prelookup transient error - fallback enabled", "error", err)
-					metrics.PrelookupResult.WithLabelValues("managesieve", "transient_error_fallback").Inc()
+				if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
+					s.DebugLog("remotelookup transient error - fallback enabled", "error", err)
+					metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
-					s.DebugLog("prelookup transient error - fallback disabled", "error", err)
-					metrics.PrelookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
+					s.DebugLog("remotelookup transient error - fallback disabled", "error", err)
+					metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
-					return fmt.Errorf("prelookup service unavailable")
+					return fmt.Errorf("remotelookup service unavailable")
 				}
 			} else {
 				// Unknown error type - log and fallthrough
-				s.WarnLog("prelookup unknown error - attempting fallback", "error", err)
+				s.WarnLog("remotelookup unknown error - attempting fallback", "error", err)
 				// Fallthrough to main DB auth
 			}
 		} else {
 			switch authResult {
 			case proxy.AuthSuccess:
-				// Prelookup returned success - use routing info
-				s.DebugLog("prelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
-				s.DebugLog("prelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
-				metrics.PrelookupResult.WithLabelValues("managesieve", "success").Inc()
+				// RemoteLookup returned success - use routing info
+				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("remotelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
+				metrics.RemoteLookupResult.WithLabelValues("managesieve", "success").Inc()
 				s.accountID = routingInfo.AccountID
-				s.isPrelookupAccount = routingInfo.IsPrelookupAccount
+				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
 				s.routingInfo = routingInfo
 
 				// Determine the resolved email for caching and backend impersonation
-				// Use ActualEmail from prelookup response if available, otherwise derive from username
+				// Use ActualEmail from remotelookup response if available, otherwise derive from username
 				var resolvedEmail string
 				if routingInfo.ActualEmail != "" {
 					resolvedEmail = routingInfo.ActualEmail
 				} else if masterAuthValidated {
-					resolvedEmail = usernameForPrelookup // Base address already
+					resolvedEmail = usernameForRemoteLookup // Base address already
 				} else {
 					resolvedEmail = username // Fallback to original
 				}
@@ -764,7 +764,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
 						RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
 						Result:                 lookupcache.AuthSuccess,
-						FromPrelookup:          true,
+						FromRemoteLookup:       true,
 						IsNegative:             false,
 					})
 				}
@@ -780,7 +780,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Single consolidated log for authentication success
-				method := "prelookup"
+				method := "remotelookup"
 				if masterAuthValidated {
 					method = "master"
 				}
@@ -795,11 +795,11 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return nil // Authentication complete
 
 			case proxy.AuthFailed:
-				// User found in prelookup, but password was wrong
+				// User found in remotelookup, but password was wrong
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("prelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
 				}
 
 				// Cache negative result (wrong password)
@@ -819,21 +819,29 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
 
 				// Single consolidated log for authentication failure
-				s.InfoLog("authentication failed", "reason", "invalid_password", "cached", false, "method", "prelookup")
+				s.InfoLog("authentication failed", "reason", "invalid_password", "cached", false, "method", "remotelookup")
 
 				return consts.ErrAuthenticationFailed
 
 			case proxy.AuthTemporarilyUnavailable:
-				// Prelookup service is temporarily unavailable - tell user to retry later
-				s.WarnLog("prelookup service temporarily unavailable")
+				// RemoteLookup service is temporarily unavailable - tell user to retry later
+				s.WarnLog("remotelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
-				// User not found in prelookup (404). This means the user is NOT in the other system.
-				// Always fall through to main DB auth - this is the expected behavior for partitioning.
-				s.InfoLog("User not found in prelookup - trying main DB")
-				metrics.PrelookupResult.WithLabelValues("managesieve", "user_not_found_fallback").Inc()
+				// User not found in remotelookup (404)
+				if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
+					s.InfoLog("User not found in remotelookup, fallback enabled - trying main DB")
+					metrics.RemoteLookupResult.WithLabelValues("managesieve", "user_not_found_fallback").Inc()
+					// Fallthrough to main DB auth
+				} else {
+					s.InfoLog("User not found in remotelookup, fallback disabled - rejecting")
+					metrics.RemoteLookupResult.WithLabelValues("managesieve", "user_not_found_rejected").Inc()
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+					return consts.ErrAuthenticationFailed
+				}
 			}
 		}
 	}
@@ -924,7 +932,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	}
 
 	s.accountID = accountID
-	s.isPrelookupAccount = false
+	s.isRemoteLookupAccount = false
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
@@ -951,12 +959,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			passwordHash = lookupcache.HashPassword(password)
 		}
 		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-			AccountID:     accountID,
-			PasswordHash:  passwordHash,
-			ServerAddress: "", // Will be populated by affinity/routing in next connection
-			Result:        lookupcache.AuthSuccess,
-			FromPrelookup: false,
-			IsNegative:    false,
+			AccountID:        accountID,
+			PasswordHash:     passwordHash,
+			ServerAddress:    "", // Will be populated by affinity/routing in next connection
+			Result:           lookupcache.AuthSuccess,
+			FromRemoteLookup: false,
+			IsNegative:       false,
 		})
 	}
 
@@ -1019,14 +1027,14 @@ func (s *Session) sendCapabilities() error {
 // connectToBackendAndAuth connects to backend and authenticates.
 func (s *Session) connectToBackendAndAuth() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
-		Ctx:                s.ctx,
-		Username:           s.username,
-		Protocol:           "managesieve",
-		IsPrelookupAccount: s.isPrelookupAccount,
-		RoutingInfo:        s.routingInfo,
-		ConnManager:        s.server.connManager,
-		EnableAffinity:     s.server.enableAffinity,
-		ProxyName:          "ManageSieve Proxy",
+		Ctx:                   s.ctx,
+		Username:              s.username,
+		Protocol:              "managesieve",
+		IsRemoteLookupAccount: s.isRemoteLookupAccount,
+		RoutingInfo:           s.routingInfo,
+		ConnManager:           s.server.connManager,
+		EnableAffinity:        s.server.enableAffinity,
+		ProxyName:             "ManageSieve Proxy",
 	})
 	if err != nil {
 		s.DebugLog("Error determining route", "error", err)
@@ -1036,7 +1044,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	s.routingInfo = routeResult.RoutingInfo
 	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
-	isPrelookupRoute := routeResult.IsPrelookupRoute
+	isRemoteLookupRoute := routeResult.IsRemoteLookupRoute
 
 	// 4. Connect using the determined address (or round-robin if empty)
 	// Track which routing method was used for this connection.
@@ -1058,13 +1066,13 @@ func (s *Session) connectToBackendAndAuth() error {
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
-	if isPrelookupRoute && actualAddr != preferredAddr {
-		// The prelookup route specified a server, but we connected to a different one.
+	if isRemoteLookupRoute && actualAddr != preferredAddr {
+		// The remotelookup route specified a server, but we connected to a different one.
 		// This means the preferred server failed and the connection manager fell back.
-		// For prelookup routes, this is a hard failure.
+		// For remotelookup routes, this is a hard failure.
 		conn.Close()
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
-		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
+		return fmt.Errorf("remotelookup route to %s failed, and fallback is disabled for remotelookup routes", preferredAddr)
 	}
 
 	metrics.ProxyBackendConnections.WithLabelValues("managesieve", "success").Inc()
@@ -1072,16 +1080,16 @@ func (s *Session) connectToBackendAndAuth() error {
 	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity
-	// Auth-only prelookup users (IsPrelookupAccount=true but ServerAddress="") should get affinity
+	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity
 	if s.server.enableAffinity && actualAddr != "" {
 		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
-			Username:           s.username,
-			Protocol:           "managesieve",
-			IsPrelookupAccount: s.isPrelookupAccount,
-			RoutingInfo:        s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
-			ConnManager:        s.server.connManager,
-			EnableAffinity:     s.server.enableAffinity,
-			ProxyName:          "ManageSieve Proxy",
+			Username:              s.username,
+			Protocol:              "managesieve",
+			IsRemoteLookupAccount: s.isRemoteLookupAccount,
+			RoutingInfo:           s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
+			ConnManager:           s.server.connManager,
+			EnableAffinity:        s.server.enableAffinity,
+			ProxyName:             "ManageSieve Proxy",
 		}, actualAddr, routeResult.RoutingMethod == "affinity")
 	}
 
@@ -1103,18 +1111,18 @@ func (s *Session) connectToBackendAndAuth() error {
 	}
 
 	// Check if we need to negotiate StartTLS with the backend
-	// This happens when prelookup (or global config) specifies remote_tls_use_starttls
+	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
 	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
-		// Prelookup routing specified StartTLS
+		// RemoteLookup routing specified StartTLS
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
 			Renegotiation:      tls.RenegotiateNever,
 		}
-		s.DebugLog("Using prelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
+		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
 	} else if s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS
 		shouldUseStartTLS = true

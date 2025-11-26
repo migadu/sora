@@ -314,7 +314,7 @@ func TestIMAPProxy_MasterAuthenticationMultipleAccounts(t *testing.T) {
 	})
 }
 
-// TestIMAPProxy_TokenAuthentication tests token-based authentication through prelookup
+// TestIMAPProxy_TokenAuthentication tests token-based authentication through remotelookup
 func TestIMAPProxy_TokenAuthentication(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -327,7 +327,7 @@ func TestIMAPProxy_TokenAuthentication(t *testing.T) {
 	proxy := setupIMAPProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
 	defer proxy.Close()
 
-	t.Run("Login with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+	t.Run("Login with @TOKEN suffix sends to remotelookup", func(t *testing.T) {
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
 			t.Fatalf("Failed to dial IMAP proxy: %v", err)
@@ -335,16 +335,16 @@ func TestIMAPProxy_TokenAuthentication(t *testing.T) {
 		defer c.Logout()
 
 		// Login format: user@domain.com@TOKEN with USER_PASSWORD
-		// The @TOKEN should be sent to prelookup (not validated locally)
-		// NOTE: This test expects prelookup to be configured and handle tokens
+		// The @TOKEN should be sent to remotelookup (not validated locally)
+		// NOTE: This test expects remotelookup to be configured and handle tokens
 		loginUsername := account.Email + "@sometoken123"
 		err = c.Login(loginUsername, account.Password).Wait()
-		// Without prelookup configured, this will fail - but that's expected
+		// Without remotelookup configured, this will fail - but that's expected
 		// The important part is that the code path handles @TOKEN differently than *MASTER
 		if err != nil {
-			t.Logf("Login with @TOKEN failed (expected without prelookup): %v", err)
+			t.Logf("Login with @TOKEN failed (expected without remotelookup): %v", err)
 		} else {
-			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+			t.Log("✓ Login with @TOKEN succeeded (remotelookup configured)")
 		}
 	})
 

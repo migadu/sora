@@ -21,21 +21,21 @@ import (
 	"github.com/migadu/sora/server/managesieveproxy"
 )
 
-// TestManageSieveProxyPrelookupContextCancellation tests that context cancellation during prelookup
+// TestManageSieveProxyRemoteLookupContextCancellation tests that context cancellation during remotelookup
 // (e.g., server shutdown) returns temporary unavailability instead of authentication failed.
-func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
+func TestManageSieveProxyRemoteLookupContextCancellation(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend ManageSieve server
 	backendServer, account := common.SetupManageSieveServer(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that blocks for a long time
-	prelookupBlockChan := make(chan struct{})
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that blocks for a long time
+	remotelookupBlockChan := make(chan struct{})
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Block until the channel is closed or request context is cancelled
 		select {
-		case <-prelookupBlockChan:
+		case <-remotelookupBlockChan:
 			// Channel closed - return success
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -44,21 +44,21 @@ func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
 			})
 		case <-r.Context().Done():
 			// Request context cancelled (proxy shutting down)
-			t.Log("✓ Prelookup request context cancelled (expected during shutdown)")
+			t.Log("✓ RemoteLookup request context cancelled (expected during shutdown)")
 			return
 		}
 	}))
-	defer prelookupServer.Close()
-	defer close(prelookupBlockChan)
+	defer remotelookupServer.Close()
+	defer close(remotelookupBlockChan)
 
-	// Set up ManageSieve proxy with prelookup enabled and fallback disabled
-	// This ensures we're testing the prelookup code path
+	// Set up ManageSieve proxy with remotelookup enabled and fallback disabled
+	// This ensures we're testing the remotelookup code path
 	proxyAddress := common.GetRandomAddress(t)
 
-	hostname := "test-proxy-prelookup-cancel"
+	hostname := "test-proxy-remotelookup-cancel"
 
 	opts := managesieveproxy.ServerOptions{
-		Name:               "test-proxy-prelookup-cancel",
+		Name:               "test-proxy-remotelookup-cancel",
 		Addr:               proxyAddress,
 		RemoteAddrs:        []string{backendServer.Address},
 		RemotePort:         4190,
@@ -77,11 +77,11 @@ func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
 			Enabled: false,
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupServer.URL + "/$email",
-			Timeout:         "30s", // Long timeout - we'll cancel before this
-			FallbackDefault: false, // Disable fallback to ensure prelookup path is tested
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupServer.URL + "/$email",
+			Timeout:      "30s", // Long timeout - we'll cancel before this
+			FallbackToDB: false, // Disable fallback to ensure remotelookup path is tested
 		},
 	}
 
@@ -134,7 +134,7 @@ func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
 	authString := fmt.Sprintf("\x00%s\x00%s", account.Email, account.Password)
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
-	// Start AUTHENTICATE in a goroutine (this will trigger prelookup)
+	// Start AUTHENTICATE in a goroutine (this will trigger remotelookup)
 	authErrChan := make(chan error, 1)
 	go func() {
 		// Send AUTHENTICATE PLAIN command with base64-encoded credentials
@@ -163,11 +163,11 @@ func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
 		}
 	}()
 
-	// Wait longer to ensure the auth request reaches prelookup and blocks there
+	// Wait longer to ensure the auth request reaches remotelookup and blocks there
 	time.Sleep(300 * time.Millisecond)
 
-	// Now shutdown the proxy (this will cancel the prelookup context)
-	t.Log("Shutting down proxy during prelookup...")
+	// Now shutdown the proxy (this will cancel the remotelookup context)
+	t.Log("Shutting down proxy during remotelookup...")
 	proxy.Stop()
 
 	// Wait for auth to complete
@@ -182,7 +182,7 @@ func TestManageSieveProxyPrelookupContextCancellation(t *testing.T) {
 
 		// Check that we got temporary unavailability (not "Authentication failed" or just "NO")
 		if strings.Contains(errStr, "UNAVAILABLE") || strings.Contains(errStr, "TRYLATER") || strings.Contains(errStr, "shutting down") {
-			t.Logf("✓ Correctly received temporary unavailability during prelookup context cancellation")
+			t.Logf("✓ Correctly received temporary unavailability during remotelookup context cancellation")
 		} else if strings.Contains(errStr, "Authentication failed") || strings.Contains(errStr, "NO \"Authentication") {
 			t.Errorf("FAIL: Received 'Authentication failed' instead of temporary unavailability during shutdown")
 			t.Errorf("This will cause clients to prompt for password and penalize rate limiting")

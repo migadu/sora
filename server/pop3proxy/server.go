@@ -44,7 +44,7 @@ type POP3ProxyServer struct {
 	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig        *config.PreLookupConfig
+	remotelookupConfig     *config.RemoteLookupConfig
 	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
@@ -147,7 +147,7 @@ type POP3ProxyServerOptions struct {
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	AuthRateLimit          server.AuthRateLimiterConfig
-	PreLookup              *config.PreLookupConfig
+	RemoteLookup           *config.RemoteLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
 
@@ -175,26 +175,26 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Create a new context with a cancel function for clean shutdown
 	serverCtx, serverCancel := context.WithCancel(appCtx)
 
-	// Ensure PreLookup config has a default value to avoid nil panics.
-	if options.PreLookup == nil {
-		options.PreLookup = &config.PreLookupConfig{}
+	// Ensure RemoteLookup config has a default value to avoid nil panics.
+	if options.RemoteLookup == nil {
+		options.RemoteLookup = &config.RemoteLookupConfig{}
 	}
 
-	// Initialize prelookup client if configured
+	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if options.PreLookup != nil && options.PreLookup.Enabled {
-		prelookupClient, err := proxy.InitializePrelookup("pop3", options.PreLookup)
+	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
+		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup)
 		if err != nil {
-			logger.Debug("POP3 Proxy: Failed to initialize prelookup client", "proxy", options.Name, "error", err)
-			if !options.PreLookup.FallbackDefault {
+			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
+			if !options.RemoteLookup.FallbackToDB {
 				serverCancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 			}
-			logger.Debug("POP3 Proxy: Continuing without prelookup due to fallback_to_default=true", "proxy", options.Name)
+			logger.Debug("POP3 Proxy: Continuing without remotelookup due to fallback_to_db=true", "proxy", options.Name)
 		} else {
-			routingLookup = prelookupClient
+			routingLookup = remotelookupClient
 			if options.Debug {
-				logger.Debug("POP3 Proxy: Prelookup client initialized successfully", "proxy", options.Name)
+				logger.Debug("POP3 Proxy: RemoteLookup client initialized successfully", "proxy", options.Name)
 			}
 		}
 	}
@@ -341,7 +341,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		affinityStickiness:         stickiness,
 		authLimiter:                authLimiter,
 		trustedProxies:             options.TrustedProxies,
-		prelookupConfig:            options.PreLookup,
+		remotelookupConfig:         options.RemoteLookup,
 		authIdleTimeout:            options.AuthIdleTimeout,
 		commandTimeout:             options.CommandTimeout,
 		absoluteSessionTimeout:     options.AbsoluteSessionTimeout,
@@ -599,12 +599,12 @@ func (s *POP3ProxyServer) Stop() error {
 		logger.Debug("POP3 Proxy: Server stop timeout", "proxy", s.name)
 	}
 
-	// Close prelookup client if it exists
+	// Close remotelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			logger.Debug("POP3 Proxy: Closing prelookup client", "proxy", s.name)
+			logger.Debug("POP3 Proxy: Closing remotelookup client", "proxy", s.name)
 			if err := routingLookup.Close(); err != nil {
-				logger.Debug("POP3 Proxy: Error closing prelookup client", "proxy", s.name, "error", err)
+				logger.Debug("POP3 Proxy: Error closing remotelookup client", "proxy", s.name, "error", err)
 			}
 		}
 	}

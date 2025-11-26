@@ -19,21 +19,21 @@ import (
 	"github.com/migadu/sora/server/lmtpproxy"
 )
 
-// TestLMTPProxyPrelookupContextCancellation tests that context cancellation during prelookup
+// TestLMTPProxyRemoteLookupContextCancellation tests that context cancellation during remotelookup
 // (e.g., server shutdown) returns a temporary error instead of permanent user unknown.
-func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
+func TestLMTPProxyRemoteLookupContextCancellation(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Create backend LMTP server
 	backendServer, account := common.SetupLMTPServerWithPROXY(t)
 	defer backendServer.Close()
 
-	// Create a prelookup server that blocks for a long time
-	prelookupBlockChan := make(chan struct{})
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a remotelookup server that blocks for a long time
+	remotelookupBlockChan := make(chan struct{})
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Block until the channel is closed or request context is cancelled
 		select {
-		case <-prelookupBlockChan:
+		case <-remotelookupBlockChan:
 			// Channel closed - return success
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -42,19 +42,19 @@ func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
 			})
 		case <-r.Context().Done():
 			// Request context cancelled (proxy shutting down)
-			t.Log("✓ Prelookup request context cancelled (expected during shutdown)")
+			t.Log("✓ RemoteLookup request context cancelled (expected during shutdown)")
 			return
 		}
 	}))
-	defer prelookupServer.Close()
-	defer close(prelookupBlockChan)
+	defer remotelookupServer.Close()
+	defer close(remotelookupBlockChan)
 
-	// Set up LMTP proxy with prelookup enabled and fallback disabled
+	// Set up LMTP proxy with remotelookup enabled and fallback disabled
 	proxyAddress := common.GetRandomAddress(t)
 	rdb := common.SetupTestDatabase(t)
 
 	opts := lmtpproxy.ServerOptions{
-		Name:                   "test-lmtp-proxy-prelookup-cancel",
+		Name:                   "test-lmtp-proxy-remotelookup-cancel",
 		Addr:                   proxyAddress,
 		RemoteAddrs:            []string{backendServer.Address},
 		RemotePort:             25,
@@ -63,11 +63,11 @@ func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
 		TrustedProxies:         []string{"127.0.0.0/8", "::1/128"},
 		ConnectTimeout:         5 * time.Second,
 		AuthIdleTimeout:        30 * time.Second,
-		PreLookup: &config.PreLookupConfig{
-			Enabled:         true,
-			URL:             prelookupServer.URL + "/$email",
-			Timeout:         "30s", // Long timeout - we'll cancel before this
-			FallbackDefault: false, // Disable fallback to ensure prelookup path is tested
+		RemoteLookup: &config.RemoteLookupConfig{
+			Enabled:      true,
+			URL:          remotelookupServer.URL + "/$email",
+			Timeout:      "30s", // Long timeout - we'll cancel before this
+			FallbackToDB: false, // Disable fallback to ensure remotelookup path is tested
 		},
 	}
 
@@ -132,11 +132,11 @@ func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
 		t.Fatalf("MAIL FROM failed: %s", resp)
 	}
 
-	// Start RCPT TO in a goroutine (this will trigger prelookup)
+	// Start RCPT TO in a goroutine (this will trigger remotelookup)
 	rcptErrChan := make(chan error, 1)
 	rcptRespChan := make(chan string, 1)
 	go func() {
-		// Send RCPT TO command (this will trigger prelookup routing)
+		// Send RCPT TO command (this will trigger remotelookup routing)
 		cmd := fmt.Sprintf("RCPT TO:<%s>\r\n", account.Email)
 		t.Log("Sending RCPT TO command...")
 		if _, err := writer.WriteString(cmd); err != nil {
@@ -161,11 +161,11 @@ func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
 		rcptErrChan <- nil
 	}()
 
-	// Wait a moment to ensure the RCPT TO request reaches prelookup
+	// Wait a moment to ensure the RCPT TO request reaches remotelookup
 	time.Sleep(300 * time.Millisecond)
 
-	// Now shutdown the proxy (this will cancel the prelookup context)
-	t.Log("Shutting down proxy during prelookup...")
+	// Now shutdown the proxy (this will cancel the remotelookup context)
+	t.Log("Shutting down proxy during remotelookup...")
 	proxy.Stop()
 
 	// Wait for RCPT TO to complete
@@ -187,7 +187,7 @@ func TestLMTPProxyPrelookupContextCancellation(t *testing.T) {
 
 			// Check that we got a temporary failure (4xx) not permanent failure (5xx)
 			if strings.HasPrefix(resp, "421") || strings.Contains(resp, "shutting down") || strings.Contains(resp, "try again") {
-				t.Logf("✓ Correctly received temporary error during prelookup context cancellation")
+				t.Logf("✓ Correctly received temporary error during remotelookup context cancellation")
 			} else if strings.HasPrefix(resp, "550") || strings.Contains(resp, "User unknown") {
 				t.Errorf("FAIL: Received permanent 'User unknown' (550) instead of temporary error during shutdown")
 				t.Errorf("This will cause senders to bounce emails instead of retrying")

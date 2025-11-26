@@ -1249,7 +1249,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AuthRateLimit:          authRateLimit,
 		LookupCache:            serverConfig.LookupCache,
-		PreLookup:              serverConfig.PreLookup,
+		RemoteLookup:           serverConfig.RemoteLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
@@ -1270,11 +1270,11 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 			logger.Info("IMAP Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
-		// Register prelookup health check if prelookup is enabled
+		// Register remotelookup health check if remotelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
-			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
-				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Info("Registered prelookup health check for IMAP proxy", "name", serverConfig.Name)
+			if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+				deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+				logger.Info("Registered remotelookup health check for IMAP proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1360,7 +1360,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		Debug:                  serverConfig.Debug,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		AuthRateLimit:          authRateLimit,
-		PreLookup:              serverConfig.PreLookup,
+		RemoteLookup:           serverConfig.RemoteLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
 		MaxConnectionsPerIP:    serverConfig.MaxConnectionsPerIP,
@@ -1381,11 +1381,11 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 			logger.Info("POP3 Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
-		// Register prelookup health check if prelookup is enabled
+		// Register remotelookup health check if remotelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
-			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
-				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Info("Registered prelookup health check for POP3 proxy", "name", serverConfig.Name)
+			if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+				deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+				logger.Info("Registered remotelookup health check for POP3 proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1470,7 +1470,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
 		AuthRateLimit:          authRateLimit,
-		PreLookup:              serverConfig.PreLookup,
+		RemoteLookup:           serverConfig.RemoteLookup,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxConnections:         serverConfig.MaxConnections,
@@ -1494,11 +1494,11 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 			logger.Info("ManageSieve Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
-		// Register prelookup health check if prelookup is enabled
+		// Register remotelookup health check if remotelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
-			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
-				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Info("Registered prelookup health check for ManageSieve proxy", "name", serverConfig.Name)
+			if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+				deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+				logger.Info("Registered remotelookup health check for ManageSieve proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1560,7 +1560,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		AuthIdleTimeout:        authIdleTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		LookupCache:            serverConfig.LookupCache,
-		PreLookup:              serverConfig.PreLookup,
+		RemoteLookup:           serverConfig.RemoteLookup,
 		TrustedProxies:         deps.config.Servers.TrustedNetworks,
 		MaxMessageSize:         maxMessageSize,
 		MaxConnections:         serverConfig.MaxConnections,
@@ -1579,11 +1579,11 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 			logger.Info("LMTP Proxy: Affinity manager attached to connection manager", "name", serverConfig.Name)
 		}
 
-		// Register prelookup health check if prelookup is enabled
+		// Register remotelookup health check if remotelookup is enabled
 		if routingLookup := connMgr.GetRoutingLookup(); routingLookup != nil {
-			if healthChecker, ok := routingLookup.(health.PrelookupHealthChecker); ok {
-				deps.healthIntegration.RegisterPrelookupCheck(healthChecker, serverConfig.Name)
-				logger.Info("Registered prelookup health check for LMTP proxy", "name", serverConfig.Name)
+			if healthChecker, ok := routingLookup.(health.RemoteLookupHealthChecker); ok {
+				deps.healthIntegration.RegisterRemoteLookupCheck(healthChecker, serverConfig.Name)
+				logger.Info("Registered remotelookup health check for LMTP proxy", "name", serverConfig.Name)
 			}
 		}
 	}
@@ -1766,7 +1766,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		MaxConnectionsPerIP: serverConfig.MaxConnectionsPerIP,
 		TrustedNetworks:     deps.config.Servers.TrustedNetworks,
 		TrustedProxies:      deps.config.Servers.TrustedNetworks,
-		PreLookup:           serverConfig.PreLookup,
+		RemoteLookup:        serverConfig.RemoteLookup,
 		LookupCache:         serverConfig.LookupCache,
 		AffinityManager:     deps.affinityManager,
 	})

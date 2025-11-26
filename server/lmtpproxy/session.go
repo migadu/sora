@@ -21,29 +21,29 @@ import (
 
 // Session represents an LMTP proxy session.
 type Session struct {
-	server             *Server
-	clientConn         net.Conn
-	backendConn        net.Conn
-	backendReader      *bufio.Reader
-	backendWriter      *bufio.Writer
-	clientReader       *bufio.Reader
-	clientWriter       *bufio.Writer
-	sender             string
-	mailFromReceived   bool
-	to                 string
-	username           string
-	isPrelookupAccount bool
-	routingInfo        *proxy.UserRoutingInfo
-	accountID          int64
-	serverAddr         string
-	routingMethod      string
-	clientAddr         string // Cached client address to avoid race with connection close
-	releaseConn        func() // Connection limiter cleanup function
-	mu                 sync.Mutex
-	ctx                context.Context
-	cancel             context.CancelFunc
-	startTime          time.Time
-	proxyInfo          *server.ProxyProtocolInfo
+	server                *Server
+	clientConn            net.Conn
+	backendConn           net.Conn
+	backendReader         *bufio.Reader
+	backendWriter         *bufio.Writer
+	clientReader          *bufio.Reader
+	clientWriter          *bufio.Writer
+	sender                string
+	mailFromReceived      bool
+	to                    string
+	username              string
+	isRemoteLookupAccount bool
+	routingInfo           *proxy.UserRoutingInfo
+	accountID             int64
+	serverAddr            string
+	routingMethod         string
+	clientAddr            string // Cached client address to avoid race with connection close
+	releaseConn           func() // Connection limiter cleanup function
+	mu                    sync.Mutex
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	startTime             time.Time
+	proxyInfo             *server.ProxyProtocolInfo
 }
 
 // newSession creates a new LMTP proxy session.
@@ -430,7 +430,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
 
 			s.accountID = cached.AccountID
-			s.isPrelookupAccount = cached.FromPrelookup
+			s.isRemoteLookupAccount = cached.FromRemoteLookup
 			s.routingInfo = &proxy.UserRoutingInfo{
 				AccountID:              cached.AccountID,
 				ServerAddress:          cached.ServerAddress,
@@ -459,44 +459,44 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		}
 	}
 
-	// 1. Try prelookup first
+	// 1. Try remotelookup first
 	hasRouting := s.server.connManager.HasRouting()
 
 	if hasRouting {
-		// Call prelookup API
-		routingTimeout := s.server.connManager.GetPrelookupTimeout()
+		// Call remotelookup API
+		routingTimeout := s.server.connManager.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, routingTimeout)
 		defer routingCancel()
 
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
 		if lookupErr != nil {
-			s.InfoLog("prelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
+			s.InfoLog("remotelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
 
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(lookupErr, server.ErrServerShuttingDown) {
-				s.InfoLog("prelookup cancelled due to server shutdown")
-				metrics.PrelookupResult.WithLabelValues("lmtp", "shutdown").Inc()
+				s.InfoLog("remotelookup cancelled due to server shutdown")
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", "shutdown").Inc()
 				return server.ErrServerShuttingDown
 			}
 
 			// Only check fallback setting for transient errors (network, 5xx, circuit breaker)
 			// User not found (404) always falls through to support partitioning scenarios
-			if s.server.prelookupConfig != nil && !s.server.prelookupConfig.FallbackDefault {
-				s.InfoLog("prelookup transient error and fallback_to_default=false - rejecting recipient", "username", s.username)
-				metrics.PrelookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
-				return fmt.Errorf("prelookup failed and fallback disabled: %w", lookupErr)
+			if s.server.remotelookupConfig != nil && !s.server.remotelookupConfig.FallbackToDB {
+				s.InfoLog("remotelookup transient error and fallback_to_db=false - rejecting recipient", "username", s.username)
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
+				return fmt.Errorf("remotelookup failed and fallback disabled: %w", lookupErr)
 			}
-			s.InfoLog("prelookup transient error - fallback_to_default=true, falling back to main DB", "username", s.username)
-			metrics.PrelookupResult.WithLabelValues("lmtp", "transient_error_fallback").Inc()
+			s.InfoLog("remotelookup transient error - fallback_to_db=true, falling back to main DB", "username", s.username)
+			metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_fallback").Inc()
 		} else if routingInfo != nil {
-			// Prelookup succeeded - may or may not have ServerAddress
+			// RemoteLookup succeeded - may or may not have ServerAddress
 			// If no ServerAddress, backend selection will use consistent hash/round-robin
-			metrics.PrelookupResult.WithLabelValues("lmtp", "success").Inc()
+			metrics.RemoteLookupResult.WithLabelValues("lmtp", "success").Inc()
 			s.routingInfo = routingInfo
-			s.isPrelookupAccount = true
+			s.isRemoteLookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
 
-			// Use ActualEmail from prelookup if available (for token resolution)
+			// Use ActualEmail from remotelookup if available (for token resolution)
 			var resolvedEmail string
 			if routingInfo.ActualEmail != "" {
 				resolvedEmail = routingInfo.ActualEmail
@@ -507,7 +507,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			// Cache positive result (routing info found)
 			// Cache key is s.username (BaseAddress of submitted recipient)
-			// Store ActualEmail if prelookup resolved to a different address
+			// Store ActualEmail if remotelookup resolved to a different address
 			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
 				AccountID:              routingInfo.AccountID,
 				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
@@ -518,7 +518,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
 				RemoteUseXCLIENT:       routingInfo.RemoteUseXCLIENT,
 				Result:                 lookupcache.AuthSuccess,
-				FromPrelookup:          true,
+				FromRemoteLookup:       true,
 			})
 
 			// Single consolidated log for lookup success
@@ -526,23 +526,28 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			s.InfoLog("account lookup successful",
 				"address", s.username,
 				"cached", false,
-				"method", "prelookup",
+				"method", "remotelookup",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 			return nil
 		} else {
-			// User not found in prelookup (404 or empty response).
-			// Always fall through to main DB - this supports partitioning scenarios
-			// where some users are in prelookup system and others are in main DB.
-			s.InfoLog("user not found in prelookup, attempting main DB", "username", s.username)
-			metrics.PrelookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
+			// User not found in remotelookup (404 or empty response).
+			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
+				s.InfoLog("user not found in remotelookup, fallback enabled - attempting main DB", "username", s.username)
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
+				// Fallthrough to main DB
+			} else {
+				s.InfoLog("user not found in remotelookup, fallback disabled - rejecting", "username", s.username)
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_rejected").Inc()
+				return fmt.Errorf("user not found in remotelookup")
+			}
 		}
 	} else {
-		s.InfoLog("prelookup not available - HasRouting returned false", "username", s.username)
+		s.InfoLog("remotelookup not available - HasRouting returned false", "username", s.username)
 	}
 
 	// 2. Fallback to main DB to get account ID for affinity
-	s.isPrelookupAccount = false
+	s.isRemoteLookupAccount = false
 	// Use configured database query timeout instead of hardcoded value
 	queryTimeout := s.server.rdb.GetQueryTimeout()
 	dbCtx, dbCancel := context.WithTimeout(s.ctx, queryTimeout)
@@ -574,8 +579,8 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		return fmt.Errorf("user not found in main database: %w", err)
 	}
 
-	// Set routing info so connectToBackend doesn't call prelookup again
-	// Preserve global proxy settings (XCLIENT support) since we're not using prelookup routing
+	// Set routing info so connectToBackend doesn't call remotelookup again
+	// Preserve global proxy settings (XCLIENT support) since we're not using remotelookup routing
 	s.routingInfo = &proxy.UserRoutingInfo{
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
@@ -586,7 +591,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
 		Result:           lookupcache.AuthSuccess,
-		FromPrelookup:    false,
+		FromRemoteLookup: false,
 	})
 
 	// Single consolidated log for lookup success
@@ -603,14 +608,14 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 // connectToBackend establishes a connection to the backend server.
 func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
-		Ctx:                s.ctx,
-		Username:           s.username,
-		Protocol:           "lmtp",
-		IsPrelookupAccount: s.isPrelookupAccount,
-		RoutingInfo:        s.routingInfo,
-		ConnManager:        s.server.connManager,
-		EnableAffinity:     s.server.enableAffinity,
-		ProxyName:          "LMTP Proxy",
+		Ctx:                   s.ctx,
+		Username:              s.username,
+		Protocol:              "lmtp",
+		IsRemoteLookupAccount: s.isRemoteLookupAccount,
+		RoutingInfo:           s.routingInfo,
+		ConnManager:           s.server.connManager,
+		EnableAffinity:        s.server.enableAffinity,
+		ProxyName:             "LMTP Proxy",
 	})
 	if err != nil {
 		s.DebugLog("Error determining route", "error", err)
@@ -620,9 +625,9 @@ func (s *Session) connectToBackend() error {
 	s.routingInfo = routeResult.RoutingInfo
 	s.routingMethod = routeResult.RoutingMethod
 	preferredAddr := routeResult.PreferredAddr
-	isPrelookupRoute := routeResult.IsPrelookupRoute
+	isRemoteLookupRoute := routeResult.IsRemoteLookupRoute
 
-	s.DebugLog("Routing", "method", routeResult.RoutingMethod, "preferred_addr", preferredAddr, "is_prelookup", isPrelookupRoute)
+	s.DebugLog("Routing", "method", routeResult.RoutingMethod, "preferred_addr", preferredAddr, "is_remotelookup", isRemoteLookupRoute)
 	if s.routingInfo != nil {
 		s.DebugLog("Routing info", "server", s.routingInfo.ServerAddress, "tls", s.routingInfo.RemoteTLS, "starttls", s.routingInfo.RemoteTLSUseStartTLS, "tls_verify", s.routingInfo.RemoteTLSVerify, "xclient", s.routingInfo.RemoteUseXCLIENT)
 	}
@@ -644,13 +649,13 @@ func (s *Session) connectToBackend() error {
 		return fmt.Errorf("failed to connect to backend: %w", err)
 	}
 
-	if isPrelookupRoute && actualAddr != preferredAddr {
-		// The prelookup route specified a server, but we connected to a different one.
+	if isRemoteLookupRoute && actualAddr != preferredAddr {
+		// The remotelookup route specified a server, but we connected to a different one.
 		// This means the preferred server failed and the connection manager fell back.
-		// For prelookup routes, this is a hard failure.
+		// For remotelookup routes, this is a hard failure.
 		backendConn.Close()
 		metrics.ProxyBackendConnections.WithLabelValues("lmtp", "failure").Inc()
-		return fmt.Errorf("prelookup route to %s failed, and fallback is disabled for prelookup routes", preferredAddr)
+		return fmt.Errorf("remotelookup route to %s failed, and fallback is disabled for remotelookup routes", preferredAddr)
 	}
 
 	// Track backend connection success
@@ -661,16 +666,16 @@ func (s *Session) connectToBackend() error {
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Record successful connection for future affinity
-	// Auth-only prelookup users (IsPrelookupAccount=true but ServerAddress="") should get affinity
+	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity
 	if s.server.enableAffinity && actualAddr != "" {
 		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
-			Username:           s.username,
-			Protocol:           "lmtp",
-			IsPrelookupAccount: s.isPrelookupAccount,
-			RoutingInfo:        s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
-			ConnManager:        s.server.connManager,
-			EnableAffinity:     s.server.enableAffinity,
-			ProxyName:          "LMTP Proxy",
+			Username:              s.username,
+			Protocol:              "lmtp",
+			IsRemoteLookupAccount: s.isRemoteLookupAccount,
+			RoutingInfo:           s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
+			ConnManager:           s.server.connManager,
+			EnableAffinity:        s.server.enableAffinity,
+			ProxyName:             "LMTP Proxy",
 		}, actualAddr, routeResult.RoutingMethod == "affinity")
 	}
 
@@ -711,18 +716,18 @@ func (s *Session) connectToBackend() error {
 	}
 
 	// Check if we need to negotiate StartTLS with the backend
-	// This happens when prelookup (or global config) specifies remote_tls_use_starttls
+	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
 	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
-		// Prelookup routing specified StartTLS
+		// RemoteLookup routing specified StartTLS
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
 			Renegotiation:      tls.RenegotiateNever,
 		}
-		s.DebugLog("Using prelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
+		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
 	} else if s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS
 		shouldUseStartTLS = true

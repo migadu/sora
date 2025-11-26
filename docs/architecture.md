@@ -77,7 +77,7 @@ Sora exposes its services through several standard email protocols. Each server 
 
 ### Scaling and High Availability
 
-*   **Proxy Servers (`servers.*_proxy`)**: Sora includes built-in proxy servers for all major protocols. These proxies can load balance connections across multiple backend Sora nodes, enabling horizontal scaling and high-availability setups. They support user-server affinity (sticky sessions) and an advanced database-driven routing mode (`prelookup`).
+*   **Proxy Servers (`servers.*_proxy`)**: Sora includes built-in proxy servers for all major protocols. These proxies can load balance connections across multiple backend Sora nodes, enabling horizontal scaling and high-availability setups. They support user-server affinity (sticky sessions) and an advanced database-driven routing mode (`remote_lookup`).
 
 ### Monitoring and Administration
 

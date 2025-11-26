@@ -323,7 +323,7 @@ func TestManageSieveProxy_MasterAuthenticationPriority(t *testing.T) {
 	})
 }
 
-// TestManageSieveProxy_TokenAuthentication tests token-based authentication through prelookup
+// TestManageSieveProxy_TokenAuthentication tests token-based authentication through remotelookup
 func TestManageSieveProxy_TokenAuthentication(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -336,7 +336,7 @@ func TestManageSieveProxy_TokenAuthentication(t *testing.T) {
 	proxy := setupManageSieveProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
 	defer proxy.Close()
 
-	t.Run("AUTHENTICATE PLAIN with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+	t.Run("AUTHENTICATE PLAIN with @TOKEN suffix sends to remotelookup", func(t *testing.T) {
 		client, err := NewManageSieveClient(proxyAddress)
 		if err != nil {
 			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
@@ -344,19 +344,19 @@ func TestManageSieveProxy_TokenAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// AUTHENTICATE PLAIN format: user@domain.com@TOKEN with USER_PASSWORD
-		// The @TOKEN should be sent to prelookup (not validated locally)
+		// The @TOKEN should be sent to remotelookup (not validated locally)
 		username := account.Email + "@sometoken123"
 		authString := "\x00" + username + "\x00" + account.Password
 		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
 		client.SendCommand("AUTHENTICATE \"PLAIN\" \"" + encoded + "\"")
 		response, err := client.ReadResponse()
-		// Without prelookup configured, this will fail - but that's expected
+		// Without remotelookup configured, this will fail - but that's expected
 		// The important part is that the code path handles @TOKEN differently than *MASTER
 		if err == nil && response == "OK" {
-			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+			t.Log("✓ Login with @TOKEN succeeded (remotelookup configured)")
 		} else {
-			t.Logf("Login with @TOKEN failed (expected without prelookup): %s", response)
+			t.Logf("Login with @TOKEN failed (expected without remotelookup): %s", response)
 		}
 	})
 

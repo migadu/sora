@@ -1406,7 +1406,7 @@ func (s *POP3Session) handleConnection() {
 
 			s.DebugLog("sasl plain authentication", "authz_id", authzID, "authn_id", authnID)
 
-			// Parse authentication-identity to check for suffix (master username or prelookup token)
+			// Parse authentication-identity to check for suffix (master username or remotelookup token)
 			authnParsed, parseErr := server.NewAddress(authnID)
 
 			var accountID int64

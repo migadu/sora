@@ -181,40 +181,40 @@ func (hi *HealthIntegration) RegisterRelayQueueCheck(relayQueue RelayQueueStatsP
 	hi.monitor.RegisterCheck(relayQueueCheck)
 }
 
-// PrelookupHealthChecker interface for prelookup clients that support health checks
-type PrelookupHealthChecker interface {
+// RemoteLookupHealthChecker interface for remotelookup clients that support health checks
+type RemoteLookupHealthChecker interface {
 	HealthCheck(ctx context.Context) error
 }
 
-// PrelookupWithCircuitBreaker interface for prelookup clients with circuit breaker
-type PrelookupWithCircuitBreaker interface {
-	PrelookupHealthChecker
+// RemoteLookupWithCircuitBreaker interface for remotelookup clients with circuit breaker
+type RemoteLookupWithCircuitBreaker interface {
+	RemoteLookupHealthChecker
 	GetCircuitBreaker() *circuitbreaker.CircuitBreaker
 }
 
-// RegisterPrelookupCheck registers a health check for the prelookup HTTP endpoint
+// RegisterRemoteLookupCheck registers a health check for the remotelookup HTTP endpoint
 // If the client has a circuit breaker, it will also register a circuit breaker check
-func (hi *HealthIntegration) RegisterPrelookupCheck(prelookupClient PrelookupHealthChecker, serverName string) {
-	checkName := "prelookup_http"
+func (hi *HealthIntegration) RegisterRemoteLookupCheck(remotelookupClient RemoteLookupHealthChecker, serverName string) {
+	checkName := "remotelookup_http"
 	if serverName != "" {
-		checkName = fmt.Sprintf("prelookup_http_%s", serverName)
+		checkName = fmt.Sprintf("remotelookup_http_%s", serverName)
 	}
 
-	prelookupCheck := &HealthCheck{
+	remotelookupCheck := &HealthCheck{
 		Name:     checkName,
 		Interval: 30 * time.Second,
 		Timeout:  10 * time.Second,
-		Critical: false, // Not critical since prelookup has fallback mode
-		Check:    prelookupClient.HealthCheck,
+		Critical: false, // Not critical since remotelookup has fallback mode
+		Check:    remotelookupClient.HealthCheck,
 	}
-	hi.monitor.RegisterCheck(prelookupCheck)
+	hi.monitor.RegisterCheck(remotelookupCheck)
 
 	// If the client has a circuit breaker, register it too
-	if clientWithBreaker, ok := prelookupClient.(PrelookupWithCircuitBreaker); ok {
+	if clientWithBreaker, ok := remotelookupClient.(RemoteLookupWithCircuitBreaker); ok {
 		if breaker := clientWithBreaker.GetCircuitBreaker(); breaker != nil {
-			cbName := "prelookup_http_circuit_breaker"
+			cbName := "remotelookup_http_circuit_breaker"
 			if serverName != "" {
-				cbName = fmt.Sprintf("prelookup_http_circuit_breaker_%s", serverName)
+				cbName = fmt.Sprintf("remotelookup_http_circuit_breaker_%s", serverName)
 			}
 			hi.RegisterCircuitBreakerCheck(cbName, breaker)
 		}

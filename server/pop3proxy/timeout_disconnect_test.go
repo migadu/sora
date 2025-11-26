@@ -41,7 +41,7 @@ func TestIdleTimeoutSendsError(t *testing.T) {
 		ConnectTimeout: 5 * time.Second,
 		AuthRateLimit:  server.AuthRateLimiterConfig{},
 		MaxConnections: 10,
-		PreLookup:      &config.PreLookupConfig{},
+		RemoteLookup:   &config.RemoteLookupConfig{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create POP3 proxy: %v", err)
@@ -124,7 +124,7 @@ func TestSessionMaxTimeoutSendsError(t *testing.T) {
 		ConnectTimeout:         5 * time.Second,
 		AuthRateLimit:          server.AuthRateLimiterConfig{},
 		MaxConnections:         10,
-		PreLookup:              &config.PreLookupConfig{},
+		RemoteLookup:           &config.RemoteLookupConfig{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create POP3 proxy: %v", err)
@@ -199,7 +199,7 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 		ConnectTimeout:  5 * time.Second,
 		AuthRateLimit:   server.AuthRateLimiterConfig{},
 		MaxConnections:  10,
-		PreLookup:       &config.PreLookupConfig{},
+		RemoteLookup:    &config.RemoteLookupConfig{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create POP3 proxy: %v", err)

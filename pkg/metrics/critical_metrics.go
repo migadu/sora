@@ -242,13 +242,13 @@ var (
 			Name: "sora_proxy_routing_method_total",
 			Help: "Total number of backend connections by routing method.",
 		},
-		[]string{"protocol", "method"}, // e.g., protocol="imap", method="prelookup"
+		[]string{"protocol", "method"}, // e.g., protocol="imap", method="remotelookup"
 	)
 
-	PrelookupResult = promauto.NewCounterVec(
+	RemoteLookupResult = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "sora_prelookup_result_total",
-			Help: "Total number of prelookup results by outcome type.",
+			Name: "sora_remotelookup_result_total",
+			Help: "Total number of remotelookup results by outcome type.",
 		},
 		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found_fallback/transient_error_fallback/transient_error_rejected
 	)

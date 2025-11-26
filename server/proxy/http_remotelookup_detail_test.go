@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// TestHTTPPrelookupDetailStripping verifies that +detail is stripped correctly
-// and master tokens are preserved when making prelookup HTTP requests
-func TestHTTPPrelookupDetailStripping(t *testing.T) {
+// TestHTTPRemoteLookupDetailStripping verifies that +detail is stripped correctly
+// and master tokens are preserved when making remotelookup HTTP requests
+func TestHTTPRemoteLookupDetailStripping(t *testing.T) {
 	tests := []struct {
 		name             string
 		inputEmail       string
@@ -78,8 +78,8 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 			}))
 			defer server.Close()
 
-			// Create prelookup client
-			client := NewHTTPPreLookupClient(
+			// Create remotelookup client
+			client := NewHTTPRemoteLookupClient(
 				server.URL+"/lookup?email=$email",
 				5*time.Second,
 				"test-token",
@@ -113,8 +113,8 @@ func TestHTTPPrelookupDetailStripping(t *testing.T) {
 	}
 }
 
-// TestHTTPPrelookupURLEncoding verifies that emails are properly URL-encoded
-func TestHTTPPrelookupURLEncoding(t *testing.T) {
+// TestHTTPRemoteLookupURLEncoding verifies that emails are properly URL-encoded
+func TestHTTPRemoteLookupURLEncoding(t *testing.T) {
 	tests := []struct {
 		name          string
 		inputEmail    string
@@ -153,7 +153,7 @@ func TestHTTPPrelookupURLEncoding(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPPreLookupClient(
+			client := NewHTTPRemoteLookupClient(
 				server.URL+"/lookup?email=$email",
 				5*time.Second,
 				"test-token",

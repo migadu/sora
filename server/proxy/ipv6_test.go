@@ -6,7 +6,7 @@ import (
 )
 
 // This file tests the IPv6 address resolution fix for the connection manager.
-// The problem was that addresses like "localhost" from prelookup would get
+// The problem was that addresses like "localhost" from remotelookup would get
 // normalized to "localhost:993" but not resolved to "[::1]:993" before dialing,
 // causing "too many colons in address" errors when Go's network stack resolved
 // localhost to ::1 and tried to create "::1:993" instead of "[::1]:993".
@@ -149,18 +149,18 @@ func TestIPv6AddressValidation(t *testing.T) {
 
 func TestFullIPv6WorkflowWithLocalhost(t *testing.T) {
 	// This test simulates the exact problem scenario:
-	// 1. Address from prelookup (e.g., "localhost")
+	// 1. Address from remotelookup (e.g., "localhost")
 	// 2. Normalization with default port
 	// 3. Resolution before dial
 
 	cm := &ConnectionManager{}
 	defaultPort := 993
 
-	// Simulate prelookup returning "localhost"
-	prelookupAddr := "localhost"
+	// Simulate remotelookup returning "localhost"
+	remotelookupAddr := "localhost"
 
-	// Step 1: Normalize (what happens in prelookup.go)
-	normalized := normalizeHostPort(prelookupAddr, defaultPort)
+	// Step 1: Normalize (what happens in remotelookup.go)
+	normalized := normalizeHostPort(remotelookupAddr, defaultPort)
 
 	// Step 2: Resolve (what happens in connection_manager.go before dial)
 	resolved := cm.resolveAddress(normalized)
@@ -169,7 +169,7 @@ func TestFullIPv6WorkflowWithLocalhost(t *testing.T) {
 	host, port, err := net.SplitHostPort(resolved)
 	if err != nil {
 		t.Fatalf("Full workflow failed at SplitHostPort: %v\nAddress chain: %q -> %q -> %q",
-			err, prelookupAddr, normalized, resolved)
+			err, remotelookupAddr, normalized, resolved)
 	}
 
 	// Verify we have a valid format
@@ -190,7 +190,7 @@ func TestFullIPv6WorkflowWithLocalhost(t *testing.T) {
 	}
 
 	t.Logf("Successful workflow: %q -> %q -> %q (host=%q, port=%q)",
-		prelookupAddr, normalized, resolved, host, port)
+		remotelookupAddr, normalized, resolved, host, port)
 }
 
 // Helper function to check if a string contains a substring

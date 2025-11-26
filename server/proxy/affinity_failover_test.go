@@ -52,14 +52,14 @@ func testHealthyBackendAffinity(t *testing.T) {
 
 	// Determine route with affinity
 	result, err := DetermineRoute(RouteParams{
-		Ctx:                context.Background(),
-		Username:           "user@example.com",
-		Protocol:           "imap",
-		IsPrelookupAccount: false,
-		RoutingInfo:        nil,
-		ConnManager:        connMgr,
-		EnableAffinity:     true,
-		ProxyName:          "Test Proxy",
+		Ctx:                   context.Background(),
+		Username:              "user@example.com",
+		Protocol:              "imap",
+		IsRemoteLookupAccount: false,
+		RoutingInfo:           nil,
+		ConnManager:           connMgr,
+		EnableAffinity:        true,
+		ProxyName:             "Test Proxy",
 	})
 
 	if err != nil {
@@ -117,14 +117,14 @@ func testUnhealthyBackendFailover(t *testing.T) {
 
 	// Determine route - should detect unhealthy backend and delete affinity
 	result, err := DetermineRoute(RouteParams{
-		Ctx:                context.Background(),
-		Username:           "user@example.com",
-		Protocol:           "imap",
-		IsPrelookupAccount: false,
-		RoutingInfo:        nil,
-		ConnManager:        connMgr,
-		EnableAffinity:     true,
-		ProxyName:          "Test Proxy",
+		Ctx:                   context.Background(),
+		Username:              "user@example.com",
+		Protocol:              "imap",
+		IsRemoteLookupAccount: false,
+		RoutingInfo:           nil,
+		ConnManager:           connMgr,
+		EnableAffinity:        true,
+		ProxyName:             "Test Proxy",
 	})
 
 	if err != nil {

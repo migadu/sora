@@ -51,7 +51,7 @@ type Server struct {
 	cancel                 context.CancelFunc
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	prelookupConfig        *config.PreLookupConfig
+	remotelookupConfig     *config.RemoteLookupConfig
 	remoteUseIDCommand     bool                        // Whether backend supports IMAP ID command for forwarding
 	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
@@ -148,7 +148,7 @@ type ServerOptions struct {
 	EnableAffinity         bool
 	AuthRateLimit          server.AuthRateLimiterConfig
 	LookupCache            *config.LookupCacheConfig // Authentication cache configuration
-	PreLookup              *config.PreLookupConfig
+	RemoteLookup           *config.RemoteLookupConfig
 	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseIDCommand     bool     // Whether backend supports IMAP ID command for forwarding
 
@@ -185,26 +185,26 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connectTimeout = 10 * time.Second
 	}
 
-	// Ensure PreLookup config has a default value to avoid nil panics.
-	if opts.PreLookup == nil {
-		opts.PreLookup = &config.PreLookupConfig{}
+	// Ensure RemoteLookup config has a default value to avoid nil panics.
+	if opts.RemoteLookup == nil {
+		opts.RemoteLookup = &config.RemoteLookupConfig{}
 	}
 
-	// Initialize prelookup client if configured
+	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
-	if opts.PreLookup.Enabled {
-		prelookupClient, err := proxy.InitializePrelookup("imap", opts.PreLookup)
+	if opts.RemoteLookup.Enabled {
+		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup)
 		if err != nil {
-			logger.Error("Failed to initialize prelookup client", "proxy", opts.Name, "error", err)
-			if !opts.PreLookup.FallbackDefault {
+			logger.Error("Failed to initialize remotelookup client", "proxy", opts.Name, "error", err)
+			if !opts.RemoteLookup.FallbackToDB {
 				cancel()
-				return nil, fmt.Errorf("failed to initialize prelookup client: %w", err)
+				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 			}
-			logger.Warn("Continuing without prelookup due to fallback_to_default=true", "proxy", opts.Name)
+			logger.Warn("Continuing without remotelookup due to fallback_to_db=true", "proxy", opts.Name)
 		} else {
-			routingLookup = prelookupClient
+			routingLookup = remotelookupClient
 			if opts.Debug {
-				logger.Debug("Prelookup client initialized successfully", "proxy", opts.Name)
+				logger.Debug("RemoteLookup client initialized successfully", "proxy", opts.Name)
 			}
 		}
 	}
@@ -339,7 +339,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		cancel:                     cancel,
 		authLimiter:                authLimiter,
 		trustedProxies:             opts.TrustedProxies,
-		prelookupConfig:            opts.PreLookup,
+		remotelookupConfig:         opts.RemoteLookup,
 		remoteUseIDCommand:         opts.RemoteUseIDCommand,
 		proxyReader:                proxyReader,
 		lookupCache:                lookupCache,
@@ -624,12 +624,12 @@ func (s *Server) Stop() error {
 		logger.Warn("Proxy server stop timeout", "proxy", s.name)
 	}
 
-	// Close prelookup client if it exists
+	// Close remotelookup client if it exists
 	if s.connManager != nil {
 		if routingLookup := s.connManager.GetRoutingLookup(); routingLookup != nil {
-			logger.Debug("Closing prelookup client", "proxy", s.name)
+			logger.Debug("Closing remotelookup client", "proxy", s.name)
 			if err := routingLookup.Close(); err != nil {
-				logger.Error("Error closing prelookup client", "proxy", s.name, "error", err)
+				logger.Error("Error closing remotelookup client", "proxy", s.name, "error", err)
 			}
 		}
 	}

@@ -102,17 +102,17 @@ func TestIMAPProxyLookupCache_BadPasswordHandling(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("lookupcache-bad-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Create prelookup server that returns auth + routing info
+	// Create remotelookup server that returns auth + routing info
 	// When "server" field is present, proxy validates password locally using password_hash,
 	// then connects to specified backend using master SASL authentication
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := map[string]interface{}{
 			"address":       account.Email,
 			"password_hash": passwordHash,
@@ -122,12 +122,12 @@ func TestIMAPProxyLookupCache_BadPasswordHandling(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up IMAP proxy with short negative cache TTL (1 second) for testing
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupIMAPProxyWithHTTPRemoteLookupAndShortNegativeTTL(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
 	// Test 1: First bad password attempt - should fail and cache
@@ -192,18 +192,18 @@ func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("lookupcache-expiry-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "test123")
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	passwordHashBytes, err := bcrypt.GenerateFromPassword([]byte(account.Password), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("Failed to hash password: %v", err)
 	}
 	passwordHash := string(passwordHashBytes)
 
-	// Track prelookup calls
-	prelookupCalls := 0
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls++
-		t.Logf("Prelookup call #%d", prelookupCalls)
+	// Track remotelookup calls
+	remotelookupCalls := 0
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls++
+		t.Logf("RemoteLookup call #%d", remotelookupCalls)
 
 		// When "server" field is present, proxy validates password locally using password_hash,
 		// then connects to specified backend using master SASL authentication
@@ -216,17 +216,17 @@ func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up IMAP proxy with short positive cache TTL (3 seconds) for testing
 	proxyAddress := common.GetRandomAddress(t)
-	proxy := setupIMAPProxyWithHTTPPrelookupAndShortPositiveTTL(t, backendServer.ResilientDB, proxyAddress,
-		[]string{backendServer.Address}, prelookupServer.URL)
+	proxy := setupIMAPProxyWithHTTPRemoteLookupAndShortPositiveTTL(t, backendServer.ResilientDB, proxyAddress,
+		[]string{backendServer.Address}, remotelookupServer.URL)
 	defer proxy.Close()
 
-	// Test 1: First login - should call prelookup
-	t.Run("FirstLogin_CallsPrelookup", func(t *testing.T) {
-		initialCalls := prelookupCalls
+	// Test 1: First login - should call remotelookup
+	t.Run("FirstLogin_CallsRemoteLookup", func(t *testing.T) {
+		initialCalls := remotelookupCalls
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
@@ -239,16 +239,16 @@ func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			t.Fatalf("First login failed: %v", err)
 		}
 
-		if prelookupCalls == initialCalls {
-			t.Fatal("Expected prelookup to be called on first login")
+		if remotelookupCalls == initialCalls {
+			t.Fatal("Expected remotelookup to be called on first login")
 		}
-		t.Logf("✓ First login succeeded (prelookup called, cache populated)")
+		t.Logf("✓ First login succeeded (remotelookup called, cache populated)")
 	})
 
-	// Test 2: Second login within TTL - should use cache (no prelookup call)
+	// Test 2: Second login within TTL - should use cache (no remotelookup call)
 	t.Run("SecondLogin_UsesCache", func(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
-		callsBeforeLogin := prelookupCalls
+		callsBeforeLogin := remotelookupCalls
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
@@ -261,18 +261,18 @@ func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			t.Fatalf("Second login failed: %v", err)
 		}
 
-		if prelookupCalls > callsBeforeLogin {
-			t.Logf("NOTE: Prelookup was called on second login (cache miss or revalidation)")
+		if remotelookupCalls > callsBeforeLogin {
+			t.Logf("NOTE: RemoteLookup was called on second login (cache miss or revalidation)")
 		} else {
-			t.Log("✓ Second login used cache (no prelookup call)")
+			t.Log("✓ Second login used cache (no remotelookup call)")
 		}
 	})
 
-	// Test 3: Third login after TTL expiry - should revalidate (call prelookup)
+	// Test 3: Third login after TTL expiry - should revalidate (call remotelookup)
 	t.Run("ThirdLogin_AfterExpiry", func(t *testing.T) {
 		// Wait for cache entry to expire (3 seconds TTL)
 		time.Sleep(3500 * time.Millisecond)
-		callsBeforeLogin := prelookupCalls
+		callsBeforeLogin := remotelookupCalls
 
 		c, err := imapclient.DialInsecure(proxyAddress, nil)
 		if err != nil {
@@ -285,10 +285,10 @@ func TestIMAPProxyLookupCache_SuccessfulAuthExpiry(t *testing.T) {
 			t.Fatalf("Third login failed after cache expiry: %v", err)
 		}
 
-		if prelookupCalls == callsBeforeLogin {
+		if remotelookupCalls == callsBeforeLogin {
 			t.Log("NOTE: Cache entry not expired yet or revalidation window not reached")
 		} else {
-			t.Log("✓ Third login revalidated (prelookup called after expiry)")
+			t.Log("✓ Third login revalidated (remotelookup called after expiry)")
 		}
 	})
 }
@@ -355,7 +355,7 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	uniqueEmail := fmt.Sprintf("lookupcache-pos-reval-%d@example.com", time.Now().UnixNano())
 	account := common.CreateTestAccountWithEmail(t, backendServer.ResilientDB, uniqueEmail, "oldpassword")
 
-	// Generate password hash for prelookup response
+	// Generate password hash for remotelookup response
 	// We need to update this when password changes
 	var currentPasswordHash string
 	updateHash := func(pwd string) {
@@ -364,10 +364,10 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	}
 	updateHash("oldpassword")
 
-	// Track prelookup calls
-	prelookupCalls := 0
-	prelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prelookupCalls++
+	// Track remotelookup calls
+	remotelookupCalls := 0
+	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotelookupCalls++
 		response := map[string]interface{}{
 			"address":       account.Email,
 			"password_hash": currentPasswordHash,
@@ -377,7 +377,7 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(response)
 	}))
-	defer prelookupServer.Close()
+	defer remotelookupServer.Close()
 
 	// Set up IMAP proxy with short positive revalidation window (2 seconds)
 	// Note: PositiveTTL is longer (5m) to ensure entry stays in cache
@@ -399,11 +399,11 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupServer.URL,
+			URL:                    remotelookupServer.URL,
 			Timeout:                "5s",
-			FallbackDefault:        false,
+			FallbackToDB:           false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -436,8 +436,8 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if err := c.Login(account.Email, "oldpassword").Wait(); err != nil {
 			t.Fatalf("Login failed: %v", err)
 		}
-		if prelookupCalls != 1 {
-			t.Fatalf("Expected 1 prelookup call, got %d", prelookupCalls)
+		if remotelookupCalls != 1 {
+			t.Fatalf("Expected 1 remotelookup call, got %d", remotelookupCalls)
 		}
 	})
 
@@ -446,7 +446,7 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 	// Update backend DB
 	hashedPassword, _ := db.GenerateBcryptHash(newPassword)
 	backendServer.ResilientDB.UpdatePasswordWithRetry(context.Background(), account.Email, hashedPassword)
-	// Update mock prelookup hash
+	// Update mock remotelookup hash
 	updateHash(newPassword)
 
 	// Test 2: Login with new password immediately - should fail (cache hit, hash mismatch, fresh entry)
@@ -461,9 +461,9 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if err := c.Login(account.Email, newPassword).Wait(); err == nil {
 			t.Fatal("Login with new password should have failed (cached old hash)")
 		}
-		// Prelookup should NOT be called again
-		if prelookupCalls != 1 {
-			t.Fatalf("Expected prelookup calls to remain 1, got %d", prelookupCalls)
+		// RemoteLookup should NOT be called again
+		if remotelookupCalls != 1 {
+			t.Fatalf("Expected remotelookup calls to remain 1, got %d", remotelookupCalls)
 		}
 		t.Log("✓ Login with new password failed immediately (cached old hash)")
 	})
@@ -483,9 +483,9 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 		if err := c.Login(account.Email, newPassword).Wait(); err != nil {
 			t.Fatalf("Login with new password failed after window: %v", err)
 		}
-		// Prelookup SHOULD be called again
-		if prelookupCalls != 2 {
-			t.Fatalf("Expected 2 prelookup calls, got %d", prelookupCalls)
+		// RemoteLookup SHOULD be called again
+		if remotelookupCalls != 2 {
+			t.Fatalf("Expected 2 remotelookup calls, got %d", remotelookupCalls)
 		}
 		t.Log("✓ Login with new password succeeded after window (revalidated)")
 	})
@@ -546,16 +546,16 @@ func setupIMAPProxyWithMasterAuthAndCache(t *testing.T, rdb *resilient.Resilient
 	}
 }
 
-// setupIMAPProxyWithHTTPPrelookupAndCache creates IMAP proxy with HTTP prelookup and caching
-func setupIMAPProxyWithHTTPPrelookupAndCache(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithHTTPRemoteLookupAndCache creates IMAP proxy with HTTP remotelookup and caching
+func setupIMAPProxyWithHTTPRemoteLookupAndCache(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
-	hostname := "test-proxy-prelookup-cache"
+	hostname := "test-proxy-remotelookup-cache"
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
 	opts := imapproxy.ServerOptions{
-		Name:                   "test-proxy-prelookup-cache",
+		Name:                   "test-proxy-remotelookup-cache",
 		Addr:                   proxyAddr,
 		RemoteAddrs:            backendAddrs,
 		RemotePort:             143,
@@ -570,11 +570,11 @@ func setupIMAPProxyWithHTTPPrelookupAndCache(t *testing.T, rdb *resilient.Resili
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL,
+			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackDefault:        false,
+			FallbackToDB:           false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -588,7 +588,7 @@ func setupIMAPProxyWithHTTPPrelookupAndCache(t *testing.T, rdb *resilient.Resili
 
 	proxy, err := imapproxy.New(context.Background(), rdb, hostname, opts)
 	if err != nil {
-		t.Fatalf("Failed to create IMAP proxy with prelookup: %v", err)
+		t.Fatalf("Failed to create IMAP proxy with remotelookup: %v", err)
 	}
 
 	// Start proxy in background
@@ -608,8 +608,8 @@ func setupIMAPProxyWithHTTPPrelookupAndCache(t *testing.T, rdb *resilient.Resili
 	}
 }
 
-// setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL creates proxy with short negative cache TTL (1s)
-func setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithHTTPRemoteLookupAndShortNegativeTTL creates proxy with short negative cache TTL (1s)
+func setupIMAPProxyWithHTTPRemoteLookupAndShortNegativeTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-proxy-short-negative"
@@ -632,11 +632,11 @@ func setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL,
+			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackDefault:        false,
+			FallbackToDB:           false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -670,8 +670,8 @@ func setupIMAPProxyWithHTTPPrelookupAndShortNegativeTTL(t *testing.T, rdb *resil
 	}
 }
 
-// setupIMAPProxyWithHTTPPrelookupAndShortPositiveTTL creates proxy with short positive cache TTL (3s)
-func setupIMAPProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, prelookupURL string) *common.TestServer {
+// setupIMAPProxyWithHTTPRemoteLookupAndShortPositiveTTL creates proxy with short positive cache TTL (3s)
+func setupIMAPProxyWithHTTPRemoteLookupAndShortPositiveTTL(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, remotelookupURL string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-proxy-short-positive"
@@ -694,11 +694,11 @@ func setupIMAPProxyWithHTTPPrelookupAndShortPositiveTTL(t *testing.T, rdb *resil
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		PreLookup: &config.PreLookupConfig{
+		RemoteLookup: &config.RemoteLookupConfig{
 			Enabled:                true,
-			URL:                    prelookupURL,
+			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackDefault:        false,
+			FallbackToDB:           false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{

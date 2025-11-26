@@ -82,12 +82,12 @@ func TestBackendAuthTimeout(t *testing.T) {
 	proxyAddr := proxyListener.Addr().String()
 	proxyListener.Close()
 
-	// Create empty mock database - we'll use prelookup to bypass DB auth
+	// Create empty mock database - we'll use remotelookup to bypass DB auth
 	mockRDB := &resilient.ResilientDatabase{}
 
-	// Create prelookup config that always succeeds (simulates successful user lookup)
-	prelookupConfig := &config.PreLookupConfig{
-		Enabled: false, // Disable prelookup, use master username instead
+	// Create remotelookup config that always succeeds (simulates successful user lookup)
+	remotelookupConfig := &config.RemoteLookupConfig{
+		Enabled: false, // Disable remotelookup, use master username instead
 	}
 
 	// Create proxy with very short connect timeout (shorter than backend delay)
@@ -100,7 +100,7 @@ func TestBackendAuthTimeout(t *testing.T) {
 		ConnectTimeout:     2 * time.Second, // Short timeout so backend delay triggers it
 		AuthRateLimit:      server.AuthRateLimiterConfig{},
 		MaxConnections:     10,
-		PreLookup:          prelookupConfig,
+		RemoteLookup:       remotelookupConfig,
 		MasterUsername:     "master",     // Configure master username auth
 		MasterPassword:     "masterpass", // so we can auth without database
 		MasterSASLUsername: "master",
@@ -246,7 +246,7 @@ func TestBackendConnectTimeout(t *testing.T) {
 		ConnectTimeout:     1 * time.Second, // Very short timeout
 		AuthRateLimit:      server.AuthRateLimiterConfig{},
 		MaxConnections:     10,
-		PreLookup:          &config.PreLookupConfig{Enabled: false},
+		RemoteLookup:       &config.RemoteLookupConfig{Enabled: false},
 		MasterUsername:     "master",     // Configure master username auth
 		MasterPassword:     "masterpass", // so we can auth without database
 		MasterSASLUsername: "master",

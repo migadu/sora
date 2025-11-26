@@ -381,7 +381,7 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 # Synchronize user-to-backend affinity (sticky sessions) across cluster nodes via gossip.
 # When enabled, users are consistently routed to the same backend server across all proxy nodes
 # for better cache locality and connection reuse. Affinity automatically updates when backends fail.
-# NOTE: Affinity is ONLY for non-prelookup users. Prelookup routes are always authoritative.
+# NOTE: Affinity is ONLY for non-remote_lookup users. RemoteLookup routes are always authoritative.
 [cluster.affinity]
 enabled = false                                 # Enable cluster-wide server affinity (default: false)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
@@ -1090,10 +1090,10 @@ timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disabl
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
-# --- HTTP-BASED USER ROUTING (PRELOOKUP) ---
+# --- HTTP-BASED USER ROUTING (REMOTE_LOOKUP) ---
 # Advanced feature for routing users to specific backend servers via HTTP API.
 #
-# The prelookup service is called via HTTP GET with email interpolation.
+# The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
 #
 # Example URLs:
@@ -1133,7 +1133,7 @@ timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 =
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
 # - If HTTP endpoint returns 404 → always falls back to default routing (partitioning support)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
-# - If HTTP endpoint returns other 4xx/5xx → respects fallback_to_default setting
+# - If HTTP endpoint returns other 4xx/5xx → respects fallback_to_db setting
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
 # - Timeout for HTTP requests is configurable (default: 5s)
@@ -1144,7 +1144,7 @@ timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 =
 # - Response: {"address": "realuser@domain.com", ...}
 # - Proxy connects to backend and authenticates as "realuser@domain.com"
 #
-[server.prelookup]
+[server.remotelookup]
 enabled = false                             # Enable/disable HTTP-based user routing.
 url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $email placeholder (required if enabled)
                                             # The $email placeholder is replaced with the URL-encoded email address
@@ -1159,37 +1159,22 @@ timeout = "10s"                             # HTTP response timeout (default: 10
                                             # Subsequent requests reuse connections and complete within this timeout
 # auth_token = "your-secret-token"          # Bearer token for HTTP authentication (optional)
                                             # If set, sends "Authorization: Bearer <token>" header with requests
-                                            # Use this to secure your prelookup endpoint
+                                            # Use this to secure your remote_lookup endpoint
 
-fallback_to_default = true            # Controls behavior when prelookup service has TRANSIENT errors
-                                      # (network issues, timeouts, 4xx errors except 401/403/404, 5xx errors, circuit breaker open).
-                                      #
-                                      # IMPORTANT: User-not-found (404 or empty response) ALWAYS falls back to main DB
-                                      # regardless of this setting. This supports PARTITIONING scenarios where some
-                                      # users are in one system and others are in another system.
-                                      #
-                                      # TRANSIENT ERROR BEHAVIOR:
-                                      # - true  = High availability mode - fall back to main DB when prelookup is down
-                                      #           Trade-off: Accept all mail even if routing might be temporarily incorrect
-                                      #           Use case: When accepting mail is more important than perfect routing
-                                      #
-                                      # - false = Strict mode - reject requests when prelookup service is unavailable
-                                      #           Trade-off: Lower availability for higher routing consistency
-                                      #           Use case: When routing accuracy is critical (compliance, data sovereignty)
-                                      #
+fallback_to_db = true                 #
                                       # USER NOT FOUND BEHAVIOR (always falls through):
-                                      # - Prelookup returns 404 or empty server_address → falls back to main DB
+                                      # - RemoteLookup returns 404 or empty server_address → falls back to main DB
                                       # - This enables gradual migrations, geographic partitioning, and A/B testing
                                       # - Example: Move 20% of users to new system, rest stay in main DB
                                       #
                                       # EXAMPLES:
-                                      # Scenario 1: Prelookup service crashes (network error)
-                                      #   - fallback_to_default=true  → Proxy uses main DB, mail delivery continues
-                                      #   - fallback_to_default=false → Proxy rejects all mail until service recovers
+                                      # Scenario 1: RemoteLookup service crashes (network error)
+                                      #   - fallback_to_db=true  → Proxy uses main DB, mail delivery continues
+                                      #   - fallback_to_db=false → Proxy rejects all mail until service recovers
                                       #
-                                      # Scenario 2: User exists in main DB but not in prelookup (404)
-                                      #   - fallback_to_default=true  → Proxy uses main DB (partitioning works)
-                                      #   - fallback_to_default=false → Proxy STILL uses main DB (partitioning works)
+                                      # Scenario 2: User exists in main DB but not in remote_lookup (404)
+                                      #   - fallback_to_db=true  → Proxy uses main DB (partitioning works)
+                                      #   - fallback_to_db=false → Proxy STILL uses main DB (partitioning works)
                                       #                                 Setting only affects transient errors, not 404s
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
@@ -1201,14 +1186,14 @@ remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
 
 
-  # --- CIRCUIT BREAKER FOR PRELOOKUP ENDPOINT ---
-  # Protects the system from cascading failures when the HTTP prelookup endpoint becomes unavailable.
+  # --- CIRCUIT BREAKER FOR REMOTE_LOOKUP ENDPOINT ---
+  # Protects the system from cascading failures when the HTTP remote_lookup endpoint becomes unavailable.
   # When the endpoint starts failing (timeouts, 5xx errors, network issues), the circuit breaker
   # automatically "opens" to prevent further requests and allow the service to recover.
   #
   # CIRCUIT BREAKER STATES:
   # - CLOSED: Normal operation, all requests go through
-  # - OPEN: Endpoint is failing, all requests rejected immediately (respects fallback_to_default)
+  # - OPEN: Endpoint is failing, all requests rejected immediately (respects fallback_to_db)
   # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
   #
   # RECOVERY PROCESS:
@@ -1227,7 +1212,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - min_requests: 5-10 (avoids opening circuit on brief hiccups)
   # - failure_ratio: 0.6-0.8 (60-80% failure rate before opening)
   #
-  # [server.prelookup.circuit_breaker]
+  # [server.remotelookup.circuit_breaker]
   # max_requests = 3                # Maximum concurrent requests in half-open state (default: 3)
                                     # Higher values = more confidence that service recovered before closing circuit
                                     # Lower values = faster recovery but may close prematurely
@@ -1246,7 +1231,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # Production: Consider 5-10 for more stable thresholds
 
   # --- HTTP TRANSPORT CONFIGURATION ---
-  # Connection pooling and timeout settings for the HTTP client used to query the prelookup endpoint.
+  # Connection pooling and timeout settings for the HTTP client used to query the remote_lookup endpoint.
   # Proper connection pooling enables parallel authentication requests while reusing connections.
   # Separate timeouts for different connection phases prevent premature timeouts during initial setup.
   #
@@ -1274,16 +1259,16 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - High traffic → connections stay warm and reused immediately
   # - Slow network → generous dial/TLS timeouts prevent spurious failures
   #
-  # [server.prelookup.transport]
+  # [server.remotelookup.transport]
   # max_idle_conns = 100            # Maximum idle connections across all hosts (default: 100)
                                     # Total number of connections kept alive in the pool
                                     # Higher = more connections reused, less overhead
-  # max_idle_conns_per_host = 100   # Maximum idle connections per prelookup host (default: 100)
-                                    # For single prelookup endpoint, should match max_idle_conns
+  # max_idle_conns_per_host = 100   # Maximum idle connections per remote_lookup host (default: 100)
+                                    # For single remote_lookup endpoint, should match max_idle_conns
                                     # For multiple endpoints, distributes pool across hosts
   # max_conns_per_host = 0          # Maximum total connections per host, 0=unlimited (default: 0)
                                     # Set to 0 (unlimited) for best parallel performance
-                                    # Only limit if prelookup endpoint has connection restrictions
+                                    # Only limit if remote_lookup endpoint has connection restrictions
   # idle_conn_timeout = "90s"       # How long idle connections stay open (default: "90s")
                                     # Longer = better for sustained traffic, more memory
                                     # Shorter = less memory, more reconnects under load
@@ -1363,7 +1348,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
 # The "address" field in the HTTP response determines which user the proxy authenticates as on the backend.
 # All logic for token splitting, validation, alias resolution, etc. is handled by your HTTP endpoint.
 #
-# See test_prelookup_server.go for a working example implementation.
+# See test_remote_lookup_server.go for a working example implementation.
 
 
 # POP3 PROXY EXAMPLE

@@ -81,7 +81,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	// Parse address with potential suffix (master username or prelookup token)
+	// Parse address with potential suffix (master username or remotelookup token)
 	addressParsed, err := server.NewAddress(address)
 	if err != nil {
 		s.DebugLog("failed to parse address", "error", err)
@@ -164,7 +164,7 @@ func (s *IMAPSession) Login(address, password string) error {
 
 	// Regular authentication - use the already parsed address
 	// If it has a suffix but didn't match MasterUsername, fall through to regular auth
-	// (this allows the suffix to be used for prelookup in proxy scenarios)
+	// (this allows the suffix to be used for remotelookup in proxy scenarios)
 
 	s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
 

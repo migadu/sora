@@ -45,7 +45,7 @@ func TestIdleTimeoutDisconnects(t *testing.T) {
 		ConnectTimeout: 5 * time.Second,
 		AuthRateLimit:  server.AuthRateLimiterConfig{},
 		MaxConnections: 10,
-		PreLookup:      &config.PreLookupConfig{},
+		RemoteLookup:   &config.RemoteLookupConfig{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create IMAP proxy: %v", err)
@@ -148,7 +148,7 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 		ConnectTimeout:  5 * time.Second,
 		AuthRateLimit:   server.AuthRateLimiterConfig{},
 		MaxConnections:  10,
-		PreLookup:       &config.PreLookupConfig{},
+		RemoteLookup:    &config.RemoteLookupConfig{},
 	})
 	if err != nil {
 		t.Fatalf("Failed to create IMAP proxy: %v", err)

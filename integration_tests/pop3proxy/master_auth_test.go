@@ -367,7 +367,7 @@ func TestPOP3Proxy_MasterAuthenticationPriority(t *testing.T) {
 	})
 }
 
-// TestPOP3Proxy_TokenAuthentication tests token-based authentication through prelookup
+// TestPOP3Proxy_TokenAuthentication tests token-based authentication through remotelookup
 func TestPOP3Proxy_TokenAuthentication(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -380,7 +380,7 @@ func TestPOP3Proxy_TokenAuthentication(t *testing.T) {
 	proxy := setupPOP3ProxyWithMasterAuth(t, backendServer, proxyAddress, []string{backendServer.Address})
 	defer proxy.Stop()
 
-	t.Run("USER with @TOKEN suffix sends to prelookup", func(t *testing.T) {
+	t.Run("USER with @TOKEN suffix sends to remotelookup", func(t *testing.T) {
 		client, err := NewPOP3Client(proxyAddress)
 		if err != nil {
 			t.Fatalf("Failed to connect to POP3 proxy: %v", err)
@@ -388,19 +388,19 @@ func TestPOP3Proxy_TokenAuthentication(t *testing.T) {
 		defer client.Close()
 
 		// USER format: user@domain.com@TOKEN with USER_PASSWORD
-		// The @TOKEN should be sent to prelookup (not validated locally)
+		// The @TOKEN should be sent to remotelookup (not validated locally)
 		username := account.Email + "@sometoken123"
 		client.SendCommand("USER " + username)
 		client.ReadResponse()
 
 		client.SendCommand("PASS " + account.Password)
 		response, _ := client.ReadResponse()
-		// Without prelookup configured, this will fail - but that's expected
+		// Without remotelookup configured, this will fail - but that's expected
 		// The important part is that the code path handles @TOKEN differently than *MASTER
 		if strings.HasPrefix(response, "+OK") {
-			t.Log("✓ Login with @TOKEN succeeded (prelookup configured)")
+			t.Log("✓ Login with @TOKEN succeeded (remotelookup configured)")
 		} else {
-			t.Logf("Login with @TOKEN failed (expected without prelookup): %s", response)
+			t.Logf("Login with @TOKEN failed (expected without remotelookup): %s", response)
 		}
 	})
 
