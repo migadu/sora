@@ -178,6 +178,7 @@ func (s *Session) handleConnection() {
 		case "RCPT":
 			toParam, found := findParameter(args, "TO:")
 			if !found {
+				s.DebugLog("RCPT command missing TO parameter", "args", fmt.Sprintf("%v", args))
 				s.sendResponse("501 5.5.4 Syntax error in RCPT command (missing TO)")
 				continue
 			}
@@ -185,11 +186,14 @@ func (s *Session) handleConnection() {
 			// Extract the recipient address (first part before any parameters)
 			// toParam may contain the address and additional ESMTP parameters
 			// Example: "<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com"
+			s.DebugLog("Parsing RCPT TO", "toParam", toParam, "args", fmt.Sprintf("%v", args))
 			to := s.extractAddress(toParam)
 			if to == "" {
+				s.DebugLog("Failed to extract address", "toParam", toParam)
 				s.sendResponse("501 5.1.3 Bad recipient address syntax")
 				continue
 			}
+			s.DebugLog("Extracted recipient address", "to", to)
 
 			lookupStart := time.Now() // Start account lookup timing
 			if err := s.handleRecipient(to, lookupStart); err != nil {
@@ -367,6 +371,84 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
 	s.getLogger().WarnLog(msg, keyvals...)
+}
+
+// stripUnsupportedRCPTParameters removes ESMTP parameters from RCPT TO commands that
+// are not commonly supported by LMTP servers. This uses an allowlist approach - only
+// explicitly allowed parameters are kept, everything else is stripped.
+//
+// Allowed RCPT TO parameters for LMTP:
+//   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
+//
+// Stripped parameters (SMTP-only, not supported by typical LMTP servers):
+//   - NOTIFY, ORCPT, RET, ENVID: DSN extensions (RFC 3461)
+//   - Any other unknown ESMTP parameters
+//
+// Examples:
+//   - "RCPT TO:<user@example.com> NOTIFY=NEVER" -> "RCPT TO:<user@example.com>"
+//   - "RCPT TO:<user@example.com> NOTIFY=NEVER XRCPTFORWARD=fwd@example.com" -> "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com"
+//   - "RCPT TO:<user@example.com> UNKNOWN=value" -> "RCPT TO:<user@example.com>"
+func stripUnsupportedRCPTParameters(command string) string {
+	// Only process RCPT TO commands
+	if !strings.HasPrefix(strings.ToUpper(command), "RCPT TO") {
+		return command
+	}
+
+	// Find the recipient address (between < and >)
+	startIdx := strings.Index(command, "<")
+	if startIdx == -1 {
+		return command // No angle bracket, return as-is
+	}
+
+	endIdx := strings.Index(command[startIdx:], ">")
+	if endIdx == -1 {
+		return command // No closing bracket, return as-is
+	}
+	endIdx += startIdx // Adjust to absolute position
+
+	// Extract the RCPT TO prefix and the address
+	// Everything before and including the closing > bracket
+	cleanCommand := command[:endIdx+1]
+
+	// Check if there are any parameters after the address
+	remainder := strings.TrimSpace(command[endIdx+1:])
+	if remainder == "" {
+		return cleanCommand // No parameters, already clean
+	}
+
+	// Allowlist of RCPT TO parameters supported by LMTP servers
+	// Using a map for O(1) lookup
+	allowedParams := map[string]bool{
+		"XRCPTFORWARD": true, // Dovecot-specific: original recipient for forwarding
+		// Add more LMTP-supported parameters here if needed
+	}
+
+	// Parse parameters and keep only allowed ones
+	params := strings.Fields(remainder)
+	var keptParams []string
+
+	for _, param := range params {
+		// Extract parameter name (before '=')
+		parts := strings.SplitN(param, "=", 2)
+		if len(parts) == 0 {
+			continue // Malformed parameter
+		}
+
+		paramName := strings.ToUpper(parts[0])
+
+		// Keep only if in allowlist
+		if allowedParams[paramName] {
+			keptParams = append(keptParams, param)
+		}
+		// Silently drop everything else (DSN parameters, unknown parameters, etc.)
+	}
+
+	// Reconstruct command with kept parameters
+	if len(keptParams) > 0 {
+		return cleanCommand + " " + strings.Join(keptParams, " ")
+	}
+
+	return cleanCommand
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -868,8 +950,16 @@ func (s *Session) startProxy(initialCommand string) {
 
 	s.DebugLog("startProxy() called")
 
+	// Strip unsupported ESMTP parameters from RCPT TO before forwarding to backend
+	// Most ESMTP extensions (especially DSN) are SMTP-specific and not supported by LMTP
+	cleanedCommand := stripUnsupportedRCPTParameters(initialCommand)
+	if cleanedCommand != initialCommand {
+		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", initialCommand, "cleaned", cleanedCommand)
+	}
+
 	// First, send the RCPT TO command that triggered proxying
-	_, err := s.backendWriter.WriteString(initialCommand + "\r\n")
+	s.DebugLog("Sending RCPT TO to backend", "command", cleanedCommand)
+	_, err := s.backendWriter.WriteString(cleanedCommand + "\r\n")
 	if err != nil {
 		s.DebugLog("Failed to send initial RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
@@ -884,6 +974,7 @@ func (s *Session) startProxy(initialCommand string) {
 		s.sendResponse("451 4.4.2 Backend error")
 		return
 	}
+	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
 	s.clientWriter.WriteString(response)
 	s.clientWriter.Flush()
 
