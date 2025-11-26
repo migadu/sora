@@ -181,6 +181,10 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in RCPT command (missing TO)")
 				continue
 			}
+
+			// Extract the recipient address (first part before any parameters)
+			// toParam may contain the address and additional ESMTP parameters
+			// Example: "<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com"
 			to := s.extractAddress(toParam)
 			if to == "" {
 				s.sendResponse("501 5.1.3 Bad recipient address syntax")
@@ -366,6 +370,9 @@ func (s *Session) WarnLog(msg string, keyvals ...any) {
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
+// This handles ESMTP parameters that may follow the address, such as:
+//   - MAIL FROM:<user@example.com> SIZE=1234
+//   - RCPT TO:<user@example.com> NOTIFY=NEVER ORCPT=rfc822;user@example.com
 func (s *Session) extractAddress(param string) string {
 	// The parameter value might be quoted, so unquote it first.
 	param = server.UnquoteString(strings.TrimSpace(param))
@@ -374,17 +381,20 @@ func (s *Session) extractAddress(param string) string {
 		return ""
 	}
 
-	// Handle <address> format, which is the most common.
-	if param[0] == '<' && param[len(param)-1] == '>' {
-		return param[1 : len(param)-1]
+	// Handle <address> format with or without additional ESMTP parameters
+	// Extract everything between < and > (the address), ignoring anything after >
+	if param[0] == '<' {
+		endIdx := strings.Index(param, ">")
+		if endIdx > 0 {
+			// Found closing bracket - extract address between < and >
+			return param[1:endIdx]
+		}
+		// No closing bracket found - invalid format
+		return ""
 	}
 
-	// Handle <address> with additional parameters
-	if idx := strings.Index(param, ">"); idx > 0 && param[0] == '<' {
-		return param[1:idx]
-	}
-
-	// Some clients might not use angle brackets
+	// Some clients might not use angle brackets (non-standard but handle it)
+	// In this case, stop at the first space (which would separate address from parameters)
 	if idx := strings.Index(param, " "); idx > 0 {
 		return param[:idx]
 	}
