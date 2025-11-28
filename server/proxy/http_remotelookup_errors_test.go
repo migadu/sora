@@ -34,9 +34,9 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error": "bad request"}`, http.StatusBadRequest)
 			},
-			expectAuthResult: AuthTemporarilyUnavailable,
-			expectErrorType:  ErrRemoteLookupTransient,
-			description:      "4xx errors (except 401/403/404) should be treated as temporarily unavailable",
+			expectAuthResult: AuthFailed,
+			expectErrorType:  nil,
+			description:      "4xx errors (except 401/403/404) should be treated as auth failed (client error, not service failure)",
 		},
 		{
 			name: "500_ServerError",

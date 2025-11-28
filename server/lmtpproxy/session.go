@@ -571,15 +571,11 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				return server.ErrServerShuttingDown
 			}
 
-			// Only check fallback setting for transient errors (network, 5xx, circuit breaker)
-			// User not found (404) always falls through to support partitioning scenarios
-			if s.server.remotelookupConfig != nil && !s.server.remotelookupConfig.FallbackToDB {
-				s.InfoLog("remotelookup transient error and fallback_to_db=false - rejecting recipient", "username", s.username)
-				metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
-				return fmt.Errorf("remotelookup failed and fallback disabled: %w", lookupErr)
-			}
-			s.InfoLog("remotelookup transient error - fallback_to_db=true, falling back to main DB", "username", s.username)
-			metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_fallback").Inc()
+			// Transient errors (network, 5xx, circuit breaker) - NEVER fallback to DB
+			// These are service availability issues, not "user not found" cases
+			s.InfoLog("remotelookup transient error - service unavailable, rejecting recipient", "username", s.username)
+			metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
+			return fmt.Errorf("remotelookup service unavailable: %w", lookupErr)
 		} else if routingInfo != nil {
 			// RemoteLookup succeeded - may or may not have ServerAddress
 			// If no ServerAddress, backend selection will use consistent hash/round-robin
@@ -623,9 +619,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		} else {
-			// User not found in remotelookup (404 or empty response).
-			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
-				s.InfoLog("user not found in remotelookup, fallback enabled - attempting main DB", "username", s.username)
+			// User not found in remotelookup (404/3xx or empty response).
+			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
+				s.InfoLog("user not found in remotelookup, local lookup enabled - attempting main DB", "username", s.username)
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 				// Fallthrough to main DB
 			} else {

@@ -604,18 +604,13 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					return server.ErrServerShuttingDown
 				}
 
-				// Transient error (network, 5xx, circuit breaker) - check fallback config
-				if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
-					s.WarnLog("remotelookup transient error, fallback enabled - attempting main DB: %v", err)
-					metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_fallback").Inc()
-					// Fallthrough to main DB auth
-				} else {
-					s.WarnLog("remotelookup transient error, fallback disabled - rejecting authentication: %v", err)
-					metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
-					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
-					return fmt.Errorf("remotelookup service unavailable")
-				}
+				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
+				// These are service availability issues, not "user not found" cases
+				s.WarnLog("remotelookup transient error - service unavailable: %v", err)
+				metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()
+				return fmt.Errorf("remotelookup service unavailable")
 			} else {
 				// Unknown error type - fallthrough to main DB auth
 			}
@@ -730,13 +725,13 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
-				// User not found in remotelookup (404)
-				if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.FallbackToDB {
-					s.InfoLog("user not found in remotelookup, fallback enabled - attempting main DB")
+				// User not found in remotelookup (404/3xx)
+				if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
+					s.InfoLog("user not found in remotelookup, local lookup enabled - attempting main DB")
 					metrics.RemoteLookupResult.WithLabelValues("pop3", "user_not_found_fallback").Inc()
 					// Fallthrough to main DB auth
 				} else {
-					s.InfoLog("user not found in remotelookup, fallback disabled - rejecting")
+					s.InfoLog("user not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("pop3", "user_not_found_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 					metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()

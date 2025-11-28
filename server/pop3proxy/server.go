@@ -186,11 +186,11 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup)
 		if err != nil {
 			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
-			if !options.RemoteLookup.FallbackToDB {
+			if !options.RemoteLookup.ShouldLookupLocalUsers() {
 				serverCancel()
 				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 			}
-			logger.Debug("POP3 Proxy: Continuing without remotelookup due to fallback_to_db=true", "proxy", options.Name)
+			logger.Debug("POP3 Proxy: Continuing without remotelookup due to lookup_local_users=true", "proxy", options.Name)
 		} else {
 			routingLookup = remotelookupClient
 			if options.Debug {

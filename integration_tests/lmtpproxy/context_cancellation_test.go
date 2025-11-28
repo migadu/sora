@@ -64,10 +64,10 @@ func TestLMTPProxyRemoteLookupContextCancellation(t *testing.T) {
 		ConnectTimeout:         5 * time.Second,
 		AuthIdleTimeout:        30 * time.Second,
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled:      true,
-			URL:          remotelookupServer.URL + "/$email",
-			Timeout:      "30s", // Long timeout - we'll cancel before this
-			FallbackToDB: false, // Disable fallback to ensure remotelookup path is tested
+			Enabled:          true,
+			URL:              remotelookupServer.URL + "/$email",
+			Timeout:          "30s", // Long timeout - we'll cancel before this
+			LookupLocalUsers: false, // Disable fallback to ensure remotelookup path is tested
 		},
 	}
 

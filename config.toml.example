@@ -1131,9 +1131,9 @@ timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 =
 # - HTTP GET request is made for each authentication attempt
 # - Circuit breaker protects against service failures (60% failure rate triggers open state)
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
-# - If HTTP endpoint returns 404 → always falls back to default routing (partitioning support)
+# - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
-# - If HTTP endpoint returns other 4xx/5xx → respects fallback_to_db setting
+# - If HTTP endpoint returns other 4xx/5xx → service unavailable, ALWAYS reject (no fallback)
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
 # - Timeout for HTTP requests is configurable (default: 5s)
@@ -1161,21 +1161,26 @@ timeout = "10s"                             # HTTP response timeout (default: 10
                                             # If set, sends "Authorization: Bearer <token>" header with requests
                                             # Use this to secure your remote_lookup endpoint
 
-fallback_to_db = true                 #
-                                      # USER NOT FOUND BEHAVIOR (always falls through):
-                                      # - RemoteLookup returns 404 or empty server_address → falls back to main DB
-                                      # - This enables gradual migrations, geographic partitioning, and A/B testing
-                                      # - Example: Move 20% of users to new system, rest stay in main DB
+lookup_local_users = true             # Check local DB when remote returns 404/3xx (user not found)
+                                      # This enables user partitioning: some users in remote system, others in local DB
+                                      #
+                                      # USER NOT FOUND BEHAVIOR (404/3xx responses):
+                                      #   - lookup_local_users=true  → Check local DB (enables split user scenarios)
+                                      #   - lookup_local_users=false → Reject authentication (remote-only mode)
+                                      #
+                                      # SERVICE UNAVAILABLE (network errors, 5xx, circuit breaker):
+                                      #   - Always reject, regardless of this setting
+                                      #   - This is NOT a failover mechanism
                                       #
                                       # EXAMPLES:
-                                      # Scenario 1: RemoteLookup service crashes (network error)
-                                      #   - fallback_to_db=true  → Proxy uses main DB, mail delivery continues
-                                      #   - fallback_to_db=false → Proxy rejects all mail until service recovers
+                                      # Scenario 1: User exists in local DB but not in remote (404)
+                                      #   - lookup_local_users=true  → Authenticates via local DB ✓
+                                      #   - lookup_local_users=false → Authentication rejected ✗
                                       #
-                                      # Scenario 2: User exists in main DB but not in remote_lookup (404)
-                                      #   - fallback_to_db=true  → Proxy uses main DB (partitioning works)
-                                      #   - fallback_to_db=false → Proxy STILL uses main DB (partitioning works)
-                                      #                                 Setting only affects transient errors, not 404s
+                                      # Scenario 2: Remote service is down (network error/5xx)
+                                      #   - lookup_local_users=true  → Authentication rejected ✗
+                                      #   - lookup_local_users=false → Authentication rejected ✗
+                                      #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
                                       # NOTE: Only supported for LMTP and ManageSieve proxies.
@@ -1193,7 +1198,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   #
   # CIRCUIT BREAKER STATES:
   # - CLOSED: Normal operation, all requests go through
-  # - OPEN: Endpoint is failing, all requests rejected immediately (respects fallback_to_db)
+  # - OPEN: Endpoint is failing, all requests rejected immediately (treated as service unavailable)
   # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
   #
   # RECOVERY PROCESS:

@@ -115,9 +115,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
 		if err != nil {
 			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if !opts.RemoteLookup.FallbackToDB {
+			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
 				cancel()
-				return nil, fmt.Errorf("remotelookup initialization failed and fallback disabled: %w", err)
+				return nil, fmt.Errorf("remotelookup initialization failed and local lookup disabled: %w", err)
 			}
 			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
 		} else {

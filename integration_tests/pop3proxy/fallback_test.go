@@ -21,8 +21,9 @@ import (
 	"github.com/migadu/sora/server/pop3proxy"
 )
 
-// TestPOP3ProxyFallbackToDefaultEnabled tests that when fallback_to_db=true,
-// proxy falls back to regular backend routing when remotelookup fails
+// TestPOP3ProxyFallbackToDefaultEnabled tests that when lookup_local_users=true,
+// proxy still rejects auth when remotelookup has service failures (5xx errors)
+// This is NOT a failover mechanism - transient errors always reject
 func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -47,7 +48,7 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	}))
 	defer remotelookupServer.Close()
 
-	// Set up POP3 proxy with remotelookup enabled and fallback_to_db=true
+	// Set up POP3 proxy with remotelookup enabled and lookup_local_users=true
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
@@ -72,7 +73,7 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	}
 	t.Logf("Received greeting: %s", greeting)
 
-	// Test login through proxy - should succeed with fallback
+	// Test login through proxy - should FAIL with 5xx error
 	fmt.Fprintf(writer, "USER %s\r\n", account.Email)
 	writer.Flush()
 
@@ -91,27 +92,15 @@ func TestPOP3ProxyFallbackToDefaultEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read PASS response: %v", err)
 	}
-	if !strings.HasPrefix(string(response), "+OK") {
-		t.Fatalf("Login failed through proxy with fallback enabled: %s", response)
+	if strings.HasPrefix(string(response), "+OK") {
+		t.Fatalf("Expected login to fail with 5xx error (service unavailable), but it succeeded: %s", response)
 	}
-	t.Log("✓ Login succeeded with fallback_to_db=true (remotelookup failed)")
-
-	// Verify we can perform POP3 operations
-	fmt.Fprintf(writer, "STAT\r\n")
-	writer.Flush()
-
-	response, _, err = reader.ReadLine()
-	if err != nil {
-		t.Fatalf("Failed to read STAT response: %v", err)
-	}
-	if !strings.HasPrefix(string(response), "+OK") {
-		t.Fatalf("STAT command failed: %s", response)
-	}
-	t.Log("✓ POP3 operations work after fallback")
+	t.Logf("✓ Login correctly failed with 5xx error (service unavailable): %s", response)
 }
 
-// TestPOP3ProxyFallbackToDefaultDisabled tests that when fallback_to_db=false,
-// proxy rejects authentication when remotelookup fails
+// TestPOP3ProxyFallbackToDefaultDisabled tests that when lookup_local_users=false,
+// proxy still rejects auth when remotelookup has service failures (5xx errors)
+// The setting has no effect on transient errors - they always reject
 func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -136,7 +125,7 @@ func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 	}))
 	defer remotelookupServer.Close()
 
-	// Set up POP3 proxy with remotelookup enabled and fallback_to_db=false
+	// Set up POP3 proxy with remotelookup enabled and lookup_local_users=false
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 	defer proxy.Close()
@@ -180,12 +169,12 @@ func TestPOP3ProxyFallbackToDefaultDisabled(t *testing.T) {
 		t.Fatalf("Failed to read PASS response: %v", err)
 	}
 	if !strings.HasPrefix(string(response), "-ERR") {
-		t.Fatalf("Expected login to fail with fallback_to_db=false, but got: %s", response)
+		t.Fatalf("Expected login to fail with lookup_local_users=false, but got: %s", response)
 	}
-	t.Logf("✓ Login correctly failed with fallback_to_db=false: %s", response)
+	t.Logf("✓ Login correctly failed with lookup_local_users=false: %s", response)
 }
 
-// TestPOP3ProxyFallbackUserNotFound tests user-not-found (404) behavior based on fallback_to_db setting
+// TestPOP3ProxyFallbackUserNotFound tests user-not-found (404) behavior based on lookup_local_users setting
 func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -211,7 +200,7 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 	defer remotelookupServer.Close()
 
 	t.Run("FallbackEnabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_db=true
+		// Set up proxy with lookup_local_users=true
 		proxyAddress := common.GetRandomAddress(t)
 		proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 		defer proxy.Close()
@@ -240,11 +229,11 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 		if !strings.HasPrefix(string(response), "+OK") {
 			t.Fatalf("Login failed when user not found with fallback enabled: %s", response)
 		}
-		t.Log("✓ Login succeeded when user not found with fallback_to_db=true")
+		t.Log("✓ Login succeeded when user not found with lookup_local_users=true")
 	})
 
 	t.Run("FallbackDisabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_db=false
+		// Set up proxy with lookup_local_users=false
 		proxyAddress := common.GetRandomAddress(t)
 		proxy := setupPOP3ProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 		defer proxy.Close()
@@ -271,9 +260,9 @@ func TestPOP3ProxyFallbackUserNotFound(t *testing.T) {
 		response, _, _ := reader.ReadLine()
 
 		if strings.HasPrefix(string(response), "+OK") {
-			t.Fatal("Expected login to fail with fallback_to_db=false when user not found, but it succeeded")
+			t.Fatal("Expected login to fail with lookup_local_users=false when user not found, but it succeeded")
 		}
-		t.Logf("✓ Login correctly failed when user not found with fallback_to_db=false: %s", response)
+		t.Logf("✓ Login correctly failed when user not found with lookup_local_users=false: %s", response)
 	})
 }
 
@@ -307,10 +296,10 @@ func setupPOP3ProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, 
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled:      true,
-			URL:          remotelookupURL,
-			Timeout:      "5s",
-			FallbackToDB: fallbackToDefault,
+			Enabled:          true,
+			URL:              remotelookupURL,
+			Timeout:          "5s",
+			LookupLocalUsers: fallbackToDefault,
 		},
 	}
 

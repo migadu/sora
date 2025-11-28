@@ -1206,13 +1206,13 @@ func handleMockLMTPBackendFailDuringDATA(conn net.Conn) {
 	}
 }
 
-// TestLMTPProxyRemoteLookupFallbackToDefault tests the fallback_to_db setting
+// TestLMTPProxyRemoteLookupFallbackToDefault tests the lookup_local_users setting
 // when remotelookup fails or returns empty results
 func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	// Test cases for different fallback scenarios
-	// Note: fallback_to_db controls ALL fallback behavior including user not found (404)
+	// Note: lookup_local_users controls ALL fallback behavior including user not found (404)
 	testCases := []struct {
 		name                   string
 		fallbackToDefault      bool
@@ -1222,12 +1222,12 @@ func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 		expectLog              string // Expected log message
 	}{
 		{
-			name:                   "fallback_enabled_transient_error_accepts_recipient",
+			name:                   "fallback_enabled_transient_error_rejects_recipient",
 			fallbackToDefault:      true,
 			remotelookupStatusCode: 500,
 			remotelookupBody:       `{"error": "internal server error"}`,
-			expectAccept:           true,
-			expectLog:              "remotelookup transient error - fallback_to_db=true, falling back to main DB",
+			expectAccept:           false,
+			expectLog:              "remotelookup transient error - service unavailable, rejecting recipient",
 		},
 		{
 			name:                   "fallback_disabled_transient_error_rejects_recipient",
@@ -1235,7 +1235,7 @@ func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 			remotelookupStatusCode: 500,
 			remotelookupBody:       `{"error": "internal server error"}`,
 			expectAccept:           false,
-			expectLog:              "remotelookup transient error and fallback_to_db=false - rejecting recipient",
+			expectLog:              "remotelookup transient error - service unavailable, rejecting recipient",
 		},
 		{
 			name:                   "user_not_found_fallback_enabled",
@@ -1243,7 +1243,7 @@ func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 			remotelookupStatusCode: 404,
 			remotelookupBody:       `{"error": "user not found"}`,
 			expectAccept:           true,
-			expectLog:              "user not found in remotelookup, fallback enabled - attempting main DB",
+			expectLog:              "user not found in remotelookup, local lookup enabled - attempting main DB",
 		},
 		{
 			name:                   "user_not_found_fallback_disabled",
@@ -1365,10 +1365,10 @@ func setupLMTPProxyWithRemoteLookup(t *testing.T, backendAddress string, remotel
 			ConnectTimeout:         5 * time.Second,
 			AuthIdleTimeout:        30 * time.Second,
 			RemoteLookup: &config.RemoteLookupConfig{
-				Enabled:      true,
-				URL:          remotelookupURL,
-				Timeout:      "5s",
-				FallbackToDB: fallbackToDefault,
+				Enabled:          true,
+				URL:              remotelookupURL,
+				Timeout:          "5s",
+				LookupLocalUsers: fallbackToDefault,
 			},
 		},
 	)

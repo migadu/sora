@@ -186,7 +186,7 @@ func setupIMAPProxyWithRemoteLookup(t *testing.T, rdb *resilient.ResilientDataba
 			Enabled:                true,
 			URL:                    remotelookupURL + "/$email",
 			Timeout:                "10s",
-			FallbackToDB:           false,
+			LookupLocalUsers:       false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{

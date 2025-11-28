@@ -20,8 +20,9 @@ import (
 	"github.com/migadu/sora/server/managesieveproxy"
 )
 
-// TestManageSieveProxyFallbackToDefaultEnabled tests that when fallback_to_db=true,
-// proxy falls back to regular backend routing when remotelookup fails
+// TestManageSieveProxyFallbackToDefaultEnabled tests that when lookup_local_users=true,
+// proxy still rejects auth when remotelookup has service failures (5xx errors)
+// This is NOT a failover mechanism - transient errors always reject
 func TestManageSieveProxyFallbackToDefaultEnabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -29,19 +30,19 @@ func TestManageSieveProxyFallbackToDefaultEnabled(t *testing.T) {
 	backendServer, account := common.SetupManageSieveServerWithMaster(t)
 	defer backendServer.Close()
 
-	// Create a remotelookup server that always returns 500 (simulating failure)
+	// Create a remotelookup server that always returns 500 (simulating service failure)
 	remotelookupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
 	}))
 	defer remotelookupServer.Close()
 
-	// Set up ManageSieve proxy with remotelookup enabled and fallback_to_db=true
+	// Set up ManageSieve proxy with remotelookup enabled and lookup_local_users=true
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupManageSieveProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 	defer proxy.Close()
 
-	// Test that authentication works (falls back to default routing)
+	// Test that authentication FAILS (service unavailable, no fallback for 5xx)
 	client, err := NewManageSieveClient(proxyAddress)
 	if err != nil {
 		t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
@@ -62,30 +63,15 @@ func TestManageSieveProxyFallbackToDefaultEnabled(t *testing.T) {
 		t.Fatalf("Failed to read AUTHENTICATE response: %v", err)
 	}
 
-	if !strings.HasPrefix(response, "OK") {
-		t.Fatalf("Authentication failed through proxy with fallback enabled: %s", response)
+	if strings.HasPrefix(response, "OK") {
+		t.Fatalf("Expected authentication to fail with 5xx error (service unavailable), but it succeeded: %s", response)
 	}
-	t.Log("✓ Authentication succeeded with fallback_to_db=true (remotelookup failed)")
-
-	// Verify we can perform ManageSieve operations
-	err = client.SendCommand("LISTSCRIPTS")
-	if err != nil {
-		t.Fatalf("Failed to send LISTSCRIPTS command: %v", err)
-	}
-
-	response, err = client.ReadResponse()
-	if err != nil {
-		t.Fatalf("Failed to read LISTSCRIPTS response: %v", err)
-	}
-
-	if !strings.HasPrefix(response, "OK") {
-		t.Fatalf("LISTSCRIPTS command failed: %s", response)
-	}
-	t.Log("✓ ManageSieve operations work after fallback")
+	t.Logf("✓ Authentication correctly failed with 5xx error (service unavailable): %s", response)
 }
 
-// TestManageSieveProxyFallbackToDefaultDisabled tests that when fallback_to_db=false,
-// proxy rejects authentication when remotelookup fails
+// TestManageSieveProxyFallbackToDefaultDisabled tests that when lookup_local_users=false,
+// proxy still rejects auth when remotelookup has service failures (5xx errors)
+// The setting has no effect on transient errors - they always reject
 func TestManageSieveProxyFallbackToDefaultDisabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -100,7 +86,7 @@ func TestManageSieveProxyFallbackToDefaultDisabled(t *testing.T) {
 	}))
 	defer remotelookupServer.Close()
 
-	// Set up ManageSieve proxy with remotelookup enabled and fallback_to_db=false
+	// Set up ManageSieve proxy with remotelookup enabled and lookup_local_users=false
 	proxyAddress := common.GetRandomAddress(t)
 	proxy := setupManageSieveProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 	defer proxy.Close()
@@ -127,12 +113,12 @@ func TestManageSieveProxyFallbackToDefaultDisabled(t *testing.T) {
 	}
 
 	if !strings.HasPrefix(response, "NO") && !strings.HasPrefix(response, "BYE") {
-		t.Fatalf("Expected authentication to fail with fallback_to_db=false, but got: %s", response)
+		t.Fatalf("Expected authentication to fail with lookup_local_users=false, but got: %s", response)
 	}
-	t.Logf("✓ Authentication correctly failed with fallback_to_db=false: %s", response)
+	t.Logf("✓ Authentication correctly failed with lookup_local_users=false: %s", response)
 }
 
-// TestManageSieveProxyFallbackUserNotFound tests user-not-found (404) behavior based on fallback_to_db setting
+// TestManageSieveProxyFallbackUserNotFound tests user-not-found (404) behavior based on lookup_local_users setting
 func TestManageSieveProxyFallbackUserNotFound(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -148,7 +134,7 @@ func TestManageSieveProxyFallbackUserNotFound(t *testing.T) {
 	defer remotelookupServer.Close()
 
 	t.Run("FallbackEnabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_db=true
+		// Set up proxy with lookup_local_users=true
 		proxyAddress := common.GetRandomAddress(t)
 		proxy := setupManageSieveProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, true)
 		defer proxy.Close()
@@ -176,11 +162,11 @@ func TestManageSieveProxyFallbackUserNotFound(t *testing.T) {
 		if !strings.HasPrefix(response, "OK") {
 			t.Fatalf("Authentication failed when user not found with fallback enabled: %s", response)
 		}
-		t.Log("✓ Authentication succeeded when user not found with fallback_to_db=true")
+		t.Log("✓ Authentication succeeded when user not found with lookup_local_users=true")
 	})
 
 	t.Run("FallbackDisabled", func(t *testing.T) {
-		// Set up proxy with fallback_to_db=false
+		// Set up proxy with lookup_local_users=false
 		proxyAddress := common.GetRandomAddress(t)
 		proxy := setupManageSieveProxyWithFallback(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address}, remotelookupServer.URL, false)
 		defer proxy.Close()
@@ -206,9 +192,9 @@ func TestManageSieveProxyFallbackUserNotFound(t *testing.T) {
 		}
 
 		if strings.HasPrefix(response, "OK") {
-			t.Fatal("Expected authentication to fail with fallback_to_db=false when user not found, but it succeeded")
+			t.Fatal("Expected authentication to fail with lookup_local_users=false when user not found, but it succeeded")
 		}
-		t.Logf("✓ Authentication correctly failed when user not found with fallback_to_db=false: %s", response)
+		t.Logf("✓ Authentication correctly failed when user not found with lookup_local_users=false: %s", response)
 	})
 }
 
@@ -242,10 +228,10 @@ func setupManageSieveProxyWithFallback(t *testing.T, rdb *resilient.ResilientDat
 		},
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled:      true,
-			URL:          remotelookupURL,
-			Timeout:      "5s",
-			FallbackToDB: fallbackToDefault,
+			Enabled:          true,
+			URL:              remotelookupURL,
+			Timeout:          "5s",
+			LookupLocalUsers: fallbackToDefault,
 		},
 	}
 

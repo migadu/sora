@@ -169,10 +169,10 @@ func setupLMTPProxyWithRemoteLookupForActualEmailTest(t *testing.T, rdb *resilie
 		ConnectTimeout: 10 * time.Second,
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled:      true,
-			URL:          remotelookupURL + "/$email",
-			Timeout:      "5s",
-			FallbackToDB: false,
+			Enabled:          true,
+			URL:              remotelookupURL + "/$email",
+			Timeout:          "5s",
+			LookupLocalUsers: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,

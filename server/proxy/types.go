@@ -3,20 +3,21 @@ package proxy
 import (
 	"context"
 	"errors"
-	"github.com/migadu/sora/logger"
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/migadu/sora/logger"
 )
 
 // AuthResult represents the result of authentication
 type AuthResult int
 
 const (
-	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by fallback_to_db
+	AuthUserNotFound           AuthResult = iota // User doesn't exist in remotelookup - fallback controlled by lookup_local_users
 	AuthSuccess                                  // User found and authenticated - proceed with routing
 	AuthFailed                                   // User found but auth failed - reject, no fallback
-	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - fallback controlled by fallback_to_db
+	AuthTemporarilyUnavailable                   // Auth service temporarily unavailable - fallback controlled by lookup_local_users
 )
 
 // String returns a human-readable representation of AuthResult
@@ -38,7 +39,7 @@ func (a AuthResult) String() string {
 // RemoteLookup error types for distinguishing failure modes
 var (
 	// ErrRemoteLookupTransient represents a transient error (network issue, 5xx, circuit breaker open)
-	// Fallback behavior is controlled by fallback_to_db config
+	// Fallback behavior is controlled by lookup_local_users config
 	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
 	// ErrRemoteLookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)

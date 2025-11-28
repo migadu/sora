@@ -310,6 +310,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
+	// Store message locally for background upload to S3
 	filePath, err := s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
 	if err != nil {
 		return s.InternalError("failed to save message to disk: %v", err)
@@ -521,7 +522,10 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
 		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 	if err != nil {
-		_ = os.Remove(*filePath) // cleanup file on failure
+		// Cleanup local file on failure (only if it was stored locally)
+		if filePath != nil {
+			_ = os.Remove(*filePath)
+		}
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
 
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -782,6 +786,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	// Pin this session to the master DB to ensure read-your-writes consistency
 	s.useMasterDB = true
 
+	// Notify uploader that a new upload is queued
 	s.backend.uploader.NotifyUploadQueued()
 	s.InfoLog("message saved", "uid", messageUID, "mailbox", mailbox.Name)
 	return nil

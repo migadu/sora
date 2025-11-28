@@ -14,6 +14,7 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/lmtpproxy"
+	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
@@ -32,9 +33,31 @@ func TestLMTPProxyESMTPParameters(t *testing.T) {
 	// Initialize S3 storage (empty struct for testing)
 	s3 := &storage.S3Storage{}
 
+	// Create upload worker for backend server
+	tempDir := t.TempDir()
+	uploadWorker, err := uploader.New(
+		ctx,
+		tempDir,
+		10,            // batch size
+		2,             // concurrency
+		3,             // max attempts
+		5*time.Second, // retry interval
+		"test-backend",
+		rdb,
+		s3,
+		nil, // cache
+		make(chan error, 1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+	t.Cleanup(func() {
+		uploadWorker.Stop()
+	})
+
 	// Start backend LMTP server
 	backendAddr := "127.0.0.1:12425"
-	backendServer, err := lmtp.New(ctx, "test-backend", "localhost", backendAddr, s3, rdb, nil, lmtp.LMTPServerOptions{
+	backendServer, err := lmtp.New(ctx, "test-backend", "localhost", backendAddr, s3, rdb, uploadWorker, lmtp.LMTPServerOptions{
 		Debug: true,
 	})
 	if err != nil {
@@ -257,9 +280,31 @@ func TestLMTPProxyFullDeliveryWithESMTP(t *testing.T) {
 	// Initialize S3 storage (empty struct for testing)
 	s3 := &storage.S3Storage{}
 
+	// Create upload worker for backend server
+	tempDir := t.TempDir()
+	uploadWorker, err := uploader.New(
+		ctx,
+		tempDir,
+		10,            // batch size
+		2,             // concurrency
+		3,             // max attempts
+		5*time.Second, // retry interval
+		"test-backend",
+		rdb,
+		s3,
+		nil, // cache
+		make(chan error, 1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+	t.Cleanup(func() {
+		uploadWorker.Stop()
+	})
+
 	// Start backend LMTP server
 	backendAddr := "127.0.0.1:12427"
-	backendServer, err := lmtp.New(ctx, "test-backend", "localhost", backendAddr, s3, rdb, nil, lmtp.LMTPServerOptions{
+	backendServer, err := lmtp.New(ctx, "test-backend", "localhost", backendAddr, s3, rdb, uploadWorker, lmtp.LMTPServerOptions{
 		Debug: true,
 	})
 	if err != nil {

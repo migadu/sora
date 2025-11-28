@@ -300,10 +300,10 @@ func setupLMTPProxyWithRemoteLookupAndCache(t *testing.T, rdb *resilient.Resilie
 		ConnectTimeout: 10 * time.Second,
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled:      true,
-			URL:          remotelookupURL,
-			Timeout:      "5s",
-			FallbackToDB: false,
+			Enabled:          true,
+			URL:              remotelookupURL,
+			Timeout:          "5s",
+			LookupLocalUsers: false,
 		},
 		LookupCache: &config.LookupCacheConfig{
 			Enabled:         true,

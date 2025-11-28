@@ -196,11 +196,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup)
 		if err != nil {
 			logger.Error("Failed to initialize remotelookup client", "proxy", opts.Name, "error", err)
-			if !opts.RemoteLookup.FallbackToDB {
+			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 			}
-			logger.Warn("Continuing without remotelookup due to fallback_to_db=true", "proxy", opts.Name)
+			logger.Warn("Continuing without remotelookup due to lookup_local_users=true", "proxy", opts.Name)
 		} else {
 			routingLookup = remotelookupClient
 			if opts.Debug {

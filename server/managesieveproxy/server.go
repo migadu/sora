@@ -173,11 +173,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup)
 	if err != nil {
 		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-		if opts.RemoteLookup != nil && !opts.RemoteLookup.FallbackToDB {
+		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
 			cancel()
 			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - fallback enabled", "name", opts.Name)
+		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
 	}
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)

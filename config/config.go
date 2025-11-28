@@ -513,7 +513,7 @@ type RemoteLookupConfig struct {
 	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	FallbackToDB           bool  `toml:"fallback_to_db"`            // Fallback to database auth if remotelookup fails or user not found
+	LookupLocalUsers       bool  `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
 	RemoteTLS              bool  `toml:"remote_tls"`                // Use TLS for backend connections
 	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`         // Verify backend TLS certificate
@@ -556,6 +556,15 @@ func (c *RemoteLookupConfig) GetTimeout() (time.Duration, error) {
 		return 5 * time.Second, nil
 	}
 	return helpers.ParseDuration(c.Timeout)
+}
+
+// ShouldLookupLocalUsers returns whether to check local DB when remote returns 404/3xx
+func (c *RemoteLookupConfig) ShouldLookupLocalUsers() bool {
+	// If new setting is explicitly set, use it
+	if c.LookupLocalUsers {
+		return true
+	}
+	return false
 }
 
 // Circuit breaker configuration helpers

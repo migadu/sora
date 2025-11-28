@@ -286,7 +286,7 @@ func setupIMAPProxyWithAuthOnly(t *testing.T, rdb *resilient.ResilientDatabase, 
 			Enabled:                true,
 			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackToDB:           false, // Not needed for auth-only mode
+			LookupLocalUsers:       false, // Not needed for auth-only mode
 			RemoteUseProxyProtocol: true,  // Backend servers expect PROXY protocol
 		},
 	}

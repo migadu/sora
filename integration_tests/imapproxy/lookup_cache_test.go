@@ -403,7 +403,7 @@ func TestIMAPProxyLookupCache_PositiveCacheRevalidation(t *testing.T) {
 			Enabled:                true,
 			URL:                    remotelookupServer.URL,
 			Timeout:                "5s",
-			FallbackToDB:           false,
+			LookupLocalUsers:       false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -574,7 +574,7 @@ func setupIMAPProxyWithHTTPRemoteLookupAndCache(t *testing.T, rdb *resilient.Res
 			Enabled:                true,
 			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackToDB:           false,
+			LookupLocalUsers:       false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -636,7 +636,7 @@ func setupIMAPProxyWithHTTPRemoteLookupAndShortNegativeTTL(t *testing.T, rdb *re
 			Enabled:                true,
 			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackToDB:           false,
+			LookupLocalUsers:       false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{
@@ -698,7 +698,7 @@ func setupIMAPProxyWithHTTPRemoteLookupAndShortPositiveTTL(t *testing.T, rdb *re
 			Enabled:                true,
 			URL:                    remotelookupURL,
 			Timeout:                "5s",
-			FallbackToDB:           false,
+			LookupLocalUsers:       false,
 			RemoteUseProxyProtocol: true,
 		},
 		LookupCache: &config.LookupCacheConfig{

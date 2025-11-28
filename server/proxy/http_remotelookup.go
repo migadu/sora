@@ -303,8 +303,17 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 		// Check status code first - for error responses, status code is all we need
 		// Don't waste time reading/parsing body for non-200 responses
+
+		// 404 means user not found in remote system - fallback to DB if configured
 		if resp.StatusCode == http.StatusNotFound {
 			logger.Debug("remotelookup: User not found (404)", "user", lookupEmail)
+			return map[string]any{"result": AuthUserNotFound}, nil
+		}
+
+		// 3xx redirects mean "user exists but handle elsewhere" - this is a redirect to fallback
+		// Only fallback if lookup_local_users is enabled, otherwise reject (handled by caller)
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			logger.Debug("remotelookup: User redirect (3xx) - proceed to fallback", "status", resp.StatusCode, "user", lookupEmail)
 			return map[string]any{"result": AuthUserNotFound}, nil
 		}
 
@@ -314,22 +323,24 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			return map[string]any{"result": AuthFailed}, nil
 		}
 
-		// Other 4xx errors mean user lookup failed - treat as temporarily unavailable
-		// This respects fallback_to_db setting (unlike AuthUserNotFound which always falls back)
+		// Other 4xx errors are client errors - don't trigger circuit breaker
+		// These indicate wrong request format, invalid parameters, etc. (not service failures)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Warn("remotelookup: Client error - treating as temporarily unavailable", "status", resp.StatusCode, "user", lookupEmail)
-			return nil, fmt.Errorf("%w: client error %d", ErrRemoteLookupTransient, resp.StatusCode)
+			logger.Warn("remotelookup: Client error - bad request", "status", resp.StatusCode, "user", lookupEmail)
+			// Return success to circuit breaker but indicate auth failed
+			// This prevents 4xx from triggering circuit breaker (they're not service failures)
+			return map[string]any{"result": AuthFailed}, nil
 		}
 
-		// 5xx errors are transient - fallback controlled by config
+		// 5xx errors are server failures - these SHOULD trigger circuit breaker
 		if resp.StatusCode >= 500 {
-			logger.Warn("remotelookup: Server error", "status", resp.StatusCode, "user", lookupEmail)
+			logger.Warn("remotelookup: Server error - service unavailable", "status", resp.StatusCode, "user", lookupEmail)
 			return nil, fmt.Errorf("%w: server error %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
 		// Non-200 2xx responses - treat as transient
 		if resp.StatusCode != http.StatusOK {
-			logger.Warn("remotelookup: Unexpected status", "status", resp.StatusCode, "user", lookupEmail)
+			logger.Warn("remotelookup: Unexpected status - service unavailable", "status", resp.StatusCode, "user", lookupEmail)
 			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
