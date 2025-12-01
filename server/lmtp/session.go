@@ -159,14 +159,21 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	`, lookupAddress).Scan(&AccountID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// User not found - permanent failure
 			s.DebugLog("user not found", "address", lookupAddress)
+			return &smtp.SMTPError{
+				Code:         550,
+				EnhancedCode: smtp.EnhancedCode{5, 1, 1},
+				Message:      "No such user here",
+			}
 		} else {
-			s.WarnLog("failed to get user id", "address", lookupAddress, "error", err)
-		}
-		return &smtp.SMTPError{
-			Code:         550,
-			EnhancedCode: smtp.EnhancedCode{5, 1, 1},
-			Message:      "No such user here",
+			// Database error (connection failure, timeout, etc.) - temporary failure
+			s.WarnLog("database error during user lookup", "address", lookupAddress, "error", err)
+			return &smtp.SMTPError{
+				Code:         451,
+				EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+				Message:      "Temporary failure, please try again later",
+			}
 		}
 	}
 
