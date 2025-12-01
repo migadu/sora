@@ -333,7 +333,11 @@ func (s *Session) handleConnection() {
 				soraConn.SetUsername(s.username)
 			}
 
-			s.postAuthenticationSetup(tag, authStart)
+			if !s.postAuthenticationSetup(tag, authStart) {
+				// Backend connection failed - send BYE and close connection
+				s.sendResponse("* BYE Backend server unavailable, please try again")
+				return
+			}
 			authenticated = true
 
 		case "AUTHENTICATE":
@@ -421,7 +425,11 @@ func (s *Session) handleConnection() {
 				soraConn.SetUsername(s.username)
 			}
 
-			s.postAuthenticationSetup(tag, authStart)
+			if !s.postAuthenticationSetup(tag, authStart) {
+				// Backend connection failed - send BYE and close connection
+				s.sendResponse("* BYE Backend server unavailable, please try again")
+				return
+			}
 			authenticated = true
 
 		case "LOGOUT":
@@ -457,13 +465,9 @@ func (s *Session) handleConnection() {
 			s.WarnLog("failed to clear read deadline", "error", err)
 		}
 	}
-	// Start proxying only if backend connection was successful
-	if s.backendConn != nil {
-		s.DebugLog("starting proxy for user")
-		s.startProxy()
-	} else {
-		logger.Error("Cannot start proxy - no backend connection", "proxy", s.server.name, "user", s.username)
-	}
+	// Start proxying (at this point backend connection must be successful)
+	s.DebugLog("starting proxy for user")
+	s.startProxy()
 }
 
 // handleAuthError increments the error count, sends an error response, and
@@ -1200,12 +1204,13 @@ func (s *Session) authenticateToBackend() (string, error) {
 }
 
 // postAuthenticationSetup handles the common tasks after a user is successfully authenticated.
-func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time) {
+// Returns true if setup was successful, false if backend connection failed.
+func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time) bool {
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
 		logger.Error("Failed to connect to backend", "proxy", s.server.name, "user", s.username, "error", err)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
-		return
+		return false
 	}
 
 	// Send ID command to backend with forwarding parameters if enabled.
@@ -1241,7 +1246,7 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 			s.backendReader = nil
 			s.backendWriter = nil
 		}
-		return
+		return false
 	}
 
 	// Register connection
@@ -1267,6 +1272,7 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		responsePayload = "OK Authentication successful"
 	}
 	s.sendResponse(fmt.Sprintf("%s %s", clientTag, responsePayload))
+	return true
 }
 
 // startProxy starts bidirectional proxying between client and backend.
