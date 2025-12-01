@@ -1,6 +1,7 @@
 package tlsmanager
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -228,15 +229,25 @@ func (m *Manager) initLetsEncryptProvider() error {
 
 			// Check if the server name matches our configured domains using the HostPolicy
 			if err := m.autocertMgr.HostPolicy(nil, serverName); err != nil {
-				logger.Debug("TLS: Rejected certificate request for unconfigured domain", "domain", serverName, "error", err)
+				logger.Info("TLS: Rejected certificate request for unconfigured domain", "domain", serverName, "error", err)
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
-
-			logger.Debug("TLS: Certificate request during handshake", "domain", serverName, "has_sni", hello.ServerName != "")
 
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverName
+
+			// Check if certificate exists in cache first (to log whether we're serving from cache or requesting new)
+			ctx := context.Background()
+			_, cacheErr := m.autocertMgr.Cache.Get(ctx, serverName)
+
+			if cacheErr == autocert.ErrCacheMiss {
+				logger.Info("TLS: Certificate not in cache - requesting NEW certificate from Let's Encrypt", "domain", serverName)
+			} else if cacheErr != nil {
+				logger.Info("TLS: Cache check failed - attempting certificate retrieval", "domain", serverName, "error", cacheErr)
+			} else {
+				logger.Debug("TLS: Serving certificate from cache", "domain", serverName)
+			}
 
 			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
 			if err != nil {
@@ -246,7 +257,12 @@ func (m *Manager) initLetsEncryptProvider() error {
 				logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err)
 				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 			}
-			logger.Debug("TLS: Certificate provided", "domain", serverName)
+
+			if cacheErr == autocert.ErrCacheMiss {
+				logger.Info("TLS: NEW certificate successfully obtained from Let's Encrypt", "domain", serverName)
+			} else {
+				logger.Debug("TLS: Certificate provided for domain", "domain", serverName)
+			}
 			return cert, nil
 		},
 		MinVersion:    tls.VersionTLS12,

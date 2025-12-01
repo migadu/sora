@@ -441,20 +441,5 @@ var (
 		},
 	)
 
-	// Auth cache metrics
-	CacheSize = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sora_cache_entries",
-			Help: "Number of entries in cache by type",
-		},
-		[]string{"type"}, // auth, etc
-	)
-
-	CacheHitRatio = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sora_cache_hit_ratio",
-			Help: "Cache hit ratio (0-1) by type",
-		},
-		[]string{"type"},
-	)
+	// Note: Old auth cache metrics (CacheSize, CacheHitRatio) removed - replaced by LookupCacheEntriesTotal and LookupCacheHitRate
 )

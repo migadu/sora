@@ -529,7 +529,7 @@ type RemoteLookupConfig struct {
 	Transport *RemoteLookupTransportConfig `toml:"transport"` // HTTP transport connection pooling settings
 }
 
-// RemoteLookupCircuitBreakerConfig holds circuit breaker configuration for remotelookup
+// RemoteLookupCircuitBreakerConfig holds circuit breaker configuration for remote_lookup
 type RemoteLookupCircuitBreakerConfig struct {
 	MaxRequests  int     `toml:"max_requests"`  // Maximum concurrent requests in half-open state (default: 3)
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
@@ -538,7 +538,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
 }
 
-// RemoteLookupTransportConfig holds HTTP transport configuration for remotelookup connection pooling and timeouts
+// RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
 type RemoteLookupTransportConfig struct {
 	MaxIdleConns          int    `toml:"max_idle_conns"`          // Maximum idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
@@ -1008,7 +1008,7 @@ type IMAPProxyServerConfig struct {
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`    // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`   // Database-driven user routing
 }
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
@@ -1036,7 +1036,7 @@ type POP3ProxyServerConfig struct {
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`    // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`   // Database-driven user routing
 }
 
 // ManageSieveProxyServerConfig holds ManageSieve proxy server configuration.
@@ -1065,7 +1065,7 @@ type ManageSieveProxyServerConfig struct {
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remotelookup"`             // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`            // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string                `toml:"affinity_validity"`
@@ -1095,7 +1095,7 @@ type LMTPProxyServerConfig struct {
 	EnableAffinity         bool                `toml:"enable_affinity"`
 	AffinityStickiness     float64             `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
 	AffinityValidity       string              `toml:"affinity_validity"`
-	RemoteLookup           *RemoteLookupConfig `toml:"remotelookup"` // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig `toml:"remote_lookup"` // Database-driven user routing
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1260,7 +1260,7 @@ type ServerConfig struct {
 	Timeouts *ServerTimeoutsConfig `toml:"timeouts,omitempty"`
 
 	// Pre-lookup (embedded)
-	RemoteLookup *RemoteLookupConfig `toml:"remotelookup,omitempty"`
+	RemoteLookup *RemoteLookupConfig `toml:"remote_lookup,omitempty"`
 
 	// Client capability filtering (IMAP specific)
 	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`

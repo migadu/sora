@@ -247,10 +247,19 @@ var (
 
 	RemoteLookupResult = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "sora_remotelookup_result_total",
-			Help: "Total number of remotelookup results by outcome type.",
+			Name: "sora_remote_lookup_result_total",
+			Help: "Total number of remote lookup results by outcome type.",
 		},
 		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found_fallback/transient_error_fallback/transient_error_rejected
+	)
+
+	RemoteLookupDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_remote_lookup_duration_seconds",
+			Help:    "Duration of remote lookup API calls in seconds",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		},
+		[]string{"protocol", "result"}, // protocol: imap/lmtp/pop3/managesieve, result: success/user_not_found/transient_error/shutdown
 	)
 )
 

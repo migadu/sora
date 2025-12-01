@@ -1144,7 +1144,7 @@ timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 =
 # - Response: {"address": "realuser@domain.com", ...}
 # - Proxy connects to backend and authenticates as "realuser@domain.com"
 #
-[server.remotelookup]
+[server.remote_lookup]
 enabled = false                             # Enable/disable HTTP-based user routing.
 url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $email placeholder (required if enabled)
                                             # The $email placeholder is replaced with the URL-encoded email address
@@ -1217,7 +1217,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - min_requests: 5-10 (avoids opening circuit on brief hiccups)
   # - failure_ratio: 0.6-0.8 (60-80% failure rate before opening)
   #
-  # [server.remotelookup.circuit_breaker]
+  # [server.remote_lookup.circuit_breaker]
   # max_requests = 3                # Maximum concurrent requests in half-open state (default: 3)
                                     # Higher values = more confidence that service recovered before closing circuit
                                     # Lower values = faster recovery but may close prematurely
@@ -1264,7 +1264,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - High traffic → connections stay warm and reused immediately
   # - Slow network → generous dial/TLS timeouts prevent spurious failures
   #
-  # [server.remotelookup.transport]
+  # [server.remote_lookup.transport]
   # max_idle_conns = 100            # Maximum idle connections across all hosts (default: 100)
                                     # Total number of connections kept alive in the pool
                                     # Higher = more connections reused, less overhead

@@ -204,7 +204,30 @@ func (s *Session) handleConnection() {
 					s.sendResponse("421 4.3.2 Service shutting down, please try again later")
 					return
 				}
-				s.sendResponse("550 5.1.1 User unknown")
+				// Check if error is a temporary service unavailability (remotelookup transient error)
+				if errors.Is(err, server.ErrAuthServiceUnavailable) {
+					s.InfoLog("rejecting recipient - remote lookup service temporarily unavailable",
+						"recipient", to,
+						"response", "451 4.4.3")
+					s.sendResponse("451 4.4.3 Service temporarily unavailable, please try again later")
+					continue
+				}
+				// Check if error is user not found (permanent failure)
+				if errors.Is(err, server.ErrUserNotFound) {
+					s.InfoLog("rejecting recipient - user not found",
+						"recipient", to,
+						"response", "550 5.1.1")
+					s.sendResponse("550 5.1.1 User unknown")
+					continue
+				}
+				// Unknown/unexpected error - use temporary failure to be safe
+				// If this is actually a permanent issue, it will keep failing on retry
+				// If it's transient (e.g., database timeout), sender can retry
+				s.InfoLog("rejecting recipient - unexpected lookup error, temporary failure",
+					"recipient", to,
+					"error", err.Error(),
+					"response", "451 4.3.0")
+				s.sendResponse("451 4.3.0 Temporary failure, please try again later")
 				continue
 			}
 
@@ -516,7 +539,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"method", "cache",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-			return fmt.Errorf("user not found")
+			return server.ErrUserNotFound
 		} else {
 			// User found - use cached routing info
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
@@ -560,7 +583,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		routingCtx, routingCancel := context.WithTimeout(s.ctx, routingTimeout)
 		defer routingCancel()
 
+		remoteLookupStart := time.Now()
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		remoteLookupDuration := time.Since(remoteLookupStart).Seconds()
+
 		if lookupErr != nil {
 			s.InfoLog("remotelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
 
@@ -568,18 +594,26 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			if errors.Is(lookupErr, server.ErrServerShuttingDown) {
 				s.InfoLog("remotelookup cancelled due to server shutdown")
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "shutdown").Inc()
+				metrics.RemoteLookupDuration.WithLabelValues("lmtp", "shutdown").Observe(remoteLookupDuration)
 				return server.ErrServerShuttingDown
 			}
 
 			// Transient errors (network, 5xx, circuit breaker) - NEVER fallback to DB
 			// These are service availability issues, not "user not found" cases
-			s.InfoLog("remotelookup transient error - service unavailable, rejecting recipient", "username", s.username)
+			// Return ErrAuthServiceUnavailable so caller can send 451 (temporary) instead of 550 (permanent)
+			duration := time.Since(lookupStart)
+			s.InfoLog("remotelookup transient error - service unavailable, rejecting recipient",
+				"username", s.username,
+				"error", lookupErr.Error(),
+				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 			metrics.RemoteLookupResult.WithLabelValues("lmtp", "transient_error_rejected").Inc()
-			return fmt.Errorf("remotelookup service unavailable: %w", lookupErr)
+			metrics.RemoteLookupDuration.WithLabelValues("lmtp", "transient_error").Observe(remoteLookupDuration)
+			return server.ErrAuthServiceUnavailable
 		} else if routingInfo != nil {
 			// RemoteLookup succeeded - may or may not have ServerAddress
 			// If no ServerAddress, backend selection will use consistent hash/round-robin
 			metrics.RemoteLookupResult.WithLabelValues("lmtp", "success").Inc()
+			metrics.RemoteLookupDuration.WithLabelValues("lmtp", "success").Observe(remoteLookupDuration)
 			s.routingInfo = routingInfo
 			s.isRemoteLookupAccount = true
 			s.accountID = routingInfo.AccountID // May be 0, that's fine
@@ -620,14 +654,20 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			return nil
 		} else {
 			// User not found in remotelookup (404/3xx or empty response).
+			duration := time.Since(lookupStart)
+			metrics.RemoteLookupDuration.WithLabelValues("lmtp", "user_not_found").Observe(remoteLookupDuration)
 			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
-				s.InfoLog("user not found in remotelookup, local lookup enabled - attempting main DB", "username", s.username)
+				s.InfoLog("user not found in remote lookup, local lookup enabled - attempting main DB",
+					"username", s.username,
+					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 				// Fallthrough to main DB
 			} else {
-				s.InfoLog("user not found in remotelookup, fallback disabled - rejecting", "username", s.username)
+				s.InfoLog("user not found in remote lookup, fallback disabled - rejecting",
+					"username", s.username,
+					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_rejected").Inc()
-				return fmt.Errorf("user not found in remotelookup")
+				return server.ErrUserNotFound
 			}
 		}
 	} else {
@@ -643,8 +683,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 	row := s.server.rdb.QueryRowWithRetry(dbCtx, "SELECT c.account_id FROM credentials c JOIN accounts a ON c.account_id = a.id WHERE c.address = $1 AND a.deleted_at IS NULL", s.username)
 	if err := row.Scan(&s.accountID); err != nil {
-		// Check if error is due to context cancellation (server shutdown)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Check if error is due to session context cancellation (server shutdown)
+		// Note: Must check s.ctx.Err(), not just the query error, because the query context
+		// can timeout (DeadlineExceeded) independently from server shutdown
+		if s.ctx.Err() != nil {
 			s.InfoLog("database lookup cancelled due to server shutdown")
 			return server.ErrServerShuttingDown
 		}
@@ -664,7 +706,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			"method", "main_db",
 			"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-		return fmt.Errorf("user not found in main database: %w", err)
+		return server.ErrUserNotFound
 	}
 
 	// Set routing info so connectToBackend doesn't call remotelookup again

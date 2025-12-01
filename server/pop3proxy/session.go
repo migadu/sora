@@ -763,8 +763,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		s.DebugLog("master auth already validated, getting account ID from main database")
 		accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Check if error is due to session context cancellation (server shutdown)
+			// Note: Must check s.ctx.Err(), not just the query error, because the query context
+			// can timeout (DeadlineExceeded) independently from server shutdown
+			if s.ctx.Err() != nil {
 				s.InfoLog("master auth cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
 			}
@@ -779,8 +781,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			// Check if error is due to session context cancellation (server shutdown)
+			// Note: Must check s.ctx.Err(), not just the query error, because the query context
+			// can timeout (DeadlineExceeded) independently from server shutdown
+			if s.ctx.Err() != nil {
 				s.InfoLog("authentication cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
 			}

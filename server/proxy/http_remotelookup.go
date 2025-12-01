@@ -289,14 +289,16 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			// Check if error is due to context cancellation (server shutdown)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				logger.Info("remotelookup: Request cancelled due to context cancellation (server shutdown)")
+			// Check if error is due to context cancellation
+			// Note: DeadlineExceeded from timeout is NOT server shutdown, it's a transient timeout error
+			// Only context.Canceled (parent context cancelled) indicates server shutdown
+			if errors.Is(err, context.Canceled) {
+				logger.Info("remotelookup: Request cancelled due to server shutdown")
 				// Return temporarily unavailable to avoid penalizing as auth failure
 				// Wrap server.ErrServerShuttingDown with ErrRemoteLookupTransient so it flows correctly
 				return nil, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, server.ErrServerShuttingDown)
 			}
-			// Network error - this is transient
+			// Network error or timeout - this is transient
 			return nil, fmt.Errorf("%w: HTTP request failed: %v", ErrRemoteLookupTransient, err)
 		}
 		defer resp.Body.Close()

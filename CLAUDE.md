@@ -448,7 +448,7 @@ max_attempts = 10
 
 ### Prometheus Metrics
 
-Comprehensive monitoring with 26 Prometheus metrics:
+Comprehensive monitoring with 89 active Prometheus metrics (59 used in application code, 30 updated by metrics collector):
 
 #### Metric Categories
 - **Connections** (5): Total, current, authenticated, duration, auth attempts
@@ -459,6 +459,13 @@ Comprehensive monitoring with 26 Prometheus metrics:
 - **Workers** (2): Upload worker jobs and duration
 - **Health** (3): Component status, health checks, check duration
 - **Memory** (2): Session peak memory, limit exceeded events
+- **Remote Lookup** (1): Remote lookup API call duration (histogram)
+
+#### Key Metrics
+- **sora_remote_lookup_duration_seconds** (Histogram): Duration of remote lookup API calls
+  - Labels: `protocol` (imap/lmtp/pop3/managesieve), `result` (success/user_not_found/transient_error/shutdown)
+  - Buckets: 1ms to 5s (optimal for network API calls)
+  - Use case: Monitor remote lookup performance, detect slowdowns, identify timeout issues
 
 #### Metrics Collector
 - Runs every 60 seconds to update gauge metrics from database
@@ -774,10 +781,12 @@ Do not use the standard `log` package - use `logger` instead.
 - Three-state queue (pending/processing/failed)
 
 ### Prometheus Metrics (2025)
-- 26 comprehensive metrics covering all subsystems
-- Metrics collector for periodic gauge updates
+- 89 active metrics covering all subsystems (59 application-instrumented, 30 collector-updated)
+- Metrics collector runs every 60 seconds for gauge updates
 - Connection, database, storage, cache, protocol metrics
 - Health monitoring and worker statistics
+- Remote lookup duration tracking (histogram for performance monitoring)
+- Circuit breaker states, connection pool saturation, mailbox lock contention
 
 ### JA4 Fingerprinting (2025)
 - TLS client fingerprinting using exaring/ja4plus
