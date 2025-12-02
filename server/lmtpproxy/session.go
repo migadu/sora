@@ -944,8 +944,10 @@ func (s *Session) connectToBackend() error {
 	// needs to validate if the client connecting to it is another trusted proxy.
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(s.backendWriter, s.backendReader); err != nil {
-			s.DebugLog("Failed to send forwarding parameters", "error", err)
+			s.WarnLog("Failed to send XCLIENT to backend - continuing without forwarding parameters", "backend", s.serverAddr, "error", err)
 			// Continue without forwarding parameters rather than failing
+			// Note: If XCLIENT is rejected, this may indicate backend is not configured
+			// to accept XCLIENT from this proxy IP (check backend's trusted_networks)
 		}
 	}
 
@@ -995,9 +997,30 @@ func (s *Session) startProxy(initialCommand string) {
 		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", initialCommand, "cleaned", cleanedCommand)
 	}
 
+	// IMPORTANT: If remotelookup resolved the recipient to a different email (ActualEmail),
+	// we must rewrite the RCPT TO command to use the resolved email, not the original.
+	// This handles cases where remotelookup returns a token-based or aliased address
+	backendCommand := cleanedCommand
+	if s.username != s.to {
+		// Username was resolved to a different email - rewrite RCPT TO
+		// Extract any ESMTP parameters from cleaned command (after the address)
+		params := ""
+		if idx := strings.Index(cleanedCommand, ">"); idx != -1 && idx+1 < len(cleanedCommand) {
+			params = strings.TrimSpace(cleanedCommand[idx+1:])
+		}
+
+		// Reconstruct RCPT TO with resolved email
+		if params != "" {
+			backendCommand = fmt.Sprintf("RCPT TO:<%s> %s", s.username, params)
+		} else {
+			backendCommand = fmt.Sprintf("RCPT TO:<%s>", s.username)
+		}
+		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", s.username, "backend_command", backendCommand)
+	}
+
 	// First, send the RCPT TO command that triggered proxying
-	s.DebugLog("Sending RCPT TO to backend", "command", cleanedCommand)
-	_, err := s.backendWriter.WriteString(cleanedCommand + "\r\n")
+	s.DebugLog("Sending RCPT TO to backend", "command", backendCommand)
+	_, err := s.backendWriter.WriteString(backendCommand + "\r\n")
 	if err != nil {
 		s.DebugLog("Failed to send initial RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
@@ -1005,7 +1028,7 @@ func (s *Session) startProxy(initialCommand string) {
 	}
 	s.backendWriter.Flush()
 
-	// Read and forward the response
+	// Read the backend's response to RCPT TO
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
@@ -1013,6 +1036,36 @@ func (s *Session) startProxy(initialCommand string) {
 		return
 	}
 	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
+
+	// Check if backend rejected the recipient BEFORE forwarding to client
+	trimmedResponse := strings.TrimSpace(response)
+	if strings.HasPrefix(trimmedResponse, "5") {
+		// Backend rejected with permanent error (5xx)
+		// This should NOT happen if remotelookup/cache said the user exists on this backend
+		// This indicates a data consistency problem between remotelookup and backend, not a legitimate user-not-found
+		// Return 4xx (temporary failure) instead of forwarding 5xx so sender can retry
+		// This gives operators time to fix the data inconsistency without causing message loss
+		s.WarnLog("backend rejected recipient - data inconsistency detected, returning temporary failure",
+			"backend", s.serverAddr,
+			"method", s.routingMethod,
+			"sender", s.sender,
+			"recipient", s.to,
+			"backend_response", trimmedResponse,
+			"returned_to_client", "451 4.3.0",
+			"issue", "remotelookup returned this backend but backend rejected user - check data consistency")
+
+		// Override the backend's 5xx response with our own 4xx to allow retry
+		s.sendResponse("451 4.3.0 Backend configuration issue, please try again later")
+		return
+	} else if strings.HasPrefix(trimmedResponse, "4") {
+		// Backend rejected with temporary error (4xx) - forward as-is
+		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "sender", s.sender, "recipient", s.to, "response", trimmedResponse)
+		s.clientWriter.WriteString(response)
+		s.clientWriter.Flush()
+		return
+	}
+
+	// Backend accepted (2xx) - forward response to client
 	s.clientWriter.WriteString(response)
 	s.clientWriter.Flush()
 
