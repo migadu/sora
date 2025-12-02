@@ -487,3 +487,86 @@ func TestLMTP_Reset(t *testing.T) {
 
 	t.Logf("RSET command worked correctly: %s", response)
 }
+
+func TestLMTP_NullSender(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServer(t)
+	defer server.Close()
+
+	client, err := NewLMTPClient(server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP server: %v", err)
+	}
+	defer client.Close()
+
+	// LHLO
+	if err := client.SendCommand("LHLO test.example.com"); err != nil {
+		t.Fatalf("Failed to send LHLO: %v", err)
+	}
+	if _, err := client.ReadMultilineResponse(); err != nil {
+		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+
+	// MAIL FROM with null sender (used for bounce messages per RFC 5321)
+	if err := client.SendCommand("MAIL FROM:<>"); err != nil {
+		t.Fatalf("Failed to send MAIL FROM: %v", err)
+	}
+	response, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read MAIL FROM response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 response to MAIL FROM:<> (null sender), got: %s", response)
+	}
+	t.Logf("✓ Null sender accepted: %s", response)
+
+	// RCPT TO
+	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
+		t.Fatalf("Failed to send RCPT TO: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read RCPT TO response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 response to RCPT TO, got: %s", response)
+	}
+
+	// DATA
+	if err := client.SendCommand("DATA"); err != nil {
+		t.Fatalf("Failed to send DATA: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read DATA response: %v", err)
+	}
+	if !strings.HasPrefix(response, "354") {
+		t.Fatalf("Expected 354 response to DATA, got: %s", response)
+	}
+
+	// Send bounce message content (typical bounce format)
+	message := "From: MAILER-DAEMON@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Delivery Status Notification (Failure)\r\n" +
+		"Content-Type: multipart/report; report-type=delivery-status\r\n" +
+		"\r\n" +
+		"This is a delivery failure notification.\r\n" +
+		"Your message could not be delivered.\r\n" +
+		".\r\n"
+
+	if _, err := client.conn.Write([]byte(message)); err != nil {
+		t.Fatalf("Failed to send message data: %v", err)
+	}
+
+	// Read final response
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read final response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 response after message data, got: %s", response)
+	}
+
+	t.Logf("✓ Bounce message with null sender delivered successfully: %s", response)
+}

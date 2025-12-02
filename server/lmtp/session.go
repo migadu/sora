@@ -77,14 +77,27 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}()
 
 	s.DebugLog("processing mail from command", "from", from)
-	fromAddress, err := server.NewAddress(from)
-	if err != nil {
-		s.WarnLog("invalid from address", "error", err)
-		return &smtp.SMTPError{
-			Code:         553,
-			EnhancedCode: smtp.EnhancedCode{5, 1, 7},
-			Message:      "Invalid sender",
+
+	// Handle null sender (MAIL FROM:<>) used for bounce messages
+	// Per RFC 5321, empty reverse-path is used for delivery status notifications
+	var fromAddress server.Address
+	if from == "" {
+		// Null sender - create a special empty address
+		fromAddress = server.Address{} // Empty address for null sender
+		s.DebugLog("null sender accepted (bounce message)")
+	} else {
+		// Normal sender - validate address
+		var err error
+		fromAddress, err = server.NewAddress(from)
+		if err != nil {
+			s.WarnLog("invalid from address", "from", from, "error", err)
+			return &smtp.SMTPError{
+				Code:         553,
+				EnhancedCode: smtp.EnhancedCode{5, 1, 7},
+				Message:      "Invalid sender",
+			}
 		}
+		s.DebugLog("mail from accepted", "from", fromAddress.FullAddress())
 	}
 
 	// Acquire write lock to update sender
@@ -102,7 +115,6 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	s.sender = &fromAddress
 
 	success = true
-	s.DebugLog("mail from accepted", "from", fromAddress.FullAddress())
 	return nil
 }
 
@@ -313,6 +325,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	if err != nil {
 		s.WarnLog("failed to extract plaintext body", "error", err)
 		// The plaintext body is needed only for indexing, so we can ignore the error
+		// Use empty string as fallback
+		emptyBody := ""
+		plaintextBody = &emptyBody
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
