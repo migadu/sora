@@ -578,15 +578,15 @@ func (s *LMTPSession) Reset() {
 	s.User = nil
 	s.sender = nil
 
-	s.InfoLog("session reset")
+	s.DebugLog("session reset")
 }
 
 func (s *LMTPSession) Logout() error {
 	// Check if this is a normal QUIT command or an abrupt connection close
 	if s.conn != nil && s.conn.Conn() != nil {
-		s.InfoLog("session logout requested")
+		s.DebugLog("session logout requested")
 	} else {
-		s.InfoLog("client dropped connection")
+		s.DebugLog("client dropped connection")
 	}
 
 	// Acquire write lock for logout operations
@@ -795,6 +795,6 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 
 	// Notify uploader that a new upload is queued
 	s.backend.uploader.NotifyUploadQueued()
-	s.InfoLog("message saved", "uid", messageUID, "mailbox", mailbox.Name)
+	s.DebugLog("message saved", "uid", messageUID, "mailbox", mailbox.Name)
 	return nil
 }
