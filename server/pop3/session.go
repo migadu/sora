@@ -289,7 +289,7 @@ func (s *POP3Session) handleConnection() {
 						// Track rate limiting
 						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
 					} else {
-						s.DebugLog("[PASS] rate limited: %v", err)
+						s.DebugLog("[PASS] rate limited", "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
 					}
 

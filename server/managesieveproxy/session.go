@@ -95,14 +95,14 @@ func (s *Session) handleConnection() {
 	// Perform TLS handshake if this is a TLS connection
 	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
 		if err := tlsConn.PerformHandshake(); err != nil {
-			s.DebugLog("TLS handshake failed: %v", err)
+			s.DebugLog("TLS handshake failed", "error", err)
 			return
 		}
 	}
 
 	// Send initial greeting with capabilities
 	if err := s.sendGreeting(); err != nil {
-		s.DebugLog("failed to send greeting: %v", err)
+		s.DebugLog("failed to send greeting", "error", err)
 		return
 	}
 
@@ -112,7 +112,7 @@ func (s *Session) handleConnection() {
 		// Set a read deadline for the client command to prevent idle connections.
 		if s.server.authIdleTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
-				s.DebugLog("failed to set read deadline: %v", err)
+				s.DebugLog("failed to set read deadline", "error", err)
 				return
 			}
 		}
@@ -126,7 +126,7 @@ func (s *Session) handleConnection() {
 				return
 			}
 			if err != io.EOF {
-				s.DebugLog("error reading from client: %v", err)
+				s.DebugLog("error reading from client", "error", err)
 			}
 			return
 		}
@@ -146,12 +146,12 @@ func (s *Session) handleConnection() {
 			continue
 		}
 
-		s.DebugLog("client command: %s", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
+		s.DebugLog("client command", "command", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
 		switch command {
 		case "AUTHENTICATE":
-			s.DebugLog("AUTHENTICATE command (args_len: %d)", len(args))
+			s.DebugLog("AUTHENTICATE command", "args_len", len(args))
 			for i, arg := range args {
-				s.DebugLog("AUTHENTICATE arg[%d]: %s", i, arg)
+				s.DebugLog("AUTHENTICATE arg", "index", i, "value", arg)
 			}
 
 			// Check if authentication is allowed over non-TLS connection
@@ -192,13 +192,13 @@ func (s *Session) handleConnection() {
 						continue
 					}
 
-					s.DebugLog("AUTHENTICATE reading literal (%d bytes)", literalSize)
+					s.DebugLog("AUTHENTICATE reading literal", "bytes", literalSize)
 
 					// Read the literal data
 					literalData := make([]byte, literalSize)
 					_, err = io.ReadFull(s.clientReader, literalData)
 					if err != nil {
-						s.DebugLog("error reading literal data: %v", err)
+						s.DebugLog("error reading literal data", "error", err)
 						return
 					}
 
@@ -218,7 +218,7 @@ func (s *Session) handleConnection() {
 				// Read SASL response
 				saslLine, err = s.clientReader.ReadString('\n')
 				if err != nil {
-					s.DebugLog("error reading SASL response: %v", err)
+					s.DebugLog("error reading SASL response", "error", err)
 					return
 				}
 				// The response to a continuation can also be a quoted string.
@@ -255,7 +255,7 @@ func (s *Session) handleConnection() {
 
 			authStart := time.Now() // Start authentication timing
 			if err := s.authenticateUser(authnID, password, authStart); err != nil {
-				s.DebugLog("authentication failed: %v", err)
+				s.DebugLog("authentication failed", "error", err)
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				// Check if error is due to server shutdown or temporary unavailability
@@ -270,7 +270,7 @@ func (s *Session) handleConnection() {
 			// Connect to backend and authenticate
 			backendConnStart := time.Now()
 			if err := s.connectToBackendAndAuth(); err != nil {
-				s.DebugLog("backend connection/auth failed: %v", err)
+				s.DebugLog("backend connection/auth failed", "error", err)
 				// Check if this is a timeout or connection error (backend unavailable)
 				if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
 					s.sendResponse(`NO (UNAVAILABLE) "Backend server temporarily unavailable"`)
@@ -282,7 +282,7 @@ func (s *Session) handleConnection() {
 
 			// Register connection
 			if err := s.registerConnection(); err != nil {
-				s.DebugLog("failed to register connection: %v", err)
+				s.DebugLog("failed to register connection", "error", err)
 			}
 
 			// Set username on client connection for timeout logging
@@ -318,7 +318,7 @@ func (s *Session) handleConnection() {
 		case "CAPABILITY":
 			// Re-send capabilities as per RFC 5804
 			if err := s.sendCapabilities(); err != nil {
-				s.DebugLog("error sending capabilities: %v", err)
+				s.DebugLog("error sending capabilities", "error", err)
 				return
 			}
 
@@ -341,7 +341,7 @@ func (s *Session) handleConnection() {
 
 			// Send OK response
 			if err := s.sendResponse(`OK "Begin TLS negotiation now"`); err != nil {
-				s.DebugLog("failed to send STARTTLS response: %v", err)
+				s.DebugLog("failed to send STARTTLS response", "error", err)
 				return
 			}
 
@@ -355,7 +355,7 @@ func (s *Session) handleConnection() {
 				// Load from cert files
 				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
 				if err != nil {
-					s.DebugLog("failed to load TLS certificate: %v", err)
+					s.DebugLog("failed to load TLS certificate", "error", err)
 					return
 				}
 
@@ -378,7 +378,7 @@ func (s *Session) handleConnection() {
 			// Upgrade connection to TLS
 			tlsConn := tls.Server(s.clientConn, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				s.DebugLog("TLS handshake failed: %v", err)
+				s.DebugLog("TLS handshake failed", "error", err)
 				return
 			}
 
@@ -392,7 +392,7 @@ func (s *Session) handleConnection() {
 
 			// Re-send greeting with updated capabilities (now with SASL mechanisms available)
 			if err := s.sendGreeting(); err != nil {
-				s.DebugLog("failed to send greeting after STARTTLS: %v", err)
+				s.DebugLog("failed to send greeting after STARTTLS", "error", err)
 				return
 			}
 
@@ -412,7 +412,7 @@ func (s *Session) handleConnection() {
 	// its own connection lifetime.
 	if s.server.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-			s.DebugLog("failed to clear read deadline: %v", err)
+			s.DebugLog("failed to clear read deadline", "error", err)
 		}
 	}
 
@@ -646,13 +646,13 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return consts.ErrAuthenticationFailed
 			}
 			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful for '%s', using base address for routing", parsedAddr.BaseAddress())
+			s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
 			usernameForRemoteLookup = parsedAddr.BaseAddress()
 			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
-			s.DebugLog("token detected in username, sending full username to remotelookup: %s", username)
+			s.DebugLog("token detected in username, sending full username to remotelookup", "username", username)
 			usernameForRemoteLookup = username
 			masterAuthValidated = false
 		}

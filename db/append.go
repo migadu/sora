@@ -275,6 +275,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
+	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
 	// Delete any expunged messages in the mailbox that have the same message_id
 	// This prevents unique constraint violations when appending messages that were previously expunged
@@ -372,7 +373,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
 		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, options.RawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
 	if err != nil {
 		log.Printf("Database: failed to insert message content for content_hash %s: %v", options.ContentHash, err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
@@ -511,6 +512,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
+	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
@@ -593,7 +595,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
 		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, options.RawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
 	if err != nil {
 		log.Printf("Database: failed to insert message content for content_hash %s: %v", options.ContentHash, err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback

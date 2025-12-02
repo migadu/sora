@@ -118,11 +118,14 @@ func (s *IMAPSession) applyCapabilityFilters() {
 }
 
 func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
-	s.InfoLog(format, a...)
+	// Format the error message once
+	errorText := fmt.Sprintf(format, a...)
+	// Log using structured logging with the formatted message
+	s.InfoLog(errorText)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeServerBug,
-		Text: fmt.Sprintf(format, a...),
+		Text: errorText,
 	}
 }
 

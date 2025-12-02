@@ -606,7 +606,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
 				// These are service availability issues, not "user not found" cases
-				s.WarnLog("remotelookup transient error - service unavailable: %v", err)
+				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", "failure").Inc()

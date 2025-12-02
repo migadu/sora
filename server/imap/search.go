@@ -71,7 +71,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	messages, err := s.server.rdb.GetMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria)
 	if err != nil {
 		// The resilient layer already logs retry attempts. We just log the final error.
-		s.DebugLog("[SEARCH] final error after retries: %v", err)
+		s.DebugLog("[SEARCH] final error after retries", "error", err)
 		s.classifyAndTrackError("SEARCH", err, nil)
 		return nil, s.internalError("failed to search messages: %v", err)
 	}

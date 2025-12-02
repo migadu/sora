@@ -31,6 +31,7 @@ type Session struct {
 	sender                string
 	mailFromReceived      bool
 	to                    string
+	toAddress             *server.Address // Parsed recipient address with detail
 	username              string
 	isRemoteLookupAccount bool
 	routingInfo           *proxy.UserRoutingInfo
@@ -515,6 +516,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	}
 
 	s.to = to
+	s.toAddress = &address // Store parsed address with detail
 	s.username = address.BaseAddress()
 
 	// Set username on client connection for timeout logging
@@ -691,11 +693,19 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			return server.ErrServerShuttingDown
 		}
 
-		// Cache negative result (user not found)
-		s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
-			Result:     lookupcache.AuthUserNotFound,
-			IsNegative: true,
-		})
+		// IMPORTANT: Only cache negative result if remotelookup is NOT available
+		// If remotelookup is the source of truth but DB is used for fallback,
+		// we should NOT cache negative DB results because the user might exist in remotelookup
+		// and we'd be caching stale "not found" results that block future lookups
+		shouldCacheNegative := !hasRouting // Only cache if remotelookup is not configured
+
+		if shouldCacheNegative {
+			// Cache negative result (user not found)
+			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+				Result:     lookupcache.AuthUserNotFound,
+				IsNegative: true,
+			})
+		}
 
 		// Single consolidated log for lookup failure
 		duration := time.Since(lookupStart)
@@ -704,6 +714,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			"reason", "user_not_found",
 			"cached", false,
 			"method", "main_db",
+			"negative_cache_skipped", !shouldCacheNegative,
 			"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 		return server.ErrUserNotFound
@@ -999,9 +1010,10 @@ func (s *Session) startProxy(initialCommand string) {
 
 	// IMPORTANT: If remotelookup resolved the recipient to a different email (ActualEmail),
 	// we must rewrite the RCPT TO command to use the resolved email, not the original.
-	// This handles cases where remotelookup returns a token-based or aliased address
+	// This handles cases where remotelookup returns a token-based or aliased address.
+	// However, we must preserve the detail part (e.g., +test) from the original address.
 	backendCommand := cleanedCommand
-	if s.username != s.to {
+	if s.username != s.toAddress.BaseAddress() {
 		// Username was resolved to a different email - rewrite RCPT TO
 		// Extract any ESMTP parameters from cleaned command (after the address)
 		params := ""
@@ -1009,13 +1021,29 @@ func (s *Session) startProxy(initialCommand string) {
 			params = strings.TrimSpace(cleanedCommand[idx+1:])
 		}
 
-		// Reconstruct RCPT TO with resolved email
-		if params != "" {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s> %s", s.username, params)
+		// Reconstruct resolved email with detail if present
+		var resolvedRecipient string
+		if s.toAddress.Detail() != "" {
+			// Preserve detail part from original address
+			resolvedAddr, parseErr := server.NewAddress(s.username)
+			if parseErr == nil {
+				resolvedRecipient = fmt.Sprintf("%s+%s@%s", resolvedAddr.LocalPart(), s.toAddress.Detail(), resolvedAddr.Domain())
+			} else {
+				// Fallback: use resolved username as-is if parsing fails
+				s.WarnLog("Failed to parse resolved username for detail preservation", "username", s.username, "error", parseErr)
+				resolvedRecipient = s.username
+			}
 		} else {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s>", s.username)
+			resolvedRecipient = s.username
 		}
-		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", s.username, "backend_command", backendCommand)
+
+		// Reconstruct RCPT TO with resolved email (with detail if present)
+		if params != "" {
+			backendCommand = fmt.Sprintf("RCPT TO:<%s> %s", resolvedRecipient, params)
+		} else {
+			backendCommand = fmt.Sprintf("RCPT TO:<%s>", resolvedRecipient)
+		}
+		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", resolvedRecipient, "backend_command", backendCommand)
 	}
 
 	// First, send the RCPT TO command that triggered proxying
