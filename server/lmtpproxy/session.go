@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/textproto"
 	"strings"
 	"sync"
 	"time"
@@ -239,25 +238,74 @@ func (s *Session) handleConnection() {
 					s.DebugLog("Failed to clear read deadline", "error", err)
 				}
 			}
-			// Now connect to backend
-			if err := s.connectToBackend(); err != nil {
-				s.InfoLog("backend connection failed", "recipient", s.to, "error", err)
-				s.sendResponse("451 4.4.1 Backend connection failed")
-				return
+
+			// Connect to backend if not already connected
+			if s.backendConn == nil {
+				if err := s.connectToBackend(); err != nil {
+					s.InfoLog("backend connection failed", "recipient", s.to, "error", err)
+					s.sendResponse("451 4.4.1 Backend connection failed")
+					// Do not return, continue loop to handle RSET or QUIT
+					continue
+				}
+				// Register connection
+				if err := s.registerConnection(); err != nil {
+					s.InfoLog("rejected connection registration", "error", err)
+				}
 			}
 
-			// Register connection
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("rejected connection registration", "error", err)
-			}
-
-			// Start proxying only if backend connection was successful
+			// Forward RCPT TO to backend
 			if s.backendConn != nil {
-				s.DebugLog("Starting proxy", "recipient", s.to, "account_id", s.accountID)
-				s.startProxy(line)
+				s.DebugLog("Forwarding RCPT TO to backend", "recipient", s.to, "account_id", s.accountID)
+				s.forwardRCPT(line)
 			} else {
-				s.WarnLog("Cannot start proxy - no backend connection", "recipient", s.to)
+				s.WarnLog("Cannot forward RCPT - no backend connection", "recipient", s.to)
+				s.sendResponse("451 4.4.1 Backend connection failed")
 			}
+			// Continue loop to handle subsequent RCPT TOs or DATA
+
+		case "DATA":
+			if s.backendConn == nil {
+				s.sendResponse("503 5.5.1 Bad sequence of commands (not connected to backend)")
+				continue
+			}
+
+			// Send DATA to backend
+			_, err := s.backendWriter.WriteString("DATA\r\n")
+			if err != nil {
+				s.DebugLog("Failed to send DATA to backend", "error", err)
+				s.sendResponse("451 4.4.2 Backend error")
+				// Connection likely dead, close it?
+				s.backendConn.Close()
+				s.backendConn = nil
+				continue
+			}
+			s.backendWriter.Flush()
+
+			// Read DATA response
+			response, err := s.backendReader.ReadString('\n')
+			if err != nil {
+				s.DebugLog("Failed to read DATA response", "error", err)
+				s.sendResponse("451 4.4.2 Backend error")
+				s.backendConn.Close()
+				s.backendConn = nil
+				continue
+			}
+
+			// Check response
+			if !strings.HasPrefix(response, "354") {
+				// Backend rejected DATA
+				s.clientWriter.WriteString(response)
+				s.clientWriter.Flush()
+				continue
+			}
+
+			// Backend accepted DATA (354), forward to client
+			s.clientWriter.WriteString(response)
+			s.clientWriter.Flush()
+
+			// Enter pipe mode for data transfer
+			s.DebugLog("Entering pipe mode for DATA transfer")
+			s.enterPipeMode()
 			return
 
 		case "STARTTLS":
@@ -519,13 +567,17 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	s.toAddress = &address // Store parsed address with detail
 	s.username = address.BaseAddress()
 
+	// Store original submitted address for cache operations
+	// Cache key must always be the original address, not resolved address
+	originalAddress := s.username
+
 	// Set username on client connection for timeout logging
 	if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
 		soraConn.SetUsername(s.username)
 	}
 
 	// Check cache first (for routing info - no password validation needed)
-	if cached, found := s.server.lookupCache.Get(s.server.name, s.username); found {
+	if cached, found := s.server.lookupCache.Get(s.server.name, originalAddress); found {
 		if cached.IsNegative {
 			// User previously not found - return cached failure
 			// Note: Do NOT refresh negative entries - let them expire naturally so we can
@@ -562,7 +614,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				s.username = cached.ActualEmail
 			}
 
-			s.server.lookupCache.Refresh(s.server.name, s.username)
+			s.server.lookupCache.Refresh(s.server.name, originalAddress)
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
@@ -630,9 +682,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			}
 
 			// Cache positive result (routing info found)
-			// Cache key is s.username (BaseAddress of submitted recipient)
+			// Cache key is originalAddress (BaseAddress of submitted recipient)
 			// Store ActualEmail if remotelookup resolved to a different address
-			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+			s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
 				AccountID:              routingInfo.AccountID,
 				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 				ServerAddress:          routingInfo.ServerAddress,
@@ -669,6 +721,13 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 					"username", s.username,
 					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_rejected").Inc()
+
+				// Cache negative result to protect remotelookup
+				s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
+					Result:     lookupcache.AuthUserNotFound,
+					IsNegative: true,
+				})
+
 				return server.ErrUserNotFound
 			}
 		}
@@ -693,19 +752,12 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			return server.ErrServerShuttingDown
 		}
 
-		// IMPORTANT: Only cache negative result if remotelookup is NOT available
-		// If remotelookup is the source of truth but DB is used for fallback,
-		// we should NOT cache negative DB results because the user might exist in remotelookup
-		// and we'd be caching stale "not found" results that block future lookups
-		shouldCacheNegative := !hasRouting // Only cache if remotelookup is not configured
-
-		if shouldCacheNegative {
-			// Cache negative result (user not found)
-			s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
-				Result:     lookupcache.AuthUserNotFound,
-				IsNegative: true,
-			})
-		}
+		// Cache negative result (user not found)
+		// We reached here so user is not in remotelookup (if enabled) AND not in DB.
+		s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
+			Result:     lookupcache.AuthUserNotFound,
+			IsNegative: true,
+		})
 
 		// Single consolidated log for lookup failure
 		duration := time.Since(lookupStart)
@@ -714,7 +766,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			"reason", "user_not_found",
 			"cached", false,
 			"method", "main_db",
-			"negative_cache_skipped", !shouldCacheNegative,
+			"negative_cache_skipped", false,
 			"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 		return server.ErrUserNotFound
@@ -728,7 +780,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	}
 
 	// Cache positive result (routing info from DB)
-	s.server.lookupCache.Set(s.server.name, s.username, &lookupcache.CacheEntry{
+	s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
 		Result:           lookupcache.AuthSuccess,
@@ -990,22 +1042,13 @@ func (s *Session) connectToBackend() error {
 	return nil
 }
 
-// startProxy starts bidirectional proxying between client and backend.
-// initialCommand is the RCPT TO command that triggered the proxy.
-func (s *Session) startProxy(initialCommand string) {
-	if s.backendConn == nil {
-		s.DebugLog("Backend connection not established")
-		s.sendResponse("451 4.4.2 Backend connection not available")
-		return
-	}
-
-	s.DebugLog("startProxy() called")
-
+// forwardRCPT sends the RCPT TO command to backend and handles response interception
+func (s *Session) forwardRCPT(command string) {
 	// Strip unsupported ESMTP parameters from RCPT TO before forwarding to backend
 	// Most ESMTP extensions (especially DSN) are SMTP-specific and not supported by LMTP
-	cleanedCommand := stripUnsupportedRCPTParameters(initialCommand)
-	if cleanedCommand != initialCommand {
-		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", initialCommand, "cleaned", cleanedCommand)
+	cleanedCommand := stripUnsupportedRCPTParameters(command)
+	if cleanedCommand != command {
+		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", command, "cleaned", cleanedCommand)
 	}
 
 	// IMPORTANT: If remotelookup resolved the recipient to a different email (ActualEmail),
@@ -1046,12 +1089,15 @@ func (s *Session) startProxy(initialCommand string) {
 		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", resolvedRecipient, "backend_command", backendCommand)
 	}
 
-	// First, send the RCPT TO command that triggered proxying
+	// Send the RCPT TO command
 	s.DebugLog("Sending RCPT TO to backend", "command", backendCommand)
 	_, err := s.backendWriter.WriteString(backendCommand + "\r\n")
 	if err != nil {
-		s.DebugLog("Failed to send initial RCPT TO", "error", err)
+		s.DebugLog("Failed to send RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
+		// Connection issues should probably close the backend connection but let client decide next step
+		s.backendConn.Close()
+		s.backendConn = nil
 		return
 	}
 	s.backendWriter.Flush()
@@ -1061,6 +1107,8 @@ func (s *Session) startProxy(initialCommand string) {
 	if err != nil {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
+		s.backendConn.Close()
+		s.backendConn = nil
 		return
 	}
 	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
@@ -1099,6 +1147,14 @@ func (s *Session) startProxy(initialCommand string) {
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "sender", s.sender, "recipient", s.to)
+}
+
+// enterPipeMode enters the data piping mode for transfer of message content.
+func (s *Session) enterPipeMode() {
+	if s.backendConn == nil {
+		s.DebugLog("Backend connection not established, cannot enter pipe mode")
+		return
+	}
 
 	var wg sync.WaitGroup
 
@@ -1164,7 +1220,7 @@ func (s *Session) startProxy(initialCommand string) {
 
 	s.DebugLog("Waiting for copy goroutines to finish")
 	wg.Wait()
-	s.DebugLog("Copy goroutines finished - startProxy() returning")
+	s.DebugLog("Copy goroutines finished - enterPipeMode() returning")
 }
 
 // proxyClientToBackend handles copying data from the client to the backend,
@@ -1211,35 +1267,6 @@ func (s *Session) proxyClientToBackend() {
 				s.DebugLog("Error flushing to backend", "error", err)
 			}
 			return
-		}
-
-		// If this was a DATA command, switch to raw data proxying for the message body.
-		cmd, _, _, _ := server.ParseLine(strings.TrimSpace(line), false)
-		if cmd == "DATA" {
-			// The backend's "354" response will be handled by the other goroutine.
-			// We must now proxy the message body until ".\r\n".
-			// The idle timeout is suspended during active data transfer.
-			if s.server.authIdleTimeout > 0 {
-				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					s.DebugLog("Failed to clear read deadline for DATA transfer", "error", err)
-				}
-			}
-
-			// Use a DotReader to correctly handle the message body, including dot-stuffing.
-			tp := textproto.NewReader(s.clientReader)
-			dr := tp.DotReader()
-
-			// Copy the message body directly.
-			bytesCopied, err := io.Copy(s.backendWriter, dr)
-			totalBytesIn += bytesCopied
-			if err != nil {
-				s.DebugLog("Error proxying DATA content", "error", err)
-				return
-			}
-			if err := s.backendWriter.Flush(); err != nil {
-				s.DebugLog("Error flushing after DATA content", "error", err)
-				return
-			}
 		}
 	}
 }

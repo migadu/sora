@@ -538,6 +538,14 @@ func (s *Session) WarnLog(msg string, keysAndValues ...any) {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
+	// Set username early for logging - will be updated if remotelookup resolves to a different address
+	// Parse username to get base address (strip +detail for consistent logging)
+	if addr, err := server.NewAddress(username); err == nil {
+		s.username = addr.BaseAddress()
+	} else {
+		s.username = username // Fallback to raw username if parsing fails
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
