@@ -32,6 +32,7 @@ type Session struct {
 	to                    string
 	toAddress             *server.Address // Parsed recipient address with detail
 	username              string
+	originalAddress       string // Original base address (cache key) before remotelookup resolution
 	isRemoteLookupAccount bool
 	routingInfo           *proxy.UserRoutingInfo
 	accountID             int64
@@ -570,6 +571,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	// Store original submitted address for cache operations
 	// Cache key must always be the original address, not resolved address
 	originalAddress := s.username
+	s.originalAddress = originalAddress // Store in session for cache invalidation later
 
 	// Set username on client connection for timeout logging
 	if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
@@ -603,6 +605,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			s.routingInfo = &proxy.UserRoutingInfo{
 				AccountID:              cached.AccountID,
 				ServerAddress:          cached.ServerAddress,
+				IsRemoteLookupAccount:  cached.FromRemoteLookup, // CRITICAL: Prevents fallback to other backends
 				RemoteTLS:              cached.RemoteTLS,
 				RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
 				RemoteTLSVerify:        cached.RemoteTLSVerify,
@@ -802,7 +805,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
-		Username:              s.username,
+		Username:              s.originalAddress, // Use original address (not resolved address) for route/affinity consistency
 		Protocol:              "lmtp",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -860,9 +863,10 @@ func (s *Session) connectToBackend() error {
 
 	// Record successful connection for future affinity
 	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity
+	// Use s.originalAddress for affinity key to ensure stability across resolutions
 	if s.server.enableAffinity && actualAddr != "" {
 		proxy.UpdateAffinityAfterConnection(proxy.RouteParams{
-			Username:              s.username,
+			Username:              s.originalAddress,
 			Protocol:              "lmtp",
 			IsRemoteLookupAccount: s.isRemoteLookupAccount,
 			RoutingInfo:           s.routingInfo, // Pass routing info so UpdateAffinity can check ServerAddress
@@ -1129,6 +1133,19 @@ func (s *Session) forwardRCPT(command string) {
 			"backend_response", trimmedResponse,
 			"returned_to_client", "451 4.3.0",
 			"issue", "remotelookup returned this backend but backend rejected user - check data consistency")
+
+		// Invalidate cache entry to force fresh lookup on next attempt
+		// This prevents repeated routing to the wrong backend
+		// Use originalAddress as cache key (same key used when entry was created)
+		if s.originalAddress != "" {
+			// Construct cache key: "serverName:username" (or just "username" if serverName is empty)
+			cacheKey := s.originalAddress
+			if s.server.name != "" {
+				cacheKey = fmt.Sprintf("%s:%s", s.server.name, s.originalAddress)
+			}
+			s.server.lookupCache.Invalidate(cacheKey)
+			s.InfoLog("invalidated cache entry due to backend rejection", "cache_key", cacheKey, "username", s.username, "backend", s.serverAddr)
+		}
 
 		// Override the backend's 5xx response with our own 4xx to allow retry
 		s.sendResponse("451 4.3.0 Backend configuration issue, please try again later")
