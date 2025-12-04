@@ -47,6 +47,7 @@ func ExtractRecipients(header message.Header) []Recipient {
 	extractAddresses("Cc")
 	extractAddresses("Bcc")
 	extractAddresses("From")
+	extractAddresses("Sender")
 	extractAddresses("Reply-To")
 
 	return recipients

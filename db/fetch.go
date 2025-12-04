@@ -133,9 +133,16 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 			envelope.ReplyTo = append(envelope.ReplyTo, address)
 		case "from":
 			envelope.From = append(envelope.From, address)
+		case "sender":
+			envelope.Sender = append(envelope.Sender, address)
 		default:
 			log.Printf("Database: WARNING - unhandled address type: %s (UID %d, MailboxID %d)", addressType, UID, mailboxID)
 		}
+	}
+
+	// RFC 3501: If Sender is not present in the message, it defaults to From
+	if len(envelope.Sender) == 0 && len(envelope.From) > 0 {
+		envelope.Sender = envelope.From
 	}
 
 	return &envelope, nil
