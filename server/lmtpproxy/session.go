@@ -252,6 +252,35 @@ func (s *Session) handleConnection() {
 				if err := s.registerConnection(); err != nil {
 					s.InfoLog("rejected connection registration", "error", err)
 				}
+			} else {
+				// Verify if the current backend connection is compatible with this recipient
+				// Since we are reusing the connection, we must ensure this user routes to the same backend
+				routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
+					Ctx:                   s.ctx,
+					Username:              s.originalAddress,
+					Protocol:              "lmtp",
+					IsRemoteLookupAccount: s.isRemoteLookupAccount,
+					RoutingInfo:           s.routingInfo,
+					ConnManager:           s.server.connManager,
+					EnableAffinity:        s.server.enableAffinity,
+					ProxyName:             "LMTP Proxy",
+				})
+
+				if err == nil {
+					targetAddr := routeResult.PreferredAddr
+					// If a specific backend is required (targetAddr not empty) and it differs from
+					// the currently connected backend, we must reject this recipient.
+					// The client should retry this recipient in a separate transaction.
+					if targetAddr != "" && targetAddr != s.serverAddr {
+						s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
+							"recipient", s.to,
+							"current_backend", s.serverAddr,
+							"target_backend", targetAddr,
+							"method", routeResult.RoutingMethod)
+						s.sendResponse("451 4.3.0 Recipient requires different backend server, start new transaction")
+						continue
+					}
+				}
 			}
 
 			// Forward RCPT TO to backend
