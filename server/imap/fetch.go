@@ -289,6 +289,9 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 		for _, customFlag := range msg.CustomFlags {
 			allFlags = append(allFlags, imap.Flag(customFlag))
 		}
+		// Sanitize flags to remove invalid values (NIL, NULL, etc.) that may have been
+		// stored in the database before validation was added
+		allFlags = helpers.SanitizeFlags(allFlags)
 		m.WriteFlags(allFlags)
 	}
 	if options.UID {

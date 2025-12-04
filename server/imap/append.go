@@ -152,9 +152,13 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	size := int64(len(fullMessageBytes))
 
+	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
+	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
+	sanitizedFlags := helpers.SanitizeFlags(options.Flags)
+
 	// Add \Recent flag to newly appended messages
-	appendFlags := make([]imap.Flag, len(options.Flags))
-	copy(appendFlags, options.Flags)
+	appendFlags := make([]imap.Flag, len(sanitizedFlags))
+	copy(appendFlags, sanitizedFlags)
 	appendFlags = append(appendFlags, imap.Flag("\\Recent"))
 
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,

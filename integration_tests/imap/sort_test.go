@@ -336,7 +336,7 @@ func TestIMAP_SortDisplayCommand(t *testing.T) {
 	// Test SORT with DISPLAY sort key
 	displaySortOptions := &imapclient.SortOptions{
 		SearchCriteria: &imap.SearchCriteria{},
-		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplay, Reverse: false}},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplayFrom, Reverse: false}},
 	}
 	displaySortCmd := c.Sort(displaySortOptions)
 	displaySortResult, err := displaySortCmd.Wait()
@@ -352,7 +352,7 @@ func TestIMAP_SortDisplayCommand(t *testing.T) {
 	// Test SORT with REVERSE DISPLAY
 	reverseSortOptions := &imapclient.SortOptions{
 		SearchCriteria: &imap.SearchCriteria{},
-		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplay, Reverse: true}},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplayFrom, Reverse: true}},
 	}
 	reverseSortCmd := c.Sort(reverseSortOptions)
 	reverseSortResult, err := reverseSortCmd.Wait()
@@ -368,7 +368,7 @@ func TestIMAP_SortDisplayCommand(t *testing.T) {
 	// Test UID SORT with DISPLAY
 	uidDisplaySortOptions := &imapclient.SortOptions{
 		SearchCriteria: &imap.SearchCriteria{},
-		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplay, Reverse: false}},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyDisplayFrom, Reverse: false}},
 	}
 	uidDisplaySortCmd := c.UIDSort(uidDisplaySortOptions)
 	uidDisplaySortResult, err := uidDisplaySortCmd.Wait()

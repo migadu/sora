@@ -3,6 +3,7 @@ package imap
 import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/helpers"
 )
 
 func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
@@ -40,10 +41,21 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	release()
 
+	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
+	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
+	sanitizedFlags := helpers.SanitizeFlags(flags.Flags)
+
+	// Create a sanitized StoreFlags structure
+	sanitizedStoreFlags := &imap.StoreFlags{
+		Op:     flags.Op,
+		Silent: flags.Silent,
+		Flags:  sanitizedFlags,
+	}
+
 	// Check ACL permissions based on which flags are being modified
 	// Need 'w' (write) for general flags, 's' (seen) for \Seen, 't' (delete-msg) for \Deleted
 	var needsWrite, needsSeen, needsDelete bool
-	for _, flag := range flags.Flags {
+	for _, flag := range sanitizedFlags {
 		switch flag {
 		case imap.FlagSeen:
 			needsSeen = true
@@ -156,13 +168,13 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 		var newFlags []imap.Flag
 		var newModSeq int64
-		switch flags.Op {
+		switch sanitizedStoreFlags.Op {
 		case imap.StoreFlagsAdd:
-			newFlags, newModSeq, err = s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsDel:
-			newFlags, newModSeq, err = s.server.rdb.RemoveMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.RemoveMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsSet:
-			newFlags, newModSeq, err = s.server.rdb.SetMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, flags.Flags)
+			newFlags, newModSeq, err = s.server.rdb.SetMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
 		}
 
 		if err != nil {
@@ -203,7 +215,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	currentSessionTracker := s.sessionTracker // Get the current session tracker
 	release()
 
-	if !flags.Silent && currentSessionTracker != nil {
+	if !sanitizedStoreFlags.Silent && currentSessionTracker != nil {
 		for _, modified := range modifiedMessages {
 			m := w.CreateMessage(currentSessionTracker.EncodeSeqNum(modified.seq))
 

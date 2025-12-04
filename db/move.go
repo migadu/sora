@@ -14,10 +14,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Map to store the original UID to new UID mapping
 	messageUIDMap := make(map[imap.UID]imap.UID)
 
-	// Check if source and destination mailboxes are the same
+	// Per RFC 6851, moving to the same mailbox is allowed and assigns new UIDs.
+	// This is useful for "refreshing" messages with new UIDs.
 	if srcMailboxID == destMailboxID {
-		log.Printf("Database: WARNING - source and destination mailboxes are the same (ID=%d). Aborting move operation.", srcMailboxID)
-		return nil, fmt.Errorf("cannot move messages within the same mailbox")
+		log.Printf("Database: moving messages within the same mailbox (ID=%d), will assign new UIDs", srcMailboxID)
 	}
 
 	// Acquire locks on both mailboxes in a consistent order to prevent deadlocks.
@@ -98,10 +98,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// moving messages that had previously been moved from/to this mailbox.
 	// For example: INBOX->Trash (creates tombstone in INBOX), then later Trash->INBOX would
 	// fail because the old INBOX tombstone still exists.
+	//
+	// When moving within the same mailbox, we must exclude the source messages themselves
+	// from deletion (they're not tombstones, they're the messages we're moving).
 	deleteResult, err := tx.Exec(ctx, `
 		DELETE FROM messages
 		WHERE mailbox_id = $1
 		  AND message_id IN (SELECT message_id FROM messages WHERE id = ANY($2))
+		  AND id != ALL($2)
 	`, destMailboxID, messageIDs)
 	if err != nil {
 		log.Printf("Database: ERROR - failed to delete conflicting tombstones in destination mailbox: %v", err)
@@ -111,46 +115,93 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		log.Printf("Database: deleted %d conflicting message(s) from destination mailbox before move", deleteResult.RowsAffected())
 	}
 
-	// Batch insert the moved messages into the destination mailbox.
-	// This single query is much more efficient than inserting in a loop.
-	// It also fixes a bug where s3_domain, s3_localpart, and the correct
-	// mailbox_path were not being copied to the new message rows.
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (
-			account_id, content_hash, uploaded, message_id, in_reply_to, 
-			subject, sent_date, internal_date, flags, custom_flags, size, 
-			body_structure, recipients_json, s3_domain, s3_localpart,
-			subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort,
-			mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
-		)
-		SELECT 
-			m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
-			m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
-			m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-			m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_email_sort, m.cc_email_sort,
-			$1 AS mailbox_id,
-			$2 AS mailbox_path,
-			NOW() AS flags_changed_at,
-			nextval('messages_modseq'),
-			d.new_uid
-		FROM messages m
-		JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs)
-	if err != nil {
-		log.Printf("Database: ERROR - failed to batch insert messages into destination mailbox: %v", err)
-		return nil, fmt.Errorf("failed to move messages: %w", err)
+	// Batch insert the moved messages.
+	//
+	// For same-mailbox moves, we must mark old messages as expunged BEFORE inserting new ones.
+	// The partial unique index (WHERE expunged_at IS NULL) allows this since expunged messages
+	// are excluded from the index.
+	if srcMailboxID == destMailboxID {
+		// Step 1: Mark old messages as expunged to remove them from the unique index
+		_, err = tx.Exec(ctx, `
+			UPDATE messages
+			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+			WHERE mailbox_id = $1 AND id = ANY($2) AND expunged_at IS NULL
+		`, srcMailboxID, messageIDs)
+		if err != nil {
+			log.Printf("Database: ERROR - failed to mark messages as expunged for same-mailbox move: %v", err)
+			return nil, fmt.Errorf("failed to mark messages as expunged: %w", err)
+		}
+
+		// Step 2: Insert new copies with new UIDs
+		// The expunged messages are now excluded from the unique index, so this succeeds
+		_, err = tx.Exec(ctx, `
+			INSERT INTO messages (
+				account_id, content_hash, uploaded, message_id, in_reply_to,
+				subject, sent_date, internal_date, flags, custom_flags, size,
+				body_structure, recipients_json, s3_domain, s3_localpart,
+				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+				mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+			)
+			SELECT
+				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+				m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
+				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
+				$1 AS mailbox_id,
+				$2 AS mailbox_path,
+				NOW() AS flags_changed_at,
+				nextval('messages_modseq') AS created_modseq,
+				d.new_uid
+			FROM messages m
+			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+		`, srcMailboxID, destMailboxName, messageIDs, newUIDs)
+		if err != nil {
+			log.Printf("Database: ERROR - failed to insert new messages for same-mailbox move: %v", err)
+			return nil, fmt.Errorf("failed to move messages: %w", err)
+		}
+		log.Printf("Database: moved %d message(s) with new UIDs in same-mailbox move (old messages marked as expunged)", len(messageIDs))
+	} else {
+		// Different mailbox: normal insert from existing rows
+		_, err = tx.Exec(ctx, `
+			INSERT INTO messages (
+				account_id, content_hash, uploaded, message_id, in_reply_to,
+				subject, sent_date, internal_date, flags, custom_flags, size,
+				body_structure, recipients_json, s3_domain, s3_localpart,
+				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+				mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+			)
+			SELECT
+				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+				m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
+				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
+				$1 AS mailbox_id,
+				$2 AS mailbox_path,
+				NOW() AS flags_changed_at,
+				nextval('messages_modseq'),
+				d.new_uid
+			FROM messages m
+			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+		`, destMailboxID, destMailboxName, messageIDs, newUIDs)
+		if err != nil {
+			log.Printf("Database: ERROR - failed to batch insert messages into destination mailbox: %v", err)
+			return nil, fmt.Errorf("failed to move messages: %w", err)
+		}
 	}
 
 	// Mark the original messages as expunged in the source mailbox
-	_, err = tx.Exec(ctx, `
-		UPDATE messages
-		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		WHERE mailbox_id = $1 AND id = ANY($2)
-	`, srcMailboxID, messageIDs)
+	// (unless we already did this above for same-mailbox moves)
+	if srcMailboxID != destMailboxID {
+		_, err = tx.Exec(ctx, `
+			UPDATE messages
+			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+			WHERE mailbox_id = $1 AND id = ANY($2)
+		`, srcMailboxID, messageIDs)
 
-	if err != nil {
-		log.Printf("Database: ERROR - failed to mark original messages as expunged: %v", err)
-		return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
+		if err != nil {
+			log.Printf("Database: ERROR - failed to mark original messages as expunged: %v", err)
+			return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
+		}
 	}
 
 	return messageUIDMap, nil

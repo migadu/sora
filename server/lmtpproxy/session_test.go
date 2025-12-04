@@ -292,9 +292,10 @@ func TestRCPTWithESMTPParameters(t *testing.T) {
 
 			// Find the parameter (TO: or FROM:)
 			var prefix string
-			if command == "RCPT" {
+			switch command {
+			case "RCPT":
 				prefix = "TO:"
-			} else if command == "MAIL" {
+			case "MAIL":
 				prefix = "FROM:"
 			}
 

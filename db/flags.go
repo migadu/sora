@@ -13,6 +13,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -75,9 +76,14 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 		log.Printf("Database: error unmarshalling custom_flags for UID %d (mailbox %d): %v. JSON: %s", messageUID, mailboxID, err, string(customFlagsJSON))
 		return nil, fmt.Errorf("failed to unmarshal custom_flags for UID %d (mailbox %d): %w", messageUID, mailboxID, err)
 	}
+
+	// Convert custom keywords to imap.Flag and sanitize to remove invalid values
+	// that may have been stored before validation was added (e.g., NIL, NULL)
 	for _, kw := range customKeywords {
 		allFlags = append(allFlags, imap.Flag(kw))
 	}
+	allFlags = helpers.SanitizeFlags(allFlags)
+
 	return allFlags, nil
 }
 
@@ -219,6 +225,7 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 // GetUniqueCustomFlagsForMailbox retrieves a list of unique custom flags
 // (keywords) currently in use for messages within a specific mailbox.
 // It excludes system flags (those starting with '\').
+// Also sanitizes flags to remove invalid values (NIL, NULL, etc.) that may have been stored.
 func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxID int64) ([]string, error) {
 	query := `
 		SELECT DISTINCT flag
@@ -233,16 +240,26 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 	}
 	defer rows.Close()
 
-	var flags []string
+	var flags []imap.Flag
 	for rows.Next() {
 		var flag string
 		if err := rows.Scan(&flag); err != nil {
 			return nil, fmt.Errorf("failed to scan custom flag for mailbox %d: %w", mailboxID, err)
 		}
-		flags = append(flags, flag)
+		flags = append(flags, imap.Flag(flag))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating unique custom flags for mailbox %d: %w", mailboxID, err)
 	}
-	return flags, nil
+
+	// Sanitize to remove invalid flags (NIL, NULL, etc.) that may have been stored
+	sanitizedFlags := helpers.SanitizeFlags(flags)
+
+	// Convert back to []string for return
+	result := make([]string, len(sanitizedFlags))
+	for i, f := range sanitizedFlags {
+		result[i] = string(f)
+	}
+
+	return result, nil
 }

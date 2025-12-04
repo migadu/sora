@@ -119,11 +119,30 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 			if len(messages) > 0 {
 				// Set fields for ESEARCH responses when we have results
+				// MIN and MAX should be UIDs for UID SEARCH, sequence numbers for regular SEARCH
 				if options.ReturnMin {
-					searchData.Min = uint32(messages[0].UID)
+					if numKind == imapserver.NumKindUID {
+						searchData.Min = uint32(messages[0].UID)
+					} else {
+						// For sequence number search, use the encoded sequence number
+						if sessionTrackerSnapshot != nil {
+							searchData.Min = sessionTrackerSnapshot.EncodeSeqNum(messages[0].Seq)
+						} else {
+							searchData.Min = messages[0].Seq
+						}
+					}
 				}
 				if options.ReturnMax {
-					searchData.Max = uint32(messages[len(messages)-1].UID)
+					if numKind == imapserver.NumKindUID {
+						searchData.Max = uint32(messages[len(messages)-1].UID)
+					} else {
+						// For sequence number search, use the encoded sequence number
+						if sessionTrackerSnapshot != nil {
+							searchData.Max = sessionTrackerSnapshot.EncodeSeqNum(messages[len(messages)-1].Seq)
+						} else {
+							searchData.Max = messages[len(messages)-1].Seq
+						}
+					}
 				}
 
 				// Populate ALL with actual results

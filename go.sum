@@ -44,8 +44,6 @@ github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4
 github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/emersion/go-message v0.18.2 h1:rl55SQdjd9oJcIoQNhubD2Acs1E6IzlZISRTK7x/Lpg=
-github.com/emersion/go-message v0.18.2/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 h1:oP4q0fw+fOSWn3DfFi4EXdT+B+gTtzx8GC9xsc26Znk=
 github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6/go.mod h1:iL2twTeMvZnrg54ZoPDNfJaJaqy0xIQFuBdrLsmspwQ=
 github.com/exaring/ja4plus v0.0.2 h1:lfLUicnWFuIlAVHPaq9t0PfSC++AOt1vt+PXg3+Hz5w=
@@ -166,8 +164,10 @@ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D
 github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
 github.com/miekg/dns v1.1.26 h1:gPxPSwALAeHJSjarOs00QjVdV9QoBvc1D2ujQUr5BzU=
 github.com/miekg/dns v1.1.26/go.mod h1:bPDLeHnStXmXAq1m/Ch/hvfNHr14JKNPMBo3VZKjuso=
-github.com/migadu/go-imap/v2 v2.0.0-20251108210014-eefc7750bd16 h1:ETkYAPbTycSqqouI6VBPg3qy4otCh1IHRN31LniDZ3c=
-github.com/migadu/go-imap/v2 v2.0.0-20251108210014-eefc7750bd16/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
+github.com/migadu/go-imap/v2 v2.0.0-20251204163526-98015f8db7c5 h1:116GXVyXTC6QWB22MwLiB2YSjZcOzx+c0Ze76XwC3+Y=
+github.com/migadu/go-imap/v2 v2.0.0-20251204163526-98015f8db7c5/go.mod h1:NPrus+m0RgwOPTVuxaIay2Sipli9TDC4eRQnZCcUmq4=
+github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da h1:AOv2uDrSq1ly/RkWa46Dt6+Uj3nKyrPBd3AMhZxRSLk=
+github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43 h1:/07M1CWNcis7nhsnt7N2eWGIdPZue3YfCrKxXmVOFTw=
 github.com/migadu/go-sieve v0.0.0-20250924160026-17d8f94a0a43/go.mod h1:XykjlGKeykHsZKfFBDlmJiFbbQT+6Li9iUNNuZQNqxg=
 github.com/minio/crc64nvme v1.1.1 h1:8dwx/Pz49suywbO+auHCBpCtlW1OfpcLN7wYgVR6wAI=

@@ -138,6 +138,18 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) = 0", datePrefix, param))
 	}
 
+	// MODSEQ filtering (CONDSTORE extension - RFC 7162)
+	// Search for messages with MODSEQ >= specified value
+	if criteria.ModSeq != nil {
+		param := nextParam()
+		args[param] = criteria.ModSeq.ModSeq
+		// MODSEQ is the maximum of created_modseq, updated_modseq, and expunged_modseq
+		// GREATEST returns the largest non-NULL value
+		conditions = append(conditions, fmt.Sprintf(
+			"GREATEST(%screated_modseq, COALESCE(%supdated_modseq, 0), COALESCE(%sexpunged_modseq, 0)) >= @%s",
+			datePrefix, datePrefix, datePrefix, param))
+	}
+
 	// Header conditions
 	for _, header := range criteria.Header {
 		lowerValue := strings.ToLower(header.Value)
@@ -247,14 +259,17 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 			orderField = fmt.Sprintf("%ssubject_sort", colPrefix)
 		case imap.SortKeySize:
 			orderField = fmt.Sprintf("%ssize", colPrefix)
-		case imap.SortKeyDisplay:
-			// Use pre-normalized columns. Fallback from name to email.
+		case imap.SortKeyDisplayFrom:
+			// DISPLAYFROM: Use display name if available, fallback to email (RFC 5256)
 			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
-			// Use the pre-normalized sort column.
+			// FROM: Use email address only
 			orderField = fmt.Sprintf("%sfrom_email_sort", colPrefix)
+		case imap.SortKeyDisplayTo:
+			// DISPLAYTO: Use display name if available, fallback to email (RFC 5256)
+			orderField = fmt.Sprintf("COALESCE(%sto_name_sort, %sto_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyTo:
-			// Use the pre-normalized sort column.
+			// TO: Use email address only
 			orderField = fmt.Sprintf("%sto_email_sort", colPrefix)
 		case imap.SortKeyCc:
 			// Use the pre-normalized sort column.
@@ -397,9 +412,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
-		// Default to DESC so newest messages are returned first when hitting LIMIT
+		// Default to ASC for consistent SEARCH ordering (oldest to newest)
+		// This ensures MIN/MAX in ESEARCH work correctly with messages[0] and messages[len-1]
 		if orderByClause == "" {
-			orderByClause = "ORDER BY m.uid DESC"
+			orderByClause = "ORDER BY m.uid ASC"
 		}
 
 		// Fast path: Simple query without joining message_contents.
@@ -425,9 +441,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For CTE queries, ensure ORDER BY uses no prefix
-		// Default to DESC so newest messages are returned first when hitting LIMIT
+		// Default to ASC for consistent SEARCH ordering (oldest to newest)
+		// This ensures MIN/MAX in ESEARCH work correctly with messages[0] and messages[len-1]
 		if orderByClause == "" {
-			orderByClause = "ORDER BY uid DESC"
+			orderByClause = "ORDER BY uid ASC"
 		}
 
 		// Complex path: Use CTE when sequence numbers or FTS are needed

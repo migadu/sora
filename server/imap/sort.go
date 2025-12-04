@@ -46,16 +46,16 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 	}
 
 	// Create SortData with the results
-	sortData := &imap.SortData{
-		All: nums,
-	}
+	sortData := &imap.SortData{}
 
 	// Handle ESORT options if provided and capability is enabled
 	if options != nil {
 		if !s.GetCapabilities().Has(imap.CapESort) {
 			s.InfoLog("ESORT options ignored due to capability filtering")
+			// If ESORT is not available, return All by default
+			sortData.All = nums
 		} else {
-			s.InfoLog("ESORT options provided", "min", options.ReturnMin, "max", options.ReturnMax, "all", options.ReturnAll, "count", options.ReturnCount)
+			// RFC 5267: Only return what was requested
 			if options.ReturnCount {
 				sortData.Count = uint32(len(nums))
 			}
@@ -65,7 +65,13 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 			if options.ReturnMax && len(nums) > 0 {
 				sortData.Max = nums[len(nums)-1]
 			}
+			if options.ReturnAll {
+				sortData.All = nums
+			}
 		}
+	} else {
+		// No ESORT options, return All by default (regular SORT)
+		sortData.All = nums
 	}
 
 	return sortData, nil
