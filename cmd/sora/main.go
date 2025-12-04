@@ -73,22 +73,23 @@ func (sm *serverManager) Wait() {
 
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
-	storage            *storage.S3Storage
-	resilientDB        *resilient.ResilientDatabase
-	uploadWorker       *uploader.UploadWorker
-	cacheInstance      *cache.Cache
-	cleanupWorker      *cleaner.CleanupWorker
-	relayQueue         *relayqueue.DiskQueue
-	relayWorker        *relayqueue.Worker
-	healthIntegration  *health.HealthIntegration
-	metricsCollector   *metrics.Collector
-	clusterManager     *cluster.Manager
-	tlsManager         *tlsmanager.Manager
-	affinityManager    *server.AffinityManager
-	hostname           string
-	config             config.Config
-	serverManager      *serverManager
-	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for admin API kick)
+	storage               *storage.S3Storage
+	resilientDB           *resilient.ResilientDatabase
+	uploadWorker          *uploader.UploadWorker
+	cacheInstance         *cache.Cache
+	cleanupWorker         *cleaner.CleanupWorker
+	relayQueue            *relayqueue.DiskQueue
+	relayWorker           *relayqueue.Worker
+	healthIntegration     *health.HealthIntegration
+	metricsCollector      *metrics.Collector
+	clusterManager        *cluster.Manager
+	tlsManager            *tlsmanager.Manager
+	affinityManager       *server.AffinityManager
+	hostname              string
+	config                config.Config
+	serverManager         *serverManager
+	connectionTrackers    map[string]*server.ConnectionTracker // protocol -> tracker (for admin API kick)
+	connectionTrackersMux sync.Mutex                           // protects connectionTrackers map
 }
 
 func main() {
@@ -896,7 +897,9 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
+				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
+				deps.connectionTrackersMux.Unlock()
 			}
 		}
 	}
@@ -1046,7 +1049,9 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 			defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
+				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
+				deps.connectionTrackersMux.Unlock()
 			}
 		}
 	}
@@ -1143,7 +1148,9 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 			defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
+				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
+				deps.connectionTrackersMux.Unlock()
 			}
 		}
 	}
@@ -1282,7 +1289,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers["IMAP"] = tracker
+		deps.connectionTrackersMux.Unlock()
 	}
 
 	go func() {
@@ -1393,7 +1402,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers["POP3"] = tracker
+		deps.connectionTrackersMux.Unlock()
 	}
 
 	go func() {
@@ -1506,7 +1517,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers["ManageSieve"] = tracker
+		deps.connectionTrackersMux.Unlock()
 	}
 
 	go func() {
@@ -1591,7 +1604,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	// Start connection tracker if enabled.
 	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
+		deps.connectionTrackersMux.Lock()
 		deps.connectionTrackers["LMTP"] = tracker
+		deps.connectionTrackersMux.Unlock()
 	}
 
 	go func() {
