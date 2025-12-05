@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"fmt"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
@@ -88,8 +90,14 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	searchData := &imap.SearchData{}
 
-	// Log search parameters for debugging iOS Mail infinite loop issue
-	s.InfoLog("SEARCH command", "numKind", numKind, "criteria", criteria, "options", options, "results", len(messages))
+	var optionsStr string
+	if options != nil {
+		optionsStr = fmt.Sprintf("Min:%v Max:%v All:%v Count:%v Save:%v",
+			options.ReturnMin, options.ReturnMax, options.ReturnAll, options.ReturnCount, options.ReturnSave)
+	} else {
+		optionsStr = "nil"
+	}
+	s.DebugLog("SEARCH command", "numKind", numKind, "options", optionsStr, "results", len(messages))
 
 	// Check if this is actually an ESEARCH command (has RETURN options)
 	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set

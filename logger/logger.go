@@ -113,18 +113,21 @@ func (h *syslogHandler) Enabled(_ context.Context, level slog.Level) bool {
 func (h *syslogHandler) Handle(_ context.Context, r slog.Record) error {
 	msg := r.Message
 
-	// Add attributes
+	// Add attributes as key=value pairs
 	if len(h.attrs) > 0 || r.NumAttrs() > 0 {
-		attrs := make([]any, 0, len(h.attrs)*2+r.NumAttrs()*2)
+		var attrPairs []string
 		for _, a := range h.attrs {
-			attrs = append(attrs, a.Key, a.Value.Any())
+			attrPairs = append(attrPairs, fmt.Sprintf("%s=%v", a.Key, a.Value.Any()))
 		}
 		r.Attrs(func(a slog.Attr) bool {
-			attrs = append(attrs, a.Key, a.Value.Any())
+			attrPairs = append(attrPairs, fmt.Sprintf("%s=%v", a.Key, a.Value.Any()))
 			return true
 		})
-		if len(attrs) > 0 {
-			msg = fmt.Sprintf("%s %v", msg, attrs)
+		if len(attrPairs) > 0 {
+			// Join attributes with spaces
+			for _, attr := range attrPairs {
+				msg = msg + " " + attr
+			}
 		}
 	}
 
