@@ -88,9 +88,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	searchData := &imap.SearchData{}
 
-	// Log search parameters for debugging iOS Mail infinite loop issue
-	s.InfoLog("SEARCH command", "numKind", numKind, "criteria", criteria, "options", options, "results", len(messages))
-
 	// Check if this is actually an ESEARCH command (has RETURN options)
 	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
@@ -112,12 +109,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 		// At this point, isESEARCH is true and capability is verified
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {
-			// Only set count if explicitly requested
-			// RFC 4731: COUNT should only be included when ReturnCount is true
-			// Setting it unconditionally breaks iOS Mail parsing
-			if options.ReturnCount {
-				searchData.Count = uint32(len(messages))
-			}
+			// Set count for ESEARCH responses
+			searchData.Count = uint32(len(messages))
 
 			// Always initialize All as empty set for ESEARCH to work around go-imap encoder bug
 			// The encoder checks if All is nil/empty AFTER writing "ALL", causing parse errors
