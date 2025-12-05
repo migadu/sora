@@ -177,16 +177,9 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
 	}
 
-	// Get flags for this mailbox and store them for filtering FETCH responses
-	displayFlags := getDisplayFlags(readCtx, s.server.rdb, mailbox)
-	s.announcedFlags = make(map[imap.Flag]struct{}, len(displayFlags))
-	for _, f := range displayFlags {
-		s.announcedFlags[f] = struct{}{}
-	}
-
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
-		Flags: displayFlags,
+		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox),
 		// Flags that can be changed, including \* for custom
 		PermanentFlags:    getPermanentFlags(),
 		NumMessages:       s.currentNumMessages.Load(),

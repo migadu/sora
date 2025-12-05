@@ -293,18 +293,6 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 		// stored in the database before validation was added
 		allFlags = helpers.SanitizeFlags(allFlags)
 
-		// Filter flags to only include those announced during SELECT (RFC 3501 Section 7.2.6)
-		// "Any flags that are in a message but not in the FLAGS response MUST NOT be returned in a FETCH FLAGS response"
-		if s.announcedFlags != nil {
-			filteredFlags := make([]imap.Flag, 0, len(allFlags))
-			for _, flag := range allFlags {
-				if _, announced := s.announcedFlags[flag]; announced {
-					filteredFlags = append(filteredFlags, flag)
-				}
-			}
-			allFlags = filteredFlags
-		}
-
 		m.WriteFlags(allFlags)
 	}
 	if options.UID {

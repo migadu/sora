@@ -48,8 +48,7 @@ type IMAPSession struct {
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
-	useMasterDB           bool                   // Pin session to master DB after a write to ensure consistency
-	announcedFlags        map[imap.Flag]struct{} // Flags announced during SELECT (RFC 3501 requires consistency)
+	useMasterDB           bool // Pin session to master DB after a write to ensure consistency
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
@@ -265,7 +264,6 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentHighestModSeq.Store(0)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
-	s.announcedFlags = nil // Clear announced flags on unselect
 }
 
 // decodeNumSetLocked translates client sequence numbers to server sequence numbers.
