@@ -126,11 +126,15 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 			if len(messages) > 0 {
 				// Set fields for ESEARCH responses when we have results
+				// Messages are returned in DESC order (newest first) from database
+				// So messages[0] has the highest UID (MAX) and messages[len-1] has the lowest UID (MIN)
 				if options.ReturnMin {
-					searchData.Min = uint32(messages[0].UID)
+					// MIN is the smallest UID - last element in DESC order
+					searchData.Min = uint32(messages[len(messages)-1].UID)
 				}
 				if options.ReturnMax {
-					searchData.Max = uint32(messages[len(messages)-1].UID)
+					// MAX is the largest UID - first element in DESC order
+					searchData.Max = uint32(messages[0].UID)
 				}
 
 				// Populate ALL with actual results

@@ -412,10 +412,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
-		// Default to ASC for consistent SEARCH ordering (oldest to newest)
-		// This ensures MIN/MAX in ESEARCH work correctly with messages[0] and messages[len-1]
+		// Default to DESC so newest messages are returned first (iOS Mail expects this)
+		// NOTE: ESEARCH MIN/MAX logic in server/imap/search.go handles DESC order correctly
 		if orderByClause == "" {
-			orderByClause = "ORDER BY m.uid ASC"
+			orderByClause = "ORDER BY m.uid DESC"
 		}
 
 		// Fast path: Simple query without joining message_contents.
@@ -441,10 +441,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For CTE queries, ensure ORDER BY uses no prefix
-		// Default to ASC for consistent SEARCH ordering (oldest to newest)
-		// This ensures MIN/MAX in ESEARCH work correctly with messages[0] and messages[len-1]
+		// Default to DESC so newest messages are returned first (iOS Mail expects this)
+		// NOTE: ESEARCH MIN/MAX logic in server/imap/search.go handles DESC order correctly
 		if orderByClause == "" {
-			orderByClause = "ORDER BY uid ASC"
+			orderByClause = "ORDER BY uid DESC"
 		}
 
 		// Complex path: Use CTE when sequence numbers or FTS are needed
