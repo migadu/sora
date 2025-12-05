@@ -86,7 +86,7 @@ func TestIMAPProxyClusterWidePerIPLimit(t *testing.T) {
 	}
 	defer conn1.Close()
 	t.Log("✓ Connection 1 to node1 succeeded")
-	time.Sleep(200 * time.Millisecond) // Allow gossip to propagate
+	time.Sleep(500 * time.Millisecond) // Allow gossip to propagate (gossip interval is 200ms, need 2-3x for reliability)
 
 	// Connect to node 2 (same IP, different node)
 	conn2, err := net.Dial("tcp", proxyAddr2)
@@ -95,7 +95,7 @@ func TestIMAPProxyClusterWidePerIPLimit(t *testing.T) {
 	}
 	defer conn2.Close()
 	t.Log("✓ Connection 2 to node2 succeeded")
-	time.Sleep(200 * time.Millisecond) // Allow gossip to propagate
+	time.Sleep(500 * time.Millisecond) // Allow gossip to propagate (need time for increment event to reach node1)
 
 	// Third connection to either node should be rejected (cluster-wide limit reached)
 	t.Log("Attempting third connection to node1 (should be rejected - cluster limit)...")
@@ -120,7 +120,7 @@ func TestIMAPProxyClusterWidePerIPLimit(t *testing.T) {
 	// Test 2: Verify counter decrements work cluster-wide
 	t.Log("\n--- Test 2: Cluster-wide counter decrement ---")
 	conn1.Close()
-	time.Sleep(300 * time.Millisecond) // Allow gossip to propagate decrement
+	time.Sleep(600 * time.Millisecond) // Allow gossip to propagate decrement (needs more time than increment)
 
 	// Should now be able to connect again (1 connection freed)
 	conn4, err := net.Dial("tcp", proxyAddr1)

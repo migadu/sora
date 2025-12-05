@@ -90,7 +90,16 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 		t.Fatalf("Failed to inject NIL flag: %v", err)
 	}
 
-	t.Log("NIL flag injected. Now fetching message to verify it's filtered out...")
+	t.Log("NIL flag injected. Re-selecting to update announced flags...")
+
+	// Re-select INBOX to update the announcedFlags with the new flags from database
+	// This simulates a fresh session that sees the NIL flag in the database
+	_, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Failed to re-select INBOX after injection: %v", err)
+	}
+
+	t.Log("Now fetching message to verify NIL is filtered out...")
 
 	// Fetch the message flags - NIL should be filtered out
 	uidSet := imap.UIDSet{}
