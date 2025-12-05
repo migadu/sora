@@ -1009,18 +1009,52 @@ func (s *IMAPServer) sendGracefulShutdownBye() {
 
 	logger.Debug("IMAP: Sending graceful shutdown BYE to active connections", "name", s.name, "count", len(activeConns))
 
-	// Send BYE to all active connections
+	// Send BYE to all active connections with timeout per connection
+	// Use goroutines to send BYE messages in parallel to avoid blocking on stuck connections
+	var wg sync.WaitGroup
 	for _, conn := range activeConns {
-		// Send untagged BYE with text message
-		// RFC 3501 Section 7.1.5: BYE response indicates the server is closing the connection
-		if err := conn.Bye("Server shutting down, please reconnect"); err != nil {
-			logger.Debug("IMAP: Failed to send BYE", "name", s.name, "remote", server.GetAddrString(conn.NetConn().RemoteAddr()), "error", err)
-		}
+		wg.Add(1)
+		go func(c *imapserver.Conn) {
+			defer wg.Done()
+			// Create a timeout for sending BYE to prevent hanging on stuck connections
+			done := make(chan struct{})
+			go func() {
+				// Send untagged BYE with text message
+				// RFC 3501 Section 7.1.5: BYE response indicates the server is closing the connection
+				if err := c.Bye("Server shutting down, please reconnect"); err != nil {
+					logger.Debug("IMAP: Failed to send BYE", "name", s.name, "remote", server.GetAddrString(c.NetConn().RemoteAddr()), "error", err)
+				}
+				close(done)
+			}()
+
+			// Wait for BYE to be sent or timeout after 500ms
+			select {
+			case <-done:
+				// BYE sent successfully
+			case <-time.After(500 * time.Millisecond):
+				logger.Debug("IMAP: Timeout sending BYE to connection", "name", s.name, "remote", server.GetAddrString(c.NetConn().RemoteAddr()))
+			}
+		}(conn)
 	}
 
-	// Give clients a brief moment (1 second) to receive and process the BYE
-	// This prevents abrupt connection termination that could be misinterpreted as auth failure
-	time.Sleep(1 * time.Second)
+	// Wait for all BYE messages to be sent (or timeout) with overall timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Overall timeout of 2 seconds for all BYE messages
+	select {
+	case <-done:
+		logger.Debug("IMAP: All BYE messages sent", "name", s.name)
+	case <-time.After(2 * time.Second):
+		logger.Debug("IMAP: Timeout waiting for all BYE messages", "name", s.name)
+	}
+
+	// Give clients a brief moment (200ms) to receive and process the BYE
+	// Reduced from 1 second to speed up test cleanup
+	time.Sleep(200 * time.Millisecond)
 
 	logger.Debug("IMAP: Proceeding with connection cleanup", "name", s.name)
 }
