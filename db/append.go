@@ -181,36 +181,77 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	var highestUID int64
 	var uidToUse int64
 
-	// If we have a preserved UID, use it; otherwise generate a new one
+	// Check UIDVALIDITY before deciding whether to use preserved UID
+	if options.PreservedUID != nil && options.PreservedUIDValidity != nil {
+		// Check if any messages already exist in this mailbox
+		var hasMessages bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM messages
+				WHERE mailbox_id = $1
+				AND expunged_at IS NULL
+				LIMIT 1
+			)`, options.MailboxID).Scan(&hasMessages)
+		if err != nil {
+			log.Printf("Database: failed to check for existing messages: %v", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
+
+		// Get current UIDVALIDITY
+		var currentUIDValidity uint32
+		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
+		if err != nil {
+			log.Printf("Database: failed to query current UIDVALIDITY: %v", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
+
+		if hasMessages {
+			// Mailbox already has messages - check if UIDVALIDITY matches
+			if currentUIDValidity != *options.PreservedUIDValidity {
+				// UIDVALIDITY changed - ignore preserved UID and deliver normally
+				log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
+					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+
+				// Clear preserved values to use normal auto-increment
+				options.PreservedUID = nil
+				options.PreservedUIDValidity = nil
+			}
+			// If UIDVALIDITY matches, continue with UID preservation
+		} else {
+			// First preserved message - set UIDVALIDITY (overriding auto-generated value)
+			if currentUIDValidity != *options.PreservedUIDValidity {
+				_, err = tx.Exec(ctx, `
+					UPDATE mailboxes
+					SET uid_validity = $2
+					WHERE id = $1`,
+					options.MailboxID, *options.PreservedUIDValidity)
+				if err != nil {
+					log.Printf("Database: failed to update UIDVALIDITY: %v", err)
+					return 0, 0, consts.ErrDBUpdateFailed
+				}
+				log.Printf("Database: set UIDVALIDITY for mailbox %d from %d to %d (first preserved message)",
+					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+			}
+		}
+	}
+
+	// Now assign UID (either preserved or auto-increment based on above logic)
 	if options.PreservedUID != nil {
 		uidToUse = int64(*options.PreservedUID)
 
-		// Update highest_uid if preserved UID is higher
+		// Update highest_uid if preserved UID is higher (handles out-of-order)
 		err = tx.QueryRow(ctx, `
-			UPDATE mailboxes 
+			UPDATE mailboxes
 			SET highest_uid = GREATEST(highest_uid, $2)
-			WHERE id = $1 
+			WHERE id = $1
 			RETURNING highest_uid`,
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
 			log.Printf("Database: failed to update highest UID with preserved UID: %v", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
-
-		// If we have a preserved UIDVALIDITY, update it
-		if options.PreservedUIDValidity != nil {
-			_, err = tx.Exec(ctx, `
-				UPDATE mailboxes 
-				SET uid_validity = $2
-				WHERE id = $1`,
-				options.MailboxID, *options.PreservedUIDValidity)
-			if err != nil {
-				log.Printf("Database: failed to update UIDVALIDITY: %v", err)
-				return 0, 0, consts.ErrDBUpdateFailed
-			}
-		}
 	} else {
-		// Atomically increment and get the new highest UID for the mailbox.
+		// Atomically increment and get the new highest UID for the mailbox
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
 			log.Printf("Database: failed to update highest UID: %v", err)
@@ -218,6 +259,30 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		}
 		uidToUse = highestUID
 	}
+
+	// Deduplication: Check if message with same message_id AND content_hash already exists
+	// This prevents true duplicates (same Message-ID header + same body) while allowing
+	// legitimate cases like forwarding the same email multiple times (different Message-ID)
+	var existingUID int64
+	err = tx.QueryRow(ctx, `
+		SELECT uid FROM messages
+		WHERE mailbox_id = $1
+		AND message_id = $2
+		AND content_hash = $3
+		AND expunged_at IS NULL
+		LIMIT 1`,
+		options.MailboxID, options.MessageID, options.ContentHash).Scan(&existingUID)
+	if err == nil {
+		// Message already exists - return existing UID
+		log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
+			options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		return 0, existingUID, nil // Return 0 for messageID, existing UID
+	} else if err != pgx.ErrNoRows {
+		// Unexpected error
+		log.Printf("Database: failed to check for duplicate message: %v", err)
+		return 0, 0, consts.ErrDBQueryFailed
+	}
+	// err == pgx.ErrNoRows means no duplicate found, continue with insert
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {
@@ -399,7 +464,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
-	return messageRowId, highestUID, nil
+	return messageRowId, uidToUse, nil
 }
 
 func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions) (messageID int64, uid int64, err error) {
@@ -423,37 +488,78 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	var highestUID int64
 	var uidToUse int64
 
-	// If we have a preserved UID, use it; otherwise generate a new one
+	// Check UIDVALIDITY before deciding whether to use preserved UID
+	if options.PreservedUID != nil && options.PreservedUIDValidity != nil {
+		// Check if any messages already exist in this mailbox
+		var hasMessages bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM messages
+				WHERE mailbox_id = $1
+				AND expunged_at IS NULL
+				LIMIT 1
+			)`, options.MailboxID).Scan(&hasMessages)
+		if err != nil {
+			log.Printf("Database: failed to check for existing messages: %v", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
+
+		// Get current UIDVALIDITY
+		var currentUIDValidity uint32
+		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
+		if err != nil {
+			log.Printf("Database: failed to query current UIDVALIDITY: %v", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
+
+		if hasMessages {
+			// Mailbox already has messages - check if UIDVALIDITY matches
+			if currentUIDValidity != *options.PreservedUIDValidity {
+				// UIDVALIDITY changed - ignore preserved UID and deliver normally
+				log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
+					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+
+				// Clear preserved values to use normal auto-increment
+				options.PreservedUID = nil
+				options.PreservedUIDValidity = nil
+			}
+			// If UIDVALIDITY matches, continue with UID preservation
+		} else {
+			// First preserved message - set UIDVALIDITY (overriding auto-generated value)
+			if currentUIDValidity != *options.PreservedUIDValidity {
+				_, err = tx.Exec(ctx, `
+					UPDATE mailboxes
+					SET uid_validity = $2
+					WHERE id = $1`,
+					options.MailboxID, *options.PreservedUIDValidity)
+				if err != nil {
+					log.Printf("Database: failed to update UIDVALIDITY: %v", err)
+					return 0, 0, consts.ErrDBUpdateFailed
+				}
+				log.Printf("Database: set UIDVALIDITY for mailbox %d from %d to %d (first preserved message)",
+					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+			}
+		}
+	}
+
+	// Now assign UID (either preserved or auto-increment based on above logic)
 	if options.PreservedUID != nil {
 		uidToUse = int64(*options.PreservedUID)
 
-		// Update highest_uid if preserved UID is higher
+		// Update highest_uid if preserved UID is higher (handles out-of-order)
 		err = tx.QueryRow(ctx, `
-			UPDATE mailboxes 
+			UPDATE mailboxes
 			SET highest_uid = GREATEST(highest_uid, $2)
-			WHERE id = $1 
+			WHERE id = $1
 			RETURNING highest_uid`,
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
 			log.Printf("Database: failed to update highest UID with preserved UID: %v", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
-
-		// If we have a preserved UIDVALIDITY, update it
-		if options.PreservedUIDValidity != nil {
-			_, err = tx.Exec(ctx, `
-				UPDATE mailboxes 
-				SET uid_validity = $2
-				WHERE id = $1`,
-				options.MailboxID, *options.PreservedUIDValidity)
-			if err != nil {
-				log.Printf("Database: failed to update UIDVALIDITY: %v", err)
-				return 0, 0, consts.ErrDBUpdateFailed
-			}
-		}
 	} else {
-		// Atomically increment and get the new highest UID for the mailbox.
-		// The UPDATE statement implicitly locks the row, making a prior SELECT FOR UPDATE redundant.
+		// Atomically increment and get the new highest UID for the mailbox
+		// The UPDATE statement implicitly locks the row, making a prior SELECT FOR UPDATE redundant
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
 			log.Printf("Database: failed to update highest UID: %v", err)
@@ -461,6 +567,30 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		}
 		uidToUse = highestUID
 	}
+
+	// Deduplication: Check if message with same message_id AND content_hash already exists
+	// This prevents true duplicates (same Message-ID header + same body) while allowing
+	// legitimate cases like forwarding the same email multiple times (different Message-ID)
+	var existingUID int64
+	err = tx.QueryRow(ctx, `
+		SELECT uid FROM messages
+		WHERE mailbox_id = $1
+		AND message_id = $2
+		AND content_hash = $3
+		AND expunged_at IS NULL
+		LIMIT 1`,
+		options.MailboxID, options.MessageID, options.ContentHash).Scan(&existingUID)
+	if err == nil {
+		// Message already exists - return existing UID
+		log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
+			options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		return 0, existingUID, nil // Return 0 for messageID, existing UID
+	} else if err != pgx.ErrNoRows {
+		// Unexpected error
+		log.Printf("Database: failed to check for duplicate message: %v", err)
+		return 0, 0, consts.ErrDBQueryFailed
+	}
+	// err == pgx.ErrNoRows means no duplicate found, continue with insert
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {

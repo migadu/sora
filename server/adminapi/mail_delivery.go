@@ -22,9 +22,12 @@ import (
 
 // DeliverMailRequest represents the HTTP request for mail delivery
 type DeliverMailRequest struct {
-	Recipients []string `json:"recipients,omitempty"` // Optional if in headers
-	Message    string   `json:"message"`              // RFC822 message
-	From       string   `json:"from,omitempty"`       // Optional sender override
+	Recipients  []string `json:"recipients,omitempty"`   // Optional if in headers
+	Message     string   `json:"message"`                // RFC822 message
+	From        string   `json:"from,omitempty"`         // Optional sender override
+	UID         *uint32  `json:"uid,omitempty"`          // Optional: preserved UID for migration
+	UIDValidity *uint32  `json:"uid_validity,omitempty"` // Optional: preserved UIDVALIDITY for migration
+	MailboxName string   `json:"mailbox,omitempty"`      // Optional: target mailbox (bypasses Sieve)
 }
 
 // RecipientStatus represents the delivery status for a single recipient
@@ -189,7 +192,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, recipient := range req.Recipients {
-		status := s.deliverToRecipient(ctx, req.From, recipient, messageBytes, messageEntity)
+		status := s.deliverToRecipient(ctx, &req, recipient, messageBytes, messageEntity)
 		response.Recipients = append(response.Recipients, status)
 
 		if !status.Accepted {
@@ -217,7 +220,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 }
 
 // deliverToRecipient delivers a message to a single recipient using the delivery package
-func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
+func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,
@@ -261,7 +264,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient 
 
 	deliveryCtx.SieveExecutor = sieveExecutor
 
-	logger.Log("starting delivery from=%s size=%d", from, len(messageBytes))
+	logger.Log("starting delivery from=%s size=%d uid=%v", req.From, len(messageBytes), req.UID)
 
 	// Lookup recipient
 	recipientInfo, err := deliveryCtx.LookupRecipient(ctx, recipient)
@@ -274,11 +277,16 @@ func (s *Server) deliverToRecipient(ctx context.Context, from string, recipient 
 	logger.Log("recipient found AccountID=%d", recipientInfo.AccountID)
 
 	// Set from address if provided
-	if from != "" {
-		if addr, parseErr := server.NewAddress(from); parseErr == nil {
+	if req.From != "" {
+		if addr, parseErr := server.NewAddress(req.From); parseErr == nil {
 			recipientInfo.FromAddress = &addr
 		}
 	}
+
+	// Set preserved UID fields for migration
+	recipientInfo.PreservedUID = req.UID
+	recipientInfo.PreservedUIDVal = req.UIDValidity
+	recipientInfo.TargetMailbox = req.MailboxName
 
 	// Deliver message
 	result, err := deliveryCtx.DeliverMessage(*recipientInfo, messageBytes)

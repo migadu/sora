@@ -52,9 +52,12 @@ type DeliveryResult struct {
 
 // RecipientInfo contains information about the recipient.
 type RecipientInfo struct {
-	AccountID   int64
-	Address     *server.Address
-	FromAddress *server.Address // Optional sender address
+	AccountID       int64
+	Address         *server.Address
+	FromAddress     *server.Address // Optional sender address
+	PreservedUID    *uint32         // Optional: preserved UID for migration
+	PreservedUIDVal *uint32         // Optional: preserved UIDVALIDITY for migration
+	TargetMailbox   string          // Optional: target mailbox (bypasses Sieve)
 }
 
 // DeliverMessage is the main entry point for message delivery.
@@ -120,47 +123,59 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, err
 	}
 
-	// Execute Sieve scripts
-	mailboxName, discarded, err := d.SieveExecutor.ExecuteSieve(
-		d.Ctx,
-		recipient,
-		messageEntity,
-		plaintextBody,
-		messageBytes,
-	)
-	if err != nil {
-		result.ErrorMessage = fmt.Sprintf("Sieve execution error: %v", err)
-		return result, err
-	}
+	// Determine target mailbox
+	var mailboxName string
+	var discarded bool
 
-	if discarded {
-		result.Discarded = true
-		result.Success = true
-		return result, nil
+	if recipient.TargetMailbox != "" {
+		// Use explicit target mailbox (bypasses Sieve - for migrations)
+		mailboxName = recipient.TargetMailbox
+		discarded = false
+	} else {
+		// Execute Sieve scripts
+		mailboxName, discarded, err = d.SieveExecutor.ExecuteSieve(
+			d.Ctx,
+			recipient,
+			messageEntity,
+			plaintextBody,
+			messageBytes,
+		)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("Sieve execution error: %v", err)
+			return result, err
+		}
+
+		if discarded {
+			result.Discarded = true
+			result.Success = true
+			return result, nil
+		}
 	}
 
 	// Save message to mailbox
 	size := int64(len(messageBytes))
 	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
 		&db.InsertMessageOptions{
-			AccountID:     recipient.AccountID,
-			MailboxID:     0, // Will be set by InsertMessage based on mailboxName
-			S3Domain:      recipient.Address.Domain(),
-			S3Localpart:   recipient.Address.LocalPart(),
-			MailboxName:   mailboxName,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			BodyStructure: bodyStructure,
-			Recipients:    recipients,
-			Flags:         []imap.Flag{}, // Unread
-			RawHeaders:    rawHeadersText,
-			FTSRetention:  d.FTSRetention,
+			AccountID:            recipient.AccountID,
+			MailboxID:            0, // Will be set by InsertMessage based on mailboxName
+			S3Domain:             recipient.Address.Domain(),
+			S3Localpart:          recipient.Address.LocalPart(),
+			MailboxName:          mailboxName,
+			ContentHash:          contentHash,
+			MessageID:            messageID,
+			InternalDate:         time.Now(),
+			Size:                 size,
+			Subject:              subject,
+			PlaintextBody:        *plaintextBody,
+			SentDate:             sentDate,
+			InReplyTo:            inReplyTo,
+			BodyStructure:        bodyStructure,
+			Recipients:           recipients,
+			Flags:                []imap.Flag{}, // Unread
+			RawHeaders:           rawHeadersText,
+			FTSRetention:         d.FTSRetention,
+			PreservedUID:         recipient.PreservedUID,
+			PreservedUIDValidity: recipient.PreservedUIDVal,
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,
