@@ -410,9 +410,12 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 		cached, found := s.lookupCache.Get(s.name, email)
 		if found && !cached.IsNegative {
 			// Positive cache entry - use cached route
+			// NOTE: We do NOT refresh routing cache. Entries should expire after
+			// positive_ttl to allow periodic revalidation via remotelookup.
+			// This ensures that when a domain moves backends, active users
+			// eventually pick up the new backend.
 			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 			metrics.LookupCacheHitsTotal.Inc()
-			s.lookupCache.Refresh(s.name, email)
 			return cached.ServerAddress, nil
 		}
 		// Cache miss or negative entry - fall through to lookup

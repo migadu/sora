@@ -559,6 +559,10 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 // SetConnectionTracker sets the connection tracker for the server.
 func (s *POP3ProxyServer) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	s.connTracker = tracker
+	// Enable cache invalidation on kick events if lookup cache is available
+	if tracker != nil && s.lookupCache != nil {
+		tracker.SetLookupCache(s.lookupCache)
+	}
 }
 
 // GetConnectionTracker returns the connection tracker for the server.

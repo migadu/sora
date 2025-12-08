@@ -94,6 +94,9 @@ type ConnectionTracker struct {
 	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
 	kickSessionsMu sync.RWMutex
 
+	// Cache invalidation (optional, for proxies)
+	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick
+
 	// Configuration
 	maxConnectionsPerUser      int // Cluster-wide limit per user (0 = unlimited)
 	maxConnectionsPerUserPerIP int // Local limit per user per IP (0 = unlimited)
@@ -111,6 +114,11 @@ type ConnectionTracker struct {
 	stopCleanup       chan struct{}
 	stopStateSnapshot chan struct{}
 	stopOnce          sync.Once
+}
+
+// LookupCacheInvalidator interface for invalidating cache entries
+type LookupCacheInvalidator interface {
+	Invalidate(key string)
 }
 
 // NewConnectionTracker creates a new connection tracker.
@@ -160,6 +168,12 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 	}
 
 	return ct
+}
+
+// SetLookupCache sets the lookup cache for cache invalidation on kick events.
+// This should be called after creating the tracker to enable cache invalidation.
+func (ct *ConnectionTracker) SetLookupCache(cache LookupCacheInvalidator) {
+	ct.lookupCache = cache
 }
 
 // trackerType returns the name of the tracker for logging purposes.
@@ -817,6 +831,15 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 // handleKick processes a kick event from another node
 func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
 	logger.Debug("Gossip tracker: Received kick", "name", ct.name, "account_id", event.AccountID, "protocol", event.Protocol, "from_node", event.NodeID)
+
+	// CRITICAL: Invalidate cache for this user
+	// This ensures that when they reconnect, they get fresh routing/auth info
+	// Especially important if user was kicked due to backend changes
+	if ct.lookupCache != nil && event.Username != "" {
+		cacheKey := ct.name + ":" + event.Username
+		ct.lookupCache.Invalidate(cacheKey)
+		logger.Debug("Gossip tracker: Invalidated cache on kick", "name", ct.name, "cache_key", cacheKey, "account_id", event.AccountID)
+	}
 
 	// Notify all sessions for this user
 	ct.kickSessionsMu.Lock()

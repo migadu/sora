@@ -576,10 +576,12 @@ func (s *Session) authenticateUser(username, password string) error {
 		if cached.IsNegative {
 			// Negative cache entry - authentication previously failed
 			if passwordMatches {
-				// Same wrong password - return cached failure and refresh TTL
+				// Same wrong password - return cached failure
+				// NOTE: We do NOT refresh negative cache entries. They should expire
+				// after negative_ttl to allow retry. Brute force protection is handled
+				// by rate limiting, not by extending cache TTL.
 				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-				s.server.lookupCache.Refresh(s.server.name, username)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", "failure").Inc()
 				return consts.ErrAuthenticationFailed
@@ -593,7 +595,11 @@ func (s *Session) authenticateUser(username, password string) error {
 		} else {
 			// Positive cache entry (successful auth)
 			if passwordMatches {
-				// Same password - use cached routing info and refresh TTL
+				// Same password - use cached routing info
+				// NOTE: We do NOT refresh routing cache. Entries should expire after
+				// positive_ttl to allow periodic revalidation via remotelookup/database.
+				// This ensures that when a domain moves backends or password changes,
+				// active users eventually pick up the changes.
 				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 				metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
 
@@ -616,9 +622,6 @@ func (s *Session) authenticateUser(username, password string) error {
 				} else {
 					s.username = username
 				}
-
-				// Refresh TTL since password matched
-				s.server.lookupCache.Refresh(s.server.name, username)
 
 				// Use actual username (resolved email) for rate limiting and metrics
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, s.username, true)
@@ -1240,6 +1243,16 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	backendResponse, err := s.authenticateToBackend()
 	if err != nil {
 		logger.Error("Backend authentication failed", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr, "error", err)
+
+		// CRITICAL: Invalidate cache on backend authentication failure
+		// This ensures the next request does fresh remotelookup/database lookup
+		// to pick up backend changes (e.g., domain moved to different server)
+		if s.server.lookupCache != nil && s.username != "" {
+			cacheKey := s.server.name + ":" + s.username
+			s.server.lookupCache.Invalidate(cacheKey)
+			s.DebugLog("invalidated cache due to backend auth failure", "cache_key", cacheKey)
+		}
+
 		// Check if this is a timeout or connection error (backend unavailable)
 		// rather than an actual authentication failure
 		if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {

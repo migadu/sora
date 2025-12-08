@@ -646,7 +646,11 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				s.username = cached.ActualEmail
 			}
 
-			s.server.lookupCache.Refresh(s.server.name, originalAddress)
+			// NOTE: We intentionally do NOT call Refresh() for routing cache.
+			// Routing entries should expire after positive_ttl to allow periodic
+			// revalidation via remotelookup. This ensures that when a domain moves
+			// backends, active users eventually pick up the new backend.
+			// See: integration_tests/lmtpproxy/routing_cache_expiration_test.go
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)

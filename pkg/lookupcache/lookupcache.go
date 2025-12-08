@@ -492,7 +492,7 @@ func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 }
 
 // Refresh extends the TTL of an existing cache entry
-// This is called when the same password is used again to keep frequently-used entries fresh
+// DO NOT USE. Use natural TTL expiration instead.
 func (c *LookupCache) Refresh(serverName, username string) bool {
 	key := makeKey(serverName, username)
 

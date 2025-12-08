@@ -517,10 +517,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			if cached.IsNegative {
 				// Negative cache entry - authentication previously failed
 				if passwordMatches {
-					// Same wrong password - return cached failure and refresh TTL
+					// Same wrong password - return cached failure
+					// NOTE: We do NOT refresh negative cache entries. They should expire
+					// after negative_ttl to allow retry. Brute force protection is handled
+					// by rate limiting, not by extending cache TTL.
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-					s.server.lookupCache.Refresh(s.server.name, username)
 					return consts.ErrAuthenticationFailed
 				} else {
 					// Different password - ALWAYS revalidate (user might have fixed their password)
@@ -532,10 +534,13 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			} else {
 				// Positive cache entry - successful authentication previously cached
 				if passwordMatches {
-					// Same password - use cached routing info and refresh TTL
+					// Same password - use cached routing info
+					// NOTE: We do NOT refresh routing cache. Entries should expire after
+					// positive_ttl to allow periodic revalidation via remotelookup/database.
+					// This ensures that when a domain moves backends or password changes,
+					// active users eventually pick up the changes.
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive").Inc()
-					s.server.lookupCache.Refresh(s.server.name, username)
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
@@ -1192,12 +1197,26 @@ func (s *Session) authenticateToBackend() error {
 	// Read authentication response
 	response, err := backendReader.ReadString('\n')
 	if err != nil {
+		// CRITICAL: Invalidate cache on backend authentication failure
+		if s.server.lookupCache != nil && s.username != "" {
+			cacheKey := s.server.name + ":" + s.username
+			s.server.lookupCache.Invalidate(cacheKey)
+			s.DebugLog("invalidated cache due to backend auth read error", "cache_key", cacheKey)
+		}
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
 	if !strings.HasPrefix(response, "OK") {
+		// CRITICAL: Invalidate cache on backend authentication failure
+		// This ensures the next request does fresh remotelookup/database lookup
+		// to pick up backend changes (e.g., domain moved to different server)
+		if s.server.lookupCache != nil && s.username != "" {
+			cacheKey := s.server.name + ":" + s.username
+			s.server.lookupCache.Invalidate(cacheKey)
+			s.DebugLog("invalidated cache due to backend auth rejection", "cache_key", cacheKey, "response", strings.TrimSpace(response))
+		}
 		return fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
