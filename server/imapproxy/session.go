@@ -1414,7 +1414,8 @@ func (s *Session) close() {
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
-	if s.accountID > 0 && s.server.connTracker != nil {
+	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
+	if s.server.connTracker != nil {
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1430,7 +1431,7 @@ func (s *Session) close() {
 			logger.Debug("Successfully unregistered connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username)
 		}
 	} else {
-		logger.Debug("Skipping unregister - no accountID or connTracker", "proxy", s.server.name, "account_id", s.accountID, "has_tracker", s.server.connTracker != nil)
+		logger.Debug("Skipping unregister - no connTracker", "proxy", s.server.name, "account_id", s.accountID)
 	}
 
 	if s.clientConn != nil {
