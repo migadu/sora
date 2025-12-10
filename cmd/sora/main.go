@@ -766,12 +766,13 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 }
 
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
+// Returns both the tracker and the map key to use for registration.
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
-}) *server.ConnectionTracker {
+}) (*server.ConnectionTracker, string) {
 	if clusterMgr == nil {
 		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
-		return nil
+		return nil, ""
 	}
 
 	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
@@ -788,7 +789,10 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 	if tracker != nil {
 		srv.SetConnectionTracker(tracker)
 	}
-	return tracker
+
+	// Return tracker and the map key (protocol-instanceID for uniqueness across cluster)
+	mapKey := protocol + "-" + instanceID
+	return tracker, mapKey
 }
 
 // Dynamic server functions
@@ -1287,10 +1291,10 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
+		deps.connectionTrackers[mapKey] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1400,10 +1404,10 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
+		deps.connectionTrackers[mapKey] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1515,10 +1519,10 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
+		deps.connectionTrackers[mapKey] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1602,10 +1606,10 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Start connection tracker if enabled.
-	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
+	if tracker, mapKey := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["LMTP-"+serverConfig.Name] = tracker
+		deps.connectionTrackers[mapKey] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 

@@ -501,6 +501,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	var result struct {
 		Connections []struct {
 			Protocol   string    `json:"protocol"`
+			Instance   string    `json:"instance"` // Full tracker key (for filtering/debugging)
 			AccountID  int64     `json:"account_id"`
 			Email      string    `json:"email"`
 			LocalCount int       `json:"local_count"`
@@ -543,6 +544,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	if protocol != "" || instanceID != "" {
 		filtered := make([]struct {
 			Protocol   string    `json:"protocol"`
+			Instance   string    `json:"instance"`
 			AccountID  int64     `json:"account_id"`
 			Email      string    `json:"email"`
 			LocalCount int       `json:"local_count"`
@@ -550,22 +552,25 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 			LastUpdate time.Time `json:"last_update"`
 		}, 0)
 		for _, conn := range result.Connections {
-			// Filter by protocol (supports both exact match and prefix match)
-			// Examples: "LMTP" matches "LMTP-proxy1", "LMTP-proxy2", etc.
-			//           "LMTP-proxy1" matches only "LMTP-proxy1"
+			// Filter by protocol using the instance field (full tracker key)
+			// Examples: "LMTP" matches "LMTP-host1-proxy", "LMTP-host2-proxy", etc.
+			//           "LMTP-host1" matches "LMTP-host1-proxy", "LMTP-host1-other", etc.
+			//           "LMTP-host1-proxy" matches only "LMTP-host1-proxy"
 			if protocol != "" {
 				// Try exact match first (case-insensitive)
-				exactMatch := strings.EqualFold(conn.Protocol, protocol)
+				exactMatch := strings.EqualFold(conn.Instance, protocol)
 				// Try prefix match (case-insensitive)
-				prefixMatch := strings.HasPrefix(strings.ToUpper(conn.Protocol), strings.ToUpper(protocol)+"-")
+				prefixMatch := strings.HasPrefix(strings.ToUpper(conn.Instance), strings.ToUpper(protocol)+"-")
 
 				if !exactMatch && !prefixMatch {
 					continue
 				}
 			}
-			// Note: instanceID filtering not available with gossip tracking
+			// instanceID is now supported via the instance field
 			if instanceID != "" {
-				fmt.Println("Warning: --instance filtering not available with gossip-based tracking")
+				if !strings.Contains(strings.ToLower(conn.Instance), strings.ToLower(instanceID)) {
+					continue
+				}
 			}
 			filtered = append(filtered, conn)
 		}

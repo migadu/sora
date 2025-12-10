@@ -958,6 +958,28 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// extractProtocolFromKey extracts the protocol name from a tracker key.
+// Examples:
+//
+//	"LMTP-host1-lmtp-proxy" -> "LMTP"
+//	"IMAP-backend1" -> "IMAP"
+//	"POP3-host2-pop3-proxy" -> "POP3"
+func extractProtocolFromKey(key string) string {
+	// Find first dash
+	dashIdx := -1
+	for i, c := range key {
+		if c == '-' {
+			dashIdx = i
+			break
+		}
+	}
+	if dashIdx > 0 {
+		return key[:dashIdx]
+	}
+	// No dash found, return as-is
+	return key
+}
+
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available
@@ -971,14 +993,20 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 
 	// Collect connections from all trackers
 	allConnections := make([]map[string]any, 0)
-	for protocol, tracker := range s.connectionTrackers {
+	for trackerKey, tracker := range s.connectionTrackers {
 		if tracker == nil {
 			continue
 		}
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
+			// Extract protocol from tracker key
+			// Key format: "PROTOCOL-hostname-servername" or "PROTOCOL-servername"
+			// Display: Just "PROTOCOL" for simplicity
+			protocol := extractProtocolFromKey(trackerKey)
+
 			allConnections = append(allConnections, map[string]any{
 				"protocol":    protocol,
+				"instance":    trackerKey, // Full key for debugging/filtering
 				"account_id":  connInfo.AccountID,
 				"local_count": connInfo.LocalCount,
 				"total_count": connInfo.TotalCount,
