@@ -1290,7 +1290,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	if tracker := startConnectionTrackerForProxy("IMAP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["IMAP"] = tracker
+		deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1403,7 +1403,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	if tracker := startConnectionTrackerForProxy("POP3", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["POP3"] = tracker
+		deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1518,7 +1518,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	if tracker := startConnectionTrackerForProxy("ManageSieve", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["ManageSieve"] = tracker
+		deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
@@ -1605,7 +1605,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	if tracker := startConnectionTrackerForProxy("LMTP", serverConfig.Name, deps.hostname, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, deps.clusterManager, &deps.config.Cluster, server); tracker != nil {
 		defer tracker.Stop()
 		deps.connectionTrackersMux.Lock()
-		deps.connectionTrackers["LMTP"] = tracker
+		deps.connectionTrackers["LMTP-"+serverConfig.Name] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
 
