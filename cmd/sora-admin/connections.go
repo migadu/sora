@@ -550,9 +550,18 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 			LastUpdate time.Time `json:"last_update"`
 		}, 0)
 		for _, conn := range result.Connections {
-			// Filter by protocol
-			if protocol != "" && !strings.EqualFold(conn.Protocol, protocol) {
-				continue
+			// Filter by protocol (supports both exact match and prefix match)
+			// Examples: "LMTP" matches "LMTP-proxy1", "LMTP-proxy2", etc.
+			//           "LMTP-proxy1" matches only "LMTP-proxy1"
+			if protocol != "" {
+				// Try exact match first (case-insensitive)
+				exactMatch := strings.EqualFold(conn.Protocol, protocol)
+				// Try prefix match (case-insensitive)
+				prefixMatch := strings.HasPrefix(strings.ToUpper(conn.Protocol), strings.ToUpper(protocol)+"-")
+
+				if !exactMatch && !prefixMatch {
+					continue
+				}
 			}
 			// Note: instanceID filtering not available with gossip tracking
 			if instanceID != "" {
