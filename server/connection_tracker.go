@@ -927,8 +927,22 @@ func (ct *ConnectionTracker) cleanup() {
 			}
 		}
 
-		// Remove user entry if no connections and stale
+		// Remove user entry in two cases:
+		// 1. No connections and stale (standard cleanup)
+		// 2. No local connections and very stale (gossip desync recovery)
+		//    This handles cases where gossip unregister messages were lost
+		veryStaleThreshold := time.Now().Add(-1 * time.Hour)
+
 		if info.TotalCount <= 0 && info.LastUpdate.Before(staleThreshold) {
+			// Case 1: Normal cleanup - no connections at all
+			delete(ct.connections, accountID)
+			cleaned++
+		} else if info.LocalCount == 0 && info.LastUpdate.Before(veryStaleThreshold) {
+			// Case 2: Gossip desync recovery - no local connections and very stale
+			// This handles lost gossip messages from other nodes
+			logger.Debug("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
+				"user", info.Username, "account_id", accountID,
+				"total", info.TotalCount, "last_update", info.LastUpdate)
 			delete(ct.connections, accountID)
 			cleaned++
 		}
