@@ -931,7 +931,12 @@ func (ct *ConnectionTracker) cleanup() {
 		// 1. No connections and stale (standard cleanup)
 		// 2. No local connections and very stale (gossip desync recovery)
 		//    This handles cases where gossip unregister messages were lost
-		veryStaleThreshold := time.Now().Add(-1 * time.Hour)
+		// Use 3 minutes for all protocols since:
+		// - State snapshots are broadcast every 60 seconds, keeping active connections fresh
+		// - 3 minutes allows for ~3 missed gossip messages before cleanup (resilient to temporary issues)
+		// - Aggressively cleans up stale entries from failed nodes or lost unregister messages
+		veryStaleTimeout := 3 * time.Minute
+		veryStaleThreshold := time.Now().Add(-1 * veryStaleTimeout)
 
 		if info.TotalCount <= 0 && info.LastUpdate.Before(staleThreshold) {
 			// Case 1: Normal cleanup - no connections at all
@@ -942,7 +947,7 @@ func (ct *ConnectionTracker) cleanup() {
 			// This handles lost gossip messages from other nodes
 			logger.Debug("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
 				"user", info.Username, "account_id", accountID,
-				"total", info.TotalCount, "last_update", info.LastUpdate)
+				"total", info.TotalCount, "last_update", info.LastUpdate, "threshold", veryStaleTimeout)
 			delete(ct.connections, accountID)
 			cleaned++
 		}
