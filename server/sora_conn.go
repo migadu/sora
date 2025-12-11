@@ -56,6 +56,7 @@ func GetAddrString(addr net.Addr) string {
 // Returns total bytes copied and any error encountered.
 func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction string) (int64, error) {
 	const writeDeadline = 30 * time.Second
+	const readDeadline = 30 * time.Minute // Detect stale connections while supporting IMAP IDLE (29min RFC 2177)
 
 	// Use buffered copy with pooled buffer
 	bufp := copyBufPool.Get().(*[]byte)
@@ -77,6 +78,16 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 		case <-ctx.Done():
 			return totalBytes, ctx.Err()
 		default:
+		}
+
+		// Set read deadline to detect stale connections
+		// This prevents goroutines from hanging indefinitely when the peer stops responding
+		// 30 minutes accommodates IMAP IDLE (RFC 2177: up to 29 minutes of silence is valid)
+		// while still detecting truly hung connections within a reasonable timeframe
+		// Note: TCP keepalive (set above) provides faster detection (~12 min) for dead connections
+		if err := src.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+			// Don't fail on deadline errors - continue without deadline
+			// This handles connections that don't support deadlines
 		}
 
 		nr, err := src.Read(buf)
@@ -105,6 +116,10 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 			}
 		}
 		if err != nil {
+			// Check if this is a read timeout error (stale connection)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return totalBytes, fmt.Errorf("read timeout in %s after %v (connection appears stale): %w", direction, readDeadline, err)
+			}
 			if err != io.EOF {
 				return totalBytes, err
 			}

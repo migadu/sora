@@ -1910,7 +1910,8 @@ func TestACLManagement(t *testing.T) {
 	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
 	ownerID, _ := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
-	mailboxName := "Shared/TestACL"
+	// Use unique mailbox name to avoid conflicts with previous test runs
+	mailboxName := fmt.Sprintf("Shared/TestACL-%d", time.Now().UnixNano())
 
 	err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailboxName, nil)
 	if err != nil {

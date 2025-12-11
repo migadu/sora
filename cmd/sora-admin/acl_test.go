@@ -33,7 +33,7 @@ func TestACLCommands(t *testing.T) {
 	owner := createACLTestAccount(t, rdb, fmt.Sprintf("owner-%d@example.com", timestamp), "password123")
 	user1 := createACLTestAccount(t, rdb, fmt.Sprintf("user1-%d@example.com", timestamp), "password123")
 
-	// Create a shared mailbox
+	// Create a shared mailbox with unique name to avoid conflicts with previous test runs
 	ctx := context.Background()
 	cfg := &config.Config{
 		SharedMailboxes: config.SharedMailboxesConfig{
@@ -43,7 +43,7 @@ func TestACLCommands(t *testing.T) {
 	}
 	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
-	mailboxName := "Shared/TestMailbox"
+	mailboxName := fmt.Sprintf("Shared/TestMailbox-%d", timestamp)
 	err := rdb.CreateMailboxWithRetry(ctx, owner.AccountID, mailboxName, nil)
 	if err != nil {
 		t.Fatalf("Failed to create shared mailbox: %v", err)

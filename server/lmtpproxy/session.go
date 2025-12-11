@@ -77,6 +77,15 @@ func (s *Session) handleConnection() {
 	defer s.server.unregisterSession(s)
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
+	// Enforce absolute session timeout to prevent hung sessions from leaking
+	if s.server.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
+			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
+			s.cancel() // Force cancel context to unblock any stuck I/O
+		})
+		defer timeout.Stop()
+	}
+
 	// Log connection at INFO level
 	s.InfoLog("connected")
 
@@ -894,6 +903,16 @@ func (s *Session) connectToBackend() error {
 	s.backendReader = bufio.NewReader(s.backendConn)
 	s.backendWriter = bufio.NewWriter(s.backendConn)
 
+	// Enable TCP keepalive on backend connection to detect dead connections
+	// This helps detect network partitions and stale connections without waiting for read timeout
+	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			s.DebugLog("Failed to enable TCP keepalive on backend", "error", err)
+		} else if err := tcpConn.SetKeepAlivePeriod(2 * time.Minute); err != nil {
+			s.DebugLog("Failed to set TCP keepalive period on backend", "error", err)
+		}
+	}
+
 	// Record successful connection for future affinity
 	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity
 	// Use s.originalAddress for affinity key to ensure stability across resolutions
@@ -1409,15 +1428,33 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 // that was buffered but not yet read.
 func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int64, error) {
 	const writeDeadline = 30 * time.Second
+	const readDeadline = 5 * time.Minute // Detect stale backend connections during data transfer
 	var totalBytes int64
 	buf := make([]byte, 32*1024)
 	nextDeadline := time.Now()
+
+	// Get the underlying connection to set read deadline
+	// The buffered reader wraps s.backendConn, but we need to access the conn itself
+	var srcConn net.Conn
+	if s.backendConn != nil {
+		srcConn = s.backendConn
+	}
 
 	for {
 		select {
 		case <-s.ctx.Done():
 			return totalBytes, s.ctx.Err()
 		default:
+		}
+
+		// Set read deadline on backend connection to detect stale connections
+		// This prevents goroutines from hanging indefinitely when backend stops responding
+		// 5 minutes is generous for LMTP data transfer while still detecting hung connections
+		if srcConn != nil {
+			if err := srcConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+				s.DebugLog("Failed to set read deadline on backend", "error", err)
+				// Continue anyway - this is not fatal
+			}
 		}
 
 		nr, err := src.Read(buf)
@@ -1446,6 +1483,11 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 			}
 		}
 		if err != nil {
+			// Check if this is a read timeout error (stale backend connection)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.InfoLog("Backend read timeout during data transfer - connection appears stale", "duration", readDeadline)
+				return totalBytes, fmt.Errorf("backend read timeout after %v: %w", readDeadline, err)
+			}
 			if err != io.EOF {
 				return totalBytes, err
 			}

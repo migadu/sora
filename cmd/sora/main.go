@@ -1543,6 +1543,18 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
+	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
+	if err != nil {
+		logger.Info("LMTP proxy: Invalid absolute session timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
+		absoluteSessionTimeout = 5 * time.Minute
+	}
+	// Override default 24h with 5m for LMTP since connections should be short-lived
+	// LMTP is a delivery protocol - messages should be delivered in seconds/minutes, not hours
+	if absoluteSessionTimeout == 24*time.Hour && serverConfig.Timeouts != nil && serverConfig.Timeouts.AbsoluteSessionTimeout == "" {
+		logger.Info("LMTP proxy: Using LMTP-specific default (5 minutes) instead of generic default (24 hours)", "name", serverConfig.Name)
+		absoluteSessionTimeout = 5 * time.Minute
+	}
+
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
 		errChan <- fmt.Errorf("invalid remote_port for LMTP proxy %s: %w", serverConfig.Name, err)
@@ -1575,6 +1587,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseXCLIENT:       serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:         connectTimeout,
 		AuthIdleTimeout:        authIdleTimeout,
+		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		EnableAffinity:         serverConfig.EnableAffinity,
 		LookupCache:            serverConfig.LookupCache,
 		RemoteLookup:           serverConfig.RemoteLookup,

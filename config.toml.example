@@ -1511,9 +1511,18 @@ proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol heade
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-auth_idle_timeout = "2m"
+auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
+                              # Resets after each command received. Cleared after successful authentication.
+                              # Note: absolute_session_timeout (below) separately limits total session duration.
 max_message_size = "50mb"
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+
+# --- TIMEOUT CONFIGURATION ---
+timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.absolute_session_timeout = "5m"    # Maximum total session duration (default: 5m for LMTP)
+                                            # LMTP is a delivery protocol - connections should complete in seconds/minutes
+                                            # 5 minutes is generous for large messages while detecting hung backends quickly
+timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)

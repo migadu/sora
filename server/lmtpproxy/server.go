@@ -22,31 +22,32 @@ import (
 
 // Server represents an LMTP proxy server.
 type Server struct {
-	listener           net.Listener
-	listenerMu         sync.RWMutex
-	rdb                *resilient.ResilientDatabase
-	name               string // Server name for logging
-	addr               string
-	hostname           string
-	connManager        *proxy.ConnectionManager
-	connTracker        *server.ConnectionTracker
-	tls                bool
-	tlsUseStartTLS     bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
-	enableAffinity     bool
-	affinityValidity   time.Duration
-	affinityStickiness float64
-	wg                 sync.WaitGroup
-	ctx                context.Context
-	cancel             context.CancelFunc
-	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig *config.RemoteLookupConfig
-	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
-	authIdleTimeout    time.Duration
-	maxMessageSize     int64
+	listener               net.Listener
+	listenerMu             sync.RWMutex
+	rdb                    *resilient.ResilientDatabase
+	name                   string // Server name for logging
+	addr                   string
+	hostname               string
+	connManager            *proxy.ConnectionManager
+	connTracker            *server.ConnectionTracker
+	tls                    bool
+	tlsUseStartTLS         bool
+	tlsCertFile            string
+	tlsKeyFile             string
+	tlsVerify              bool
+	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
+	enableAffinity         bool
+	affinityValidity       time.Duration
+	affinityStickiness     float64
+	wg                     sync.WaitGroup
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig     *config.RemoteLookupConfig
+	remoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
+	authIdleTimeout        time.Duration // Idle timeout between commands
+	absoluteSessionTimeout time.Duration // Maximum total session duration (prevents hung sessions)
+	maxMessageSize         int64
 
 	// Trusted networks for connection filtering
 	trustedNetworks []*net.IPNet
@@ -94,8 +95,9 @@ type ServerOptions struct {
 	AffinityValidity       time.Duration
 	AffinityStickiness     float64
 	RemoteLookup           *config.RemoteLookupConfig
-	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseXCLIENT       bool     // Whether backend supports XCLIENT command for forwarding
+	TrustedProxies         []string      // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
+	AbsoluteSessionTimeout time.Duration // Maximum total session duration (prevents hung sessions)
 	MaxMessageSize         int64
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
@@ -269,34 +271,35 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	s := &Server{
-		rdb:                rdb,
-		name:               opts.Name,
-		addr:               opts.Addr,
-		hostname:           hostname,
-		connManager:        connManager,
-		tls:                opts.TLS,
-		tlsUseStartTLS:     opts.TLSUseStartTLS,
-		tlsCertFile:        opts.TLSCertFile,
-		tlsKeyFile:         opts.TLSKeyFile,
-		tlsVerify:          opts.TLSVerify,
-		enableAffinity:     opts.EnableAffinity,
-		affinityValidity:   opts.AffinityValidity,
-		affinityStickiness: stickiness,
-		ctx:                ctx,
-		cancel:             cancel,
-		trustedProxies:     opts.TrustedProxies,
-		remotelookupConfig: opts.RemoteLookup,
-		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
-		authIdleTimeout:    opts.AuthIdleTimeout,
-		maxMessageSize:     opts.MaxMessageSize,
-		trustedNetworks:    trustedNets,
-		limiter:            limiter,
-		lookupCache:        lookupCache,
-		listenBacklog:      listenBacklog,
-		debug:              opts.Debug,
-		debugWriter:        debugWriter,
-		activeSessions:     make(map[*Session]struct{}),
-		proxyReader:        proxyReader,
+		rdb:                    rdb,
+		name:                   opts.Name,
+		addr:                   opts.Addr,
+		hostname:               hostname,
+		connManager:            connManager,
+		tls:                    opts.TLS,
+		tlsUseStartTLS:         opts.TLSUseStartTLS,
+		tlsCertFile:            opts.TLSCertFile,
+		tlsKeyFile:             opts.TLSKeyFile,
+		tlsVerify:              opts.TLSVerify,
+		enableAffinity:         opts.EnableAffinity,
+		affinityValidity:       opts.AffinityValidity,
+		affinityStickiness:     stickiness,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		trustedProxies:         opts.TrustedProxies,
+		remotelookupConfig:     opts.RemoteLookup,
+		remoteUseXCLIENT:       opts.RemoteUseXCLIENT,
+		authIdleTimeout:        opts.AuthIdleTimeout,
+		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
+		maxMessageSize:         opts.MaxMessageSize,
+		trustedNetworks:        trustedNets,
+		limiter:                limiter,
+		lookupCache:            lookupCache,
+		listenBacklog:          listenBacklog,
+		debug:                  opts.Debug,
+		debugWriter:            debugWriter,
+		activeSessions:         make(map[*Session]struct{}),
+		proxyReader:            proxyReader,
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
