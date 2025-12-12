@@ -113,6 +113,9 @@ type ConnectionTracker struct {
 	broadcastQueue []ConnectionEvent
 	queueMu        sync.Mutex
 
+	// Instance tracking for stall detection
+	instanceLastSeen map[string]time.Time
+
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 
@@ -149,6 +152,7 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		snapshotOnly:               snapshotOnly,
 		kickSessions:               make(map[int64][]chan struct{}),
 		broadcastQueue:             make([]ConnectionEvent, 0, 100),
+		instanceLastSeen:           make(map[string]time.Time),
 		stopBroadcast:              make(chan struct{}),
 		stopCleanup:                make(chan struct{}),
 		stopStateSnapshot:          make(chan struct{}),
@@ -747,6 +751,14 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 		return
 	}
 
+	// Update last seen time for this instance
+	ct.mu.Lock()
+	if ct.instanceLastSeen == nil {
+		ct.instanceLastSeen = make(map[string]time.Time)
+	}
+	ct.instanceLastSeen[event.InstanceID] = time.Now()
+	ct.mu.Unlock()
+
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
 	if age > 5*time.Minute {
@@ -949,6 +961,22 @@ func (ct *ConnectionTracker) cleanup() {
 	cleaned := 0
 	cleanedInstances := 0
 	cleanedIPs := 0
+
+	// Prune stale instances that haven't gossiped recently
+	// This cleans up data from nodes that crashed or were partitioned
+	staleInstanceThreshold := 5 * time.Minute // 5m is generous for 60s gossip interval
+	for instanceID, lastSeen := range ct.instanceLastSeen {
+		if time.Since(lastSeen) > staleInstanceThreshold {
+			logger.Info("Gossip tracker: Purging stale instance data", "name", ct.name, "instance", instanceID, "age", time.Since(lastSeen))
+			for _, info := range ct.connections {
+				if len(info.PerIPCountByInstance[instanceID]) > 0 {
+					delete(info.PerIPCountByInstance, instanceID)
+					cleanedInstances++
+				}
+			}
+			delete(ct.instanceLastSeen, instanceID)
+		}
+	}
 
 	for accountID, info := range ct.connections {
 		// Clean up zero-count entries in PerIPCountByInstance map

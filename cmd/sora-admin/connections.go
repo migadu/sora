@@ -44,6 +44,7 @@ func handleListConnections(ctx context.Context) {
 	fs := flag.NewFlagSet("connections list", flag.ExitOnError)
 
 	userEmail := fs.String("user", "", "Filter connections by user email")
+	domain := fs.String("domain", "", "Filter connections by domain")
 	protocol := fs.String("protocol", "", "Filter connections by protocol (IMAP, POP3, LMTP)")
 	instanceID := fs.String("instance", "", "Filter connections by instance ID")
 
@@ -55,6 +56,7 @@ Usage:
 
 Options:
   --user string         Filter connections by user email
+  --domain string       Filter connections by domain
   --protocol string     Filter connections by protocol (IMAP, POP3, LMTP)
   --instance string     Filter connections by instance ID
 
@@ -67,6 +69,7 @@ This command shows:
 Examples:
   sora-admin --config config.toml connections list
   sora-admin --config config.toml connections list --user user@example.com
+  sora-admin --config config.toml connections list --domain example.com
   sora-admin --config config.toml connections list --protocol IMAP
   sora-admin --config config.toml connections list --instance server1
 `)
@@ -78,7 +81,7 @@ Examples:
 	}
 
 	// List connections
-	if err := listConnections(ctx, globalConfig, *userEmail, *protocol, *instanceID); err != nil {
+	if err := listConnections(ctx, globalConfig, *userEmail, *domain, *protocol, *instanceID); err != nil {
 		logger.Fatalf("Failed to list connections: %v", err)
 	}
 }
@@ -456,7 +459,7 @@ Use 'sora-admin affinity <subcommand> --help' for detailed help.
 `)
 }
 
-func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, instanceID string) error {
+func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, protocol, instanceID string) error {
 	// Create HTTP API client
 	client, err := createHTTPAPIClient(cfg)
 	if err != nil {
@@ -532,9 +535,9 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		return nil
 	}
 
-	// Apply filters (protocol and instanceID are client-side filters)
+	// Apply filters (domain, protocol and instanceID are client-side filters)
 	filteredConnections := result.Connections
-	if protocol != "" || instanceID != "" {
+	if domain != "" || protocol != "" || instanceID != "" {
 		filtered := make([]struct {
 			Protocol   string    `json:"protocol"`
 			Instance   string    `json:"instance"`
@@ -545,6 +548,16 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 			LastUpdate time.Time `json:"last_update"`
 		}, 0)
 		for _, conn := range result.Connections {
+			// Filter by domain (extract domain from email)
+			if domain != "" {
+				emailDomain := ""
+				if idx := strings.Index(conn.Email, "@"); idx != -1 {
+					emailDomain = conn.Email[idx+1:]
+				}
+				if !strings.EqualFold(emailDomain, domain) {
+					continue
+				}
+			}
 			// Filter by protocol using the instance field (full tracker key)
 			// Examples: "LMTP" matches "LMTP-host1-proxy", "LMTP-host2-proxy", etc.
 			//           "LMTP-host1" matches "LMTP-host1-proxy", "LMTP-host1-other", etc.

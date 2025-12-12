@@ -1144,18 +1144,12 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ctx := r.Context()
-
-	// Get account ID from email
-	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, email)
-	if err != nil {
-		logger.Warn("HTTP API: Error getting account ID", "name", s.name, "email", email, "error", err)
-		s.writeError(w, http.StatusNotFound, "User not found")
-		return
-	}
-
 	// Collect connections for this user from all trackers
+	// Filter by email string matching (case-insensitive) - no database lookup needed
+	// The connection tracker already stores the username (email) via gossip
 	userConnections := make([]map[string]any, 0)
+	emailLower := strings.ToLower(email)
+
 	for protocol, tracker := range s.connectionTrackers {
 		if tracker == nil {
 			continue
@@ -1163,10 +1157,11 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			if connInfo.AccountID == accountID {
+			// Match email case-insensitively
+			if strings.ToLower(connInfo.Username) == emailLower {
 				userConnections = append(userConnections, map[string]any{
 					"protocol":    protocol,
-					"account_id":  accountID,
+					"account_id":  connInfo.AccountID,
 					"email":       connInfo.Username,
 					"local_count": connInfo.GetLocalCount(instanceID),
 					"total_count": connInfo.GetTotalCount(),
