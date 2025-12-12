@@ -674,6 +674,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			options.MaxConnectionsPerUser,      // per-user connection limit
 			options.MaxConnectionsPerUserPerIP, // per-user-per-IP connection limit
 			0,                                  // queue size (not used in local mode)
+			false,                              // snapshot-only mode (not used in local mode)
 		)
 
 		logger.Debug("IMAP: Local connection tracking enabled", "name", name, "max_per_user", options.MaxConnectionsPerUser)

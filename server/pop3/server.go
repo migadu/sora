@@ -304,6 +304,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			options.MaxConnectionsPerUser,      // per-user connection limit
 			options.MaxConnectionsPerUserPerIP, // per-user-per-IP connection limit
 			0,                                  // queue size (not used in local mode)
+			false,                              // snapshot-only mode (not used in local mode)
 		)
 
 		logger.Debug("POP3: Local connection tracking enabled", "name", name, "max", options.MaxConnectionsPerUser)

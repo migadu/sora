@@ -783,9 +783,12 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		maxEventQueueSize = clusterCfg.GetMaxEventQueueSize()
 	}
 
-	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
+	// LMTP uses snapshot-only mode to reduce gossip overhead (connections are short-lived and from trusted backends)
+	snapshotOnly := (protocol == "LMTP")
 
-	tracker := server.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize)
+	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP, "snapshot_only", snapshotOnly)
+
+	tracker := server.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
 	if tracker != nil {
 		srv.SetConnectionTracker(tracker)
 	}
@@ -895,7 +898,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("IMAP", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1047,7 +1050,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("POP3", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()
@@ -1146,7 +1149,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	// Start local connection tracker for backend server
 	if serverConfig.MaxConnectionsPerUser > 0 {
 		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0)
+		tracker := server.NewConnectionTracker("ManageSieve", instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
 		if tracker != nil {
 			s.SetConnTracker(tracker)
 			defer tracker.Stop()

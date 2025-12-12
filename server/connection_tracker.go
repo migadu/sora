@@ -99,9 +99,10 @@ type ConnectionTracker struct {
 	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick
 
 	// Configuration
-	maxConnectionsPerUser      int // Cluster-wide limit per user (0 = unlimited)
-	maxConnectionsPerUserPerIP int // Local limit per user per IP (0 = unlimited)
-	maxEventQueueSize          int // Maximum events in broadcast queue
+	maxConnectionsPerUser      int  // Cluster-wide limit per user (0 = unlimited)
+	maxConnectionsPerUserPerIP int  // Local limit per user per IP (0 = unlimited)
+	maxEventQueueSize          int  // Maximum events in broadcast queue
+	snapshotOnly               bool // If true, only broadcast state snapshots (no individual register/unregister)
 
 	// Broadcast queue for outgoing events
 	broadcastQueue []ConnectionEvent
@@ -125,7 +126,8 @@ type LookupCacheInvalidator interface {
 // NewConnectionTracker creates a new connection tracker.
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
-func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int) *ConnectionTracker {
+// If snapshotOnly is true, only broadcasts periodic state snapshots (no individual register/unregister events).
+func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
 	// Use default if not specified
 	if maxEventQueueSize <= 0 {
 		maxEventQueueSize = defaultMaxEventQueueSize
@@ -139,6 +141,7 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		maxConnectionsPerUser:      maxConnectionsPerUser,
 		maxConnectionsPerUserPerIP: maxConnectionsPerUserPerIP,
 		maxEventQueueSize:          maxEventQueueSize,
+		snapshotOnly:               snapshotOnly,
 		kickSessions:               make(map[int64][]chan struct{}),
 		broadcastQueue:             make([]ConnectionEvent, 0, 100),
 		stopBroadcast:              make(chan struct{}),
@@ -158,8 +161,12 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 		go ct.cleanupRoutine()
 		go ct.stateSnapshotRoutine()
 
+		mode := "full"
+		if snapshotOnly {
+			mode = "snapshot-only"
+		}
 		logger.Info("GossipTracker: Initialized (cluster mode)", "protocol", name,
-			"instance", instanceID, "max_per_user", maxConnectionsPerUser, "queue_size", maxEventQueueSize)
+			"instance", instanceID, "max_per_user", maxConnectionsPerUser, "queue_size", maxEventQueueSize, "mode", mode)
 	} else {
 		// Local mode: no gossip, just track connections locally
 		go ct.cleanupRoutine()
@@ -276,8 +283,8 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 
 	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.LocalCount, "total", info.TotalCount)
 
-	// Broadcast to cluster (only in cluster mode)
-	if ct.clusterManager != nil {
+	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
+	if ct.clusterManager != nil && !ct.snapshotOnly {
 		ct.queueEvent(ConnectionEvent{
 			Type:       ConnectionEventRegister,
 			AccountID:  accountID,
@@ -363,8 +370,8 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 		delete(ct.connections, accountID)
 	}
 
-	// Broadcast to cluster (only in cluster mode)
-	if ct.clusterManager != nil {
+	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
+	if ct.clusterManager != nil && !ct.snapshotOnly {
 		ct.queueEvent(ConnectionEvent{
 			Type:       ConnectionEventUnregister,
 			AccountID:  accountID,
