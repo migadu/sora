@@ -583,10 +583,10 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	}
 
 	// Print header
-	fmt.Printf("%-25s %-12s %-12s %-12s %-20s\n",
-		"User", "Protocol", "Local", "Total", "Last Update")
-	fmt.Printf("%-25s %-12s %-12s %-12s %-20s\n",
-		"----", "--------", "-----", "-----", "-----------")
+	fmt.Printf("%-25s %-12s %-30s %-12s %-12s %-20s\n",
+		"User", "Protocol", "Instance", "Local", "Remote", "Last Update")
+	fmt.Printf("%-25s %-12s %-30s %-12s %-12s %-20s\n",
+		"----", "--------", "--------", "-----", "------", "-----------")
 
 	// Print connection details
 	for _, conn := range filteredConnections {
@@ -600,11 +600,30 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 			email = email[:21] + "..."
 		}
 
-		fmt.Printf("%-25s %-12s %-12d %-12d %-20s\n",
+		// Extract just the server name from instance
+		// Instance format: "PROTOCOL-hostname-servername"
+		// We want just: "servername"
+		instance := conn.Instance
+		parts := strings.Split(instance, "-")
+		if len(parts) >= 3 {
+			// Join everything after "PROTOCOL-hostname"
+			instance = strings.Join(parts[2:], "-")
+		}
+
+		// Truncate if still too long
+		if len(instance) > 29 {
+			instance = instance[:26] + "..."
+		}
+
+		// Calculate remote count (Total - Local)
+		remoteCount := conn.TotalCount - conn.LocalCount
+
+		fmt.Printf("%-25s %-12s %-30s %-12d %-12d %-20s\n",
 			email,
 			conn.Protocol,
+			instance,
 			conn.LocalCount,
-			conn.TotalCount,
+			remoteCount,
 			conn.LastUpdate.Format("2006-01-02 15:04:05"))
 	}
 

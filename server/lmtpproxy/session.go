@@ -77,6 +77,19 @@ func (s *Session) handleConnection() {
 	defer s.server.unregisterSession(s)
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
 
+	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
+	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
+	go func() {
+		<-s.ctx.Done()
+		// Force close connection to unblock any pending Read calls
+		// Use mutex to ensure safe access consistent with close()
+		s.mu.Lock()
+		if s.clientConn != nil {
+			s.clientConn.Close()
+		}
+		s.mu.Unlock()
+	}()
+
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.server.absoluteSessionTimeout > 0 {
 		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
@@ -87,7 +100,7 @@ func (s *Session) handleConnection() {
 	}
 
 	// Log connection at INFO level
-	s.InfoLog("connected")
+	s.InfoLog("connected", "absolute_timeout", s.server.absoluteSessionTimeout, "auth_idle_timeout", s.server.authIdleTimeout)
 
 	// Register this session for graceful shutdown tracking
 	s.server.registerSession(s)

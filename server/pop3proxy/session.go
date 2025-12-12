@@ -47,6 +47,19 @@ func (s *POP3ProxySession) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 
+	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
+	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
+	go func() {
+		<-s.ctx.Done()
+		// Force close connection to unblock any pending Read calls
+		// Use mutex to ensure safe access consistent with close()
+		s.mutex.Lock()
+		if s.clientConn != nil {
+			s.clientConn.Close()
+		}
+		s.mutex.Unlock()
+	}()
+
 	s.startTime = time.Now()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
