@@ -17,7 +17,7 @@ func (m *mockLookupCache) Invalidate(key string) {
 // TestKickInvalidatesCache verifies that kick events invalidate the cache
 func TestKickInvalidatesCache(t *testing.T) {
 	// Create a connection tracker without cluster (local mode for testing)
-	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100, false)
 
 	// Create a mock cache
 	mockCache := &mockLookupCache{
@@ -56,7 +56,7 @@ func TestKickInvalidatesCache(t *testing.T) {
 // TestKickWithoutCacheDoesNotPanic verifies that kick works without a cache
 func TestKickWithoutCacheDoesNotPanic(t *testing.T) {
 	// Create a connection tracker without cache
-	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100, false)
 
 	// Do NOT set lookup cache
 
@@ -84,7 +84,7 @@ func TestKickWithoutCacheDoesNotPanic(t *testing.T) {
 // TestKickWithEmptyUsernameDoesNotInvalidate verifies that kick events
 // without username don't attempt cache invalidation
 func TestKickWithEmptyUsernameDoesNotInvalidate(t *testing.T) {
-	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100, false)
 
 	mockCache := &mockLookupCache{
 		invalidatedKeys: []string{},
@@ -113,7 +113,7 @@ func TestKickWithEmptyUsernameDoesNotInvalidate(t *testing.T) {
 
 // TestMultipleKicksInvalidateMultipleCaches tests kicking multiple users
 func TestMultipleKicksInvalidateMultipleCaches(t *testing.T) {
-	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test-protocol", "test-instance", nil, 0, 0, 100, false)
 
 	mockCache := &mockLookupCache{
 		invalidatedKeys: []string{},

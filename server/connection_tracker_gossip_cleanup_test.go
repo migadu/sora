@@ -10,7 +10,7 @@ import (
 // FirstSeen timestamp, not LastUpdate, so gossip refreshes don't prevent cleanup
 func TestGossipCleanupUsesFirstSeenNotLastUpdate(t *testing.T) {
 	// Create a connection tracker without cluster (simpler for testing)
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0)
+	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
 
 	// Register a connection
 	accountID := int64(12345)
@@ -46,9 +46,10 @@ func TestGossipCleanupUsesFirstSeenNotLastUpdate(t *testing.T) {
 
 	// Verify LocalCount is now 0
 	tracker.mu.Lock()
-	if info.LocalCount != 0 {
+	localCount := info.GetLocalCount(tracker.instanceID)
+	if localCount != 0 {
 		tracker.mu.Unlock()
-		t.Fatalf("Expected LocalCount=0 after unregister, got %d", info.LocalCount)
+		t.Fatalf("Expected LocalCount=0 after unregister, got %d", localCount)
 	}
 	tracker.mu.Unlock()
 
@@ -97,7 +98,7 @@ func TestGossipCleanupUsesFirstSeenNotLastUpdate(t *testing.T) {
 // TestGossipCleanupPreservesActiveConnections verifies that connections
 // with LocalCount > 0 are never cleaned up, even if old
 func TestGossipCleanupPreservesActiveConnections(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0)
+	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
 
 	// Register a connection
 	accountID := int64(12345)
@@ -119,21 +120,23 @@ func TestGossipCleanupPreservesActiveConnections(t *testing.T) {
 	// Verify connection is preserved because LocalCount > 0
 	tracker.mu.Lock()
 	info = tracker.connections[accountID]
-	tracker.mu.Unlock()
-
 	if info == nil {
+		tracker.mu.Unlock()
 		t.Fatal("Active connection (LocalCount > 0) was incorrectly cleaned up")
 	}
 
-	if info.LocalCount != 1 {
-		t.Fatalf("Expected LocalCount=1, got %d", info.LocalCount)
+	localCount := info.GetLocalCount(tracker.instanceID)
+	tracker.mu.Unlock()
+
+	if localCount != 1 {
+		t.Fatalf("Expected LocalCount=1, got %d", localCount)
 	}
 }
 
 // TestGossipCleanupThreeMinuteThreshold verifies the 3-minute threshold
 // for gossip entries (LocalCount=0 but TotalCount>0 from other nodes)
 func TestGossipCleanupThreeMinuteThreshold(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0)
+	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
 
 	// Test cases with different ages
 	testCases := []struct {
@@ -160,15 +163,14 @@ func TestGossipCleanupThreeMinuteThreshold(t *testing.T) {
 			tracker.mu.Lock()
 			// Manually create a gossip entry (simulating entry from another node)
 			firstSeenTime := time.Now().Add(time.Duration(-tc.ageMinutes*60) * time.Second)
+			perIPCountByInstance := make(map[string]map[string]int)
+			perIPCountByInstance["other-node"] = map[string]int{"192.168.1.1": 1}
 			tracker.connections[accountID] = &UserConnectionInfo{
-				AccountID:      accountID,
-				Username:       username,
-				LocalCount:     0, // No local connections
-				TotalCount:     1, // One connection on another node
-				FirstSeen:      firstSeenTime,
-				LastUpdate:     time.Now(), // Kept fresh by gossip
-				LocalInstances: map[string]int{"other-node": 1},
-				PerIPCount:     make(map[string]int),
+				AccountID:            accountID,
+				Username:             username,
+				FirstSeen:            firstSeenTime,
+				LastUpdate:           time.Now(), // Kept fresh by gossip
+				PerIPCountByInstance: perIPCountByInstance,
 			}
 			tracker.mu.Unlock()
 
@@ -196,7 +198,7 @@ func TestGossipCleanupThreeMinuteThreshold(t *testing.T) {
 // TestFirstSeenNotUpdatedByLastUpdate verifies that FirstSeen stays constant
 // even when LastUpdate is refreshed (simulating gossip behavior)
 func TestFirstSeenNotUpdatedByLastUpdate(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0)
+	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
 
 	// Register a connection
 	accountID := int64(12345)

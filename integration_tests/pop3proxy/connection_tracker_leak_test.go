@@ -47,7 +47,7 @@ func TestConnectionTrackerLeak(t *testing.T) {
 	}
 
 	// Create and set connection tracker (local mode with nil cluster manager)
-	tracker := server.NewConnectionTracker("POP3", "test-instance", nil, 5, 2, 1000)
+	tracker := server.NewConnectionTracker("POP3", "test-instance", nil, 5, 2, 1000, false)
 	proxy.SetConnectionTracker(tracker)
 
 	// Start proxy in background

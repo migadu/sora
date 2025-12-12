@@ -997,6 +997,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		if tracker == nil {
 			continue
 		}
+		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
 			// Extract protocol from tracker key
@@ -1008,8 +1009,8 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 				"protocol":    protocol,
 				"instance":    trackerKey, // Full key for debugging/filtering
 				"account_id":  connInfo.AccountID,
-				"local_count": connInfo.LocalCount,
-				"total_count": connInfo.TotalCount,
+				"local_count": connInfo.GetLocalCount(instanceID),
+				"total_count": connInfo.GetTotalCount(),
 				"last_update": connInfo.LastUpdate,
 				"email":       connInfo.Username,
 			})
@@ -1159,6 +1160,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		if tracker == nil {
 			continue
 		}
+		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
 			if connInfo.AccountID == accountID {
@@ -1166,8 +1168,8 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 					"protocol":    protocol,
 					"account_id":  accountID,
 					"email":       connInfo.Username,
-					"local_count": connInfo.LocalCount,
-					"total_count": connInfo.TotalCount,
+					"local_count": connInfo.GetLocalCount(instanceID),
+					"total_count": connInfo.GetTotalCount(),
 					"last_update": connInfo.LastUpdate,
 				})
 			}

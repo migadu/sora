@@ -7,7 +7,7 @@ import (
 
 // TestLocalInstancesMapLeak proves that LocalInstances map accumulates zero-count entries
 func TestLocalInstancesMapLeak(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -44,32 +44,35 @@ func TestLocalInstancesMapLeak(t *testing.T) {
 		return
 	}
 
-	// Check LocalInstances map
-	localInstancesSize := len(info.LocalInstances)
-	if localInstancesSize > 0 {
-		// Check if entries are zero-count
-		zeroCountEntries := 0
-		for instanceID, count := range info.LocalInstances {
-			t.Logf("LocalInstances[%s] = %d", instanceID, count)
-			if count == 0 {
-				zeroCountEntries++
-			}
-		}
-
-		if zeroCountEntries > 0 {
-			t.Errorf("MEMORY LEAK: LocalInstances map has %d zero-count entries", zeroCountEntries)
-			t.Errorf("These entries should be deleted immediately, not wait for cleanup")
+	// Check PerIPCountByInstance map for empty instance maps
+	emptyInstanceMaps := 0
+	for instanceID, perIPMap := range info.PerIPCountByInstance {
+		if len(perIPMap) == 0 {
+			t.Logf("PerIPCountByInstance[%s] is empty", instanceID)
+			emptyInstanceMaps++
 		}
 	}
 
-	// Check PerIPCount map for comparison
-	perIPCountSize := len(info.PerIPCount)
+	if emptyInstanceMaps > 0 {
+		t.Errorf("MEMORY LEAK: PerIPCountByInstance has %d empty instance maps", emptyInstanceMaps)
+		t.Errorf("These entries should be deleted immediately, not wait for cleanup")
+	}
+
+	// Check PerIPCountByInstance map for comparison
+	perIPCountSize := 0
+	for instanceID, perIPMap := range info.PerIPCountByInstance {
+		perIPCountSize += len(perIPMap)
+		for ip, count := range perIPMap {
+			t.Logf("PerIPCountByInstance[%s][%s] = %d", instanceID, ip, count)
+		}
+	}
 	if perIPCountSize > 0 {
 		zeroCountIPs := 0
-		for ip, count := range info.PerIPCount {
-			t.Logf("PerIPCount[%s] = %d", ip, count)
-			if count == 0 {
-				zeroCountIPs++
+		for _, perIPMap := range info.PerIPCountByInstance {
+			for _, count := range perIPMap {
+				if count == 0 {
+					zeroCountIPs++
+				}
 			}
 		}
 
@@ -80,14 +83,13 @@ func TestLocalInstancesMapLeak(t *testing.T) {
 		}
 	}
 
-	t.Logf("LocalInstances map size: %d", localInstancesSize)
-	t.Logf("PerIPCount map size: %d", perIPCountSize)
+	t.Logf("PerIPCountByInstance total IP entries: %d", perIPCountSize)
 }
 
 // TestLocalInstancesMapGrowthWithMultipleInstances tests that the fix prevents map growth
 func TestLocalInstancesMapGrowthWithMultipleInstances(t *testing.T) {
 	// Test that LocalInstances map doesn't accumulate zero-count entries after fix
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -112,7 +114,7 @@ func TestLocalInstancesMapGrowthWithMultipleInstances(t *testing.T) {
 		}
 	}
 
-	// Check LocalInstances map - should be empty or have only active entries
+	// Check PerIPCountByInstance map - should be empty or have only active entries
 	tracker.mu.RLock()
 	info, exists := tracker.connections[accountID]
 	tracker.mu.RUnlock()
@@ -122,31 +124,39 @@ func TestLocalInstancesMapGrowthWithMultipleInstances(t *testing.T) {
 		return
 	}
 
-	localInstancesSize := len(info.LocalInstances)
-	t.Logf("LocalInstances map has %d entries", localInstancesSize)
+	totalInstanceMaps := len(info.PerIPCountByInstance)
+	t.Logf("PerIPCountByInstance has %d instance maps", totalInstanceMaps)
 
 	// Count zero-count entries
 	zeroCountEntries := 0
-	for instanceID, count := range info.LocalInstances {
-		t.Logf("  %s: %d connections", instanceID, count)
-		if count == 0 {
-			zeroCountEntries++
+	emptyInstanceMaps := 0
+	for instanceID, perIPMap := range info.PerIPCountByInstance {
+		if len(perIPMap) == 0 {
+			emptyInstanceMaps++
+			t.Logf("  %s: empty instance map", instanceID)
+		} else {
+			for ip, count := range perIPMap {
+				t.Logf("  %s[%s]: %d connections", instanceID, ip, count)
+				if count == 0 {
+					zeroCountEntries++
+				}
+			}
 		}
 	}
 
-	if zeroCountEntries > 0 {
-		t.Errorf("MEMORY LEAK: %d/%d entries in LocalInstances have zero count",
-			zeroCountEntries, localInstancesSize)
+	if zeroCountEntries > 0 || emptyInstanceMaps > 0 {
+		t.Errorf("MEMORY LEAK: %d zero-count entries and %d empty instance maps",
+			zeroCountEntries, emptyInstanceMaps)
 		t.Errorf("The fix should delete zero-count entries immediately")
 	} else {
-		t.Logf("✓ No zero-count entries - fix is working")
+		t.Logf("✓ No zero-count entries or empty maps - fix is working")
 	}
 }
 
 // TestLocalInstancesVsPerIPCountConsistency tests the inconsistency between cleanup strategies
 func TestLocalInstancesVsPerIPCountConsistency(t *testing.T) {
 	// Test with per-IP limiting enabled
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 10, 1000)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 10, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -180,38 +190,48 @@ func TestLocalInstancesVsPerIPCountConsistency(t *testing.T) {
 		return
 	}
 
-	localInstancesSize := len(info.LocalInstances)
-	perIPCountSize := len(info.PerIPCount)
-
-	t.Logf("LocalInstances size: %d", localInstancesSize)
-	t.Logf("PerIPCount size: %d", perIPCountSize)
-
-	// PerIPCount should be empty (cleaned immediately)
-	if perIPCountSize > 0 {
-		t.Errorf("INCONSISTENCY: PerIPCount has %d entries (should be 0)", perIPCountSize)
-		for ip, count := range info.PerIPCount {
-			t.Logf("  PerIPCount[%s] = %d", ip, count)
+	totalInstanceMaps := len(info.PerIPCountByInstance)
+	perIPCountSize := 0
+	zeroCountEntries := 0
+	emptyInstanceMaps := 0
+	for _, perIPMap := range info.PerIPCountByInstance {
+		if len(perIPMap) == 0 {
+			emptyInstanceMaps++
+		} else {
+			perIPCountSize += len(perIPMap)
+			for _, count := range perIPMap {
+				if count == 0 {
+					zeroCountEntries++
+				}
+			}
 		}
-	} else {
-		t.Logf("✓ PerIPCount is empty (immediate cleanup works)")
 	}
 
-	// LocalInstances should also be empty but likely isn't
-	if localInstancesSize > 0 {
-		t.Logf("⚠️  INCONSISTENCY: LocalInstances has %d entries (PerIPCount has %d)",
-			localInstancesSize, perIPCountSize)
-		t.Logf("LocalInstances uses deferred cleanup, PerIPCount uses immediate cleanup")
-		t.Logf("This inconsistency suggests LocalInstances should also use immediate cleanup")
+	t.Logf("PerIPCountByInstance instances: %d", totalInstanceMaps)
+	t.Logf("PerIPCountByInstance total IP entries: %d", perIPCountSize)
+	t.Logf("Empty instance maps: %d", emptyInstanceMaps)
+	t.Logf("Zero-count IP entries: %d", zeroCountEntries)
 
-		for instanceID, count := range info.LocalInstances {
-			t.Logf("  LocalInstances[%s] = %d", instanceID, count)
+	// PerIPCountByInstance should be empty (cleaned immediately)
+	if perIPCountSize > 0 {
+		t.Errorf("BUG: PerIPCountByInstance has %d entries (should be 0 after disconnect)", perIPCountSize)
+		for instanceID, perIPMap := range info.PerIPCountByInstance {
+			for ip, count := range perIPMap {
+				t.Logf("  PerIPCountByInstance[%s][%s] = %d", instanceID, ip, count)
+			}
 		}
+	} else {
+		t.Logf("✓ PerIPCountByInstance is empty (immediate cleanup works)")
+	}
+
+	if emptyInstanceMaps > 0 {
+		t.Errorf("BUG: PerIPCountByInstance has %d empty instance maps (should be cleaned immediately)", emptyInstanceMaps)
 	}
 }
 
 // TestMemoryImpactWithManyUsers tests map growth with many users
 func TestMemoryImpactWithManyUsers(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10000)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -231,17 +251,26 @@ func TestMemoryImpactWithManyUsers(t *testing.T) {
 		tracker.UnregisterConnection(ctx, accountID, protocol, clientAddr)
 	}
 
-	// Count total LocalInstances entries across all users
+	// Count total PerIPCountByInstance entries across all users
 	tracker.mu.RLock()
 	totalUsers := len(tracker.connections)
-	totalLocalInstances := 0
+	totalInstanceMaps := 0
+	totalIPEntries := 0
 	totalZeroCountEntries := 0
+	totalEmptyInstanceMaps := 0
 
 	for _, info := range tracker.connections {
-		totalLocalInstances += len(info.LocalInstances)
-		for _, count := range info.LocalInstances {
-			if count == 0 {
-				totalZeroCountEntries++
+		totalInstanceMaps += len(info.PerIPCountByInstance)
+		for _, perIPMap := range info.PerIPCountByInstance {
+			if len(perIPMap) == 0 {
+				totalEmptyInstanceMaps++
+			} else {
+				totalIPEntries += len(perIPMap)
+				for _, count := range perIPMap {
+					if count == 0 {
+						totalZeroCountEntries++
+					}
+				}
 			}
 		}
 	}
@@ -249,13 +278,15 @@ func TestMemoryImpactWithManyUsers(t *testing.T) {
 
 	t.Logf("Simulated %d users connecting/disconnecting", numUsers)
 	t.Logf("Users in tracker: %d", totalUsers)
-	t.Logf("Total LocalInstances entries: %d", totalLocalInstances)
-	t.Logf("Zero-count entries: %d", totalZeroCountEntries)
+	t.Logf("Total instance maps: %d", totalInstanceMaps)
+	t.Logf("Total IP entries: %d", totalIPEntries)
+	t.Logf("Empty instance maps: %d", totalEmptyInstanceMaps)
+	t.Logf("Zero-count IP entries: %d", totalZeroCountEntries)
 
-	if totalZeroCountEntries > 0 {
-		estimatedWaste := totalZeroCountEntries * 32 // map entry overhead
-		t.Errorf("MEMORY LEAK: %d zero-count entries wasting ~%d bytes",
-			totalZeroCountEntries, estimatedWaste)
+	if totalZeroCountEntries > 0 || totalEmptyInstanceMaps > 0 {
+		estimatedWaste := (totalZeroCountEntries + totalEmptyInstanceMaps) * 32 // map entry overhead
+		t.Errorf("MEMORY LEAK: %d zero-count entries and %d empty maps wasting ~%d bytes",
+			totalZeroCountEntries, totalEmptyInstanceMaps, estimatedWaste)
 		t.Errorf("This memory won't be reclaimed until cleanup runs (every 5 minutes)")
 	}
 
@@ -263,14 +294,21 @@ func TestMemoryImpactWithManyUsers(t *testing.T) {
 	tracker.cleanup()
 
 	tracker.mu.RLock()
-	totalLocalInstancesAfter := 0
+	totalIPEntriesAfter := 0
+	totalEmptyInstanceMapsAfter := 0
 	for _, info := range tracker.connections {
-		totalLocalInstancesAfter += len(info.LocalInstances)
+		for _, perIPMap := range info.PerIPCountByInstance {
+			if len(perIPMap) == 0 {
+				totalEmptyInstanceMapsAfter++
+			} else {
+				totalIPEntriesAfter += len(perIPMap)
+			}
+		}
 	}
 	tracker.mu.RUnlock()
 
-	removed := totalLocalInstances - totalLocalInstancesAfter
+	removed := (totalIPEntries + totalEmptyInstanceMaps) - (totalIPEntriesAfter + totalEmptyInstanceMapsAfter)
 	if removed > 0 {
-		t.Logf("✓ Cleanup removed %d zero-count entries", removed)
+		t.Logf("✓ Cleanup removed %d entries/maps", removed)
 	}
 }

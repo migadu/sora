@@ -83,7 +83,7 @@ func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser i
 	}
 
 	// Create and set connection tracker in local mode (no cluster manager)
-	tracker := serverPkg.NewConnectionTracker("IMAP", "test-backend-instance", nil, maxConnectionsPerUser, 0, 0)
+	tracker := serverPkg.NewConnectionTracker("IMAP", "test-backend-instance", nil, maxConnectionsPerUser, 0, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}

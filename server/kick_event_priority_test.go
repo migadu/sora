@@ -8,7 +8,7 @@ import (
 // even when the queue overflows
 func TestKickEventPriority_NeverDropped(t *testing.T) {
 	// Create tracker with very small queue for testing
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10, false)
 	defer tracker.Stop()
 
 	// Fill queue with register events (9 events, leaving 1 slot)
@@ -72,7 +72,7 @@ func TestKickEventPriority_NeverDropped(t *testing.T) {
 // TestKickEventPriority_RegisterEventsDropped verifies that register events
 // are dropped before kick events when queue overflows
 func TestKickEventPriority_RegisterEventsDropped(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10, false)
 	defer tracker.Stop()
 
 	// Fill queue completely with non-critical events first
@@ -129,7 +129,7 @@ func TestKickEventPriority_RegisterEventsDropped(t *testing.T) {
 
 // TestKickEventPriority_AllKicksQueue verifies behavior when queue is full of kick events
 func TestKickEventPriority_AllKicksQueue(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10, false)
 	defer tracker.Stop()
 
 	// Fill entire queue with kick events
@@ -199,7 +199,7 @@ func TestKickEventPriority_AllKicksQueue(t *testing.T) {
 
 // TestKickEventPriority_LargeScaleOverflow tests behavior with many events
 func TestKickEventPriority_LargeScaleOverflow(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 100, false)
 	defer tracker.Stop()
 
 	// Add 50 kick events
@@ -254,7 +254,7 @@ func TestKickEventPriority_LargeScaleOverflow(t *testing.T) {
 
 // TestDropNonCriticalEvents tests the dropNonCriticalEvents helper function
 func TestDropNonCriticalEvents(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 100)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 100, false)
 	defer tracker.Stop()
 
 	// Populate queue with known events
@@ -302,7 +302,7 @@ func TestDropNonCriticalEvents(t *testing.T) {
 
 // TestKickEventPriority_RealWorldScenario simulates a realistic overflow scenario
 func TestKickEventPriority_RealWorldScenario(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 50)
+	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 50, false)
 	defer tracker.Stop()
 
 	// Simulate normal operation: queue register events

@@ -187,6 +187,7 @@ func TestConnectionTracker_HandleRegisterIncrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-1",
+		ClientAddr: "192.168.1.100:12345",
 	}
 
 	tracker.handleRegister(event1)
@@ -200,8 +201,8 @@ func TestConnectionTracker_HandleRegisterIncrementsCounts(t *testing.T) {
 		t.Fatal("Connection info not found")
 	}
 
-	if info.TotalCount != 1 {
-		t.Errorf("Expected TotalCount=1, got %d", info.TotalCount)
+	if info.GetTotalCount() != 1 {
+		t.Errorf("Expected TotalCount=1, got %d", info.GetTotalCount())
 	}
 
 	// Register second connection from different instance
@@ -211,6 +212,7 @@ func TestConnectionTracker_HandleRegisterIncrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-2",
+		ClientAddr: "192.168.1.200:54321",
 	}
 
 	tracker.handleRegister(event2)
@@ -219,17 +221,17 @@ func TestConnectionTracker_HandleRegisterIncrementsCounts(t *testing.T) {
 	info = tracker.connections[accountID]
 	tracker.mu.RUnlock()
 
-	if info.TotalCount != 2 {
-		t.Errorf("Expected TotalCount=2, got %d", info.TotalCount)
+	if info.GetTotalCount() != 2 {
+		t.Errorf("Expected TotalCount=2, got %d", info.GetTotalCount())
 	}
 
 	// Check per-instance counts
-	if info.LocalInstances["instance-1"] != 1 {
-		t.Errorf("Expected instance-1 count=1, got %d", info.LocalInstances["instance-1"])
+	if info.GetLocalCount("instance-1") != 1 {
+		t.Errorf("Expected instance-1 count=1, got %d", info.GetLocalCount("instance-1"))
 	}
 
-	if info.LocalInstances["instance-2"] != 1 {
-		t.Errorf("Expected instance-2 count=1, got %d", info.LocalInstances["instance-2"])
+	if info.GetLocalCount("instance-2") != 1 {
+		t.Errorf("Expected instance-2 count=1, got %d", info.GetLocalCount("instance-2"))
 	}
 
 	t.Log("✓ Connection counts incremented correctly via gossip events")
@@ -253,6 +255,7 @@ func TestConnectionTracker_HandleUnregisterDecrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-1",
+		ClientAddr: "192.168.1.100:12345",
 	})
 
 	tracker.handleRegister(ConnectionEvent{
@@ -261,6 +264,7 @@ func TestConnectionTracker_HandleUnregisterDecrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-1",
+		ClientAddr: "192.168.1.100:12346",
 	})
 
 	// Unregister one
@@ -270,6 +274,7 @@ func TestConnectionTracker_HandleUnregisterDecrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-1",
+		ClientAddr: "192.168.1.100:12345",
 	})
 
 	// Check counts
@@ -281,8 +286,8 @@ func TestConnectionTracker_HandleUnregisterDecrementsCounts(t *testing.T) {
 		t.Fatal("Connection info not found after unregister")
 	}
 
-	if info.TotalCount != 1 {
-		t.Errorf("Expected TotalCount=1 after unregister, got %d", info.TotalCount)
+	if info.GetTotalCount() != 1 {
+		t.Errorf("Expected TotalCount=1 after unregister, got %d", info.GetTotalCount())
 	}
 
 	// Unregister the last one
@@ -292,6 +297,7 @@ func TestConnectionTracker_HandleUnregisterDecrementsCounts(t *testing.T) {
 		Username:   username,
 		Protocol:   "IMAP",
 		InstanceID: "instance-1",
+		ClientAddr: "192.168.1.100:12346",
 	})
 
 	// Connection info should be cleaned up

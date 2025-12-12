@@ -62,23 +62,28 @@ type ConnectionStateSnapshot struct {
 
 // UserConnectionData is the serializable version of UserConnectionInfo for gossip
 type UserConnectionData struct {
-	AccountID      int64          `json:"account_id"`
-	Username       string         `json:"username"`
-	LocalInstances map[string]int `json:"local_instances"` // instanceID -> count
-	PerIPCount     map[string]int `json:"per_ip_count"`    // clientIP -> count (cluster-wide)
-	LastUpdate     time.Time      `json:"last_update"`
+	AccountID  int64          `json:"account_id"`
+	Username   string         `json:"username"`
+	PerIPCount map[string]int `json:"per_ip_count"` // clientIP -> count (for THIS instance only)
+	LastUpdate time.Time      `json:"last_update"`
 }
 
 // UserConnectionInfo tracks connection information for a specific user
 type UserConnectionInfo struct {
-	AccountID      int64
-	Username       string
-	TotalCount     int // Cluster-wide count (eventually consistent)
-	LocalCount     int // This instance's count
-	LastUpdate     time.Time
-	FirstSeen      time.Time      // When we first saw this connection (for cleanup, not updated by gossip)
-	LocalInstances map[string]int // instanceID -> count on that instance
-	PerIPCount     map[string]int // clientIP -> count (cluster-wide via gossip, for per-user-per-IP limiting)
+	AccountID  int64
+	Username   string
+	LastUpdate time.Time
+	FirstSeen  time.Time // When we first saw this connection (for cleanup, not updated by gossip)
+
+	// PerIPCountByInstance tracks per-IP connection counts per instance (including local).
+	// Structure: PerIPCountByInstance[instanceID][clientIP] = count
+	//
+	// - Local instance uses ct.instanceID as key
+	// - Remote instances use their instanceID from gossip
+	// - State snapshots replace entire map for the sending instance (authoritative)
+	// - To get cluster-wide count for an IP: sum across all instances
+	// - To get total connections: sum all counts across all instances and IPs
+	PerIPCountByInstance map[string]map[string]int // instanceID -> (clientIP -> count)
 }
 
 // ConnectionTracker manages connection tracking using gossip protocol
@@ -206,30 +211,30 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	if !exists {
 		now := time.Now()
 		info = &UserConnectionInfo{
-			AccountID:      accountID,
-			Username:       username,
-			TotalCount:     0,
-			LocalCount:     0,
-			LastUpdate:     now,
-			FirstSeen:      now,
-			LocalInstances: make(map[string]int),
-			PerIPCount:     make(map[string]int),
+			AccountID:            accountID,
+			Username:             username,
+			LastUpdate:           now,
+			FirstSeen:            now,
+			PerIPCountByInstance: make(map[string]map[string]int),
 		}
 		ct.connections[accountID] = info
 	}
 
 	// Check limit (if configured)
 	// In cluster mode, check cluster-wide count. In local mode, check local count.
-	checkCount := info.TotalCount // cluster mode
+	var checkCount int
+	var scope string
 	if ct.clusterManager == nil {
-		checkCount = info.LocalCount // local mode
+		// Local mode: check only this instance
+		checkCount = info.GetLocalCount(ct.instanceID)
+		scope = "on this server"
+	} else {
+		// Cluster mode: check cluster-wide
+		checkCount = info.GetTotalCount()
+		scope = "across cluster"
 	}
 
 	if ct.maxConnectionsPerUser > 0 && checkCount >= ct.maxConnectionsPerUser {
-		scope := "across cluster"
-		if ct.clusterManager == nil {
-			scope = "on this server"
-		}
 		logger.Info("Connection tracker: Maximum connections per user reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "current", checkCount, "max", ct.maxConnectionsPerUser, "scope", scope, "client_addr", clientAddr)
 		return fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
 			username, checkCount, ct.maxConnectionsPerUser, scope)
@@ -248,7 +253,8 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 			}
 		}
 
-		ipCount := info.PerIPCount[clientIP]
+		// Get cluster-wide count for this IP by summing across all instances
+		ipCount := info.GetClusterWideIPCount(clientIP)
 		if ipCount >= ct.maxConnectionsPerUserPerIP {
 			logger.Info("Connection tracker: Maximum connections per user per IP reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "ip", clientIP, "current", ipCount, "max", ct.maxConnectionsPerUserPerIP, "client_addr", clientAddr)
 			return fmt.Errorf("user %s has reached maximum connections from IP %s (%d/%d)",
@@ -256,32 +262,27 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		}
 	}
 
-	// Increment local count
-	info.LocalCount++
-	info.TotalCount++
+	// Increment connection count for this instance
 	info.LastUpdate = time.Now()
-	info.LocalInstances[ct.instanceID]++
 
-	// Increment per-IP count (if tracking enabled)
-	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
-		// Extract IP from clientAddr
-		clientIP := clientAddr
-		if idx := len(clientAddr) - 1; idx >= 0 {
-			for i := idx; i >= 0; i-- {
-				if clientAddr[i] == ':' {
-					clientIP = clientAddr[:i]
-					break
-				}
+	// Extract IP from clientAddr (we always track per-IP, even if limiting is disabled)
+	clientIP := clientAddr
+	if idx := len(clientAddr) - 1; idx >= 0 {
+		for i := idx; i >= 0; i-- {
+			if clientAddr[i] == ':' {
+				clientIP = clientAddr[:i]
+				break
 			}
 		}
-		info.PerIPCount[clientIP]++
 	}
 
-	if ct.clusterManager == nil {
-		info.TotalCount = info.LocalCount // In local mode, total = local
+	// Initialize nested map if needed
+	if info.PerIPCountByInstance[ct.instanceID] == nil {
+		info.PerIPCountByInstance[ct.instanceID] = make(map[string]int)
 	}
+	info.PerIPCountByInstance[ct.instanceID][clientIP]++
 
-	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.LocalCount, "total", info.TotalCount)
+	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.GetLocalCount(ct.instanceID), "total", info.GetTotalCount())
 
 	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
 	if ct.clusterManager != nil && !ct.snapshotOnly {
@@ -315,55 +316,44 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 		return nil
 	}
 
-	// Decrement local count
-	if info.LocalCount > 0 {
-		info.LocalCount--
-	}
-	if info.TotalCount > 0 {
-		info.TotalCount--
-	}
-	if count := info.LocalInstances[ct.instanceID]; count > 0 {
-		info.LocalInstances[ct.instanceID] = count - 1
-		// Clean up zero counts immediately (consistent with PerIPCount cleanup)
-		if info.LocalInstances[ct.instanceID] == 0 {
-			delete(info.LocalInstances, ct.instanceID)
+	// Decrement connection count for this instance
+	// Extract IP from clientAddr
+	clientIP := clientAddr
+	if idx := len(clientAddr) - 1; idx >= 0 {
+		for i := idx; i >= 0; i-- {
+			if clientAddr[i] == ':' {
+				clientIP = clientAddr[:i]
+				break
+			}
 		}
 	}
 
-	// Decrement per-IP count (if tracking enabled)
-	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
-		// Extract IP from clientAddr
-		clientIP := clientAddr
-		if idx := len(clientAddr) - 1; idx >= 0 {
-			for i := idx; i >= 0; i-- {
-				if clientAddr[i] == ':' {
-					clientIP = clientAddr[:i]
-					break
-				}
-			}
-		}
-		if count := info.PerIPCount[clientIP]; count > 0 {
-			info.PerIPCount[clientIP] = count - 1
+	if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
+		if count := perIPMap[clientIP]; count > 0 {
+			perIPMap[clientIP] = count - 1
 			// Clean up zero counts
-			if info.PerIPCount[clientIP] == 0 {
-				delete(info.PerIPCount, clientIP)
+			if perIPMap[clientIP] == 0 {
+				delete(perIPMap, clientIP)
+			}
+			// Clean up empty instance map
+			if len(perIPMap) == 0 {
+				delete(info.PerIPCountByInstance, ct.instanceID)
 			}
 		}
-	}
-
-	// In local mode, keep total = local
-	if ct.clusterManager == nil {
-		info.TotalCount = info.LocalCount
 	}
 
 	info.LastUpdate = time.Now()
 
-	logger.Debug("Connection tracker: Unregistered", "name", ct.name, "type", ct.trackerType(), "user", info.Username, "local", info.LocalCount, "total", info.TotalCount)
+	logger.Debug("Connection tracker: Unregistered", "name", ct.name, "type", ct.trackerType(), "user", info.Username, "local", info.GetLocalCount(ct.instanceID), "total", info.GetTotalCount())
 
-	// Clean up if no local connections remain
-	cleanupThreshold := info.TotalCount
+	// Clean up if no connections remain
+	var cleanupThreshold int
 	if ct.clusterManager == nil {
-		cleanupThreshold = info.LocalCount // In local mode, clean up when no local connections
+		// In local mode, clean up when no local connections
+		cleanupThreshold = info.GetLocalCount(ct.instanceID)
+	} else {
+		// In cluster mode, clean up when no connections across cluster
+		cleanupThreshold = info.GetTotalCount()
 	}
 
 	if cleanupThreshold <= 0 {
@@ -387,6 +377,47 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	return nil
 }
 
+// getClusterWideIPCount calculates the cluster-wide connection count for a specific IP
+// by summing counts across all instances in PerIPCountByInstance
+func (info *UserConnectionInfo) GetClusterWideIPCount(clientIP string) int {
+	total := 0
+	for _, perIPMap := range info.PerIPCountByInstance {
+		total += perIPMap[clientIP]
+	}
+	return total
+}
+
+// getTotalCount calculates the total cluster-wide connection count
+// by summing all counts across all instances and IPs
+func (info *UserConnectionInfo) GetTotalCount() int {
+	total := 0
+	for _, perIPMap := range info.PerIPCountByInstance {
+		for _, count := range perIPMap {
+			total += count
+		}
+	}
+	return total
+}
+
+// getLocalCount returns the connection count for a specific instance
+func (info *UserConnectionInfo) GetLocalCount(instanceID string) int {
+	total := 0
+	if perIPMap := info.PerIPCountByInstance[instanceID]; perIPMap != nil {
+		for _, count := range perIPMap {
+			total += count
+		}
+	}
+	return total
+}
+
+// GetInstanceID returns the instance ID of this tracker
+func (ct *ConnectionTracker) GetInstanceID() string {
+	if ct == nil {
+		return ""
+	}
+	return ct.instanceID
+}
+
 // GetConnectionCount returns the cluster-wide connection count for a user
 func (ct *ConnectionTracker) GetConnectionCount(accountID int64) int {
 	if ct == nil {
@@ -397,7 +428,7 @@ func (ct *ConnectionTracker) GetConnectionCount(accountID int64) int {
 	defer ct.mu.RUnlock()
 
 	if info, exists := ct.connections[accountID]; exists {
-		return info.TotalCount
+		return info.GetTotalCount()
 	}
 	return 0
 }
@@ -412,7 +443,7 @@ func (ct *ConnectionTracker) GetLocalConnectionCount(accountID int64) int {
 	defer ct.mu.RUnlock()
 
 	if info, exists := ct.connections[accountID]; exists {
-		return info.LocalCount
+		return info.GetLocalCount(ct.instanceID)
 	}
 	return 0
 }
@@ -428,21 +459,21 @@ func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
 
 	result := make([]UserConnectionInfo, 0, len(ct.connections))
 	for _, info := range ct.connections {
-		var instancesCopy map[string]int
-		if len(info.LocalInstances) > 0 {
-			instancesCopy = make(map[string]int, len(info.LocalInstances))
-			for k, v := range info.LocalInstances {
-				instancesCopy[k] = v
+		// Deep copy PerIPCountByInstance
+		perIPCopy := make(map[string]map[string]int, len(info.PerIPCountByInstance))
+		for instanceID, perIPMap := range info.PerIPCountByInstance {
+			perIPCopy[instanceID] = make(map[string]int, len(perIPMap))
+			for ip, count := range perIPMap {
+				perIPCopy[instanceID][ip] = count
 			}
 		}
 
 		result = append(result, UserConnectionInfo{
-			AccountID:      info.AccountID,
-			Username:       info.Username,
-			TotalCount:     info.TotalCount,
-			LocalCount:     info.LocalCount,
-			LastUpdate:     info.LastUpdate,
-			LocalInstances: instancesCopy,
+			AccountID:            info.AccountID,
+			Username:             info.Username,
+			LastUpdate:           info.LastUpdate,
+			FirstSeen:            info.FirstSeen,
+			PerIPCountByInstance: perIPCopy,
 		})
 	}
 	return result
@@ -460,7 +491,7 @@ func (ct *ConnectionTracker) GetUniqueUserCount() int {
 	// Count unique users with at least one connection
 	count := 0
 	for _, info := range ct.connections {
-		if info.TotalCount > 0 {
+		if info.GetTotalCount() > 0 {
 			count++
 		}
 	}
@@ -752,24 +783,18 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 	if !exists {
 		now := time.Now()
 		info = &UserConnectionInfo{
-			AccountID:      event.AccountID,
-			Username:       event.Username,
-			TotalCount:     0,
-			LocalCount:     0,
-			LastUpdate:     now,
-			FirstSeen:      now,
-			LocalInstances: make(map[string]int),
-			PerIPCount:     make(map[string]int),
+			AccountID:            event.AccountID,
+			Username:             event.Username,
+			LastUpdate:           now,
+			FirstSeen:            now,
+			PerIPCountByInstance: make(map[string]map[string]int),
 		}
 		ct.connections[event.AccountID] = info
 	}
 
-	// Increment cluster-wide count
-	info.TotalCount++
 	info.LastUpdate = time.Now()
-	info.LocalInstances[event.InstanceID]++
 
-	// Increment per-IP count (cluster-wide tracking via gossip)
+	// Increment per-IP count for the remote instance (cluster-wide tracking via gossip)
 	if event.ClientAddr != "" {
 		// Extract IP from clientAddr
 		clientIP := event.ClientAddr
@@ -781,10 +806,15 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 				}
 			}
 		}
-		info.PerIPCount[clientIP]++
+
+		// Initialize nested map if needed
+		if info.PerIPCountByInstance[event.InstanceID] == nil {
+			info.PerIPCountByInstance[event.InstanceID] = make(map[string]int)
+		}
+		info.PerIPCountByInstance[event.InstanceID][clientIP]++
 	}
 
-	logger.Debug("Gossip tracker: Cluster register", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
+	logger.Debug("Gossip tracker: Cluster register", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.GetTotalCount())
 }
 
 // handleUnregister processes an unregister event from another node
@@ -797,19 +827,7 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 		return // Unknown user, ignore
 	}
 
-	// Decrement cluster-wide count
-	if info.TotalCount > 0 {
-		info.TotalCount--
-	}
-	if count := info.LocalInstances[event.InstanceID]; count > 0 {
-		info.LocalInstances[event.InstanceID] = count - 1
-		// Clean up zero counts immediately (consistent with PerIPCount cleanup)
-		if info.LocalInstances[event.InstanceID] == 0 {
-			delete(info.LocalInstances, event.InstanceID)
-		}
-	}
-
-	// Decrement per-IP count (cluster-wide tracking via gossip)
+	// Decrement per-IP count for the remote instance (cluster-wide tracking via gossip)
 	if event.ClientAddr != "" {
 		// Extract IP from clientAddr
 		clientIP := event.ClientAddr
@@ -821,21 +839,28 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 				}
 			}
 		}
-		if count := info.PerIPCount[clientIP]; count > 0 {
-			info.PerIPCount[clientIP] = count - 1
-			// Clean up zero counts
-			if info.PerIPCount[clientIP] == 0 {
-				delete(info.PerIPCount, clientIP)
+
+		if perIPMap := info.PerIPCountByInstance[event.InstanceID]; perIPMap != nil {
+			if count := perIPMap[clientIP]; count > 0 {
+				perIPMap[clientIP] = count - 1
+				// Clean up zero counts
+				if perIPMap[clientIP] == 0 {
+					delete(perIPMap, clientIP)
+				}
+				// Clean up empty instance map
+				if len(perIPMap) == 0 {
+					delete(info.PerIPCountByInstance, event.InstanceID)
+				}
 			}
 		}
 	}
 
 	info.LastUpdate = time.Now()
 
-	logger.Debug("Gossip tracker: Cluster unregister", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.TotalCount)
+	logger.Debug("Gossip tracker: Cluster unregister", "name", ct.name, "user", event.Username, "instance", event.InstanceID, "cluster_total", info.GetTotalCount())
 
 	// Clean up if no connections remain
-	if info.TotalCount <= 0 {
+	if info.GetTotalCount() <= 0 {
 		delete(ct.connections, event.AccountID)
 	}
 }
@@ -922,19 +947,18 @@ func (ct *ConnectionTracker) cleanup() {
 	cleanedIPs := 0
 
 	for accountID, info := range ct.connections {
-		// Clean up zero-count entries in LocalInstances map
-		for instanceID, count := range info.LocalInstances {
-			if count <= 0 {
-				delete(info.LocalInstances, instanceID)
-				cleanedInstances++
+		// Clean up zero-count entries in PerIPCountByInstance map
+		for instanceID, perIPMap := range info.PerIPCountByInstance {
+			for ip, count := range perIPMap {
+				if count <= 0 {
+					delete(perIPMap, ip)
+					cleanedIPs++
+				}
 			}
-		}
-
-		// Clean up zero-count entries in PerIPCount map
-		for ip, count := range info.PerIPCount {
-			if count <= 0 {
-				delete(info.PerIPCount, ip)
-				cleanedIPs++
+			// Clean up empty instance maps
+			if len(perIPMap) == 0 {
+				delete(info.PerIPCountByInstance, instanceID)
+				cleanedInstances++
 			}
 		}
 
@@ -949,31 +973,39 @@ func (ct *ConnectionTracker) cleanup() {
 		veryStaleTimeout := 3 * time.Minute
 		veryStaleThreshold := time.Now().Add(-1 * veryStaleTimeout)
 
-		if info.TotalCount <= 0 {
+		totalCount := info.GetTotalCount()
+		localCount := info.GetLocalCount(ct.instanceID)
+
+		if totalCount <= 0 {
 			// Case 1: Normal cleanup - no connections at all (clean immediately)
 			delete(ct.connections, accountID)
 			cleaned++
-		} else if info.LocalCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
-			// Case 2: Gossip desync recovery - no local connections and very stale
-			// This handles lost gossip messages from other nodes or connections that never closed properly
-			logger.Info("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
+		} else if localCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
+			// Case 2: Fallback cleanup for edge cases not handled by state snapshots
+			// This handles:
+			// - Nodes permanently offline (no more state snapshots received)
+			// - Network partitions >5 minutes (snapshots rejected as too old)
+			// - Lost state snapshot messages
+			// With authoritative state snapshots, this should be rare (most cleanup happens via snapshots within 60s)
+			logger.Info("Gossip tracker: Fallback cleanup of stale remote entry", "name", ct.name,
 				"user", info.Username, "account_id", accountID,
-				"total", info.TotalCount, "local", info.LocalCount,
+				"total", totalCount, "local", localCount,
 				"first_seen", info.FirstSeen, "age", time.Since(info.FirstSeen),
 				"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
-				"threshold", veryStaleTimeout, "instances", info.LocalInstances)
+				"threshold", veryStaleTimeout, "instances", len(info.PerIPCountByInstance),
+				"reason", "This may indicate a node offline/partitioned or missed state snapshots")
 			delete(ct.connections, accountID)
 			cleaned++
-		} else if info.LocalCount == 0 && info.TotalCount > 0 {
+		} else if localCount == 0 && totalCount > 0 {
 			// Log entries that are NOT being cleaned (for debugging)
 			age := time.Since(info.FirstSeen)
 			if age > 1*time.Minute {
 				logger.Info("Gossip tracker: Keeping remote entry (not stale enough yet)", "name", ct.name,
 					"user", info.Username, "account_id", accountID,
-					"total", info.TotalCount, "local", info.LocalCount,
+					"total", totalCount, "local", localCount,
 					"first_seen", info.FirstSeen, "age", age,
 					"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
-					"threshold", veryStaleTimeout, "instances", info.LocalInstances)
+					"threshold", veryStaleTimeout, "instances", len(info.PerIPCountByInstance))
 			}
 		}
 	}
@@ -983,8 +1015,11 @@ func (ct *ConnectionTracker) cleanup() {
 	totalInstanceIDs := 0
 	totalIPs := 0
 	for _, info := range ct.connections {
-		totalInstanceIDs += len(info.LocalInstances)
-		totalIPs += len(info.PerIPCount)
+		totalInstanceIDs += len(info.PerIPCountByInstance)
+		// Count total IP tracking entries across all instances
+		for _, perIPMap := range info.PerIPCountByInstance {
+			totalIPs += len(perIPMap)
+		}
 	}
 
 	if cleaned > 0 || cleanedInstances > 0 || cleanedIPs > 0 {
@@ -1057,32 +1092,26 @@ func (ct *ConnectionTracker) broadcastStateSnapshot() {
 	}
 
 	for accountID, info := range ct.connections {
-		// Only include instances where we have actual connections
-		localInstances := make(map[string]int)
-		for instanceID, count := range info.LocalInstances {
-			if count > 0 {
-				localInstances[instanceID] = count
-			}
-		}
-
-		if len(localInstances) == 0 {
-			continue // Skip if no actual connections
-		}
-
-		// Copy PerIPCount for cluster-wide tracking
+		// Copy PerIPCount for THIS INSTANCE ONLY (authoritative for this instance)
 		perIPCount := make(map[string]int)
-		for ip, count := range info.PerIPCount {
-			if count > 0 {
-				perIPCount[ip] = count
+		if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
+			for ip, count := range perIPMap {
+				if count > 0 {
+					perIPCount[ip] = count
+				}
 			}
+		}
+
+		// Skip if no local connections
+		if len(perIPCount) == 0 {
+			continue
 		}
 
 		snapshot.Connections[accountID] = UserConnectionData{
-			AccountID:      accountID,
-			Username:       info.Username,
-			LocalInstances: localInstances,
-			PerIPCount:     perIPCount,
-			LastUpdate:     info.LastUpdate,
+			AccountID:  accountID,
+			Username:   info.Username,
+			PerIPCount: perIPCount, // Only this instance's per-IP counts
+			LastUpdate: info.LastUpdate,
 		}
 	}
 
@@ -1127,55 +1156,67 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 
 	reconciledCount := 0
 	addedCount := 0
+	removedCount := 0
 
+	// Build a map of accounts in the snapshot for fast lookup
+	snapshotAccounts := make(map[int64]bool, len(snapshot.Connections))
+	for accountID := range snapshot.Connections {
+		snapshotAccounts[accountID] = true
+	}
+
+	// First pass: Remove stale entries for the snapshot's instance
+	// If we have entries from snapshotInstanceID that are NOT in the snapshot, remove them
+	for accountID, info := range ct.connections {
+		// Check if this account has connections from the snapshot's instance
+		if perIPMap := info.PerIPCountByInstance[snapshot.InstanceID]; len(perIPMap) > 0 {
+			// If the snapshot doesn't include this account, the connection is stale
+			if !snapshotAccounts[accountID] {
+				// Remove the stale instance entry
+				delete(info.PerIPCountByInstance, snapshot.InstanceID)
+				removedCount++
+
+				// Clean up the user entry if no connections remain
+				if info.GetTotalCount() <= 0 {
+					delete(ct.connections, accountID)
+					logger.Debug("Gossip tracker: Removed user entry (no connections remain)", "name", ct.name,
+						"account_id", accountID, "username", info.Username, "instance", snapshot.InstanceID)
+				} else {
+					logger.Debug("Gossip tracker: Removed stale entry for instance", "name", ct.name,
+						"account_id", accountID, "username", info.Username,
+						"instance", snapshot.InstanceID, "new_total", info.GetTotalCount())
+				}
+			}
+		}
+	}
+
+	// Second pass: Add/update entries from the snapshot
 	for accountID, remoteData := range snapshot.Connections {
 		info, exists := ct.connections[accountID]
 		if !exists {
 			// New user we didn't know about
 			now := time.Now()
 			info = &UserConnectionInfo{
-				AccountID:      accountID,
-				Username:       remoteData.Username,
-				TotalCount:     0,
-				LocalCount:     0,
-				LastUpdate:     now,
-				FirstSeen:      now,
-				LocalInstances: make(map[string]int),
-				PerIPCount:     make(map[string]int),
+				AccountID:            accountID,
+				Username:             remoteData.Username,
+				LastUpdate:           now,
+				FirstSeen:            now,
+				PerIPCountByInstance: make(map[string]map[string]int),
 			}
 			ct.connections[accountID] = info
 			addedCount++
 		}
 
-		// Merge remote instance counts
-		for instanceID, count := range remoteData.LocalInstances {
-			if instanceID == ct.instanceID {
-				// Don't override our own local count
-				continue
-			}
-
-			oldCount := info.LocalInstances[instanceID]
-			if oldCount != count {
-				info.LocalInstances[instanceID] = count
+		// Replace per-IP counts for the snapshot's instance (authoritative)
+		// The snapshot contains only the sending instance's per-IP counts
+		if len(remoteData.PerIPCount) > 0 {
+			// Replace entire map for this instance (authoritative)
+			info.PerIPCountByInstance[snapshot.InstanceID] = remoteData.PerIPCount
+			reconciledCount++
+		} else {
+			// Empty PerIPCount means no IP tracking for this instance - remove it
+			if info.PerIPCountByInstance[snapshot.InstanceID] != nil {
+				delete(info.PerIPCountByInstance, snapshot.InstanceID)
 				reconciledCount++
-			}
-		}
-
-		// Merge per-IP counts from remote snapshot (cluster-wide tracking)
-		// We merge all IPs, not just from other instances, because per-IP is cluster-wide
-		for ip, count := range remoteData.PerIPCount {
-			oldCount := info.PerIPCount[ip]
-			if oldCount != count {
-				info.PerIPCount[ip] = count
-				reconciledCount++
-			}
-		}
-
-		// Recalculate total count
-		info.TotalCount = info.LocalCount // Start with local
-		for instanceID, count := range info.LocalInstances {
-			if instanceID != ct.instanceID {
-				info.TotalCount += count
 			}
 		}
 
@@ -1183,7 +1224,7 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 	}
 
 	logger.Info("GossipTracker: Reconciled state", "protocol", ct.name,
-		"from_node", snapshot.InstanceID, "updated", reconciledCount, "added", addedCount)
+		"from_node", snapshot.InstanceID, "updated", reconciledCount, "added", addedCount, "removed", removedCount)
 }
 
 // Stop stops the gossip tracker (idempotent)
@@ -1214,9 +1255,12 @@ func (ct *ConnectionTracker) GetStats(ctx context.Context) map[string]any {
 	totalConnections := 0
 
 	for _, info := range ct.connections {
-		totalInstanceIDs += len(info.LocalInstances)
-		totalIPs += len(info.PerIPCount)
-		totalConnections += info.TotalCount
+		totalInstanceIDs += len(info.PerIPCountByInstance)
+		// Count total IP tracking entries across all instances
+		for _, perIPMap := range info.PerIPCountByInstance {
+			totalIPs += len(perIPMap)
+		}
+		totalConnections += info.GetTotalCount()
 	}
 	ct.mu.RUnlock()
 

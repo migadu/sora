@@ -16,7 +16,7 @@ func TestConnectionTrackerCleanup(t *testing.T) {
 	defer cancel()
 
 	// Create a mock connection tracker
-	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000)
+	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	// Create a minimal server instance with connection tracker
@@ -215,7 +215,7 @@ func TestConnectionTrackerAsyncUnregisterReliability(t *testing.T) {
 	defer cancel()
 
 	// Create a mock connection tracker
-	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000)
+	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	// Create a minimal server instance with connection tracker
@@ -316,7 +316,7 @@ func TestConnectionTrackerWithRealSession(t *testing.T) {
 	defer cancel()
 
 	// Create a mock connection tracker
-	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000)
+	tracker := server.NewConnectionTracker("test-imap", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	// Create a minimal server instance with connection tracker

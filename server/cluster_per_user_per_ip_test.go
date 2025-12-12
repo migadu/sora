@@ -20,14 +20,14 @@ func TestClusterPerUserPerIP_GossipPropagation(t *testing.T) {
 	clientAddr2 := clientIP + ":10002"
 
 	// Node 1 - local mode tracker (simulates cluster node)
-	node1 := NewConnectionTracker("IMAP", "node-1", nil, 10, 3, 0)
+	node1 := NewConnectionTracker("IMAP", "node-1", nil, 10, 3, 0, false)
 	if node1 == nil {
 		t.Fatal("Failed to create node1 tracker")
 	}
 	defer node1.Stop()
 
 	// Node 2 - local mode tracker (simulates cluster node)
-	node2 := NewConnectionTracker("IMAP", "node-2", nil, 10, 3, 0)
+	node2 := NewConnectionTracker("IMAP", "node-2", nil, 10, 3, 0, false)
 	if node2 == nil {
 		t.Fatal("Failed to create node2 tracker")
 	}
@@ -99,7 +99,7 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	ip2 := "192.168.1.101"
 
 	// Create tracker and register connections from multiple IPs
-	tracker := NewConnectionTracker("IMAP", "node-1", nil, 20, 5, 0)
+	tracker := NewConnectionTracker("IMAP", "node-1", nil, 20, 5, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create tracker")
 	}
@@ -118,12 +118,24 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	tracker.mu.Lock()
 	info := tracker.connections[accountID]
 
-	// Verify PerIPCount is populated correctly
-	if info.PerIPCount[ip1] != 2 {
-		t.Errorf("Expected PerIPCount[%s] = 2, got %d", ip1, info.PerIPCount[ip1])
+	// Verify PerIPCountByInstance is populated correctly for this instance
+	if perIPMap := info.PerIPCountByInstance[tracker.instanceID]; perIPMap == nil {
+		t.Fatal("PerIPCountByInstance should be initialized for this instance")
+	} else {
+		if perIPMap[ip1] != 2 {
+			t.Errorf("Expected PerIPCountByInstance[%s][%s] = 2, got %d", tracker.instanceID, ip1, perIPMap[ip1])
+		}
+		if perIPMap[ip2] != 3 {
+			t.Errorf("Expected PerIPCountByInstance[%s][%s] = 3, got %d", tracker.instanceID, ip2, perIPMap[ip2])
+		}
 	}
-	if info.PerIPCount[ip2] != 3 {
-		t.Errorf("Expected PerIPCount[%s] = 3, got %d", ip2, info.PerIPCount[ip2])
+
+	// Get cluster-wide count (should match local since only one instance)
+	if info.GetClusterWideIPCount(ip1) != 2 {
+		t.Errorf("Cluster-wide count for IP1 should be 2, got %d", info.GetClusterWideIPCount(ip1))
+	}
+	if info.GetClusterWideIPCount(ip2) != 3 {
+		t.Errorf("Cluster-wide count for IP2 should be 3, got %d", info.GetClusterWideIPCount(ip2))
 	}
 
 	// Simulate creating a snapshot (like stateSnapshotRoutine does)
@@ -133,24 +145,25 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 		Connections: make(map[int64]UserConnectionData),
 	}
 
-	// Copy PerIPCount for cluster-wide tracking
+	// Copy PerIPCount for THIS INSTANCE ONLY (authoritative)
 	perIPCount := make(map[string]int)
-	for ip, count := range info.PerIPCount {
-		if count > 0 {
-			perIPCount[ip] = count
+	if perIPMap := info.PerIPCountByInstance[tracker.instanceID]; perIPMap != nil {
+		for ip, count := range perIPMap {
+			if count > 0 {
+				perIPCount[ip] = count
+			}
 		}
 	}
 
 	snapshot.Connections[accountID] = UserConnectionData{
-		AccountID:      accountID,
-		Username:       username,
-		LocalInstances: info.LocalInstances,
-		PerIPCount:     perIPCount,
-		LastUpdate:     info.LastUpdate,
+		AccountID:  accountID,
+		Username:   username,
+		PerIPCount: perIPCount,
+		LastUpdate: info.LastUpdate,
 	}
 	tracker.mu.Unlock()
 
-	// Verify snapshot contains PerIPCount
+	// Verify snapshot contains PerIPCount for this instance
 	snapshotData := snapshot.Connections[accountID]
 	if snapshotData.PerIPCount[ip1] != 2 {
 		t.Errorf("Snapshot should contain PerIPCount[%s] = 2, got %d", ip1, snapshotData.PerIPCount[ip1])
@@ -160,7 +173,7 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	}
 
 	// Create a second tracker and reconcile with the snapshot
-	tracker2 := NewConnectionTracker("IMAP", "node-2", nil, 20, 5, 0)
+	tracker2 := NewConnectionTracker("IMAP", "node-2", nil, 20, 5, 0, false)
 	if tracker2 == nil {
 		t.Fatal("Failed to create tracker2")
 	}
@@ -175,11 +188,25 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	if info2 == nil {
 		t.Fatal("Tracker2 should have user info after reconciliation")
 	}
-	if info2.PerIPCount[ip1] != 2 {
-		t.Errorf("After reconciliation, PerIPCount[%s] should be 2, got %d", ip1, info2.PerIPCount[ip1])
+
+	// Verify PerIPCountByInstance has the data from node-1 (tracker.instanceID)
+	if perIPMap := info2.PerIPCountByInstance[tracker.instanceID]; perIPMap == nil {
+		t.Fatal("Tracker2 should have PerIPCountByInstance for node-1 after reconciliation")
+	} else {
+		if perIPMap[ip1] != 2 {
+			t.Errorf("After reconciliation, PerIPCountByInstance[node-1][%s] should be 2, got %d", ip1, perIPMap[ip1])
+		}
+		if perIPMap[ip2] != 3 {
+			t.Errorf("After reconciliation, PerIPCountByInstance[node-1][%s] should be 3, got %d", ip2, perIPMap[ip2])
+		}
 	}
-	if info2.PerIPCount[ip2] != 3 {
-		t.Errorf("After reconciliation, PerIPCount[%s] should be 3, got %d", ip2, info2.PerIPCount[ip2])
+
+	// Verify cluster-wide counts match
+	if info2.GetClusterWideIPCount(ip1) != 2 {
+		t.Errorf("After reconciliation, cluster-wide count for IP1 should be 2, got %d", info2.GetClusterWideIPCount(ip1))
+	}
+	if info2.GetClusterWideIPCount(ip2) != 3 {
+		t.Errorf("After reconciliation, cluster-wide count for IP2 should be 3, got %d", info2.GetClusterWideIPCount(ip2))
 	}
 	tracker2.mu.Unlock()
 
@@ -193,7 +220,7 @@ func TestClusterPerUserPerIP_DifferentIPsAllowed(t *testing.T) {
 	username := "multiip@example.com"
 	protocol := "IMAP"
 
-	tracker := NewConnectionTracker("IMAP", "node-1", nil, 50, 3, 0)
+	tracker := NewConnectionTracker("IMAP", "node-1", nil, 50, 3, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create tracker")
 	}
