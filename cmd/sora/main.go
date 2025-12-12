@@ -1550,7 +1550,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 	// Override default 24h with 5m for LMTP since connections should be short-lived
 	// LMTP is a delivery protocol - messages should be delivered in seconds/minutes, not hours
-	if absoluteSessionTimeout == 24*time.Hour && serverConfig.Timeouts != nil && serverConfig.Timeouts.AbsoluteSessionTimeout == "" {
+	// Check if timeout is the default 24h value (either Timeouts is nil or AbsoluteSessionTimeout is empty)
+	if absoluteSessionTimeout == 24*time.Hour && (serverConfig.Timeouts == nil || serverConfig.Timeouts.AbsoluteSessionTimeout == "") {
 		logger.Info("LMTP proxy: Using LMTP-specific default (5 minutes) instead of generic default (24 hours)", "name", serverConfig.Name)
 		absoluteSessionTimeout = 5 * time.Minute
 	}
