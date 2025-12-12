@@ -242,3 +242,65 @@ func TestFirstSeenNotUpdatedByLastUpdate(t *testing.T) {
 		t.Error("FirstSeen should be older than LastUpdate after multiple updates")
 	}
 }
+
+// TestSnapshotOnlyBackendCleansUpLocalEntries verifies that backend servers
+// (snapshotOnly=true) clean up entries when local count reaches 0, even if
+// they've received gossip about other instances showing TotalCount > 0
+func TestSnapshotOnlyBackendCleansUpLocalEntries(t *testing.T) {
+	// Create a tracker simulating a backend LMTP server in cluster mode
+	// (has cluster manager, but is snapshotOnly=true)
+	tracker := NewConnectionTracker("LMTP", "backend-instance", nil, 0, 0, 0, true) // snapshotOnly=true
+	defer tracker.Stop()
+
+	accountID := int64(12345)
+	username := "test@example.com"
+	clientAddr := "192.168.1.100:54321"
+
+	// Register a local connection
+	err := tracker.RegisterConnection(context.Background(), accountID, username, "LMTP", clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to register connection: %v", err)
+	}
+
+	// Simulate receiving gossip from another instance about the same user
+	tracker.mu.Lock()
+	info := tracker.connections[accountID]
+	if info.PerIPCountByInstance == nil {
+		info.PerIPCountByInstance = make(map[string]map[string]int)
+	}
+	// Add entry from another instance
+	info.PerIPCountByInstance["other-backend"] = map[string]int{"192.168.1.200": 1}
+	tracker.mu.Unlock()
+
+	// Verify TotalCount > LocalCount
+	tracker.mu.Lock()
+	localCount := info.GetLocalCount(tracker.instanceID)
+	totalCount := info.GetTotalCount()
+	tracker.mu.Unlock()
+
+	if localCount != 1 {
+		t.Fatalf("Expected LocalCount=1, got %d", localCount)
+	}
+	if totalCount != 2 {
+		t.Fatalf("Expected TotalCount=2 (1 local + 1 from other instance), got %d", totalCount)
+	}
+
+	// Unregister the local connection
+	err = tracker.UnregisterConnection(context.Background(), accountID, "LMTP", clientAddr)
+	if err != nil {
+		t.Fatalf("Failed to unregister connection: %v", err)
+	}
+
+	// Verify the entry was DELETED despite TotalCount still being 1 (from other instance)
+	tracker.mu.Lock()
+	info = tracker.connections[accountID]
+	tracker.mu.Unlock()
+
+	if info != nil {
+		t.Errorf("Backend server (snapshotOnly=true) should clean up entry when LocalCount=0, even if TotalCount > 0")
+		t.Errorf("LocalCount: %d, TotalCount: %d", info.GetLocalCount(tracker.instanceID), info.GetTotalCount())
+		t.Error("This would cause the backend to keep including this user in state snapshots, causing the proxy to never clean up the entry")
+	} else {
+		t.Log("✓ Backend server correctly cleaned up entry when LocalCount=0 (even though TotalCount > 0)")
+	}
+}

@@ -348,11 +348,13 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 
 	// Clean up if no connections remain
 	var cleanupThreshold int
-	if ct.clusterManager == nil {
-		// In local mode, clean up when no local connections
+	if ct.clusterManager == nil || ct.snapshotOnly {
+		// In local mode OR snapshot-only mode (backend servers), clean up when no local connections
+		// Backend servers only track their own connections authoritatively, so should clean up
+		// when local count hits 0, even if they've received gossip about other instances
 		cleanupThreshold = info.GetLocalCount(ct.instanceID)
 	} else {
-		// In cluster mode, clean up when no connections across cluster
+		// In cluster proxy mode, clean up when no connections across cluster
 		cleanupThreshold = info.GetTotalCount()
 	}
 
@@ -923,7 +925,9 @@ func (ct *ConnectionTracker) broadcastRoutine() {
 
 // cleanupRoutine periodically cleans up stale connection entries
 func (ct *ConnectionTracker) cleanupRoutine() {
-	ticker := time.NewTicker(5 * time.Minute)
+	// Run cleanup every 1 minute to ensure timely cleanup of stale entries
+	// (stale threshold is 3 minutes, so this ensures entries are cleaned within 4 minutes worst-case)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {

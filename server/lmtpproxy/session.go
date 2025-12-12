@@ -108,6 +108,16 @@ func (s *Session) handleConnection() {
 
 	// Handle commands until we get RCPT TO
 	for {
+		// Check if context is cancelled (server shutdown or absolute timeout)
+		select {
+		case <-s.ctx.Done():
+			s.InfoLog("Session context cancelled", "reason", s.ctx.Err())
+			s.sendResponse("421 4.3.2 Service closing connection")
+			return
+		default:
+			// Continue normal operation
+		}
+
 		// Set a read deadline for the client command to prevent idle connections.
 		if s.server.authIdleTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
