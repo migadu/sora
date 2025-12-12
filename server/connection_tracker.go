@@ -950,11 +950,25 @@ func (ct *ConnectionTracker) cleanup() {
 		} else if info.LocalCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
 			// Case 2: Gossip desync recovery - no local connections and very stale
 			// This handles lost gossip messages from other nodes or connections that never closed properly
-			logger.Debug("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
+			logger.Info("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
 				"user", info.Username, "account_id", accountID,
-				"total", info.TotalCount, "first_seen", info.FirstSeen, "age", time.Since(info.FirstSeen), "threshold", veryStaleTimeout)
+				"total", info.TotalCount, "local", info.LocalCount,
+				"first_seen", info.FirstSeen, "age", time.Since(info.FirstSeen),
+				"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
+				"threshold", veryStaleTimeout, "instances", info.LocalInstances)
 			delete(ct.connections, accountID)
 			cleaned++
+		} else if info.LocalCount == 0 && info.TotalCount > 0 {
+			// Log entries that are NOT being cleaned (for debugging)
+			age := time.Since(info.FirstSeen)
+			if age > 1*time.Minute {
+				logger.Info("Gossip tracker: Keeping remote entry (not stale enough yet)", "name", ct.name,
+					"user", info.Username, "account_id", accountID,
+					"total", info.TotalCount, "local", info.LocalCount,
+					"first_seen", info.FirstSeen, "age", age,
+					"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
+					"threshold", veryStaleTimeout, "instances", info.LocalInstances)
+			}
 		}
 	}
 
