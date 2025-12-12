@@ -532,13 +532,6 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		return nil
 	}
 
-	// Display results
-	if userEmail != "" {
-		fmt.Printf("Active connections for user: %s\n\n", userEmail)
-	} else {
-		fmt.Printf("Found %d active connection(s):\n\n", result.Count)
-	}
-
 	// Apply filters (protocol and instanceID are client-side filters)
 	filteredConnections := result.Connections
 	if protocol != "" || instanceID != "" {
@@ -580,6 +573,11 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 	if len(filteredConnections) == 0 {
 		fmt.Println("No connections matching the specified filters.")
 		return nil
+	}
+
+	// Display results header
+	if userEmail != "" {
+		fmt.Printf("Active connections for user: %s\n\n", userEmail)
 	}
 
 	// Print header
