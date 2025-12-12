@@ -76,6 +76,7 @@ type UserConnectionInfo struct {
 	TotalCount     int // Cluster-wide count (eventually consistent)
 	LocalCount     int // This instance's count
 	LastUpdate     time.Time
+	FirstSeen      time.Time      // When we first saw this connection (for cleanup, not updated by gossip)
 	LocalInstances map[string]int // instanceID -> count on that instance
 	PerIPCount     map[string]int // clientIP -> count (cluster-wide via gossip, for per-user-per-IP limiting)
 }
@@ -196,12 +197,14 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	// Get or create user info
 	info, exists := ct.connections[accountID]
 	if !exists {
+		now := time.Now()
 		info = &UserConnectionInfo{
 			AccountID:      accountID,
 			Username:       username,
 			TotalCount:     0,
 			LocalCount:     0,
-			LastUpdate:     time.Now(),
+			LastUpdate:     now,
+			FirstSeen:      now,
 			LocalInstances: make(map[string]int),
 			PerIPCount:     make(map[string]int),
 		}
@@ -740,12 +743,14 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 
 	info, exists := ct.connections[event.AccountID]
 	if !exists {
+		now := time.Now()
 		info = &UserConnectionInfo{
 			AccountID:      event.AccountID,
 			Username:       event.Username,
 			TotalCount:     0,
 			LocalCount:     0,
-			LastUpdate:     time.Now(),
+			LastUpdate:     now,
+			FirstSeen:      now,
 			LocalInstances: make(map[string]int),
 			PerIPCount:     make(map[string]int),
 		}
@@ -931,10 +936,10 @@ func (ct *ConnectionTracker) cleanup() {
 		// 1. No connections and stale (standard cleanup)
 		// 2. No local connections and very stale (gossip desync recovery)
 		//    This handles cases where gossip unregister messages were lost
-		// Use 3 minutes for all protocols since:
-		// - State snapshots are broadcast every 60 seconds, keeping active connections fresh
-		// - 3 minutes allows for ~3 missed gossip messages before cleanup (resilient to temporary issues)
-		// - Aggressively cleans up stale entries from failed nodes or lost unregister messages
+		// Use FirstSeen for staleness check (not LastUpdate) because:
+		// - LastUpdate is refreshed every 60 seconds by gossip state snapshots
+		// - FirstSeen tracks when we first learned about the connection
+		// - Use 3 minutes for all protocols (allows ~3 missed gossip messages before cleanup)
 		veryStaleTimeout := 3 * time.Minute
 		veryStaleThreshold := time.Now().Add(-1 * veryStaleTimeout)
 
@@ -942,12 +947,12 @@ func (ct *ConnectionTracker) cleanup() {
 			// Case 1: Normal cleanup - no connections at all
 			delete(ct.connections, accountID)
 			cleaned++
-		} else if info.LocalCount == 0 && info.LastUpdate.Before(veryStaleThreshold) {
+		} else if info.LocalCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
 			// Case 2: Gossip desync recovery - no local connections and very stale
-			// This handles lost gossip messages from other nodes
+			// This handles lost gossip messages from other nodes or connections that never closed properly
 			logger.Debug("Gossip tracker: Cleaning up stale remote entry", "name", ct.name,
 				"user", info.Username, "account_id", accountID,
-				"total", info.TotalCount, "last_update", info.LastUpdate, "threshold", veryStaleTimeout)
+				"total", info.TotalCount, "first_seen", info.FirstSeen, "age", time.Since(info.FirstSeen), "threshold", veryStaleTimeout)
 			delete(ct.connections, accountID)
 			cleaned++
 		}
@@ -1107,12 +1112,14 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 		info, exists := ct.connections[accountID]
 		if !exists {
 			// New user we didn't know about
+			now := time.Now()
 			info = &UserConnectionInfo{
 				AccountID:      accountID,
 				Username:       remoteData.Username,
 				TotalCount:     0,
 				LocalCount:     0,
-				LastUpdate:     time.Now(),
+				LastUpdate:     now,
+				FirstSeen:      now,
 				LocalInstances: make(map[string]int),
 				PerIPCount:     make(map[string]int),
 			}
