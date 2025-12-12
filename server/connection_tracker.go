@@ -913,7 +913,6 @@ func (ct *ConnectionTracker) cleanup() {
 	cleaned := 0
 	cleanedInstances := 0
 	cleanedIPs := 0
-	staleThreshold := time.Now().Add(-10 * time.Minute)
 
 	for accountID, info := range ct.connections {
 		// Clean up zero-count entries in LocalInstances map
@@ -943,8 +942,8 @@ func (ct *ConnectionTracker) cleanup() {
 		veryStaleTimeout := 3 * time.Minute
 		veryStaleThreshold := time.Now().Add(-1 * veryStaleTimeout)
 
-		if info.TotalCount <= 0 && info.LastUpdate.Before(staleThreshold) {
-			// Case 1: Normal cleanup - no connections at all
+		if info.TotalCount <= 0 {
+			// Case 1: Normal cleanup - no connections at all (clean immediately)
 			delete(ct.connections, accountID)
 			cleaned++
 		} else if info.LocalCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
