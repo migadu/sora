@@ -770,12 +770,38 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) (*server.ConnectionTracker, string) {
+	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
+
+	// LMTP proxy connections are short-lived (often seconds) and typically originate from
+	// trusted internal infrastructure.
+	//
+	// Cluster-wide gossip tracking (especially snapshot-only at 60s intervals) is not useful
+	// and can add overhead and complexity for little gain.
+	//
+	// For LMTP we keep a local-only tracker for monitoring/visibility, and we force limits
+	// to 0 to ensure tracking never rejects delivery connections.
+	if protocol == "LMTP" {
+		logger.Info("Proxy: Starting local LMTP connection tracker (no gossip)",
+			"protocol", protocol,
+			"name", serverName,
+			"instance", instanceID,
+			"max_per_user", 0,
+			"max_per_user_per_ip", 0,
+		)
+
+		tracker := server.NewConnectionTracker(protocol, instanceID, nil, 0, 0, 0, false)
+		if tracker != nil {
+			srv.SetConnectionTracker(tracker)
+		}
+		mapKey := protocol + "-" + instanceID
+		return tracker, mapKey
+	}
+
+	// Other proxy protocols use cluster-wide gossip tracking.
 	if clusterMgr == nil {
 		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
 		return nil, ""
 	}
-
-	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
 
 	// Get queue size from config (or use default)
 	maxEventQueueSize := 0
@@ -783,12 +809,9 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		maxEventQueueSize = clusterCfg.GetMaxEventQueueSize()
 	}
 
-	// LMTP uses snapshot-only mode to reduce gossip overhead (connections are short-lived and from trusted backends)
-	snapshotOnly := (protocol == "LMTP")
+	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP)
 
-	logger.Info("Proxy: Starting gossip connection tracker", "protocol", protocol, "name", serverName, "instance", instanceID, "max_per_user", maxConnectionsPerUser, "max_per_user_per_ip", maxConnectionsPerUserPerIP, "snapshot_only", snapshotOnly)
-
-	tracker := server.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
+	tracker := server.NewConnectionTracker(protocol, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, false)
 	if tracker != nil {
 		srv.SetConnectionTracker(tracker)
 	}
@@ -1541,6 +1564,18 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
+
+	// Warn if user configured connection limits (they will be ignored for LMTP)
+	if serverConfig.MaxConnectionsPerUser > 0 {
+		logger.Warn("LMTP proxy: max_connections_per_user configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
+			"name", serverConfig.Name,
+			"configured_value", serverConfig.MaxConnectionsPerUser)
+	}
+	if serverConfig.MaxConnectionsPerUserPerIP > 0 {
+		logger.Warn("LMTP proxy: max_connections_per_user_per_ip configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
+			"name", serverConfig.Name,
+			"configured_value", serverConfig.MaxConnectionsPerUserPerIP)
+	}
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()

@@ -45,6 +45,13 @@ type Session struct {
 	cancel                context.CancelFunc
 	startTime             time.Time
 	proxyInfo             *server.ProxyProtocolInfo
+
+	// Connection tracker bookkeeping:
+	// LMTP sessions can contain multiple RCPT TO commands (multiple recipients).
+	// We register the session as a "connection" against each recipient account we handle.
+	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
+	// earlier recipients would leak connection counts permanently.
+	registeredAccountIDs map[int64]struct{}
 }
 
 // newSession creates a new LMTP proxy session.
@@ -58,15 +65,16 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 	}
 
 	return &Session{
-		server:       s,
-		clientConn:   conn,
-		clientReader: bufio.NewReader(conn),
-		clientWriter: bufio.NewWriter(conn),
-		clientAddr:   clientAddr, // Use real client IP from PROXY protocol or connection
-		ctx:          sessionCtx,
-		cancel:       sessionCancel,
-		startTime:    time.Now(),
-		proxyInfo:    proxyInfo,
+		server:               s,
+		clientConn:           conn,
+		clientReader:         bufio.NewReader(conn),
+		clientWriter:         bufio.NewWriter(conn),
+		clientAddr:           clientAddr, // Use real client IP from PROXY protocol or connection
+		ctx:                  sessionCtx,
+		cancel:               sessionCancel,
+		startTime:            time.Now(),
+		proxyInfo:            proxyInfo,
+		registeredAccountIDs: make(map[int64]struct{}),
 	}
 }
 
@@ -1381,17 +1389,31 @@ func (s *Session) close() {
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
-	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
 	if s.server.connTracker != nil {
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		// Use cached client address to avoid race with connection close
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "LMTP", s.clientAddr); err != nil {
-			// Connection tracking is non-critical monitoring data, so log but continue
-			s.WarnLog("Failed to unregister connection", "error", err)
+		// Unregister all account IDs that we actually registered during this LMTP session.
+		// LMTP sessions can contain multiple RCPTs; s.accountID is overwritten per RCPT.
+		// If we were to unregister only s.accountID (the *last* RCPT), we would leak the
+		// original registered user forever.
+		accountIDs := make([]int64, 0, 1)
+		for id := range s.registeredAccountIDs {
+			accountIDs = append(accountIDs, id)
+		}
+		if len(accountIDs) == 0 {
+			// Backward compatibility / defensive: if we never tracked registrations, fall back.
+			accountIDs = append(accountIDs, s.accountID)
+		}
+
+		for _, id := range accountIDs {
+			// Use cached client address to avoid race with connection close
+			if err := s.server.connTracker.UnregisterConnection(ctx, id, "LMTP", s.clientAddr); err != nil {
+				// Connection tracking is non-critical monitoring data, so log but continue
+				s.WarnLog("Failed to unregister connection", "error", err, "account_id", id)
+			}
 		}
 	}
 
@@ -1406,14 +1428,29 @@ func (s *Session) close() {
 
 // registerConnection registers the connection in the database.
 func (s *Session) registerConnection() error {
-	// Use configured database query timeout for connection tracking (database INSERT)
-	queryTimeout := s.server.rdb.GetQueryTimeout()
+	// registerConnection is an in-memory tracking operation, but we still bound it with a timeout.
+	// In production we use the configured DB query timeout as a convenient knob.
+	// In unit tests (or misconfiguration), s.server.rdb can be nil, so fall back safely.
+	queryTimeout := 1 * time.Second
+	if s.server != nil && s.server.rdb != nil {
+		queryTimeout = s.server.rdb.GetQueryTimeout()
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
+		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
+		if err != nil {
+			return err
+		}
+		// Remember which account we registered so close() can unregister the same one,
+		// even if s.accountID later changes due to additional RCPT TOs.
+		if s.registeredAccountIDs == nil {
+			s.registeredAccountIDs = make(map[int64]struct{})
+		}
+		s.registeredAccountIDs[s.accountID] = struct{}{}
+		return nil
 	}
 	return nil
 }

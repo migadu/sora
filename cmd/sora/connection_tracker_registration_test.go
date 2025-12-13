@@ -22,7 +22,7 @@ func TestMultipleProxyTrackersOverwrite_BugDemo(t *testing.T) {
 	// (This mimics what happens in startDynamicLMTPProxyServer)
 
 	// First LMTP proxy: "lmtp-proxy-1"
-	tracker1 := server.NewConnectionTracker("LMTP", "lmtp-proxy-1", nil, 0, 0, 0)
+	tracker1 := server.NewConnectionTracker("LMTP", "lmtp-proxy-1", nil, 0, 0, 0, false)
 	if tracker1 != nil {
 		defer tracker1.Stop()
 		connectionTrackersMux.Lock()
@@ -32,7 +32,7 @@ func TestMultipleProxyTrackersOverwrite_BugDemo(t *testing.T) {
 	}
 
 	// Second LMTP proxy: "lmtp-proxy-2"
-	tracker2 := server.NewConnectionTracker("LMTP", "lmtp-proxy-2", nil, 0, 0, 0)
+	tracker2 := server.NewConnectionTracker("LMTP", "lmtp-proxy-2", nil, 0, 0, 0, false)
 	if tracker2 != nil {
 		defer tracker2.Stop()
 		connectionTrackersMux.Lock()
@@ -85,7 +85,7 @@ func TestMultipleProxyTrackersWithUniqueKeys(t *testing.T) {
 
 	// First LMTP proxy: host1 with name "lmtp-proxy"
 	instanceID1 := fmt.Sprintf("%s-%s", hostname1, serverName)
-	tracker1 := server.NewConnectionTracker("LMTP", instanceID1, nil, 0, 0, 0)
+	tracker1 := server.NewConnectionTracker("LMTP", instanceID1, nil, 0, 0, 0, false)
 	if tracker1 != nil {
 		defer tracker1.Stop()
 		connectionTrackersMux.Lock()
@@ -97,7 +97,7 @@ func TestMultipleProxyTrackersWithUniqueKeys(t *testing.T) {
 
 	// Second LMTP proxy: host2 with name "lmtp-proxy" (SAME server name!)
 	instanceID2 := fmt.Sprintf("%s-%s", hostname2, serverName)
-	tracker2 := server.NewConnectionTracker("LMTP", instanceID2, nil, 0, 0, 0)
+	tracker2 := server.NewConnectionTracker("LMTP", instanceID2, nil, 0, 0, 0, false)
 	if tracker2 != nil {
 		defer tracker2.Stop()
 		connectionTrackersMux.Lock()

@@ -1487,6 +1487,8 @@ remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
 max_connections = 1000
 max_connections_per_ip = 0            # Typically no per-IP limits for LMTP (trusted sources)
 # Note: max_connections_per_user not applicable for LMTP (no user authentication)
+#       LMTP uses local-only connection tracking (no gossip) for monitoring visibility.
+#       Connection limits are automatically disabled for LMTP to prevent delivery rejection.
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false

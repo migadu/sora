@@ -953,113 +953,84 @@ func (ct *ConnectionTracker) cleanupRoutine() {
 	}
 }
 
-// cleanup removes stale entries (not updated recently and zero connections)
+// cleanup prunes invalid/expired bookkeeping data.
+//
+// Design goals:
+//   - Never delete active local connections.
+//   - In cluster mode, remote state is pruned based on *instance liveness*, not per-user age.
+//     If an instance is still gossiping (instanceLastSeen is fresh), its state is authoritative.
+//   - User entries are removed only when their total count reaches 0 after pruning.
 func (ct *ConnectionTracker) cleanup() {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
-	cleaned := 0
+	cleanedUsers := 0
 	cleanedInstances := 0
 	cleanedIPs := 0
 
-	// Prune stale instances that haven't gossiped recently
-	// This cleans up data from nodes that crashed or were partitioned
-	staleInstanceThreshold := 5 * time.Minute // 5m is generous for 60s gossip interval
-	for instanceID, lastSeen := range ct.instanceLastSeen {
-		if time.Since(lastSeen) > staleInstanceThreshold {
-			logger.Info("Gossip tracker: Purging stale instance data", "name", ct.name, "instance", instanceID, "age", time.Since(lastSeen))
-			for _, info := range ct.connections {
-				if len(info.PerIPCountByInstance[instanceID]) > 0 {
-					delete(info.PerIPCountByInstance, instanceID)
-					cleanedInstances++
-				}
-			}
-			delete(ct.instanceLastSeen, instanceID)
-		}
-	}
+	now := time.Now()
 
-	for accountID, info := range ct.connections {
-		// Clean up zero-count entries in PerIPCountByInstance map
-		for instanceID, perIPMap := range info.PerIPCountByInstance {
-			for ip, count := range perIPMap {
-				if count <= 0 {
-					delete(perIPMap, ip)
-					cleanedIPs++
-				}
+	// 1) Purge instance maps for instances that appear offline/partitioned.
+	//    This is the only place where we remove non-local connection counts.
+	staleInstanceThreshold := 5 * time.Minute // generous for 60s snapshot interval + jitter
+	for instanceID, lastSeen := range ct.instanceLastSeen {
+		if now.Sub(lastSeen) <= staleInstanceThreshold {
+			continue
+		}
+
+		logger.Info("Gossip tracker: Purging stale instance data", "name", ct.name, "instance", instanceID, "age", now.Sub(lastSeen))
+		for _, info := range ct.connections {
+			if info.PerIPCountByInstance == nil {
+				continue
 			}
-			// Clean up empty instance maps
-			if len(perIPMap) == 0 {
+			if _, ok := info.PerIPCountByInstance[instanceID]; ok {
 				delete(info.PerIPCountByInstance, instanceID)
 				cleanedInstances++
 			}
 		}
+		delete(ct.instanceLastSeen, instanceID)
+	}
 
-		// Remove user entry in two cases:
-		// 1. No connections and stale (standard cleanup)
-		// 2. No local connections and very stale (gossip desync recovery)
-		//    This handles cases where gossip unregister messages were lost
-		// Use FirstSeen for staleness check (not LastUpdate) because:
-		// - LastUpdate is refreshed every 60 seconds by gossip state snapshots
-		// - FirstSeen tracks when we first learned about the connection
-		// - Use 3 minutes for all protocols (allows ~3 missed gossip messages before cleanup)
-		veryStaleTimeout := 3 * time.Minute
-		veryStaleThreshold := time.Now().Add(-1 * veryStaleTimeout)
-
-		totalCount := info.GetTotalCount()
-		localCount := info.GetLocalCount(ct.instanceID)
-
-		if totalCount <= 0 {
-			// Case 1: Normal cleanup - no connections at all (clean immediately)
-			delete(ct.connections, accountID)
-			cleaned++
-		} else if localCount == 0 && info.FirstSeen.Before(veryStaleThreshold) {
-			// Case 2: Fallback cleanup for edge cases not handled by state snapshots
-			// This handles:
-			// - Nodes permanently offline (no more state snapshots received)
-			// - Network partitions >5 minutes (snapshots rejected as too old)
-			// - Lost state snapshot messages
-			// With authoritative state snapshots, this should be rare (most cleanup happens via snapshots within 60s)
-			logger.Info("Gossip tracker: Fallback cleanup of stale remote entry", "name", ct.name,
-				"user", info.Username, "account_id", accountID,
-				"total", totalCount, "local", localCount,
-				"first_seen", info.FirstSeen, "age", time.Since(info.FirstSeen),
-				"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
-				"threshold", veryStaleTimeout, "instances", len(info.PerIPCountByInstance),
-				"reason", "This may indicate a node offline/partitioned or missed state snapshots")
-			delete(ct.connections, accountID)
-			cleaned++
-		} else if localCount == 0 && totalCount > 0 {
-			// Log entries that are NOT being cleaned (for debugging)
-			age := time.Since(info.FirstSeen)
-			if age > 1*time.Minute {
-				logger.Info("Gossip tracker: Keeping remote entry (not stale enough yet)", "name", ct.name,
-					"user", info.Username, "account_id", accountID,
-					"total", totalCount, "local", localCount,
-					"first_seen", info.FirstSeen, "age", age,
-					"last_update", info.LastUpdate, "last_update_age", time.Since(info.LastUpdate),
-					"threshold", veryStaleTimeout, "instances", len(info.PerIPCountByInstance))
+	// 2) Remove invalid counts and empty maps.
+	for accountID, info := range ct.connections {
+		if info.PerIPCountByInstance != nil {
+			for instanceID, perIPMap := range info.PerIPCountByInstance {
+				for ip, count := range perIPMap {
+					if count <= 0 {
+						delete(perIPMap, ip)
+						cleanedIPs++
+					}
+				}
+				if len(perIPMap) == 0 {
+					delete(info.PerIPCountByInstance, instanceID)
+					cleanedInstances++
+				}
 			}
+		}
+
+		// 3) Remove user entries if no counts remain.
+		if info.GetTotalCount() <= 0 {
+			delete(ct.connections, accountID)
+			cleanedUsers++
 		}
 	}
 
-	// Calculate total instance IDs and IPs across all users for memory reporting
+	// 4) Metrics.
 	totalUsers := len(ct.connections)
 	totalInstanceIDs := 0
 	totalIPs := 0
 	for _, info := range ct.connections {
 		totalInstanceIDs += len(info.PerIPCountByInstance)
-		// Count total IP tracking entries across all instances
 		for _, perIPMap := range info.PerIPCountByInstance {
 			totalIPs += len(perIPMap)
 		}
 	}
 
-	if cleaned > 0 || cleanedInstances > 0 || cleanedIPs > 0 {
+	if cleanedUsers > 0 || cleanedInstances > 0 || cleanedIPs > 0 {
 		logger.Debug("Gossip tracker: Cleaned up stale entries", "name", ct.name,
-			"users", cleaned, "instance_ids", cleanedInstances, "ips", cleanedIPs)
+			"users", cleanedUsers, "instance_ids", cleanedInstances, "ips", cleanedIPs)
 	}
 
-	// Update Prometheus metrics every cleanup cycle
 	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name).Set(float64(totalUsers))
 	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name).Set(float64(totalInstanceIDs))
 	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name).Set(float64(totalIPs))
@@ -1069,8 +1040,7 @@ func (ct *ConnectionTracker) cleanup() {
 	ct.queueMu.Unlock()
 	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name).Set(float64(queueSize))
 
-	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
-	// This helps monitor for memory leaks without flooding logs
+	// Log memory usage stats every 10 cleanup cycles (~10 minutes with 1m cleanup interval)
 	ct.cleanupCounter++
 	if ct.cleanupCounter%10 == 0 {
 		logger.Info("Connection tracker stats", "protocol", ct.name,
