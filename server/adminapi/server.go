@@ -992,6 +992,8 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect connections from all trackers
+	// Only report connections where this tracker instance has actual local connections
+	// This prevents duplicate entries where trackers report gossip data from other instances
 	allConnections := make([]map[string]any, 0)
 	for trackerKey, tracker := range s.connectionTrackers {
 		if tracker == nil {
@@ -1000,6 +1002,13 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
+			// Only report if this tracker instance has local connections for this user
+			// Skip entries that are purely gossip data from other instances
+			localCount := connInfo.GetLocalCount(instanceID)
+			if localCount == 0 {
+				continue // Skip - this is only gossip data, not an actual connection on this instance
+			}
+
 			// Extract protocol from tracker key
 			// Key format: "PROTOCOL-hostname-servername" or "PROTOCOL-servername"
 			// Display: Just "PROTOCOL" for simplicity
@@ -1009,7 +1018,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 				"protocol":    protocol,
 				"instance":    trackerKey, // Full key for debugging/filtering
 				"account_id":  connInfo.AccountID,
-				"local_count": connInfo.GetLocalCount(instanceID),
+				"local_count": localCount,
 				"total_count": connInfo.GetTotalCount(),
 				"last_update": connInfo.LastUpdate,
 				"email":       connInfo.Username,
