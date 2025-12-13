@@ -1463,10 +1463,9 @@ func (s *Session) registerConnection() error {
 	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 
-	clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-
+	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", clientAddr)
+		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr)
 	}
 	return nil
 }
