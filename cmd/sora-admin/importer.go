@@ -389,6 +389,17 @@ func (i *Importer) Run() error {
 		return fmt.Errorf("failed to scan maildir: %w", err)
 	}
 
+	// Sync mailbox state (UIDVALIDITY) before starting import
+	// This ensures that mailboxes have the correct UIDVALIDITY from Dovecot
+	// even if the first imported message doesn't have a preserved UID.
+	if i.options.PreserveUIDs {
+		logger.Info("Syncing mailbox state (UIDVALIDITY)...")
+		if err := i.syncMailboxState(); err != nil {
+			// Log warning but continue - import might still work partially
+			logger.Info("Warning: Failed to sync mailbox state", "error", err)
+		}
+	}
+
 	// After scanning, count only NEW (not yet on S3) messages in SQLite database
 	var totalCount, alreadyOnS3 int64
 	countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
@@ -891,6 +902,48 @@ func HashContent(content []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// resolveMailboxName determines the mailbox name from the maildir path
+func (i *Importer) resolveMailboxName(path string) (string, error) {
+	cleanPath := filepath.Clean(i.maildirPath)
+	relPath, err := filepath.Rel(cleanPath, path)
+	if err != nil {
+		return "", fmt.Errorf("could not get relative path for %s: %w", path, err)
+	}
+
+	var mailboxName string
+	if relPath == "." {
+		mailboxName = "INBOX"
+	} else {
+		// Remove leading dot if present
+		cleanName := strings.TrimPrefix(relPath, ".")
+
+		// Replace maildir separator (.) with IMAP separator (/)
+		mailboxName = strings.ReplaceAll(cleanName, ".", "/")
+
+		// Validate characters
+		if strings.ContainsAny(mailboxName, "\t\r\n") {
+			return "", fmt.Errorf("invalid characters in mailbox name")
+		}
+
+		mailboxName = strings.TrimSpace(mailboxName)
+
+		// Handle special folder name mappings
+		switch strings.ToLower(mailboxName) {
+		case "sent", "sent items", "sent mail":
+			mailboxName = "Sent"
+		case "drafts", "draft":
+			mailboxName = "Drafts"
+		case "trash", "deleted", "deleted items":
+			mailboxName = "Trash"
+		case "junk", "spam":
+			mailboxName = "Junk"
+		case "archive", "archives":
+			mailboxName = "Archive"
+		}
+	}
+	return mailboxName, nil
+}
+
 // parseMaildirFlags extracts IMAP flags from a maildir filename.
 func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 	var flags []imap.Flag
@@ -1207,6 +1260,136 @@ func (i *Importer) scanMaildir() error {
 	return walkErr
 }
 
+// syncMailboxState ensures mailboxes exist and have correct UIDVALIDITY
+func (i *Importer) syncMailboxState() error {
+	address, err := server.NewAddress(i.email)
+	if err != nil {
+		return fmt.Errorf("invalid email: %w", err)
+	}
+
+	accountID, err := i.rdb.GetAccountIDByAddressWithRetry(i.ctx, address.FullAddress())
+	if err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+	user := server.NewUser(address, accountID)
+
+	for path, uidList := range i.dovecotUIDLists {
+		if uidList == nil {
+			continue
+		}
+
+		mailboxName, err := i.resolveMailboxName(path)
+		if err != nil {
+			logger.Info("Warning: Failed to resolve mailbox name for state sync", "path", path, "error", err)
+			continue
+		}
+
+		if !i.shouldImportMailbox(mailboxName) {
+			continue
+		}
+
+		// Get or create the mailbox
+		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), mailboxName)
+		if err != nil {
+			logger.Info("Warning: Failed to get/create mailbox for state sync", "mailbox", mailboxName, "error", err)
+			continue
+		}
+
+		// Update UIDVALIDITY if needed
+		// We only update if the mailbox is empty OR if we're forcing it.
+		// Since we can't easily check if it's empty here without extra queries,
+		// and we want to enforce Dovecot state, we'll try to update it.
+		//
+		// Ideally, we should only update if empty. db.InsertMessageFromImporter handles this check safely.
+		// But to prevent the "first message missing UID" issue, we'll do a check here.
+
+		var currentUIDValidity uint32
+		var hasMessages bool
+
+		// Use the operational database for direct queries
+		db := i.rdb.GetOperationalDatabase()
+
+		// Check current state
+		err = db.WritePool.QueryRow(i.ctx, `
+			SELECT m.uid_validity, EXISTS(SELECT 1 FROM messages msg WHERE msg.mailbox_id = m.id AND msg.expunged_at IS NULL)
+			FROM mailboxes m
+			WHERE m.id = $1
+		`, mailbox.ID).Scan(&currentUIDValidity, &hasMessages)
+
+		if err != nil {
+			logger.Info("Warning: Failed to check mailbox state", "mailbox", mailboxName, "error", err)
+			continue
+		}
+
+		if currentUIDValidity == uidList.UIDValidity {
+			// Already matches
+			continue
+		}
+
+		if hasMessages {
+			logger.Info("Warning: Mailbox not empty and UIDVALIDITY mismatch - cannot safely update",
+				"mailbox", mailboxName, "current", currentUIDValidity, "dovecot", uidList.UIDValidity)
+			// We do NOT force update here to avoid invalidating existing messages unexpectedly.
+			// Users should use --clean-db or ensure mailboxes are empty if they want full UID preservation.
+			continue
+		}
+
+		// Mailbox is empty, safe to update UIDVALIDITY and highest_uid
+		// Set highest_uid = NextUID - 1 to match Dovecot's sequence exactly
+		// This prevents UID gaps/collisions if some UIDs were not imported
+		highestUID := int64(0)
+		if uidList.NextUID > 0 {
+			highestUID = int64(uidList.NextUID) - 1
+		}
+
+		_, err = db.WritePool.Exec(i.ctx, `UPDATE mailboxes SET uid_validity = $2, highest_uid = $3 WHERE id = $1`,
+			mailbox.ID, uidList.UIDValidity, highestUID)
+		if err != nil {
+			logger.Info("Warning: Failed to update UIDVALIDITY and highest_uid", "mailbox", mailboxName, "error", err)
+		} else {
+			logger.Info("Updated UIDVALIDITY and highest_uid", "mailbox", mailboxName,
+				"old_uidvalidity", currentUIDValidity, "new_uidvalidity", uidList.UIDValidity,
+				"highest_uid", highestUID)
+		}
+	}
+
+	return nil
+}
+
+// findMovedFile attempts to find a file that has been renamed (e.g. flags changed)
+// It looks for a file in the same directory with the same unique ID prefix.
+func (i *Importer) findMovedFile(originalPath string) (string, bool) {
+	dir := filepath.Dir(originalPath)
+	filename := filepath.Base(originalPath)
+
+	// Dovecot Maildir format: unique_id:2,flags
+	// We want to match the unique_id part.
+	// The separator is usually ":2,".
+	parts := strings.SplitN(filename, ":2,", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	prefix := parts[0] + ":2,"
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Look for a file that starts with the same prefix but has different flags
+		if strings.HasPrefix(name, prefix) && name != filename {
+			return filepath.Join(dir, name), true
+		}
+	}
+
+	return "", false
+}
+
 // shouldSkipMessage applies date filters
 func (i *Importer) shouldSkipMessage(path string) bool {
 	if i.options.StartDate == nil && i.options.EndDate == nil {
@@ -1373,8 +1556,21 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// Read file
 			content, err := os.ReadFile(msg.path)
 			if err != nil {
-				logger.Warn("Failed to read file", "path", msg.path, "error", err)
-				return
+				// If file not found, it might have been renamed (e.g. flags changed)
+				// Try to find it by unique ID prefix
+				if os.IsNotExist(err) {
+					if newPath, found := i.findMovedFile(msg.path); found {
+						logger.Info("File moved, found at new path", "old", msg.path, "new", newPath)
+						msg.path = newPath
+						msg.filename = filepath.Base(newPath)
+						content, err = os.ReadFile(newPath)
+					}
+				}
+
+				if err != nil {
+					logger.Warn("Failed to read file", "path", msg.path, "error", err)
+					return
+				}
 			}
 
 			// Check for cancellation after I/O

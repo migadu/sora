@@ -102,15 +102,17 @@ func parseHeader(line string, uidlist *DovecotUIDList) error {
 
 		switch field[0] {
 		case 'V':
-			// UIDVALIDITY
-			val, err := strconv.ParseUint(field[1:], 10, 32)
+			// UIDVALIDITY - Parse as uint64 first to avoid overflow, then cast to uint32
+			// Dovecot can generate UIDVALIDITYs larger than uint32 max (4,294,967,295)
+			// by using Unix timestamps in microseconds or nanoseconds
+			val, err := strconv.ParseUint(field[1:], 10, 64)
 			if err != nil {
 				return fmt.Errorf("invalid UIDVALIDITY: %s", field)
 			}
 			uidlist.UIDValidity = uint32(val)
 		case 'N':
-			// Next UID
-			val, err := strconv.ParseUint(field[1:], 10, 32)
+			// Next UID - Parse as uint64 first to avoid overflow, then cast to uint32
+			val, err := strconv.ParseUint(field[1:], 10, 64)
 			if err != nil {
 				return fmt.Errorf("invalid Next UID: %s", field)
 			}
@@ -166,9 +168,17 @@ func parseUIDMapping(line string, uidlist *DovecotUIDList) error {
 		baseFilename = baseFilename[:idx]
 	}
 
-	// Remove size information (like ,S=1355,W=1394)
-	if idx := strings.Index(baseFilename, ",S="); idx > 0 {
-		baseFilename = baseFilename[:idx]
+	// Remove size information (,S=xxx,W=yyy or ,W=yyy)
+	// Dovecot maildir format always puts S before W, but check both for robustness
+	// Find the earliest occurrence of size markers
+	sIdx := strings.Index(baseFilename, ",S=")
+	wIdx := strings.Index(baseFilename, ",W=")
+
+	// Use the earliest marker position (both may be present)
+	if sIdx > 0 && (wIdx < 0 || sIdx < wIdx) {
+		baseFilename = baseFilename[:sIdx]
+	} else if wIdx > 0 {
+		baseFilename = baseFilename[:wIdx]
 	}
 
 	baseFilename = filepath.Base(baseFilename)
@@ -208,9 +218,17 @@ func (u *DovecotUIDList) GetUIDForFile(filename string) (uint32, bool) {
 		return uid, true
 	}
 
-	// Remove size information (,S=1355,W=1394) if present
-	if idx := strings.Index(cleanFilename, ",S="); idx > 0 {
-		cleanFilename = cleanFilename[:idx]
+	// Remove size information (,S=xxx,W=yyy or ,W=yyy) if present
+	// Dovecot maildir format always puts S before W, but check both for robustness
+	// Find the earliest occurrence of size markers
+	sIdx := strings.Index(cleanFilename, ",S=")
+	wIdx := strings.Index(cleanFilename, ",W=")
+
+	// Use the earliest marker position (both may be present)
+	if sIdx > 0 && (wIdx < 0 || sIdx < wIdx) {
+		cleanFilename = cleanFilename[:sIdx]
+	} else if wIdx > 0 {
+		cleanFilename = cleanFilename[:wIdx]
 	}
 
 	// Try without size info and flags
