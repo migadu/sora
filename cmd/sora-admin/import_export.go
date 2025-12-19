@@ -172,13 +172,22 @@ Examples:
 	defer rdb.Close()
 
 	// Connect to S3
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug())
-	if err != nil {
-		logger.Fatalf("Failed to connect to S3: %v", err)
-	}
-	if globalConfig.S3.Encrypt {
-		if err := s3.EnableEncryption(globalConfig.S3.EncryptionKey); err != nil {
-			logger.Fatalf("Failed to enable S3 encryption: %v", err)
+	// NOTE: Importer supports TestMode, but the CLI normally requires S3 connectivity.
+	// For integration tests (and some migration workflows), we allow skipping S3 by
+	// setting SORA_ADMIN_SKIP_S3=1.
+	var s3 *storage.S3Storage
+	if os.Getenv("SORA_ADMIN_SKIP_S3") == "1" {
+		logger.Info("S3 disabled via SORA_ADMIN_SKIP_S3=1")
+		s3 = nil
+	} else {
+		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug())
+		if err != nil {
+			logger.Fatalf("Failed to connect to S3: %v", err)
+		}
+		if globalConfig.S3.Encrypt {
+			if err := s3.EnableEncryption(globalConfig.S3.EncryptionKey); err != nil {
+				logger.Fatalf("Failed to enable S3 encryption: %v", err)
+			}
 		}
 	}
 
@@ -203,6 +212,7 @@ Examples:
 		SievePath:            *sievePath,
 		PreserveUIDs:         *preserveUIDs || *dovecot,
 		FTSRetention:         ftsRetention,
+		TestMode:             s3 == nil,
 		BatchSize:            *batchSize,
 		BatchTransactionMode: *batchTxMode,
 	}

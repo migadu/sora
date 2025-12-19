@@ -109,6 +109,32 @@ func TestImporter_Resilience(t *testing.T) {
 		}
 	})
 
+	// Test findMovedFile from new to cur
+	t.Run("FindMovedFile_NewToCur", func(t *testing.T) {
+		// Create file in new
+		filename := "1234567891.M123P456.host"
+		oldPath := filepath.Join(maildirPath, "new", filename)
+		err := os.WriteFile(oldPath, []byte("body"), 0644)
+		if err != nil {
+			t.Fatalf("Failed to create file: %v", err)
+		}
+
+		// Move to cur with flags
+		newPath := filepath.Join(maildirPath, "cur", filename+":2,S")
+		err = os.Rename(oldPath, newPath)
+		if err != nil {
+			t.Fatalf("Failed to rename: %v", err)
+		}
+
+		// findMovedFile only supports dovecot-style renames (flags-only changes)
+		// where both the old and new filenames contain the ":2," separator.
+		// new->cur moves don't have that separator in the original filename,
+		// so this case is intentionally not supported.
+		if _, found := importer.findMovedFile(oldPath); found {
+			t.Errorf("Expected NOT to find moved file (new->cur) with findMovedFile")
+		}
+	})
+
 	// Test syncMailboxState
 	t.Run("SyncMailboxState", func(t *testing.T) {
 		// Ensure mailbox exists
@@ -128,7 +154,7 @@ func TestImporter_Resilience(t *testing.T) {
 		db := rdb.GetOperationalDatabase()
 		var uidValidity uint32
 		err = db.WritePool.QueryRow(context.Background(),
-			"SELECT uid_validity FROM mailboxes WHERE name = 'INBOX' AND account_id = (SELECT id FROM accounts WHERE email = $1)",
+			"SELECT uid_validity FROM mailboxes WHERE name = 'INBOX' AND account_id = (SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($1) AND primary_identity = TRUE)",
 			testEmail).Scan(&uidValidity)
 		if err != nil {
 			t.Fatalf("Failed to query UIDVALIDITY: %v", err)

@@ -978,9 +978,10 @@ func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 		}
 	}
 
-	// Add \Recent flag to newly imported messages
-	flags = append(flags, imap.Flag("\\Recent"))
-
+	// NOTE: Do NOT set \Recent on import.
+	// Per RFC 3501, \Recent is session-specific and not a persistent flag.
+	// Persisting it causes clients to treat all messages as new/recent after import,
+	// which often triggers a full re-sync/redownload.
 	return flags
 }
 
@@ -1490,7 +1491,8 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	if i.options.PreserveFlags {
 		flags = i.parseMaildirFlags(filename)
 	} else {
-		flags = []imap.Flag{imap.Flag("\\Recent")}
+		// \Recent must not be persisted; return no flags by default.
+		flags = nil
 	}
 
 	// Preserved UIDs
