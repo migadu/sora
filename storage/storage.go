@@ -72,37 +72,70 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"net/http"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type S3Storage struct {
-	Client        *minio.Client
+	Client        *s3.Client
 	BucketName    string
 	Encrypt       bool
 	EncryptionKey []byte
 }
 
 func New(endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool, debug bool) (*S3Storage, error) {
-	// Initialize the MinIO client
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
-		Secure: useSSL, // Use SSL (https) if true
-	})
-	if err != nil {
-		logger.Error("STORAGE: Failed to initialize MinIO client", "error", err)
-		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+	// Build endpoint URL - accept either with or without protocol
+	var endpointURL string
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		// Endpoint already includes protocol
+		endpointURL = endpoint
+	} else {
+		// Add protocol based on useSSL flag
+		if useSSL {
+			endpointURL = "https://" + endpoint
+		} else {
+			endpointURL = "http://" + endpoint
+		}
 	}
 
-	// Enable detailed tracing of requests and responses for debugging
-	if debug {
-		client.TraceOn(os.Stdout)
+	// Create AWS credentials
+	creds := credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")
+
+	// Create custom endpoint resolver
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL:               endpointURL,
+			HostnameImmutable: true,
+			Source:            aws.EndpointSourceCustom,
+		}, nil
+	})
+
+	// Build AWS config
+	cfg := aws.Config{
+		Credentials:                 creds,
+		Region:                      "us-east-1", // Default region, can be overridden
+		EndpointResolverWithOptions: customResolver,
 	}
+
+	// Add debug logging if requested
+	if debug {
+		cfg.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
+	}
+
+	// Create S3 client with path-style addressing for compatibility
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
+
+	logger.Info("STORAGE: Initialized AWS S3 client", "endpoint", endpoint, "bucket", bucketName, "ssl", useSSL)
 
 	// Return the initialized storage client
 	return &S3Storage{
@@ -138,15 +171,25 @@ func (s *S3Storage) EnableEncryption(encryptionKey string) error {
 
 // Exists checks if an object with the given key exists in the bucket.
 func (s *S3Storage) Exists(key string) (bool, string, error) {
-	objInfo, err := s.Client.StatObject(context.Background(), s.BucketName, key, minio.StatObjectOptions{})
-	if err == nil {
-		return true, objInfo.VersionID, nil // Object exists
+	ctx := context.Background()
+	input := &s3.HeadObjectInput{
+		Bucket: aws.String(s.BucketName),
+		Key:    aws.String(key),
 	}
 
-	// Check if the error is a minio.ErrorResponse
-	var minioErr minio.ErrorResponse
-	if errors.As(err, &minioErr) {
-		if minioErr.StatusCode == 404 {
+	result, err := s.Client.HeadObject(ctx, input)
+	if err == nil {
+		versionID := ""
+		if result.VersionId != nil {
+			versionID = *result.VersionId
+		}
+		return true, versionID, nil // Object exists
+	}
+
+	// Check if the error is a 404 Not Found
+	var responseError *awshttp.ResponseError
+	if errors.As(err, &responseError) {
+		if responseError.HTTPStatusCode() == http.StatusNotFound {
 			return false, "", nil // Object does not exist
 		}
 	}
@@ -157,6 +200,7 @@ func (s *S3Storage) Exists(key string) (bool, string, error) {
 
 func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	start := time.Now()
+	ctx := context.Background()
 
 	// If encryption is enabled, encrypt the data before uploading
 	if s.Encrypt {
@@ -172,14 +216,13 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 			return fmt.Errorf("failed to encrypt data: %w", err)
 		}
 
-		_, err = s.Client.PutObject(
-			context.Background(),
-			s.BucketName,
-			key,
-			bytes.NewReader(encryptedData),
-			int64(len(encryptedData)),
-			minio.PutObjectOptions{SendContentMd5: true},
-		)
+		input := &s3.PutObjectInput{
+			Bucket: aws.String(s.BucketName),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(encryptedData),
+		}
+
+		_, err = s.Client.PutObject(ctx, input)
 		if err != nil {
 			metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
 			metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
@@ -191,14 +234,13 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	}
 
 	// No encryption, upload as-is
-	_, err := s.Client.PutObject(
-		context.Background(),
-		s.BucketName,
-		key,
-		body,
-		size,
-		minio.PutObjectOptions{SendContentMd5: true},
-	)
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(s.BucketName),
+		Key:    aws.String(key),
+		Body:   body,
+	}
+
+	_, err := s.Client.PutObject(ctx, input)
 	if err != nil {
 		metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
 		metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
@@ -260,8 +302,14 @@ func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
 
 func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 	start := time.Now()
+	ctx := context.Background()
 
-	object, err := s.Client.GetObject(context.Background(), s.BucketName, key, minio.GetObjectOptions{})
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(s.BucketName),
+		Key:    aws.String(key),
+	}
+
+	result, err := s.Client.GetObject(ctx, input)
 	if err != nil {
 		metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 		metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
@@ -270,15 +318,16 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 
 	// If encryption is enabled, decrypt the data after downloading
 	if s.Encrypt {
-		encryptedData, err := io.ReadAll(object)
+		encryptedData, err := io.ReadAll(result.Body)
 		if err != nil {
 			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
+			result.Body.Close()
 			return nil, fmt.Errorf("failed to read encrypted data: %w", err)
 		}
 
 		// Close the original reader since we've read all the data
-		if err := object.Close(); err != nil {
+		if err := result.Body.Close(); err != nil {
 			logger.Warn("Storage: Failed to close S3 object", "error", err)
 		}
 
@@ -296,11 +345,12 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 
 	metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
 	metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
-	return object, nil
+	return result.Body, nil
 }
 
 func (s *S3Storage) Delete(key string) error {
 	start := time.Now()
+	ctx := context.Background()
 
 	// Check if the object exists before attempting to delete.
 	// This makes DeleteMessage idempotent.
@@ -318,7 +368,16 @@ func (s *S3Storage) Delete(key string) error {
 		metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 		return nil
 	}
-	err = s.Client.RemoveObject(context.Background(), s.BucketName, key, minio.RemoveObjectOptions{VersionID: versionId})
+
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(s.BucketName),
+		Key:    aws.String(key),
+	}
+	if versionId != "" {
+		input.VersionId = aws.String(versionId)
+	}
+
+	_, err = s.Client.DeleteObject(ctx, input)
 	if err != nil {
 		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
 	} else {
@@ -358,6 +417,8 @@ func contains(s, substr string) bool {
 }
 
 func (s *S3Storage) Copy(sourcePath, destPath string) error {
+	ctx := context.Background()
+
 	// If encryption is enabled, we need to download, decrypt, and re-upload
 	if s.Encrypt {
 		// Get the source object
@@ -383,16 +444,14 @@ func (s *S3Storage) Copy(sourcePath, destPath string) error {
 	}
 
 	// No encryption, use the standard copy operation
-	src := minio.CopySrcOptions{
-		Bucket: s.BucketName,
-		Object: sourcePath,
-	}
-	dst := minio.CopyDestOptions{
-		Bucket: s.BucketName,
-		Object: destPath,
+	copySource := fmt.Sprintf("%s/%s", s.BucketName, sourcePath)
+	input := &s3.CopyObjectInput{
+		Bucket:     aws.String(s.BucketName),
+		CopySource: aws.String(copySource),
+		Key:        aws.String(destPath),
 	}
 
-	_, err := s.Client.CopyObject(context.Background(), dst, src)
+	_, err := s.Client.CopyObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to copy object from %s to %s: %w", sourcePath, destPath, err)
 	}
@@ -416,22 +475,31 @@ func (s *S3Storage) ListObjects(ctx context.Context, prefix string, recursive bo
 		defer close(objectCh)
 		defer close(errCh)
 
-		opts := minio.ListObjectsOptions{
-			Prefix:    prefix,
-			Recursive: recursive,
+		input := &s3.ListObjectsV2Input{
+			Bucket: aws.String(s.BucketName),
+			Prefix: aws.String(prefix),
 		}
 
-		for object := range s.Client.ListObjects(ctx, s.BucketName, opts) {
-			if object.Err != nil {
-				errCh <- object.Err
+		if !recursive {
+			input.Delimiter = aws.String("/")
+		}
+
+		paginator := s3.NewListObjectsV2Paginator(s.Client, input)
+
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				errCh <- err
 				return
 			}
 
-			objectCh <- S3Object{
-				Key:          object.Key,
-				Size:         object.Size,
-				LastModified: object.LastModified,
-				ETag:         object.ETag,
+			for _, object := range page.Contents {
+				objectCh <- S3Object{
+					Key:          aws.ToString(object.Key),
+					Size:         aws.ToInt64(object.Size),
+					LastModified: aws.ToTime(object.LastModified),
+					ETag:         strings.Trim(aws.ToString(object.ETag), "\""),
+				}
 			}
 		}
 	}()

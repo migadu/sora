@@ -328,6 +328,20 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	}
 }
 
+// ForceHalfOpen forces the circuit breaker to half-open state regardless of current state
+// This is useful when external monitoring (e.g., health checks) confirms that the service
+// has recovered and we want to immediately allow requests to test the connection.
+// Use with caution - this bypasses the normal timeout-based recovery mechanism.
+func (cb *CircuitBreaker) ForceHalfOpen() {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	now := time.Now()
+	if cb.state != StateHalfOpen {
+		cb.setState(StateHalfOpen, now)
+	}
+}
+
 func DefaultSettings(name string) Settings {
 	return Settings{
 		Name:        name,

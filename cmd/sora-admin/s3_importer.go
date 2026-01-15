@@ -16,6 +16,8 @@ import (
 
 	"github.com/migadu/sora/logger"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/mail"
@@ -24,7 +26,6 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
-	"github.com/minio/minio-go/v7"
 	_ "modernc.org/sqlite"
 )
 
@@ -188,80 +189,89 @@ func (si *S3Importer) scanS3Objects() error {
 	logger.Info("Scanning S3 bucket for user", "email", si.options.Email, "prefix", s3Prefix)
 
 	ctx := context.Background()
-	opts := minio.ListObjectsOptions{
-		Prefix:       s3Prefix,
-		Recursive:    true,
-		MaxKeys:      1000, // Process in batches
-		StartAfter:   si.options.ContinuationToken,
-		WithMetadata: false,
+	input := &s3.ListObjectsV2Input{
+		Bucket:     aws.String(si.s3.GetStorage().BucketName),
+		Prefix:     aws.String(s3Prefix),
+		MaxKeys:    aws.Int32(1000), // Process in batches
+		StartAfter: aws.String(si.options.ContinuationToken),
 	}
 
 	objectCount := 0
 	batchCount := 0
 
-	for object := range si.s3.GetStorage().Client.ListObjects(ctx, si.s3.GetStorage().BucketName, opts) {
-		if object.Err != nil {
-			return fmt.Errorf("error listing S3 objects: %w", object.Err)
-		}
+	paginator := s3.NewListObjectsV2Paginator(si.s3.GetStorage().Client, input)
 
-		// Parse the S3 key to extract domain, local_part, and content_hash
-		// Expected format: domain/local_part/content_hash
-		parts := strings.Split(object.Key, "/")
-		if len(parts) != 3 {
-			logger.Info("Skipping S3 object with unexpected key format", "key", object.Key)
-			continue
-		}
-
-		domain := parts[0]
-		localPart := parts[1]
-		contentHash := parts[2]
-
-		// Validate that this matches our expected user
-		expectedDomain := address.Domain()
-		expectedLocalPart := address.LocalPart()
-		if domain != expectedDomain || localPart != expectedLocalPart {
-			logger.Info("Skipping S3 object for different user", "key", object.Key,
-				"expected_email", fmt.Sprintf("%s@%s", expectedLocalPart, expectedDomain))
-			continue
-		}
-
-		// Validate content hash format (should be hex)
-		if len(contentHash) != 64 { // SHA256 hex string length
-			logger.Info("Skipping S3 object with invalid hash format", "key", object.Key)
-			continue
-		}
-		if _, err := hex.DecodeString(contentHash); err != nil {
-			logger.Info("Skipping S3 object with non-hex hash", "key", object.Key)
-			continue
-		}
-
-		// Store object information in SQLite
-		_, err := si.db.Exec(`
-			INSERT OR IGNORE INTO s3_objects 
-			(key, size, last_modified, etag, domain, local_part, content_hash) 
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			object.Key, object.Size, object.LastModified.Format(time.RFC3339),
-			object.ETag, domain, localPart, contentHash)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to insert S3 object info: %w", err)
+			return fmt.Errorf("error listing S3 objects: %w", err)
 		}
 
-		objectCount++
-		if objectCount%1000 == 0 {
-			logger.Info("Scanned S3 objects", "count", objectCount)
-		}
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			size := aws.ToInt64(object.Size)
+			lastModified := aws.ToTime(object.LastModified)
+			etag := strings.Trim(aws.ToString(object.ETag), "\"")
 
-		// Check if we've reached the maximum object limit
-		if si.options.MaxObjects > 0 && objectCount >= si.options.MaxObjects {
-			logger.Info("Reached maximum object limit", "max", si.options.MaxObjects)
-			break
-		}
+			// Parse the S3 key to extract domain, local_part, and content_hash
+			// Expected format: domain/local_part/content_hash
+			parts := strings.Split(key, "/")
+			if len(parts) != 3 {
+				logger.Info("Skipping S3 object with unexpected key format", "key", key)
+				continue
+			}
 
-		batchCount++
-		if batchCount >= si.options.BatchSize {
-			// Store continuation token for resumable operations
-			si.lastContinuationToken = object.Key
-			batchCount = 0
+			domain := parts[0]
+			localPart := parts[1]
+			contentHash := parts[2]
+
+			// Validate that this matches our expected user
+			expectedDomain := address.Domain()
+			expectedLocalPart := address.LocalPart()
+			if domain != expectedDomain || localPart != expectedLocalPart {
+				logger.Info("Skipping S3 object for different user", "key", key,
+					"expected_email", fmt.Sprintf("%s@%s", expectedLocalPart, expectedDomain))
+				continue
+			}
+
+			// Validate content hash format (should be hex)
+			if len(contentHash) != 64 { // SHA256 hex string length
+				logger.Info("Skipping S3 object with invalid hash format", "key", key)
+				continue
+			}
+			if _, err := hex.DecodeString(contentHash); err != nil {
+				logger.Info("Skipping S3 object with non-hex hash", "key", key)
+				continue
+			}
+
+			// Store object information in SQLite
+			_, err := si.db.Exec(`
+				INSERT OR IGNORE INTO s3_objects
+				(key, size, last_modified, etag, domain, local_part, content_hash)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				key, size, lastModified.Format(time.RFC3339),
+				etag, domain, localPart, contentHash)
+			if err != nil {
+				return fmt.Errorf("failed to insert S3 object info: %w", err)
+			}
+
+			objectCount++
+			if objectCount%1000 == 0 {
+				logger.Info("Scanned S3 objects", "count", objectCount)
+			}
+
+			// Check if we've reached the maximum object limit
+			if si.options.MaxObjects > 0 && objectCount >= si.options.MaxObjects {
+				logger.Info("Reached maximum object limit", "max", si.options.MaxObjects)
+				return nil
+			}
+
+			batchCount++
+			if batchCount >= si.options.BatchSize {
+				// Store continuation token for resumable operations
+				si.lastContinuationToken = key
+				batchCount = 0
+			}
 		}
 	}
 

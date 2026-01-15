@@ -26,8 +26,8 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/migadu/sora/storage"
-	"github.com/minio/minio-go/v7"
 )
 
 // DatabaseManager defines the interface for database operations required by the cleaner.
@@ -281,9 +281,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			s3Err := w.s3.DeleteWithRetry(ctx, s3Key)
 
 			isS3ObjectNotFoundError := false
-			var minioErr minio.ErrorResponse
-			if s3Err != nil && errors.As(s3Err, &minioErr) {
-				isS3ObjectNotFoundError = (minioErr.StatusCode == 404)
+			var awsErr *awshttp.ResponseError
+			if s3Err != nil && errors.As(s3Err, &awsErr) {
+				isS3ObjectNotFoundError = (awsErr.HTTPStatusCode() == 404)
 			}
 
 			if s3Err != nil && !isS3ObjectNotFoundError {

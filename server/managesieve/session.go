@@ -1390,7 +1390,7 @@ func (s *ManageSieveSession) startTerminationPoller() {
 		select {
 		case <-kickChan:
 			// Kick notification received - close connection
-			s.DebugLog("connection kicked, disconnecting")
+			s.InfoLog("connection kicked, disconnecting")
 			(*s.conn).Close()
 		case <-s.ctx.Done():
 			// Session ended normally

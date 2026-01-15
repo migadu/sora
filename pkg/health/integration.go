@@ -6,12 +6,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
-	"github.com/minio/minio-go/v7"
 )
 
 // HealthIntegration manages health monitoring for the Sora server
@@ -89,18 +90,13 @@ func (hi *HealthIntegration) RegisterS3Check(s3storage *storage.S3Storage) {
 		Critical: true,
 		Check: func(ctx context.Context) error {
 			// Test S3 connectivity by attempting to list objects
-			objectCh := s3storage.Client.ListObjects(ctx, s3storage.BucketName, minio.ListObjectsOptions{MaxKeys: 1})
-			select {
-			case obj, ok := <-objectCh:
-				if !ok {
-					// Channel closed without error means bucket is accessible but empty - this is OK
-					return nil
-				}
-				if obj.Err != nil {
-					return fmt.Errorf("S3 list objects failed: %w", obj.Err)
-				}
-			case <-ctx.Done():
-				return ctx.Err()
+			input := &s3.ListObjectsV2Input{
+				Bucket:  aws.String(s3storage.BucketName),
+				MaxKeys: aws.Int32(1),
+			}
+			_, err := s3storage.Client.ListObjectsV2(ctx, input)
+			if err != nil {
+				return fmt.Errorf("S3 list objects failed: %w", err)
 			}
 			return nil
 		},

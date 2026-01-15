@@ -226,7 +226,7 @@ func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context,
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).PruneOldMessageBodies(ctx, tx, retention)
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutAdmin, op)
 	if err != nil {
 		return 0, err
 	}

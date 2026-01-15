@@ -7,27 +7,30 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"os"
+	"net/http"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"golang.org/x/crypto/acme/autocert"
 )
 
 // S3Cache implements autocert.Cache using S3 for certificate storage.
 // This allows certificates to be shared across multiple instances of the application.
 type S3Cache struct {
-	client *minio.Client
+	client *s3.Client
 	bucket string
 	prefix string // Key prefix for certificate storage (default: "autocert/")
 }
 
-// NewS3Cache creates a new S3-backed autocert cache using MinIO client.
+// NewS3Cache creates a new S3-backed autocert cache using AWS SDK.
 func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 	ctx := context.Background()
 
@@ -40,29 +43,59 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 	// Determine if TLS should be used
 	useSSL := !cfg.DisableTLS
 
+	// Build endpoint URL - accept either with or without protocol
+	var endpointURL string
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		// Endpoint already includes protocol
+		endpointURL = endpoint
+	} else {
+		// Add protocol based on useSSL flag
+		if useSSL {
+			endpointURL = "https://" + endpoint
+		} else {
+			endpointURL = "http://" + endpoint
+		}
+	}
+
 	// Configure credentials
-	var creds *credentials.Credentials
+	var creds aws.CredentialsProvider
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
 		// Use static credentials
-		creds = credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, "")
+		creds = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
 	} else {
-		// Use IAM credentials chain (environment vars, EC2 IAM role, etc.)
-		creds = credentials.NewIAM("")
+		// Use default credentials chain (environment vars, EC2 IAM role, etc.)
+		// This will be handled by the SDK automatically
+		creds = nil
 	}
 
-	// Initialize MinIO client
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  creds,
-		Secure: useSSL,
+	// Create custom endpoint resolver
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL:               endpointURL,
+			HostnameImmutable: true,
+			Source:            aws.EndpointSourceCustom,
+		}, nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+
+	// Build AWS config
+	awsCfg := aws.Config{
+		Region:                      "us-east-1", // Default region
+		EndpointResolverWithOptions: customResolver,
 	}
 
-	// Enable debug logging if requested
-	if cfg.Debug {
-		client.TraceOn(os.Stdout)
+	if creds != nil {
+		awsCfg.Credentials = creds
 	}
+
+	// Add debug logging if requested
+	if cfg.Debug {
+		awsCfg.ClientLogMode = aws.LogRequest | aws.LogResponse | aws.LogRetries
+	}
+
+	// Create S3 client with path-style addressing for compatibility
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 
 	cache := &S3Cache{
 		client: client,
@@ -82,12 +115,12 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config) (*S3Cache, error) {
 
 // verifyBucketAccess checks if the S3 bucket exists and is accessible.
 func (c *S3Cache) verifyBucketAccess(ctx context.Context) error {
-	exists, err := c.client.BucketExists(ctx, c.bucket)
+	input := &s3.HeadBucketInput{
+		Bucket: aws.String(c.bucket),
+	}
+	_, err := c.client.HeadBucket(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to check bucket existence: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("bucket %s does not exist", c.bucket)
 	}
 	return nil
 }
@@ -98,27 +131,29 @@ func (c *S3Cache) Get(ctx context.Context, key string) ([]byte, error) {
 
 	logger.Debug("S3-Cache: Getting certificate", "key", key, "s3_key", s3Key)
 
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(s3Key),
+	}
+
 	// Get object from S3
-	obj, err := c.client.GetObject(ctx, c.bucket, s3Key, minio.GetObjectOptions{})
+	result, err := c.client.GetObject(ctx, input)
 	if err != nil {
+		// Check if the error is a 404 Not Found
+		var responseError *awshttp.ResponseError
+		if errors.As(err, &responseError) {
+			if responseError.HTTPStatusCode() == http.StatusNotFound {
+				logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
+				return nil, autocert.ErrCacheMiss
+			}
+		}
 		logger.Error("S3-Cache: Failed to get object from S3", "error", err)
 		return nil, autocert.ErrCacheMiss
 	}
-	defer obj.Close()
-
-	// Check if object exists (404 means cache miss)
-	if _, err := obj.Stat(); err != nil {
-		// MinIO returns error on stat if object doesn't exist
-		if minio.ToErrorResponse(err).StatusCode == 404 {
-			logger.Debug("S3-Cache: Certificate not found (cache miss)", "key", key)
-			return nil, autocert.ErrCacheMiss
-		}
-		logger.Error("S3-Cache: Failed to stat object", "error", err)
-		return nil, fmt.Errorf("failed to stat object: %w", err)
-	}
+	defer result.Body.Close()
 
 	// Read object data
-	data, err := io.ReadAll(obj)
+	data, err := io.ReadAll(result.Body)
 	if err != nil {
 		logger.Error("S3-Cache: Failed to read object data", "error", err)
 		return nil, fmt.Errorf("failed to read object: %w", err)
@@ -134,17 +169,16 @@ func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
 
 	logger.Debug("S3-Cache: Putting certificate", "key", key, "s3_key", s3Key, "bytes", len(data))
 
+	contentType := "application/octet-stream"
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(c.bucket),
+		Key:         aws.String(s3Key),
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	}
+
 	// Upload to S3
-	_, err := c.client.PutObject(
-		ctx,
-		c.bucket,
-		s3Key,
-		bytes.NewReader(data),
-		int64(len(data)),
-		minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-		},
-	)
+	_, err := c.client.PutObject(ctx, input)
 	if err != nil {
 		logger.Error("S3-Cache: Failed to upload certificate to S3", "error", err)
 		return fmt.Errorf("failed to upload to S3: %w", err)
@@ -160,13 +194,21 @@ func (c *S3Cache) Delete(ctx context.Context, key string) error {
 
 	logger.Debug("S3-Cache: Deleting certificate", "key", key, "s3_key", s3Key)
 
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(s3Key),
+	}
+
 	// Delete from S3
-	err := c.client.RemoveObject(ctx, c.bucket, s3Key, minio.RemoveObjectOptions{})
+	_, err := c.client.DeleteObject(ctx, input)
 	if err != nil {
 		// Check if object doesn't exist (which is fine for Delete)
-		if minio.ToErrorResponse(err).StatusCode == 404 {
-			logger.Debug("S3-Cache: Certificate already deleted or doesn't exist", "key", key)
-			return nil
+		var responseError *awshttp.ResponseError
+		if errors.As(err, &responseError) {
+			if responseError.HTTPStatusCode() == http.StatusNotFound {
+				logger.Debug("S3-Cache: Certificate already deleted or doesn't exist", "key", key)
+				return nil
+			}
 		}
 		logger.Error("S3-Cache: Failed to delete certificate from S3", "error", err)
 		return fmt.Errorf("failed to delete from S3: %w", err)

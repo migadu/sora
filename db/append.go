@@ -209,8 +209,11 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			// Mailbox already has messages - check if UIDVALIDITY matches
 			if currentUIDValidity != *options.PreservedUIDValidity {
 				// UIDVALIDITY changed - ignore preserved UID and deliver normally
-				log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
-					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				// Only log once per mailbox to avoid log spam
+				if _, logged := d.uidValidityMismatchLoggedMap.LoadOrStore(options.MailboxID, true); !logged {
+					log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
+						options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				}
 
 				// Clear preserved values to use normal auto-increment
 				options.PreservedUID = nil
@@ -393,39 +396,15 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	if err != nil {
 		// Check for a unique constraint violation specifically on the message_id.
-		// Other unique violations (e.g., from triggers) are not recoverable here
-		// as they will abort the transaction.
 		// Note: We check both old constraint name and new index name for backward compatibility during rolling deploys.
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
 				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
-			// Unique constraint violation. Check if it's due to message_id and if we can return the existing message.
-			// The saneMessageID was used in the INSERT attempt.
-
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Attempting to find existing message.", saneMessageID, options.MailboxID)
-			var existingID, existingUID int64
-			// Query within the same transaction. If we return successfully from here,
-			// the defer tx.Rollback(ctx) will roll back the attempted INSERT and UID bump.
-			queryErr := tx.QueryRow(ctx,
-				`SELECT id, uid FROM messages 
-					 WHERE account_id = $1 AND mailbox_id = $2 AND message_id = $3 AND expunged_at IS NULL`,
-				options.AccountID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
-
-			if queryErr == nil {
-				log.Printf("Database: found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
-				return existingID, existingUID, nil // Return existing message details
-			} else if errors.Is(queryErr, pgx.ErrNoRows) {
-				// This is unexpected: unique constraint fired, but we can't find the row by message_id.
-				// Could be a conflict on UID or another unique constraint.
-				log.Printf("Database: unique constraint violation for MailboxID %d (MessageID '%s'), but no existing non-expunged message found by this MessageID. Falling back to unique violation error. Lookup error: %v", options.MailboxID, saneMessageID, queryErr)
-			} else {
-				// Error during the lookup query
-				log.Printf("Database: error querying for existing message after unique constraint violation (MailboxID %d, MessageID '%s'): %v. Falling back to unique violation error.", options.MailboxID, saneMessageID, queryErr)
-			}
-
-			// Fallback to returning the original unique violation error if MessageID was empty or lookup failed.
-			log.Printf("Database: original unique constraint violation error for MailboxID %d, MessageID '%s': %v", options.MailboxID, saneMessageID, err)
-			return 0, 0, consts.ErrDBUniqueViolation // Original error
+			// Unique constraint violation on message_id - message already exists in this mailbox.
+			// The transaction is aborted by PostgreSQL, so we cannot query for the existing message.
+			// Return ErrDBUniqueViolation and let the caller handle it (typically by skipping the duplicate).
+			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Message already exists, transaction will be rolled back.", saneMessageID, options.MailboxID)
+			return 0, 0, consts.ErrDBUniqueViolation
 		}
 		log.Printf("Database: failed to insert message into database: %v", err)
 		return 0, 0, consts.ErrDBInsertFailed
@@ -516,8 +495,11 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			// Mailbox already has messages - check if UIDVALIDITY matches
 			if currentUIDValidity != *options.PreservedUIDValidity {
 				// UIDVALIDITY changed - ignore preserved UID and deliver normally
-				log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
-					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				// Only log once per mailbox to avoid log spam
+				if _, logged := d.uidValidityMismatchLoggedMap.LoadOrStore(options.MailboxID, true); !logged {
+					log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
+						options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				}
 
 				// Clear preserved values to use normal auto-increment
 				options.PreservedUID = nil
@@ -686,39 +668,15 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	if err != nil {
 		// Check for a unique constraint violation specifically on the message_id.
-		// Other unique violations (e.g., from triggers) are not recoverable here
-		// as they will abort the transaction.
 		// Note: We check both old constraint name and new index name for backward compatibility during rolling deploys.
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
 				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
-			// Unique constraint violation. Check if it's due to message_id and if we can return the existing message.
-			// The saneMessageID was used in the INSERT attempt.
-
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Attempting to find existing message.", saneMessageID, options.MailboxID)
-			var existingID, existingUID int64
-			// Query within the same transaction. If we return successfully from here,
-			// the defer tx.Rollback(ctx) will roll back the attempted INSERT and UID bump.
-			queryErr := tx.QueryRow(ctx,
-				`SELECT id, uid FROM messages 
-					 WHERE account_id = $1 AND mailbox_id = $2 AND message_id = $3 AND expunged_at IS NULL`,
-				options.AccountID, options.MailboxID, saneMessageID).Scan(&existingID, &existingUID)
-
-			if queryErr == nil {
-				log.Printf("Database: found existing message for MessageID '%s' in MailboxID %d. Returning existing ID: %d, UID: %d. Current transaction will be rolled back.", saneMessageID, options.MailboxID, existingID, existingUID)
-				return existingID, existingUID, nil // Return existing message details
-			} else if errors.Is(queryErr, pgx.ErrNoRows) {
-				// This is unexpected: unique constraint fired, but we can't find the row by message_id.
-				// Could be a conflict on UID or another unique constraint.
-				log.Printf("Database: unique constraint violation for MailboxID %d (MessageID '%s'), but no existing non-expunged message found by this MessageID. Falling back to unique violation error. Lookup error: %v", options.MailboxID, saneMessageID, queryErr)
-			} else {
-				// Error during the lookup query
-				log.Printf("Database: error querying for existing message after unique constraint violation (MailboxID %d, MessageID '%s'): %v. Falling back to unique violation error.", options.MailboxID, saneMessageID, queryErr)
-			}
-
-			// Fallback to returning the original unique violation error if MessageID was empty or lookup failed.
-			log.Printf("Database: original unique constraint violation error for MailboxID %d, MessageID '%s': %v", options.MailboxID, saneMessageID, err)
-			return 0, 0, consts.ErrDBUniqueViolation // Original error
+			// Unique constraint violation on message_id - message already exists in this mailbox.
+			// The transaction is aborted by PostgreSQL, so we cannot query for the existing message.
+			// Return ErrDBUniqueViolation and let the caller handle it (typically by skipping the duplicate).
+			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Message already exists, transaction will be rolled back.", saneMessageID, options.MailboxID)
+			return 0, 0, consts.ErrDBUniqueViolation
 		}
 		log.Printf("Database: failed to insert message into database: %v", err)
 		return 0, 0, consts.ErrDBInsertFailed

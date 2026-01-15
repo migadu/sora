@@ -522,7 +522,7 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 
 	if ct.clusterManager != nil {
 		// Cluster mode: broadcast kick event via gossip
-		logger.Debug("Gossip tracker: Broadcasting kick", "name", ct.name, "account_id", accountID, "protocol", protocol)
+		logger.Info("Gossip tracker: Broadcasting kick", "name", ct.name, "account_id", accountID, "protocol", protocol)
 
 		ct.queueEvent(ConnectionEvent{
 			Type:       ConnectionEventKick,
@@ -881,7 +881,7 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 
 // handleKick processes a kick event from another node
 func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
-	logger.Debug("Gossip tracker: Received kick", "name", ct.name, "account_id", event.AccountID, "protocol", event.Protocol, "from_node", event.NodeID)
+	logger.Info("Gossip tracker: Received kick", "name", ct.name, "account_id", event.AccountID, "protocol", event.Protocol, "from_node", event.NodeID)
 
 	// CRITICAL: Invalidate cache for this user
 	// This ensures that when they reconnect, they get fresh routing/auth info
@@ -909,7 +909,7 @@ func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
 	// Clear the sessions list
 	delete(ct.kickSessions, event.AccountID)
 
-	logger.Debug("Gossip tracker: Notified sessions", "name", ct.name, "session_count", len(sessions), "account_id", event.AccountID)
+	logger.Info("Gossip tracker: Notified sessions", "name", ct.name, "session_count", len(sessions), "account_id", event.AccountID)
 }
 
 // broadcastRoutine periodically triggers broadcasts

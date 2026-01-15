@@ -1028,6 +1028,25 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 		pool.isHealthy.Store(isHealthyNow)
 		if isHealthyNow {
 			logger.Info("Database pool recovered", "component", "RESILIENT-FAILOVER", "type", poolType, "host", pool.host)
+
+			// Reset circuit breakers when database recovers to allow immediate recovery
+			// This prevents the circuit breaker from staying OPEN even when the database is healthy
+			if poolType == "write" || !rd.failoverManager.readPoolsAreDistinct() {
+				// Reset write breaker for write pools or when using write pool for reads
+				queryState := rd.queryBreaker.State()
+				writeState := rd.writeBreaker.State()
+
+				// Force circuit breakers to half-open state to allow immediate testing
+				// This is safe because we've just confirmed the database is responding to pings
+				if queryState == circuitbreaker.StateOpen {
+					logger.Info("Forcing query circuit breaker to half-open after database recovery", "component", "RESILIENT-FAILOVER")
+					rd.queryBreaker.ForceHalfOpen()
+				}
+				if writeState == circuitbreaker.StateOpen {
+					logger.Info("Forcing write circuit breaker to half-open after database recovery", "component", "RESILIENT-FAILOVER")
+					rd.writeBreaker.ForceHalfOpen()
+				}
+			}
 		} else {
 			logger.Warn("Database pool failed health check", "component", "RESILIENT-FAILOVER", "type", poolType, "host", pool.host, "error", err)
 			pool.lastFailure.Store(time.Now().Unix())

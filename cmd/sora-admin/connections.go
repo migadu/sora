@@ -95,7 +95,8 @@ func handleKickConnections(ctx context.Context) {
 	server := fs.String("server", "", "Kick connections to specific server")
 	clientAddr := fs.String("client", "", "Kick connection from specific client address")
 	all := fs.Bool("all", false, "Kick all active connections")
-	confirm := fs.Bool("confirm", false, "Confirm kick without interactive prompt")
+	confirm := fs.Bool("confirm", false, "Skip confirmation prompt")
+	yes := fs.Bool("y", false, "Skip confirmation prompt (alias for --confirm)")
 
 	// Database connection flags (overrides from config file)
 
@@ -108,7 +109,8 @@ Usage:
 Options:
   --user string         Kick all connections for specific user email (REQUIRED)
   --protocol string     Kick connections using specific protocol (IMAP, POP3, ManageSieve)
-  --confirm             Confirm kick without interactive prompt
+  --confirm             Skip confirmation prompt
+  -y                    Skip confirmation prompt (alias for --confirm)
 
 This command uses the HTTP API to broadcast a kick event via the gossip protocol.
 All cluster nodes will receive the kick and terminate matching connections within ~100ms.
@@ -121,6 +123,7 @@ Examples:
   sora-admin --config config.toml connections kick --user user@example.com
   sora-admin --config config.toml connections kick --user user@example.com --protocol IMAP
   sora-admin --config config.toml connections kick --user user@example.com --confirm
+  sora-admin --config config.toml connections kick --user user@example.com -y
 `)
 	}
 
@@ -155,7 +158,8 @@ Examples:
 	}
 
 	// Kick connections
-	if err := kickConnections(ctx, globalConfig, *userEmail, *protocol, *server, *clientAddr, *all, *confirm); err != nil {
+	autoConfirm := *yes || *confirm
+	if err := kickConnections(ctx, globalConfig, *userEmail, *protocol, *server, *clientAddr, *all, autoConfirm); err != nil {
 		logger.Fatalf("Failed to kick connections: %v", err)
 	}
 }

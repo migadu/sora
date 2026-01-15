@@ -6,11 +6,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 	"github.com/migadu/sora/storage"
-	"github.com/minio/minio-go/v7"
 )
 
 type ResilientS3Storage struct {
@@ -151,7 +152,7 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 	return err
 }
 
-func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string, reader io.Reader, objectSize int64) (*s3.PutObjectOutput, error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 1 * time.Second,
 		MaxInterval:     30 * time.Second,
@@ -162,17 +163,22 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 	}
 
 	op := func() (any, error) {
-		return rs.storage.Client.PutObject(ctx, rs.storage.BucketName, key, reader, objectSize, opts)
+		input := &s3.PutObjectInput{
+			Bucket: aws.String(rs.storage.BucketName),
+			Key:    aws.String(key),
+			Body:   reader,
+		}
+		return rs.storage.Client.PutObject(ctx, input)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, op)
 	if err != nil {
-		return minio.UploadInfo{}, err
+		return nil, err
 	}
-	info := result.(minio.UploadInfo)
-	return info, err
+	output := result.(*s3.PutObjectOutput)
+	return output, err
 }
 
-func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string, opts minio.GetObjectOptions) (*minio.Object, error) {
+func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string) (*s3.GetObjectOutput, error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 500 * time.Millisecond,
 		MaxInterval:     10 * time.Second,
@@ -183,7 +189,11 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 	}
 
 	op := func() (any, error) {
-		return rs.storage.Client.GetObject(ctx, rs.storage.BucketName, key, opts)
+		input := &s3.GetObjectInput{
+			Bucket: aws.String(rs.storage.BucketName),
+			Key:    aws.String(key),
+		}
+		return rs.storage.Client.GetObject(ctx, input)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
 	if err != nil {
@@ -192,11 +202,11 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 	if result == nil {
 		return nil, nil
 	}
-	object := result.(*minio.Object)
-	return object, err
+	output := result.(*s3.GetObjectOutput)
+	return output, err
 }
 
-func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key string, opts minio.StatObjectOptions) (minio.ObjectInfo, error) {
+func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key string) (*s3.HeadObjectOutput, error) {
 	config := retry.BackoffConfig{
 		InitialInterval: 500 * time.Millisecond,
 		MaxInterval:     5 * time.Second,
@@ -207,14 +217,18 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 	}
 
 	op := func() (any, error) {
-		return rs.storage.Client.StatObject(ctx, rs.storage.BucketName, key, opts)
+		input := &s3.HeadObjectInput{
+			Bucket: aws.String(rs.storage.BucketName),
+			Key:    aws.String(key),
+		}
+		return rs.storage.Client.HeadObject(ctx, input)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, op)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return nil, err
 	}
-	info := result.(minio.ObjectInfo)
-	return info, err
+	output := result.(*s3.HeadObjectOutput)
+	return output, err
 }
 
 // executeS3OperationWithRetry provides a generic wrapper for executing an S3 operation with retries and a circuit breaker.

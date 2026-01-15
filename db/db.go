@@ -121,11 +121,12 @@ type PoolHealthStatus struct {
 }
 
 type Database struct {
-	WritePool     *pgxpool.Pool    // Write operations pool
-	ReadPool      *pgxpool.Pool    // Read operations pool
-	WriteFailover *FailoverManager // Failover manager for write operations
-	ReadFailover  *FailoverManager // Failover manager for read operations
-	lockConn      *pgxpool.Conn    // Connection holding the advisory lock
+	WritePool                    *pgxpool.Pool    // Write operations pool
+	ReadPool                     *pgxpool.Pool    // Read operations pool
+	WriteFailover                *FailoverManager // Failover manager for write operations
+	ReadFailover                 *FailoverManager // Failover manager for read operations
+	lockConn                     *pgxpool.Conn    // Connection holding the advisory lock
+	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
 }
 
 func (db *Database) Close() {
@@ -820,11 +821,23 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		// This runs a background goroutine that checks idle connections periodically
 		config.HealthCheckPeriod = 15 * time.Second
 
-		// Note: We don't use BeforeAcquire for connection validation because:
-		// 1. It adds latency to every query (blocking acquire)
-		// 2. HealthCheckPeriod already proactively removes dead connections
-		// 3. Query-level timeouts in the resilient layer handle connection failures
-		// 4. Dead connections will be detected on first query and removed from pool
+		// Configure BeforeAcquire to validate connections before use
+		// This is critical for circuit breaker recovery: when testing if the database
+		// has recovered, we need to ensure we're not reusing dead connections from a
+		// previous outage. Without this, the circuit breaker can get stuck in an
+		// infinite OPEN -> HALF_OPEN -> OPEN loop even when the database is healthy.
+		config.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+			// Quick ping to validate connection is alive
+			// Use a short timeout to avoid blocking acquire for too long
+			pingCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+			defer cancel()
+
+			if err := conn.Ping(pingCtx); err != nil {
+				// Connection is dead, don't use it - pool will create a new one
+				return false
+			}
+			return true
+		}
 
 		dbPool, err := pgxpool.NewWithConfig(ctx, config)
 		if err != nil {

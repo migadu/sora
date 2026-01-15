@@ -1057,17 +1057,6 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Determine which protocols to kick
-	protocols := []string{}
-	if req.Protocol != "" {
-		protocols = []string{req.Protocol}
-	} else {
-		// Kick all protocols if not specified
-		for proto := range s.connectionTrackers {
-			protocols = append(protocols, proto)
-		}
-	}
-
 	if len(s.connectionTrackers) == 0 {
 		// No connection trackers available (not running in cluster/proxy mode)
 		logger.Debug("HTTP API: No connection trackers available - gossip-based kick requires cluster mode", "name", s.name)
@@ -1075,22 +1064,61 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Kick user on all specified protocols
+	// Determine which trackers to kick
+	// If protocol is specified, match trackers by prefix (e.g., "IMAP" matches "IMAP-*")
+	// If not specified, kick all trackers
+	var trackersToKick []struct {
+		key     string
+		tracker *server.ConnectionTracker
+	}
+
+	if req.Protocol != "" {
+		// Find all trackers that match the protocol prefix
+		normalizedProtocol := strings.ToUpper(req.Protocol)
+		for trackerKey, tracker := range s.connectionTrackers {
+			// Extract protocol from tracker key (format: "PROTOCOL-hostname-servername")
+			trackerProtocol := extractProtocolFromKey(trackerKey)
+			if strings.ToUpper(trackerProtocol) == normalizedProtocol {
+				trackersToKick = append(trackersToKick, struct {
+					key     string
+					tracker *server.ConnectionTracker
+				}{trackerKey, tracker})
+			}
+		}
+	} else {
+		// Kick all trackers if no protocol specified
+		for trackerKey, tracker := range s.connectionTrackers {
+			trackersToKick = append(trackersToKick, struct {
+				key     string
+				tracker *server.ConnectionTracker
+			}{trackerKey, tracker})
+		}
+	}
+
+	if len(trackersToKick) == 0 {
+		if req.Protocol != "" {
+			s.writeError(w, http.StatusNotFound, fmt.Sprintf("No connection trackers found for protocol: %s", req.Protocol))
+		} else {
+			s.writeError(w, http.StatusInternalServerError, "No connection trackers available")
+		}
+		return
+	}
+
+	// Kick user on all matching trackers
 	kickedProtocols := []string{}
-	for _, protocol := range protocols {
-		tracker := s.connectionTrackers[protocol]
-		if tracker == nil {
-			logger.Debug("HTTP API: No tracker for protocol", "name", s.name, "proto", protocol)
+	for _, item := range trackersToKick {
+		if item.tracker == nil {
+			logger.Debug("HTTP API: Nil tracker", "name", s.name, "tracker_key", item.key)
 			continue
 		}
 
-		if err := tracker.KickUser(accountID, protocol); err != nil {
-			logger.Warn("HTTP API: Error kicking user on protocol", "name", s.name, "email", req.UserEmail, "proto", protocol, "error", err)
+		if err := item.tracker.KickUser(accountID, item.key); err != nil {
+			logger.Warn("HTTP API: Error kicking user on tracker", "name", s.name, "email", req.UserEmail, "tracker", item.key, "error", err)
 			continue
 		}
 
-		kickedProtocols = append(kickedProtocols, protocol)
-		logger.Debug("HTTP API: Kicked user on protocol", "name", s.name, "email", req.UserEmail, "account_id", accountID, "proto", protocol)
+		kickedProtocols = append(kickedProtocols, item.key)
+		logger.Info("HTTP API: Kicked user on tracker", "name", s.name, "email", req.UserEmail, "account_id", accountID, "tracker", item.key)
 	}
 
 	if len(kickedProtocols) == 0 {

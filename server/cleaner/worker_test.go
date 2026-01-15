@@ -3,11 +3,13 @@ package cleaner
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/migadu/sora/db"
-	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -133,7 +135,14 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	}
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, gracePeriod, db.BATCH_PURGE_SIZE).Return(userScopedCandidates, nil).Once()
 	mockS3.On("DeleteWithRetry", ctx, "example.com/user1/hash1").Return(nil).Once()
-	mockS3.On("DeleteWithRetry", ctx, "example.com/user2/hash2-not-found").Return(minio.ErrorResponse{StatusCode: 404}).Once()
+	// Create a proper AWS HTTP 404 error
+	notFoundErr := &awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 404}},
+			Err:      errors.New("not found"),
+		},
+	}
+	mockS3.On("DeleteWithRetry", ctx, "example.com/user2/hash2-not-found").Return(notFoundErr).Once()
 	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", ctx, userScopedCandidates).Return(int64(2), nil).Once()
 
 	// Phase 2a: FTS pruning
