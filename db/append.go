@@ -263,22 +263,30 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		uidToUse = highestUID
 	}
 
-	// Deduplication: Check if message with same message_id AND content_hash already exists
-	// This prevents true duplicates (same Message-ID header + same body) while allowing
-	// legitimate cases like forwarding the same email multiple times (different Message-ID)
+	// Deduplication: Check if message with same message_id already exists (regardless of content_hash)
+	// The unique constraint is on (message_id, mailbox_id, expunged_at IS NULL), so we must check
+	// for any existing message with this message_id to avoid unique violations.
 	var existingUID int64
+	var existingContentHash string
 	err = tx.QueryRow(ctx, `
-		SELECT uid FROM messages
+		SELECT uid, content_hash FROM messages
 		WHERE mailbox_id = $1
 		AND message_id = $2
-		AND content_hash = $3
 		AND expunged_at IS NULL
 		LIMIT 1`,
-		options.MailboxID, options.MessageID, options.ContentHash).Scan(&existingUID)
+		options.MailboxID, options.MessageID).Scan(&existingUID, &existingContentHash)
 	if err == nil {
-		// Message already exists - return existing UID
-		log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
-			options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		// Message with same message_id already exists
+		if existingContentHash == options.ContentHash {
+			// True duplicate (same Message-ID + same content) - skip insert
+			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
+				options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		} else {
+			// Same Message-ID but different content - this shouldn't happen in normal mail flow
+			// but can occur during import if maildir has duplicates with same Message-ID header
+			log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Skipping insert to avoid unique violation. Existing UID=%d",
+				options.MessageID, existingContentHash[:12], options.ContentHash[:12], options.MailboxID, existingUID)
+		}
 		return 0, existingUID, nil // Return 0 for messageID, existing UID
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
@@ -401,9 +409,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
 				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
-			// The transaction is aborted by PostgreSQL, so we cannot query for the existing message.
-			// Return ErrDBUniqueViolation and let the caller handle it (typically by skipping the duplicate).
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Message already exists, transaction will be rolled back.", saneMessageID, options.MailboxID)
+			// The transaction is now in an aborted state and must be rolled back.
+			// We cannot query for the existing message within this transaction.
+			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Returning error to caller.", saneMessageID, options.MailboxID)
 			return 0, 0, consts.ErrDBUniqueViolation
 		}
 		log.Printf("Database: failed to insert message into database: %v", err)
@@ -550,22 +558,30 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		uidToUse = highestUID
 	}
 
-	// Deduplication: Check if message with same message_id AND content_hash already exists
-	// This prevents true duplicates (same Message-ID header + same body) while allowing
-	// legitimate cases like forwarding the same email multiple times (different Message-ID)
+	// Deduplication: Check if message with same message_id already exists (regardless of content_hash)
+	// The unique constraint is on (message_id, mailbox_id, expunged_at IS NULL), so we must check
+	// for any existing message with this message_id to avoid unique violations.
 	var existingUID int64
+	var existingContentHash string
 	err = tx.QueryRow(ctx, `
-		SELECT uid FROM messages
+		SELECT uid, content_hash FROM messages
 		WHERE mailbox_id = $1
 		AND message_id = $2
-		AND content_hash = $3
 		AND expunged_at IS NULL
 		LIMIT 1`,
-		options.MailboxID, options.MessageID, options.ContentHash).Scan(&existingUID)
+		options.MailboxID, options.MessageID).Scan(&existingUID, &existingContentHash)
 	if err == nil {
-		// Message already exists - return existing UID
-		log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
-			options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		// Message with same message_id already exists
+		if existingContentHash == options.ContentHash {
+			// True duplicate (same Message-ID + same content) - skip insert
+			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
+				options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+		} else {
+			// Same Message-ID but different content - this shouldn't happen in normal mail flow
+			// but can occur during import if maildir has duplicates with same Message-ID header
+			log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Skipping insert to avoid unique violation. Existing UID=%d",
+				options.MessageID, existingContentHash[:12], options.ContentHash[:12], options.MailboxID, existingUID)
+		}
 		return 0, existingUID, nil // Return 0 for messageID, existing UID
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
@@ -673,9 +689,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
 				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
-			// The transaction is aborted by PostgreSQL, so we cannot query for the existing message.
-			// Return ErrDBUniqueViolation and let the caller handle it (typically by skipping the duplicate).
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Message already exists, transaction will be rolled back.", saneMessageID, options.MailboxID)
+			// The transaction is now in an aborted state and must be rolled back.
+			// We cannot query for the existing message within this transaction.
+			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Returning error to caller.", saneMessageID, options.MailboxID)
 			return 0, 0, consts.ErrDBUniqueViolation
 		}
 		log.Printf("Database: failed to insert message into database: %v", err)

@@ -614,3 +614,97 @@ func TestInsertMessageFromImporter(t *testing.T) {
 
 	t.Logf("Successfully tested InsertMessageFromImporter with accountID: %d, mailboxID: %d, messageID: %d, UID: %d", accountID, mailboxID, messageID, uid)
 }
+
+// TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent tests that inserting a message
+// with the same message_id but different content_hash is handled gracefully without unique violations.
+// This proves the fix for the bug where the deduplication check was checking both message_id AND content_hash,
+// but the unique constraint is only on message_id.
+func TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, mailboxID := setupMessageTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Insert first message with specific message_id and content_hash
+	tx, err := db.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	options1 := &InsertMessageOptions{
+		AccountID:   accountID,
+		MailboxID:   mailboxID,
+		MailboxName: "INBOX",
+		S3Domain:    "example.com",
+		S3Localpart: "duplicate-test",
+		ContentHash: "hash-content-v1", // First content hash
+		MessageID:   "unique-msg-id@example.com",
+		Subject:     "First Version",
+		Size:        100,
+		SentDate:    time.Now(),
+	}
+
+	messageID1, uid1, err := db.InsertMessageFromImporter(ctx, tx, options1)
+	require.NoError(t, err, "First insert should succeed")
+	require.Greater(t, messageID1, int64(0))
+	require.Greater(t, uid1, int64(0))
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	// Now try to insert a message with SAME message_id but DIFFERENT content_hash
+	// Before the fix, this would:
+	// 1. Pass the deduplication check (because content_hash differs)
+	// 2. Fail on INSERT with unique constraint violation (because message_id matches)
+	// 3. Cause an aborted transaction error when trying to query for the existing message
+	//
+	// After the fix, this should:
+	// 1. Find the existing message by message_id (regardless of content_hash)
+	// 2. Return the existing UID without attempting INSERT
+	// 3. Log that same message_id with different content was found
+
+	tx2, err := db.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	options2 := &InsertMessageOptions{
+		AccountID:   accountID,
+		MailboxID:   mailboxID,
+		MailboxName: "INBOX",
+		S3Domain:    "example.com",
+		S3Localpart: "duplicate-test",
+		ContentHash: "hash-content-v2", // DIFFERENT content hash
+		MessageID:   "unique-msg-id@example.com", // SAME message_id
+		Subject:     "Second Version (should be skipped)",
+		Size:        200,
+		SentDate:    time.Now(),
+	}
+
+	messageID2, uid2, err := db.InsertMessageFromImporter(ctx, tx2, options2)
+
+	// Should succeed without error (not a unique violation)
+	require.NoError(t, err, "Second insert should succeed (duplicate detected before INSERT)")
+
+	// Should return 0 for messageID (indicating duplicate was found)
+	assert.Equal(t, int64(0), messageID2, "messageID should be 0 for duplicate")
+
+	// Should return the SAME UID as the first message
+	assert.Equal(t, uid1, uid2, "UID should match the existing message")
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify only ONE message exists (the duplicate was NOT inserted)
+	messages, err := db.ListMessages(ctx, mailboxID)
+	require.NoError(t, err)
+	assert.Len(t, messages, 1, "Only one message should exist (duplicate was skipped)")
+
+	// Verify the FIRST message is the one that was kept
+	assert.Equal(t, "First Version", messages[0].Subject)
+	assert.Equal(t, "hash-content-v1", messages[0].ContentHash)
+
+	t.Logf("Successfully tested duplicate message_id with different content_hash: kept UID=%d, skipped duplicate with different content", uid1)
+}
