@@ -1479,6 +1479,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
+	logger.Debug("IMAP Proxy: Registering session for kick notifications", "username", s.username, "account_id", s.accountID, "client_addr", s.clientAddr)
 	kickChan := s.server.connTracker.RegisterSession(s.accountID)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 

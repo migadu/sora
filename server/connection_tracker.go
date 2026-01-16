@@ -897,6 +897,7 @@ func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
 	defer ct.kickSessionsMu.Unlock()
 
 	sessions := ct.kickSessions[event.AccountID]
+	logger.Debug("Gossip tracker: Looking for sessions to kick", "name", ct.name, "account_id", event.AccountID, "registered_sessions", len(sessions), "total_registered_account_ids", len(ct.kickSessions))
 	for _, ch := range sessions {
 		select {
 		case <-ch:

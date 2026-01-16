@@ -22,6 +22,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -1050,11 +1051,13 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get account ID from email
+	// Try database first (for local accounts)
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, req.UserEmail)
 	if err != nil {
-		logger.Warn("HTTP API: Error getting account ID", "name", s.name, "email", req.UserEmail, "error", err)
-		s.writeError(w, http.StatusNotFound, "User not found")
-		return
+		// User not found in database - could be a remotelookup account
+		// Derive accountID from email (same logic as remotelookup)
+		accountID = proxy.DeriveAccountIDFromEmail(req.UserEmail)
+		logger.Info("HTTP API: User not in database, using derived accountID for kick", "name", s.name, "email", req.UserEmail, "derived_account_id", accountID)
 	}
 
 	if len(s.connectionTrackers) == 0 {

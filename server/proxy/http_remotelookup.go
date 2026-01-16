@@ -381,7 +381,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		}
 
 		// Derive account_id from the address field
-		lookupResp.AccountID = deriveAccountIDFromEmail(lookupResp.Address)
+		lookupResp.AccountID = DeriveAccountIDFromEmail(lookupResp.Address)
 		logger.Debug("remotelookup: Derived account_id from address", "address", lookupResp.Address, "account_id", lookupResp.AccountID)
 
 		return lookupResp, nil
@@ -510,9 +510,10 @@ func (c *HTTPRemoteLookupClient) normalizeServerAddress(addr string) string {
 	return fmt.Sprintf("%s:%d", addr, defaultPort)
 }
 
-// deriveAccountIDFromEmail creates a stable, unique int64 ID from an email address
+// DeriveAccountIDFromEmail creates a stable, unique int64 ID from an email address
 // This allows connection tracking even when the remotelookup endpoint doesn't provide an account_id
-func deriveAccountIDFromEmail(email string) int64 {
+// Exported for use in admin API kick functionality
+func DeriveAccountIDFromEmail(email string) int64 {
 	// Normalize the email (lowercase, trim spaces)
 	normalized := strings.ToLower(strings.TrimSpace(email))
 
