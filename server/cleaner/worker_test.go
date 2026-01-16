@@ -60,6 +60,10 @@ func (m *mockDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context, reten
 	args := m.Called(ctx, retention)
 	return args.Get(0).(int64), args.Error(1)
 }
+func (m *mockDatabase) PruneOldMessageBodiesBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
+	args := m.Called(ctx, retention)
+	return args.Get(0).(int64), args.Error(1)
+}
 func (m *mockDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error) {
 	args := m.Called(ctx, limit)
 	return args.Get(0).([]string), args.Error(1)
@@ -146,7 +150,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", ctx, userScopedCandidates).Return(int64(2), nil).Once()
 
 	// Phase 2a: FTS pruning
-	mockDB.On("PruneOldMessageBodiesWithRetry", ctx, ftsRetention).Return(int64(15), nil).Once()
+	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, ftsRetention).Return(int64(15), nil).Once()
 
 	// Phase 2b: Global resource cleanup
 	orphanHashes := []string{"orphan1", "orphan2"}
@@ -249,7 +253,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	// DB batch delete should not be called for the failed S3 key
 
 	// The rest of the cleanup should proceed
-	mockDB.On("PruneOldMessageBodiesWithRetry", ctx, mock.Anything).Return(int64(0), nil)
+	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
 	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
 
@@ -286,6 +290,6 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	assert.NoError(t, err)
 	mockDB.AssertExpectations(t)
 	mockDB.AssertNotCalled(t, "ExpungeOldMessagesWithRetry")
-	mockDB.AssertNotCalled(t, "PruneOldMessageBodiesWithRetry")
+	mockDB.AssertNotCalled(t, "PruneOldMessageBodiesBatchedWithRetry")
 	mockCache.AssertNotCalled(t, "Delete")
 }

@@ -194,52 +194,112 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 // PruneOldMessageBodies sets the text_body to NULL for message contents
 // where all associated non-expunged messages are older than the given retention period.
 // This saves storage while preserving the text_body_tsv for full-text search.
-// Processes in batches to avoid long-running transactions and timeouts.
+// NOTE: This function is designed to work in a single-batch mode when called with a transaction.
+// For production use with large datasets, use PruneOldMessageBodiesBatched instead.
 func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
-	const batchSize = 1000
-	var totalPruned int64
+	// Process a single batch of 100 records
+	// This is safe within the transaction timeout constraints
+	const batchSize = 100
 
-	for {
-		// This query is optimized to use a NOT EXISTS clause, which is generally more
-		// efficient than a subquery with GROUP BY and MAX(). It finds content hashes
-		// that have not been pruned yet (text_body IS NOT NULL) and for which no
-		// active, recent message exists. We process in batches with LIMIT to avoid
-		// timeout issues on large databases.
-		query := `
-			UPDATE message_contents
-			SET
-				text_body = NULL,
-				updated_at = now()
-			WHERE content_hash IN (
-				SELECT content_hash
-				FROM message_contents
-				WHERE text_body IS NOT NULL
-				  AND NOT EXISTS (
-					SELECT 1 FROM messages m
-					WHERE m.content_hash = message_contents.content_hash
-					  AND m.expunged_at IS NULL
-					  AND m.sent_date >= (now() - $1::interval)
-				  )
-				LIMIT $2
+	query := `
+		WITH candidates AS (
+			SELECT content_hash
+			FROM message_contents
+			WHERE text_body IS NOT NULL
+			LIMIT $2
+		),
+		prunable AS (
+			SELECT c.content_hash
+			FROM candidates c
+			WHERE NOT EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.content_hash = c.content_hash
+				  AND m.expunged_at IS NULL
+				  AND m.sent_date >= (now() - $1::interval)
 			)
-		`
-		tag, err := tx.Exec(ctx, query, retention, batchSize)
-		if err != nil {
-			return totalPruned, fmt.Errorf("failed to prune old message bodies: %w", err)
-		}
+		)
+		UPDATE message_contents mc
+		SET
+			text_body = NULL,
+			updated_at = now()
+		FROM prunable p
+		WHERE mc.content_hash = p.content_hash
+	`
+	tag, err := tx.Exec(ctx, query, retention, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune old message bodies: %w", err)
+	}
 
-		rowsAffected := tag.RowsAffected()
-		totalPruned += rowsAffected
+	return tag.RowsAffected(), nil
+}
 
-		// If we processed fewer rows than the batch size, we're done
-		if rowsAffected < int64(batchSize) {
-			break
-		}
+// PruneOldMessageBodiesBatched processes message body pruning in multiple batches,
+// committing between batches to avoid transaction timeout issues.
+// This should be used for production cleanup operations on large databases.
+func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention time.Duration) (int64, error) {
+	const batchSize = 100
+	var totalPruned int64
+	maxBatches := 1000 // Safety limit: max 100,000 records per cleanup run
 
-		// Check if context is cancelled between batches
+	for batch := 0; batch < maxBatches; batch++ {
+		// Check if context is cancelled
 		if ctx.Err() != nil {
 			return totalPruned, ctx.Err()
 		}
+
+		// Start a new transaction for this batch
+		tx, err := d.GetWritePool().Begin(ctx)
+		if err != nil {
+			return totalPruned, fmt.Errorf("failed to begin transaction for batch %d: %w", batch, err)
+		}
+
+		// Process one batch
+		query := `
+			WITH candidates AS (
+				SELECT content_hash
+				FROM message_contents
+				WHERE text_body IS NOT NULL
+				LIMIT $2
+			),
+			prunable AS (
+				SELECT c.content_hash
+				FROM candidates c
+				WHERE NOT EXISTS (
+					SELECT 1 FROM messages m
+					WHERE m.content_hash = c.content_hash
+					  AND m.expunged_at IS NULL
+					  AND m.sent_date >= (now() - $1::interval)
+				)
+			)
+			UPDATE message_contents mc
+			SET
+				text_body = NULL,
+				updated_at = now()
+			FROM prunable p
+			WHERE mc.content_hash = p.content_hash
+		`
+		tag, err := tx.Exec(ctx, query, retention, batchSize)
+		if err != nil {
+			tx.Rollback(ctx)
+			return totalPruned, fmt.Errorf("failed to prune message bodies in batch %d: %w", batch, err)
+		}
+
+		rowsAffected := tag.RowsAffected()
+
+		// Commit this batch
+		if err := tx.Commit(ctx); err != nil {
+			return totalPruned, fmt.Errorf("failed to commit batch %d: %w", batch, err)
+		}
+
+		totalPruned += rowsAffected
+
+		// If we processed zero rows, we're done (no more candidates)
+		if rowsAffected == 0 {
+			break
+		}
+
+		// Sleep briefly between batches to avoid overwhelming the database
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	return totalPruned, nil

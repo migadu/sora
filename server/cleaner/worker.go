@@ -43,6 +43,7 @@ type DatabaseManager interface {
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	PruneOldMessageBodiesBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error)
 	DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
 	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
@@ -314,7 +315,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	if w.ftsRetention > 0 {
 		// This prunes the text_body of old messages to save space, but keeps the
 		// text_body_tsv so that full-text search on the body continues to work.
-		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesWithRetry(ctx, w.ftsRetention)
+		// Use the batched version which commits between batches to avoid timeout issues.
+		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesBatchedWithRetry(ctx, w.ftsRetention)
 		if err != nil {
 			logger.Error("Cleanup: Failed to prune old message bodies", "error", err)
 			// Continue with other cleanup tasks even if this fails

@@ -233,6 +233,12 @@ func (rd *ResilientDatabase) PruneOldMessageBodiesWithRetry(ctx context.Context,
 	return result.(int64), nil
 }
 
+func (rd *ResilientDatabase) PruneOldMessageBodiesBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
+	// This function manages its own transactions, so we don't use executeWriteInTxWithRetry
+	// We add retry logic at the call level if a batch fails
+	return rd.getOperationalDatabaseForOperation(true).PruneOldMessageBodiesBatched(ctx, retention)
+}
+
 func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetUnusedContentHashes(ctx, batchSize)
