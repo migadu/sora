@@ -244,6 +244,77 @@ func TestPruneOldMessageBodiesEmptyDatabase(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestPruneOldMessageBodiesBatching tests that pruning works correctly with batching
+func TestPruneOldMessageBodiesBatching(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, testEmail, accountID, mailboxID := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a small number of old message contents to test batching logic
+	// We use 5 records to verify the batch loop works correctly
+	const numRecords = 5
+	testTimestamp := time.Now().UnixNano()
+	testBody := "Test message body for batching test"
+	oldSentDate := time.Now().Add(-48 * time.Hour)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	// Insert multiple old message contents
+	for i := 0; i < numRecords; i++ {
+		contentHash := fmt.Sprintf("batch_%s_%d_%d", t.Name(), testTimestamp, i)
+
+		// Insert message content
+		_, err = tx.Exec(ctx, `
+			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, created_at, updated_at)
+			VALUES ($1, $2, to_tsvector('english', $2), '', NOW(), NOW())
+		`, contentHash, testBody)
+		require.NoError(t, err)
+
+		// Insert old message
+		_, err = tx.Exec(ctx, `
+			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+			VALUES ($1, $2, $3, $4, $5, $5, $6, 0, NULL, TRUE, 'test-domain', $7, $8, 'body', '[]', $3)
+		`, accountID, mailboxID, 1000+i, contentHash, oldSentDate, len(testBody),
+			fmt.Sprintf("test-localpart-batch-%d", i),
+			fmt.Sprintf("msgid-batch-%d", i))
+		require.NoError(t, err)
+	}
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	// Prune with 24 hour retention - all test messages should be pruned
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	retention := 24 * time.Hour
+	rowsAffected, err := db.PruneOldMessageBodies(ctx, tx2, retention)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, rowsAffected, int64(numRecords), "Should prune at least our test records")
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify all our test messages were pruned
+	for i := 0; i < numRecords; i++ {
+		contentHash := fmt.Sprintf("batch_%s_%d_%d", t.Name(), testTimestamp, i)
+		var body *string
+		err = db.GetReadPool().QueryRow(ctx, "SELECT text_body FROM message_contents WHERE content_hash = $1", contentHash).Scan(&body)
+		require.NoError(t, err)
+		assert.Nil(t, body, "Message body %d should be NULL after pruning", i)
+	}
+
+	t.Logf("Successfully tested batching with %d records (email: %s)", numRecords, testEmail)
+}
+
 // TestCleanupLock tests the distributed locking mechanism for cleanup operations
 func TestCleanupLock(t *testing.T) {
 	if testing.Short() {

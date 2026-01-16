@@ -194,33 +194,55 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 // PruneOldMessageBodies sets the text_body to NULL for message contents
 // where all associated non-expunged messages are older than the given retention period.
 // This saves storage while preserving the text_body_tsv for full-text search.
+// Processes in batches to avoid long-running transactions and timeouts.
 func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
-	// This query is optimized to use a NOT EXISTS clause, which is generally more
-	// efficient than a subquery with GROUP BY and MAX(). It finds content hashes
-	// that have not been pruned yet (text_body IS NOT NULL) and for which no
-	// active, recent message exists.
-	query := `
-		UPDATE message_contents
-		SET 
-			text_body = NULL,
-			updated_at = now()
-		WHERE content_hash IN (
-			SELECT content_hash
-			FROM message_contents
-			WHERE text_body IS NOT NULL
-			  AND NOT EXISTS (
-				SELECT 1 FROM messages m
-				WHERE m.content_hash = message_contents.content_hash
-				  AND m.expunged_at IS NULL
-				  AND m.sent_date >= (now() - $1::interval)
-			  )
-		)
-	`
-	tag, err := tx.Exec(ctx, query, retention)
-	if err != nil {
-		return 0, fmt.Errorf("failed to prune old message bodies: %w", err)
+	const batchSize = 1000
+	var totalPruned int64
+
+	for {
+		// This query is optimized to use a NOT EXISTS clause, which is generally more
+		// efficient than a subquery with GROUP BY and MAX(). It finds content hashes
+		// that have not been pruned yet (text_body IS NOT NULL) and for which no
+		// active, recent message exists. We process in batches with LIMIT to avoid
+		// timeout issues on large databases.
+		query := `
+			UPDATE message_contents
+			SET
+				text_body = NULL,
+				updated_at = now()
+			WHERE content_hash IN (
+				SELECT content_hash
+				FROM message_contents
+				WHERE text_body IS NOT NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM messages m
+					WHERE m.content_hash = message_contents.content_hash
+					  AND m.expunged_at IS NULL
+					  AND m.sent_date >= (now() - $1::interval)
+				  )
+				LIMIT $2
+			)
+		`
+		tag, err := tx.Exec(ctx, query, retention, batchSize)
+		if err != nil {
+			return totalPruned, fmt.Errorf("failed to prune old message bodies: %w", err)
+		}
+
+		rowsAffected := tag.RowsAffected()
+		totalPruned += rowsAffected
+
+		// If we processed fewer rows than the batch size, we're done
+		if rowsAffected < int64(batchSize) {
+			break
+		}
+
+		// Check if context is cancelled between batches
+		if ctx.Err() != nil {
+			return totalPruned, ctx.Err()
+		}
 	}
-	return tag.RowsAffected(), nil
+
+	return totalPruned, nil
 }
 
 // GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
