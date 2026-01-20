@@ -60,6 +60,10 @@ func (rd *ResilientDatabase) GetUserScopedObjectsForAccount(ctx context.Context,
 	return rd.getOperationalDatabaseForOperation(false).GetUserScopedObjectsForAccount(ctx, accountID, gracePeriod, limit)
 }
 
+func (rd *ResilientDatabase) GetAllUploadedObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]db.UserScopedObjectForCleanup, error) {
+	return rd.getOperationalDatabaseForOperation(false).GetAllUploadedObjectsForAccount(ctx, accountID, limit)
+}
+
 func (rd *ResilientDatabase) PurgeMailboxesForAccount(ctx context.Context, accountID int64) error {
 	return rd.getOperationalDatabaseForOperation(true).PurgeMailboxesForAccount(ctx, accountID)
 }

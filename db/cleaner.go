@@ -650,6 +650,34 @@ func (d *Database) GetUserScopedObjectsForAccount(ctx context.Context, accountID
 	return result, rows.Err()
 }
 
+// GetAllUploadedObjectsForAccount retrieves ALL uploaded S3 objects for a specific account
+// regardless of expunge status. Used for account purging when messages might already be deleted from DB.
+//
+// SAFETY: This function is account-isolated by design (same guarantees as GetUserScopedObjectsForAccount)
+func (d *Database) GetAllUploadedObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]UserScopedObjectForCleanup, error) {
+	rows, err := d.GetReadPool().Query(ctx, `
+		SELECT account_id, s3_domain, s3_localpart, content_hash
+		FROM messages
+		WHERE account_id = $1 AND uploaded = TRUE
+		GROUP BY account_id, s3_domain, s3_localpart, content_hash
+		LIMIT $2;
+	`, accountID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query for all uploaded objects for account: %w", err)
+	}
+	defer rows.Close()
+
+	var result []UserScopedObjectForCleanup
+	for rows.Next() {
+		var candidate UserScopedObjectForCleanup
+		if err := rows.Scan(&candidate.AccountID, &candidate.S3Domain, &candidate.S3Localpart, &candidate.ContentHash); err != nil {
+			return nil, fmt.Errorf("failed to scan uploaded object for cleanup: %w", err)
+		}
+		result = append(result, candidate)
+	}
+	return result, rows.Err()
+}
+
 // PurgeMailboxesForAccount permanently deletes all mailboxes for an account
 // This is a hard delete used by the admin tool for immediate account purging
 func (d *Database) PurgeMailboxesForAccount(ctx context.Context, accountID int64) error {

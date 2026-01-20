@@ -129,91 +129,98 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 	}
 
 	// Step 1: Mark all messages as expunged (atomic, idempotent)
-	fmt.Printf("Step 1: Marking all messages as expunged...\n")
+	// We do this first so we can safely delete them.
+	// Even if this returns 0 (already expunged), we proceed to check for any remaining S3 objects.
+	fmt.Printf("Step 1: Marking messages as expunged...\n")
 	expungedCount, err := rdb.ExpungeAllMessagesForAccount(ctx, accountID)
 	if err != nil {
 		return fmt.Errorf("failed to expunge messages: %w", err)
 	}
-	if expungedCount > 0 {
-		fmt.Printf("✓ Marked %d messages as expunged\n", expungedCount)
-	} else {
-		fmt.Printf("✓ No messages to expunge (already expunged or none exist)\n")
-	}
+	fmt.Printf("✓ Marked %d messages as expunged (or already expunged)\n", expungedCount)
 
-	// Step 2: Clean up expunged messages in batches (resumable)
-	fmt.Printf("\nStep 2: Cleaning up messages from S3 and database (resumable)...\n")
+	// Step 2: Delete S3 objects and clean up DB
+	// We iterate in batches: Fetch -> Delete S3 -> Delete DB
+	fmt.Printf("\nStep 2: Deleting S3 objects and database records...\n")
+
 	totalS3Deletes := 0
 	totalDBDeletes := int64(0)
-	totalFailed := 0
-	batchNum := 0
-	const batchSize = 100
+	const batchSize = 1000
 
 	for {
-		batchNum++
-
-		// Check for context cancellation
-		if ctx.Err() != nil {
-			return fmt.Errorf("operation cancelled: %w (safe to resume)", ctx.Err())
-		}
-
-		// Fetch next batch (grace period = 0 for immediate cleanup)
-		candidates, err := rdb.GetUserScopedObjectsForAccount(ctx, accountID, 0, batchSize)
+		// Fetch batch of uploaded objects
+		// We use GetAllUploadedObjectsForAccount which filters by uploaded=TRUE.
+		// Since we delete records in each iteration, this acts as pagination.
+		batch, err := rdb.GetAllUploadedObjectsForAccount(ctx, accountID, batchSize)
 		if err != nil {
-			return fmt.Errorf("failed to fetch cleanup batch %d: %w", batchNum, err)
+			return fmt.Errorf("failed to scan S3 objects: %w", err)
 		}
 
-		if len(candidates) == 0 {
-			if batchNum == 1 {
-				fmt.Printf("✓ No messages to clean up\n")
-			} else {
-				fmt.Printf("✓ All messages cleaned up (processed %d batches)\n", batchNum-1)
-			}
+		if len(batch) == 0 {
 			break
 		}
 
-		fmt.Printf("  Batch %d: Processing %d unique S3 objects...\n", batchNum, len(candidates))
+		fmt.Printf("  Processing batch of %d objects...\n", len(batch))
 
-		// Delete from S3 first (same pattern as cleanup worker)
-		var successfulDeletes []db.UserScopedObjectForCleanup
-		for _, candidate := range candidates {
+		// Build S3 keys
+		s3Keys := make([]string, 0, len(batch))
+		keyToCandidate := make(map[string]db.UserScopedObjectForCleanup, len(batch))
+		for _, candidate := range batch {
 			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
-			err := s3Storage.Delete(s3Key)
-			if err != nil {
-				fmt.Printf("    Warning: Failed to delete %s: %v (will retry on next run)\n", s3Key, err)
-				totalFailed++
-				continue
-			}
-			successfulDeletes = append(successfulDeletes, candidate)
-			totalS3Deletes++
+			s3Keys = append(s3Keys, s3Key)
+			keyToCandidate[s3Key] = candidate
 		}
 
-		// Delete from DB (only successfully deleted from S3)
+		// Delete from S3
+		var successfulDeletes []db.UserScopedObjectForCleanup
+		var failedDeletes int
+
+		if realS3, ok := s3Storage.(*storage.S3Storage); ok {
+			// Bulk delete
+			errors := realS3.DeleteBulk(s3Keys)
+			for _, s3Key := range s3Keys {
+				if err, failed := errors[s3Key]; failed {
+					fmt.Printf("    Warning: Failed to delete %s: %v\n", s3Key, err)
+					failedDeletes++
+				} else {
+					successfulDeletes = append(successfulDeletes, keyToCandidate[s3Key])
+					fmt.Printf("    Deleted S3 key: %s\n", s3Key)
+				}
+			}
+		} else {
+			// One-by-one
+			for _, s3Key := range s3Keys {
+				err := s3Storage.Delete(s3Key)
+				if err != nil {
+					fmt.Printf("    Warning: Failed to delete %s: %v\n", s3Key, err)
+					failedDeletes++
+				} else {
+					successfulDeletes = append(successfulDeletes, keyToCandidate[s3Key])
+					fmt.Printf("    Deleted S3 key: %s\n", s3Key)
+				}
+			}
+		}
+
+		// Update stats
+		totalS3Deletes += len(successfulDeletes)
+
+		// Delete from DB (only successful S3 deletions)
 		if len(successfulDeletes) > 0 {
 			deleted, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, successfulDeletes)
 			if err != nil {
-				return fmt.Errorf("failed to delete messages from DB in batch %d: %w", batchNum, err)
+				return fmt.Errorf("failed to delete messages from DB: %w", err)
 			}
 			totalDBDeletes += deleted
-			fmt.Printf("    ✓ Deleted %d messages from DB\n", deleted)
-		}
-
-		// If full batch was processed, there might be more
-		if len(candidates) < batchSize {
-			fmt.Printf("✓ All messages cleaned up (processed %d batches)\n", batchNum)
-			break
+			fmt.Printf("    ✓ Deleted %d S3 objects and %d DB records this batch\n", len(successfulDeletes), deleted)
+		} else if failedDeletes > 0 && len(batch) > 0 {
+			// If we found objects but failed to delete ANY of them, we are stuck.
+			// The next iteration will find the same objects.
+			return fmt.Errorf("failed to delete any S3 objects in current batch (%d failed). Aborting to prevent infinite loop", failedDeletes)
 		}
 	}
 
-	if totalFailed > 0 {
-		fmt.Printf("\n⚠ Warning: %d S3 objects failed to delete. Run command again to retry.\n", totalFailed)
-		return fmt.Errorf("incomplete purge: %d S3 objects failed (safe to retry)", totalFailed)
-	}
+	fmt.Printf("\n✓ Successfully cleaned up %d S3 objects and %d message records\n", totalS3Deletes, totalDBDeletes)
 
-	if totalS3Deletes > 0 || totalDBDeletes > 0 {
-		fmt.Printf("\n✓ Successfully cleaned up %d S3 objects and %d message records\n", totalS3Deletes, totalDBDeletes)
-	}
-
-	// Step 3: Delete mailboxes, credentials, account (only after all messages cleaned)
+	// Step 3: Delete mailboxes, credentials, account
 	fmt.Printf("\nStep 3: Removing account data...\n")
 
 	if err := rdb.PurgeMailboxesForAccount(ctx, accountID); err != nil {

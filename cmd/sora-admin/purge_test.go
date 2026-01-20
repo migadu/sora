@@ -120,6 +120,10 @@ func TestAccountPurgeResumability(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, messages, messageCount, "Messages should still exist after marking as expunged")
 
+	// Verify S3 objects still exist before resume
+	s3CountBefore := countS3ObjectsForAccount(t, s3Storage, email)
+	require.Equal(t, messageCount, s3CountBefore, "All S3 objects should still exist before resume")
+
 	// RESUME: Run purge again (should complete cleanup - delete from S3 and DB)
 	err = purgeAccountWithStorage(ctx, cfg, rdb, accountID, email, s3Storage)
 	require.NoError(t, err)
@@ -128,6 +132,10 @@ func TestAccountPurgeResumability(t *testing.T) {
 	exists, err := rdb.AccountExistsWithRetry(ctx, email)
 	require.NoError(t, err)
 	require.False(t, exists)
+
+	// CRITICAL: Verify NO S3 objects remain after resume
+	s3CountAfter := countS3ObjectsForAccount(t, s3Storage, email)
+	require.Equal(t, 0, s3CountAfter, "All S3 objects should be deleted after resume")
 }
 
 // TestAccountPurgeIsolation tests that purging one account doesn't affect another
@@ -266,6 +274,10 @@ func TestDomainPurge(t *testing.T) {
 		exists, err := rdb.AccountExistsWithRetry(ctx, email)
 		require.NoError(t, err)
 		require.False(t, exists, "Account should be deleted: %s", email)
+
+		// CRITICAL: Verify NO S3 objects remain for this account
+		s3Count := countS3ObjectsForAccount(t, s3Storage, email)
+		require.Equal(t, 0, s3Count, "All S3 objects should be deleted for %s", email)
 	}
 
 	// Verify other domain account still exists
@@ -276,6 +288,10 @@ func TestDomainPurge(t *testing.T) {
 	messages, err := rdb.GetMessagesForAccount(ctx, otherAccountID)
 	require.NoError(t, err)
 	require.Len(t, messages, 3, "Other domain messages should be unaffected")
+
+	// Verify other domain S3 objects still exist
+	otherS3Count := countS3ObjectsForAccount(t, s3Storage, otherEmail)
+	require.Equal(t, 3, otherS3Count, "Other domain S3 objects should still exist")
 
 	// Cleanup: purge other account
 	err = purgeAccountWithStorage(ctx, cfg, rdb, otherAccountID, otherEmail, s3Storage)
@@ -339,6 +355,64 @@ func TestDomainPurgeResumability(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, exists, "Account should be deleted: %s", email)
 	}
+}
+
+// TestAccountPurgeS3Missing tests robustness when S3 object is already missing
+func TestAccountPurgeS3Missing(t *testing.T) {
+	ctx := context.Background()
+
+	// Setup database
+	rdb := setupPurgeTestDatabase(t)
+	defer rdb.Close()
+
+	// Create file-based S3 mock
+	s3Storage := createPurgeTestS3Storage(t)
+
+	// Load admin config
+	cfg := createPurgeTestConfig(t)
+
+	// Create test account
+	email := fmt.Sprintf("test-missing-s3-%d@example.com", time.Now().Unix())
+	createPurgeTestAccount(t, rdb, email, "password123")
+
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	require.NoError(t, err)
+
+	// Add test messages
+	messageCount := 5
+	_, s3Keys := createPurgeTestMessages(t, ctx, rdb, s3Storage, accountID, email, messageCount)
+
+	// Manually delete some S3 objects to simulate inconsistency
+	// This happens if a previous purge run deleted S3 objects but failed before deleting DB records
+	require.NoError(t, s3Storage.Delete(s3Keys[0]))
+	require.NoError(t, s3Storage.Delete(s3Keys[1]))
+
+	// Verify they are gone from S3
+	exists, _, _ := s3Storage.Exists(s3Keys[0])
+	require.False(t, exists)
+
+	// Count S3 objects before purge (should be 3: 5 created, 2 manually deleted)
+	s3CountBefore := countS3ObjectsForAccount(t, s3Storage, email)
+	require.Equal(t, 3, s3CountBefore, "Should have 3 S3 objects before purge")
+
+	// PURGE ACCOUNT
+	// This should succeed even though some S3 objects are missing
+	err = purgeAccountWithStorage(ctx, cfg, rdb, accountID, email, s3Storage)
+	require.NoError(t, err)
+
+	// Verify account fully purged
+	exists, err = rdb.AccountExistsWithRetry(ctx, email)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	// Verify messages deleted from DB
+	messages, err := rdb.GetMessagesForAccount(ctx, accountID)
+	require.NoError(t, err)
+	require.Len(t, messages, 0)
+
+	// CRITICAL: Verify NO S3 objects remain for this account
+	s3CountAfter := countS3ObjectsForAccount(t, s3Storage, email)
+	require.Equal(t, 0, s3CountAfter, "All S3 objects should be deleted after purge")
 }
 
 // Helper functions
@@ -476,13 +550,8 @@ func createPurgeTestMessages(t *testing.T, ctx context.Context, rdb *resilient.R
 		err = s3Storage.Put(s3Key, bytes.NewReader(messageBody), int64(len(messageBody)))
 		require.NoError(t, err)
 
-		// Create body structure (required by InsertMessageOptions)
-		bodyStructurePart := &imap.BodyStructureSinglePart{
-			Type:    "text",
-			Subtype: "plain",
-			Size:    uint32(len(messageBody)),
-		}
-		var bodyStructure imap.BodyStructure = bodyStructurePart
+		bsPart := &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}
+		var bs imap.BodyStructure = bsPart
 
 		// Insert message with empty PendingUpload (since we already uploaded to S3)
 		opts := &db.InsertMessageOptions{
@@ -496,7 +565,7 @@ func createPurgeTestMessages(t *testing.T, ctx context.Context, rdb *resilient.R
 			InternalDate:  time.Now(),
 			Size:          int64(len(messageBody)),
 			Flags:         []imap.Flag{},
-			BodyStructure: &bodyStructure,
+			BodyStructure: &bs,
 		}
 
 		pendingUpload := db.PendingUpload{
@@ -528,4 +597,37 @@ func splitPurgeEmail(email string) []string {
 		}
 	}
 	return []string{email}
+}
+
+// countS3ObjectsForAccount counts how many S3 objects exist for a specific account
+// by checking for S3 keys that contain the account's domain and localpart
+func countS3ObjectsForAccount(t *testing.T, s3Storage objectStorage, email string) int {
+	t.Helper()
+
+	// Type assert to FileBasedS3Mock to access GetStoredKeys method
+	mock, ok := s3Storage.(*testutils.FileBasedS3Mock)
+	if !ok {
+		t.Fatalf("s3Storage is not a FileBasedS3Mock, cannot count objects")
+	}
+
+	parts := splitPurgeEmail(email)
+	if len(parts) != 2 {
+		t.Fatalf("Invalid email format: %s", email)
+	}
+	localpart := parts[0]
+	domain := parts[1]
+
+	// Get all keys from mock storage
+	allKeys := mock.GetStoredKeys()
+
+	// Count keys that match this account's path pattern: domain/localpart/hash
+	count := 0
+	expectedPrefix := domain + "/" + localpart + "/"
+	for _, key := range allKeys {
+		if len(key) >= len(expectedPrefix) && key[:len(expectedPrefix)] == expectedPrefix {
+			count++
+		}
+	}
+
+	return count
 }

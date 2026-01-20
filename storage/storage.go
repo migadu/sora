@@ -80,6 +80,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -385,6 +386,76 @@ func (s *S3Storage) Delete(key string) error {
 	}
 	metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 	return err
+}
+
+// DeleteBulk deletes multiple objects in a single S3 API call (up to 1000 objects)
+// Returns a map of key -> error for any objects that failed to delete
+// S3's DeleteObjects API is idempotent - deleting non-existent objects succeeds
+func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
+	start := time.Now()
+	ctx := context.Background()
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	if len(keys) > 1000 {
+		logger.Warn("STORAGE: DeleteBulk called with more than 1000 keys, only first 1000 will be deleted", "count", len(keys))
+		keys = keys[:1000]
+	}
+
+	// Build DeleteObjects input
+	var objects []types.ObjectIdentifier
+	for _, key := range keys {
+		objects = append(objects, types.ObjectIdentifier{
+			Key: aws.String(key),
+		})
+	}
+
+	input := &s3.DeleteObjectsInput{
+		Bucket: aws.String(s.BucketName),
+		Delete: &types.Delete{
+			Objects: objects,
+			Quiet:   aws.Bool(true), // Only return errors, not successful deletes
+		},
+	}
+
+	output, err := s.Client.DeleteObjects(ctx, input)
+
+	metrics.S3OperationDuration.WithLabelValues("DELETE_BULK").Observe(time.Since(start).Seconds())
+
+	if err != nil {
+		// Entire operation failed
+		logger.Error("STORAGE: Bulk delete failed", "count", len(keys), "error", err)
+		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "error").Inc()
+
+		// Return error for all keys
+		errors := make(map[string]error)
+		for _, key := range keys {
+			errors[key] = err
+		}
+		return errors
+	}
+
+	// Check for partial failures
+	errors := make(map[string]error)
+	if len(output.Errors) > 0 {
+		for _, deleteError := range output.Errors {
+			key := aws.ToString(deleteError.Key)
+			code := aws.ToString(deleteError.Code)
+			message := aws.ToString(deleteError.Message)
+			errors[key] = fmt.Errorf("S3 delete error: %s - %s", code, message)
+			logger.Warn("STORAGE: Failed to delete object in bulk operation", "key", key, "code", code, "message", message)
+		}
+		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "partial").Inc()
+	} else {
+		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "success").Inc()
+	}
+
+	successCount := len(keys) - len(errors)
+	logger.Info("STORAGE: Bulk delete completed", "total", len(keys), "success", successCount, "failed", len(errors))
+
+	return errors
 }
 
 // classifyS3Error classifies S3 errors for metrics tracking
