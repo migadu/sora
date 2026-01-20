@@ -38,6 +38,8 @@ func handleAccountsCommand(ctx context.Context) {
 		handleDeleteAccount(ctx)
 	case "restore":
 		handleRestoreAccount(ctx)
+	case "purge-domain":
+		handlePurgeDomain(ctx)
 	case "help", "--help", "-h":
 		printAccountsUsage()
 	default:
@@ -328,9 +330,10 @@ func handleDeleteAccount(ctx context.Context) {
 
 	email := fs.String("email", "", "Email address for the account to delete (required)")
 	confirm := fs.Bool("confirm", false, "Confirm account deletion (required)")
+	purge := fs.Bool("purge", false, "Purge all account data immediately (messages, mailboxes, credentials) without grace period")
 
 	fs.Usage = func() {
-		fmt.Printf(`Soft-delete an account
+		fmt.Printf(`Delete an account
 
 This command soft-deletes an account by marking it for deletion. The account and
 its data will be permanently removed by a background worker after a configurable
@@ -338,15 +341,23 @@ grace period.
 
 During the grace period, the account can be restored using the 'accounts restore' command.
 
+Use the --purge flag to immediately delete all data (messages from S3, mailboxes,
+credentials) without any grace period. This action is irreversible.
+
 Usage:
   sora-admin accounts delete [options]
 
 Options:
   --email string      Email address for the account to delete (required)
-  --confirm           Confirm account soft-deletion (required for safety)
+  --confirm           Confirm account deletion (required for safety)
+  --purge             Purge all account data immediately without grace period (irreversible)
 
 Examples:
+  # Soft-delete (with grace period)
   sora-admin --config config.toml accounts delete --email user@example.com --confirm
+
+  # Hard-delete immediately (purge everything)
+  sora-admin --config config.toml accounts delete --email user@example.com --confirm --purge
 `)
 	}
 
@@ -369,11 +380,15 @@ Examples:
 	}
 
 	// Delete the account
-	if err := deleteAccount(ctx, globalConfig, *email); err != nil {
+	if err := deleteAccount(ctx, globalConfig, *email, *purge); err != nil {
 		logger.Fatalf("Failed to delete account: %v", err)
 	}
 
-	fmt.Printf("Successfully soft-deleted account: %s. It will be permanently removed after the grace period.\n", *email)
+	if *purge {
+		fmt.Printf("Successfully purged account: %s. All data (messages, mailboxes, credentials) has been permanently deleted.\n", *email)
+	} else {
+		fmt.Printf("Successfully soft-deleted account: %s. It will be permanently removed after the grace period.\n", *email)
+	}
 }
 
 func handleRestoreAccount(ctx context.Context) {
@@ -421,6 +436,71 @@ Examples:
 	fmt.Printf("Successfully restored account: %s\n", *email)
 }
 
+func handlePurgeDomain(ctx context.Context) {
+	// Parse purge-domain specific flags
+	fs := flag.NewFlagSet("accounts purge-domain", flag.ExitOnError)
+
+	domain := fs.String("domain", "", "Domain to purge (e.g., example.com) (required)")
+	confirm := fs.Bool("confirm", false, "Confirm domain purge (required for safety)")
+
+	fs.Usage = func() {
+		fmt.Printf(`Purge all accounts in a domain
+
+This command purges ALL accounts under a domain (e.g., *@example.com).
+It iterates through all accounts and purges each one using the resumable
+expunge-then-cleanup pattern.
+
+⚠️  WARNING: This is IRREVERSIBLE and will delete:
+  - All accounts with emails ending in @<domain>
+  - All their messages (from S3 and database)
+  - All their mailboxes
+  - All their credentials
+
+The operation is RESUMABLE - you can interrupt with Ctrl+C and re-run
+the same command to continue where you left off.
+
+Usage:
+  sora-admin accounts purge-domain [options]
+
+Options:
+  --domain string     Domain to purge (e.g., example.com) (required)
+  --confirm           Confirm domain purge (required for safety)
+
+Examples:
+  # Purge all *@example.com accounts
+  sora-admin --config config.toml accounts purge-domain --domain example.com --confirm
+
+  # If interrupted, re-run same command to resume
+  sora-admin --config config.toml accounts purge-domain --domain example.com --confirm
+`)
+	}
+
+	// Parse the remaining arguments
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// Validate required arguments
+	if *domain == "" {
+		fmt.Printf("Error: --domain is required\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	if !*confirm {
+		fmt.Printf("Error: --confirm is required for domain purge\n\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	// Purge the domain
+	if err := purgeDomain(ctx, globalConfig, *domain); err != nil {
+		logger.Fatalf("Failed to purge domain: %v", err)
+	}
+
+	fmt.Printf("\n✅ Successfully purged all accounts for domain: %s\n", *domain)
+}
+
 func printAccountsUsage() {
 	fmt.Printf(`Account Management
 
@@ -428,12 +508,13 @@ Usage:
   sora-admin accounts <subcommand> [options]
 
 Subcommands:
-  create   Create a new account
-  list     List all accounts in the system
-  show     Show detailed information for a specific account
-  update   Update an existing account's password
-  delete   Delete an account (soft delete with grace period)
-  restore  Restore a soft-deleted account
+  create        Create a new account
+  list          List all accounts in the system
+  show          Show detailed information for a specific account
+  update        Update an existing account's password
+  delete        Delete an account (soft delete with grace period, or hard delete with --purge)
+  restore       Restore a soft-deleted account
+  purge-domain  Purge all accounts in a domain (irreversible, resumable)
 
 Examples:
   sora-admin accounts create --email user@example.com --password mypassword
@@ -441,7 +522,9 @@ Examples:
   sora-admin accounts show --email user@example.com
   sora-admin accounts update --email user@example.com --password newpassword
   sora-admin accounts delete --email user@example.com --confirm
+  sora-admin accounts delete --email user@example.com --confirm --purge
   sora-admin accounts restore --email user@example.com
+  sora-admin accounts purge-domain --domain example.com --confirm
 
 Use 'sora-admin accounts <subcommand> --help' for detailed help.
 `)
@@ -652,7 +735,7 @@ func updateAccount(ctx context.Context, cfg AdminConfig, email, password, passwo
 	return nil
 }
 
-func deleteAccount(ctx context.Context, cfg AdminConfig, email string) error {
+func deleteAccount(ctx context.Context, cfg AdminConfig, email string, purge bool) error {
 
 	// Connect to resilient database
 	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
@@ -661,9 +744,23 @@ func deleteAccount(ctx context.Context, cfg AdminConfig, email string) error {
 	}
 	defer rdb.Close()
 
-	// Delete the account using the existing database function
-	if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil {
-		return fmt.Errorf("failed to delete account: %w", err)
+	// Get account ID first (needed for purge)
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	if err != nil {
+		return fmt.Errorf("failed to find account: %w", err)
+	}
+
+	// If purge flag is set, delete all data immediately using the expunge-then-cleanup pattern
+	if purge {
+		// Use the shared purgeAccount function
+		if err := purgeAccount(ctx, cfg, rdb, accountID, email); err != nil {
+			return err
+		}
+	} else {
+		// Soft-delete the account using the existing database function
+		if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil {
+			return fmt.Errorf("failed to delete account: %w", err)
+		}
 	}
 
 	return nil

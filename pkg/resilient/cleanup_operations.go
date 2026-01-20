@@ -47,3 +47,27 @@ func (rd *ResilientDatabase) GetMessagesForMailboxAndChildren(ctx context.Contex
 func (rd *ResilientDatabase) PurgeMessagesByIDs(ctx context.Context, messageIDs []int64) (int64, error) {
 	return rd.getOperationalDatabaseForOperation(true).PurgeMessagesByIDs(ctx, messageIDs)
 }
+
+func (rd *ResilientDatabase) GetMessagesForAccount(ctx context.Context, accountID int64) ([]db.Message, error) {
+	return rd.getOperationalDatabaseForOperation(false).GetMessagesForAccount(ctx, accountID)
+}
+
+func (rd *ResilientDatabase) ExpungeAllMessagesForAccount(ctx context.Context, accountID int64) (int64, error) {
+	return rd.getOperationalDatabaseForOperation(true).ExpungeAllMessagesForAccount(ctx, accountID)
+}
+
+func (rd *ResilientDatabase) GetUserScopedObjectsForAccount(ctx context.Context, accountID int64, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error) {
+	return rd.getOperationalDatabaseForOperation(false).GetUserScopedObjectsForAccount(ctx, accountID, gracePeriod, limit)
+}
+
+func (rd *ResilientDatabase) PurgeMailboxesForAccount(ctx context.Context, accountID int64) error {
+	return rd.getOperationalDatabaseForOperation(true).PurgeMailboxesForAccount(ctx, accountID)
+}
+
+func (rd *ResilientDatabase) PurgeCredentialsForAccount(ctx context.Context, accountID int64) error {
+	return rd.getOperationalDatabaseForOperation(true).PurgeCredentialsForAccount(ctx, accountID)
+}
+
+func (rd *ResilientDatabase) PurgeAccount(ctx context.Context, accountID int64) error {
+	return rd.getOperationalDatabaseForOperation(true).PurgeAccount(ctx, accountID)
+}

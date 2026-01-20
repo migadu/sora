@@ -676,7 +676,7 @@ func TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent(t *testing
 		MailboxName: "INBOX",
 		S3Domain:    "example.com",
 		S3Localpart: "duplicate-test",
-		ContentHash: "hash-content-v2", // DIFFERENT content hash
+		ContentHash: "hash-content-v2",           // DIFFERENT content hash
 		MessageID:   "unique-msg-id@example.com", // SAME message_id
 		Subject:     "Second Version (should be skipped)",
 		Size:        200,

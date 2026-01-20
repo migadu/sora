@@ -695,6 +695,50 @@ type AccountSummary struct {
 	CreatedAt       string `json:"created_at"`
 }
 
+// GetAccountsByDomain returns a simplified list of accounts for a given domain
+// Used by the purge-domain command to iterate through accounts
+func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
+	query := `
+		SELECT a.id,
+			   a.created_at,
+			   c.address as primary_email,
+			   0 as credential_count,
+			   0 as mailbox_count,
+			   0 as message_count
+		FROM accounts a
+		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
+		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		  AND a.deleted_at IS NULL
+		ORDER BY c.address
+	`
+
+	rows, err := db.GetReadPool().Query(ctx, query, domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query accounts by domain: %w", err)
+	}
+	defer rows.Close()
+
+	var accounts []AccountSummary
+	for rows.Next() {
+		var account AccountSummary
+		var createdAt any
+		if err := rows.Scan(
+			&account.AccountID,
+			&createdAt,
+			&account.PrimaryEmail,
+			&account.CredentialCount,
+			&account.MailboxCount,
+			&account.MessageCount,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan account summary: %w", err)
+		}
+		account.CreatedAt = fmt.Sprintf("%v", createdAt)
+		accounts = append(accounts, account)
+	}
+
+	return accounts, rows.Err()
+}
+
 // ListAccounts returns a summary of all accounts in the system
 func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) {
 	query := `

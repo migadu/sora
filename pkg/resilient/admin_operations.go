@@ -100,6 +100,17 @@ func (rd *ResilientDatabase) ListAccountsWithRetry(ctx context.Context) ([]*db.A
 	return accounts, nil
 }
 
+func (rd *ResilientDatabase) GetAccountsByDomain(ctx context.Context, domain string) ([]db.AccountSummary, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetAccountsByDomain(ctx, domain)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.AccountSummary), nil
+}
+
 func (rd *ResilientDatabase) GetAccountDetailsWithRetry(ctx context.Context, email string) (*db.AccountDetails, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetAccountDetails(ctx, email)
