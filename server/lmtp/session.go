@@ -729,13 +729,18 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	textWriter.Close()
 	w.Close()
 
-	sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
-	if sendErr != nil {
-		s.DebugLog("error enqueuing vacation response", "error", sendErr)
-		// The Sieve engine's policy should have already recorded the response attempt.
-		// Failure here is a delivery issue.
+	// Only send vacation response if relay queue is configured
+	if s.backend.relayQueue != nil {
+		sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
+		if sendErr != nil {
+			s.DebugLog("error enqueuing vacation response", "error", sendErr)
+			// The Sieve engine's policy should have already recorded the response attempt.
+			// Failure here is a delivery issue.
+		} else {
+			s.DebugLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
+		}
 	} else {
-		s.DebugLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
+		s.DebugLog("relay queue not configured, cannot send vacation response")
 	}
 
 	// The recording of the vacation response is now handled by SievePolicy via VacationOracle
