@@ -98,9 +98,10 @@ type HostHealth struct {
 
 // FailoverManager manages host selection and failover for database connections
 type FailoverManager struct {
-	hosts        []*HostHealth
-	currentIndex atomic.Int64
-	poolType     string
+	hosts              []*HostHealth
+	currentIndex       atomic.Int64
+	poolType           string
+	failureThreshold   int64 // Number of consecutive failures before marking unhealthy
 	// Store endpoint config to build health check connection strings
 	endpointConfig *config.DatabaseEndpointConfig
 }
@@ -865,9 +866,10 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 // NewFailoverManager creates a new failover manager for the given hosts
 func NewFailoverManager(endpointConfig *config.DatabaseEndpointConfig, poolType string) *FailoverManager {
 	fm := &FailoverManager{
-		hosts:          make([]*HostHealth, len(endpointConfig.Hosts)),
-		poolType:       poolType,
-		endpointConfig: endpointConfig,
+		hosts:            make([]*HostHealth, len(endpointConfig.Hosts)),
+		poolType:         poolType,
+		failureThreshold: 3, // Require 3 consecutive failures before marking unhealthy
+		endpointConfig:   endpointConfig,
 	}
 
 	for i, host := range endpointConfig.Hosts {
@@ -953,16 +955,23 @@ func (fm *FailoverManager) MarkHostUnhealthy(host string, err error) {
 	for _, h := range fm.hosts {
 		if h.Host == host {
 			wasHealthy := h.IsHealthy.Load()
-			h.IsHealthy.Store(false)
 			h.mu.Lock()
 			h.ConsecutiveFails++
 			h.LastHealthCheck = time.Now()
 			fails := h.ConsecutiveFails
 			h.mu.Unlock()
 
-			if wasHealthy {
-				log.Printf("[DB-%s-FAILOVER] Host %s marked as unhealthy (fails: %d, error: %v)",
-					fm.poolType, host, fails, err)
+			// Only mark as unhealthy after threshold consecutive failures
+			if fails >= fm.failureThreshold {
+				if wasHealthy {
+					h.IsHealthy.Store(false)
+					log.Printf("[DB-%s-FAILOVER] Host %s marked as unhealthy (fails: %d, error: %v)",
+						fm.poolType, host, fails, err)
+				}
+			} else {
+				// Still incrementing failure count but not marking unhealthy yet
+				log.Printf("[DB-%s-FAILOVER] Host %s connection failed (fails: %d/%d, error: %v)",
+					fm.poolType, host, fails, fm.failureThreshold, err)
 			}
 			break
 		}

@@ -17,6 +17,14 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
+// truncateHash safely truncates a hash string for logging purposes
+func truncateHash(hash string) string {
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
+}
+
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
 // It returns a map of old UIDs to new UIDs.
 func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
@@ -263,9 +271,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		uidToUse = highestUID
 	}
 
-	// Deduplication: Check if message with same message_id already exists (regardless of content_hash)
-	// The unique constraint is on (message_id, mailbox_id, expunged_at IS NULL), so we must check
-	// for any existing message with this message_id to avoid unique violations.
+	// Check for existing message with same message_id
 	var existingUID int64
 	var existingContentHash string
 	err = tx.QueryRow(ctx, `
@@ -274,26 +280,40 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		AND message_id = $2
 		AND expunged_at IS NULL
 		LIMIT 1`,
-		options.MailboxID, options.MessageID).Scan(&existingUID, &existingContentHash)
+		options.MailboxID, saneMessageID).Scan(&existingUID, &existingContentHash)
+
 	if err == nil {
-		// Message with same message_id already exists
+		// Message with same message_id exists
 		if existingContentHash == options.ContentHash {
-			// True duplicate (same Message-ID + same content) - skip insert
+			// True duplicate (same Message-ID + same content_hash) - skip insert
 			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
-				options.MessageID, options.ContentHash, options.MailboxID, existingUID)
-		} else {
-			// Same Message-ID but different content - this shouldn't happen in normal mail flow
-			// but can occur during import if maildir has duplicates with same Message-ID header
-			log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Skipping insert to avoid unique violation. Existing UID=%d",
-				options.MessageID, existingContentHash[:12], options.ContentHash[:12], options.MailboxID, existingUID)
+				saneMessageID, options.ContentHash, options.MailboxID, existingUID)
+			return 0, existingUID, nil
 		}
-		return 0, existingUID, nil // Return 0 for messageID, existing UID
+
+		// Same Message-ID but different content - this is draft replacement
+		// Delete the old message before inserting the new one
+		log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Deleting old message (UID=%d) for draft replacement.",
+			saneMessageID, truncateHash(existingContentHash), truncateHash(options.ContentHash), options.MailboxID, existingUID)
+
+		deleteResult, err := tx.Exec(ctx, `
+			DELETE FROM messages
+			WHERE mailbox_id = $1
+			  AND message_id = $2
+		`, options.MailboxID, saneMessageID)
+		if err != nil {
+			log.Printf("Database: ERROR - failed to delete conflicting message for draft replacement: %v", err)
+			return 0, 0, fmt.Errorf("failed to delete conflicting message: %w", err)
+		}
+		if deleteResult.RowsAffected() > 0 {
+			log.Printf("Database: deleted %d message(s) for draft replacement", deleteResult.RowsAffected())
+		}
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
 		log.Printf("Database: failed to check for duplicate message: %v", err)
 		return 0, 0, consts.ErrDBQueryFailed
 	}
-	// err == pgx.ErrNoRows means no duplicate found, continue with insert
+	// err == pgx.ErrNoRows means no existing message found, continue with insert
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {
@@ -354,21 +374,6 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
-
-	// Delete any expunged messages in the mailbox that have the same message_id
-	// This prevents unique constraint violations when appending messages that were previously expunged
-	deleteResult, err := tx.Exec(ctx, `
-		DELETE FROM messages
-		WHERE mailbox_id = $1
-		  AND message_id = $2
-	`, options.MailboxID, saneMessageID)
-	if err != nil {
-		log.Printf("Database: ERROR - failed to delete conflicting tombstones: %v", err)
-		return 0, 0, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
-	}
-	if deleteResult.RowsAffected() > 0 {
-		log.Printf("Database: deleted %d conflicting message(s) from mailbox before append", deleteResult.RowsAffected())
-	}
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
@@ -580,9 +585,10 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			// Same Message-ID but different content - this shouldn't happen in normal mail flow
 			// but can occur during import if maildir has duplicates with same Message-ID header
 			log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Skipping insert to avoid unique violation. Existing UID=%d",
-				options.MessageID, existingContentHash[:12], options.ContentHash[:12], options.MailboxID, existingUID)
+				options.MessageID, truncateHash(existingContentHash), truncateHash(options.ContentHash), options.MailboxID, existingUID)
 		}
-		return 0, existingUID, nil // Return 0 for messageID, existing UID
+		// Return unique violation error so importer can count it as skipped
+		return 0, existingUID, consts.ErrDBUniqueViolation
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
 		log.Printf("Database: failed to check for duplicate message: %v", err)
