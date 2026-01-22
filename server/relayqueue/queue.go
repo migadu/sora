@@ -223,7 +223,56 @@ func (q *DiskQueue) MarkSuccess(messageID string) error {
 	return nil
 }
 
-// MarkFailure updates the message after a failed delivery attempt
+// MarkPermanentFailure immediately moves a message to failed directory without retry.
+// This is used for permanent SMTP errors (5xx codes) that should not be retried.
+func (q *DiskQueue) MarkPermanentFailure(messageID string, errorMsg string) error {
+	start := time.Now()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	metadataPath := filepath.Join(q.processingDir, messageID+".json")
+	messagePath := filepath.Join(q.processingDir, messageID+".msg")
+
+	// Read current metadata
+	var metadata QueuedMessage
+	if err := q.readMetadata(metadataPath, &metadata); err != nil {
+		metrics.RelayQueueOperations.WithLabelValues("mark_permanent_failure", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("mark_permanent_failure").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	// Update metadata
+	metadata.Attempts++
+	metadata.LastAttempt = time.Now()
+	metadata.Errors = append(metadata.Errors, fmt.Sprintf("[%s] PERMANENT: %s", time.Now().Format(time.RFC3339), errorMsg))
+
+	logger.Error("RelayQueue: Permanent failure (5xx or similar), moving to failed", "id", messageID, "error", errorMsg)
+
+	// Move to failed directory
+	failedMetadataPath := filepath.Join(q.failedDir, messageID+".json")
+	failedMessagePath := filepath.Join(q.failedDir, messageID+".msg")
+
+	if err := q.writeFileAtomic(failedMetadataPath, metadata); err != nil {
+		metrics.RelayQueueOperations.WithLabelValues("mark_permanent_failure", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("mark_permanent_failure").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to write failed metadata: %w", err)
+	}
+
+	if err := os.Rename(messagePath, failedMessagePath); err != nil {
+		metrics.RelayQueueOperations.WithLabelValues("mark_permanent_failure", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("mark_permanent_failure").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to move message to failed: %w", err)
+	}
+
+	// Remove from processing
+	os.Remove(metadataPath)
+	metrics.RelayQueueOperations.WithLabelValues("mark_permanent_failure", "success").Inc()
+	metrics.RelayQueueOperationDuration.WithLabelValues("mark_permanent_failure").Observe(time.Since(start).Seconds())
+	return nil
+}
+
+// MarkFailure updates the message after a failed delivery attempt (for temporary failures).
+// This is used for temporary SMTP errors (4xx codes) and network errors.
 func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 	start := time.Now()
 	q.mu.Lock()

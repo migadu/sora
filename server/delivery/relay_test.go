@@ -1,11 +1,14 @@
 package delivery
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-smtp"
 )
 
 // Mock logger for testing
@@ -398,5 +401,232 @@ func BenchmarkHTTPRelayHandler(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.SendToExternalRelay("from@example.com", "to@example.com", message)
+	}
+}
+
+// TestIsPermanentError tests the error classification logic
+func TestIsPermanentError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantPerm bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			wantPerm: false,
+		},
+		{
+			name:     "generic error (temporary)",
+			err:      errors.New("generic error"),
+			wantPerm: false,
+		},
+		{
+			name:     "SMTP 4xx error (temporary)",
+			err:      &smtp.SMTPError{Code: 421, Message: "Service not available"},
+			wantPerm: false,
+		},
+		{
+			name:     "SMTP 450 mailbox busy (temporary)",
+			err:      &smtp.SMTPError{Code: 450, Message: "Requested mail action not taken: mailbox unavailable"},
+			wantPerm: false,
+		},
+		{
+			name:     "SMTP 451 local error (temporary)",
+			err:      &smtp.SMTPError{Code: 451, Message: "Requested action aborted: local error in processing"},
+			wantPerm: false,
+		},
+		{
+			name:     "SMTP 452 insufficient storage (temporary)",
+			err:      &smtp.SMTPError{Code: 452, Message: "Requested action not taken: insufficient system storage"},
+			wantPerm: false,
+		},
+		{
+			name:     "SMTP 5xx error (permanent)",
+			err:      &smtp.SMTPError{Code: 550, Message: "Requested action not taken: mailbox unavailable"},
+			wantPerm: true,
+		},
+		{
+			name:     "SMTP 551 user not local (permanent)",
+			err:      &smtp.SMTPError{Code: 551, Message: "User not local; please try <forward-path>"},
+			wantPerm: true,
+		},
+		{
+			name:     "SMTP 552 exceeded storage (permanent)",
+			err:      &smtp.SMTPError{Code: 552, Message: "Requested mail action aborted: exceeded storage allocation"},
+			wantPerm: true,
+		},
+		{
+			name:     "SMTP 553 mailbox name invalid (permanent)",
+			err:      &smtp.SMTPError{Code: 553, Message: "Requested action not taken: mailbox name not allowed"},
+			wantPerm: true,
+		},
+		{
+			name:     "SMTP 554 transaction failed (permanent)",
+			err:      &smtp.SMTPError{Code: 554, Message: "Transaction failed"},
+			wantPerm: true,
+		},
+		{
+			name:     "wrapped SMTP 4xx (temporary)",
+			err:      fmt.Errorf("context: %w", &smtp.SMTPError{Code: 450, Message: "mailbox busy"}),
+			wantPerm: false,
+		},
+		{
+			name:     "wrapped SMTP 5xx (permanent)",
+			err:      fmt.Errorf("context: %w", &smtp.SMTPError{Code: 550, Message: "mailbox not found"}),
+			wantPerm: true,
+		},
+		{
+			name:     "RelayError temporary",
+			err:      &RelayError{Err: errors.New("temp"), Permanent: false},
+			wantPerm: false,
+		},
+		{
+			name:     "RelayError permanent",
+			err:      &RelayError{Err: errors.New("perm"), Permanent: true},
+			wantPerm: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsPermanentError(tt.err)
+			if got != tt.wantPerm {
+				t.Errorf("IsPermanentError() = %v, want %v", got, tt.wantPerm)
+			}
+		})
+	}
+}
+
+// TestRelayError tests the RelayError wrapper
+func TestRelayError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      *RelayError
+		wantMsg  string
+		wantPerm bool
+	}{
+		{
+			name:     "temporary error",
+			err:      &RelayError{Err: errors.New("network timeout"), Permanent: false},
+			wantMsg:  "temporary failure: network timeout",
+			wantPerm: false,
+		},
+		{
+			name:     "permanent error",
+			err:      &RelayError{Err: errors.New("mailbox not found"), Permanent: true},
+			wantMsg:  "permanent failure: mailbox not found",
+			wantPerm: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.wantMsg {
+				t.Errorf("RelayError.Error() = %v, want %v", got, tt.wantMsg)
+			}
+			if got := IsPermanentError(tt.err); got != tt.wantPerm {
+				t.Errorf("IsPermanentError(RelayError) = %v, want %v", got, tt.wantPerm)
+			}
+		})
+	}
+}
+
+// TestRelayError_Unwrap tests error unwrapping
+func TestRelayError_Unwrap(t *testing.T) {
+	innerErr := errors.New("inner error")
+	relayErr := &RelayError{Err: innerErr, Permanent: true}
+
+	if !errors.Is(relayErr, innerErr) {
+		t.Errorf("errors.Is() should find inner error")
+	}
+
+	if unwrapped := relayErr.Unwrap(); unwrapped != innerErr {
+		t.Errorf("Unwrap() = %v, want %v", unwrapped, innerErr)
+	}
+}
+
+// TestHTTPRelayHandler_ErrorClassification tests HTTP error classification
+func TestHTTPRelayHandler_ErrorClassification(t *testing.T) {
+	tests := []struct {
+		name           string
+		statusCode     int
+		expectError    bool
+		expectPermanent bool
+	}{
+		{
+			name:            "200 OK - success",
+			statusCode:      http.StatusOK,
+			expectError:     false,
+			expectPermanent: false,
+		},
+		{
+			name:            "400 Bad Request - permanent",
+			statusCode:      http.StatusBadRequest,
+			expectError:     true,
+			expectPermanent: true,
+		},
+		{
+			name:            "401 Unauthorized - permanent",
+			statusCode:      http.StatusUnauthorized,
+			expectError:     true,
+			expectPermanent: true,
+		},
+		{
+			name:            "404 Not Found - permanent",
+			statusCode:      http.StatusNotFound,
+			expectError:     true,
+			expectPermanent: true,
+		},
+		{
+			name:            "500 Internal Server Error - temporary",
+			statusCode:      http.StatusInternalServerError,
+			expectError:     true,
+			expectPermanent: false,
+		},
+		{
+			name:            "502 Bad Gateway - temporary",
+			statusCode:      http.StatusBadGateway,
+			expectError:     true,
+			expectPermanent: false,
+		},
+		{
+			name:            "503 Service Unavailable - temporary",
+			statusCode:      http.StatusServiceUnavailable,
+			expectError:     true,
+			expectPermanent: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer server.Close()
+
+			handler := &HTTPRelayHandler{
+				HTTPURL:      server.URL,
+				AuthToken:    "token",
+				MetricsLabel: "test",
+			}
+
+			err := handler.SendToExternalRelay("from@example.com", "to@example.com", []byte("test"))
+
+			if tt.expectError {
+				if err == nil {
+					t.Fatal("Expected error, got nil")
+				}
+
+				isPerm := IsPermanentError(err)
+				if isPerm != tt.expectPermanent {
+					t.Errorf("IsPermanentError() = %v, want %v for status %d", isPerm, tt.expectPermanent, tt.statusCode)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package relayqueue
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -645,5 +646,144 @@ func BenchmarkAcquireNext(b *testing.B) {
 		if msg != nil {
 			queue.MarkSuccess(msg.ID)
 		}
+	}
+}
+
+// TestMarkPermanentFailure tests that permanent failures are immediately moved to failed directory
+func TestMarkPermanentFailure(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Enqueue a message
+	err = queue.Enqueue("sender@example.com", "recipient@example.com", "redirect", []byte("Test message"))
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	// Acquire the message (moves to processing)
+	msg, _, err := queue.AcquireNext()
+	if err != nil {
+		t.Fatalf("AcquireNext failed: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("Expected message, got nil")
+	}
+
+	// Mark as permanent failure (simulating 5xx SMTP error)
+	err = queue.MarkPermanentFailure(msg.ID, "550 Mailbox not found")
+	if err != nil {
+		t.Fatalf("MarkPermanentFailure failed: %v", err)
+	}
+
+	// Verify message moved directly to failed (not retried)
+	pending, processing, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+
+	if pending != 0 {
+		t.Errorf("Expected 0 pending (no retry), got %d", pending)
+	}
+	if processing != 0 {
+		t.Errorf("Expected 0 processing, got %d", processing)
+	}
+	if failed != 1 {
+		t.Errorf("Expected 1 failed, got %d", failed)
+	}
+
+	// Verify metadata contains "PERMANENT" marker in errors
+	entries, err := os.ReadDir(queue.failedDir)
+	if err != nil {
+		t.Fatalf("Failed to read failed directory: %v", err)
+	}
+
+	var metadata QueuedMessage
+	found := false
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".json" {
+			path := filepath.Join(queue.failedDir, entry.Name())
+			if err := queue.readMetadata(path, &metadata); err == nil {
+				found = true
+				break
+			}
+		}
+	}
+
+	if !found {
+		t.Fatal("Failed message metadata not found")
+	}
+
+	if metadata.Attempts != 1 {
+		t.Errorf("Expected 1 attempt (no retry), got %d", metadata.Attempts)
+	}
+
+	if len(metadata.Errors) != 1 {
+		t.Fatalf("Expected 1 error, got %d", len(metadata.Errors))
+	}
+
+	// Check that error contains "PERMANENT" marker
+	errorMsg := metadata.Errors[0]
+	if !strings.Contains(errorMsg, "PERMANENT") {
+		t.Errorf("Expected error to contain 'PERMANENT', got: %s", errorMsg)
+	}
+	if !strings.Contains(errorMsg, "550 Mailbox not found") {
+		t.Errorf("Expected error to contain '550 Mailbox not found', got: %s", errorMsg)
+	}
+}
+
+// TestMarkPermanentFailureVsTemporaryFailure tests the difference between permanent and temporary failures
+func TestMarkPermanentFailureVsTemporaryFailure(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 3, []time.Duration{100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Enqueue two messages
+	err = queue.Enqueue("sender1@example.com", "recipient1@example.com", "redirect", []byte("Permanent failure test"))
+	if err != nil {
+		t.Fatalf("Enqueue 1 failed: %v", err)
+	}
+
+	err = queue.Enqueue("sender2@example.com", "recipient2@example.com", "redirect", []byte("Temporary failure test"))
+	if err != nil {
+		t.Fatalf("Enqueue 2 failed: %v", err)
+	}
+
+	// Acquire first message and mark as permanent failure (5xx)
+	msg1, _, err := queue.AcquireNext()
+	if err != nil || msg1 == nil {
+		t.Fatalf("AcquireNext 1 failed: %v", err)
+	}
+	err = queue.MarkPermanentFailure(msg1.ID, "550 User not found")
+	if err != nil {
+		t.Fatalf("MarkPermanentFailure failed: %v", err)
+	}
+
+	// Acquire second message and mark as temporary failure (4xx)
+	msg2, _, err := queue.AcquireNext()
+	if err != nil || msg2 == nil {
+		t.Fatalf("AcquireNext 2 failed: %v", err)
+	}
+	err = queue.MarkFailure(msg2.ID, "450 Mailbox busy")
+	if err != nil {
+		t.Fatalf("MarkFailure failed: %v", err)
+	}
+
+	// Check stats: permanent should be in failed, temporary should be in pending (for retry)
+	pending, processing, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+
+	if pending != 1 {
+		t.Errorf("Expected 1 pending (temporary failure queued for retry), got %d", pending)
+	}
+	if processing != 0 {
+		t.Errorf("Expected 0 processing, got %d", processing)
+	}
+	if failed != 1 {
+		t.Errorf("Expected 1 failed (permanent failure), got %d", failed)
 	}
 }

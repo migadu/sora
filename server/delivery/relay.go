@@ -15,6 +15,49 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
+// RelayError wraps an error with information about whether it's permanent or temporary.
+// Permanent errors (5xx SMTP codes) should not be retried.
+// Temporary errors (4xx SMTP codes, network errors) can be retried.
+type RelayError struct {
+	Err       error
+	Permanent bool // true for 5xx errors, false for 4xx/network errors
+}
+
+func (e *RelayError) Error() string {
+	if e.Permanent {
+		return fmt.Sprintf("permanent failure: %v", e.Err)
+	}
+	return fmt.Sprintf("temporary failure: %v", e.Err)
+}
+
+func (e *RelayError) Unwrap() error {
+	return e.Err
+}
+
+// IsPermanentError checks if an error is a permanent failure (5xx SMTP error).
+// Returns true for 5xx errors, false for 4xx errors and network/connection errors.
+func IsPermanentError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check if it's already wrapped as RelayError
+	var relayErr *RelayError
+	if errors.As(err, &relayErr) {
+		return relayErr.Permanent
+	}
+
+	// Check for SMTP error
+	var smtpErr *smtp.SMTPError
+	if errors.As(err, &smtpErr) {
+		// 5xx = permanent, 4xx = temporary (use Temporary() which returns true for 4xx)
+		return !smtpErr.Temporary()
+	}
+
+	// Network errors, connection errors, etc. are temporary
+	return false
+}
+
 // RelayHandler interface defines the contract for external relay operations.
 type RelayHandler interface {
 	SendToExternalRelay(from string, to string, messageBytes []byte) error
@@ -79,7 +122,8 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 		cert, err := tls.LoadX509KeyPair(r.TLSCertFile, r.TLSKeyFile)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-			return fmt.Errorf("failed to load client certificate: %w", err)
+			// Certificate loading errors are configuration errors (permanent)
+			return &RelayError{Err: fmt.Errorf("failed to load client certificate: %w", err), Permanent: true}
 		}
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
@@ -90,21 +134,24 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 		c, err = smtp.Dial(r.SMTPHost)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-			return fmt.Errorf("failed to connect to SMTP relay: %w", err)
+			// Connection errors are temporary (network issue, server down)
+			return &RelayError{Err: fmt.Errorf("failed to connect to SMTP relay: %w", err), Permanent: false}
 		}
 	} else if r.UseStartTLS {
 		// Connect with STARTTLS (automatically upgrades to TLS)
 		c, err = smtp.DialStartTLS(r.SMTPHost, tlsConfig)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-			return fmt.Errorf("failed to connect to SMTP relay with STARTTLS: %w", err)
+			// Connection errors are temporary (network issue, server down)
+			return &RelayError{Err: fmt.Errorf("failed to connect to SMTP relay with STARTTLS: %w", err), Permanent: false}
 		}
 	} else {
 		// Direct TLS connection
 		c, err = smtp.DialTLS(r.SMTPHost, tlsConfig)
 		if err != nil {
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-			return fmt.Errorf("failed to connect to SMTP relay with TLS: %w", err)
+			// Connection errors are temporary (network issue, server down)
+			return &RelayError{Err: fmt.Errorf("failed to connect to SMTP relay with TLS: %w", err), Permanent: false}
 		}
 	}
 	defer c.Close()
@@ -118,27 +165,34 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 	}()
 
 	if relayErr = c.Mail(from, nil); relayErr != nil {
-		return fmt.Errorf("failed to set sender: %w", relayErr)
+		// Classify SMTP error (5xx = permanent, 4xx = temporary)
+		return &RelayError{Err: fmt.Errorf("failed to set sender: %w", relayErr), Permanent: IsPermanentError(relayErr)}
 	}
 	if relayErr = c.Rcpt(to, nil); relayErr != nil {
-		return fmt.Errorf("failed to set recipient: %w", relayErr)
+		// Classify SMTP error (5xx = permanent, 4xx = temporary)
+		return &RelayError{Err: fmt.Errorf("failed to set recipient: %w", relayErr), Permanent: IsPermanentError(relayErr)}
 	}
 
 	wc, relayErr := c.Data()
 	if relayErr != nil {
-		return fmt.Errorf("failed to start data: %w", relayErr)
+		// Classify SMTP error (5xx = permanent, 4xx = temporary)
+		return &RelayError{Err: fmt.Errorf("failed to start data: %w", relayErr), Permanent: IsPermanentError(relayErr)}
 	}
 	if _, relayErr = wc.Write(messageBytes); relayErr != nil {
 		// Attempt to close the data writer even if write fails, to send the final dot.
 		_ = wc.Close()
-		return fmt.Errorf("failed to write message: %w", relayErr)
+		// Write errors are typically I/O errors (temporary)
+		return &RelayError{Err: fmt.Errorf("failed to write message: %w", relayErr), Permanent: false}
 	}
 	if relayErr = wc.Close(); relayErr != nil {
-		return fmt.Errorf("failed to close data writer: %w", relayErr)
+		// Classify SMTP error (5xx = permanent, 4xx = temporary)
+		return &RelayError{Err: fmt.Errorf("failed to close data writer: %w", relayErr), Permanent: IsPermanentError(relayErr)}
 	}
 
 	if relayErr = c.Quit(); relayErr != nil {
-		return fmt.Errorf("failed to quit: %w", relayErr)
+		// Quit errors don't affect message delivery (already accepted), treat as non-fatal
+		// Just log it but don't return error
+		logger.Warn("SMTP Relay: Failed to send QUIT", "error", relayErr)
 	}
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
@@ -202,14 +256,16 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to marshal relay request: %w", err)
+		// Marshal errors are programming errors (permanent)
+		return &RelayError{Err: fmt.Errorf("failed to marshal relay request: %w", err), Permanent: true}
 	}
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", r.HTTPURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to create HTTP request: %w", err)
+		// Invalid URL is a configuration error (permanent)
+		return &RelayError{Err: fmt.Errorf("failed to create HTTP request: %w", err), Permanent: true}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -230,14 +286,21 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	resp, err := client.Do(req)
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("failed to send HTTP relay request: %w", err)
+		// Network/connection errors are temporary
+		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", err), Permanent: false}
 	}
 	defer resp.Body.Close()
 
 	// Check response status
+	// HTTP 5xx = server error (temporary, server may recover)
+	// HTTP 4xx = client error (permanent, e.g., bad auth, invalid request)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
-		return fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode)
+		permanent := resp.StatusCode >= 400 && resp.StatusCode < 500 // 4xx = permanent
+		return &RelayError{
+			Err:       fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode),
+			Permanent: permanent,
+		}
 	}
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()

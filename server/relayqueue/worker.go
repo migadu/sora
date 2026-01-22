@@ -9,6 +9,7 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server/delivery"
 )
 
 // RelayQueue defines the interface for queue operations required by the worker.
@@ -17,6 +18,7 @@ type RelayQueue interface {
 	AcquireNext() (*QueuedMessage, []byte, error)
 	MarkSuccess(messageID string) error
 	MarkFailure(messageID string, errorMsg string) error
+	MarkPermanentFailure(messageID string, errorMsg string) error
 	GetStats() (pending, processing, failed int, err error)
 }
 
@@ -290,15 +292,30 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 	duration := time.Since(startTime)
 
 	if err != nil {
-		// Delivery failed
-		logger.Error("Relay: Delivery failed for message", "id", msg.ID, "error", err, "duration", duration)
+		// Classify the error to determine if it's permanent (5xx) or temporary (4xx/network)
+		isPermanent := delivery.IsPermanentError(err)
 
-		if markErr := w.queue.MarkFailure(msg.ID, err.Error()); markErr != nil {
-			logger.Error("Relay: CRITICAL - Failed to mark failure for message", "id", msg.ID, "error", markErr)
+		if isPermanent {
+			// Permanent failure (5xx SMTP error) - drop immediately without retry
+			logger.Error("Relay: Permanent delivery failure (5xx), dropping message", "id", msg.ID, "error", err, "duration", duration)
+
+			if markErr := w.queue.MarkPermanentFailure(msg.ID, err.Error()); markErr != nil {
+				logger.Error("Relay: CRITICAL - Failed to mark permanent failure for message", "id", msg.ID, "error", markErr)
+			}
+
+			metrics.RelayDelivery.WithLabelValues(msg.Type, "permanent_failure").Inc()
+			metrics.RelayDeliveryDuration.WithLabelValues(msg.Type, "permanent_failure").Observe(duration.Seconds())
+		} else {
+			// Temporary failure (4xx SMTP error or network error) - retry with backoff
+			logger.Error("Relay: Temporary delivery failure (4xx/network), will retry", "id", msg.ID, "error", err, "duration", duration)
+
+			if markErr := w.queue.MarkFailure(msg.ID, err.Error()); markErr != nil {
+				logger.Error("Relay: CRITICAL - Failed to mark failure for message", "id", msg.ID, "error", markErr)
+			}
+
+			metrics.RelayDelivery.WithLabelValues(msg.Type, "temporary_failure").Inc()
+			metrics.RelayDeliveryDuration.WithLabelValues(msg.Type, "temporary_failure").Observe(duration.Seconds())
 		}
-
-		metrics.RelayDelivery.WithLabelValues(msg.Type, "failure").Inc()
-		metrics.RelayDeliveryDuration.WithLabelValues(msg.Type, "failure").Observe(duration.Seconds())
 		return
 	}
 
