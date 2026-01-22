@@ -58,6 +58,7 @@ func handleImportMaildir(ctx context.Context) {
 	mailboxFilter := fs.String("mailbox-filter", "", "Comma-separated list of mailboxes to import (e.g. INBOX,Sent)")
 	startDate := fs.String("start-date", "", "Import only messages after this date (YYYY-MM-DD)")
 	endDate := fs.String("end-date", "", "Import only messages before this date (YYYY-MM-DD)")
+	incremental := fs.Bool("incremental", false, "Skip messages already marked as imported in SQLite cache")
 
 	fs.Usage = func() {
 		fmt.Printf(`Import maildir from a given path
@@ -72,11 +73,12 @@ Options:
   --batch-size int        Number of messages to process in each batch (default: 20)
   --batch-transaction     Use single transaction per batch (20x faster but less resilient, default: false)
   --dry-run               Preview what would be imported without making changes
-  --preserve-flags        Preserve maildir flags (default: true)  
+  --preserve-flags        Preserve maildir flags (default: true)
   --progress              Show import progress (default: true)
   --delay duration        Delay between operations to control rate (e.g. 500ms)
   --force-reimport        Force reimport of messages even if they already exist
   --cleanup-db            Remove the SQLite import database after successful import
+  --incremental           Skip messages already marked as imported in SQLite cache (default: false = read all)
   --dovecot               Process Dovecot-specific files (subscriptions, dovecot-keywords, dovecot-uidlist)
   --sieve string          Path to Sieve script file to import for the user
   --preserve-uids         Preserve original UIDs from dovecot-uidlist files (implied by --dovecot)
@@ -88,6 +90,10 @@ Options:
 IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
 not to a parent directory containing multiple maildirs.
 
+The --incremental flag controls whether to use the SQLite cache to skip already-imported messages:
+  - Without --incremental (default): All files are read and processed every time
+  - With --incremental: Only files not marked as imported in the SQLite cache are processed
+
 Use --dovecot flag to process Dovecot-specific files including 'subscriptions', 'dovecot-keywords', and
 'dovecot-uidlist'. This will create missing mailboxes, subscribe the user to specified folders, preserve
 custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist files.
@@ -95,6 +101,9 @@ custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist file
 Examples:
   # Import all mail (correct path points to maildir root)
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+
+  # Incremental import (skip already imported messages based on SQLite cache)
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --incremental
 
   # Dry run to preview (note: correct maildir path)
   sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
@@ -215,6 +224,7 @@ Examples:
 		TestMode:             s3 == nil,
 		BatchSize:            *batchSize,
 		BatchTransactionMode: *batchTxMode,
+		Incremental:          *incremental,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)

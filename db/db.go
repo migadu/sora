@@ -98,10 +98,10 @@ type HostHealth struct {
 
 // FailoverManager manages host selection and failover for database connections
 type FailoverManager struct {
-	hosts              []*HostHealth
-	currentIndex       atomic.Int64
-	poolType           string
-	failureThreshold   int64 // Number of consecutive failures before marking unhealthy
+	hosts            []*HostHealth
+	currentIndex     atomic.Int64
+	poolType         string
+	failureThreshold int64 // Number of consecutive failures before marking unhealthy
 	// Store endpoint config to build health check connection strings
 	endpointConfig *config.DatabaseEndpointConfig
 }

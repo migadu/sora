@@ -58,14 +58,19 @@ func TestImportExportCycle(t *testing.T) {
 		verifySQLiteCache(t, importMaildir, 10, 10)
 	})
 
-	// Test 2: Re-import the same maildir (should skip everything)
-	t.Run("ReimportShouldSkip", func(t *testing.T) {
-		testReimportSkipsAll(t, importMaildir, testEmail, rdb, mockS3)
+	// Test 2: Re-import the same maildir with incremental mode (should skip everything)
+	t.Run("ReimportIncrementalShouldSkip", func(t *testing.T) {
+		testReimportSkipsAll(t, importMaildir, testEmail, rdb, mockS3, true)
 	})
 
 	// Test 3: Add new messages and verify incremental import
 	t.Run("IncrementalImport", func(t *testing.T) {
-		testIncrementalImport(t, importMaildir, testEmail, rdb, mockS3)
+		testIncrementalImport(t, importMaildir, testEmail, rdb, mockS3, true)
+	})
+
+	// Test 4: Re-import without incremental mode (should read all files but skip existing in DB)
+	t.Run("ReimportNonIncrementalReadsAll", func(t *testing.T) {
+		testReimportNonIncremental(t, importMaildir, testEmail, rdb, mockS3)
 	})
 
 	t.Log("✅ Complete import/export/cache cycle test passed!")
@@ -81,6 +86,7 @@ func testInitialImport(t *testing.T, maildirPath, email string, rdb *resilient.R
 		ForceReimport: false,
 		CleanupDB:     false, // Keep DB for inspection
 		TestMode:      true,  // Skip actual S3 uploads
+		Incremental:   false, // Non-incremental for initial import (reads all files)
 	}
 
 	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
@@ -109,7 +115,7 @@ func testInitialImport(t *testing.T, maildirPath, email string, rdb *resilient.R
 	}
 }
 
-func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage) {
+func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, incremental bool) {
 	t.Helper()
 
 	options := ImporterOptions{
@@ -119,6 +125,7 @@ func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilien
 		ForceReimport: false,
 		CleanupDB:     false,
 		TestMode:      true,
+		Incremental:   incremental, // Use incremental mode to skip already-uploaded messages
 	}
 
 	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
@@ -149,7 +156,7 @@ func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilien
 	}
 }
 
-func testIncrementalImport(t *testing.T, maildirPath, email string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage) {
+func testIncrementalImport(t *testing.T, maildirPath, email string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, incremental bool) {
 	t.Helper()
 
 	// Copy 3 additional messages to the maildir
@@ -166,6 +173,7 @@ func testIncrementalImport(t *testing.T, maildirPath, email string, rdb *resilie
 		ForceReimport: false,
 		CleanupDB:     false,
 		TestMode:      true,
+		Incremental:   incremental, // Use incremental mode to import only new messages
 	}
 
 	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
@@ -370,4 +378,46 @@ func copyCacheTestMaildir(t *testing.T, src, dst string, messageLimit int) error
 
 	t.Logf("Copied %d messages to %s", copied, dst)
 	return nil
+}
+
+// testReimportNonIncremental tests that non-incremental mode reads all files
+// but still skips messages already in PostgreSQL
+func testReimportNonIncremental(t *testing.T, maildirPath, email string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage) {
+	t.Helper()
+
+	options := ImporterOptions{
+		DryRun:        false,
+		PreserveFlags: true,
+		ShowProgress:  false,
+		ForceReimport: false,
+		CleanupDB:     false,
+		TestMode:      true,
+		Incremental:   false, // Non-incremental mode: reads all files
+	}
+
+	importer, err := NewImporter(context.Background(), maildirPath, email, 1, rdb, s3, options)
+	if err != nil {
+		t.Fatalf("Failed to create importer: %v", err)
+	}
+	defer importer.Close()
+
+	startTime := time.Now()
+	err = importer.Run()
+	duration := time.Since(startTime)
+	if err != nil {
+		t.Fatalf("Non-incremental reimport failed: %v", err)
+	}
+
+	t.Logf("Non-incremental reimport took: %v", duration)
+	t.Logf("Imported: %d, Skipped: %d, Failed: %d",
+		importer.importedMessages, importer.skippedMessages, importer.failedMessages)
+
+	// All messages should be skipped (already in PostgreSQL)
+	// Even though we read all files, the database check should skip them
+	if importer.importedMessages != 0 {
+		t.Errorf("Expected 0 messages to be imported on non-incremental reimport, got %d", importer.importedMessages)
+	}
+
+	// Note: Non-incremental mode will be slower than incremental mode
+	// because it reads and hashes all files, even though they're already imported
 }

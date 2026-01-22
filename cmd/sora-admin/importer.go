@@ -53,6 +53,7 @@ type ImporterOptions struct {
 	TestMode             bool          // Skip S3 uploads for testing (messages stored in DB only)
 	BatchSize            int           // Number of messages to process in each batch (default: 20)
 	BatchTransactionMode bool          // Use single transaction per batch (faster but less resilient, default: false)
+	Incremental          bool          // Use SQLite cache to skip already-imported messages (default: false = always read all)
 }
 
 // resilientDB defines the interface for database operations needed by the importer.
@@ -116,7 +117,7 @@ type Importer struct {
 	maildirPath string
 	email       string
 	jobs        int
-	sqliteDB    *sql.DB // SQLite database for caching
+	sqliteDB    *sql.DB // SQLite database for caching (nil in non-incremental mode)
 	dbPath      string  // Path to the SQLite database file
 	rdb         resilientDB
 	s3          objectStorage
@@ -144,9 +145,14 @@ type Importer struct {
 
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
-	// Create SQLite database in the maildir path to persist maildir state
+	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
-	logger.Info("Using maildir database", "path", dbPath)
+
+	if options.Incremental {
+		logger.Info("Using maildir database for incremental import", "path", dbPath)
+	} else {
+		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
+	}
 
 	// Open SQLite with proper settings for concurrent access
 	// WAL mode enables concurrent readers and writers
@@ -400,19 +406,32 @@ func (i *Importer) Run() error {
 		}
 	}
 
-	// After scanning, count only NEW (not yet on S3) messages in SQLite database
+	// Count messages based on mode
 	var totalCount, alreadyOnS3 int64
-	countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
-	if countErr != nil {
-		return fmt.Errorf("failed to count messages in database: %w", countErr)
+	if i.options.Incremental {
+		// Incremental mode: count only NEW (not yet on S3) messages in SQLite database
+		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 0").Scan(&totalCount)
+		if countErr != nil {
+			return fmt.Errorf("failed to count messages in database: %w", countErr)
+		}
+
+		// Also count messages already on S3 for logging
+		i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 1").Scan(&alreadyOnS3)
+
+		// Set totalMessages to the actual count in database
+		atomic.StoreInt64(&i.totalMessages, totalCount)
+		logger.Info("Found new messages to import (incremental mode)", "new", totalCount, "already_on_s3", alreadyOnS3)
+	} else {
+		// Non-incremental mode: count all scanned messages in SQLite (but we'll import all)
+		countErr := i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages").Scan(&totalCount)
+		if countErr != nil {
+			return fmt.Errorf("failed to count messages in database: %w", countErr)
+		}
+
+		// Set totalMessages to the actual count in database
+		atomic.StoreInt64(&i.totalMessages, totalCount)
+		logger.Info("Found messages to import (non-incremental mode - reading all)", "total", totalCount)
 	}
-
-	// Also count messages already on S3 for logging
-	i.sqliteDB.QueryRow("SELECT COUNT(*) FROM messages WHERE s3_uploaded = 1").Scan(&alreadyOnS3)
-
-	// Set totalMessages to the actual count in database
-	atomic.StoreInt64(&i.totalMessages, totalCount)
-	logger.Info("Found new messages to import", "new", totalCount, "already_on_s3", alreadyOnS3)
 
 	if i.options.DryRun {
 		logger.Info("DRY RUN: Analyzing what would be imported...")
@@ -696,9 +715,17 @@ func (i *Importer) performDryRun() error {
 		// Don't fail the dry run, as mailboxes might already exist
 	}
 
-	// Query the SQLite database for messages not yet on S3
+	// Query the SQLite database for messages
+	var query string
+	if i.options.Incremental {
+		// Incremental mode: only show messages not yet uploaded
+		query = "SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path"
+	} else {
+		// Non-incremental mode: show all messages
+		query = "SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path"
+	}
 
-	rows, err := i.sqliteDB.Query("SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path")
+	rows, err := i.sqliteDB.Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to query messages from sqlite: %w", err)
 	}
@@ -1117,6 +1144,7 @@ func (i *Importer) scanMaildir() error {
 					continue
 				}
 
+				// Always store in SQLite database for tracking
 				// Try to insert, relying on unique constraints to prevent duplicates
 				// This operation is thread-safe with the "sqlite" driver.
 				_, err = i.sqliteDB.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
@@ -2004,12 +2032,16 @@ func (i *Importer) importMessages() error {
 
 	// Read ALL messages into memory first, then close the cursor
 	// This prevents holding the SQLite connection while processing batches
-	rows, err := i.sqliteDB.Query(`
-		SELECT path, filename, hash, size, mailbox 
-		FROM messages 
-		WHERE s3_uploaded = 0 
-		ORDER BY mailbox, path
-	`)
+	var query string
+	if i.options.Incremental {
+		// Incremental mode: only load messages not yet uploaded
+		query = `SELECT path, filename, hash, size, mailbox FROM messages WHERE s3_uploaded = 0 ORDER BY mailbox, path`
+	} else {
+		// Non-incremental mode: load all messages
+		query = `SELECT path, filename, hash, size, mailbox FROM messages ORDER BY mailbox, path`
+	}
+
+	rows, err := i.sqliteDB.Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to query messages: %w", err)
 	}

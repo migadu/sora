@@ -549,9 +549,9 @@ func TestRelayError_Unwrap(t *testing.T) {
 // TestHTTPRelayHandler_ErrorClassification tests HTTP error classification
 func TestHTTPRelayHandler_ErrorClassification(t *testing.T) {
 	tests := []struct {
-		name           string
-		statusCode     int
-		expectError    bool
+		name            string
+		statusCode      int
+		expectError     bool
 		expectPermanent bool
 	}{
 		{
