@@ -244,6 +244,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		// This fixes the Thunderbird draft replacement issue where clients repeatedly save
 		// drafts with the same Message-ID, causing the old draft to be deleted.
 		// See test: TestIMAP_AppendOperation/Draft_Replacement_-_Same_Message-ID
+		oldCount := s.currentNumMessages.Load()
 		actualCount, _, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(s.ctx, mailbox.ID)
 		if err != nil {
 			s.DebugLog("failed to get message count after append", "error", err)
@@ -253,11 +254,16 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			s.currentNumMessages.Store(uint32(actualCount))
 		}
 
-		if s.mailboxTracker != nil {
+		// Only queue if the count increased
+		// NOTE: QueueNumMessages() only accepts increases - it panics on decreases or equal values
+		if s.mailboxTracker != nil && uint32(actualCount) > oldCount {
 			s.mailboxTracker.QueueNumMessages(uint32(actualCount))
-		} else {
+		} else if s.mailboxTracker == nil {
 			// This would indicate an inconsistent state if a mailbox is selected but has no tracker.
 			s.DebugLog("inconsistent state: mailbox selected but tracker is nil", "mailbox_id", s.selectedMailbox.ID)
+		} else if actualCount > 0 && uint32(actualCount) == oldCount {
+			// Draft replacement case - count didn't change
+			s.DebugLog("message count unchanged after append (draft replacement)", "count", actualCount)
 		}
 	}
 

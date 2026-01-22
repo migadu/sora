@@ -80,12 +80,10 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// First, update message count if it has increased (new messages)
 	// This must be done before processing expunges to ensure sequence numbers are valid
 	currentCount := s.currentNumMessages.Load()
-	messageCountChanged := false
 	if poll.NumMessages > currentCount {
 		s.DebugLog("updating message count", "old_count", currentCount, "new_count", poll.NumMessages)
 		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
 		s.currentNumMessages.Store(poll.NumMessages)
-		messageCountChanged = true
 	}
 
 	// Group updates by sequence number to detect duplicate expunges
@@ -105,7 +103,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 
 		// Validate sequence number is within range
 		currentMessages := s.currentNumMessages.Load()
-		if update.SeqNum > currentMessages {
+		if update.SeqNum == 0 || update.SeqNum > currentMessages {
 			s.DebugLog("expunge sequence number out of range, skipping", "seq", update.SeqNum, "mailbox_messages", currentMessages)
 			continue
 		}
@@ -122,9 +120,12 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// Update message count again if it has decreased (after expunges)
 	finalCount := s.currentNumMessages.Load()
 	if poll.NumMessages < finalCount {
-		s.DebugLog("adjusting message count after expunges", "old_count", finalCount, "new_count", poll.NumMessages)
-		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
-		s.currentNumMessages.Store(poll.NumMessages)
+		s.WarnLog("critical state desync: database has fewer messages than session", "session_count", finalCount, "db_count", poll.NumMessages)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "Session state desynchronized, forcing reconnect",
+		}
 	}
 
 	// Process message flag updates
@@ -134,6 +135,9 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		}
 
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
+		if allFlags == nil {
+			allFlags = []imap.Flag{}
+		}
 		for _, customFlag := range update.CustomFlags {
 			allFlags = append(allFlags, imap.Flag(customFlag))
 		}
@@ -143,20 +147,10 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
 
-	// Check if we have any updates to process before calling sessionTracker.Poll
-	// We have updates if there are database updates OR if the message count changed
-	hasUpdates := len(poll.Updates) > 0 || messageCountChanged
-
 	release() // Release lock before writing to the network
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {
-		return nil
-	}
-
-	// Only call sessionTracker.Poll if we have meaningful updates to send
-	// This prevents sending empty updates that cause panics in the go-imap library
-	if !hasUpdates {
 		return nil
 	}
 
