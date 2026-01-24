@@ -1,0 +1,25 @@
+# Proxy-only configuration (no database required)
+
+[logging]
+format = "text"
+level = "info"
+
+# Database section can be omitted or left with dummy values
+# when running proxy-only with remote_lookup
+[database]
+
+# No S3 needed for proxies
+[s3]
+
+# IMAP Proxy with remote_lookup
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = ":1143"
+remote_addrs = ["backend1.example.com:143"]
+
+[server.remote_lookup]
+enabled = true
+url = "http://auth-api.example.com/lookup?email=$email"
+lookup_local_users = false  # Critical: must be false to skip database
+timeout = "5s"

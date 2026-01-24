@@ -298,10 +298,22 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
+	databaseNeeded := false
 	for _, server := range allServers {
 		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
 			storageServicesNeeded = true
+			databaseNeeded = true
 			break
+		}
+		// Check if proxy servers need database (when lookup_local_users=true)
+		if server.Type == "imap_proxy" || server.Type == "pop3_proxy" || server.Type == "managesieve_proxy" || server.Type == "lmtp_proxy" || server.Type == "user_api_proxy" {
+			if server.RemoteLookup != nil && server.RemoteLookup.ShouldLookupLocalUsers() {
+				databaseNeeded = true
+			}
+		}
+		// Admin API and User API need database for account management
+		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
+			databaseNeeded = true
 		}
 	}
 
@@ -343,19 +355,25 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 	}
 
-	// Initialize the resilient database with runtime failover
-	logger.Info("Connecting to database with resilient failover configuration")
+	// Initialize the resilient database with runtime failover (if needed)
 	var err error
-	deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
-	if err != nil {
-		logger.Info("Failed to initialize resilient database", "error", err)
-		os.Exit(1)
+	if databaseNeeded {
+		logger.Info("Connecting to database with resilient failover configuration")
+		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
+		if err != nil {
+			logger.Info("Failed to initialize resilient database", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		logger.Info("Skipping database initialization - running in proxy-only mode with remote_lookup")
 	}
 
-	// Start the new aggregated metrics and health monitoring for all managed pools
-	deps.resilientDB.StartPoolMetrics(ctx)
-	deps.resilientDB.StartPoolHealthMonitoring(ctx)
-	logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+	// Start database metrics and health monitoring if database is available
+	if deps.resilientDB != nil {
+		deps.resilientDB.StartPoolMetrics(ctx)
+		deps.resilientDB.StartPoolHealthMonitoring(ctx)
+		logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+	}
 
 	// Initialize health monitoring
 	logger.Info("Initializing health monitoring")
@@ -678,9 +696,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	deps.healthIntegration.Start(ctx)
 	logger.Info("Health monitoring started - collecting metrics every 30-60 seconds")
 
-	// Start metrics collector for database statistics
-	deps.metricsCollector = metrics.NewCollector(deps.resilientDB, 60*time.Second)
-	go deps.metricsCollector.Start(ctx)
+	// Start metrics collector for database statistics (if database is available)
+	if deps.resilientDB != nil {
+		deps.metricsCollector = metrics.NewCollector(deps.resilientDB, 60*time.Second)
+		go deps.metricsCollector.Start(ctx)
+	}
 
 	return deps, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/migadu/sora/cluster"
@@ -33,7 +34,9 @@ type Manager struct {
 	autocertMgr    *autocert.Manager
 	tlsConfig      *tls.Config
 	clusterManager *cluster.Manager
-	stopCertSync   chan struct{} // Signal to stop certificate sync worker
+	stopCertSync   chan struct{}            // Signal to stop certificate sync worker
+	rateLimitMap   map[string]time.Time     // Track rate-limited domains and their retry-after times
+	rateLimitMu    sync.RWMutex             // Protect rateLimitMap
 }
 
 // New creates a new TLS manager based on the provided configuration.
@@ -47,6 +50,7 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 		config:         cfg,
 		clusterManager: clusterMgr,
 		stopCertSync:   make(chan struct{}),
+		rateLimitMap:   make(map[string]time.Time),
 	}
 
 	// Log cluster integration status
@@ -233,6 +237,14 @@ func (m *Manager) initLetsEncryptProvider() error {
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
 
+			// Check if this domain is rate-limited
+			if isRateLimited, retryAfter := m.isRateLimited(serverName); isRateLimited {
+				logger.Debug("TLS: Domain is rate-limited, skipping Let's Encrypt request",
+					"domain", serverName, "retry_after", retryAfter)
+				return nil, fmt.Errorf("%w for %s: rate limited until %v",
+					ErrCertificateUnavailable, serverName, retryAfter)
+			}
+
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverName
@@ -251,12 +263,39 @@ func (m *Manager) initLetsEncryptProvider() error {
 
 			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
 			if err != nil {
+				// Check if this is a rate limit error from Let's Encrypt
+				errStr := err.Error()
+				if strings.Contains(errStr, "429") && strings.Contains(errStr, "rateLimited") {
+					// Parse retry-after time from error message
+					// Example: "retry after 2026-01-25 12:42:05 UTC: see https://..."
+					retryAfter := time.Now().Add(24 * time.Hour) // Default: retry after 24 hours
+					if strings.Contains(errStr, "retry after") {
+						// Try to parse the retry time from the error message
+						parts := strings.Split(errStr, "retry after ")
+						if len(parts) > 1 {
+							// Split on ": " to get just the timestamp
+							timeParts := strings.SplitN(parts[1], ": ", 2)
+							if len(timeParts) > 0 {
+								timeStr := strings.TrimSpace(timeParts[0])
+								if parsedTime, parseErr := time.Parse("2006-01-02 15:04:05 MST", timeStr); parseErr == nil {
+									retryAfter = parsedTime
+									logger.Info("TLS: Parsed rate limit retry-after time", "domain", serverName, "retry_after", retryAfter)
+								}
+							}
+						}
+					}
+					m.markRateLimited(serverName, retryAfter)
+				}
+
 				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
 				// This allows the server to continue serving cached certificates for other domains
 				logger.Error("TLS: Failed to get certificate", "server_name", serverName, "error", err)
 				return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 			}
+
+			// Clear rate limit on successful certificate retrieval
+			m.clearRateLimit(serverName)
 
 			if cacheErr == autocert.ErrCacheMiss {
 				logger.Info("TLS: NEW certificate successfully obtained from Let's Encrypt", "domain", serverName)
@@ -275,6 +314,11 @@ func (m *Manager) initLetsEncryptProvider() error {
 		logger.Info("Default domain for SNI-less connections", "domain", defaultDomain)
 	}
 	logger.Info("Certificates will be stored in S3 bucket", "bucket", leCfg.S3.Bucket)
+
+	// Pre-warm certificates from cache into autocert's state
+	// This ensures that existing certificates in S3 are loaded immediately at startup
+	// instead of waiting for the first TLS handshake (which might timeout/fail)
+	m.prewarmCertificates()
 
 	// Start certificate sync worker if configured
 	if leCfg.SyncInterval != "" && leCfg.SyncInterval != "0" {
@@ -362,6 +406,104 @@ func WrapTLSConfigWithDefaultDomain(baseCfg *tls.Config, serverDefaultDomain str
 	}
 
 	return wrapped
+}
+
+// isRateLimited checks if a domain is currently rate-limited by Let's Encrypt
+func (m *Manager) isRateLimited(domain string) (bool, time.Time) {
+	m.rateLimitMu.RLock()
+	defer m.rateLimitMu.RUnlock()
+
+	retryAfter, exists := m.rateLimitMap[domain]
+	if !exists {
+		return false, time.Time{}
+	}
+
+	// Check if the rate limit has expired
+	if time.Now().After(retryAfter) {
+		return false, time.Time{}
+	}
+
+	return true, retryAfter
+}
+
+// markRateLimited records that a domain is rate-limited until the specified time
+func (m *Manager) markRateLimited(domain string, retryAfter time.Time) {
+	m.rateLimitMu.Lock()
+	defer m.rateLimitMu.Unlock()
+
+	m.rateLimitMap[domain] = retryAfter
+	logger.Warn("TLS: Domain marked as rate-limited", "domain", domain, "retry_after", retryAfter)
+}
+
+// clearRateLimit removes a domain from the rate limit map
+func (m *Manager) clearRateLimit(domain string) {
+	m.rateLimitMu.Lock()
+	defer m.rateLimitMu.Unlock()
+
+	delete(m.rateLimitMap, domain)
+}
+
+// prewarmCertificates loads existing certificates from cache into autocert's state
+// This prevents the "certificate exists in S3 but autocert doesn't know about it" problem
+func (m *Manager) prewarmCertificates() {
+	if m.autocertMgr == nil || m.config.LetsEncrypt == nil {
+		return
+	}
+
+	logger.Info("Pre-warming certificates from cache")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	warmed := 0
+	failed := 0
+
+	for _, domain := range m.config.LetsEncrypt.Domains {
+		// Check if certificate exists in cache first
+		// This avoids triggering ACME requests during pre-warming
+		if m.autocertMgr.Cache != nil {
+			_, err := m.autocertMgr.Cache.Get(ctx, domain)
+			if err != nil {
+				// Not in cache, skip pre-warming for this domain
+				logger.Debug("Pre-warm: Certificate not in cache", "domain", domain)
+				failed++
+				continue
+			}
+		}
+
+		// Create a dummy ClientHelloInfo to trigger certificate loading
+		hello := &tls.ClientHelloInfo{
+			ServerName: domain,
+			// Prefer ECDSA (more modern, smaller certs)
+			SignatureSchemes: []tls.SignatureScheme{
+				tls.ECDSAWithP256AndSHA256,
+				tls.ECDSAWithP384AndSHA384,
+			},
+			SupportedCurves: []tls.CurveID{
+				tls.CurveP256,
+				tls.CurveP384,
+			},
+		}
+
+		// Certificate exists in cache, load it into autocert's state
+		_, err := m.autocertMgr.GetCertificate(hello)
+		if err != nil {
+			// Failed to load even though it's in cache
+			logger.Warn("Pre-warm: Failed to load certificate from cache", "domain", domain, "error", err)
+			failed++
+			continue
+		}
+
+		// Successfully loaded certificate from cache into autocert's state
+		logger.Info("Pre-warm: Certificate loaded from cache", "domain", domain)
+		warmed++
+	}
+
+	if warmed > 0 {
+		logger.Info("Certificate pre-warming complete", "loaded", warmed, "failed", failed)
+	} else if failed > 0 {
+		logger.Info("Certificate pre-warming complete - no cached certificates found", "domains_checked", failed)
+	}
 }
 
 // Shutdown gracefully stops the TLS manager and its background workers

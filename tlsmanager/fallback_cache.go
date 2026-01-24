@@ -138,10 +138,17 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 			return nil, autocert.ErrCacheMiss
 		}
 
-		// S3 error (timeout or other error) - mark as unavailable
+		// S3 error (timeout or other error) - mark as unavailable and return cache miss
+		// This allows autocert to continue operating using the local cache.
+		// If a certificate exists in S3 but we can't fetch it due to S3 issues,
+		// autocert will attempt to issue a new one. The local fallback cache will
+		// prevent the server from completely failing during S3 outages.
 		logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable)", "name", name, "error", err)
 		fc.markS3Unavailable()
-		return nil, err
+
+		// Return cache miss instead of the S3 error to prevent blocking TLS handshakes
+		// autocert will handle the cache miss appropriately
+		return nil, autocert.ErrCacheMiss
 	}
 
 	// S3 not available and not in local cache

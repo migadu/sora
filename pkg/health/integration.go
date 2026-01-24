@@ -56,30 +56,33 @@ func (hi *HealthIntegration) GetMonitor() *HealthMonitor {
 }
 
 func (hi *HealthIntegration) registerStandardChecks() {
-	// Database health check
-	dbCheck := &HealthCheck{
-		Name:     "database",
-		Interval: 30 * time.Second,
-		Timeout:  10 * time.Second,
-		Critical: true,
-		Check: func(ctx context.Context) error {
-			// Simple ping to verify database connectivity
-			return hi.database.GetDatabase().WritePool.Ping(ctx)
-		},
-	}
-	hi.monitor.RegisterCheck(dbCheck)
+	// Only register database health checks if database is available
+	if hi.database != nil {
+		// Database health check
+		dbCheck := &HealthCheck{
+			Name:     "database",
+			Interval: 30 * time.Second,
+			Timeout:  10 * time.Second,
+			Critical: true,
+			Check: func(ctx context.Context) error {
+				// Simple ping to verify database connectivity
+				return hi.database.GetDatabase().WritePool.Ping(ctx)
+			},
+		}
+		hi.monitor.RegisterCheck(dbCheck)
 
-	// Database read pool health check
-	dbReadCheck := &HealthCheck{
-		Name:     "database_read_pool",
-		Interval: 30 * time.Second,
-		Timeout:  10 * time.Second,
-		Critical: false,
-		Check: func(ctx context.Context) error {
-			return hi.database.GetDatabase().ReadPool.Ping(ctx)
-		},
+		// Database read pool health check
+		dbReadCheck := &HealthCheck{
+			Name:     "database_read_pool",
+			Interval: 30 * time.Second,
+			Timeout:  10 * time.Second,
+			Critical: false,
+			Check: func(ctx context.Context) error {
+				return hi.database.GetDatabase().ReadPool.Ping(ctx)
+			},
+		}
+		hi.monitor.RegisterCheck(dbReadCheck)
 	}
-	hi.monitor.RegisterCheck(dbReadCheck)
 }
 
 func (hi *HealthIntegration) RegisterS3Check(s3storage *storage.S3Storage) {
@@ -218,6 +221,11 @@ func (hi *HealthIntegration) RegisterRemoteLookupCheck(remotelookupClient Remote
 }
 
 func (hi *HealthIntegration) storeHealthStatus(componentName string, status ComponentStatus) {
+	// Skip storing if database is not available (proxy-only mode)
+	if hi.database == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
