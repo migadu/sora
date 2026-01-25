@@ -813,6 +813,12 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 	// 2. Fallback to main DB to get account ID for affinity
 	s.isRemoteLookupAccount = false
+
+	// Skip database lookup if database is not available (proxy-only mode)
+	if s.server.rdb == nil {
+		return fmt.Errorf("database not available for account lookup in proxy-only mode")
+	}
+
 	// Use configured database query timeout instead of hardcoded value
 	queryTimeout := s.server.rdb.GetQueryTimeout()
 	dbCtx, dbCancel := context.WithTimeout(s.ctx, queryTimeout)

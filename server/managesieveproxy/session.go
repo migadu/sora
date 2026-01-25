@@ -1373,7 +1373,11 @@ func (s *Session) close() {
 // registerConnection registers the connection in the database.
 func (s *Session) registerConnection() error {
 	// Use configured database query timeout for connection tracking (database INSERT)
-	queryTimeout := s.server.rdb.GetQueryTimeout()
+	// Default to 30 seconds if database is not available (proxy-only mode)
+	queryTimeout := 30 * time.Second
+	if s.server.rdb != nil {
+		queryTimeout = s.server.rdb.GetQueryTimeout()
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer cancel()
 

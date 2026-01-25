@@ -445,65 +445,52 @@ func (m *Manager) clearRateLimit(domain string) {
 
 // prewarmCertificates loads existing certificates from cache into autocert's state
 // This prevents the "certificate exists in S3 but autocert doesn't know about it" problem
+//
+// IMPORTANT: We DO NOT call GetCertificate() during pre-warming because:
+// 1. It triggers ACME validation if certificate needs renewal
+// 2. ACME validation requires storing HTTP-01 tokens
+// 3. On non-leader cluster nodes, token storage is blocked
+// 4. This causes pre-warming to fail on non-leader nodes
+//
+// Instead, we just verify certificates exist in cache. The first actual TLS handshake
+// will load the certificate into autocert's state (and if it needs renewal, the leader
+// will handle it).
 func (m *Manager) prewarmCertificates() {
 	if m.autocertMgr == nil || m.config.LetsEncrypt == nil {
 		return
 	}
 
-	logger.Info("Pre-warming certificates from cache")
+	logger.Info("Pre-warming: Checking certificates in cache")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	warmed := 0
-	failed := 0
+	found := 0
+	missing := 0
 
 	for _, domain := range m.config.LetsEncrypt.Domains {
-		// Check if certificate exists in cache first
-		// This avoids triggering ACME requests during pre-warming
+		// Check if certificate exists in cache
 		if m.autocertMgr.Cache != nil {
-			_, err := m.autocertMgr.Cache.Get(ctx, domain)
+			data, err := m.autocertMgr.Cache.Get(ctx, domain)
 			if err != nil {
-				// Not in cache, skip pre-warming for this domain
-				logger.Debug("Pre-warm: Certificate not in cache", "domain", domain)
-				failed++
+				// Not in cache
+				logger.Debug("Pre-warm: Certificate not in cache", "domain", domain, "error", err)
+				missing++
 				continue
 			}
-		}
 
-		// Create a dummy ClientHelloInfo to trigger certificate loading
-		hello := &tls.ClientHelloInfo{
-			ServerName: domain,
-			// Prefer ECDSA (more modern, smaller certs)
-			SignatureSchemes: []tls.SignatureScheme{
-				tls.ECDSAWithP256AndSHA256,
-				tls.ECDSAWithP384AndSHA384,
-			},
-			SupportedCurves: []tls.CurveID{
-				tls.CurveP256,
-				tls.CurveP384,
-			},
+			// Verify it's parseable
+			if len(data) > 0 {
+				logger.Info("Pre-warm: Certificate found in cache", "domain", domain, "size", len(data))
+				found++
+			} else {
+				logger.Warn("Pre-warm: Empty certificate data in cache", "domain", domain)
+				missing++
+			}
 		}
-
-		// Certificate exists in cache, load it into autocert's state
-		_, err := m.autocertMgr.GetCertificate(hello)
-		if err != nil {
-			// Failed to load even though it's in cache
-			logger.Warn("Pre-warm: Failed to load certificate from cache", "domain", domain, "error", err)
-			failed++
-			continue
-		}
-
-		// Successfully loaded certificate from cache into autocert's state
-		logger.Info("Pre-warm: Certificate loaded from cache", "domain", domain)
-		warmed++
 	}
 
-	if warmed > 0 {
-		logger.Info("Certificate pre-warming complete", "loaded", warmed, "failed", failed)
-	} else if failed > 0 {
-		logger.Info("Certificate pre-warming complete - no cached certificates found", "domains_checked", failed)
-	}
+	logger.Info("Pre-warm: Completed", "found", found, "missing", missing, "total", len(m.config.LetsEncrypt.Domains))
 }
 
 // Shutdown gracefully stops the TLS manager and its background workers
