@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"database/sql"
@@ -46,6 +47,10 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		WHERE mb.id = $1
 	`, mailboxID).Scan(&currentModSeq, &messageCount)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Mailbox was deleted while session was active
+			return nil, ErrMailboxNotFound
+		}
 		return nil, fmt.Errorf("failed to get mailbox stats: %w", err)
 	}
 

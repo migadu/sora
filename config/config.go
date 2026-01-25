@@ -513,15 +513,15 @@ type RemoteLookupConfig struct {
 	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	LookupLocalUsers         bool   `toml:"lookup_local_users"`          // Check local DB when remote returns 404/3xx (for split user scenarios)
-	UserNotFoundResponse     string `toml:"user_not_found_response"`     // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
-	RemoteTLS                bool   `toml:"remote_tls"`                  // Use TLS for backend connections
-	RemoteTLSUseStartTLS     bool   `toml:"remote_tls_use_starttls"`     // Use STARTTLS for backend connections (LMTP/ManageSieve only)
-	RemoteTLSVerify          *bool  `toml:"remote_tls_verify"`           // Verify backend TLS certificate
-	RemotePort               any    `toml:"remote_port"`                 // Default port for routed backends if not in address
-	RemoteUseProxyProtocol   bool   `toml:"remote_use_proxy_protocol"`   // Use PROXY protocol for backend connections
-	RemoteUseIDCommand       bool   `toml:"remote_use_id_command"`       // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT         bool   `toml:"remote_use_xclient"`          // Use XCLIENT command (POP3/LMTP)
+	LookupLocalUsers       bool   `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
+	UserNotFoundResponse   string `toml:"user_not_found_response"`   // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
+	RemoteTLS              bool   `toml:"remote_tls"`                // Use TLS for backend connections
+	RemoteTLSUseStartTLS   bool   `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (LMTP/ManageSieve only)
+	RemoteTLSVerify        *bool  `toml:"remote_tls_verify"`         // Verify backend TLS certificate
+	RemotePort             any    `toml:"remote_port"`               // Default port for routed backends if not in address
+	RemoteUseProxyProtocol bool   `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseIDCommand     bool   `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
+	RemoteUseXCLIENT       bool   `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
 
 	// Circuit breaker configuration
 	CircuitBreaker *RemoteLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration

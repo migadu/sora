@@ -33,6 +33,7 @@ type AdminConfig struct {
 	Uploader                  config.UploaderConfig        `toml:"uploader"`
 	Cleanup                   config.CleanupConfig         `toml:"cleanup"`
 	SharedMailboxes           config.SharedMailboxesConfig `toml:"shared_mailboxes"`
+	TLS                       config.TLSConfig             `toml:"tls"` // TLS configuration for accessing Let's Encrypt S3 bucket
 	DynamicServers            []config.ServerConfig        // Populated from full config
 	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
@@ -78,6 +79,7 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.Uploader = fullCfg.Uploader
 	cfg.Cleanup = fullCfg.Cleanup
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
+	cfg.TLS = fullCfg.TLS
 	cfg.DynamicServers = fullCfg.DynamicServers
 	cfg.HTTPAPIAddr = fullCfg.AdminCLI.Addr
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
@@ -200,6 +202,8 @@ func main() {
 		handleRelayCommand(ctx)
 	case "verify":
 		handleVerifyCommand(ctx)
+	case "tls":
+		handleTLSCommand(ctx)
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)
 		printUsage()
@@ -238,6 +242,7 @@ Commands:
   verify        Verify data integrity (S3 storage, etc.)
   import        Import maildir data
   export        Export maildir data
+  tls           TLS certificate management (list certificates from S3 and cache)
   version       Show version information
   help          Show this help message
 

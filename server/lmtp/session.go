@@ -321,13 +321,16 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
 	bodyStructure := &bodyStructureVal
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageContent)
+	var plaintextBody *string
+	plaintextBodyResult, err := helpers.ExtractPlaintextBody(messageContent)
 	if err != nil {
 		s.WarnLog("failed to extract plaintext body", "error", err)
 		// The plaintext body is needed only for indexing, so we can ignore the error
 		// Use empty string as fallback
-		emptyBody := ""
-		plaintextBody = &emptyBody
+		emptyStr := new(string)
+		plaintextBody = emptyStr
+	} else {
+		plaintextBody = plaintextBodyResult
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)

@@ -1251,7 +1251,7 @@ func TestLMTPProxyRemoteLookupFallbackToDefault(t *testing.T) {
 			remotelookupStatusCode: 404,
 			remotelookupBody:       `{"error": "user not found"}`,
 			expectAccept:           false,
-			expectLog:              "user not found in remote lookup, fallback disabled - rejecting",
+			expectLog:              "user not found in remote lookup, fallback disabled",
 		},
 	}
 

@@ -267,4 +267,94 @@ func TestPollMailbox(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(ctx))
 	})
+
+	// --- Scenario 6: Deleted Mailbox ---
+	t.Run("DeletedMailbox", func(t *testing.T) {
+		// Create a temporary mailbox for this test
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		err = db.CreateMailbox(ctx, tx, accountID, "TempBox", nil)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		tempMailbox, err := db.GetMailboxByName(ctx, accountID, "TempBox")
+		require.NoError(t, err)
+		tempMailboxID := tempMailbox.ID
+
+		// Add a message to get a modseq
+		tx, err = db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		insertTestMessageWithUIDForPoll(t, db, ctx, tx, accountID, tempMailboxID, "TempBox", 999, nil)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		modSeqBefore := getHighestModSeq(t, db, ctx, tempMailboxID)
+
+		// Delete all messages first (cascade delete)
+		tx, err = db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "DELETE FROM messages WHERE mailbox_id = $1", tempMailboxID)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		// Delete the mailbox
+		tx, err = db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		err = db.DeleteMailbox(ctx, tx, tempMailboxID, accountID)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		// Try to poll the deleted mailbox
+		poll, err := db.PollMailbox(ctx, tempMailboxID, modSeqBefore)
+		assert.ErrorIs(t, err, ErrMailboxNotFound, "PollMailbox should return ErrMailboxNotFound for deleted mailbox")
+		assert.Nil(t, poll)
+	})
+
+	// --- Scenario 7: External Message Deletion (State Desync) ---
+	t.Run("ExternalDeletion", func(t *testing.T) {
+		// Simulate a session that thinks it has messages, but they were deleted externally
+		// (e.g., via another connection or direct database manipulation)
+
+		// Add messages
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		insertTestMessageWithUIDForPoll(t, db, ctx, tx, accountID, mailboxID, "INBOX", 200, nil)
+		insertTestMessageWithUIDForPoll(t, db, ctx, tx, accountID, mailboxID, "INBOX", 201, nil)
+		insertTestMessageWithUIDForPoll(t, db, ctx, tx, accountID, mailboxID, "INBOX", 202, nil)
+		require.NoError(t, tx.Commit(ctx))
+
+		modSeqBefore := getHighestModSeq(t, db, ctx, mailboxID)
+
+		// Externally delete messages (bypassing normal expunge, simulating direct DB manipulation)
+		tx, err = db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "DELETE FROM messages WHERE mailbox_id = $1 AND uid IN (200, 201)", mailboxID)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		// Poll should detect that database has fewer messages (1) than expected (3)
+		// but has no expunge updates to explain it
+		poll, err := db.PollMailbox(ctx, mailboxID, modSeqBefore)
+		require.NoError(t, err)
+
+		// The poll should return with NumMessages = 1 (only UID 202 remains)
+		// but no expunge updates because we deleted directly
+		assert.Equal(t, uint32(1), poll.NumMessages, "Database should have 1 message")
+
+		// Check for expunge updates - there should be NONE because we bypassed normal expunge
+		expungeCount := 0
+		for _, update := range poll.Updates {
+			if update.IsExpunge {
+				expungeCount++
+			}
+		}
+		assert.Equal(t, 0, expungeCount, "Should have no expunge updates for external deletion")
+
+		// Cleanup
+		tx, err = db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "DELETE FROM messages WHERE mailbox_id = $1", mailboxID)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+	})
 }

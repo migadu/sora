@@ -1,6 +1,7 @@
 package tlsmanager
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,6 +11,8 @@ import (
 	"math/big"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // generateTestCertificate creates a self-signed certificate for testing
@@ -194,4 +197,87 @@ func TestExtractFallbackCache(t *testing.T) {
 	if result != nil {
 		t.Errorf("Expected nil for S3Cache, got %v", result)
 	}
+}
+
+func TestSyncCertificateFromS3_SyncsRSAVariant(t *testing.T) {
+	// This test verifies that both ECDSA and RSA certificates are synced from S3
+	// to local cache, ensuring the fix for the missing RSA sync bug.
+
+	// Create temporary directories for S3 and local caches
+	s3Dir := t.TempDir()
+	localDir := t.TempDir()
+
+	// Use autocert.DirCache for both S3 (mock) and local
+	s3Cache := autocert.DirCache(s3Dir)
+	localCache := autocert.DirCache(localDir)
+
+	// Create fallback cache
+	fallbackCache := &FallbackCache{
+		primary:     s3Cache,
+		fallback:    localCache,
+		fallbackDir: localDir,
+	}
+
+	// Generate test certificates
+	now := time.Now()
+	ecdsaCert, err := generateTestCertificate(now, now.Add(90*24*time.Hour), 1001)
+	if err != nil {
+		t.Fatalf("Failed to generate ECDSA certificate: %v", err)
+	}
+
+	rsaCert, err := generateTestCertificate(now, now.Add(90*24*time.Hour), 1002)
+	if err != nil {
+		t.Fatalf("Failed to generate RSA certificate: %v", err)
+	}
+
+	// Store certificates in S3 (primary cache)
+	domain := "test.example.com"
+	ctx := context.Background()
+
+	if err := s3Cache.Put(ctx, domain, ecdsaCert); err != nil {
+		t.Fatalf("Failed to store ECDSA cert in S3: %v", err)
+	}
+
+	rsaDomain := domain + "+rsa"
+	if err := s3Cache.Put(ctx, rsaDomain, rsaCert); err != nil {
+		t.Fatalf("Failed to store RSA cert in S3: %v", err)
+	}
+
+	// Create a real autocert.Manager with the fallback cache
+	acmeMgr := &autocert.Manager{
+		Cache:      fallbackCache,
+		HostPolicy: autocert.HostWhitelist(domain),
+	}
+
+	// Create a minimal manager
+	mgr := &Manager{
+		autocertMgr: acmeMgr,
+	}
+
+	// Sync ECDSA certificate
+	if err := mgr.syncCertificateFromS3(ctx, domain); err != nil {
+		t.Fatalf("Failed to sync ECDSA certificate: %v", err)
+	}
+
+	// Sync RSA certificate
+	if err := mgr.syncCertificateFromS3(ctx, rsaDomain); err != nil {
+		t.Fatalf("Failed to sync RSA certificate: %v", err)
+	}
+
+	// Verify both certificates are in local cache
+	localECDSA, err := localCache.Get(ctx, domain)
+	if err != nil {
+		t.Errorf("ECDSA certificate not found in local cache: %v", err)
+	} else if len(localECDSA) == 0 {
+		t.Error("ECDSA certificate in local cache is empty")
+	}
+
+	localRSA, err := localCache.Get(ctx, rsaDomain)
+	if err != nil {
+		t.Errorf("RSA certificate not found in local cache: %v", err)
+	} else if len(localRSA) == 0 {
+		t.Error("RSA certificate in local cache is empty")
+	}
+
+	t.Logf("Successfully synced both ECDSA and RSA certificates to local cache")
 }

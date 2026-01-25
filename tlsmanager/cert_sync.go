@@ -214,8 +214,14 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 				for _, domain := range m.config.LetsEncrypt.Domains {
+					// Sync ECDSA certificate
 					if err := m.syncCertificateFromS3(ctx, domain); err != nil {
 						logger.Debug("CertSync: Sync failed", "domain", domain, "error", err)
+					}
+					// Sync RSA certificate
+					rsaDomain := domain + "+rsa"
+					if err := m.syncCertificateFromS3(ctx, rsaDomain); err != nil {
+						logger.Debug("CertSync: Sync failed", "domain", rsaDomain, "error", err)
 					}
 				}
 

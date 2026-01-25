@@ -34,9 +34,9 @@ type Manager struct {
 	autocertMgr    *autocert.Manager
 	tlsConfig      *tls.Config
 	clusterManager *cluster.Manager
-	stopCertSync   chan struct{}            // Signal to stop certificate sync worker
-	rateLimitMap   map[string]time.Time     // Track rate-limited domains and their retry-after times
-	rateLimitMu    sync.RWMutex             // Protect rateLimitMap
+	stopCertSync   chan struct{}        // Signal to stop certificate sync worker
+	rateLimitMap   map[string]time.Time // Track rate-limited domains and their retry-after times
+	rateLimitMu    sync.RWMutex         // Protect rateLimitMap
 }
 
 // New creates a new TLS manager based on the provided configuration.
