@@ -8,7 +8,6 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/aclservice"
 )
 
@@ -77,7 +76,7 @@ func handleACLGrant(ctx context.Context) {
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -138,7 +137,7 @@ func handleACLRevoke(ctx context.Context) {
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -186,7 +185,7 @@ func handleACLList(ctx context.Context) {
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)

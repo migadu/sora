@@ -15,7 +15,6 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 func handleAccountsCommand(ctx context.Context) {
@@ -532,8 +531,8 @@ Use 'sora-admin accounts <subcommand> --help' for detailed help.
 
 func createAccount(ctx context.Context, cfg AdminConfig, email, password, passwordHash string, isPrimary bool, hashType string) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -585,8 +584,8 @@ func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credenti
 		}
 	}
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -608,8 +607,8 @@ func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credenti
 
 func listAccounts(ctx context.Context, cfg AdminConfig) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -656,8 +655,8 @@ func listAccounts(ctx context.Context, cfg AdminConfig) error {
 
 func showAccount(ctx context.Context, cfg AdminConfig, email string, jsonOutput bool) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -712,8 +711,8 @@ func showAccount(ctx context.Context, cfg AdminConfig, email string, jsonOutput 
 
 func updateAccount(ctx context.Context, cfg AdminConfig, email, password, passwordHash string, makePrimary bool, hashType string) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -737,8 +736,8 @@ func updateAccount(ctx context.Context, cfg AdminConfig, email, password, passwo
 
 func deleteAccount(ctx context.Context, cfg AdminConfig, email string, purge bool) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -768,8 +767,8 @@ func deleteAccount(ctx context.Context, cfg AdminConfig, email string, purge boo
 
 func restoreAccount(ctx context.Context, cfg AdminConfig, email string) error {
 
-	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	// Connect to resilient database (skip read replicas for CLI)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

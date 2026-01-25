@@ -13,7 +13,6 @@ import (
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 func handleCredentialsCommand(ctx context.Context) {
@@ -291,7 +290,7 @@ Use 'sora-admin credentials <subcommand> --help' for detailed help.
 func addCredential(ctx context.Context, cfg AdminConfig, primaryIdentity, email, password, passwordHash string, makePrimary bool, hashType string) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -324,7 +323,7 @@ func addCredential(ctx context.Context, cfg AdminConfig, primaryIdentity, email,
 func listCredentials(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -357,7 +356,7 @@ func listCredentials(ctx context.Context, cfg AdminConfig, email string) error {
 func showCredential(ctx context.Context, cfg AdminConfig, email string, jsonOutput bool) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -410,7 +409,7 @@ func showCredential(ctx context.Context, cfg AdminConfig, email string, jsonOutp
 func deleteCredential(ctx context.Context, cfg AdminConfig, email string) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

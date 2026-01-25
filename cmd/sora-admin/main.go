@@ -13,6 +13,7 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 // Version information, injected at build time.
@@ -39,6 +40,12 @@ type AdminConfig struct {
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
 	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
 	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
+}
+
+// newAdminDatabase creates a resilient database for admin CLI operations.
+// It skips read replicas since CLI tools are short-lived and don't benefit from read/write separation.
+func newAdminDatabase(ctx context.Context, cfg *config.DatabaseConfig) (*resilient.ResilientDatabase, error) {
+	return resilient.NewResilientDatabaseWithOptions(ctx, cfg, false, false, true)
 }
 
 // createHTTPAPIClient creates an HTTP client for calling the HTTP API

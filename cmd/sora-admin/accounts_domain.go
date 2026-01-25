@@ -16,7 +16,7 @@ import (
 // It's resumable - accounts already purged are skipped
 func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

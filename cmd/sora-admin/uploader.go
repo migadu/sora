@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 func handleUploaderCommand(ctx context.Context) {
@@ -99,7 +98,7 @@ Use 'sora-admin uploader <subcommand> --help' for detailed help.
 
 func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, failedLimit int) error {
 	// Connect to database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

@@ -203,7 +203,7 @@ func showCacheStats(ctx context.Context, cfg AdminConfig) error {
 	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -258,7 +258,7 @@ func purgeCacheWithConfirmation(ctx context.Context, cfg AdminConfig, autoConfir
 	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
 	// Connect to minimal database instance for cache initialization
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -290,7 +290,7 @@ func purgeCacheWithConfirmation(ctx context.Context, cfg AdminConfig, autoConfir
 
 func showCacheMetrics(ctx context.Context, cfg AdminConfig, instanceID string, sinceDuration time.Duration, showHistory bool, limit int, jsonOutput bool) error {
 	// Connect to database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

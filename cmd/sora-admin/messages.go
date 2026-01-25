@@ -13,7 +13,6 @@ import (
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 func handleMessagesCommand(ctx context.Context) {
@@ -247,7 +246,7 @@ Use 'sora-admin messages <subcommand> --help' for detailed help.
 func listDeletedMessages(ctx context.Context, cfg AdminConfig, email string, mailbox *string, since *time.Time, until *time.Time, limit int) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}
@@ -324,7 +323,7 @@ func listDeletedMessages(ctx context.Context, cfg AdminConfig, email string, mai
 func restoreMessages(ctx context.Context, cfg AdminConfig, email string, mailbox *string, messageIDs []int64, since *time.Time, until *time.Time, confirm bool) error {
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize resilient database: %w", err)
 	}

@@ -129,7 +129,7 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 	startTime := time.Now()
 
 	// Initialize database
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}

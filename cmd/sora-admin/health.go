@@ -81,7 +81,7 @@ Examples:
 	}
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}

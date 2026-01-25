@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
 )
 
@@ -174,7 +173,7 @@ Examples:
 	}
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -265,7 +264,7 @@ func handleImportS3(ctx context.Context) {
 	}
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}
@@ -434,7 +433,7 @@ Examples:
 	}
 
 	// Connect to resilient database
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		logger.Fatalf("Failed to initialize resilient database: %v", err)
 	}

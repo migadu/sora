@@ -160,6 +160,17 @@ type ResilientDatabase struct {
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
+	return NewResilientDatabaseWithOptions(ctx, config, enableHealthCheck, runMigrations, false)
+}
+
+// NewResilientDatabaseWithOptions creates a new resilient database with additional options.
+// Parameters:
+//   - ctx: Context for initialization
+//   - config: Database configuration
+//   - enableHealthCheck: Enable background health checking
+//   - runMigrations: Run database migrations on startup
+//   - skipReadReplicas: Skip read replica initialization (use write pool for reads, useful for CLI tools)
+func NewResilientDatabaseWithOptions(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool, skipReadReplicas bool) (*ResilientDatabase, error) {
 	// Create circuit breakers
 	querySettings := circuitbreaker.DefaultSettings("database_query")
 	querySettings.MaxRequests = 5
@@ -235,7 +246,7 @@ func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, en
 	}
 
 	// Create failover manager
-	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations)
+	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations, skipReadReplicas)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create failover manager: %w", err)
 	}
@@ -665,7 +676,7 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 // --- Runtime Failover Implementation ---
 
 // newRuntimeFailoverManager creates a new runtime failover manager with separate read/write pools
-func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfig, runMigrations bool) (*RuntimeFailoverManager, error) {
+func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfig, runMigrations bool, skipReadReplicas bool) (*RuntimeFailoverManager, error) {
 	manager := &RuntimeFailoverManager{
 		writePools:      make([]*DatabasePool, 0),
 		readPools:       make([]*DatabasePool, 0),
@@ -708,7 +719,8 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 	}
 
 	// Create database pools for all read hosts (in parallel for faster startup)
-	if config.Read != nil && len(config.Read.Hosts) > 0 {
+	// Skip if skipReadReplicas is true (e.g., for CLI tools)
+	if !skipReadReplicas && config.Read != nil && len(config.Read.Hosts) > 0 {
 		logger.Info("Attempting to connect to read replicas", "component", "RESILIENT-FAILOVER", "count", len(config.Read.Hosts))
 
 		// Use channels to collect results from parallel connection attempts
@@ -772,8 +784,10 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 
 	// Fallback: if no read pools, use write pools for reads
 	if len(manager.readPools) == 0 && len(manager.writePools) > 0 {
-		if config.Read != nil && len(config.Read.Hosts) > 0 {
+		if !skipReadReplicas && config.Read != nil && len(config.Read.Hosts) > 0 {
 			logger.Warn("All read replicas unreachable at startup, falling back to write pools, will automatically reconnect when they recover", "component", "RESILIENT-FAILOVER")
+		} else if skipReadReplicas {
+			logger.Info("Read replicas disabled for CLI mode, using write pool for all operations", "component", "RESILIENT-FAILOVER")
 		} else {
 			logger.Info("No read pools configured, using write pools for read operations", "component", "RESILIENT-FAILOVER")
 		}

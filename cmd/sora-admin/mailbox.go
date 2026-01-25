@@ -83,7 +83,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -143,7 +143,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -237,7 +237,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -347,7 +347,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -415,7 +415,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
@@ -476,7 +476,7 @@ Examples:
 	}
 
 	// Create database connection
-	rdb, err := resilient.NewResilientDatabase(ctx, &globalConfig.Database, false, false)
+	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
