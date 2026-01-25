@@ -110,6 +110,10 @@ func main() {
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
+	// Clean up default database config if user explicitly set empty sections
+	// This allows proxy-only mode without database
+	cleanupDatabaseDefaults(&cfg)
+
 	// Initialize logging with zap logger
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
@@ -232,6 +236,30 @@ func main() {
 	}
 }
 
+// cleanupDatabaseDefaults clears default database config if the TOML explicitly has empty sections
+// This allows proxy-only deployments without database
+func cleanupDatabaseDefaults(cfg *config.Config) {
+	// If database.write section exists but has default "localhost", clear it
+	// This happens when user has [database.write] but no hosts specified
+	if cfg.Database.Write != nil {
+		if len(cfg.Database.Write.Hosts) == 1 && cfg.Database.Write.Hosts[0] == "localhost" &&
+			cfg.Database.Write.User == "postgres" && cfg.Database.Write.Name == "sora_mail_db" {
+			// This looks like unmodified defaults - user probably wants no database
+			logger.Debug("Detected default database.write config - clearing for proxy-only mode")
+			cfg.Database.Write = nil
+		}
+	}
+
+	// Same for read config
+	if cfg.Database.Read != nil {
+		if len(cfg.Database.Read.Hosts) == 1 && cfg.Database.Read.Hosts[0] == "localhost" &&
+			cfg.Database.Read.User == "postgres" && cfg.Database.Read.Name == "sora_mail_db" {
+			logger.Debug("Detected default database.read config - clearing for proxy-only mode")
+			cfg.Database.Read = nil
+		}
+	}
+}
+
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
@@ -299,6 +327,12 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
 	databaseNeeded := false
+
+	// Check if database is actually configured
+	// Database is configured if either write or read has valid hosts
+	databaseConfigured := (cfg.Database.Write != nil && len(cfg.Database.Write.Hosts) > 0) ||
+		(cfg.Database.Read != nil && len(cfg.Database.Read.Hosts) > 0)
+
 	for _, server := range allServers {
 		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
 			storageServicesNeeded = true
@@ -315,6 +349,19 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
 			databaseNeeded = true
 		}
+	}
+
+	// If database is needed but not configured, that's an error
+	if databaseNeeded && !databaseConfigured {
+		errorHandler.ValidationError("database configuration", fmt.Errorf("database is required for configured servers but not configured in [database.write] or [database.read]"))
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	// Override: if database is not configured at all, force databaseNeeded to false
+	// This allows proxy-only mode without database config
+	if !databaseConfigured {
+		databaseNeeded = false
+		logger.Info("Database not configured - forcing proxy-only mode (lookup_local_users will be treated as false)")
 	}
 
 	deps := &serverDependencies{
