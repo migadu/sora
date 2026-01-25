@@ -261,6 +261,14 @@ func (s *Session) handleConnection() {
 					s.sendResponse("550 5.1.1 User unknown")
 					continue
 				}
+				// Check if user not found with tempfail response
+				if errors.Is(err, server.ErrUserNotFoundTempFail) {
+					s.InfoLog("tempfail recipient - user not found (tempfail configured)",
+						"recipient", to,
+						"response", "450 4.1.1")
+					s.sendResponse("450 4.1.1 User unknown (temporary failure)")
+					continue
+				}
 				// Unknown/unexpected error - use temporary failure to be safe
 				// If this is actually a permanent issue, it will keep failing on retry
 				// If it's transient (e.g., database timeout), sender can retry
@@ -793,10 +801,17 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 				// Fallthrough to main DB
 			} else {
-				s.InfoLog("user not found in remote lookup, fallback disabled - rejecting",
+				// User not found and no database fallback - use configured response
+				response := "reject" // default
+				if s.server.remotelookupConfig != nil {
+					response = s.server.remotelookupConfig.GetUserNotFoundResponse()
+				}
+
+				s.InfoLog("user not found in remote lookup, fallback disabled",
 					"username", s.username,
-					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_rejected").Inc()
+					"duration", fmt.Sprintf("%.3fs", duration.Seconds()),
+					"response", response)
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_"+response).Inc()
 
 				// Cache negative result to protect remotelookup
 				s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
@@ -804,6 +819,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 					IsNegative: true,
 				})
 
+				// Return appropriate error based on configuration
+				if response == "tempfail" {
+					return server.ErrUserNotFoundTempFail
+				}
 				return server.ErrUserNotFound
 			}
 		}

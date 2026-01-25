@@ -20,8 +20,11 @@ var (
 	// ErrAuthServiceUnavailable indicates that an authentication service (e.g., remotelookup) is temporarily unavailable
 	ErrAuthServiceUnavailable = errors.New("authentication service temporarily unavailable, please try again later")
 
-	// ErrUserNotFound indicates that the user was not found (permanent failure)
+	// ErrUserNotFound indicates that the user was not found (permanent failure - 550)
 	ErrUserNotFound = errors.New("user not found")
+
+	// ErrUserNotFoundTempFail indicates user not found but with temp failure response (450)
+	ErrUserNotFoundTempFail = errors.New("user not found (temporary failure)")
 )
 
 // Backend connection/authentication error sentinels (for proxy servers)

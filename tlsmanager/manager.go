@@ -237,29 +237,32 @@ func (m *Manager) initLetsEncryptProvider() error {
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 			}
 
-			// Check if this domain is rate-limited
-			if isRateLimited, retryAfter := m.isRateLimited(serverName); isRateLimited {
-				logger.Debug("TLS: Domain is rate-limited, skipping Let's Encrypt request",
-					"domain", serverName, "retry_after", retryAfter)
-				return nil, fmt.Errorf("%w for %s: rate limited until %v",
-					ErrCertificateUnavailable, serverName, retryAfter)
+			// Check if certificate exists in cache BEFORE checking rate limits
+			// Rationale: Even if we're rate-limited, we should serve existing certificates from cache/S3
+			// Rate limiting only applies to NEW certificate requests
+			ctx := context.Background()
+			_, cacheErr := m.autocertMgr.Cache.Get(ctx, serverName)
+
+			// If certificate exists in cache, proceed to serve it (skip rate limit check)
+			if cacheErr == nil {
+				logger.Debug("TLS: Serving certificate from cache", "domain", serverName)
+			} else if cacheErr == autocert.ErrCacheMiss {
+				// Certificate not in cache - check if we're rate-limited before requesting new one
+				if isRateLimited, retryAfter := m.isRateLimited(serverName); isRateLimited {
+					logger.Warn("TLS: Domain is rate-limited, cannot request new certificate",
+						"domain", serverName, "retry_after", retryAfter)
+					return nil, fmt.Errorf("%w for %s: rate limited until %v",
+						ErrCertificateUnavailable, serverName, retryAfter)
+				}
+				logger.Info("TLS: Certificate not in cache - requesting NEW certificate from Let's Encrypt", "domain", serverName)
+			} else {
+				// Cache error (not a miss) - log but try to proceed anyway
+				logger.Info("TLS: Cache check failed - attempting certificate retrieval", "domain", serverName, "error", cacheErr)
 			}
 
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverName
-
-			// Check if certificate exists in cache first (to log whether we're serving from cache or requesting new)
-			ctx := context.Background()
-			_, cacheErr := m.autocertMgr.Cache.Get(ctx, serverName)
-
-			if cacheErr == autocert.ErrCacheMiss {
-				logger.Info("TLS: Certificate not in cache - requesting NEW certificate from Let's Encrypt", "domain", serverName)
-			} else if cacheErr != nil {
-				logger.Info("TLS: Cache check failed - attempting certificate retrieval", "domain", serverName, "error", cacheErr)
-			} else {
-				logger.Debug("TLS: Serving certificate from cache", "domain", serverName)
-			}
 
 			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
 			if err != nil {

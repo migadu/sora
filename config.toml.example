@@ -1186,6 +1186,24 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #   - lookup_local_users=true  → Authentication rejected ✗
                                       #   - lookup_local_users=false → Authentication rejected ✗
                                       #
+# user_not_found_response = "reject"  # LMTP ONLY: Response when user not found and lookup_local_users=false
+                                      # Controls SMTP response code when remote_lookup returns 404 (user not found)
+                                      # and lookup_local_users=false (no database fallback)
+                                      #
+                                      # OPTIONS:
+                                      #   "reject"   (default) → 550 5.1.1 User unknown (permanent failure)
+                                      #                         Sender will NOT retry, message bounces immediately
+                                      #   "tempfail"           → 450 4.1.1 User unknown (temporary failure)
+                                      #                         Sender will retry later (useful for provisioning delays)
+                                      #
+                                      # WHEN TO USE:
+                                      #   - "reject"   → Production with complete user database
+                                      #   - "tempfail" → Users being migrated/provisioned, remote_lookup may be incomplete
+                                      #
+                                      # NOTE: This setting ONLY affects LMTP proxy behavior for unknown recipients.
+                                      #       IMAP/POP3/ManageSieve proxies always reject unknown users (no retry semantics).
+                                      #       This setting is IGNORED when lookup_local_users=true (database fallback enabled).
+                                      #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
                                       # NOTE: Only supported for LMTP and ManageSieve proxies.

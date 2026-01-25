@@ -109,7 +109,21 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 	}
 
 	// STEP 2: Try S3 (SLOW - network call) with timeout
-	if fc.isS3Available() {
+	// We try S3 even if marked unavailable when cert is not in local cache.
+	// Rationale:
+	// - S3 may have been marked unavailable due to a transient error on a different cert
+	// - The cert we're looking for might actually be in S3
+	// - Better to try and fail than to trigger unnecessary ACME requests
+	// - The timeout (5s) prevents this from blocking too long
+	shouldTryS3 := fc.isS3Available()
+	if !shouldTryS3 {
+		// S3 is marked unavailable, but we haven't found cert in local cache
+		// Try S3 anyway - it might have recovered, or the cert might be there
+		logger.Debug("FallbackCache: S3 marked unavailable, but trying anyway (cert not in local cache)", "name", name)
+		shouldTryS3 = true
+	}
+
+	if shouldTryS3 {
 		logger.Debug("FallbackCache: Fetching certificate from S3", "name", name)
 
 		// Create a timeout context for S3 operations (5 seconds max for TLS handshake path)
@@ -121,14 +135,17 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 		if err == nil {
 			logger.Info("FallbackCache: Certificate found in S3 - syncing to local cache", "name", name)
 			fc.markS3Available()
-			// Store in local cache for future fast access
-			go func() {
-				if putErr := fc.fallback.Put(context.Background(), name, data); putErr != nil {
-					logger.Warn("FallbackCache: Failed to sync certificate to local cache", "error", putErr)
-				} else {
-					logger.Debug("FallbackCache: Certificate synced to local cache", "name", name)
-				}
-			}()
+
+			// Store in local cache SYNCHRONOUSLY to ensure it's available for subsequent Get() calls
+			// This is critical because autocert may call Get() multiple times for the same cert
+			// If we sync async, the second call might happen before the local cache is populated
+			if putErr := fc.fallback.Put(context.Background(), name, data); putErr != nil {
+				logger.Warn("FallbackCache: Failed to sync certificate to local cache", "name", name, "error", putErr)
+				// Don't fail the request - we have the cert from S3
+			} else {
+				logger.Debug("FallbackCache: Certificate synced to local cache", "name", name)
+			}
+
 			return data, nil
 		}
 
@@ -151,8 +168,8 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, autocert.ErrCacheMiss
 	}
 
-	// S3 not available and not in local cache
-	logger.Debug("FallbackCache: Certificate not found (S3 unavailable, not in local cache)", "name", name)
+	// Shouldn't reach here, but just in case
+	logger.Debug("FallbackCache: Certificate not found (exhausted all options)", "name", name)
 	return nil, autocert.ErrCacheMiss
 }
 
