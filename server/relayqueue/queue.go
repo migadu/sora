@@ -357,6 +357,54 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 	return nil
 }
 
+// Release moves a message from processing back to pending without incrementing attempts.
+// This is useful when a message cannot be processed due to transient conditions like
+// circuit breaker being open, and should be retried on the next worker cycle without penalty.
+func (q *DiskQueue) Release(messageID string) error {
+	start := time.Now()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	metadataPath := filepath.Join(q.processingDir, messageID+".json")
+	messagePath := filepath.Join(q.processingDir, messageID+".msg")
+
+	// Read current metadata
+	var metadata QueuedMessage
+	if err := q.readMetadata(metadataPath, &metadata); err != nil {
+		metrics.RelayQueueOperations.WithLabelValues("release", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("release").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	// Don't increment attempts or add error - just move back to pending
+	// Set NextRetry to immediate - the worker interval will naturally rate-limit retries
+	metadata.NextRetry = time.Now()
+
+	// Move back to pending directory
+	pendingMetadataPath := filepath.Join(q.pendingDir, messageID+".json")
+	pendingMessagePath := filepath.Join(q.pendingDir, messageID+".msg")
+
+	if err := q.writeFileAtomic(pendingMetadataPath, metadata); err != nil {
+		metrics.RelayQueueOperations.WithLabelValues("release", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("release").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to write pending metadata: %w", err)
+	}
+
+	if err := os.Rename(messagePath, pendingMessagePath); err != nil {
+		// Try to clean up metadata
+		os.Remove(pendingMetadataPath)
+		metrics.RelayQueueOperations.WithLabelValues("release", "error").Inc()
+		metrics.RelayQueueOperationDuration.WithLabelValues("release").Observe(time.Since(start).Seconds())
+		return fmt.Errorf("failed to move message to pending: %w", err)
+	}
+
+	// Remove from processing
+	os.Remove(metadataPath)
+	metrics.RelayQueueOperations.WithLabelValues("release", "success").Inc()
+	metrics.RelayQueueOperationDuration.WithLabelValues("release").Observe(time.Since(start).Seconds())
+	return nil
+}
+
 // GetStats returns queue statistics
 func (q *DiskQueue) GetStats() (pending, processing, failed int, err error) {
 	q.mu.Lock()

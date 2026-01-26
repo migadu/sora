@@ -2,6 +2,7 @@ package relayqueue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type RelayQueue interface {
 	MarkSuccess(messageID string) error
 	MarkFailure(messageID string, errorMsg string) error
 	MarkPermanentFailure(messageID string, errorMsg string) error
+	Release(messageID string) error
 	GetStats() (pending, processing, failed int, err error)
 }
 
@@ -292,6 +294,21 @@ func (w *Worker) processMessage(ctx context.Context, msg *QueuedMessage, message
 	duration := time.Since(startTime)
 
 	if err != nil {
+		// Check for circuit breaker errors first - these should not increment failure count
+		// The circuit breaker is protecting the relay, so we should release the message
+		// back to the queue to be retried naturally on the next worker cycle
+		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) || errors.Is(err, circuitbreaker.ErrTooManyRequests) {
+			logger.Warn("Relay: Circuit breaker preventing delivery, releasing back to queue",
+				"id", msg.ID, "error", err, "duration", duration)
+			metrics.RelayDelivery.WithLabelValues(msg.Type, "circuit_breaker_blocked").Inc()
+
+			// Release back to queue without incrementing attempts
+			if releaseErr := w.queue.Release(msg.ID); releaseErr != nil {
+				logger.Error("Relay: CRITICAL - Failed to release message back to queue", "id", msg.ID, "error", releaseErr)
+			}
+			return
+		}
+
 		// Classify the error to determine if it's permanent (5xx) or temporary (4xx/network)
 		isPermanent := delivery.IsPermanentError(err)
 

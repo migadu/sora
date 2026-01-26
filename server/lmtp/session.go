@@ -329,6 +329,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		// Use empty string as fallback
 		emptyStr := new(string)
 		plaintextBody = emptyStr
+	} else if plaintextBodyResult == nil {
+		// No plaintext or HTML body found in the message
+		// Use empty string as fallback
+		emptyStr := new(string)
+		plaintextBody = emptyStr
 	} else {
 		plaintextBody = plaintextBodyResult
 	}

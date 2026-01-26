@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/circuitbreaker"
 )
 
 // mockRelayHandler implements delivery.RelayHandler for testing
@@ -660,5 +662,219 @@ func BenchmarkWorkerProcessing(b *testing.B) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// mockCircuitBreakerHandler implements both RelayHandler and CircuitBreakerProvider
+// Used to test circuit breaker error handling
+type mockCircuitBreakerHandler struct {
+	mu               sync.Mutex
+	messages         []mockMessage
+	callCount        int
+	returnCBError    bool  // Return circuit breaker errors
+	cbErrorType      error // Type of CB error to return (ErrCircuitBreakerOpen or ErrTooManyRequests)
+	cbErrorUntilCall int   // Return CB error until this call count
+}
+
+func (m *mockCircuitBreakerHandler) SendToExternalRelay(from, to string, message []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.callCount++
+
+	// Return circuit breaker error if configured
+	if m.returnCBError && (m.cbErrorUntilCall == 0 || m.callCount <= m.cbErrorUntilCall) {
+		return m.cbErrorType
+	}
+
+	// Otherwise deliver successfully
+	m.messages = append(m.messages, mockMessage{
+		From:    from,
+		To:      to,
+		Message: message,
+	})
+	return nil
+}
+
+func (m *mockCircuitBreakerHandler) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
+	// Return nil - we're just testing error handling, not actual circuit breaker logic
+	return nil
+}
+
+func (m *mockCircuitBreakerHandler) getMessageCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.messages)
+}
+
+func (m *mockCircuitBreakerHandler) getCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.callCount
+}
+
+// TestWorkerCircuitBreakerErrorHandling tests that circuit breaker errors don't increment attempt count
+func TestWorkerCircuitBreakerErrorHandling(t *testing.T) {
+	tests := []struct {
+		name        string
+		errorType   error
+		description string
+	}{
+		{
+			name:        "ErrCircuitBreakerOpen",
+			errorType:   circuitbreaker.ErrCircuitBreakerOpen,
+			description: "Circuit breaker OPEN state should release messages without incrementing attempts",
+		},
+		{
+			name:        "ErrTooManyRequests",
+			errorType:   circuitbreaker.ErrTooManyRequests,
+			description: "Circuit breaker HALF-OPEN with too many requests should release messages",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+			if err != nil {
+				t.Fatalf("Failed to create queue: %v", err)
+			}
+
+			handler := &mockCircuitBreakerHandler{
+				returnCBError:    true,
+				cbErrorType:      tt.errorType,
+				cbErrorUntilCall: 2, // First 2 calls return CB error, then succeed
+			}
+
+			worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, nil)
+			ctx := context.Background()
+
+			// Enqueue a message
+			err = queue.Enqueue("sender@example.com", "recipient@example.com", "redirect", []byte("Test message"))
+			if err != nil {
+				t.Fatalf("Enqueue failed: %v", err)
+			}
+
+			// Start worker
+			err = worker.Start(ctx)
+			if err != nil {
+				t.Fatalf("Failed to start worker: %v", err)
+			}
+			defer worker.Stop()
+
+			// Wait for multiple processing cycles
+			// First cycle: CB error -> message released back to queue
+			// Second cycle: CB error again -> message released back to queue
+			// Third cycle: Success
+			time.Sleep(200 * time.Millisecond)
+
+			// Verify message was eventually delivered
+			if handler.getMessageCount() != 1 {
+				t.Errorf("Expected 1 delivered message, got %d", handler.getMessageCount())
+			}
+
+			// Verify handler was called 3 times (2 CB errors + 1 success)
+			if handler.getCallCount() != 3 {
+				t.Errorf("Expected 3 handler calls (2 CB errors + 1 success), got %d", handler.getCallCount())
+			}
+
+			// Get the message metadata to verify attempts were not incremented
+			msg, _, err := queue.AcquireNext()
+			if err != nil {
+				t.Fatalf("Failed to check message: %v", err)
+			}
+
+			// Message should be delivered (moved to success), so AcquireNext returns nil
+			if msg != nil {
+				t.Errorf("Expected message to be delivered, but found in queue with %d attempts", msg.Attempts)
+			}
+
+			// Verify queue is empty
+			pending, processing, failed, err := queue.GetStats()
+			if err != nil {
+				t.Fatalf("Failed to get stats: %v", err)
+			}
+
+			if pending != 0 || processing != 0 || failed != 0 {
+				t.Errorf("Expected empty queue, got pending=%d processing=%d failed=%d", pending, processing, failed)
+			}
+		})
+	}
+}
+
+// TestWorkerCircuitBreakerNoInfiniteLoop tests that messages don't get stuck in infinite loop
+// This test simulates the production issue where circuit breaker was stuck in HALF-OPEN state
+func TestWorkerCircuitBreakerNoInfiniteLoop(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, []time.Duration{
+		100 * time.Millisecond, // Short backoff for faster test
+	})
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	handler := &mockCircuitBreakerHandler{
+		returnCBError:    true,
+		cbErrorType:      circuitbreaker.ErrTooManyRequests,
+		cbErrorUntilCall: 5, // Return CB error for first 5 calls
+	}
+
+	// Use higher concurrency than circuit breaker allows (simulating production scenario)
+	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 10, nil) // 10 concurrent workers
+	ctx := context.Background()
+
+	// Enqueue multiple messages (more than circuit breaker's MaxRequests)
+	for i := 0; i < 8; i++ {
+		err = queue.Enqueue(
+			fmt.Sprintf("sender%d@example.com", i),
+			fmt.Sprintf("recipient%d@example.com", i),
+			"redirect",
+			[]byte(fmt.Sprintf("Test message %d", i)),
+		)
+		if err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+	}
+
+	// Start worker
+	err = worker.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start worker: %v", err)
+	}
+	defer worker.Stop()
+
+	// Wait for processing (with timeout to prevent infinite wait)
+	timeout := time.After(2 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			pending, processing, failed, _ := queue.GetStats()
+			t.Fatalf("Timeout waiting for messages to process. pending=%d processing=%d failed=%d delivered=%d",
+				pending, processing, failed, handler.getMessageCount())
+		case <-ticker.C:
+			if handler.getMessageCount() == 8 {
+				// All messages delivered successfully
+				goto success
+			}
+		}
+	}
+
+success:
+	t.Logf("All 8 messages delivered after %d total handler calls", handler.getCallCount())
+
+	// Verify queue is empty
+	pending, processing, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("Failed to get stats: %v", err)
+	}
+
+	if pending != 0 || processing != 0 || failed != 0 {
+		t.Errorf("Expected empty queue, got pending=%d processing=%d failed=%d", pending, processing, failed)
+	}
+
+	// Verify we had more calls than messages (due to CB errors and retries)
+	if handler.getCallCount() <= 8 {
+		t.Errorf("Expected more than 8 handler calls due to CB errors, got %d", handler.getCallCount())
 	}
 }
