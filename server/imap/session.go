@@ -306,17 +306,17 @@ func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
 			}
 		}
 
-		// Convert resolved client-view sequence numbers to server-view sequence numbers.
-		// s.sessionTracker.DecodeSeqNum handles mapping based on this session's
-		// view of expunges. It returns 0 if the client-view number is invalid
-		// (e.g., too high, or refers to an expunged message in this session's view).
-		start := s.sessionTracker.DecodeSeqNum(actualStart)
-		stop := s.sessionTracker.DecodeSeqNum(actualStop)
+		// Use the sequence numbers directly without decoding.
+		// In our database-authoritative design, the database maintains canonical sequence
+		// numbers via triggers, and client sequence numbers should match database sequences.
+		// We don't use DecodeSeqNum because:
+		// 1. Database triggers immediately renumber sequences after expunge
+		// 2. Clients receive expunge notifications to stay in sync
+		// 3. DecodeSeqNum would double-adjust for expunges already reflected in the database
+		start := actualStart
+		stop := actualStop
 
-		// If actualStart was a specific non-zero number (not '*') but decodes to 0,
-		// it means that specific sequence number is invalid from the server's perspective
-		// for this session (e.g., message 100 requested, but only 50 exist or 100 was expunged).
-		// In such a case, this part of the range is invalid.
+		// Validate the range is non-zero and within bounds
 		if start == 0 && seqRange.Start != 0 {
 			continue
 		}

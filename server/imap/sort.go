@@ -41,7 +41,8 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 		if numKind == imapserver.NumKindUID {
 			nums = append(nums, uint32(msg.UID))
 		} else {
-			nums = append(nums, sessionTrackerSnapshot.EncodeSeqNum(msg.Seq))
+			// Use database sequence number directly (no encoding needed)
+			nums = append(nums, msg.Seq)
 		}
 	}
 

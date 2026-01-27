@@ -212,12 +212,12 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		s.DebugLog("failed to acquire second read lock within timeout")
 		return nil // Continue without sending responses since we already updated the flags
 	}
-	currentSessionTracker := s.sessionTracker // Get the current session tracker
 	release()
 
-	if !sanitizedStoreFlags.Silent && currentSessionTracker != nil {
+	if !sanitizedStoreFlags.Silent {
 		for _, modified := range modifiedMessages {
-			m := w.CreateMessage(currentSessionTracker.EncodeSeqNum(modified.seq))
+			// Use database sequence number directly (no encoding needed)
+			m := w.CreateMessage(modified.seq)
 
 			m.WriteFlags(modified.flags)
 			m.WriteUID(modified.uid)

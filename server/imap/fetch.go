@@ -169,12 +169,18 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 // writeMessageFetchData handles writing all FETCH data items for a single message.
 func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, sessionTracker *imapserver.SessionTracker) error {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
-	encodedSeqNum := sessionTracker.EncodeSeqNum(msg.Seq)
 
-	if encodedSeqNum == 0 {
-		// The sequence number from the database doesn't map to a valid client sequence number
-		// This can happen when the mailbox has been modified by another session
-		s.DebugLog("skipping message with unmappable sequence number", "uid", msg.UID, "seq", msg.Seq)
+	// Use the sequence number directly from the database.
+	// The message_sequences table is maintained by triggers and reflects the current state.
+	// We don't use EncodeSeqNum here because:
+	// 1. The database immediately renumbers sequences when messages are expunged (via triggers)
+	// 2. EncodeSeqNum is designed for in-memory servers that track deltas from an initial state
+	// 3. Using EncodeSeqNum on database sequence numbers causes off-by-one errors
+	seqNum := msg.Seq
+
+	if seqNum == 0 {
+		// Sequence number should never be 0 for valid messages
+		s.DebugLog("skipping message with invalid sequence number", "uid", msg.UID, "seq", msg.Seq)
 		return nil
 	}
 
@@ -196,15 +202,15 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 
-	m := w.CreateMessage(encodedSeqNum)
+	m := w.CreateMessage(seqNum)
 	if m == nil {
 		// This indicates an issue with the imapserver library or FetchWriter.
-		return fmt.Errorf("imapserver: FetchWriter.CreateMessage returned nil for seq %d (UID %d)", encodedSeqNum, msg.UID)
+		return fmt.Errorf("imapserver: FetchWriter.CreateMessage returned nil for seq %d (UID %d)", seqNum, msg.UID)
 	}
 	// Ensure m.Close() is called for this message, even if errors occur mid-processing.
 	defer func() {
 		if closeErr := m.Close(); closeErr != nil {
-			s.DebugLog("error closing FetchResponseWriter", "uid", msg.UID, "seq", encodedSeqNum, "error", closeErr)
+			s.DebugLog("error closing FetchResponseWriter", "uid", msg.UID, "seq", seqNum, "error", closeErr)
 		}
 	}()
 

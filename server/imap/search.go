@@ -24,7 +24,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// First safely read and decode session state
 	var selectedMailboxID int64
 	var currentNumMessages uint32
-	var sessionTrackerSnapshot *imapserver.SessionTracker
 
 	// If the session is closing, don't try to search.
 	if s.ctx.Err() != nil {
@@ -54,7 +53,6 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 	selectedMailboxID = s.selectedMailbox.ID
 	currentNumMessages = s.currentNumMessages.Load()
-	sessionTrackerSnapshot = s.sessionTracker
 	release() // Release read lock
 
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
@@ -142,12 +140,9 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 						// MIN is the smallest UID - last element in DESC order
 						searchData.Min = uint32(messages[len(messages)-1].UID)
 					} else {
-						// For sequence number search, use the encoded sequence number from last element
-						if sessionTrackerSnapshot != nil {
-							searchData.Min = sessionTrackerSnapshot.EncodeSeqNum(messages[len(messages)-1].Seq)
-						} else {
-							searchData.Min = messages[len(messages)-1].Seq
-						}
+						// For sequence number search, use the database sequence number directly
+						// (see fetch.go for explanation of why we don't use EncodeSeqNum)
+						searchData.Min = messages[len(messages)-1].Seq
 					}
 				}
 				if options.ReturnMax {
@@ -155,26 +150,17 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 						// MAX is the largest UID - first element in DESC order
 						searchData.Max = uint32(messages[0].UID)
 					} else {
-						// For sequence number search, use the encoded sequence number from first element
-						if sessionTrackerSnapshot != nil {
-							searchData.Max = sessionTrackerSnapshot.EncodeSeqNum(messages[0].Seq)
-						} else {
-							searchData.Max = messages[0].Seq
-						}
+						// For sequence number search, use the database sequence number directly
+						// (see fetch.go for explanation of why we don't use EncodeSeqNum)
+						searchData.Max = messages[0].Seq
 					}
 				}
 
 				// Populate ALL with actual results
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
-					// Use our snapshot of sessionTracker which is thread-safe
-					if sessionTrackerSnapshot != nil {
-						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
-						seqNums.AddNum(encodedSeq)
-					} else {
-						// Fallback to just using the sequence number if session tracker isn't available
-						seqNums.AddNum(msg.Seq)
-					}
+					// Use database sequence numbers directly (no encoding needed)
+					seqNums.AddNum(msg.Seq)
 				}
 			}
 
@@ -205,12 +191,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 				var seqNums imap.SeqSet
 				for _, msg := range messages {
 					uids.AddNum(msg.UID)
-					if sessionTrackerSnapshot != nil {
-						encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
-						seqNums.AddNum(encodedSeq)
-					} else {
-						seqNums.AddNum(msg.Seq)
-					}
+					// Use database sequence numbers directly (no encoding needed)
+					seqNums.AddNum(msg.Seq)
 				}
 				if numKind == imapserver.NumKindUID {
 					searchData.All = uids
@@ -233,12 +215,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 			var seqNums imap.SeqSet
 			for _, msg := range messages {
 				uids.AddNum(msg.UID)
-				if sessionTrackerSnapshot != nil {
-					encodedSeq := sessionTrackerSnapshot.EncodeSeqNum(msg.Seq)
-					seqNums.AddNum(encodedSeq)
-				} else {
-					seqNums.AddNum(msg.Seq)
-				}
+				// Use database sequence numbers directly (no encoding needed)
+				seqNums.AddNum(msg.Seq)
 			}
 
 			if numKind == imapserver.NumKindUID {

@@ -24,7 +24,6 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		}
 	}
 	mailboxID := s.selectedMailbox.ID
-	sessionTrackerSnapshot := s.sessionTracker
 	AccountID := s.AccountID()
 	release()
 
@@ -116,15 +115,13 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		return messagesToExpunge[i].seq > messagesToExpunge[j].seq
 	})
 
-	// Send notifications using snapshot
+	// Send notifications using database sequence numbers directly
 	for _, m := range messagesToExpunge {
-		if sessionTrackerSnapshot != nil {
-			sessionSeqNum := sessionTrackerSnapshot.EncodeSeqNum(m.seq)
-			if sessionSeqNum > 0 {
-				if err := w.WriteExpunge(sessionSeqNum); err != nil {
-					s.DebugLog("error writing expunge", "session_seq", sessionSeqNum, "uid", m.uid, "db_seq", m.seq, "error", err)
-					return s.internalError("failed to write expunge notification: %v", err)
-				}
+		// Use database sequence number directly (no encoding needed)
+		if m.seq > 0 {
+			if err := w.WriteExpunge(m.seq); err != nil {
+				s.DebugLog("error writing expunge", "seq", m.seq, "uid", m.uid, "error", err)
+				return s.internalError("failed to write expunge notification: %v", err)
 			}
 		}
 	}
