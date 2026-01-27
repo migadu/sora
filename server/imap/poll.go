@@ -164,11 +164,11 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		// Count actual expunge updates processed (not skipped)
 		processedExpunges := 0
 		for _, update := range poll.Updates {
-			if update.IsExpunge && !expungedSeqNums[update.SeqNum] {
-				// This was in Updates but got skipped - already counted in skippedExpunges
-			} else if update.IsExpunge {
+			if update.IsExpunge && expungedSeqNums[update.SeqNum] {
+				// This expunge was processed (marked in expungedSeqNums map)
 				processedExpunges++
 			}
+			// Note: Skipped expunges (!expungedSeqNums[update.SeqNum]) are already counted in skippedExpunges
 		}
 
 		// Determine if the mismatch can be safely reconciled
@@ -185,6 +185,18 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 			// Safe to sync as long as difference is small (< 10 messages)
 			canReconcile = true
 			reconcileReason = "missed_old_expunges"
+		} else if processedExpunges == 0 && finalCount > poll.NumMessages {
+			// Large diff with no expunges in this poll's modseq window.
+			// This can happen when:
+			// 1. Background cleaner hard-deleted old expunged messages (outside modseq window)
+			// 2. Bulk APPEND operations happened, then bulk hard-deletes occurred
+			// 3. Multiple sessions expunging with session missing the notifications
+			// Since the database is authoritative and we processed no expunges in this poll,
+			// it's safe to sync down to the database count.
+			s.WarnLog("large message count mismatch with no recent expunges, syncing to database",
+				"session_count", finalCount, "db_count", poll.NumMessages, "diff", diff)
+			canReconcile = true
+			reconcileReason = "hard_deletes_outside_window"
 		}
 
 		if canReconcile {
