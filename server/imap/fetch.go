@@ -20,6 +20,53 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
+// safeExtractBodySection wraps imapserver.ExtractBodySection with panic recovery.
+// If parsing fails (e.g., malformed MIME), returns an error instead of crashing.
+func safeExtractBodySection(r io.Reader, section *imap.FetchItemBodySection) (result []byte, err error) {
+	// Capture panics from the MIME parser
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic during body section extraction: %v", rec)
+		}
+	}()
+
+	// ExtractBodySection internally parses the message, which can panic on malformed MIME
+	result = imapserver.ExtractBodySection(r, section)
+
+	// If extraction returns empty for BODY[] (full message), it likely means parsing failed
+	// due to malformed MIME. Return an error so the fallback message is used.
+	if len(result) == 0 && section.Specifier == imap.PartSpecifierNone {
+		return nil, fmt.Errorf("body section extraction returned empty - likely malformed MIME")
+	}
+
+	return result, nil
+}
+
+// safeExtractBinarySection wraps imapserver.ExtractBinarySection with panic recovery.
+func safeExtractBinarySection(r io.Reader, section *imap.FetchItemBinarySection) (result []byte, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic during binary section extraction: %v", rec)
+		}
+	}()
+
+	result = imapserver.ExtractBinarySection(r, section)
+	return result, nil
+}
+
+// safeExtractBinarySectionSize wraps imapserver.ExtractBinarySectionSize with panic recovery.
+func safeExtractBinarySectionSize(r io.Reader, section *imap.FetchItemBinarySectionSize) (size uint32, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic during binary section size extraction: %v", rec)
+			size = 0
+		}
+	}()
+
+	size = imapserver.ExtractBinarySectionSize(r, section)
+	return size, nil
+}
+
 const crlf = "\r\n"
 
 func extractPartial(b []byte, partial *imap.SectionPartial) []byte {
@@ -348,7 +395,14 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bo
 	for _, section := range options.BinarySection {
 		var buf []byte
 		if *bodyData != nil { // Only extract if bodyData was successfully loaded
-			buf = imapserver.ExtractBinarySection(bytes.NewReader(*bodyData), section)
+			extracted, extractErr := safeExtractBinarySection(bytes.NewReader(*bodyData), section)
+			if extractErr != nil {
+				s.WarnLog("failed to extract binary section from corrupted message", "uid", msg.UID, "error", extractErr)
+				// Return empty for corrupted messages
+				buf = []byte{}
+			} else {
+				buf = extracted
+			}
 		}
 		wc := w.WriteBinarySection(section, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
@@ -371,8 +425,13 @@ func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter,
 	for _, section := range options.BinarySectionSize {
 		var n uint32
 		if *bodyData != nil { // Only extract if bodyData was successfully loaded
-			n = imapserver.ExtractBinarySectionSize(bytes.NewReader(*bodyData), section)
-
+			size, extractErr := safeExtractBinarySectionSize(bytes.NewReader(*bodyData), section)
+			if extractErr != nil {
+				s.WarnLog("failed to extract binary section size from corrupted message", "uid", msg.UID, "error", extractErr)
+				n = 0
+			} else {
+				n = size
+			}
 		}
 		w.WriteBinarySectionSize(section, n)
 	}
@@ -458,7 +517,15 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 			}
 
 			if *bodyData != nil { // Only extract if bodyData was successfully loaded
-				sectionContent = imapserver.ExtractBodySection(bytes.NewReader(*bodyData), section) // section is *FetchItemBodySection
+				// Use safe wrapper to handle malformed MIME gracefully
+				extracted, extractErr := safeExtractBodySection(bytes.NewReader(*bodyData), section)
+				if extractErr != nil {
+					s.WarnLog("failed to extract body section from corrupted message", "uid", msg.UID, "error", extractErr)
+					// Return error message instead of failing completely
+					sectionContent = []byte(fmt.Sprintf("[Message UID %d: MIME parsing failed: %v]", msg.UID, extractErr))
+				} else {
+					sectionContent = extracted
+				}
 			} else {
 				s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
 				// sectionContent remains nil, will be set to []byte{} below

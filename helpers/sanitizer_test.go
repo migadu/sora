@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
@@ -137,5 +138,83 @@ func TestSanitizeFlags_PreservesOrder(t *testing.T) {
 			t.Errorf("Order not preserved at index %d: expected %q, got %q",
 				i, expected[i], flag)
 		}
+	}
+}
+
+func TestSanitizeUTF8(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Valid UTF-8 string",
+			input:    "Hello, World!",
+			expected: "Hello, World!",
+		},
+		{
+			name:     "UTF-8 with emoji",
+			input:    "Hello 👋 World 🌍",
+			expected: "Hello 👋 World 🌍",
+		},
+		{
+			name:     "Empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "String with NULL byte at start",
+			input:    "\x00Hello",
+			expected: "Hello",
+		},
+		{
+			name:     "String with NULL byte in middle",
+			input:    "Hello\x00World",
+			expected: "HelloWorld",
+		},
+		{
+			name:     "String with NULL byte at end",
+			input:    "Hello\x00",
+			expected: "Hello",
+		},
+		{
+			name:     "String with multiple NULL bytes",
+			input:    "Hello\x00\x00World\x00",
+			expected: "HelloWorld",
+		},
+		{
+			name:     "String with only NULL bytes",
+			input:    "\x00\x00\x00",
+			expected: "",
+		},
+		{
+			name:     "String with invalid UTF-8 sequences",
+			input:    "Hello\xFFWorld",
+			expected: "HelloWorld",
+		},
+		{
+			name:     "String with NULL bytes and invalid UTF-8",
+			input:    "Hello\x00\xFFWorld\x00",
+			expected: "HelloWorld",
+		},
+		{
+			name:     "Real-world case: message with NULL bytes",
+			input:    "Subject: Test\x00\nFrom: sender@example.com\x00",
+			expected: "Subject: Test\nFrom: sender@example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := SanitizeUTF8(tt.input)
+			if result != tt.expected {
+				t.Errorf("Expected %q, got %q", tt.expected, result)
+			}
+
+			// Verify result contains no NULL bytes
+			if strings.ContainsRune(result, '\x00') {
+				t.Errorf("Result still contains NULL bytes: %q", result)
+			}
+		})
 	}
 }

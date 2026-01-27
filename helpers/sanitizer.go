@@ -7,18 +7,31 @@ import (
 	"github.com/emersion/go-imap/v2"
 )
 
+// SanitizeUTF8 removes invalid UTF-8 sequences and NULL bytes from a string.
+// PostgreSQL's text type does not allow NULL bytes (0x00) even though they are
+// valid UTF-8 characters. This function ensures the string is safe to store in
+// PostgreSQL text columns.
 func SanitizeUTF8(s string) string {
-	if utf8.ValidString(s) {
+	// Quick check: if string is valid UTF-8 and has no NULL bytes, return as-is
+	if utf8.ValidString(s) && !strings.ContainsRune(s, '\x00') {
 		return s
 	}
+
 	buf := make([]rune, 0, len(s))
 	for i, r := range s {
+		// Skip NULL bytes (0x00) - PostgreSQL text columns don't allow them
+		if r == '\x00' {
+			continue
+		}
+
+		// Skip invalid UTF-8 sequences
 		if r == utf8.RuneError {
 			_, size := utf8.DecodeRuneInString(s[i:])
 			if size == 1 {
 				continue // skip invalid byte
 			}
 		}
+
 		buf = append(buf, r)
 	}
 	return string(buf)
