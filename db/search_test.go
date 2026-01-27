@@ -337,6 +337,83 @@ func TestNeedsComplexQuery(t *testing.T) {
 			orderByClause:  "ORDER BY seqnum ASC",
 			expectsComplex: true,
 		},
+		{
+			name: "OR with body search (nested)",
+			criteria: &imap.SearchCriteria{
+				Or: [][2]imap.SearchCriteria{
+					{
+						{Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "test"}}},
+						{Body: []string{"important"}},
+					},
+				},
+			},
+			orderByClause:  "",
+			expectsComplex: true,
+		},
+		{
+			name: "OR with text search (nested)",
+			criteria: &imap.SearchCriteria{
+				Or: [][2]imap.SearchCriteria{
+					{
+						{Header: []imap.SearchCriteriaHeaderField{{Key: "From", Value: "sender@example.com"}}},
+						{Text: []string{"meeting"}},
+					},
+				},
+			},
+			orderByClause:  "",
+			expectsComplex: true,
+		},
+		{
+			name: "NOT with body search",
+			criteria: &imap.SearchCriteria{
+				Not: []imap.SearchCriteria{
+					{Body: []string{"spam"}},
+				},
+			},
+			orderByClause:  "",
+			expectsComplex: true,
+		},
+		{
+			name: "deeply nested OR with body search",
+			criteria: &imap.SearchCriteria{
+				Or: [][2]imap.SearchCriteria{
+					{
+						{Header: []imap.SearchCriteriaHeaderField{{Key: "To", Value: "a@example.com"}}},
+						{Or: [][2]imap.SearchCriteria{
+							{
+								{Header: []imap.SearchCriteriaHeaderField{{Key: "Cc", Value: "b@example.com"}}},
+								{Body: []string{"urgent"}},
+							},
+						}},
+					},
+				},
+			},
+			orderByClause:  "",
+			expectsComplex: true,
+		},
+		{
+			name: "complex production-like query",
+			criteria: &imap.SearchCriteria{
+				Or: [][2]imap.SearchCriteria{
+					{
+						{Header: []imap.SearchCriteriaHeaderField{{Key: "To", Value: "user@example.com"}}},
+						{Or: [][2]imap.SearchCriteria{
+							{
+								{Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "report"}}},
+								{Or: [][2]imap.SearchCriteria{
+									{
+										{Header: []imap.SearchCriteriaHeaderField{{Key: "From", Value: "sender@example.com"}}},
+										{Body: []string{"quarterly"}},
+									},
+								}},
+							},
+						}},
+					},
+				},
+			},
+			orderByClause:  "",
+			expectsComplex: true,
+		},
 	}
 
 	for _, tt := range tests {

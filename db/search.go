@@ -108,19 +108,23 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 	}
 
 	// Body full-text search
+	// Note: text_body_tsv is in message_contents table, which is only available in complex query path
 	for _, bodyCriteria := range criteria.Body {
 		param := nextParam()
 		args[param] = bodyCriteria
 		// Handle case where FTS data may be cleaned up (text_body_tsv is NULL)
 		// This ensures search still works but returns no results for cleaned messages
+		// Note: This column is in message_contents table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf("text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)", param))
 	}
 	// Text search - searches both headers and body
+	// Note: text_body_tsv is in message_contents table, which is only available in complex query path
 	for _, textCriteria := range criteria.Text {
 		param := nextParam()
 		args[param] = textCriteria
 		// Search in both headers and body text using full-text search
 		// Note: headers_tsv column may not exist in current schema, so search only body for now
+		// Note: This column is in message_contents table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf(
 			"(text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s))",
 			param))
@@ -362,6 +366,18 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 	// Need complex query for sequence number searches (requires seqnum calculation)
 	for _, seqSet := range criteria.SeqNum {
 		if len(seqSet) > 0 {
+			return true
+		}
+	}
+
+	// Check nested criteria for Body/Text (in OR and NOT clauses)
+	for _, notCriteria := range criteria.Not {
+		if db.needsComplexQuery(&notCriteria, orderByClause) {
+			return true
+		}
+	}
+	for _, orPair := range criteria.Or {
+		if db.needsComplexQuery(&orPair[0], orderByClause) || db.needsComplexQuery(&orPair[1], orderByClause) {
 			return true
 		}
 	}
