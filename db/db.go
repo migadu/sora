@@ -133,9 +133,6 @@ type Database struct {
 func (db *Database) Close() {
 	// Release the advisory lock first, while the connection is still valid.
 	if db.lockConn != nil {
-		// Ensure we always release the connection, even if the unlock query fails
-		defer db.lockConn.Release()
-
 		// We use a background context with a timeout because the main application
 		// context might have been cancelled during shutdown.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -164,6 +161,12 @@ func (db *Database) Close() {
 		} else {
 			log.Println("Database: connection already closed, advisory lock auto-released.")
 		}
+
+		// IMPORTANT: Release the connection back to the pool BEFORE closing the pool.
+		// If we use defer, this won't happen until the function exits, causing WritePool.Close()
+		// to hang waiting for this connection to be released.
+		db.lockConn.Release()
+		db.lockConn = nil
 	}
 
 	// Now, close the connection pools.
