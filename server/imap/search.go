@@ -12,8 +12,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	// Check search rate limit first (before any expensive operations)
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
 		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
-			s.InfoLog("rate limited", "user", s.IMAPUser.FullAddress(), "account_id", s.IMAPUser.AccountID(), "error", err)
-			metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "rate_limited", "client_error").Inc()
+			// Rate limiter already logs with suppression, no need to log here
+			// metrics already incremented by rate limiter
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Text: err.Error(),

@@ -802,7 +802,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
-limits.search_rate_limit_per_min = 30    # Maximum searches per minute per user (default: 30, set to 0 to disable).
+# NOTE: iOS Mail performs 10-15 searches when switching mailboxes (checking unread, flagged, recent messages).
+#       Set to at least 60/min to avoid rate limiting legitimate client behavior.
+limits.search_rate_limit_per_min = 60    # Maximum searches per minute per user (default: 60, set to 0 to disable).
 limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 limits.max_auth_errors = 2               # Maximum authentication errors before disconnection (default: 2).
                                          # Applies to proxy servers only (imap_proxy, pop3_proxy, managesieve_proxy).

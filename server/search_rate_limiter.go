@@ -25,8 +25,10 @@ type SearchRateLimiter struct {
 
 // UserSearchTracker tracks search operations for a single user
 type UserSearchTracker struct {
-	searches     []time.Time
-	lastActivity time.Time
+	searches      []time.Time
+	lastActivity  time.Time
+	lastLoggedAt  time.Time // Last time we logged a rate limit event
+	suppressCount int       // Count of suppressed log messages since last log
 }
 
 // NewSearchRateLimiter creates a new search rate limiter
@@ -91,7 +93,33 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 		oldestSearch := tracker.searches[0]
 		retryAfter := oldestSearch.Add(s.window).Sub(now)
 
-		logger.Debug("Search rate limiter: Rate limit exceeded", "protocol", s.protocol, "account", accountID, "searches", len(tracker.searches), "window", s.window, "retry_after", retryAfter)
+		// Log suppression: only log once per minute per user to prevent spam
+		// iOS Mail and other aggressive clients may retry dozens of times per second
+		logSuppressWindow := time.Minute
+		shouldLog := tracker.lastLoggedAt.IsZero() || now.Sub(tracker.lastLoggedAt) >= logSuppressWindow
+
+		if shouldLog {
+			if tracker.suppressCount > 0 {
+				logger.Debug("Search rate limiter: Rate limit exceeded",
+					"protocol", s.protocol,
+					"account", accountID,
+					"searches", len(tracker.searches),
+					"window", s.window,
+					"retry_after", retryAfter,
+					"suppressed_logs", tracker.suppressCount)
+			} else {
+				logger.Debug("Search rate limiter: Rate limit exceeded",
+					"protocol", s.protocol,
+					"account", accountID,
+					"searches", len(tracker.searches),
+					"window", s.window,
+					"retry_after", retryAfter)
+			}
+			tracker.lastLoggedAt = now
+			tracker.suppressCount = 0
+		} else {
+			tracker.suppressCount++
+		}
 
 		return fmt.Errorf("search rate limit exceeded: %d searches in %v, please wait %v before trying again",
 			len(tracker.searches), s.window, retryAfter.Round(time.Second))

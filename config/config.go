@@ -1817,7 +1817,7 @@ func (s *ServerConfig) GetSearchRateLimitPerMin() int {
 	if s.Limits != nil && s.Limits.SearchRateLimitPerMin > 0 {
 		return s.Limits.SearchRateLimitPerMin
 	}
-	return 30 // Default: 30 searches per minute
+	return 60 // Default: 60 searches per minute (iOS Mail does 10-15 searches when switching mailboxes)
 }
 
 // GetMinBytesPerMinute returns minimum bytes per minute
