@@ -22,6 +22,7 @@ type RelayQueue interface {
 	MarkPermanentFailure(messageID string, errorMsg string) error
 	Release(messageID string) error
 	GetStats() (pending, processing, failed int, err error)
+	RecoverOrphanedMessages() (int, error)
 }
 
 // RelayHandler defines the interface for relay handler operations.
@@ -150,6 +151,13 @@ func (w *Worker) run(ctx context.Context) {
 	defer ticker.Stop()
 
 	logger.Info("Relay: Worker processing", "interval", w.interval, "batch_size", w.batchSize, "concurrency", w.concurrency)
+
+	// Recover any orphaned messages from previous crash
+	if recovered, err := w.queue.RecoverOrphanedMessages(); err != nil {
+		logger.Error("Relay: Failed to recover orphaned messages", "error", err)
+	} else if recovered > 0 {
+		logger.Info("Relay: Crash recovery completed", "recovered_messages", recovered)
+	}
 
 	// Process immediately on start
 	w.processQueue(ctx)

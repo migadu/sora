@@ -787,3 +787,86 @@ func TestMarkPermanentFailureVsTemporaryFailure(t *testing.T) {
 		t.Errorf("Expected 1 failed (permanent failure), got %d", failed)
 	}
 }
+
+// TestRecoverOrphanedMessages tests crash recovery functionality
+func TestRecoverOrphanedMessages(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Enqueue 3 messages
+	for i := 1; i <= 3; i++ {
+		err = queue.Enqueue(
+			"sender@example.com",
+			"recipient@example.com",
+			"redirect",
+			[]byte("Test message "+string(rune('0'+i))),
+		)
+		if err != nil {
+			t.Fatalf("Enqueue %d failed: %v", i, err)
+		}
+	}
+
+	// Simulate crash by acquiring messages but not marking them
+	msg1, _, err := queue.AcquireNext()
+	if err != nil || msg1 == nil {
+		t.Fatalf("AcquireNext 1 failed: %v", err)
+	}
+	msg2, _, err := queue.AcquireNext()
+	if err != nil || msg2 == nil {
+		t.Fatalf("AcquireNext 2 failed: %v", err)
+	}
+
+	// Verify state before recovery
+	pending, processing, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if pending != 1 || processing != 2 || failed != 0 {
+		t.Errorf("Expected pending=1 processing=2 failed=0, got pending=%d processing=%d failed=%d",
+			pending, processing, failed)
+	}
+
+	// Recover orphaned messages (simulates restart after crash)
+	recovered, err := queue.RecoverOrphanedMessages()
+	if err != nil {
+		t.Fatalf("RecoverOrphanedMessages failed: %v", err)
+	}
+	if recovered != 2 {
+		t.Errorf("Expected 2 recovered messages, got %d", recovered)
+	}
+
+	// Verify all messages are back in pending
+	pending, processing, failed, err = queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if pending != 3 || processing != 0 || failed != 0 {
+		t.Errorf("Expected pending=3 processing=0 failed=0 after recovery, got pending=%d processing=%d failed=%d",
+			pending, processing, failed)
+	}
+
+	// Verify messages can be acquired again after recovery
+	msg, _, err := queue.AcquireNext()
+	if err != nil || msg == nil {
+		t.Fatalf("AcquireNext after recovery failed: %v", err)
+	}
+}
+
+// TestRecoverOrphanedMessagesEmpty tests recovery with empty processing directory
+func TestRecoverOrphanedMessagesEmpty(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Recovery should succeed with no messages
+	recovered, err := queue.RecoverOrphanedMessages()
+	if err != nil {
+		t.Fatalf("RecoverOrphanedMessages failed: %v", err)
+	}
+	if recovered != 0 {
+		t.Errorf("Expected 0 recovered messages, got %d", recovered)
+	}
+}

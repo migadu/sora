@@ -78,6 +78,53 @@ func NewDiskQueue(basePath string, maxAttempts int, retryBackoff []time.Duration
 	return q, nil
 }
 
+// RecoverOrphanedMessages moves any messages left in processing/ back to pending/
+// This handles crash recovery - messages that were being processed when the server died.
+func (q *DiskQueue) RecoverOrphanedMessages() (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	entries, err := os.ReadDir(q.processingDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read processing directory: %w", err)
+	}
+
+	recovered := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		filename := entry.Name()
+		ext := filepath.Ext(filename)
+
+		// Only handle .msg and .json files
+		if ext != ".msg" && ext != ".json" {
+			continue
+		}
+
+		processingPath := filepath.Join(q.processingDir, filename)
+		pendingPath := filepath.Join(q.pendingDir, filename)
+
+		// Move back to pending
+		if err := os.Rename(processingPath, pendingPath); err != nil {
+			logger.Error("RelayQueue: Failed to recover orphaned file", "file", filename, "error", err)
+			continue
+		}
+
+		// Only count .msg files to avoid double-counting (each message has .msg + .json)
+		if ext == ".msg" {
+			recovered++
+		}
+	}
+
+	if recovered > 0 {
+		logger.Info("RelayQueue: Recovered orphaned messages from processing directory", "count", recovered)
+	}
+
+	return recovered, nil
+}
+
 // Enqueue adds a new message to the relay queue
 func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) error {
 	start := time.Now()
