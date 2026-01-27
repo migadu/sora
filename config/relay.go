@@ -38,6 +38,8 @@ type RelayQueueConfig struct {
 	CircuitBreakerThreshold   int      `toml:"circuit_breaker_threshold"`    // Consecutive failures before opening circuit (default: 5)
 	CircuitBreakerTimeout     string   `toml:"circuit_breaker_timeout"`      // Recovery test interval (default: "30s")
 	CircuitBreakerMaxRequests int      `toml:"circuit_breaker_max_requests"` // Max requests in half-open state (default: 3)
+	FailedRetention           string   `toml:"failed_retention"`             // How long to retain failed messages before cleanup (e.g., "168h" = 7 days, default: "168h")
+	CleanupInterval           string   `toml:"cleanup_interval"`             // How often to run cleanup of old failed messages (default: "1h")
 }
 
 // IsConfigured returns true if the relay is configured
@@ -124,4 +126,23 @@ func (q *RelayQueueConfig) GetCircuitBreakerMaxRequests() int {
 		return 3 // Default: allow 3 requests in half-open
 	}
 	return q.CircuitBreakerMaxRequests
+}
+
+// GetFailedRetention returns the failed message retention duration with default
+// Special values:
+//   - "" (empty): Uses default of 7 days
+//   - "0": Disable cleanup (failed messages kept forever)
+func (q *RelayQueueConfig) GetFailedRetention() (time.Duration, error) {
+	if q.FailedRetention == "" {
+		return 168 * time.Hour, nil // Default: 7 days (168 hours)
+	}
+	return helpers.ParseDuration(q.FailedRetention)
+}
+
+// GetCleanupInterval returns the cleanup interval duration with default
+func (q *RelayQueueConfig) GetCleanupInterval() (time.Duration, error) {
+	if q.CleanupInterval == "" {
+		return 1 * time.Hour, nil // Default: 1 hour
+	}
+	return helpers.ParseDuration(q.CleanupInterval)
 }

@@ -663,6 +663,18 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					concurrency = 5 // Default concurrency for concurrent message processing
 				}
 
+				cleanupInterval, err := cfg.Relay.Queue.GetCleanupInterval()
+				if err != nil {
+					errorHandler.FatalError("parse cleanup interval", err)
+					os.Exit(errorHandler.WaitForExit())
+				}
+
+				failedRetention, err := cfg.Relay.Queue.GetFailedRetention()
+				if err != nil {
+					errorHandler.FatalError("parse failed retention", err)
+					os.Exit(errorHandler.WaitForExit())
+				}
+
 				errCh := make(chan error, 10) // Buffered error channel
 
 				// Start error listener
@@ -678,6 +690,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					workerInterval,
 					batchSize,
 					concurrency,
+					cleanupInterval,
+					failedRetention,
 					errCh,
 				)
 
@@ -686,7 +700,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					os.Exit(errorHandler.WaitForExit())
 				}
 
-				logger.Info("Relay worker started", "interval", workerInterval, "batch_size", batchSize, "concurrency", concurrency)
+				logger.Info("Relay worker started", "interval", workerInterval, "batch_size", batchSize, "concurrency", concurrency, "cleanup_interval", cleanupInterval, "failed_retention", failedRetention)
 
 				// Register relay queue health check
 				deps.healthIntegration.RegisterRelayQueueCheck(deps.relayQueue)

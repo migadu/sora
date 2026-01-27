@@ -583,6 +583,18 @@ circuit_breaker_threshold = 5                                     # Consecutive 
 circuit_breaker_timeout = "30s"                                   # Recovery test interval (default: 30s)
 circuit_breaker_max_requests = 3                                  # Max requests allowed in half-open state (default: 3)
 
+# Failed Message Cleanup Configuration
+# Permanent failures (5xx SMTP errors from relay) are moved to failed/ directory.
+# These are expected business outcomes (e.g., user not found, policy rejection) not system failures.
+# Automatic cleanup prevents the failed queue from growing indefinitely.
+failed_retention = "168h"                                         # How long to retain failed messages before deletion (default: 168h = 7 days)
+                                                                  # Messages older than this are automatically deleted
+                                                                  # Accepted formats: "24h", "7d", "168h"
+                                                                  # Special value: "0" = disable cleanup (keep failed messages forever)
+cleanup_interval = "1h"                                           # How often to run cleanup of old failed messages (default: 1h)
+                                                                  # More frequent cleanup = less disk space used
+                                                                  # Less frequent cleanup = lower I/O overhead
+
 
 # METADATA LIMITS CONFIGURATION
 # =============================================================================

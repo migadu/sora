@@ -23,6 +23,7 @@ type RelayQueue interface {
 	Release(messageID string) error
 	GetStats() (pending, processing, failed int, err error)
 	RecoverOrphanedMessages() (int, error)
+	CleanupOldFailedMessages(retentionPeriod time.Duration) (int, error)
 }
 
 // RelayHandler defines the interface for relay handler operations.
@@ -47,17 +48,19 @@ type CircuitBreakerProvider interface {
 //   - Graceful shutdown with WaitGroup
 //   - Idempotent Start/Stop (safe to call multiple times)
 type Worker struct {
-	queue        RelayQueue
-	relayHandler RelayHandler
-	interval     time.Duration
-	batchSize    int
-	concurrency  int
-	notifyCh     chan struct{}
-	stopCh       chan struct{}
-	errCh        chan<- error
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	running      bool
+	queue           RelayQueue
+	relayHandler    RelayHandler
+	interval        time.Duration
+	batchSize       int
+	concurrency     int
+	cleanupInterval time.Duration
+	failedRetention time.Duration
+	notifyCh        chan struct{}
+	stopCh          chan struct{}
+	errCh           chan<- error
+	wg              sync.WaitGroup
+	mu              sync.Mutex
+	running         bool
 }
 
 // NewWorker creates a new relay queue worker.
@@ -68,24 +71,34 @@ type Worker struct {
 //   - interval: How often to check for new messages
 //   - batchSize: Maximum messages to process per interval
 //   - concurrency: Number of messages to process concurrently
+//   - cleanupInterval: How often to clean up old failed messages
+//   - failedRetention: How long to retain failed messages before deletion
 //   - errCh: Channel for error reporting (can be nil)
-func NewWorker(queue RelayQueue, relayHandler RelayHandler, interval time.Duration, batchSize, concurrency int, errCh chan<- error) *Worker {
+func NewWorker(queue RelayQueue, relayHandler RelayHandler, interval time.Duration, batchSize, concurrency int, cleanupInterval, failedRetention time.Duration, errCh chan<- error) *Worker {
 	if batchSize <= 0 {
 		batchSize = 100 // Default batch size
 	}
 	if concurrency <= 0 {
 		concurrency = 5 // Default concurrency
 	}
+	if cleanupInterval <= 0 {
+		cleanupInterval = 1 * time.Hour // Default 1 hour
+	}
+	if failedRetention <= 0 {
+		failedRetention = 168 * time.Hour // Default 7 days
+	}
 
 	return &Worker{
-		queue:        queue,
-		relayHandler: relayHandler,
-		interval:     interval,
-		batchSize:    batchSize,
-		concurrency:  concurrency,
-		notifyCh:     make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
-		errCh:        errCh,
+		queue:           queue,
+		relayHandler:    relayHandler,
+		interval:        interval,
+		batchSize:       batchSize,
+		concurrency:     concurrency,
+		cleanupInterval: cleanupInterval,
+		failedRetention: failedRetention,
+		notifyCh:        make(chan struct{}, 1),
+		stopCh:          make(chan struct{}),
+		errCh:           errCh,
 	}
 }
 
@@ -150,7 +163,10 @@ func (w *Worker) run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	logger.Info("Relay: Worker processing", "interval", w.interval, "batch_size", w.batchSize, "concurrency", w.concurrency)
+	cleanupTicker := time.NewTicker(w.cleanupInterval)
+	defer cleanupTicker.Stop()
+
+	logger.Info("Relay: Worker processing", "interval", w.interval, "batch_size", w.batchSize, "concurrency", w.concurrency, "cleanup_interval", w.cleanupInterval, "failed_retention", w.failedRetention)
 
 	// Recover any orphaned messages from previous crash
 	if recovered, err := w.queue.RecoverOrphanedMessages(); err != nil {
@@ -158,6 +174,9 @@ func (w *Worker) run(ctx context.Context) {
 	} else if recovered > 0 {
 		logger.Info("Relay: Crash recovery completed", "recovered_messages", recovered)
 	}
+
+	// Run initial cleanup
+	w.cleanupOldFailedMessages()
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -175,6 +194,9 @@ func (w *Worker) run(ctx context.Context) {
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
 			}
+		case <-cleanupTicker.C:
+			logger.Info("Relay: cleanup tick")
+			w.cleanupOldFailedMessages()
 		case <-w.notifyCh:
 			logger.Info("Relay: worker notified")
 			_ = w.processQueue(ctx)
@@ -371,4 +393,16 @@ func (w *Worker) reportError(err error) {
 // GetStats returns current queue statistics.
 func (w *Worker) GetStats() (pending, processing, failed int, err error) {
 	return w.queue.GetStats()
+}
+
+// cleanupOldFailedMessages performs cleanup of old failed messages
+func (w *Worker) cleanupOldFailedMessages() {
+	cleaned, err := w.queue.CleanupOldFailedMessages(w.failedRetention)
+	if err != nil {
+		logger.Error("Relay: Failed to cleanup old failed messages", "error", err)
+		return
+	}
+	if cleaned > 0 {
+		logger.Info("Relay: Cleaned up old failed messages", "count", cleaned, "retention", w.failedRetention)
+	}
 }

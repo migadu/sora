@@ -164,14 +164,18 @@ func (hi *HealthIntegration) RegisterRelayQueueCheck(relayQueue RelayQueueStatsP
 				return fmt.Errorf("failed to get relay queue stats: %w", err)
 			}
 
-			// Check if failed count is excessive (more than 100 failed messages)
-			if failed > 100 {
-				return fmt.Errorf("high number of failed messages: %d (pending: %d, processing: %d)", failed, pending, processing)
-			}
+			// Failed messages (5xx relay rejections) are expected business outcomes, not system failures.
+			// Only check operational metrics:
 
-			// Check if processing queue is backed up (more than 1000 pending)
+			// Check if pending queue is backed up (more than 1000 pending)
 			if pending > 1000 {
 				return fmt.Errorf("relay queue backed up: %d pending messages (processing: %d, failed: %d)", pending, processing, failed)
+			}
+
+			// Check if processing queue is stuck (more than 100 messages stuck in processing)
+			// This could indicate worker issues or relay timeout problems
+			if processing > 100 {
+				return fmt.Errorf("relay queue processing stuck: %d messages in processing state (pending: %d, failed: %d)", processing, pending, failed)
 			}
 
 			return nil

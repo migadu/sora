@@ -870,3 +870,146 @@ func TestRecoverOrphanedMessagesEmpty(t *testing.T) {
 		t.Errorf("Expected 0 recovered messages, got %d", recovered)
 	}
 }
+
+// TestCleanupOldFailedMessages tests cleanup of old failed messages
+func TestCleanupOldFailedMessages(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 3, []time.Duration{100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Enqueue and fail 3 messages
+	for i := 1; i <= 3; i++ {
+		err = queue.Enqueue(
+			"sender@example.com",
+			"recipient@example.com",
+			"redirect",
+			[]byte("Test message "+string(rune('0'+i))),
+		)
+		if err != nil {
+			t.Fatalf("Enqueue %d failed: %v", i, err)
+		}
+
+		// Acquire and mark as permanent failure
+		msg, _, err := queue.AcquireNext()
+		if err != nil || msg == nil {
+			t.Fatalf("AcquireNext %d failed: %v", i, err)
+		}
+		err = queue.MarkPermanentFailure(msg.ID, "Test failure")
+		if err != nil {
+			t.Fatalf("MarkPermanentFailure %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all in failed
+	_, _, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if failed != 3 {
+		t.Errorf("Expected 3 failed messages, got %d", failed)
+	}
+
+	// Cleanup with 1 hour retention (nothing should be deleted yet)
+	cleaned, err := queue.CleanupOldFailedMessages(1 * time.Hour)
+	if err != nil {
+		t.Fatalf("CleanupOldFailedMessages failed: %v", err)
+	}
+	if cleaned != 0 {
+		t.Errorf("Expected 0 cleaned (too new), got %d", cleaned)
+	}
+
+	// Cleanup with 1 millisecond retention (all should be deleted)
+	time.Sleep(5 * time.Millisecond) // Ensure messages are old enough
+	cleaned, err = queue.CleanupOldFailedMessages(1 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("CleanupOldFailedMessages failed: %v", err)
+	}
+	if cleaned != 3 {
+		t.Errorf("Expected 3 cleaned messages, got %d", cleaned)
+	}
+
+	// Verify failed count is now 0
+	_, _, failed, err = queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if failed != 0 {
+		t.Errorf("Expected 0 failed messages after cleanup, got %d", failed)
+	}
+}
+
+// TestCleanupOldFailedMessagesEmpty tests cleanup with no failed messages
+func TestCleanupOldFailedMessagesEmpty(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Cleanup should succeed with no messages
+	cleaned, err := queue.CleanupOldFailedMessages(168 * time.Hour)
+	if err != nil {
+		t.Fatalf("CleanupOldFailedMessages failed: %v", err)
+	}
+	if cleaned != 0 {
+		t.Errorf("Expected 0 cleaned messages, got %d", cleaned)
+	}
+}
+
+// TestCleanupDisabledWithZeroRetention tests that cleanup is disabled when retention is 0
+func TestCleanupDisabledWithZeroRetention(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 3, []time.Duration{100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Failed to create queue: %v", err)
+	}
+
+	// Enqueue and fail 3 messages
+	for i := 1; i <= 3; i++ {
+		err = queue.Enqueue(
+			"sender@example.com",
+			"recipient@example.com",
+			"redirect",
+			[]byte("Test message "+string(rune('0'+i))),
+		)
+		if err != nil {
+			t.Fatalf("Enqueue %d failed: %v", i, err)
+		}
+
+		msg, _, err := queue.AcquireNext()
+		if err != nil || msg == nil {
+			t.Fatalf("AcquireNext %d failed: %v", i, err)
+		}
+		err = queue.MarkPermanentFailure(msg.ID, "Test failure")
+		if err != nil {
+			t.Fatalf("MarkPermanentFailure %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all in failed
+	_, _, failed, err := queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if failed != 3 {
+		t.Errorf("Expected 3 failed messages, got %d", failed)
+	}
+
+	// Cleanup with 0 retention (should not delete anything)
+	time.Sleep(5 * time.Millisecond) // Ensure messages are "old"
+	cleaned, err := queue.CleanupOldFailedMessages(0)
+	if err != nil {
+		t.Fatalf("CleanupOldFailedMessages with 0 retention failed: %v", err)
+	}
+	if cleaned != 0 {
+		t.Errorf("Expected 0 cleaned (cleanup disabled), got %d", cleaned)
+	}
+
+	// Verify all messages still in failed
+	_, _, failed, err = queue.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if failed != 3 {
+		t.Errorf("Expected 3 failed messages (cleanup disabled), got %d", failed)
+	}
+}

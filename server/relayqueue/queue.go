@@ -125,6 +125,80 @@ func (q *DiskQueue) RecoverOrphanedMessages() (int, error) {
 	return recovered, nil
 }
 
+// CleanupOldFailedMessages removes failed messages older than the retention period.
+// Returns the number of messages cleaned up.
+// If retentionPeriod is 0, cleanup is disabled (messages kept forever).
+func (q *DiskQueue) CleanupOldFailedMessages(retentionPeriod time.Duration) (int, error) {
+	// If retention is 0, cleanup is disabled
+	if retentionPeriod == 0 {
+		return 0, nil
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	entries, err := os.ReadDir(q.failedDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read failed directory: %w", err)
+	}
+
+	now := time.Now()
+	cleaned := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		filename := entry.Name()
+		ext := filepath.Ext(filename)
+
+		// Only process .json metadata files (we'll delete both .json and .msg)
+		if ext != ".json" {
+			continue
+		}
+
+		// Read metadata to check when message was moved to failed
+		metadataPath := filepath.Join(q.failedDir, filename)
+		var metadata QueuedMessage
+		if err := q.readMetadata(metadataPath, &metadata); err != nil {
+			logger.Error("RelayQueue: Failed to read metadata during cleanup", "file", filename, "error", err)
+			continue
+		}
+
+		// Calculate age based on last attempt time (when it was moved to failed)
+		age := now.Sub(metadata.LastAttempt)
+		if age < retentionPeriod {
+			continue // Not old enough to delete
+		}
+
+		// Delete both .json and .msg files
+		messageID := metadata.ID
+		messagePath := filepath.Join(q.failedDir, messageID+".msg")
+
+		// Delete message file first
+		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
+			logger.Error("RelayQueue: Failed to delete old failed message", "id", messageID, "error", err)
+			continue
+		}
+
+		// Delete metadata file
+		if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+			logger.Error("RelayQueue: Failed to delete old failed metadata", "id", messageID, "error", err)
+			continue
+		}
+
+		cleaned++
+		logger.Info("RelayQueue: Cleaned up old failed message", "id", messageID, "age", age)
+	}
+
+	if cleaned > 0 {
+		logger.Info("RelayQueue: Cleanup completed", "cleaned", cleaned, "retention", retentionPeriod)
+	}
+
+	return cleaned, nil
+}
+
 // Enqueue adds a new message to the relay queue
 func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) error {
 	start := time.Now()

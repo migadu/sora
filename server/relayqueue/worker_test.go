@@ -112,7 +112,7 @@ func TestNewWorker(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			worker := NewWorker(queue, handler, tt.interval, tt.batchSize, tt.concurrency, nil)
+			worker := NewWorker(queue, handler, tt.interval, tt.batchSize, tt.concurrency, 1*time.Hour, 168*time.Hour, nil)
 
 			if worker == nil {
 				t.Fatal("Expected non-nil worker")
@@ -145,7 +145,7 @@ func TestWorkerStartStop(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -184,7 +184,7 @@ func TestWorkerProcessMessage(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 1*time.Second, 10, 5, nil)
+	worker := NewWorker(queue, handler, 1*time.Second, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -242,7 +242,7 @@ func TestWorkerProcessMultipleMessages(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 100*time.Millisecond, 5, 5, nil) // Small batch size
+	worker := NewWorker(queue, handler, 100*time.Millisecond, 5, 5, 1*time.Hour, 168*time.Hour, nil) // Small batch size
 
 	ctx := context.Background()
 
@@ -298,7 +298,7 @@ func TestWorkerRetryOnFailure(t *testing.T) {
 		shouldFail: true,
 		failCount:  2,
 	}
-	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -346,7 +346,7 @@ func TestWorkerMaxAttemptsFailure(t *testing.T) {
 	handler := &mockRelayHandler{
 		shouldFail: true,
 	}
-	worker := NewWorker(queue, handler, 20*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 20*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -396,7 +396,7 @@ func TestWorkerContextCancellation(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -431,7 +431,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 100*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -466,7 +466,7 @@ func TestWorkerNilHandler(t *testing.T) {
 		t.Fatalf("Failed to create queue: %v", err)
 	}
 
-	worker := NewWorker(queue, nil, 50*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, nil, 50*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -505,7 +505,7 @@ func TestWorkerGetStats(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 1*time.Second, 10, 5, nil)
+	worker := NewWorker(queue, handler, 1*time.Second, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	// Enqueue some messages
 	for i := 0; i < 5; i++ {
@@ -539,7 +539,7 @@ func TestWorkerConcurrentProcessing(t *testing.T) {
 	handler := &mockRelayHandler{
 		deliveryDelay: 10 * time.Millisecond, // Small delay to simulate real processing
 	}
-	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, nil)
+	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -596,7 +596,7 @@ func TestWorkerImmediateProcessing(t *testing.T) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 10*time.Second, 10, 5, nil) // Long interval
+	worker := NewWorker(queue, handler, 10*time.Second, 10, 5, 1*time.Hour, 168*time.Hour, nil) // Long interval
 
 	ctx := context.Background()
 
@@ -636,7 +636,7 @@ func BenchmarkWorkerProcessing(b *testing.B) {
 	}
 
 	handler := &mockRelayHandler{}
-	worker := NewWorker(queue, handler, 10*time.Millisecond, 100, 5, nil)
+	worker := NewWorker(queue, handler, 10*time.Millisecond, 100, 5, 1*time.Hour, 168*time.Hour, nil)
 
 	ctx := context.Background()
 
@@ -745,7 +745,7 @@ func TestWorkerCircuitBreakerErrorHandling(t *testing.T) {
 				cbErrorUntilCall: 2, // First 2 calls return CB error, then succeed
 			}
 
-			worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, nil)
+			worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 5, 1*time.Hour, 168*time.Hour, nil)
 			ctx := context.Background()
 
 			// Enqueue a message
@@ -818,7 +818,7 @@ func TestWorkerCircuitBreakerNoInfiniteLoop(t *testing.T) {
 	}
 
 	// Use higher concurrency than circuit breaker allows (simulating production scenario)
-	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 10, nil) // 10 concurrent workers
+	worker := NewWorker(queue, handler, 50*time.Millisecond, 10, 10, 1*time.Hour, 168*time.Hour, nil) // 10 concurrent workers
 	ctx := context.Background()
 
 	// Enqueue multiple messages (more than circuit breaker's MaxRequests)
