@@ -133,29 +133,37 @@ type Database struct {
 func (db *Database) Close() {
 	// Release the advisory lock first, while the connection is still valid.
 	if db.lockConn != nil {
+		// Ensure we always release the connection, even if the unlock query fails
+		defer db.lockConn.Release()
+
 		// We use a background context with a timeout because the main application
 		// context might have been cancelled during shutdown.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		var unlocked bool
-		err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
-		if err != nil {
-			// Check if this is a connection termination error (expected during shutdown)
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
-				// 57P01 = admin_shutdown - connection terminated by administrator
-				// This is expected during graceful shutdown, lock is auto-released
-				log.Println("Database: advisory lock auto-released (connection terminated during shutdown).")
+		// Check if the connection is still valid before trying to unlock
+		// This prevents nil pointer dereference if the pool was already closed
+		if db.lockConn.Conn() != nil {
+			var unlocked bool
+			err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
+			if err != nil {
+				// Check if this is a connection termination error (expected during shutdown)
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
+					// 57P01 = admin_shutdown - connection terminated by administrator
+					// This is expected during graceful shutdown, lock is auto-released
+					log.Println("Database: advisory lock auto-released (connection terminated during shutdown).")
+				} else {
+					log.Printf("Database: failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+				}
+			} else if unlocked {
+				log.Println("Database: released shared database advisory lock.")
 			} else {
-				log.Printf("Database: failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+				log.Println("Database: advisory lock was not held at time of release (likely auto-released on connection close).")
 			}
-		} else if unlocked {
-			log.Println("Database: released shared database advisory lock.")
 		} else {
-			log.Println("Database: advisory lock was not held at time of release (likely auto-released on connection close).")
+			log.Println("Database: connection already closed, advisory lock auto-released.")
 		}
-		db.lockConn.Release()
 	}
 
 	// Now, close the connection pools.
@@ -335,6 +343,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	}()
 
 	// Wait for either completion or timeout
+	var skipFinalVerification bool
 	select {
 	case err := <-errChan:
 		// Check if error is a lock acquisition timeout (another instance is running migrations)
@@ -358,6 +367,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 				// Check if the version is now up-to-date (>= latest available migration)
 				if newVersion >= latestVersion {
 					log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
+					skipFinalVerification = true // Skip final verification since we already verified directly
 				} else {
 					return fmt.Errorf("lock acquisition failed and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
 				}
@@ -388,21 +398,26 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		// Check if the version is now up-to-date (>= latest available migration)
 		if newVersion >= latestVersion {
 			log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
+			skipFinalVerification = true // Skip final verification since we already verified directly
 		} else {
 			return fmt.Errorf("timeout waiting for migrations and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
 		}
 	}
 
-	// Final verification
-	version, dirty, err := m.Version()
-	if err != nil && err != migrate.ErrNilVersion {
-		return fmt.Errorf("failed to get final migration version: %w", err)
-	}
-	if dirty {
-		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
-	}
+	// Final verification (skip if we already verified via direct query)
+	if !skipFinalVerification {
+		version, dirty, err := m.Version()
+		if err != nil && err != migrate.ErrNilVersion {
+			return fmt.Errorf("failed to get final migration version: %w", err)
+		}
+		if dirty {
+			return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
+		}
 
-	log.Printf("Database: migration complete, current version: %d", version)
+		log.Printf("Database: migration complete, current version: %d", version)
+	} else {
+		log.Println("Database: migrations verified, proceeding with startup")
+	}
 	return nil
 }
 
