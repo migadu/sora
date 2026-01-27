@@ -166,9 +166,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		result.Action = ActionFileInto
 		result.Mailbox = data.Mailboxes[0]
 
-		// Check if ImplicitKeep is true, which means :copy was used
-		// With normal fileinto (no :copy), ImplicitKeep would be false
-		result.Copy = data.ImplicitKeep
+		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
+		// With normal fileinto (no :copy), ImplicitKeep would be false, but an explicit keep
+		// after fileinto should still save a copy to INBOX
+		result.Copy = data.ImplicitKeep || data.Keep
 	}
 
 	// Handle redirect action
@@ -177,9 +178,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		result.Action = ActionRedirect
 		result.RedirectTo = data.RedirectAddr[0]
 
-		// Check if ImplicitKeep is true, which means :copy was used
-		// With normal redirect (no :copy), ImplicitKeep would be false
-		result.Copy = data.ImplicitKeep
+		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
+		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
+		// after redirect should still save a local copy
+		result.Copy = data.ImplicitKeep || data.Keep
 	}
 
 	// Handle discard action
