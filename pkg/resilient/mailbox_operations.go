@@ -27,13 +27,21 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		id, u, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessage(ctx, tx, options, upload)
+		// Always return the result slice (including UID), even on error
+		// This allows ErrMessageExists to return the existing UID
 		if opErr != nil {
-			return nil, opErr
+			return []int64{id, u}, opErr
 		}
 		return []int64{id, u}, nil
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
+		// Extract UID from result even when there's an error (for ErrMessageExists)
+		if result != nil {
+			if resSlice, ok := result.([]int64); ok {
+				return resSlice[0], resSlice[1], err
+			}
+		}
 		return 0, 0, err
 	}
 	resSlice := result.([]int64)

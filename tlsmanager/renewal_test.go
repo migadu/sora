@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -378,7 +379,9 @@ func TestRateLimitErrorDetection(t *testing.T) {
 	domain := "example.com"
 
 	// Simulate a rate limit error message from Let's Encrypt
-	rateLimitError := errors.New("429 urn:ietf:params:acme:error:rateLimited: too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after 2026-01-25 12:42:05 UTC: see https://letsencrypt.org/docs/rate-limits/")
+	// Use a future date to ensure the rate limit is still active
+	futureDate := time.Now().Add(168 * time.Hour).Format("2006-01-02 15:04:05 MST")
+	rateLimitError := errors.New(fmt.Sprintf("429 urn:ietf:params:acme:error:rateLimited: too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after %s: see https://letsencrypt.org/docs/rate-limits/", futureDate))
 
 	// Check if error contains rate limit markers
 	errStr := rateLimitError.Error()

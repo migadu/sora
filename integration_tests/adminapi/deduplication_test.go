@@ -91,11 +91,15 @@ func TestDeduplication(t *testing.T) {
 			Size:        100,
 			AccountID:   accountID,
 		})
-		if err != nil {
-			t.Fatalf("Expected deduplication to succeed, got error: %v", err)
+		// Expect ErrMessageExists for duplicates
+		if err == nil {
+			t.Fatalf("Expected ErrMessageExists for duplicate, got nil")
+		}
+		if err.Error() != "message already exists" {
+			t.Fatalf("Expected 'message already exists', got: %v", err)
 		}
 
-		// Should return same UID
+		// Should return same UID even with error
 		if uid1 != uid2 {
 			t.Errorf("Expected duplicate to return existing UID %d, got %d", uid1, uid2)
 		}
@@ -184,8 +188,12 @@ func TestDeduplication(t *testing.T) {
 			Size:        100,
 			AccountID:   accountID,
 		})
-		if err != nil {
-			t.Fatalf("Expected deduplication to succeed, got error: %v", err)
+		// Expect ErrMessageExists for duplicates
+		if err == nil {
+			t.Fatalf("Expected ErrMessageExists for duplicate, got nil")
+		}
+		if err.Error() != "message already exists" {
+			t.Fatalf("Expected 'message already exists', got: %v", err)
 		}
 
 		// Should return ORIGINAL UID (42), not the new one (99)
@@ -376,8 +384,12 @@ func TestDeduplication(t *testing.T) {
 			Size:        100,
 			AccountID:   accountID,
 		})
-		if err != nil {
-			t.Fatalf("Expected deduplication to succeed, got error: %v", err)
+		// Expect ErrMessageExists for duplicates
+		if err == nil {
+			t.Fatalf("Expected ErrMessageExists for duplicate, got nil")
+		}
+		if err.Error() != "message already exists" {
+			t.Fatalf("Expected 'message already exists', got: %v", err)
 		}
 
 		// Should return existing UID (deduplication prevents duplicate)

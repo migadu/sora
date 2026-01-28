@@ -334,6 +334,9 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 				"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 				"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)
 
+			// Save result even on error (for cases like ErrMessageExists that return useful data)
+			result = res
+
 			for _, nonRetryableErr := range nonRetryableErrors {
 				if errors.Is(cbErr, nonRetryableErr) {
 					return retry.Stop(cbErr)

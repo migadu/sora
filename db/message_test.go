@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -685,8 +686,9 @@ func TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent(t *testing
 
 	messageID2, uid2, err := db.InsertMessageFromImporter(ctx, tx2, options2)
 
-	// Should succeed without error (not a unique violation)
-	require.NoError(t, err, "Second insert should succeed (duplicate detected before INSERT)")
+	// Should return ErrDBUniqueViolation (duplicate detected before INSERT)
+	require.Error(t, err, "Second insert should return error for duplicate")
+	require.ErrorIs(t, err, consts.ErrDBUniqueViolation, "Should return ErrDBUniqueViolation")
 
 	// Should return 0 for messageID (indicating duplicate was found)
 	assert.Equal(t, int64(0), messageID2, "messageID should be 0 for duplicate")
@@ -694,6 +696,7 @@ func TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent(t *testing
 	// Should return the SAME UID as the first message
 	assert.Equal(t, uid1, uid2, "UID should match the existing message")
 
+	// Commit should succeed (error was handled gracefully)
 	err = tx2.Commit(ctx)
 	require.NoError(t, err)
 
