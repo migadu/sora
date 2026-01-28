@@ -481,7 +481,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 			if err != nil {
-				return s.InternalError("failed to save message to specified mailbox: %v", err)
+				// Allow duplicates (message already in target mailbox)
+				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
+					return s.InternalError("failed to save message to specified mailbox: %v", err)
+				}
+				s.DebugLog("duplicate message in target mailbox, continuing", "mailbox", mailboxName)
 			}
 
 			// Then save to INBOX (for the :copy functionality)
@@ -491,7 +495,11 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 			if err != nil {
-				return s.InternalError("failed to save message copy to inbox: %v", err)
+				// Allow duplicates (message already in INBOX)
+				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
+					return s.InternalError("failed to save message copy to inbox: %v", err)
+				}
+				s.DebugLog("duplicate message in INBOX, continuing")
 			}
 
 			// Success - both copies saved
@@ -552,24 +560,30 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
 		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
 	if err != nil {
-		// Cleanup local file on failure (only if it was stored locally)
-		if filePath != nil {
-			_ = os.Remove(*filePath)
-		}
-		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
-
-		if errors.Is(err, consts.ErrDBUniqueViolation) {
-			s.WarnLog("message already exists in database", "content_hash", contentHash)
-			return &smtp.SMTPError{
-				Code:         541,
-				EnhancedCode: smtp.EnhancedCode{5, 0, 1},
-				Message:      "Message already exists",
+		// Handle duplicate messages (acceptable in LMTP - return success)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			// Cleanup local file
+			if filePath != nil {
+				_ = os.Remove(*filePath)
 			}
+			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID)
+			// Don't track as failure - duplicate is success
+			metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
+			// Fall through to success path below (don't return error)
+			// This ensures the message is accepted by LMTP even if it's a duplicate
+		} else {
+			// Cleanup local file on real failure
+			if filePath != nil {
+				_ = os.Remove(*filePath)
+			}
+			metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
+			return s.InternalError("failed to save message: %v", err)
 		}
-		return s.InternalError("failed to save message: %v", err)
+	} else {
+		// Track successful non-duplicate delivery
+		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
 	}
 
-	metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "success").Inc()
 	s.InfoLog("message delivered", "mailbox", mailboxName)
 
 	// Track domain and user activity - LMTP delivery is critical!
@@ -811,9 +825,10 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		})
 
 	if err != nil {
-		if errors.Is(err, consts.ErrDBUniqueViolation) {
-			s.WarnLog("message already exists in database", "content_hash", contentHash)
-			return fmt.Errorf("%w: message already exists", consts.ErrDBUniqueViolation)
+		// Handle duplicate messages (either pre-detected or from unique constraint violation)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			s.WarnLog("duplicate message detected, skipping delivery", "content_hash", contentHash, "message_id", messageID)
+			return fmt.Errorf("message already exists: %w", err)
 		}
 		return fmt.Errorf("failed to save message: %v", err)
 	}

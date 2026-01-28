@@ -212,14 +212,19 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			AccountID:   s.AccountID(),
 		})
 	if err != nil {
-		_ = os.Remove(*filePath) // cleanup file on failure
-		if errors.Is(err, consts.ErrDBUniqueViolation) {
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeAlreadyExists,
-				Text: "message already exists",
-			}
+		// Handle duplicate messages (either pre-detected or from unique constraint violation)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			_ = os.Remove(*filePath) // Cleanup file
+			s.DebugLog("duplicate message detected, skipping upload", "messageID", messageID, "existing_uid", messageUID)
+			// Return success with existing UID - don't notify uploader
+			success = true
+			return &imap.AppendData{
+				UID:         imap.UID(messageUID),
+				UIDValidity: mailbox.UIDValidity,
+			}, nil
 		}
+		// For other errors, cleanup and return error
+		_ = os.Remove(*filePath)
 		return nil, s.internalError("failed to insert message metadata: %v", err)
 	}
 

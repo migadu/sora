@@ -5,6 +5,7 @@ package delivery
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -186,11 +187,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	if err != nil {
 		if filePath != nil {
-			// Cleanup file on failure
+			// Cleanup file on failure (including duplicates)
 			_ = d.Uploader.RemoveLocalFile(*filePath)
 		}
-		if err == consts.ErrDBUniqueViolation {
+		// Handle duplicate messages (either pre-detected or from unique constraint violation)
+		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
 			result.ErrorMessage = "Message already exists"
+			// Don't notify uploader for duplicates
 			return result, err
 		}
 		result.ErrorMessage = fmt.Sprintf("Failed to save message: %v", err)

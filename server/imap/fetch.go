@@ -21,48 +21,49 @@ import (
 )
 
 // safeExtractBodySection wraps imapserver.ExtractBodySection with panic recovery.
-// If parsing fails (e.g., malformed MIME), returns an error instead of crashing.
-func safeExtractBodySection(r io.Reader, section *imap.FetchItemBodySection) (result []byte, err error) {
+// For BODY[] requests on malformed messages, returns the full body data.
+// This follows the email server principle: store and return what you have, let the client handle parsing.
+func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection) []byte {
 	// Capture panics from the MIME parser
 	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("panic during body section extraction: %v", rec)
+		if recover() != nil {
+			// MIME parser panicked - this is rare but handled
 		}
 	}()
 
-	// ExtractBodySection internally parses the message, which can panic on malformed MIME
-	result = imapserver.ExtractBodySection(r, section)
+	// Try to extract the requested section
+	result := imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
 
-	// Note: Empty results are valid - a section might legitimately be empty (e.g., BODY[TEXT]
-	// for a message with no body, or BODY[2] when requesting a non-existent part).
-	// We only return an error if extraction panics (handled by defer above).
+	// For BODY[] (full message), if extraction returns empty but we have body data,
+	// it means MIME parsing failed silently. Return the raw body so clients can see the content.
+	// For other sections (BODY[TEXT], BODY[1], etc.), empty is valid (part doesn't exist).
+	if len(result) == 0 && section.Specifier == imap.PartSpecifierNone && len(bodyData) > 0 {
+		return bodyData
+	}
 
-	return result, nil
+	return result
 }
 
 // safeExtractBinarySection wraps imapserver.ExtractBinarySection with panic recovery.
-func safeExtractBinarySection(r io.Reader, section *imap.FetchItemBinarySection) (result []byte, err error) {
+func safeExtractBinarySection(bodyData []byte, section *imap.FetchItemBinarySection) []byte {
 	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("panic during binary section extraction: %v", rec)
+		if recover() != nil {
+			// MIME parser panicked - return empty
 		}
 	}()
 
-	result = imapserver.ExtractBinarySection(r, section)
-	return result, nil
+	return imapserver.ExtractBinarySection(bytes.NewReader(bodyData), section)
 }
 
 // safeExtractBinarySectionSize wraps imapserver.ExtractBinarySectionSize with panic recovery.
-func safeExtractBinarySectionSize(r io.Reader, section *imap.FetchItemBinarySectionSize) (size uint32, err error) {
+func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinarySectionSize) uint32 {
 	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("panic during binary section size extraction: %v", rec)
-			size = 0
+		if recover() != nil {
+			// MIME parser panicked - return 0
 		}
 	}()
 
-	size = imapserver.ExtractBinarySectionSize(r, section)
-	return size, nil
+	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
 const crlf = "\r\n"
@@ -392,15 +393,8 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bo
 
 	for _, section := range options.BinarySection {
 		var buf []byte
-		if *bodyData != nil { // Only extract if bodyData was successfully loaded
-			extracted, extractErr := safeExtractBinarySection(bytes.NewReader(*bodyData), section)
-			if extractErr != nil {
-				s.WarnLog("failed to extract binary section from corrupted message", "uid", msg.UID, "error", extractErr)
-				// Return empty for corrupted messages
-				buf = []byte{}
-			} else {
-				buf = extracted
-			}
+		if *bodyData != nil {
+			buf = safeExtractBinarySection(*bodyData, section)
 		}
 		wc := w.WriteBinarySection(section, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
@@ -422,14 +416,8 @@ func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter,
 
 	for _, section := range options.BinarySectionSize {
 		var n uint32
-		if *bodyData != nil { // Only extract if bodyData was successfully loaded
-			size, extractErr := safeExtractBinarySectionSize(bytes.NewReader(*bodyData), section)
-			if extractErr != nil {
-				s.WarnLog("failed to extract binary section size from corrupted message", "uid", msg.UID, "error", extractErr)
-				n = 0
-			} else {
-				n = size
-			}
+		if *bodyData != nil {
+			n = safeExtractBinarySectionSize(*bodyData, section)
 		}
 		w.WriteBinarySectionSize(section, n)
 	}
@@ -515,15 +503,9 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 			}
 
 			if *bodyData != nil { // Only extract if bodyData was successfully loaded
-				// Use safe wrapper to handle malformed MIME gracefully
-				extracted, extractErr := safeExtractBodySection(bytes.NewReader(*bodyData), section)
-				if extractErr != nil {
-					s.WarnLog("failed to extract body section from corrupted message", "uid", msg.UID, "error", extractErr)
-					// Return error message instead of failing completely
-					sectionContent = []byte(fmt.Sprintf("[Message UID %d: MIME parsing failed: %v]", msg.UID, extractErr))
-				} else {
-					sectionContent = extracted
-				}
+				// Extract section. If MIME parsing fails/panics, safeExtractBodySection handles it gracefully.
+				// We return whatever the extractor gives us - email servers should be transparent conduits.
+				sectionContent = safeExtractBodySection(*bodyData, section)
 			} else {
 				s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
 				// sectionContent remains nil, will be set to []byte{} below

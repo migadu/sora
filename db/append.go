@@ -288,7 +288,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			// True duplicate (same Message-ID + same content_hash) - skip insert
 			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
 				saneMessageID, options.ContentHash, options.MailboxID, existingUID)
-			return 0, existingUID, nil
+			return 0, existingUID, consts.ErrMessageExists
 		}
 
 		// Same Message-ID but different content - this is draft replacement
