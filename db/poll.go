@@ -91,7 +91,8 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			                   AND (m2.expunged_modseq IS NULL OR m2.expunged_modseq > $2))
 			            ELSE
 			                -- For non-expunged messages, use the cached sequence number
-			                COALESCE(ms.seqnum, 0)
+			                -- Don't use COALESCE - if seqnum is NULL, skip this message (race with trigger)
+			                ms.seqnum
 			        END AS seq_num,
 			        m.flags,
 			        m.custom_flags,
@@ -103,6 +104,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			    WHERE m.mailbox_id = $1
 			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
 			      AND (m.created_modseq > $2 OR COALESCE(m.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
+			      -- Skip messages where sequence hasn't been assigned yet (race with trigger)
+			      -- For expunged messages we calculate seq_num, but for active messages we need ms.seqnum
+			      AND (m.expunged_modseq IS NOT NULL OR ms.seqnum IS NOT NULL)
 			  ),
 			  changed_messages AS (
 			    SELECT
