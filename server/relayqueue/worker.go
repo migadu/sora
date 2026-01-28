@@ -181,6 +181,11 @@ func (w *Worker) run(ctx context.Context) {
 	// Process immediately on start
 	w.processQueue(ctx)
 
+	// Create a ticker for circuit breaker state monitoring (check every 5 seconds)
+	// This ensures we attempt recovery as soon as circuit breaker enters HALF-OPEN
+	cbCheckTicker := time.NewTicker(5 * time.Second)
+	defer cbCheckTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -197,6 +202,15 @@ func (w *Worker) run(ctx context.Context) {
 		case <-cleanupTicker.C:
 			logger.Info("Relay: cleanup tick")
 			w.cleanupOldFailedMessages()
+		case <-cbCheckTicker.C:
+			// Check if circuit breaker is in HALF-OPEN state (ready for recovery attempts)
+			// This proactively triggers delivery attempts when circuit breaker recovers
+			if hasCircuitBreaker, cbState := w.getCircuitBreakerState(); hasCircuitBreaker {
+				if cbState == circuitbreaker.StateHalfOpen {
+					logger.Info("Relay: Circuit breaker entered HALF-OPEN - attempting recovery")
+					_ = w.processQueue(ctx)
+				}
+			}
 		case <-w.notifyCh:
 			logger.Info("Relay: worker notified")
 			_ = w.processQueue(ctx)
@@ -225,8 +239,13 @@ func (w *Worker) getCircuitBreakerState() (hasCircuitBreaker bool, state circuit
 func (w *Worker) processQueue(ctx context.Context) error {
 	// Check circuit breaker state for proactive recovery
 	hasCircuitBreaker, cbState := w.getCircuitBreakerState()
-	if hasCircuitBreaker && cbState != circuitbreaker.StateClosed {
-		logger.Info("Relay: Circuit breaker attempting recovery delivery", "state", cbState)
+	if hasCircuitBreaker {
+		logger.Info("Relay: Processing queue", "circuit_breaker_state", cbState)
+		if cbState == circuitbreaker.StateOpen {
+			logger.Warn("Relay: Circuit breaker is OPEN - messages will be released back to queue")
+		} else if cbState == circuitbreaker.StateHalfOpen {
+			logger.Info("Relay: Circuit breaker is HALF-OPEN - attempting recovery delivery")
+		}
 	}
 
 	sem := make(chan struct{}, w.concurrency)

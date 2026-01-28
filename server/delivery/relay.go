@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-smtp"
-	"github.com/migadu/sora/logger"
+	soralogger "github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -94,7 +94,7 @@ func (r *SMTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			logger.Warn("SMTP Relay: Circuit breaker is OPEN - skipping delivery", "host", r.SMTPHost)
+			soralogger.Warn("SMTP Relay: Circuit breaker is OPEN - skipping delivery", "host", r.SMTPHost)
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("SMTP relay circuit breaker is open: %w", err)
 		}
@@ -192,7 +192,7 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 	if relayErr = c.Quit(); relayErr != nil {
 		// Quit errors don't affect message delivery (already accepted), treat as non-fatal
 		// Just log it but don't return error
-		logger.Warn("SMTP Relay: Failed to send QUIT", "error", relayErr)
+		soralogger.Warn("SMTP Relay: Failed to send QUIT", "error", relayErr)
 	}
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
@@ -233,7 +233,7 @@ func (r *HTTPRelayHandler) SendToExternalRelay(from string, to string, messageBy
 		})
 		// Check if circuit breaker is open
 		if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
-			logger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
+			soralogger.Warn("HTTP Relay: Circuit breaker is OPEN - skipping delivery", "url", r.HTTPURL)
 			metrics.LMTPExternalRelay.WithLabelValues("circuit_breaker_open").Inc()
 			return fmt.Errorf("HTTP relay circuit breaker is open: %w", err)
 		}
@@ -339,9 +339,8 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)
 			},
 			OnStateChange: func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-				if logger != nil {
-					logger.Log(fmt.Sprintf("[SMTP Relay] Circuit breaker '%s' changed from %s to %s", name, from, to))
-				}
+				// Log to standard logger for visibility
+				soralogger.Info("SMTP Relay: Circuit breaker state changed", "name", name, "from", from.String(), "to", to.String())
 			},
 			IsSuccessful: func(err error) bool {
 				return err == nil
@@ -370,9 +369,8 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)
 			},
 			OnStateChange: func(name string, from circuitbreaker.State, to circuitbreaker.State) {
-				if logger != nil {
-					logger.Log(fmt.Sprintf("[HTTP Relay] Circuit breaker '%s' changed from %s to %s", name, from, to))
-				}
+				// Log to standard logger for visibility
+				soralogger.Info("HTTP Relay: Circuit breaker state changed", "name", name, "from", from.String(), "to", to.String())
 			},
 			IsSuccessful: func(err error) bool {
 				return err == nil
