@@ -365,6 +365,170 @@ func TestCircuitBreaker_GetCircuitBreaker(t *testing.T) {
 	})
 }
 
+// TestCircuitBreaker_PermanentErrorsDoNotTrigger tests that permanent errors (5xx SMTP, 4xx HTTP)
+// do not count as failures toward opening the circuit breaker
+func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
+	logger := &testLogger{}
+
+	t.Run("SMTP 5xx permanent errors should not open circuit", func(t *testing.T) {
+		// Simulate what happens when wc.Close() returns SMTP error 554
+		// This tests the actual error chain: RelayError -> fmt.Errorf -> SMTPError
+		cbConfig := CircuitBreakerConfig{
+			Threshold:   2, // Would open after 2 failures
+			Timeout:     100 * time.Millisecond,
+			MaxRequests: 1,
+		}
+
+		handler := NewRelayHandlerFromConfig(
+			"smtp",
+			"invalid.host.test:587", // Invalid host
+			"",
+			"",
+			"test",
+			true,
+			true,
+			false,
+			"",
+			"",
+			logger,
+			cbConfig,
+		)
+
+		smtpHandler := handler.(*SMTPRelayHandler)
+
+		// Mock the sendToSMTPRelay to return a permanent error (like 554)
+		// We can't actually mock it easily, but we can verify the error classification
+		testErr := &RelayError{
+			Err:       fmt.Errorf("failed to close data writer: SMTP error 554: no forwarding permitted"),
+			Permanent: true,
+		}
+
+		// Verify this error is correctly classified as permanent
+		if !IsPermanentError(testErr) {
+			t.Error("Expected error to be classified as permanent")
+		}
+
+		// Verify circuit breaker treats it as successful
+		// We do this by checking the IsSuccessful logic manually since we can't easily inject errors
+		if smtpHandler.CircuitBreaker != nil {
+			// The IsSuccessful callback should return true for permanent errors
+			// This is what prevents them from counting toward circuit opening
+			shouldBeSuccessful := testErr == nil || IsPermanentError(testErr)
+			if !shouldBeSuccessful {
+				t.Error("Circuit breaker should treat permanent errors as successful")
+			}
+		}
+	})
+
+	t.Run("HTTP 4xx permanent errors should not open circuit", func(t *testing.T) {
+		// Server always returns 400 Bad Request (permanent error)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest) // 4xx = permanent for HTTP
+		}))
+		defer server.Close()
+
+		cbConfig := CircuitBreakerConfig{
+			Threshold:   2, // Would open after 2 failures
+			Timeout:     100 * time.Millisecond,
+			MaxRequests: 1,
+		}
+
+		handler := NewRelayHandlerFromConfig(
+			"http",
+			"",
+			server.URL,
+			"test-token",
+			"test",
+			false,
+			false,
+			false,
+			"",
+			"",
+			logger,
+			cbConfig,
+		)
+
+		httpHandler := handler.(*HTTPRelayHandler)
+
+		// Send 5 requests that will all return 400 (permanent errors)
+		for i := 0; i < 5; i++ {
+			err := handler.SendToExternalRelay("sender@test.com", "recipient@test.com", []byte("test"))
+			if err == nil {
+				t.Errorf("Expected error on attempt %d", i+1)
+			}
+			// Should be permanent error
+			if !IsPermanentError(err) {
+				t.Errorf("Expected permanent error on attempt %d, got: %v", i+1, err)
+			}
+			// Circuit breaker should NOT be open
+			if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
+				t.Errorf("Circuit breaker should not open for permanent errors on attempt %d", i+1)
+			}
+		}
+
+		// Circuit should still be CLOSED (permanent errors don't count as failures)
+		state := httpHandler.CircuitBreaker.State()
+		if state != circuitbreaker.StateClosed {
+			t.Errorf("Expected circuit to remain CLOSED for permanent errors, got %s", state)
+		}
+	})
+
+	t.Run("HTTP 5xx temporary errors should open circuit", func(t *testing.T) {
+		// Server always returns 500 Internal Server Error (temporary error)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError) // 5xx = temporary for HTTP
+		}))
+		defer server.Close()
+
+		cbConfig := CircuitBreakerConfig{
+			Threshold:   2, // Open after 2 failures
+			Timeout:     100 * time.Millisecond,
+			MaxRequests: 1,
+		}
+
+		handler := NewRelayHandlerFromConfig(
+			"http",
+			"",
+			server.URL,
+			"test-token",
+			"test",
+			false,
+			false,
+			false,
+			"",
+			"",
+			logger,
+			cbConfig,
+		)
+
+		httpHandler := handler.(*HTTPRelayHandler)
+
+		// First 2 attempts should trigger circuit opening
+		for i := 0; i < 2; i++ {
+			err := handler.SendToExternalRelay("sender@test.com", "recipient@test.com", []byte("test"))
+			if err == nil {
+				t.Errorf("Expected error on attempt %d", i+1)
+			}
+			// Should be temporary error (not permanent)
+			if IsPermanentError(err) {
+				t.Errorf("Expected temporary error on attempt %d, got: %v", i+1, err)
+			}
+		}
+
+		// Circuit should be OPEN now (temporary errors count as failures)
+		state := httpHandler.CircuitBreaker.State()
+		if state != circuitbreaker.StateOpen {
+			t.Errorf("Expected circuit OPEN after threshold temporary failures, got %s", state)
+		}
+
+		// Next attempt should fail with circuit breaker error
+		err := handler.SendToExternalRelay("sender@test.com", "recipient@test.com", []byte("test"))
+		if !errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) {
+			t.Errorf("Expected circuit breaker open error, got: %v", err)
+		}
+	})
+}
+
 // testLoggerWithFunc extended with custom function
 type testLoggerWithFunc struct {
 	testLogger

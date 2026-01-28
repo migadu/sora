@@ -343,7 +343,14 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 				soralogger.Info("SMTP Relay: Circuit breaker state changed", "name", name, "from", from.String(), "to", to.String())
 			},
 			IsSuccessful: func(err error) bool {
-				return err == nil
+				// Circuit breaker should only count transient failures (network, 4xx errors)
+				// Permanent failures (5xx SMTP errors) are legitimate delivery failures,
+				// not relay system failures, so they should not contribute to circuit opening
+				if err == nil {
+					return true
+				}
+				// If error is permanent (5xx), treat as successful from circuit breaker perspective
+				return IsPermanentError(err)
 			},
 		})
 
@@ -373,7 +380,14 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 				soralogger.Info("HTTP Relay: Circuit breaker state changed", "name", name, "from", from.String(), "to", to.String())
 			},
 			IsSuccessful: func(err error) bool {
-				return err == nil
+				// Circuit breaker should only count transient failures (network, 5xx errors)
+				// Permanent failures (4xx HTTP errors) are legitimate delivery failures,
+				// not relay system failures, so they should not contribute to circuit opening
+				if err == nil {
+					return true
+				}
+				// If error is permanent (4xx HTTP), treat as successful from circuit breaker perspective
+				return IsPermanentError(err)
 			},
 		})
 
