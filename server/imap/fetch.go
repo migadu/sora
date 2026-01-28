@@ -33,11 +33,9 @@ func safeExtractBodySection(r io.Reader, section *imap.FetchItemBodySection) (re
 	// ExtractBodySection internally parses the message, which can panic on malformed MIME
 	result = imapserver.ExtractBodySection(r, section)
 
-	// If extraction returns empty for BODY[] (full message), it likely means parsing failed
-	// due to malformed MIME. Return an error so the fallback message is used.
-	if len(result) == 0 && section.Specifier == imap.PartSpecifierNone {
-		return nil, fmt.Errorf("body section extraction returned empty - likely malformed MIME")
-	}
+	// Note: Empty results are valid - a section might legitimately be empty (e.g., BODY[TEXT]
+	// for a message with no body, or BODY[2] when requesting a non-existent part).
+	// We only return an error if extraction panics (handled by defer above).
 
 	return result, nil
 }

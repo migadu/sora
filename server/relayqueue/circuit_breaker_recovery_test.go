@@ -15,7 +15,7 @@ type mockRelayHandlerWithRealCB struct {
 	mu               sync.Mutex
 	messages         []mockMessage
 	cb               *circuitbreaker.CircuitBreaker
-	failUntilCall    int  // Fail until this call number
+	failUntilCall    int // Fail until this call number
 	callCount        int
 	shouldFailAlways bool // Always fail (for testing stuck OPEN state)
 }
