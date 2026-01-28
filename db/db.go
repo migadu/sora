@@ -846,12 +846,10 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		// previous outage. Without this, the circuit breaker can get stuck in an
 		// infinite OPEN -> HALF_OPEN -> OPEN loop even when the database is healthy.
 		config.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
-			// Quick ping to validate connection is alive
-			// Use a short timeout to avoid blocking acquire for too long
-			pingCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-			defer cancel()
-
-			if err := conn.Ping(pingCtx); err != nil {
+			// Check if the connection is still alive without calling Ping
+			// Ping can trigger pool operations and cause infinite loop detection
+			// Instead, we check if the underlying connection is closed
+			if conn.IsClosed() {
 				// Connection is dead, don't use it - pool will create a new one
 				return false
 			}
