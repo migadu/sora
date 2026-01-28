@@ -313,3 +313,153 @@ func TestIMAP_StatusAppendLimit(t *testing.T) {
 
 	t.Log("STATUS APPENDLIMIT integration test completed successfully")
 }
+
+// TestIMAP_StatusDoesNotCorruptSelectedMailbox tests that STATUS on a different mailbox
+// does not corrupt the internal message count of the currently selected mailbox
+func TestIMAP_StatusDoesNotCorruptSelectedMailbox(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Step 1: Create a mailbox called "TestFolder" and add many messages to it
+	if err := c.Create("TestFolder", nil).Wait(); err != nil {
+		t.Fatalf("Failed to create TestFolder: %v", err)
+	}
+
+	// Add 100 messages to TestFolder to create a large message count
+	for i := 0; i < 100; i++ {
+		testMessage := fmt.Sprintf("From: test%d@example.com\r\n"+
+			"To: %s\r\n"+
+			"Subject: Test Message %d\r\n"+
+			"Date: %s\r\n"+
+			"\r\n"+
+			"Test message body %d\r\n", i, account.Email, i, time.Now().Format(time.RFC1123), i)
+
+		appendCmd := c.Append("TestFolder", int64(len(testMessage)), &imap.AppendOptions{
+			Time: time.Now(),
+		})
+		if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	t.Log("Added 100 messages to TestFolder")
+
+	// Step 2: Add 2 messages to INBOX
+	for i := 0; i < 2; i++ {
+		testMessage := fmt.Sprintf("From: inbox%d@example.com\r\n"+
+			"To: %s\r\n"+
+			"Subject: Inbox Message %d\r\n"+
+			"Date: %s\r\n"+
+			"\r\n"+
+			"Inbox message body %d\r\n", i, account.Email, i, time.Now().Format(time.RFC1123), i)
+
+		appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
+			Time: time.Now(),
+		})
+		if _, err := appendCmd.Write([]byte(testMessage)); err != nil {
+			t.Fatalf("APPEND write to INBOX failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close for INBOX failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND to INBOX failed: %v", err)
+		}
+	}
+
+	t.Log("Added 2 messages to INBOX")
+
+	// Step 3: SELECT INBOX (should have 2 messages)
+	selectData, err := c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("Failed to SELECT INBOX: %v", err)
+	}
+
+	if selectData.NumMessages != 2 {
+		t.Fatalf("Expected 2 messages in INBOX after SELECT, got %d", selectData.NumMessages)
+	}
+
+	t.Logf("SELECT INBOX: NumMessages=%d (expected 2)", selectData.NumMessages)
+
+	// Step 4: Issue STATUS command for TestFolder (which has 100 messages)
+	// This should NOT corrupt the internal message count for INBOX
+	statusData, err := c.Status("TestFolder", &imap.StatusOptions{
+		NumMessages: true,
+	}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS command for TestFolder failed: %v", err)
+	}
+
+	if statusData.NumMessages == nil || *statusData.NumMessages != 100 {
+		t.Fatalf("Expected 100 messages in TestFolder, got %v", statusData.NumMessages)
+	}
+
+	t.Logf("STATUS TestFolder: NumMessages=%d (expected 100)", *statusData.NumMessages)
+
+	// Step 5: Fetch messages from INBOX using sequence numbers
+	// If the bug exists, the session will think INBOX has 100 messages (from the STATUS command),
+	// but the database only has 2. The FETCH will try to fetch sequence numbers that don't exist.
+	fetchOptions := &imap.FetchOptions{
+		UID:      true,
+		Envelope: true,
+	}
+
+	// Fetch messages 1:* (all messages in INBOX)
+	// With the bug, this would try to fetch sequences 1-100 instead of 1-2
+	fetchCmd := c.Fetch(imap.SeqSetNum(1, 2), fetchOptions)
+	fetchMsgs, err := fetchCmd.Collect()
+	if err != nil {
+		t.Fatalf("FETCH command failed: %v", err)
+	}
+
+	if len(fetchMsgs) != 2 {
+		t.Errorf("Expected to FETCH 2 messages from INBOX, but got %d", len(fetchMsgs))
+		t.Error("This indicates the STATUS command corrupted the selected mailbox's message count")
+	} else {
+		t.Log("FETCH correctly returned 2 messages - STATUS did not corrupt INBOX message count")
+	}
+
+	for i, msg := range fetchMsgs {
+		t.Logf("FETCH returned message %d, UID=%d", i+1, msg.UID)
+	}
+
+	// Step 6: Issue NOOP to trigger a poll and verify the message count is still correct
+	if err := c.Noop().Wait(); err != nil {
+		t.Fatalf("NOOP command failed: %v", err)
+	}
+
+	// Step 7: Try to FETCH using sequence number 3 (which doesn't exist in INBOX with 2 messages)
+	// This should return no results, not an error
+	fetchCmd2 := c.Fetch(imap.SeqSetNum(3), fetchOptions)
+	fetchMsgs2, err := fetchCmd2.Collect()
+	if err != nil {
+		t.Logf("FETCH sequence 3 completed (error is expected for out-of-range): %v", err)
+	}
+
+	if len(fetchMsgs2) > 0 {
+		t.Errorf("FETCH of non-existent sequence number 3 returned %d messages (UID=%d)", len(fetchMsgs2), fetchMsgs2[0].UID)
+		t.Error("This indicates the session thinks there are more than 2 messages in INBOX")
+	} else {
+		t.Log("FETCH of sequence 3 correctly returned no results")
+	}
+
+	t.Log("STATUS does not corrupt selected mailbox test completed successfully")
+}

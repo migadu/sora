@@ -58,8 +58,11 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	if options.NumMessages {
 		num := uint32(summary.NumMessages)
 
-		// Update currentNumMessages using atomic operation, no lock needed
-		s.currentNumMessages.Store(num)
+		// Only update currentNumMessages if this is the currently selected mailbox
+		// STATUS can query any mailbox, but currentNumMessages tracks the selected mailbox
+		if s.selectedMailbox != nil && s.selectedMailbox.ID == mailbox.ID {
+			s.currentNumMessages.Store(num)
+		}
 
 		statusData.NumMessages = &num
 	}
