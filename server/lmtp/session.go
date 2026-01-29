@@ -354,10 +354,10 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
-		// File already exists (likely being processed by uploader or duplicate delivery)
-		// Don't overwrite it - just use the existing path
-		filePath = &expectedPath
-		s.DebugLog("message file already exists, skipping write", "path", expectedPath)
+		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
+		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		filePath = nil
+		s.DebugLog("message file already exists, skipping write (concurrent delivery)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
 		return s.InternalError("failed to check file existence: %v", err)
