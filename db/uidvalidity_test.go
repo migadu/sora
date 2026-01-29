@@ -54,6 +54,10 @@ func TestUIDValidityGeneration(t *testing.T) {
 
 	ctx := context.Background()
 
+	// Capture timestamp before creating mailboxes for comparison
+	nowNano := time.Now().UnixNano()
+	expectedUIDValidity := uint32(nowNano)
+
 	// Test 1: Create mailboxes with small time delays to ensure unique UIDVALIDITY
 	var mailboxes []*DBMailbox
 
@@ -86,8 +90,6 @@ func TestUIDValidityGeneration(t *testing.T) {
 	}
 
 	// Test 3: Verify UIDVALIDITY is reasonable (nanosecond timestamp-based)
-	nowNano := time.Now().UnixNano()
-	expectedUIDValidity := uint32(nowNano)
 	for _, mailbox := range mailboxes {
 		timeDiff := int64(mailbox.UIDValidity) - int64(expectedUIDValidity)
 		if timeDiff < 0 {
