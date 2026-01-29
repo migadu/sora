@@ -21,6 +21,12 @@ type PendingUpload struct {
 	LastAttempt sql.NullTime
 }
 
+// PendingUploadWithEmail extends PendingUpload with account email for display
+type PendingUploadWithEmail struct {
+	PendingUpload
+	AccountEmail string
+}
+
 // AcquireAndLeasePendingUploads selects pending uploads for a given instance,
 // locks them to prevent concurrent processing by other workers, and updates their
 // last_attempt timestamp to "lease" them to the current worker.
@@ -187,6 +193,44 @@ func (db *Database) GetFailedUploads(ctx context.Context, maxAttempts int, limit
 	for rows.Next() {
 		var u PendingUpload
 		if err := rows.Scan(&u.ID, &u.AccountID, &u.ContentHash, &u.Size, &u.InstanceID, &u.Attempts, &u.CreatedAt, &u.UpdatedAt, &u.LastAttempt); err != nil {
+			return nil, fmt.Errorf("failed to scan failed upload: %w", err)
+		}
+		uploads = append(uploads, u)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating failed uploads: %w", err)
+	}
+
+	return uploads, nil
+}
+
+// GetFailedUploadsWithEmail returns failed uploads with account email for display purposes
+func (db *Database) GetFailedUploadsWithEmail(ctx context.Context, maxAttempts int, limit int) ([]PendingUploadWithEmail, error) {
+	rows, err := db.GetReadPool().Query(ctx, `
+		SELECT
+			p.id, p.account_id, p.content_hash, p.size, p.instance_id,
+			p.attempts, p.created_at, p.updated_at, p.last_attempt,
+			c.email as account_email
+		FROM pending_uploads p
+		JOIN accounts a ON p.account_id = a.id
+		JOIN credentials c ON a.id = c.account_id AND c.is_primary = TRUE
+		WHERE p.attempts >= $1
+		ORDER BY p.created_at DESC
+		LIMIT $2
+	`, maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query failed uploads with email: %w", err)
+	}
+	defer rows.Close()
+
+	var uploads []PendingUploadWithEmail
+	for rows.Next() {
+		var u PendingUploadWithEmail
+		if err := rows.Scan(
+			&u.ID, &u.AccountID, &u.ContentHash, &u.Size, &u.InstanceID,
+			&u.Attempts, &u.CreatedAt, &u.UpdatedAt, &u.LastAttempt,
+			&u.AccountEmail,
+		); err != nil {
 			return nil, fmt.Errorf("failed to scan failed upload: %w", err)
 		}
 		uploads = append(uploads, u)

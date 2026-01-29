@@ -287,6 +287,16 @@ type MessageS3Info struct {
 	S3Key       string
 }
 
+// MessageHashInfo represents message info for content hash verification
+type MessageHashInfo struct {
+	ID          int64
+	UID         int64
+	MailboxPath string
+	Subject     string
+	Uploaded    bool
+	ContentHash string
+}
+
 // GetAllMessagesForUserVerification retrieves S3 info for all non-expunged messages for a user
 func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accountID int64) ([]MessageS3Info, error) {
 	query := `
@@ -311,6 +321,35 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 		}
 		// Construct S3 key
 		msg.S3Key = fmt.Sprintf("%s/%s/%s", msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+		messages = append(messages, msg)
+	}
+
+	return messages, rows.Err()
+}
+
+// GetMessagesByContentHash retrieves all messages with a specific content hash for an account
+func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int64, contentHash string) ([]MessageHashInfo, error) {
+	query := `
+		SELECT m.id, m.uid, mb.name as mailbox_path, m.subject, m.uploaded, m.content_hash
+		FROM messages m
+		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		WHERE m.account_id = $1 AND m.content_hash = $2 AND m.expunged_at IS NULL
+		ORDER BY m.id
+	`
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, accountID, contentHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages by content hash: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []MessageHashInfo
+	for rows.Next() {
+		var msg MessageHashInfo
+		err := rows.Scan(&msg.ID, &msg.UID, &msg.MailboxPath, &msg.Subject, &msg.Uploaded, &msg.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan message: %w", err)
+		}
 		messages = append(messages, msg)
 	}
 

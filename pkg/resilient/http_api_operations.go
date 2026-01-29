@@ -131,3 +131,17 @@ func (rd *ResilientDatabase) GetFailedUploadsWithRetry(ctx context.Context, maxA
 	}
 	return result.([]db.PendingUpload), nil
 }
+
+func (rd *ResilientDatabase) GetFailedUploadsWithEmailWithRetry(ctx context.Context, maxAttempts, limit int) ([]db.PendingUploadWithEmail, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetFailedUploadsWithEmail(ctx, maxAttempts, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.PendingUploadWithEmail{}, nil
+	}
+	return result.([]db.PendingUploadWithEmail), nil
+}

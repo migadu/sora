@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/storage"
 )
 
 func handleUploaderCommand(ctx context.Context) {
@@ -138,22 +139,60 @@ func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, f
 
 	// Show failed uploads if requested
 	if showFailed && stats.FailedUploads > 0 {
-		fmt.Printf("\nFailed Uploads (showing up to %d):\n", failedLimit)
-		fmt.Printf("%-10s %-10s %-64s %-8s %-12s %-19s %s\n", "ID", "Account ID", "Content Hash", "Size", "Attempts", "Created", "Instance ID")
-		fmt.Printf("%s\n", strings.Repeat("-", 141))
+		// Initialize S3 storage for checking existence
+		s3Storage, err := storage.New(
+			cfg.S3.Endpoint,
+			cfg.S3.AccessKey,
+			cfg.S3.SecretKey,
+			cfg.S3.Bucket,
+			!cfg.S3.DisableTLS,
+			false,
+		)
+		if err != nil {
+			logger.Warn("Failed to initialize S3 (S3 Status column will show 'N/A')", "error", err)
+			s3Storage = nil
+		} else if cfg.S3.Encrypt {
+			if err := s3Storage.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+				logger.Warn("Failed to enable S3 encryption (S3 Status column will show 'N/A')", "error", err)
+				s3Storage = nil
+			}
+		}
 
-		failedUploads, err := rdb.GetFailedUploadsWithRetry(ctx, cfg.Uploader.MaxAttempts, failedLimit)
+		fmt.Printf("\nFailed Uploads (showing up to %d):\n", failedLimit)
+		fmt.Printf("%-10s %-10s %-64s %-8s %-12s %-12s %-19s %s\n", "ID", "Account ID", "Content Hash", "Size", "Attempts", "S3 Status", "Created", "Instance ID")
+		fmt.Printf("%s\n", strings.Repeat("-", 155))
+
+		failedUploads, err := rdb.GetFailedUploadsWithEmailWithRetry(ctx, cfg.Uploader.MaxAttempts, failedLimit)
 		if err != nil {
 			return fmt.Errorf("failed to get failed uploads: %w", err)
 		}
 
+		// Check S3 existence for each upload
 		for _, upload := range failedUploads {
-			fmt.Printf("%-10d %-10d %-64s %-8s %-12d %-19s %s\n",
+			s3Status := "N/A"
+
+			if s3Storage != nil && upload.AccountEmail != "" {
+				parts := strings.Split(upload.AccountEmail, "@")
+				if len(parts) == 2 {
+					s3Key := fmt.Sprintf("%s/%s/%s", parts[1], parts[0], upload.ContentHash)
+					exists, _, checkErr := s3Storage.Exists(s3Key)
+					if checkErr == nil {
+						if exists {
+							s3Status = "✓ EXISTS"
+						} else {
+							s3Status = "✗ MISSING"
+						}
+					}
+				}
+			}
+
+			fmt.Printf("%-10d %-10d %-64s %-8s %-12d %-12s %-19s %s\n",
 				upload.ID,
 				upload.AccountID,
 				upload.ContentHash,
 				formatBytes(upload.Size),
 				upload.Attempts,
+				s3Status,
 				upload.CreatedAt.Format("2006-01-02 15:04:05"),
 				upload.InstanceID)
 		}

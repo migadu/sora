@@ -191,6 +191,21 @@ func (rdb *ResilientDatabase) GetAllMessagesForUserVerificationWithRetry(ctx con
 	return result.([]db.MessageS3Info), nil
 }
 
+// GetMessagesByContentHashWithRetry retrieves all messages with a specific content hash with retry logic
+func (rdb *ResilientDatabase) GetMessagesByContentHashWithRetry(ctx context.Context, accountID int64, contentHash string) ([]db.MessageHashInfo, error) {
+	config := readRetryConfig
+
+	op := func(ctx context.Context) (any, error) {
+		return rdb.getOperationalDatabaseForOperation(false).GetMessagesByContentHash(ctx, accountID, contentHash)
+	}
+
+	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.MessageHashInfo), nil
+}
+
 // MarkMessagesAsNotUploadedWithRetry marks messages as not uploaded with retry logic
 func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Context, s3Keys []string) (int64, error) {
 	config := writeRetryConfig
