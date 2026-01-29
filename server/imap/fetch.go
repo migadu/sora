@@ -270,8 +270,23 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		}
 	}
 	if options.BodyStructure != nil {
-		if err := s.writeBodyStructure(m, &msg.BodyStructure); err != nil {
-			return err
+		// Validate body structure from database to prevent panics on malformed data
+		if err := helpers.ValidateBodyStructure(&msg.BodyStructure); err != nil {
+			s.DebugLog("invalid body structure from database, using fallback", "uid", msg.UID, "error", err)
+			// Create fallback structure
+			fallback := &imap.BodyStructureSinglePart{
+				Type:    "text",
+				Subtype: "plain",
+				Size:    uint32(msg.Size),
+			}
+			var fallbackBS imap.BodyStructure = fallback
+			if err := s.writeBodyStructure(m, &fallbackBS); err != nil {
+				return err
+			}
+		} else {
+			if err := s.writeBodyStructure(m, &msg.BodyStructure); err != nil {
+				return err
+			}
 		}
 	}
 

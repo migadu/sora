@@ -264,11 +264,17 @@ func scanMessages(rows pgx.Rows) ([]Message, error) {
 		// Always attempt to deserialize, but fall back to default on any error
 		if len(bodyStructureBytes) > 0 {
 			if bs, err := helpers.DeserializeBodyStructureGob(bodyStructureBytes); err == nil {
-				bodyStructure = bs
+				// Validate the deserialized structure (e.g., multipart with no children)
+				if validateErr := helpers.ValidateBodyStructure(bs); validateErr != nil {
+					log.Printf("Database: WARNING - UID %d has invalid body_structure (%v), using default", msg.UID, validateErr)
+					bodyStructure = nil // Force fallback
+				} else {
+					bodyStructure = bs
+				}
 			}
 		}
 
-		// If deserialization failed or data was empty, create a safe default
+		// If deserialization failed, validation failed, or data was empty, create a safe default
 		if bodyStructure == nil {
 			log.Printf("Database: WARNING - UID %d has invalid or empty body_structure, using default", msg.UID)
 			defaultBS := &imap.BodyStructureSinglePart{
