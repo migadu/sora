@@ -352,16 +352,16 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 
 	health, exists := cm.backendHealth[backend]
 	if !exists {
-		// Create health entry for new backend
+		// Create health entry for new backend - start healthy, mark unhealthy after 3 failures
 		health = &BackendHealth{
-			IsHealthy:        false,
+			IsHealthy:        true,
 			LastFailure:      time.Now(),
 			FailureCount:     1,
 			ConsecutiveFails: 1,
 		}
 		cm.backendHealth[backend] = health
-		logger.Warn("ConnectionManager: Backend marked unhealthy after first failure", "backend", backend, "server", cm.serverName)
-		return true
+		logger.Debug("ConnectionManager: Recording first failure for backend", "backend", backend, "server", cm.serverName)
+		return false
 	}
 
 	wasHealthy := health.IsHealthy
@@ -410,7 +410,7 @@ func (cm *ConnectionManager) RecordRemoteLookupSuccess(backend string) {
 }
 
 // RecordRemoteLookupFailure records a connection failure to a remote lookup backend (not in pool)
-// Marks backend unhealthy immediately (no threshold - we want fast circuit breaking for dynamic backends)
+// Marks backend unhealthy after 3 consecutive failures (same as pool backends)
 // Returns true if backend was just marked unhealthy (transition from healthy to unhealthy)
 func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 	// If health checks are disabled, do nothing
@@ -423,16 +423,16 @@ func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 
 	health, exists := cm.remoteLookupHealth[backend]
 	if !exists {
-		// Create health entry for new remote lookup backend - mark unhealthy immediately
+		// Create health entry for new remote lookup backend - start healthy, mark unhealthy after 3 failures
 		health = &BackendHealth{
-			IsHealthy:        false,
+			IsHealthy:        true,
 			LastFailure:      time.Now(),
 			FailureCount:     1,
 			ConsecutiveFails: 1,
 		}
 		cm.remoteLookupHealth[backend] = health
-		logger.Warn("ConnectionManager: Remote lookup backend marked unhealthy after first failure", "backend", backend, "server", cm.serverName)
-		return true
+		logger.Debug("ConnectionManager: Recording first failure for remote lookup backend", "backend", backend, "server", cm.serverName)
+		return false
 	}
 
 	wasHealthy := health.IsHealthy
@@ -442,9 +442,8 @@ func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
 
 	logger.Debug("ConnectionManager: Recording remote lookup failure", "backend", backend, "consecutive_fails", health.ConsecutiveFails, "was_healthy", wasHealthy, "server", cm.serverName)
 
-	// Mark unhealthy immediately for remote lookup backends (no 3-failure threshold)
-	// We want fast circuit breaking since these are dynamic backends outside our control
-	if health.ConsecutiveFails >= 1 {
+	// Mark unhealthy after 3 consecutive failures (same as pool backends)
+	if health.ConsecutiveFails >= 3 {
 		health.IsHealthy = false
 		if wasHealthy {
 			logger.Warn("ConnectionManager: Remote lookup backend marked unhealthy", "backend", backend, "count", health.ConsecutiveFails, "server", cm.serverName)

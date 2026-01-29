@@ -579,9 +579,9 @@ func TestEnableHealthChecks(t *testing.T) {
 	}
 }
 
-// TestRemoteLookupBackendMarkedUnhealthyImmediately verifies that remote lookup backends
-// (not in pool) are marked unhealthy after the FIRST failure (no threshold)
-func TestRemoteLookupBackendMarkedUnhealthyImmediately(t *testing.T) {
+// TestRemoteLookupBackendMarkedUnhealthyAfterThreeFailures verifies that remote lookup backends
+// (not in pool) are marked unhealthy after 3 consecutive failures (same as pool backends)
+func TestRemoteLookupBackendMarkedUnhealthyAfterThreeFailures(t *testing.T) {
 	// Create a pool backend
 	poolBackend, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -605,18 +605,19 @@ func TestRemoteLookupBackendMarkedUnhealthyImmediately(t *testing.T) {
 		IsRemoteLookupAccount: true,
 	}
 
-	// Try to connect to the remote_lookup backend
+	// Try to connect to the remote_lookup backend 3 times
 	ctx := context.Background()
-	_, _, err, _ = cm.tryPreferredAddress(ctx, remoteLookupBackend, "", 0, "", 0, routingInfo)
-
-	// Should fail (backend doesn't exist)
-	if err == nil {
-		t.Error("Expected connection failure to remote_lookup backend")
+	for i := 0; i < 3; i++ {
+		_, _, err, _ = cm.tryPreferredAddress(ctx, remoteLookupBackend, "", 0, "", 0, routingInfo)
+		// Should fail (backend doesn't exist)
+		if err == nil {
+			t.Error("Expected connection failure to remote_lookup backend")
+		}
 	}
 
-	// CRITICAL: Remote lookup backend should be marked unhealthy after FIRST failure
+	// CRITICAL: Remote lookup backend should be marked unhealthy after 3 consecutive failures
 	if cm.IsRemoteLookupBackendHealthy(remoteLookupBackend) {
-		t.Error("Remote lookup backend should be unhealthy after first failure")
+		t.Error("Remote lookup backend should be unhealthy after 3 consecutive failures")
 	}
 
 	// Verify remote lookup backend is in remoteLookupHealth map
@@ -632,12 +633,12 @@ func TestRemoteLookupBackendMarkedUnhealthyImmediately(t *testing.T) {
 		t.Error("Remote lookup backend health.IsHealthy should be false")
 	}
 
-	if health.ConsecutiveFails != 1 {
-		t.Errorf("Expected 1 consecutive failure, got %d", health.ConsecutiveFails)
+	if health.ConsecutiveFails != 3 {
+		t.Errorf("Expected 3 consecutive failures, got %d", health.ConsecutiveFails)
 	}
 
-	if health.FailureCount != 1 {
-		t.Errorf("Expected 1 failure count, got %d", health.FailureCount)
+	if health.FailureCount != 3 {
+		t.Errorf("Expected 3 failure count, got %d", health.FailureCount)
 	}
 
 	// Verify pool backend is still healthy (not affected)
