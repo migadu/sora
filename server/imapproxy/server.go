@@ -124,34 +124,34 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 
 // ServerOptions holds options for creating a new IMAP proxy server.
 type ServerOptions struct {
-	Name                      string // Server name for logging
-	Addr                      string
-	RemoteAddrs               []string
-	RemotePort                int // Default port for backends if not in address
-	MasterUsername            string
-	MasterPassword            string
-	MasterSASLUsername        string
-	MasterSASLPassword        string
-	TLS                       bool
-	TLSCertFile               string
-	TLSKeyFile                string
-	TLSVerify                 bool
-	TLSConfig                 *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteTLS                 bool
-	RemoteTLSVerify           bool
-	RemoteUseProxyProtocol    bool
-	ConnectTimeout            time.Duration
-	AuthIdleTimeout           time.Duration
-	CommandTimeout            time.Duration // Idle timeout
-	AbsoluteSessionTimeout    time.Duration // Maximum total session duration
-	MinBytesPerMinute         int64         // Minimum throughput
-	EnableAffinity            bool
-	DisableBackendHealthCheck bool // Disable backend health checking
-	AuthRateLimit             server.AuthRateLimiterConfig
-	LookupCache               *config.LookupCacheConfig // Authentication cache configuration
-	RemoteLookup              *config.RemoteLookupConfig
-	TrustedProxies            []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseIDCommand        bool     // Whether backend supports IMAP ID command for forwarding
+	Name                     string // Server name for logging
+	Addr                     string
+	RemoteAddrs              []string
+	RemotePort               int // Default port for backends if not in address
+	MasterUsername           string
+	MasterPassword           string
+	MasterSASLUsername       string
+	MasterSASLPassword       string
+	TLS                      bool
+	TLSCertFile              string
+	TLSKeyFile               string
+	TLSVerify                bool
+	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteTLS                bool
+	RemoteTLSVerify          bool
+	RemoteUseProxyProtocol   bool
+	ConnectTimeout           time.Duration
+	AuthIdleTimeout          time.Duration
+	CommandTimeout           time.Duration // Idle timeout
+	AbsoluteSessionTimeout   time.Duration // Maximum total session duration
+	MinBytesPerMinute        int64         // Minimum throughput
+	EnableAffinity           bool
+	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
+	AuthRateLimit            server.AuthRateLimiterConfig
+	LookupCache              *config.LookupCacheConfig // Authentication cache configuration
+	RemoteLookup             *config.RemoteLookupConfig
+	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseIDCommand       bool     // Whether backend supports IMAP ID command for forwarding
 
 	// Connection limiting
 	MaxConnections      int              // Maximum total connections per instance (0 = unlimited, local only)
@@ -211,7 +211,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, false, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name, opts.DisableBackendHealthCheck)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, false, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name, !opts.EnableBackendHealthCheck)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

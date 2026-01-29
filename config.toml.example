@@ -1038,6 +1038,9 @@ remote_tls_use_starttls = false       # Use STARTTLS for backend connections (re
 remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
+remote_health_checks = true           # Enable backend health tracking (default: true)
+                                      # When false, all backends are always considered healthy.
+                                      # Disable only for debugging or when backends have external health monitoring.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 support for incoming connections from HAProxy, nginx, or other load balancers.
@@ -1422,6 +1425,7 @@ remote_tls_use_starttls = false       # Use STARTTLS for backend connections (re
 remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+remote_health_checks = true           # Enable backend health tracking (default: true)
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
@@ -1475,6 +1479,7 @@ remote_tls = false                    # Enable TLS for backend connections (impl
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
+remote_health_checks = true           # Enable backend health tracking (default: true)
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
@@ -1541,6 +1546,7 @@ remote_tls_use_starttls = false       # Use STARTTLS for backend connections (re
 remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+remote_health_checks = true           # Enable backend health tracking (default: true)
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.

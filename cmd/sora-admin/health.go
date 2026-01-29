@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -44,6 +46,7 @@ func handleHealthStatus(ctx context.Context) {
 	component := fs.String("component", "", "Show health status for specific component")
 	detailed := fs.Bool("detailed", false, "Show detailed health information including metadata")
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+	showBackends := fs.Bool("backends", false, "Show proxy backend health status (requires Admin API)")
 
 	// Configuration
 
@@ -58,6 +61,7 @@ Options:
   --component string    Show health status for specific component
   --detailed            Show detailed health information including metadata
   --json                Output in JSON format
+  --backends            Show proxy backend health status (requires Admin API)
   --config string        Path to TOML configuration file (required)
 
 This command shows:
@@ -65,11 +69,13 @@ This command shows:
   - Component health status (database, S3, circuit breakers)
   - Server-specific health information
   - Component failure rates and error details
+  - Proxy backend health status (with --backends flag)
 
 Examples:
   sora-admin health status
   sora-admin health status --hostname server1.example.com
   sora-admin health status --component database --detailed
+  sora-admin health status --backends
   sora-admin health status --json
 `)
 	}
@@ -78,6 +84,27 @@ Examples:
 	args := os.Args[3:]
 	if err := fs.Parse(args); err != nil {
 		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
+	// If showing backends, use Admin API instead of database
+	if *showBackends {
+		// Check that HTTP API is configured
+		if globalConfig.HTTPAPIAddr == "" {
+			logger.Fatalf("HTTP API address not configured (set http_api_addr in config)")
+		}
+		if globalConfig.HTTPAPIKey == "" {
+			logger.Fatalf("HTTP API key not configured (set http_api_key in config)")
+		}
+		if *jsonOutput {
+			if err := showBackendHealthJSON(ctx, globalConfig); err != nil {
+				logger.Fatalf("Failed to show backend health: %v", err)
+			}
+		} else {
+			if err := showBackendHealth(ctx, globalConfig); err != nil {
+				logger.Fatalf("Failed to show backend health: %v", err)
+			}
+		}
+		return
 	}
 
 	// Connect to resilient database
@@ -300,4 +327,157 @@ func showHealthStatusJSON(ctx context.Context, rdb *resilient.ResilientDatabase,
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(output)
+}
+
+func showBackendHealth(ctx context.Context, cfg AdminConfig) error {
+	// Create HTTP API client
+	client, err := createHTTPAPIClient(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
+	}
+
+	// Build URL
+	url := fmt.Sprintf("%s/admin/proxy/backends", cfg.HTTPAPIAddr)
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get backend health: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API request failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var result struct {
+		Proxies []struct {
+			ProxyName string `json:"proxy_name"`
+			Backends  []struct {
+				Address            string    `json:"address"`
+				IsHealthy          bool      `json:"is_healthy"`
+				FailureCount       int       `json:"failure_count"`
+				ConsecutiveFails   int       `json:"consecutive_fails"`
+				LastFailure        time.Time `json:"last_failure,omitempty"`
+				LastSuccess        time.Time `json:"last_success,omitempty"`
+				HealthCheckEnabled bool      `json:"health_check_enabled"`
+				IsRemoteLookup     bool      `json:"is_remote_lookup"`
+			} `json:"backends"`
+		} `json:"proxies"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Display results only if proxies are found
+	if len(result.Proxies) == 0 {
+		fmt.Printf("No proxy servers configured on this instance.\n")
+		return nil
+	}
+
+	fmt.Printf("Proxy Backend Health Status\n")
+	fmt.Printf("============================\n\n")
+	fmt.Printf("Timestamp: %s\n\n", result.Timestamp.Format("2006-01-02 15:04:05 UTC"))
+
+	for _, proxy := range result.Proxies {
+		fmt.Printf("Proxy: %s\n", proxy.ProxyName)
+		fmt.Printf("%s\n", strings.Repeat("-", len(proxy.ProxyName)+7))
+
+		if len(proxy.Backends) == 0 {
+			fmt.Printf("  No backends configured\n\n")
+			continue
+		}
+
+		for _, backend := range proxy.Backends {
+			healthStatus := "HEALTHY"
+			statusColor := "\033[32m" // green
+			if !backend.IsHealthy {
+				healthStatus = "UNHEALTHY"
+				statusColor = "\033[31m" // red
+			}
+
+			backendType := ""
+			if backend.IsRemoteLookup {
+				backendType = " [remote_lookup]"
+			}
+
+			fmt.Printf("  %-25s %s%-12s\033[0m%s", backend.Address, statusColor, healthStatus, backendType)
+
+			if !backend.HealthCheckEnabled {
+				fmt.Printf(" (health checks disabled)")
+			} else {
+				fmt.Printf(" (failures: %d/%d)", backend.ConsecutiveFails, backend.FailureCount)
+			}
+			fmt.Printf("\n")
+
+			if !backend.LastSuccess.IsZero() {
+				fmt.Printf("    Last Success: %s\n", backend.LastSuccess.Format("2006-01-02 15:04:05 UTC"))
+			}
+			if !backend.LastFailure.IsZero() {
+				fmt.Printf("    Last Failure: %s\n", backend.LastFailure.Format("2006-01-02 15:04:05 UTC"))
+			}
+		}
+		fmt.Printf("\n")
+	}
+
+	return nil
+}
+
+func showBackendHealthJSON(ctx context.Context, cfg AdminConfig) error {
+	// Create HTTP API client
+	client, err := createHTTPAPIClient(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP API client: %w", err)
+	}
+
+	// Build URL
+	url := fmt.Sprintf("%s/admin/proxy/backends", cfg.HTTPAPIAddr)
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+cfg.HTTPAPIKey)
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get backend health: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API request failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Output raw JSON
+	fmt.Println(string(body))
+	return nil
 }

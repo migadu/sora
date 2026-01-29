@@ -122,35 +122,35 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 }
 
 type POP3ProxyServerOptions struct {
-	Name                      string // Server name for logging
-	Debug                     bool
-	TLS                       bool
-	TLSCertFile               string
-	TLSKeyFile                string
-	TLSVerify                 bool
-	TLSConfig                 *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteAddrs               []string
-	RemotePort                int // Default port for backends if not in address
-	RemoteTLS                 bool
-	RemoteTLSVerify           bool
-	RemoteUseProxyProtocol    bool
-	MasterUsername            string
-	MasterPassword            string
-	MasterSASLUsername        string
-	MasterSASLPassword        string
-	ConnectTimeout            time.Duration
-	AuthIdleTimeout           time.Duration
-	CommandTimeout            time.Duration // Idle timeout
-	AbsoluteSessionTimeout    time.Duration // Maximum total session duration
-	MinBytesPerMinute         int64         // Minimum throughput
-	EnableAffinity            bool
-	DisableBackendHealthCheck bool // Disable backend health checking
-	AffinityValidity          time.Duration
-	AffinityStickiness        float64
-	AuthRateLimit             server.AuthRateLimiterConfig
-	RemoteLookup              *config.RemoteLookupConfig
-	TrustedProxies            []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseXCLIENT          bool     // Whether backend supports XCLIENT command for forwarding
+	Name                     string // Server name for logging
+	Debug                    bool
+	TLS                      bool
+	TLSCertFile              string
+	TLSKeyFile               string
+	TLSVerify                bool
+	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteAddrs              []string
+	RemotePort               int // Default port for backends if not in address
+	RemoteTLS                bool
+	RemoteTLSVerify          bool
+	RemoteUseProxyProtocol   bool
+	MasterUsername           string
+	MasterPassword           string
+	MasterSASLUsername       string
+	MasterSASLPassword       string
+	ConnectTimeout           time.Duration
+	AuthIdleTimeout          time.Duration
+	CommandTimeout           time.Duration // Idle timeout
+	AbsoluteSessionTimeout   time.Duration // Maximum total session duration
+	MinBytesPerMinute        int64         // Minimum throughput
+	EnableAffinity           bool
+	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
+	AffinityValidity         time.Duration
+	AffinityStickiness       float64
+	AuthRateLimit            server.AuthRateLimiterConfig
+	RemoteLookup             *config.RemoteLookupConfig
+	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT         bool     // Whether backend supports XCLIENT command for forwarding
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -211,7 +211,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		options.ConnectTimeout,
 		routingLookup,
 		options.Name,
-		options.DisableBackendHealthCheck,
+		!options.EnableBackendHealthCheck,
 	)
 	if err != nil {
 		if routingLookup != nil {

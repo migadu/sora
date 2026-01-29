@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -48,9 +49,10 @@ type ConnectionManager struct {
 	consistentHash *ConsistentHash
 
 	// Backend health tracking
-	healthMu                  sync.RWMutex
-	backendHealth             map[string]*BackendHealth
-	disableBackendHealthCheck bool // If true, health checks are completely disabled
+	healthMu                 sync.RWMutex
+	backendHealth            map[string]*BackendHealth // Pool backends (from remote_addrs config)
+	remoteLookupHealth       map[string]*BackendHealth // Dynamic backends from remote_lookup (not in pool)
+	enableBackendHealthCheck bool                      // If true, backend health checks are enabled (default: true)
 
 	// User routing lookup
 	routingLookup UserRoutingLookup
@@ -103,18 +105,19 @@ func NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs []stri
 	}
 
 	cm := &ConnectionManager{
-		serverName:                serverName,
-		remoteAddrs:               normalizedAddrs,
-		remotePort:                remotePort,
-		remoteTLS:                 remoteTLS,
-		remoteTLSUseStartTLS:      remoteTLSUseStartTLS,
-		remoteTLSVerify:           remoteTLSVerify,
-		remoteUseProxyProtocol:    remoteUseProxyProtocol,
-		connectTimeout:            connectTimeout,
-		consistentHash:            consistentHash,
-		backendHealth:             backendHealth,
-		routingLookup:             routingLookup,
-		disableBackendHealthCheck: disableHealthCheck,
+		serverName:               serverName,
+		remoteAddrs:              normalizedAddrs,
+		remotePort:               remotePort,
+		remoteTLS:                remoteTLS,
+		remoteTLSUseStartTLS:     remoteTLSUseStartTLS,
+		remoteTLSVerify:          remoteTLSVerify,
+		remoteUseProxyProtocol:   remoteUseProxyProtocol,
+		connectTimeout:           connectTimeout,
+		consistentHash:           consistentHash,
+		backendHealth:            backendHealth,
+		remoteLookupHealth:       make(map[string]*BackendHealth), // Dynamic remote lookup backends
+		routingLookup:            routingLookup,
+		enableBackendHealthCheck: !disableHealthCheck,
 	}
 
 	logger.Debug("Connection manager: Initialized consistent hash ring", "prefix", cm.logPrefix(), "backends", len(normalizedAddrs))
@@ -156,11 +159,15 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 		backend := cm.consistentHash.GetBackendWithExclusions(username, exclude)
 		if backend == "" {
 			// No more backends available
+			logger.Debug("ConnectionManager: Consistent hash returned no backend", "username", username, "iteration", i)
 			return ""
 		}
 
 		// Check if this backend is healthy
-		if cm.IsBackendHealthy(backend) {
+		isHealthy := cm.IsBackendHealthy(backend)
+		logger.Debug("ConnectionManager: Consistent hash health check", "username", username, "backend", backend, "healthy", isHealthy, "iteration", i)
+
+		if isHealthy {
 			return backend
 		}
 
@@ -168,7 +175,14 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 		exclude[backend] = true
 	}
 
-	// All backends unhealthy
+	// All backends unhealthy - log diagnostics
+	logger.Warn("ConnectionManager: All consistent hash backends unhealthy", "username", username, "pool_size", len(cm.remoteAddrs))
+	cm.healthMu.RLock()
+	for addr, health := range cm.backendHealth {
+		logger.Debug("ConnectionManager: Backend health status", "backend", addr, "healthy", health.IsHealthy, "consecutive_fails", health.ConsecutiveFails, "last_failure", health.LastFailure)
+	}
+	cm.healthMu.RUnlock()
+
 	return ""
 }
 
@@ -177,7 +191,7 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 // Auto-recovers backends after 1 minute of being marked unhealthy
 func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 	// If health checks are disabled, always return true (all backends healthy)
-	if cm.disableBackendHealthCheck {
+	if !cm.enableBackendHealthCheck {
 		return true
 	}
 
@@ -201,6 +215,102 @@ func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 	}
 
 	return health.IsHealthy
+}
+
+// IsRemoteLookupBackendHealthy checks if a remote lookup backend (not in pool) is healthy
+// Returns true if healthy or unknown, false if marked unhealthy
+// Auto-recovers backends after 1 minute of being marked unhealthy
+func (cm *ConnectionManager) IsRemoteLookupBackendHealthy(backend string) bool {
+	// If health checks are disabled, always return true
+	if !cm.enableBackendHealthCheck {
+		return true
+	}
+
+	cm.healthMu.RLock()
+	health, exists := cm.remoteLookupHealth[backend]
+	cm.healthMu.RUnlock()
+
+	if !exists {
+		// Unknown remote lookup backend, assume healthy (allow first attempt)
+		return true
+	}
+
+	// Check if backend should auto-recover (1 minute since last failure)
+	if !health.IsHealthy && time.Since(health.LastFailure) > 1*time.Minute {
+		cm.healthMu.Lock()
+		health.IsHealthy = true
+		health.ConsecutiveFails = 0 // Reset consecutive failures
+		cm.healthMu.Unlock()
+		logger.Info("ConnectionManager: Remote lookup backend auto-recovered after 1 minute", "backend", backend)
+		return true
+	}
+
+	return health.IsHealthy
+}
+
+// BackendHealthInfo represents the health status of a single backend for external reporting
+type BackendHealthInfo struct {
+	Address            string    `json:"address"`
+	IsHealthy          bool      `json:"is_healthy"`
+	FailureCount       int       `json:"failure_count"`
+	ConsecutiveFails   int       `json:"consecutive_fails"`
+	LastFailure        time.Time `json:"last_failure,omitempty"`
+	LastSuccess        time.Time `json:"last_success,omitempty"`
+	HealthCheckEnabled bool      `json:"health_check_enabled"`
+	IsRemoteLookup     bool      `json:"is_remote_lookup"` // True if backend from remote_lookup (not in pool)
+}
+
+// GetBackendHealthStatuses returns health information for all backends (pool + remote lookup)
+func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+
+	healthCheckEnabled := cm.enableBackendHealthCheck
+	statuses := make([]BackendHealthInfo, 0, len(cm.backendHealth)+len(cm.remoteLookupHealth))
+
+	// Add pool backends (from remote_addrs config)
+	for addr, health := range cm.backendHealth {
+		info := BackendHealthInfo{
+			Address:            addr,
+			IsHealthy:          health.IsHealthy,
+			FailureCount:       health.FailureCount,
+			ConsecutiveFails:   health.ConsecutiveFails,
+			LastFailure:        health.LastFailure,
+			LastSuccess:        health.LastSuccess,
+			HealthCheckEnabled: healthCheckEnabled,
+			IsRemoteLookup:     false, // Pool backend
+		}
+
+		// If health checks are disabled, all backends are considered healthy
+		if !healthCheckEnabled {
+			info.IsHealthy = true
+		}
+
+		statuses = append(statuses, info)
+	}
+
+	// Add remote lookup backends (dynamic, not in pool)
+	for addr, health := range cm.remoteLookupHealth {
+		info := BackendHealthInfo{
+			Address:            addr,
+			IsHealthy:          health.IsHealthy,
+			FailureCount:       health.FailureCount,
+			ConsecutiveFails:   health.ConsecutiveFails,
+			LastFailure:        health.LastFailure,
+			LastSuccess:        health.LastSuccess,
+			HealthCheckEnabled: healthCheckEnabled,
+			IsRemoteLookup:     true, // Remote lookup backend
+		}
+
+		// If health checks are disabled, all backends are considered healthy
+		if !healthCheckEnabled {
+			info.IsHealthy = true
+		}
+
+		statuses = append(statuses, info)
+	}
+
+	return statuses
 }
 
 // RecordConnectionSuccess records a successful connection to a backend
@@ -233,7 +343,7 @@ func (cm *ConnectionManager) RecordConnectionSuccess(backend string) {
 // Returns true if backend was just marked unhealthy (transition from healthy to unhealthy)
 func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 	// If health checks are disabled, do nothing
-	if cm.disableBackendHealthCheck {
+	if !cm.enableBackendHealthCheck {
 		return false
 	}
 
@@ -250,7 +360,7 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 			ConsecutiveFails: 1,
 		}
 		cm.backendHealth[backend] = health
-		logger.Warn("ConnectionManager: Backend marked unhealthy after first failure", "backend", backend)
+		logger.Warn("ConnectionManager: Backend marked unhealthy after first failure", "backend", backend, "server", cm.serverName)
 		return true
 	}
 
@@ -259,11 +369,85 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 	health.ConsecutiveFails++
 	health.LastFailure = time.Now()
 
+	logger.Debug("ConnectionManager: Recording connection failure", "backend", backend, "consecutive_fails", health.ConsecutiveFails, "was_healthy", wasHealthy, "server", cm.serverName)
+
 	// Mark unhealthy after 3 consecutive failures
 	if health.ConsecutiveFails >= 3 {
 		health.IsHealthy = false
 		if wasHealthy {
-			logger.Warn("ConnectionManager: Backend marked unhealthy after consecutive failures", "backend", backend, "count", health.ConsecutiveFails)
+			logger.Warn("ConnectionManager: Backend marked unhealthy after consecutive failures", "backend", backend, "count", health.ConsecutiveFails, "server", cm.serverName)
+			return true // Just became unhealthy
+		}
+	}
+
+	return false
+}
+
+// RecordRemoteLookupSuccess records a successful connection to a remote lookup backend (not in pool)
+func (cm *ConnectionManager) RecordRemoteLookupSuccess(backend string) {
+	cm.healthMu.Lock()
+	defer cm.healthMu.Unlock()
+
+	health, exists := cm.remoteLookupHealth[backend]
+	if !exists {
+		// Create health entry for new remote lookup backend
+		health = &BackendHealth{
+			IsHealthy:   true,
+			LastSuccess: time.Now(),
+		}
+		cm.remoteLookupHealth[backend] = health
+		return
+	}
+
+	wasUnhealthy := !health.IsHealthy
+	health.LastSuccess = time.Now()
+	health.ConsecutiveFails = 0 // Reset consecutive failures on success
+	health.IsHealthy = true
+
+	if wasUnhealthy {
+		logger.Info("ConnectionManager: Remote lookup backend recovered", "backend", backend)
+	}
+}
+
+// RecordRemoteLookupFailure records a connection failure to a remote lookup backend (not in pool)
+// Marks backend unhealthy immediately (no threshold - we want fast circuit breaking for dynamic backends)
+// Returns true if backend was just marked unhealthy (transition from healthy to unhealthy)
+func (cm *ConnectionManager) RecordRemoteLookupFailure(backend string) bool {
+	// If health checks are disabled, do nothing
+	if !cm.enableBackendHealthCheck {
+		return false
+	}
+
+	cm.healthMu.Lock()
+	defer cm.healthMu.Unlock()
+
+	health, exists := cm.remoteLookupHealth[backend]
+	if !exists {
+		// Create health entry for new remote lookup backend - mark unhealthy immediately
+		health = &BackendHealth{
+			IsHealthy:        false,
+			LastFailure:      time.Now(),
+			FailureCount:     1,
+			ConsecutiveFails: 1,
+		}
+		cm.remoteLookupHealth[backend] = health
+		logger.Warn("ConnectionManager: Remote lookup backend marked unhealthy after first failure", "backend", backend, "server", cm.serverName)
+		return true
+	}
+
+	wasHealthy := health.IsHealthy
+	health.FailureCount++
+	health.ConsecutiveFails++
+	health.LastFailure = time.Now()
+
+	logger.Debug("ConnectionManager: Recording remote lookup failure", "backend", backend, "consecutive_fails", health.ConsecutiveFails, "was_healthy", wasHealthy, "server", cm.serverName)
+
+	// Mark unhealthy immediately for remote lookup backends (no 3-failure threshold)
+	// We want fast circuit breaking since these are dynamic backends outside our control
+	if health.ConsecutiveFails >= 1 {
+		health.IsHealthy = false
+		if wasHealthy {
+			logger.Warn("ConnectionManager: Remote lookup backend marked unhealthy", "backend", backend, "count", health.ConsecutiveFails, "server", cm.serverName)
 			return true // Just became unhealthy
 		}
 	}
@@ -373,11 +557,16 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
 	}
 
+	// Capture the current list of addresses under lock to avoid data race with ResolveAddresses
+	cm.healthMu.RLock()
+	currentRemoteAddrs := cm.remoteAddrs
+	cm.healthMu.RUnlock()
+
 	// Try all servers in round-robin order
 	startIndex := cm.nextIndex.Add(1) - 1
-	for i := 0; i < len(cm.remoteAddrs); i++ {
-		idx := (startIndex + uint32(i)) % uint32(len(cm.remoteAddrs))
-		addr := cm.remoteAddrs[idx]
+	for i := 0; i < len(currentRemoteAddrs); i++ {
+		idx := (startIndex + uint32(i)) % uint32(len(currentRemoteAddrs))
+		addr := currentRemoteAddrs[idx]
 
 		// Skip unhealthy backends
 		if !cm.IsBackendHealthy(addr) {
@@ -391,9 +580,16 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			return conn, addr, nil
 		}
 
-		// Record failure in health tracking
-		cm.RecordConnectionFailure(addr)
-		logger.Debug("Failed to connect to backend", "addr", addr, "error", err)
+		// Record failure in health tracking only if the context is not done AND
+		// the error is not context-related.
+		// If ctx.Err() != nil OR the error contains context errors, the failure is due to
+		// timeout/cancellation, not backend health.
+		// Examples: slow remote_lookup consuming deadline, client disconnect, global timeout.
+		// This prevents healthy backends from being marked unhealthy due to external factors.
+		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			cm.RecordConnectionFailure(addr)
+		}
+		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
 	}
 
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
@@ -405,11 +601,22 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (conn net.Conn, addr string, err error, shouldFallback bool) {
 	isRemoteLookupRoute := routingInfo != nil && routingInfo.IsRemoteLookupAccount && routingInfo.ServerAddress == preferredAddr
 
+	cm.healthMu.RLock()
 	isInList := false
 	for _, a := range cm.remoteAddrs {
 		if a == preferredAddr {
 			isInList = true
 			break
+		}
+	}
+	cm.healthMu.RUnlock()
+
+	// For remote lookup backends NOT in pool, check their health separately
+	if !isInList && isRemoteLookupRoute {
+		if !cm.IsRemoteLookupBackendHealthy(preferredAddr) {
+			logger.Warn("ConnectionManager: Remote lookup backend (not in pool) is marked unhealthy. Failing request.", "backend", preferredAddr, "server", cm.serverName)
+			err = fmt.Errorf("remotelookup-designated backend %s is marked unhealthy", preferredAddr)
+			return nil, "", err, false // No fallback - fail immediately
 		}
 	}
 
@@ -432,29 +639,51 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 		// Success! Record success in health tracking
 		if isInList {
 			cm.RecordConnectionSuccess(preferredAddr)
+		} else if isRemoteLookupRoute {
+			// Track remote lookup backend (not in pool)
+			cm.RecordRemoteLookupSuccess(preferredAddr)
 		}
 		return conn, preferredAddr, nil, false // No fallback
 	}
 
 	// Connection failed. Mark it as unhealthy if it's in our managed list.
 	if isInList {
-		cm.RecordConnectionFailure(preferredAddr)
+		// Only record failure if context is not canceled/expired AND error is not context-related.
+		// If ctx.Err() != nil OR the error contains context errors, the failure is due to
+		// timeout/cancellation, not backend health.
+		// Examples: slow remote_lookup consuming deadline, client disconnect, global timeout.
+		// This prevents healthy backends from being marked unhealthy due to external factors.
+		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			cm.RecordConnectionFailure(preferredAddr)
+		}
+		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "server", cm.serverName)
+	} else if isRemoteLookupRoute {
+		// Track remote lookup backend failure (not in pool)
+		// Only record failure if context is not canceled/expired
+		// NOTE: We check ctx.Err() only, NOT errors.Is(err, context.DeadlineExceeded) because
+		// dialer timeouts wrap as DeadlineExceeded even when ctx is not expired
+		if ctx.Err() == nil {
+			cm.RecordRemoteLookupFailure(preferredAddr)
+		}
+		logger.Warn("Failed to connect to remote lookup backend (not in pool)", "addr", preferredAddr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
 	}
 
 	if isRemoteLookupRoute {
 		// For remotelookup routes, do NOT fall back to round-robin.
-		logger.Debug("ConnectionManager: Failed to connect to remotelookup-designated server. NOT falling back to round-robin.", "server", preferredAddr, "error", err)
+		logger.Warn("ConnectionManager: Failed to connect to remotelookup-designated server. NOT falling back to round-robin.", "server", preferredAddr, "error", err)
 		err = fmt.Errorf("failed to connect to remotelookup-designated server %s: %w", preferredAddr, err)
 		return nil, "", err, false // No fallback
 	}
 
 	// For affinity-based connections, log the failure and indicate that we should fall back.
-	logger.Debug("ConnectionManager: Failed to connect to preferred address. Falling back to round-robin.", "addr", preferredAddr, "error", err)
+	logger.Warn("ConnectionManager: Failed to connect to preferred address. Falling back to round-robin.", "addr", preferredAddr, "error", err, "server", cm.serverName)
 	return nil, "", err, true // Fallback
 }
 
 // ResolveAddresses resolves hostnames to IP addresses, expanding the address list
 func (cm *ConnectionManager) ResolveAddresses() error {
+	logger.Info("ConnectionManager: Starting address resolution", "server", cm.serverName, "current_backends", len(cm.remoteAddrs))
+
 	var resolvedAddrs []string
 	newBackendHealth := make(map[string]*BackendHealth)
 
@@ -504,8 +733,27 @@ func (cm *ConnectionManager) ResolveAddresses() error {
 	}
 
 	cm.healthMu.Lock()
+	oldBackendCount := len(cm.backendHealth)
 	cm.remoteAddrs = resolvedAddrs
 	cm.backendHealth = newBackendHealth
+
+	// Rebuild consistent hash ring with resolved addresses
+	// This is critical: if we don't update the ring, it will contain old hostnames
+	// while backendHealth contains IP addresses, causing IsBackendHealthy() to fail
+	if cm.consistentHash != nil {
+		cm.consistentHash = NewConsistentHash(150)
+		for _, addr := range resolvedAddrs {
+			cm.consistentHash.AddBackend(addr)
+		}
+		logger.Info("ConnectionManager: Rebuilt consistent hash ring after address resolution", "server", cm.serverName, "backends", len(resolvedAddrs), "previous_health_entries", oldBackendCount)
+	}
+
+	// Log the new health map for debugging
+	logger.Info("ConnectionManager: Address resolution complete", "server", cm.serverName, "resolved_backends", len(resolvedAddrs))
+	for addr, health := range newBackendHealth {
+		logger.Debug("ConnectionManager: Backend after resolution", "server", cm.serverName, "backend", addr, "healthy", health.IsHealthy)
+	}
+
 	cm.healthMu.Unlock()
 
 	return nil
@@ -597,7 +845,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Always establish plain TCP connection first
 	conn, err := dialer.DialContext(ctx, "tcp", resolvedAddr)
 	if err != nil {
-		logger.Debug("ConnectionManager: Failed to connect", "addr", resolvedAddr, "error", err)
+		logger.Warn("ConnectionManager: TCP dial failed", "addr", resolvedAddr, "original_addr", addr, "error", err, "server", cm.serverName)
 		return nil, err
 	}
 

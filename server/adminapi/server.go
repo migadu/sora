@@ -57,6 +57,7 @@ type Server struct {
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
 	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
+	proxyServers       map[string]ProxyServer               // proxy name -> proxy server
 	proxyReader        *server.ProxyProtocolReader          // PROXY protocol support
 }
 
@@ -80,6 +81,7 @@ type ServerOptions struct {
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
 	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
+	ProxyServers       map[string]ProxyServer               // proxy name -> proxy server (for backend health)
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -93,6 +95,35 @@ type AffinityManager interface {
 	GetBackend(username, protocol string) (string, bool)
 	SetBackend(username, backend, protocol string)
 	DeleteBackend(username, protocol string)
+}
+
+// ProxyServer interface for accessing proxy backend health information
+type ProxyServer interface {
+	GetConnectionManager() *proxy.ConnectionManager
+}
+
+// BackendHealthInfo represents backend health status (mirrors proxy.BackendHealthInfo)
+type BackendHealthInfo struct {
+	Address            string    `json:"address"`
+	IsHealthy          bool      `json:"is_healthy"`
+	FailureCount       int       `json:"failure_count"`
+	ConsecutiveFails   int       `json:"consecutive_fails"`
+	LastFailure        time.Time `json:"last_failure,omitempty"`
+	LastSuccess        time.Time `json:"last_success,omitempty"`
+	HealthCheckEnabled bool      `json:"health_check_enabled"`
+	IsRemoteLookup     bool      `json:"is_remote_lookup"` // True if backend from remote_lookup (not in pool)
+}
+
+// ProxyBackendsResponse is the response structure for /admin/proxy/backends
+type ProxyBackendsResponse struct {
+	Proxies   []ProxyBackendInfo `json:"proxies"`
+	Timestamp time.Time          `json:"timestamp"`
+}
+
+// ProxyBackendInfo contains information about a proxy server and its backends
+type ProxyBackendInfo struct {
+	ProxyName string              `json:"proxy_name"`
+	Backends  []BackendHealthInfo `json:"backends"`
 }
 
 // New creates a new HTTP API server
@@ -147,6 +178,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,
 		connectionTrackers: options.ConnectionTrackers,
+		proxyServers:       options.ProxyServers,
 		proxyReader:        proxyReader,
 	}
 
@@ -272,6 +304,9 @@ func (s *Server) setupRoutes() http.Handler {
 	// Health monitoring routes
 	mux.HandleFunc("/admin/health/overview", routeHandler("GET", s.handleHealthOverview))
 	mux.HandleFunc("/admin/health/servers/", s.handleHealthOperations)
+
+	// Proxy backend health routes
+	mux.HandleFunc("/admin/proxy/backends", routeHandler("GET", s.handleProxyBackends))
 
 	// System configuration and status routes
 	mux.HandleFunc("/admin/config", routeHandler("GET", s.handleConfigInfo))
@@ -1434,6 +1469,53 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 		}
 		s.writeJSON(w, http.StatusOK, status)
 	}
+}
+
+// handleProxyBackends returns backend health status for all proxy servers
+func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
+	response := ProxyBackendsResponse{
+		Timestamp: time.Now(),
+		Proxies:   make([]ProxyBackendInfo, 0),
+	}
+
+	// Iterate through all registered proxy servers
+	if s.proxyServers != nil {
+		for proxyName, proxyServer := range s.proxyServers {
+			if proxyServer == nil {
+				continue
+			}
+
+			connMgr := proxyServer.GetConnectionManager()
+			if connMgr == nil {
+				continue
+			}
+
+			// Get backend health statuses from the connection manager
+			backendStatuses := connMgr.GetBackendHealthStatuses()
+
+			// Convert proxy.BackendHealthInfo to adminapi.BackendHealthInfo
+			backends := make([]BackendHealthInfo, len(backendStatuses))
+			for i, status := range backendStatuses {
+				backends[i] = BackendHealthInfo{
+					Address:            status.Address,
+					IsHealthy:          status.IsHealthy,
+					FailureCount:       status.FailureCount,
+					ConsecutiveFails:   status.ConsecutiveFails,
+					LastFailure:        status.LastFailure,
+					LastSuccess:        status.LastSuccess,
+					HealthCheckEnabled: status.HealthCheckEnabled,
+					IsRemoteLookup:     status.IsRemoteLookup,
+				}
+			}
+
+			response.Proxies = append(response.Proxies, ProxyBackendInfo{
+				ProxyName: proxyName,
+				Backends:  backends,
+			})
+		}
+	}
+
+	s.writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {

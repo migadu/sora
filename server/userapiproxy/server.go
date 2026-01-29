@@ -62,28 +62,28 @@ type Server struct {
 
 // ServerOptions holds configuration options for the User API proxy server
 type ServerOptions struct {
-	Name                      string
-	Addr                      string
-	RemoteAddrs               []string
-	RemotePort                int    // Default port for backends if not in address
-	JWTSecret                 string // JWT secret for token validation
-	TLS                       bool
-	TLSCertFile               string
-	TLSKeyFile                string
-	TLSVerify                 bool
-	TLSConfig                 *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteTLS                 bool
-	RemoteTLSVerify           bool
-	ConnectTimeout            time.Duration
-	DisableBackendHealthCheck bool                       // Disable backend health checking
-	MaxConnections            int                        // Maximum total connections per instance (0 = unlimited, local only)
-	MaxConnectionsPerIP       int                        // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
-	TrustedNetworks           []string                   // CIDR blocks for trusted networks that bypass per-IP limits
-	TrustedProxies            []string                   // CIDR blocks for trusted proxies
-	RemoteLookup              *config.RemoteLookupConfig // RemoteLookup configuration for user routing
-	LookupCache               *config.LookupCacheConfig  // Route lookup cache configuration
-	AffinityManager           *server.AffinityManager    // Affinity manager for sticky routing (optional)
-	ClusterManager            *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
+	Name                     string
+	Addr                     string
+	RemoteAddrs              []string
+	RemotePort               int    // Default port for backends if not in address
+	JWTSecret                string // JWT secret for token validation
+	TLS                      bool
+	TLSCertFile              string
+	TLSKeyFile               string
+	TLSVerify                bool
+	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteTLS                bool
+	RemoteTLSVerify          bool
+	ConnectTimeout           time.Duration
+	EnableBackendHealthCheck bool                       // Enable backend health checking (default: true)
+	MaxConnections           int                        // Maximum total connections per instance (0 = unlimited, local only)
+	MaxConnectionsPerIP      int                        // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
+	TrustedNetworks          []string                   // CIDR blocks for trusted networks that bypass per-IP limits
+	TrustedProxies           []string                   // CIDR blocks for trusted proxies
+	RemoteLookup             *config.RemoteLookupConfig // RemoteLookup configuration for user routing
+	LookupCache              *config.LookupCacheConfig  // Route lookup cache configuration
+	AffinityManager          *server.AffinityManager    // Affinity manager for sticky routing (optional)
+	ClusterManager           *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -128,7 +128,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	}
 
 	// Create connection manager with routing lookup
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, false, opts.RemoteTLSVerify, false, connectTimeout, routingLookup, opts.Name, opts.DisableBackendHealthCheck)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, false, opts.RemoteTLSVerify, false, connectTimeout, routingLookup, opts.Name, !opts.EnableBackendHealthCheck)
 	if err != nil {
 		if routingLookup != nil {
 			// Close remotelookup client on error
