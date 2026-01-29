@@ -509,6 +509,18 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	bodyStructure := imapserver.ExtractBodyStructure(bytes.NewReader(content))
+
+	// Validate body structure and use fallback if invalid (e.g., multipart with no children)
+	if err := helpers.ValidateBodyStructure(&bodyStructure); err != nil {
+		logger.Warn("Invalid body structure in S3 object, using fallback", "key", obj.Key, "error", err)
+		fallback := &imap.BodyStructureSinglePart{
+			Type:    "text",
+			Subtype: "plain",
+			Size:    uint32(len(content)),
+		}
+		bodyStructure = fallback
+	}
+
 	extractedPlaintext, err := helpers.ExtractPlaintextBody(messageContent)
 	var actualPlaintextBody string
 	if err == nil && extractedPlaintext != nil {

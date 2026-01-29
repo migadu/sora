@@ -21,8 +21,8 @@ import (
 	_ "github.com/emersion/go-message/charset"
 )
 
-// extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery.
-// Returns a default body structure if extraction fails due to malformed MIME.
+// extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
+// Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
 func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 	defer func() {
 		if r := recover(); r != nil {
@@ -32,6 +32,15 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 
 	bs := imapserver.ExtractBodyStructure(bytes.NewReader(data))
 	if bs != nil {
+		// Validate the extracted body structure
+		if err := helpers.ValidateBodyStructure(&bs); err != nil {
+			// Invalid structure (e.g., multipart with no children), use default
+			return &imap.BodyStructureSinglePart{
+				Type:    "text",
+				Subtype: "plain",
+				Params:  map[string]string{"charset": "utf-8"},
+			}
+		}
 		return bs
 	}
 

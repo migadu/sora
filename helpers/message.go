@@ -7,6 +7,7 @@ import (
 	"mime/quotedprintable"
 	"strings"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
@@ -92,4 +93,35 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 func HashContent(content []byte) string {
 	hash := blake3.Sum256(content)
 	return fmt.Sprintf("%x", hash)
+}
+
+// ValidateBodyStructure checks if a body structure is valid and returns an error for malformed structures.
+// This prevents panics in the IMAP server when serving FETCH BODYSTRUCTURE responses.
+func ValidateBodyStructure(bs *imap.BodyStructure) error {
+	if bs == nil {
+		return nil // nil is handled elsewhere
+	}
+
+	switch v := (*bs).(type) {
+	case *imap.BodyStructureMultiPart:
+		if len(v.Children) == 0 {
+			return fmt.Errorf("invalid multipart body structure: no children (subtype=%s)", v.Subtype)
+		}
+		// Recursively validate children
+		for i, child := range v.Children {
+			if err := ValidateBodyStructure(&child); err != nil {
+				return fmt.Errorf("invalid child %d: %w", i, err)
+			}
+		}
+	case *imap.BodyStructureSinglePart:
+		// Check if it contains an embedded message/rfc822
+		if v.MessageRFC822 != nil && v.MessageRFC822.BodyStructure != nil {
+			childBS := v.MessageRFC822.BodyStructure
+			if err := ValidateBodyStructure(&childBS); err != nil {
+				return fmt.Errorf("invalid embedded message body structure: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
