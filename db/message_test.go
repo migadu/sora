@@ -711,3 +711,154 @@ func TestInsertMessageFromImporter_DuplicateMessageIDDifferentContent(t *testing
 
 	t.Logf("Successfully tested duplicate message_id with different content_hash: kept UID=%d, skipped duplicate with different content", uid1)
 }
+
+// TestInsertMessage_DuplicateDoesNotCreateOrphanedPendingUpload tests that when a duplicate
+// message is detected, no orphaned pending_upload record is created.
+// This test reproduces the bug where duplicate detection happens AFTER pending_upload insert,
+// causing stuck uploads with missing local files.
+func TestInsertMessage_DuplicateDoesNotCreateOrphanedPendingUpload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, mailboxID := setupMessageTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Step 1: Insert first message successfully
+	tx1, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx1.Rollback(ctx)
+
+	now := time.Now()
+	contentHash := "duplicate-test-hash-123"
+	messageID := "<duplicate-test@example.com>"
+
+	bodyStructure := &imap.BodyStructureSinglePart{
+		Type:    "text",
+		Subtype: "plain",
+		Params:  map[string]string{"charset": "utf-8"},
+	}
+	var bs imap.BodyStructure = bodyStructure
+
+	options1 := &InsertMessageOptions{
+		AccountID:     accountID,
+		MailboxID:     mailboxID,
+		MailboxName:   "INBOX",
+		S3Domain:      "example.com",
+		S3Localpart:   "test",
+		ContentHash:   contentHash,
+		MessageID:     messageID,
+		Flags:         []imap.Flag{},
+		InternalDate:  now,
+		Size:          100,
+		Subject:       "Original Message",
+		PlaintextBody: "Original body",
+		SentDate:      now,
+		BodyStructure: &bs,
+	}
+
+	upload1 := PendingUpload{
+		AccountID:   accountID,
+		ContentHash: contentHash,
+		InstanceID:  "test-instance",
+		Size:        100,
+	}
+
+	msgID1, uid1, err := db.InsertMessage(ctx, tx1, options1, upload1)
+	require.NoError(t, err)
+	require.Greater(t, msgID1, int64(0))
+	require.Greater(t, uid1, int64(0))
+
+	err = tx1.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify pending_upload was created for first message
+	var pendingCount1 int
+	err = db.GetReadPool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM pending_uploads
+		WHERE content_hash = $1 AND account_id = $2
+	`, contentHash, accountID).Scan(&pendingCount1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, pendingCount1, "First message should create pending_upload")
+	t.Logf("After first insert: pending_upload count = %d", pendingCount1)
+
+	// Step 2: Attempt to insert duplicate message (same message_id + same content_hash)
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	options2 := &InsertMessageOptions{
+		AccountID:     accountID,
+		MailboxID:     mailboxID,
+		MailboxName:   "INBOX",
+		S3Domain:      "example.com",
+		S3Localpart:   "test",
+		ContentHash:   contentHash, // SAME content hash
+		MessageID:     messageID,   // SAME message_id
+		Flags:         []imap.Flag{},
+		InternalDate:  now,
+		Size:          100,
+		Subject:       "Duplicate Attempt",
+		PlaintextBody: "Original body",
+		SentDate:      now,
+		BodyStructure: &bs,
+	}
+
+	upload2 := PendingUpload{
+		AccountID:   accountID,
+		ContentHash: contentHash,
+		InstanceID:  "test-instance",
+		Size:        100,
+	}
+
+	msgID2, uid2, insertErr := db.InsertMessage(ctx, tx2, options2, upload2)
+
+	// Should detect duplicate and return ErrMessageExists
+	require.Error(t, insertErr, "Duplicate message should return error")
+	require.ErrorIs(t, insertErr, consts.ErrMessageExists, "Should return ErrMessageExists")
+	assert.Equal(t, int64(0), msgID2, "messageID should be 0 for duplicate")
+	assert.Equal(t, uid1, uid2, "Should return existing UID")
+	t.Logf("After duplicate attempt: msgID=%d, uid=%d, insertErr=%v", msgID2, uid2, insertErr)
+
+	err = tx2.Rollback(ctx) // Rollback to simulate LMTP behavior
+	require.NoError(t, err)
+
+	// Step 3: CRITICAL CHECK - pending_upload count should still be 1
+	// Bug: If duplicate check happens AFTER pending_upload insert, count would be 2
+	// But local file was never written for the duplicate, causing stuck uploads
+	var pendingCountFinal int
+	err = db.GetReadPool().QueryRow(ctx, `
+		SELECT COUNT(*) FROM pending_uploads
+		WHERE content_hash = $1 AND account_id = $2
+	`, contentHash, accountID).Scan(&pendingCountFinal)
+	require.NoError(t, err)
+
+	// THIS IS THE BUG: If this fails, it means duplicate detection created an orphaned pending_upload
+	// The uploader will try to upload a file that doesn't exist (because LMTP skipped file write)
+	assert.Equal(t, 1, pendingCountFinal,
+		"BUG DETECTED: Duplicate message created orphaned pending_upload! "+
+			"This causes 'no such file or directory' errors in uploader worker. "+
+			"Fix: Move duplicate check BEFORE pending_upload insert.")
+
+	t.Logf("Test passed: Duplicate detection did not create orphaned pending_upload (count=%d)", pendingCountFinal)
+}
+
+// NOTE: The above test verifies database-level duplicate handling works correctly.
+// However, there's a separate race condition at the LMTP file system level:
+//
+// RACE CONDITION BUG (fixed in server/lmtp/session.go):
+// 1. Message1 arrives → file written to disk, pending_upload created
+// 2. Uploader acquires pending_upload, starts reading file
+// 3. Message2 (duplicate) arrives → StoreLocally() OVERWRITES same file path
+// 4. Message2 duplicate detected → LMTP deletes file
+// 5. Uploader tries to read → "no such file or directory"
+// 6. Uploader retries 5x → stuck upload
+//
+// This race happens because:
+// - File path is deterministic: /uploads/{account_id}/{content_hash}
+// - os.WriteFile() overwrites existing files
+// - LMTP deletes file on duplicate detection
+//
+// The fix checks if file exists before writing in server/lmtp/session.go:347-364

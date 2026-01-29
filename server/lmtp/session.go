@@ -341,11 +341,27 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
 	// Store message locally for background upload to S3
-	filePath, err := s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
-	if err != nil {
-		return s.InternalError("failed to save message to disk: %v", err)
+	// Check if file already exists to prevent race condition:
+	// If a duplicate arrives while uploader is processing the first copy,
+	// we don't want to overwrite/delete the file the uploader is reading.
+	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
+	var filePath *string
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		// File doesn't exist, safe to write
+		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
+		if err != nil {
+			return s.InternalError("failed to save message to disk: %v", err)
+		}
+		s.DebugLog("message accepted locally", "path", *filePath)
+	} else if err == nil {
+		// File already exists (likely being processed by uploader or duplicate delivery)
+		// Don't overwrite it - just use the existing path
+		filePath = &expectedPath
+		s.DebugLog("message file already exists, skipping write", "path", expectedPath)
+	} else {
+		// Stat error (permission issue, etc.)
+		return s.InternalError("failed to check file existence: %v", err)
 	}
-	s.DebugLog("message accepted locally", "path", *filePath)
 
 	// SIEVE script processing
 
