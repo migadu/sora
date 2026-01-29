@@ -48,8 +48,9 @@ type ConnectionManager struct {
 	consistentHash *ConsistentHash
 
 	// Backend health tracking
-	healthMu      sync.RWMutex
-	backendHealth map[string]*BackendHealth
+	healthMu                  sync.RWMutex
+	backendHealth             map[string]*BackendHealth
+	disableBackendHealthCheck bool // If true, health checks are completely disabled
 
 	// User routing lookup
 	routingLookup UserRoutingLookup
@@ -70,6 +71,11 @@ func NewConnectionManagerWithRouting(remoteAddrs []string, remotePort int, remot
 
 // NewConnectionManagerWithRoutingAndStartTLS creates a new connection manager with optional user routing and StartTLS support
 func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string) (*ConnectionManager, error) {
+	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs, remotePort, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, routingLookup, serverName, false)
+}
+
+// NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck creates a new connection manager with all options including health check control
+func NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string, disableHealthCheck bool) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
@@ -97,17 +103,18 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 	}
 
 	cm := &ConnectionManager{
-		serverName:             serverName,
-		remoteAddrs:            normalizedAddrs,
-		remotePort:             remotePort,
-		remoteTLS:              remoteTLS,
-		remoteTLSUseStartTLS:   remoteTLSUseStartTLS,
-		remoteTLSVerify:        remoteTLSVerify,
-		remoteUseProxyProtocol: remoteUseProxyProtocol,
-		connectTimeout:         connectTimeout,
-		consistentHash:         consistentHash,
-		backendHealth:          backendHealth,
-		routingLookup:          routingLookup,
+		serverName:                serverName,
+		remoteAddrs:               normalizedAddrs,
+		remotePort:                remotePort,
+		remoteTLS:                 remoteTLS,
+		remoteTLSUseStartTLS:      remoteTLSUseStartTLS,
+		remoteTLSVerify:           remoteTLSVerify,
+		remoteUseProxyProtocol:    remoteUseProxyProtocol,
+		connectTimeout:            connectTimeout,
+		consistentHash:            consistentHash,
+		backendHealth:             backendHealth,
+		routingLookup:             routingLookup,
+		disableBackendHealthCheck: disableHealthCheck,
 	}
 
 	logger.Debug("Connection manager: Initialized consistent hash ring", "prefix", cm.logPrefix(), "backends", len(normalizedAddrs))
@@ -169,6 +176,11 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 // Returns true if healthy, false if marked unhealthy
 // Auto-recovers backends after 1 minute of being marked unhealthy
 func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
+	// If health checks are disabled, always return true (all backends healthy)
+	if cm.disableBackendHealthCheck {
+		return true
+	}
+
 	cm.healthMu.RLock()
 	health, exists := cm.backendHealth[backend]
 	cm.healthMu.RUnlock()
@@ -220,6 +232,11 @@ func (cm *ConnectionManager) RecordConnectionSuccess(backend string) {
 // RecordConnectionFailure records a connection failure and marks backend unhealthy after 3 consecutive failures
 // Returns true if backend was just marked unhealthy (transition from healthy to unhealthy)
 func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
+	// If health checks are disabled, do nothing
+	if cm.disableBackendHealthCheck {
+		return false
+	}
+
 	cm.healthMu.Lock()
 	defer cm.healthMu.Unlock()
 

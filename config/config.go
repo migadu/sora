@@ -998,117 +998,121 @@ func (c *ManageSieveServerConfig) GetAbsoluteSessionTimeout() (time.Duration, er
 
 // IMAPProxyServerConfig holds IMAP proxy server configuration.
 type IMAPProxyServerConfig struct {
-	Start                  bool                  `toml:"start"`
-	Addr                   string                `toml:"addr"`
-	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
-	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername     string                `toml:"master_sasl_username"`
-	MasterSASLPassword     string                `toml:"master_sasl_password"`
-	TLS                    bool                  `toml:"tls"`
-	TLSCertFile            string                `toml:"tls_cert_file"`
-	TLSKeyFile             string                `toml:"tls_key_file"`
-	TLSVerify              bool                  `toml:"tls_verify"`
-	RemoteTLS              bool                  `toml:"remote_tls"`
-	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
-	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseIDCommand     bool                  `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding client info
-	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	EnableAffinity         bool                  `toml:"enable_affinity"`
-	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`   // Database-driven user routing
+	Start                     bool                  `toml:"start"`
+	Addr                      string                `toml:"addr"`
+	RemoteAddrs               []string              `toml:"remote_addrs"`
+	RemotePort                any                   `toml:"remote_port"`            // Default port for backends if not in address
+	MaxConnections            int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP       int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername        string                `toml:"master_sasl_username"`
+	MasterSASLPassword        string                `toml:"master_sasl_password"`
+	TLS                       bool                  `toml:"tls"`
+	TLSCertFile               string                `toml:"tls_cert_file"`
+	TLSKeyFile                string                `toml:"tls_key_file"`
+	TLSVerify                 bool                  `toml:"tls_verify"`
+	RemoteTLS                 bool                  `toml:"remote_tls"`
+	RemoteTLSVerify           bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol    bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseIDCommand        bool                  `toml:"remote_use_id_command"`     // Use IMAP ID command for forwarding client info
+	ConnectTimeout            string                `toml:"connect_timeout"`
+	AuthIdleTimeout           string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout            string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout    string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
+	MinBytesPerMinute         int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	EnableAffinity            bool                  `toml:"enable_affinity"`
+	DisableBackendHealthCheck bool                  `toml:"disable_backend_health_check"` // Disable backend health checking (default: false)
+	AuthRateLimit             AuthRateLimiterConfig `toml:"auth_rate_limit"`              // Authentication rate limiting
+	RemoteLookup              *RemoteLookupConfig   `toml:"remote_lookup"`                // Database-driven user routing
 }
 
 // POP3ProxyServerConfig holds POP3 proxy server configuration.
 type POP3ProxyServerConfig struct {
-	Start                  bool                  `toml:"start"`
-	Addr                   string                `toml:"addr"`
-	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
-	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	MasterSASLUsername     string                `toml:"master_sasl_username"`
-	MasterSASLPassword     string                `toml:"master_sasl_password"`
-	TLS                    bool                  `toml:"tls"`
-	TLSCertFile            string                `toml:"tls_cert_file"`
-	TLSKeyFile             string                `toml:"tls_key_file"`
-	TLSVerify              bool                  `toml:"tls_verify"`
-	RemoteTLS              bool                  `toml:"remote_tls"`
-	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
-	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseXCLIENT       bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
-	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	EnableAffinity         bool                  `toml:"enable_affinity"`
-	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"` // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`   // Database-driven user routing
+	Start                     bool                  `toml:"start"`
+	Addr                      string                `toml:"addr"`
+	RemoteAddrs               []string              `toml:"remote_addrs"`
+	RemotePort                any                   `toml:"remote_port"`            // Default port for backends if not in address
+	MaxConnections            int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP       int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	MasterSASLUsername        string                `toml:"master_sasl_username"`
+	MasterSASLPassword        string                `toml:"master_sasl_password"`
+	TLS                       bool                  `toml:"tls"`
+	TLSCertFile               string                `toml:"tls_cert_file"`
+	TLSKeyFile                string                `toml:"tls_key_file"`
+	TLSVerify                 bool                  `toml:"tls_verify"`
+	RemoteTLS                 bool                  `toml:"remote_tls"`
+	RemoteTLSVerify           bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol    bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT          bool                  `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
+	ConnectTimeout            string                `toml:"connect_timeout"`
+	AuthIdleTimeout           string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout            string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout    string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
+	MinBytesPerMinute         int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	EnableAffinity            bool                  `toml:"enable_affinity"`
+	DisableBackendHealthCheck bool                  `toml:"disable_backend_health_check"` // Disable backend health checking (default: false)
+	AuthRateLimit             AuthRateLimiterConfig `toml:"auth_rate_limit"`              // Authentication rate limiting
+	RemoteLookup              *RemoteLookupConfig   `toml:"remote_lookup"`                // Database-driven user routing
 }
 
 // ManageSieveProxyServerConfig holds ManageSieve proxy server configuration.
 type ManageSieveProxyServerConfig struct {
-	Start                  bool                  `toml:"start"`
-	Addr                   string                `toml:"addr"`
-	RemoteAddrs            []string              `toml:"remote_addrs"`
-	RemotePort             any                   `toml:"remote_port"`            // Default port for backends if not in address
-	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	InsecureAuth           bool                  `toml:"insecure_auth"`
-	MasterSASLUsername     string                `toml:"master_sasl_username"`
-	MasterSASLPassword     string                `toml:"master_sasl_password"`
-	TLS                    bool                  `toml:"tls"`
-	TLSUseStartTLS         bool                  `toml:"tls_use_starttls"` // Use STARTTLS on listening port
-	TLSCertFile            string                `toml:"tls_cert_file"`
-	TLSKeyFile             string                `toml:"tls_key_file"`
-	TLSVerify              bool                  `toml:"tls_verify"`
-	RemoteTLS              bool                  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool                  `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool                  `toml:"remote_tls_verify"`
-	RemoteUseProxyProtocol bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	ConnectTimeout         string                `toml:"connect_timeout"`
-	AuthIdleTimeout        string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
-	CommandTimeout         string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
-	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
-	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
-	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`            // Database-driven user routing
-	EnableAffinity         bool                  `toml:"enable_affinity"`
-	AffinityStickiness     float64               `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string                `toml:"affinity_validity"`
+	Start                     bool                  `toml:"start"`
+	Addr                      string                `toml:"addr"`
+	RemoteAddrs               []string              `toml:"remote_addrs"`
+	RemotePort                any                   `toml:"remote_port"`            // Default port for backends if not in address
+	MaxConnections            int                   `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP       int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	InsecureAuth              bool                  `toml:"insecure_auth"`
+	MasterSASLUsername        string                `toml:"master_sasl_username"`
+	MasterSASLPassword        string                `toml:"master_sasl_password"`
+	TLS                       bool                  `toml:"tls"`
+	TLSUseStartTLS            bool                  `toml:"tls_use_starttls"` // Use STARTTLS on listening port
+	TLSCertFile               string                `toml:"tls_cert_file"`
+	TLSKeyFile                string                `toml:"tls_key_file"`
+	TLSVerify                 bool                  `toml:"tls_verify"`
+	RemoteTLS                 bool                  `toml:"remote_tls"`
+	RemoteTLSUseStartTLS      bool                  `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
+	RemoteTLSVerify           bool                  `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol    bool                  `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	ConnectTimeout            string                `toml:"connect_timeout"`
+	AuthIdleTimeout           string                `toml:"auth_idle_timeout"`        // Idle timeout during authentication phase (pre-auth only, default: 2m)
+	CommandTimeout            string                `toml:"command_timeout"`          // Maximum idle time (default: 0 = disabled for proxies)
+	AbsoluteSessionTimeout    string                `toml:"absolute_session_timeout"` // Maximum total session duration (default: 24h)
+	MinBytesPerMinute         int64                 `toml:"min_bytes_per_minute"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	AuthRateLimit             AuthRateLimiterConfig `toml:"auth_rate_limit"`          // Authentication rate limiting
+	RemoteLookup              *RemoteLookupConfig   `toml:"remote_lookup"`            // Database-driven user routing
+	EnableAffinity            bool                  `toml:"enable_affinity"`
+	DisableBackendHealthCheck bool                  `toml:"disable_backend_health_check"` // Disable backend health checking (default: false)
+	AffinityStickiness        float64               `toml:"affinity_stickiness"`          // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity          string                `toml:"affinity_validity"`
 }
 
 // LMTPProxyServerConfig holds LMTP proxy server configuration.
 type LMTPProxyServerConfig struct {
-	Start                  bool                `toml:"start"`
-	Addr                   string              `toml:"addr"`
-	RemoteAddrs            []string            `toml:"remote_addrs"`
-	RemotePort             any                 `toml:"remote_port"`            // Default port for backends if not in address
-	MaxConnections         int                 `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP    int                 `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                    bool                `toml:"tls"`
-	TLSUseStartTLS         bool                `toml:"tls_use_starttls"` // Use STARTTLS on listening port
-	TLSCertFile            string              `toml:"tls_cert_file"`
-	TLSKeyFile             string              `toml:"tls_key_file"`
-	TLSVerify              bool                `toml:"tls_verify"`
-	RemoteTLS              bool                `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool                `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool                `toml:"remote_tls_verify"`
-	RemoteUseProxyProtocol bool                `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseXCLIENT       bool                `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
-	ConnectTimeout         string              `toml:"connect_timeout"`
-	AuthIdleTimeout        string              `toml:"auth_idle_timeout"` // Idle timeout during authentication phase (pre-auth only)
-	MaxMessageSize         string              `toml:"max_message_size"`  // Maximum message size announced in EHLO
-	EnableAffinity         bool                `toml:"enable_affinity"`
-	AffinityStickiness     float64             `toml:"affinity_stickiness"` // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string              `toml:"affinity_validity"`
-	RemoteLookup           *RemoteLookupConfig `toml:"remote_lookup"` // Database-driven user routing
+	Start                     bool                `toml:"start"`
+	Addr                      string              `toml:"addr"`
+	RemoteAddrs               []string            `toml:"remote_addrs"`
+	RemotePort                any                 `toml:"remote_port"`            // Default port for backends if not in address
+	MaxConnections            int                 `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP       int                 `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                       bool                `toml:"tls"`
+	TLSUseStartTLS            bool                `toml:"tls_use_starttls"` // Use STARTTLS on listening port
+	TLSCertFile               string              `toml:"tls_cert_file"`
+	TLSKeyFile                string              `toml:"tls_key_file"`
+	TLSVerify                 bool                `toml:"tls_verify"`
+	RemoteTLS                 bool                `toml:"remote_tls"`
+	RemoteTLSUseStartTLS      bool                `toml:"remote_tls_use_starttls"` // Use STARTTLS for backend connections
+	RemoteTLSVerify           bool                `toml:"remote_tls_verify"`
+	RemoteUseProxyProtocol    bool                `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	RemoteUseXCLIENT          bool                `toml:"remote_use_xclient"`        // Use XCLIENT command for forwarding client info
+	ConnectTimeout            string              `toml:"connect_timeout"`
+	AuthIdleTimeout           string              `toml:"auth_idle_timeout"` // Idle timeout during authentication phase (pre-auth only)
+	MaxMessageSize            string              `toml:"max_message_size"`  // Maximum message size announced in EHLO
+	EnableAffinity            bool                `toml:"enable_affinity"`
+	DisableBackendHealthCheck bool                `toml:"disable_backend_health_check"` // Disable backend health checking (default: false)
+	AffinityStickiness        float64             `toml:"affinity_stickiness"`          // Probability (0.0 to 1.0) of using an affinity server.
+	AffinityValidity          string              `toml:"affinity_validity"`
+	RemoteLookup              *RemoteLookupConfig `toml:"remote_lookup"` // Database-driven user routing
 }
 
 // MetricsConfig holds metrics server configuration
@@ -1152,21 +1156,22 @@ type UserAPIServerConfig struct {
 
 // UserAPIProxyServerConfig holds User API proxy server configuration
 type UserAPIProxyServerConfig struct {
-	Start               bool     `toml:"start"`
-	Addr                string   `toml:"addr"`
-	RemoteAddrs         []string `toml:"remote_addrs"`
-	RemotePort          any      `toml:"remote_port"`            // Default port for backends if not in address
-	JWTSecret           string   `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
-	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                 bool     `toml:"tls"`
-	TLSCertFile         string   `toml:"tls_cert_file"`
-	TLSKeyFile          string   `toml:"tls_key_file"`
-	TLSVerify           bool     `toml:"tls_verify"`
-	RemoteTLS           bool     `toml:"remote_tls"`
-	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
-	ConnectTimeout      string   `toml:"connect_timeout"`
-	EnableAffinity      bool     `toml:"enable_affinity"`
+	Start                     bool     `toml:"start"`
+	Addr                      string   `toml:"addr"`
+	RemoteAddrs               []string `toml:"remote_addrs"`
+	RemotePort                any      `toml:"remote_port"`            // Default port for backends if not in address
+	JWTSecret                 string   `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
+	MaxConnections            int      `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP       int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                       bool     `toml:"tls"`
+	TLSCertFile               string   `toml:"tls_cert_file"`
+	TLSKeyFile                string   `toml:"tls_key_file"`
+	TLSVerify                 bool     `toml:"tls_verify"`
+	RemoteTLS                 bool     `toml:"remote_tls"`
+	RemoteTLSVerify           bool     `toml:"remote_tls_verify"`
+	ConnectTimeout            string   `toml:"connect_timeout"`
+	EnableAffinity            bool     `toml:"enable_affinity"`
+	DisableBackendHealthCheck bool     `toml:"disable_backend_health_check"` // Disable backend health checking (default: false)
 }
 
 // ServerLimitsConfig holds resource limits for a server
@@ -1228,19 +1233,20 @@ type ServerConfig struct {
 	InsecureAuth        bool     `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific
-	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
-	RemotePort             any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
-	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
-	RemoteTLSUseStartTLS   bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
-	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
-	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
-	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
-	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
-	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
-	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
-	AffinityStickiness     float64  `toml:"affinity_stickiness,omitempty"`
-	AffinityValidity       string   `toml:"affinity_validity,omitempty"`
+	RemoteAddrs               []string `toml:"remote_addrs,omitempty"`
+	RemotePort                any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
+	RemoteTLS                 bool     `toml:"remote_tls,omitempty"`
+	RemoteTLSUseStartTLS      bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
+	RemoteTLSVerify           bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteUseProxyProtocol    bool     `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand        bool     `toml:"remote_use_id_command,omitempty"`
+	RemoteUseXCLIENT          bool     `toml:"remote_use_xclient,omitempty"`
+	ConnectTimeout            string   `toml:"connect_timeout,omitempty"`
+	AuthIdleTimeout           string   `toml:"auth_idle_timeout,omitempty"`
+	EnableAffinity            bool     `toml:"enable_affinity,omitempty"`
+	DisableBackendHealthCheck bool     `toml:"disable_backend_health_check,omitempty"` // Disable backend health checking (default: false)
+	AffinityStickiness        float64  `toml:"affinity_stickiness,omitempty"`
+	AffinityValidity          string   `toml:"affinity_validity,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`

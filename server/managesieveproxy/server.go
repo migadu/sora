@@ -85,36 +85,37 @@ type Server struct {
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
 type ServerOptions struct {
-	Name                   string // Server name for logging
-	Addr                   string
-	RemoteAddrs            []string
-	RemotePort             int // Default port for backends if not in address
-	InsecureAuth           bool
-	MasterUsername         string
-	MasterPassword         string
-	MasterSASLUsername     string
-	MasterSASLPassword     string
-	TLS                    bool
-	TLSUseStartTLS         bool // Use STARTTLS on listening port
-	TLSCertFile            string
-	TLSKeyFile             string
-	TLSVerify              bool
-	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteTLS              bool
-	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool
-	RemoteUseProxyProtocol bool
-	ConnectTimeout         time.Duration
-	AuthIdleTimeout        time.Duration
-	CommandTimeout         time.Duration // Idle timeout
-	AbsoluteSessionTimeout time.Duration // Maximum total session duration
-	MinBytesPerMinute      int64         // Minimum throughput
-	EnableAffinity         bool
-	AffinityValidity       time.Duration
-	AffinityStickiness     float64
-	AuthRateLimit          server.AuthRateLimiterConfig
-	RemoteLookup           *config.RemoteLookupConfig
-	TrustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
+	Name                      string // Server name for logging
+	Addr                      string
+	RemoteAddrs               []string
+	RemotePort                int // Default port for backends if not in address
+	InsecureAuth              bool
+	MasterUsername            string
+	MasterPassword            string
+	MasterSASLUsername        string
+	MasterSASLPassword        string
+	TLS                       bool
+	TLSUseStartTLS            bool // Use STARTTLS on listening port
+	TLSCertFile               string
+	TLSKeyFile                string
+	TLSVerify                 bool
+	TLSConfig                 *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteTLS                 bool
+	RemoteTLSUseStartTLS      bool // Use STARTTLS for backend connections
+	RemoteTLSVerify           bool
+	RemoteUseProxyProtocol    bool
+	ConnectTimeout            time.Duration
+	AuthIdleTimeout           time.Duration
+	CommandTimeout            time.Duration // Idle timeout
+	AbsoluteSessionTimeout    time.Duration // Maximum total session duration
+	MinBytesPerMinute         int64         // Minimum throughput
+	EnableAffinity            bool
+	DisableBackendHealthCheck bool // Disable backend health checking
+	AffinityValidity          time.Duration
+	AffinityStickiness        float64
+	AuthRateLimit             server.AuthRateLimiterConfig
+	RemoteLookup              *config.RemoteLookupConfig
+	TrustedProxies            []string // CIDR blocks for trusted proxies that can forward parameters
 
 	// Connection limiting
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
@@ -180,7 +181,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Debug("ManageSieve Proxy: Continuing without remotelookup - local lookup enabled", "name", opts.Name)
 	}
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name, opts.DisableBackendHealthCheck)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

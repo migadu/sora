@@ -75,30 +75,31 @@ type Server struct {
 
 // ServerOptions holds options for creating a new LMTP proxy server.
 type ServerOptions struct {
-	Name                   string // Server name for logging
-	Addr                   string
-	RemoteAddrs            []string
-	RemotePort             int // Default port for backends if not in address
-	TLS                    bool
-	TLSUseStartTLS         bool // Use STARTTLS on listening port
-	TLSCertFile            string
-	TLSKeyFile             string
-	TLSVerify              bool
-	TLSConfig              *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteTLS              bool
-	RemoteTLSUseStartTLS   bool // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool
-	RemoteUseProxyProtocol bool
-	ConnectTimeout         time.Duration
-	AuthIdleTimeout        time.Duration
-	EnableAffinity         bool
-	AffinityValidity       time.Duration
-	AffinityStickiness     float64
-	RemoteLookup           *config.RemoteLookupConfig
-	TrustedProxies         []string      // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
-	AbsoluteSessionTimeout time.Duration // Maximum total session duration (prevents hung sessions)
-	MaxMessageSize         int64
+	Name                      string // Server name for logging
+	Addr                      string
+	RemoteAddrs               []string
+	RemotePort                int // Default port for backends if not in address
+	TLS                       bool
+	TLSUseStartTLS            bool // Use STARTTLS on listening port
+	TLSCertFile               string
+	TLSKeyFile                string
+	TLSVerify                 bool
+	TLSConfig                 *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteTLS                 bool
+	RemoteTLSUseStartTLS      bool // Use STARTTLS for backend connections
+	RemoteTLSVerify           bool
+	RemoteUseProxyProtocol    bool
+	ConnectTimeout            time.Duration
+	AuthIdleTimeout           time.Duration
+	EnableAffinity            bool
+	DisableBackendHealthCheck bool // Disable backend health checking
+	AffinityValidity          time.Duration
+	AffinityStickiness        float64
+	RemoteLookup              *config.RemoteLookupConfig
+	TrustedProxies            []string      // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT          bool          // Whether backend supports XCLIENT command for forwarding
+	AbsoluteSessionTimeout    time.Duration // Maximum total session duration (prevents hung sessions)
+	MaxMessageSize            int64
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
@@ -162,7 +163,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLS(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name)
+	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, opts.RemoteTLSUseStartTLS, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name, opts.DisableBackendHealthCheck)
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()
