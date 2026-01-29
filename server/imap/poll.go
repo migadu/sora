@@ -95,7 +95,34 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	if poll.NumMessages > currentCount {
 		// New messages arrived
 		s.DebugLog("updating message count", "old_count", currentCount, "new_count", poll.NumMessages)
-		s.mailboxTracker.QueueNumMessages(poll.NumMessages)
+
+		// Protect against panic if tracker.numMessages > poll.NumMessages due to race
+		// This can happen if there's a desync between currentNumMessages and tracker's internal count
+		panicOccurred := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicOccurred = true
+					s.WarnLog("tracker desync detected - cannot update message count",
+						"error", r,
+						"old_count", currentCount,
+						"new_count", poll.NumMessages,
+						"mailbox_id", mailboxID)
+				}
+			}()
+			s.mailboxTracker.QueueNumMessages(poll.NumMessages)
+		}()
+
+		// If we couldn't update the tracker due to desync, the only safe option
+		// is to disconnect this session to force a fresh SELECT and rebuild tracker state
+		if panicOccurred {
+			s.WarnLog("forcing disconnection due to tracker desync")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeUnavailable,
+				Text: "Mailbox state changed externally, please reconnect",
+			}
+		}
 		s.currentNumMessages.Store(poll.NumMessages)
 	} else if poll.NumMessages < currentCount {
 		// Database has fewer messages - check if there are expunge updates to explain it
@@ -124,6 +151,11 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	expungedSeqNums := make(map[uint32]bool)
 	skippedExpunges := 0
 
+	// Track the mailbox tracker's expected message count as we process expunges.
+	// The tracker starts with currentCount and decrements with each expunge.
+	// We must not queue an expunge if it would make the tracker's count go negative.
+	trackerExpectedCount := s.currentNumMessages.Load()
+
 	// Process expunge updates
 	for _, update := range poll.Updates {
 		if !update.IsExpunge {
@@ -137,18 +169,33 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 			continue
 		}
 
-		// Validate sequence number is within range
-		currentMessages := s.currentNumMessages.Load()
-		if update.SeqNum == 0 || update.SeqNum > currentMessages {
-			s.DebugLog("expunge sequence number out of range, skipping", "seq", update.SeqNum, "uid", update.UID, "mailbox_messages", currentMessages)
+		// Validate sequence number is within range of the tracker's current count
+		// The tracker will panic if seqNum > tracker.numMessages, so we check against trackerExpectedCount
+		if update.SeqNum == 0 || update.SeqNum > trackerExpectedCount {
+			s.DebugLog("expunge sequence number out of range for tracker, skipping",
+				"seq", update.SeqNum, "uid", update.UID,
+				"tracker_messages", trackerExpectedCount,
+				"session_messages", s.currentNumMessages.Load())
 			skippedExpunges++
 			continue
 		}
 
-		s.DebugLog("processing expunge update", "seq", update.SeqNum, "uid", update.UID)
+		// Also check if tracker would go to zero and we have more expunges coming
+		// This prevents trying to expunge from an already-empty tracker
+		if trackerExpectedCount == 0 {
+			s.DebugLog("skipping expunge because tracker is already at zero",
+				"seq", update.SeqNum, "uid", update.UID)
+			skippedExpunges++
+			continue
+		}
+
+		s.DebugLog("processing expunge update", "seq", update.SeqNum, "uid", update.UID,
+			"tracker_count_before", trackerExpectedCount)
 		s.mailboxTracker.QueueExpunge(update.SeqNum)
 		// Atomically decrement the current number of messages
 		s.currentNumMessages.Add(^uint32(0)) // Equivalent to -1 for unsigned
+		// Track that the mailbox tracker's count decreased
+		trackerExpectedCount--
 
 		// Mark this sequence number as already expunged to prevent duplicates
 		expungedSeqNums[update.SeqNum] = true
@@ -221,6 +268,32 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		// Database has more messages than expected - sync up
 		// This is safe because new messages just get higher sequence numbers
 		s.DebugLog("syncing message count up to database", "session_count", finalCount, "db_count", poll.NumMessages)
+
+		// Protect against panic if tracker.numMessages > poll.NumMessages due to race
+		panicOccurred := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicOccurred = true
+					s.WarnLog("tracker desync detected when syncing message count up",
+						"error", r,
+						"final_count", finalCount,
+						"db_count", poll.NumMessages,
+						"mailbox_id", mailboxID)
+				}
+			}()
+			s.mailboxTracker.QueueNumMessages(poll.NumMessages)
+		}()
+
+		// If we couldn't update the tracker due to desync, force disconnection
+		if panicOccurred {
+			s.WarnLog("forcing disconnection due to tracker desync")
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeUnavailable,
+				Text: "Mailbox state changed externally, please reconnect",
+			}
+		}
 		s.currentNumMessages.Store(poll.NumMessages)
 	}
 

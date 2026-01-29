@@ -293,8 +293,33 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 		// Only queue if the count increased
 		// NOTE: QueueNumMessages() only accepts increases - it panics on decreases or equal values
+		// Also, QueueNumMessages panics if the new count is less than the tracker's internal count,
+		// which can happen if there's a desync between s.currentNumMessages and tracker.numMessages.
 		if s.mailboxTracker != nil && uint32(actualCount) > oldCount {
-			s.mailboxTracker.QueueNumMessages(uint32(actualCount))
+			panicOccurred := false
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicOccurred = true
+						s.WarnLog("tracker desync detected when updating after append",
+							"error", r,
+							"old_count", oldCount,
+							"new_count", actualCount,
+							"mailbox_id", mailbox.ID)
+					}
+				}()
+				s.mailboxTracker.QueueNumMessages(uint32(actualCount))
+			}()
+
+			// If tracker update failed due to desync, other sessions won't be notified
+			// of the new message. Log this clearly so it's visible in monitoring.
+			// The APPEND itself succeeded, so we don't fail the operation.
+			// The next IDLE/Poll will reconcile the state.
+			if panicOccurred {
+				s.WarnLog("append succeeded but tracker notification failed - other sessions may not see new message until next poll",
+					"mailbox_id", mailbox.ID,
+					"message_uid", messageUID)
+			}
 		} else if s.mailboxTracker == nil {
 			// This would indicate an inconsistent state if a mailbox is selected but has no tracker.
 			s.DebugLog("inconsistent state: mailbox selected but tracker is nil", "mailbox_id", s.selectedMailbox.ID)
