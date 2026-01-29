@@ -210,10 +210,10 @@ func (db *Database) GetFailedUploadsWithEmail(ctx context.Context, maxAttempts i
 		SELECT
 			p.id, p.account_id, p.content_hash, p.size, p.instance_id,
 			p.attempts, p.created_at, p.updated_at, p.last_attempt,
-			c.email as account_email
+			c.address as account_email
 		FROM pending_uploads p
 		JOIN accounts a ON p.account_id = a.id
-		JOIN credentials c ON a.id = c.account_id AND c.is_primary = TRUE
+		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
 		WHERE p.attempts >= $1
 		ORDER BY p.created_at DESC
 		LIMIT $2
