@@ -484,19 +484,22 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	// Before deleting the mailboxes, update all messages within them (the one
-	// being deleted and all its children) to preserve their mailbox path.
+	// being deleted and all its children) to preserve their mailbox path and mark as expunged.
 	// This is crucial for restoring messages later.
 	// This single UPDATE using a JOIN is much more efficient than looping.
 	_, err = tx.Exec(ctx, `
 		UPDATE messages m
-		SET mailbox_path = mb.name
+		SET mailbox_path = mb.name,
+		    expunged_at = now(),
+		    expunged_modseq = nextval('messages_modseq')
 		FROM mailboxes mb
 		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1 
+		  AND mb.account_id = $1
 		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
+		  AND m.expunged_at IS NULL
 	`, AccountID, mailboxID, mboxPath)
 	if err != nil {
-		log.Printf("Database: ERROR - failed to set path on messages for mailbox %d and its children: %v", mailboxID, err)
+		log.Printf("Database: ERROR - failed to set path and mark messages as expunged for mailbox %d and its children: %v", mailboxID, err)
 		return consts.ErrInternalError
 	}
 

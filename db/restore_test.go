@@ -983,3 +983,262 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	assert.Equal(t, 1, inboxCount, "Should have exactly 1 message in INBOX")
 	assert.Equal(t, 1, trashCount, "Should have exactly 1 message in Trash")
 }
+
+// TestDeleteMailbox_MarksMessagesAsExpunged tests that deleting a mailbox properly marks
+// all messages as expunged (sets expunged_at) so they can be listed and restored later
+func TestDeleteMailbox_MarksMessagesAsExpunged(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, testEmail, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a test mailbox with messages
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	err = db.CreateMailbox(ctx, tx, accountID, "ToDelete", nil)
+	require.NoError(t, err)
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	mailbox, err := db.GetMailboxByName(ctx, accountID, "ToDelete")
+	require.NoError(t, err)
+
+	// Insert multiple messages into the mailbox
+	msgID1 := insertTestMessage(t, db, accountID, mailbox.ID, "ToDelete", "Message 1", "<msg1@example.com>")
+	msgID2 := insertTestMessage(t, db, accountID, mailbox.ID, "ToDelete", "Message 2", "<msg2@example.com>")
+	msgID3 := insertTestMessage(t, db, accountID, mailbox.ID, "ToDelete", "Message 3", "<msg3@example.com>")
+
+	// Verify messages exist and are NOT expunged
+	var count int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL",
+		mailbox.ID).Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 3, count, "Should have 3 active messages before mailbox deletion")
+
+	// Delete the mailbox
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	err = db.DeleteMailbox(ctx, tx2, mailbox.ID, accountID)
+	require.NoError(t, err)
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// Verify mailbox is deleted
+	_, err = db.GetMailboxByName(ctx, accountID, "ToDelete")
+	assert.Error(t, err, "Mailbox should be deleted")
+
+	// CRITICAL ASSERTIONS: Verify messages are marked as expunged
+	var expungedCount int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE id IN ($1, $2, $3) AND expunged_at IS NOT NULL",
+		msgID1, msgID2, msgID3).Scan(&expungedCount)
+	require.NoError(t, err)
+	assert.Equal(t, 3, expungedCount, "All 3 messages should be marked as expunged after mailbox deletion")
+
+	// Verify messages have mailbox_path preserved
+	var mailboxPath1, mailboxPath2, mailboxPath3 string
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_path FROM messages WHERE id = $1", msgID1).Scan(&mailboxPath1)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_path FROM messages WHERE id = $1", msgID2).Scan(&mailboxPath2)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_path FROM messages WHERE id = $1", msgID3).Scan(&mailboxPath3)
+	require.NoError(t, err)
+
+	assert.Equal(t, "ToDelete", mailboxPath1, "Message 1 should have mailbox_path preserved")
+	assert.Equal(t, "ToDelete", mailboxPath2, "Message 2 should have mailbox_path preserved")
+	assert.Equal(t, "ToDelete", mailboxPath3, "Message 3 should have mailbox_path preserved")
+
+	// Verify messages have mailbox_id set to NULL
+	var mailboxID1, mailboxID2, mailboxID3 *int64
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_id FROM messages WHERE id = $1", msgID1).Scan(&mailboxID1)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_id FROM messages WHERE id = $1", msgID2).Scan(&mailboxID2)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_id FROM messages WHERE id = $1", msgID3).Scan(&mailboxID3)
+	require.NoError(t, err)
+
+	assert.Nil(t, mailboxID1, "Message 1 mailbox_id should be NULL after mailbox deletion")
+	assert.Nil(t, mailboxID2, "Message 2 mailbox_id should be NULL after mailbox deletion")
+	assert.Nil(t, mailboxID3, "Message 3 mailbox_id should be NULL after mailbox deletion")
+
+	// Verify NO orphaned messages (mailbox_id = NULL AND expunged_at = NULL)
+	var orphanedCount int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE id IN ($1, $2, $3) AND mailbox_id IS NULL AND expunged_at IS NULL",
+		msgID1, msgID2, msgID3).Scan(&orphanedCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, orphanedCount, "Should have NO orphaned messages (mailbox_id=NULL and expunged_at=NULL)")
+
+	// Verify messages can be listed via ListDeletedMessages
+	listParams := ListDeletedMessagesParams{
+		Email: testEmail,
+		Limit: 100,
+	}
+	deletedMessages, err := db.ListDeletedMessages(ctx, listParams)
+	require.NoError(t, err)
+
+	// Find our 3 messages in the list
+	foundCount := 0
+	for _, msg := range deletedMessages {
+		if msg.ID == msgID1 || msg.ID == msgID2 || msg.ID == msgID3 {
+			foundCount++
+			assert.Equal(t, "ToDelete", msg.MailboxPath, "Deleted message should have correct mailbox_path")
+			assert.Nil(t, msg.MailboxID, "Deleted message should have mailbox_id = NULL")
+			assert.NotZero(t, msg.ExpungedAt, "Deleted message should have expunged_at set")
+		}
+	}
+	assert.Equal(t, 3, foundCount, "All 3 messages from deleted mailbox should be in ListDeletedMessages")
+}
+
+// TestDeleteMailbox_FullRestoreFlow tests the complete flow of:
+// 1. Creating mailbox with messages
+// 2. Deleting mailbox (marks messages as expunged)
+// 3. Listing deleted messages
+// 4. Restoring messages (recreates mailbox)
+func TestDeleteMailbox_FullRestoreFlow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, testEmail, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Step 1: Create mailbox with messages
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	err = db.CreateMailbox(ctx, tx, accountID, "Archive", nil)
+	require.NoError(t, err)
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	archive, err := db.GetMailboxByName(ctx, accountID, "Archive")
+	require.NoError(t, err)
+	originalMailboxID := archive.ID
+
+	// Insert messages
+	msgID1 := insertTestMessage(t, db, accountID, archive.ID, "Archive", "Important Doc 1", "<doc1@example.com>")
+	msgID2 := insertTestMessage(t, db, accountID, archive.ID, "Archive", "Important Doc 2", "<doc2@example.com>")
+
+	t.Logf("Step 1: Created Archive mailbox (ID: %d) with 2 messages", archive.ID)
+
+	// Step 2: Delete the mailbox
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	err = db.DeleteMailbox(ctx, tx2, archive.ID, accountID)
+	require.NoError(t, err)
+
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	t.Logf("Step 2: Deleted Archive mailbox")
+
+	// Verify mailbox is gone
+	_, err = db.GetMailboxByName(ctx, accountID, "Archive")
+	assert.Error(t, err, "Archive mailbox should not exist")
+
+	// Step 3: List deleted messages
+	time.Sleep(100 * time.Millisecond) // Ensure commit is visible
+
+	listParams := ListDeletedMessagesParams{
+		Email:       testEmail,
+		MailboxPath: stringPtr("Archive"),
+		Limit:       100,
+	}
+	deletedMessages, err := db.ListDeletedMessages(ctx, listParams)
+	require.NoError(t, err)
+	assert.Len(t, deletedMessages, 2, "Should find 2 deleted messages from Archive")
+
+	t.Logf("Step 3: Listed %d deleted messages from Archive", len(deletedMessages))
+
+	// Verify message details
+	for _, msg := range deletedMessages {
+		assert.Equal(t, "Archive", msg.MailboxPath)
+		assert.Nil(t, msg.MailboxID)
+		assert.NotZero(t, msg.ExpungedAt)
+		assert.Contains(t, []string{"Important Doc 1", "Important Doc 2"}, msg.Subject)
+	}
+
+	// Step 4: Restore messages (should recreate mailbox)
+	tx3, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx3.Rollback(ctx)
+
+	restoreParams := RestoreMessagesParams{
+		Email:      testEmail,
+		MessageIDs: []int64{msgID1, msgID2},
+	}
+	restoredCount, err := db.RestoreMessages(ctx, tx3, restoreParams)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), restoredCount, "Should restore 2 messages")
+
+	err = tx3.Commit(ctx)
+	require.NoError(t, err)
+
+	t.Logf("Step 4: Restored %d messages", restoredCount)
+
+	// Step 5: Verify mailbox was recreated
+	recreatedArchive, err := db.GetMailboxByName(ctx, accountID, "Archive")
+	require.NoError(t, err)
+	assert.NotNil(t, recreatedArchive)
+	assert.NotEqual(t, originalMailboxID, recreatedArchive.ID, "Recreated mailbox should have a new ID")
+
+	t.Logf("Step 5: Archive mailbox recreated (new ID: %d, old ID: %d)", recreatedArchive.ID, originalMailboxID)
+
+	// Step 6: Verify messages are restored
+	var restoredMailboxID1, restoredMailboxID2 int64
+	var expungedAt1, expungedAt2 *time.Time
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", msgID1).Scan(&restoredMailboxID1, &expungedAt1)
+	require.NoError(t, err)
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT mailbox_id, expunged_at FROM messages WHERE id = $1", msgID2).Scan(&restoredMailboxID2, &expungedAt2)
+	require.NoError(t, err)
+
+	assert.Equal(t, recreatedArchive.ID, restoredMailboxID1, "Message 1 should be in recreated mailbox")
+	assert.Equal(t, recreatedArchive.ID, restoredMailboxID2, "Message 2 should be in recreated mailbox")
+	assert.Nil(t, expungedAt1, "Message 1 should be restored (not expunged)")
+	assert.Nil(t, expungedAt2, "Message 2 should be restored (not expunged)")
+
+	t.Logf("Step 6: Verified both messages are restored to recreated mailbox")
+
+	// Step 7: Verify messages are accessible via normal queries
+	var activeCount int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL",
+		recreatedArchive.ID).Scan(&activeCount)
+	require.NoError(t, err)
+	assert.Equal(t, 2, activeCount, "Should have 2 active messages in recreated Archive mailbox")
+
+	t.Logf("Step 7: Verified %d active messages in recreated mailbox", activeCount)
+
+	// Step 8: Verify ListDeletedMessages no longer returns these messages
+	deletedMessages2, err := db.ListDeletedMessages(ctx, listParams)
+	require.NoError(t, err)
+	assert.Len(t, deletedMessages2, 0, "Should have 0 deleted messages after restoration")
+
+	t.Logf("Complete: Delete → List → Restore flow successful")
+}
