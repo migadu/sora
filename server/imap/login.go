@@ -105,12 +105,26 @@ func (s *IMAPSession) Login(address, password string) error {
 				return err
 			}
 
-			s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
+			// Get primary email address for this account
+			// User.Address should always be the primary address (not the login address with suffix)
+			primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+			if err != nil {
+				return s.internalError("failed to get primary email: %v", err)
+			}
+
+			s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 			s.Session.User = &s.IMAPUser.User
 
 			s.server.authenticatedConnections.Add(1)
 			duration := time.Since(authStart)
-			s.InfoLog("authentication successful", "address", addressParsed.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+
+			// Log authentication with alias detection
+			loginAddr := addressParsed.BaseAddress()
+			if loginAddr != primaryAddr.FullAddress() {
+				s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+			} else {
+				s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+			}
 
 			// Prometheus metrics - successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
@@ -203,12 +217,26 @@ func (s *IMAPSession) Login(address, password string) error {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
-	s.IMAPUser = NewIMAPUser(addressParsed, AccountID)
+	// Get primary email address for this account
+	// User.Address should always be the primary address (not the login address with +alias)
+	primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+	if err != nil {
+		return s.internalError("failed to get primary email: %v", err)
+	}
+
+	s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 	s.Session.User = &s.IMAPUser.User
 
 	s.server.authenticatedConnections.Add(1)
 	duration := time.Since(authStart)
-	s.InfoLog("authentication successful", "address", addressParsed.BaseAddress(), "account_id", AccountID, "cached", false, "method", "main_db", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+
+	// Log authentication with alias detection
+	loginAddr := addressParsed.BaseAddress()
+	if loginAddr != primaryAddr.FullAddress() {
+		s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "main_db", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	} else {
+		s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "main_db", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+	}
 
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()

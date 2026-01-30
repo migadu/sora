@@ -64,7 +64,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: envelopeFrom,
-		EnvelopeTo:   recipient.Address.FullAddress(),
+		EnvelopeTo:   recipient.ToAddress.FullAddress(),
 		Header:       messageEntity.Header.Map(),
 		Body:         *plaintextBody,
 	}

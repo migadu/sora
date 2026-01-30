@@ -114,7 +114,14 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					s.IMAPUser = NewIMAPUser(address, AccountID)
+					// Get primary email address for this account
+					// User.Address should always be the primary address
+					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+					if primErr != nil {
+						return s.internalError("failed to get primary email: %v", primErr)
+					}
+
+					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
@@ -123,7 +130,14 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					s.server.authenticatedConnections.Add(1)
 					duration := time.Since(authStart)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+
+					// Log authentication with alias detection
+					loginAddr := address.BaseAddress()
+					if loginAddr != primaryAddr.FullAddress() {
+						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					} else {
+						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					}
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
@@ -211,7 +225,14 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					s.IMAPUser = NewIMAPUser(address, AccountID)
+					// Get primary email address for this account
+					// User.Address should always be the primary address
+					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+					if primErr != nil {
+						return s.internalError("failed to get primary email: %v", primErr)
+					}
+
+					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
@@ -220,7 +241,14 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					s.server.authenticatedConnections.Add(1)
 					duration := time.Since(authStart)
-					s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+
+					// Log authentication with alias detection
+					loginAddr := address.BaseAddress()
+					if loginAddr != primaryAddr.FullAddress() {
+						s.InfoLog("authentication successful", "login_address", loginAddr, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					} else {
+						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
+					}
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()

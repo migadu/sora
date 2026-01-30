@@ -184,6 +184,8 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	size := int64(len(fullMessageBytes))
 
+	// User.Address is always the primary address (set during LOGIN)
+	// No need to query - it's already cached in the session
 	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
 	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
 	sanitizedFlags := helpers.SanitizeFlags(options.Flags)
@@ -197,8 +199,8 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		&db.InsertMessageOptions{
 			AccountID:     s.AccountID(),
 			MailboxID:     mailbox.ID,
-			S3Domain:      s.IMAPUser.Address.Domain(),
-			S3Localpart:   s.IMAPUser.Address.LocalPart(),
+			S3Domain:      s.Session.User.Domain(),
+			S3Localpart:   s.Session.User.LocalPart(),
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,

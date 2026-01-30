@@ -196,6 +196,18 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		return s.InternalError("failed to create default mailboxes: %v", err)
 	}
 
+	// Get primary email address for this account
+	// User.Address should always be the primary address (not the recipient with +alias)
+	primaryAddr, err := s.backend.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, AccountID)
+	if err != nil {
+		s.WarnLog("failed to get primary email", "account_id", AccountID, "error", err)
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+			Message:      "Temporary failure, please try again later",
+		}
+	}
+
 	// Acquire write lock to update User
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
@@ -207,12 +219,18 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 	}
 	defer release()
-	s.User = server.NewUser(toAddress, AccountID) // Use the original address (with detail part)
+	s.User = server.NewUser(primaryAddr, AccountID) // Always use primary address
 	// Pin the session to the master DB to prevent reading stale data from a replica.
 	s.useMasterDB = true
 
 	success = true
-	s.DebugLog("recipient accepted", "recipient", fullAddress, "account_id", AccountID)
+
+	// Log recipient acceptance with alias detection
+	if fullAddress != primaryAddr.FullAddress() {
+		s.DebugLog("recipient accepted", "recipient", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
+	} else {
+		s.DebugLog("recipient accepted", "recipient", fullAddress, "account_id", AccountID)
+	}
 	return nil
 }
 
@@ -812,12 +830,14 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 
 	size := int64(len(fullMessageBytes))
 
+	// User.Address is always the primary address (set during RCPT TO)
+	// No need to query - it's already cached in the session
 	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
 			AccountID:     s.AccountID(),
 			MailboxID:     mailbox.ID,
-			S3Domain:      s.User.Address.Domain(),
-			S3Localpart:   s.User.Address.LocalPart(),
+			S3Domain:      s.User.Domain(),
+			S3Localpart:   s.User.LocalPart(),
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,

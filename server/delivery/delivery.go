@@ -54,7 +54,8 @@ type DeliveryResult struct {
 // RecipientInfo contains information about the recipient.
 type RecipientInfo struct {
 	AccountID       int64
-	Address         *server.Address
+	Address         *server.Address // Primary address (for S3 keys, metrics, etc.)
+	ToAddress       *server.Address // Recipient address as sent (may include +alias)
 	FromAddress     *server.Address // Optional sender address
 	PreservedUID    *uint32         // Optional: preserved UID for migration
 	PreservedUIDVal *uint32         // Optional: preserved UIDVALIDITY for migration
@@ -239,20 +240,29 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 
 	lookupAddress := toAddress.BaseAddress()
 
-	// Lookup user account
+	// Lookup user account and get primary address in one query
+	// This finds the account by alias/recipient address, but returns the primary address
 	var AccountID int64
+	var primaryEmail string
 	err = d.RDB.QueryRowWithRetry(ctx, `
-		SELECT c.account_id
+		SELECT c.account_id, primary_cred.address
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
+		JOIN credentials primary_cred ON primary_cred.account_id = c.account_id AND primary_cred.primary_identity = TRUE
 		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
-	`, lookupAddress).Scan(&AccountID)
+	`, lookupAddress).Scan(&AccountID, &primaryEmail)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("recipient not found: %s", recipient)
 		}
 		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	// Parse primary email address
+	primaryAddr, err := server.NewAddress(primaryEmail)
+	if err != nil {
+		return nil, fmt.Errorf("invalid primary email format in database: %w", err)
 	}
 
 	// Create default mailboxes if needed
@@ -263,7 +273,8 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 
 	return &RecipientInfo{
 		AccountID: AccountID,
-		Address:   &toAddress,
+		Address:   &primaryAddr, // Primary address (for S3 keys, metrics, etc.)
+		ToAddress: &toAddress,   // Recipient address as sent (may include +alias)
 	}, nil
 }
 
