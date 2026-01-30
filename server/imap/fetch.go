@@ -571,13 +571,24 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		reader, err := s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
 		if err != nil {
+			s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", err)
 			return nil, fmt.Errorf("failed to retrieve message UID %d from S3: %v", msg.UID, err)
 		}
 		defer reader.Close()
 		data, err = io.ReadAll(reader)
 		if err != nil {
+			s.DebugLog("failed to read S3 response", "uid", msg.UID, "error", err)
 			return nil, err
 		}
+
+		// Validate we got data
+		if len(data) == 0 {
+			s.WarnLog("S3 returned empty data", "uid", msg.UID, "s3_key", s3Key, "expected_size", msg.Size)
+			// Return error instead of empty data to make the problem visible
+			return nil, fmt.Errorf("S3 returned empty data for message UID %d (expected %d bytes)", msg.UID, msg.Size)
+		}
+
+		s.DebugLog("successfully fetched from S3", "uid", msg.UID, "size", len(data))
 
 		// Track memory usage for S3 data
 		if s.memTracker != nil {

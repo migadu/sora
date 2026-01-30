@@ -327,6 +327,8 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("failed to read encrypted data: %w", err)
 		}
 
+		logger.Debug("Storage: Read encrypted data from S3", "key", key, "encrypted_size", len(encryptedData))
+
 		// Close the original reader since we've read all the data
 		if err := result.Body.Close(); err != nil {
 			logger.Warn("Storage: Failed to close S3 object", "error", err)
@@ -336,7 +338,15 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 		if err != nil {
 			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
+			logger.Error("Storage: Decryption failed", "key", key, "encrypted_size", len(encryptedData), "error", err)
 			return nil, fmt.Errorf("failed to decrypt data: %w", err)
+		}
+
+		if len(decryptedData) == 0 {
+			logger.Warn("Storage: Decryption returned empty data", "key", key, "encrypted_size", len(encryptedData))
+			// Still return it, but log the warning so we know what happened
+		} else {
+			logger.Debug("Storage: Successfully decrypted data", "key", key, "decrypted_size", len(decryptedData))
 		}
 
 		metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
