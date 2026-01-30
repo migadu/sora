@@ -177,9 +177,27 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	filePath, err := s.server.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
-	if err != nil {
-		return nil, s.internalError("failed to save message to disk: %v", err)
+	// Store message locally for background upload to S3
+	// Check if file already exists to prevent race condition:
+	// If a duplicate APPEND arrives while uploader is processing the first copy,
+	// we don't want to overwrite/delete the file the uploader is reading.
+	expectedPath := s.server.uploader.FilePath(contentHash, s.AccountID())
+	var filePath *string
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		// File doesn't exist, safe to write
+		filePath, err = s.server.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
+		if err != nil {
+			return nil, s.internalError("failed to save message to disk: %v", err)
+		}
+		s.DebugLog("message accepted locally", "path", *filePath)
+	} else if err == nil {
+		// File already exists (likely being processed by uploader or concurrent duplicate APPEND)
+		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		filePath = nil
+		s.DebugLog("message file already exists, skipping write (concurrent APPEND)", "path", expectedPath)
+	} else {
+		// Stat error (permission issue, etc.)
+		return nil, s.internalError("failed to check file existence: %v", err)
 	}
 
 	size := int64(len(fullMessageBytes))
@@ -225,7 +243,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	if err != nil {
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
-			_ = os.Remove(*filePath) // Cleanup file
+			if filePath != nil {
+				_ = os.Remove(*filePath) // Cleanup file
+			}
 			s.DebugLog("duplicate message detected, skipping upload", "messageID", messageID, "existing_uid", messageUID)
 			// Return success with existing UID - don't notify uploader
 			success = true
@@ -235,7 +255,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			}, nil
 		}
 		// For other errors, cleanup and return error
-		_ = os.Remove(*filePath)
+		if filePath != nil {
+			_ = os.Remove(*filePath)
+		}
 		return nil, s.internalError("failed to insert message metadata: %v", err)
 	}
 

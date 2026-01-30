@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -132,11 +133,29 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
-	// Store message locally
-	filePath, err := d.Uploader.StoreLocally(contentHash, recipient.AccountID, messageBytes)
-	if err != nil {
-		result.ErrorMessage = fmt.Sprintf("Failed to save message to disk: %v", err)
-		return result, err
+	// Store message locally for background upload to S3
+	// Check if file already exists to prevent race condition:
+	// If a duplicate arrives while uploader is processing the first copy,
+	// we don't want to overwrite/delete the file the uploader is reading.
+	expectedPath := d.Uploader.FilePath(contentHash, recipient.AccountID)
+	var filePath *string
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		// File doesn't exist, safe to write
+		filePath, err = d.Uploader.StoreLocally(contentHash, recipient.AccountID, messageBytes)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("Failed to save message to disk: %v", err)
+			return result, err
+		}
+		d.Logger.Log("Message accepted locally, file written: %s", *filePath)
+	} else if err == nil {
+		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
+		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		filePath = nil
+		d.Logger.Log("Message file already exists, skipping write (concurrent delivery): %s", expectedPath)
+	} else {
+		// Stat error (permission issue, etc.)
+		result.ErrorMessage = fmt.Sprintf("Failed to check file existence: %v", err)
+		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
 	// Determine target mailbox
