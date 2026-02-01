@@ -596,9 +596,16 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
-			// Cleanup local file
+			// For duplicates, NEVER delete the file. This prevents a race condition where:
+			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
+			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
+			// 3. Message B's INSERT fails as duplicate
+			// 4. If Message B deletes the file, Message A's pending upload loses its source file
+			//
+			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
+			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
 			if filePath != nil {
-				_ = os.Remove(*filePath)
+				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
 			}
 			s.DebugLog("duplicate message accepted (already exists), skipping storage", "message_id", messageID)
 			// Don't track as failure - duplicate is success

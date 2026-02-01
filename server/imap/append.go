@@ -245,8 +245,16 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	if err != nil {
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			// For duplicates, NEVER delete the file. This prevents a race condition where:
+			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
+			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
+			// 3. Message B's INSERT fails as duplicate
+			// 4. If Message B deletes the file, Message A's pending upload loses its source file
+			//
+			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
+			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
 			if filePath != nil {
-				_ = os.Remove(*filePath) // Cleanup file
+				s.DebugLog("duplicate message detected, keeping file for potential pending upload", "content_hash", contentHash)
 			}
 			s.DebugLog("duplicate message detected, skipping upload", "messageID", messageID, "existing_uid", messageUID)
 			// Return success with existing UID - don't notify uploader

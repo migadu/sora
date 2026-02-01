@@ -221,15 +221,29 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		})
 
 	if err != nil {
-		if filePath != nil {
-			// Cleanup file on failure (including duplicates)
-			_ = d.Uploader.RemoveLocalFile(*filePath)
-		}
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
+			// For duplicates, NEVER delete the file. This prevents a race condition where:
+			// 1. Message A arrives, writes file, INSERT succeeds, creates pending_upload
+			// 2. Message B (duplicate) arrives, due to TOCTOU race also writes file
+			// 3. Message B's INSERT fails as duplicate
+			// 4. If Message B deletes the file, Message A's pending upload loses its source file
+			//
+			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
+			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
+			// This is safer than trying to determine if a pending upload exists, because:
+			// - The pending upload might be for a different account with the same content hash
+			// - The pending upload check itself could race with upload completion
+			if filePath != nil {
+				d.Logger.Log("Duplicate message detected, keeping file for potential pending upload: %s", contentHash)
+			}
 			result.ErrorMessage = "Message already exists"
 			// Don't notify uploader for duplicates
 			return result, err
+		}
+		// For non-duplicate errors, always clean up the file
+		if filePath != nil {
+			_ = d.Uploader.RemoveLocalFile(*filePath)
 		}
 		result.ErrorMessage = fmt.Sprintf("Failed to save message: %v", err)
 		return result, err
