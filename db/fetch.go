@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -44,7 +44,7 @@ func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailbo
 			return "", fmt.Errorf("message with UID %d in mailbox %d not found: %w", uid, mailboxID, err)
 		}
 		// Other database error during query execution.
-		log.Printf("Database: database error fetching text_body for UID %d, MailboxID %d: %v", uid, mailboxID, err)
+		logger.Error("Database: database error fetching text_body", "uid", uid, "mailbox_id", mailboxID, "err", err)
 		return "", fmt.Errorf("database error fetching text_body: %w", err)
 	}
 
@@ -54,7 +54,7 @@ func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailbo
 		// textBody.Valid being false implies no matching row in message_contents.
 		// This indicates a data integrity issue, as a message's content_hash (which is NOT NULL)
 		// should always exist in message_contents.
-		log.Printf("Database: data integrity issue: Message found (UID %d, Mailbox %d) but no corresponding entry in message_contents.", uid, mailboxID)
+		logger.Error("Database: data integrity issue: Message found but no corresponding entry in message_contents", "uid", uid, "mailbox_id", mailboxID)
 		return "", fmt.Errorf("message text content missing for UID %d, Mailbox %d (data integrity)", uid, mailboxID)
 	}
 
@@ -86,7 +86,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		&recipientsJSON,
 	)
 	if err != nil {
-		log.Printf("Database: failed to fetch envelope fields for UID %d, MailboxID %d: %v", UID, mailboxID, err)
+		logger.Error("Database: failed to fetch envelope fields", "uid", UID, "mailbox_id", mailboxID, "err", err)
 		return nil, err
 	}
 
@@ -99,7 +99,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 
 	var recipients []helpers.Recipient
 	if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
-		log.Printf("Database: failed to decode recipients JSON: %v", err)
+		logger.Error("Database: failed to decode recipients JSON", "err", err)
 		return nil, err
 	}
 
@@ -111,7 +111,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 
 		parts := strings.Split(emailAddress, "@")
 		if len(parts) != 2 {
-			log.Printf("Database: WARNING - malformed email address '%s' for recipient type '%s' (UID %d, MailboxID %d)", emailAddress, addressType, UID, mailboxID)
+			logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", UID, "mailbox_id", mailboxID)
 			continue
 		}
 		mailboxPart, hostNamePart := parts[0], parts[1]
@@ -136,7 +136,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		case "sender":
 			envelope.Sender = append(envelope.Sender, address)
 		default:
-			log.Printf("Database: WARNING - unhandled address type: %s (UID %d, MailboxID %d)", addressType, UID, mailboxID)
+			logger.Warn("Database: unhandled address type", "type", addressType, "uid", UID, "mailbox_id", mailboxID)
 		}
 	}
 

@@ -65,7 +65,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +80,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // For database/sql compatibility
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -149,17 +149,17 @@ func (db *Database) Close() {
 				if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
 					// 57P01 = admin_shutdown - connection terminated by administrator
 					// This is expected during graceful shutdown, lock is auto-released
-					log.Println("Database: advisory lock auto-released (connection terminated during shutdown).")
+					logger.Info("Database: advisory lock auto-released (connection terminated during shutdown)")
 				} else {
-					log.Printf("Database: failed to explicitly release advisory lock (lock may have been auto-released): %v", err)
+					logger.Warn("Database: failed to explicitly release advisory lock (lock may have been auto-released)", "err", err)
 				}
 			} else if unlocked {
-				log.Println("Database: released shared database advisory lock.")
+				logger.Info("Database: released shared database advisory lock")
 			} else {
-				log.Println("Database: advisory lock was not held at time of release (likely auto-released on connection close).")
+				logger.Info("Database: advisory lock was not held at time of release (likely auto-released on connection close)")
 			}
 		} else {
-			log.Println("Database: connection already closed, advisory lock auto-released.")
+			logger.Info("Database: connection already closed, advisory lock auto-released")
 		}
 
 		// IMPORTANT: Release the connection back to the pool BEFORE closing the pool.
@@ -209,7 +209,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	err := db.WritePool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&currentVersion, &dirty)
 	if err != nil && err != pgx.ErrNoRows {
 		// If the table doesn't exist yet, we'll catch it below and run migrations
-		log.Printf("Database: could not query schema_migrations table (may not exist yet): %v", err)
+		logger.Info("Database: could not query schema_migrations table (may not exist yet)", "err", err)
 	} else if err == nil {
 		// Table exists and we got a version
 		if dirty {
@@ -230,7 +230,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		firstVersion, err := sourceDriver.First()
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				log.Printf("Database: no migration files found. Database is at version %d.", currentVersion)
+				logger.Info("Database: no migration files found", "version", currentVersion)
 				return nil
 			}
 			return fmt.Errorf("failed to get first migration version: %w", err)
@@ -253,11 +253,11 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 		// Fast exit if already up-to-date
 		if currentVersion >= latestVersion {
-			log.Printf("Database: migrations are up to date (database: %d, latest: %d). Skipping migration infrastructure setup.", currentVersion, latestVersion)
+			logger.Info("Database: migrations are up to date. Skipping migration infrastructure setup", "current", currentVersion, "latest", latestVersion)
 			return nil
 		}
 
-		log.Printf("Database: migrations needed (database: %d, latest: %d). Proceeding with migration...", currentVersion, latestVersion)
+		logger.Info("Database: migrations needed. Proceeding with migration", "current", currentVersion, "latest", latestVersion)
 	}
 
 	// SLOW PATH: Migrations are needed or schema_migrations doesn't exist yet.
@@ -277,7 +277,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	firstVersion, err := sourceDriver.First()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			log.Println("Database: no migration files found. Skipping migrations.")
+			logger.Info("Database: no migration files found. Skipping migrations")
 			return nil
 		}
 		return fmt.Errorf("failed to get first migration version: %w", err)
@@ -330,18 +330,18 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
 	}
 
-	log.Printf("Database: current migration version: %d, running migrations...", currentVersion)
+	logger.Info("Database: current migration version, running migrations", "version", currentVersion)
 
 	// Run migrations with timeout context to prevent hanging forever
 	// If another instance is running migrations, this will wait up to the configured timeout
-	log.Printf("Database: migration timeout configured: %v", migrationTimeout)
+	logger.Info("Database: migration timeout configured", "timeout", migrationTimeout)
 	migrateCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
 	defer cancel()
 
 	// Create a channel to run migrations asynchronously
 	errChan := make(chan error, 1)
 	go func() {
-		log.Println("Database: attempting to run migrations...")
+		logger.Info("Database: attempting to run migrations")
 		errChan <- m.Up()
 	}()
 
@@ -353,8 +353,8 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		if err != nil && err != migrate.ErrNoChange {
 			// If it's a lock acquisition error, verify migrations instead of failing
 			if errors.Is(err, migrate.ErrLockTimeout) {
-				log.Println("Database: migration lock acquisition failed (another instance is running migrations)")
-				log.Println("Database: verifying current migration state...")
+				logger.Info("Database: migration lock acquisition failed (another instance is running migrations)")
+				logger.Info("Database: verifying current migration state")
 
 				// Query schema_migrations directly to avoid lock contention
 				var newVersion uint
@@ -369,7 +369,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 				// Check if the version is now up-to-date (>= latest available migration)
 				if newVersion >= latestVersion {
-					log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
+					logger.Info("Database: migration version verified (migrations completed by another instance)", "version", newVersion)
 					skipFinalVerification = true // Skip final verification since we already verified directly
 				} else {
 					return fmt.Errorf("lock acquisition failed and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
@@ -378,14 +378,14 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 				return fmt.Errorf("failed to run migrations: %w", err)
 			}
 		} else if err == migrate.ErrNoChange {
-			log.Println("Database: migrations are up to date")
+			logger.Info("Database: migrations are up to date")
 		} else {
-			log.Println("Database: migrations applied successfully")
+			logger.Info("Database: migrations applied successfully")
 		}
 	case <-migrateCtx.Done():
 		// Timeout occurred - likely another instance is running migrations
-		log.Println("Database: migration attempt timed out (another instance may be running migrations)")
-		log.Println("Database: verifying current migration state...")
+		logger.Info("Database: migration attempt timed out (another instance may be running migrations)")
+		logger.Info("Database: verifying current migration state")
 
 		// Query schema_migrations directly to avoid lock contention
 		var newVersion uint
@@ -400,7 +400,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 		// Check if the version is now up-to-date (>= latest available migration)
 		if newVersion >= latestVersion {
-			log.Printf("Database: migration version verified: %d (migrations completed by another instance)", newVersion)
+			logger.Info("Database: migration version verified (migrations completed by another instance)", "version", newVersion)
 			skipFinalVerification = true // Skip final verification since we already verified directly
 		} else {
 			return fmt.Errorf("timeout waiting for migrations and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
@@ -417,9 +417,9 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 			return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", version)
 		}
 
-		log.Printf("Database: migration complete, current version: %d", version)
+		logger.Info("Database: migration complete", "version", version)
 	} else {
-		log.Println("Database: migrations verified, proceeding with startup")
+		logger.Info("Database: migrations verified, proceeding with startup")
 	}
 	return nil
 }
@@ -454,11 +454,11 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 		result["write"].IsHealthy = true
 		if maxConns > 0 && acquiredConns/maxConns > 0.90 {
 			result["write"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Write pool unhealthy: high utilization (%.1f%%)", (acquiredConns/maxConns)*100)
+			logger.Warn("[DB-HEALTH] Write pool unhealthy: high utilization", "utilization_pct", (acquiredConns/maxConns)*100)
 		}
 		if maxConns > 0 && constructingConns/maxConns > 0.20 {
 			result["write"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Write pool unhealthy: too many constructing connections (%.1f%%)", (constructingConns/maxConns)*100)
+			logger.Warn("[DB-HEALTH] Write pool unhealthy: too many constructing connections", "constructing_pct", (constructingConns/maxConns)*100)
 		}
 	}
 
@@ -484,11 +484,11 @@ func (db *Database) GetPoolHealth() map[string]*PoolHealthStatus {
 		result["read"].IsHealthy = true
 		if maxConns > 0 && acquiredConns/maxConns > 0.90 {
 			result["read"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Read pool unhealthy: high utilization (%.1f%%)", (acquiredConns/maxConns)*100)
+			logger.Warn("[DB-HEALTH] Read pool unhealthy: high utilization", "utilization_pct", (acquiredConns/maxConns)*100)
 		}
 		if maxConns > 0 && constructingConns/maxConns > 0.20 {
 			result["read"].IsHealthy = false
-			log.Printf("[DB-HEALTH] Read pool unhealthy: too many constructing connections (%.1f%%)", (constructingConns/maxConns)*100)
+			logger.Warn("[DB-HEALTH] Read pool unhealthy: too many constructing connections", "constructing_pct", (constructingConns/maxConns)*100)
 		}
 	}
 
@@ -533,12 +533,12 @@ func (db *Database) runHealthChecks(ctx context.Context, fm *FailoverManager, in
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("[DB-%s-HEALTH] Starting health checks every %v", fm.poolType, interval)
+	logger.Info("[DB-HEALTH] Starting health checks", "pool_type", fm.poolType, "interval", interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[DB-%s-HEALTH] Stopping health checks", fm.poolType)
+			logger.Info("[DB-HEALTH] Stopping health checks", "pool_type", fm.poolType)
 			return
 		case <-ticker.C:
 			db.performHealthCheck(ctx, fm)
@@ -640,8 +640,8 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.GetDebug(), "read", readFailover)
 		if err != nil {
 			// If all read replicas are down, fall back to write pool instead of failing startup
-			log.Printf("Database: WARNING - failed to create read pool (all read replicas unreachable): %v", err)
-			log.Printf("Database: falling back to write pool for read operations")
+			logger.Warn("Database: failed to create read pool (all read replicas unreachable)", "err", err)
+			logger.Info("Database: falling back to write pool for read operations")
 			readPool = writePool
 			readFailover = writeFailover // Share the same failover manager
 		}
@@ -672,9 +672,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 
 	if acquireLock {
 		// Acquire and hold an advisory lock to signal that the server is running.
-		log.Printf("Database: attempting to acquire connection from pool for advisory lock (pool stats: total=%d idle=%d acquired=%d max=%d)...",
-			db.WritePool.Stat().TotalConns(), db.WritePool.Stat().IdleConns(),
-			db.WritePool.Stat().AcquiredConns(), db.WritePool.Stat().MaxConns())
+		logger.Info("Database: attempting to acquire connection from pool for advisory lock", "total", db.WritePool.Stat().TotalConns(), "idle", db.WritePool.Stat().IdleConns(), "acquired", db.WritePool.Stat().AcquiredConns(), "max", db.WritePool.Stat().MaxConns())
 
 		// Use a timeout context for connection acquisition to prevent infinite blocking
 		// if the pool is exhausted or the database is under heavy load during startup
@@ -691,7 +689,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			}
 			return nil, fmt.Errorf("failed to acquire connection for advisory lock: %w", err)
 		}
-		log.Println("Database: connection acquired from pool for advisory lock attempt")
+		logger.Info("Database: connection acquired from pool for advisory lock attempt")
 
 		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
 		// IMPORTANT: pg_try_advisory_lock_shared() returns immediately - it does NOT block.
@@ -707,7 +705,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 				jitter := time.Duration(attempt*10) * time.Millisecond
 				actualDelay := retryDelay + jitter
 
-				log.Printf("Database: retrying advisory lock acquisition (attempt %d/%d) after %v (previous attempt returned false - exclusive lock held)...", attempt+1, maxRetries, actualDelay)
+				logger.Info("Database: retrying advisory lock acquisition (previous attempt returned false - exclusive lock held)", "attempt", attempt+1, "max_retries", maxRetries, "delay", actualDelay)
 				time.Sleep(actualDelay)
 
 				// Slower exponential backoff for shared locks (1.5x instead of 2x)
@@ -725,13 +723,13 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			}
 
 			if lockAcquired {
-				log.Printf("Database: acquired shared database advisory lock (ID: %d).", consts.SoraAdvisoryLockID)
+				logger.Info("Database: acquired shared database advisory lock", "lock_id", consts.SoraAdvisoryLockID)
 				db.lockConn = lockConn // Store the *pgxpool.Conn
 				break
 			}
 
 			// Lock not acquired means an exclusive lock is currently held
-			log.Printf("Database: shared advisory lock not available (attempt %d/%d) - exclusive lock held by another process (possibly sora-admin migrate)", attempt+1, maxRetries)
+			logger.Warn("Database: shared advisory lock not available - exclusive lock held by another process (possibly sora-admin migrate)", "attempt", attempt+1, "max_retries", maxRetries)
 		}
 
 		if !lockAcquired {
@@ -872,7 +870,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 
 		// Connection successful
 		failoverManager.MarkHostHealthy(selectedHost)
-		log.Printf("Database: %s pool created successfully with failover - host: %s", poolType, actualHost)
+		logger.Info("Database: pool created successfully with failover", "pool_type", poolType, "host", actualHost)
 		return dbPool, nil
 	}
 
@@ -932,8 +930,7 @@ func (fm *FailoverManager) GetNextHealthyHost() (string, error) {
 		// Exponential backoff: wait longer after more failures
 		backoffDuration := time.Duration(1<<minInt64(consecutiveFails, 6)) * time.Second
 		if time.Since(lastCheck) > backoffDuration {
-			log.Printf("[DB-%s-FAILOVER] Retrying potentially recovered host: %s (fails: %d, backoff: %v)",
-				fm.poolType, host.Host, consecutiveFails, backoffDuration)
+			logger.Info("[DB-FAILOVER] Retrying potentially recovered host", "pool_type", fm.poolType, "host", host.Host, "fails", consecutiveFails, "backoff", backoffDuration)
 			fm.currentIndex.Store((index + 1) % int64(len(fm.hosts)))
 			return host.Host, nil
 		}
@@ -941,9 +938,7 @@ func (fm *FailoverManager) GetNextHealthyHost() (string, error) {
 
 	// All hosts are unhealthy, return the first one and hope for the best
 	fallbackHost := fm.hosts[0].Host
-	log.Printf("[DB-%s-FAILOVER] WARNING: All hosts appear unhealthy and are within their backoff period. "+
-		"Falling back to the primary host (%s) as a last resort.",
-		fm.poolType, fallbackHost)
+	logger.Warn("[DB-FAILOVER] All hosts appear unhealthy and are within their backoff period. Falling back to the primary host as a last resort", "pool_type", fm.poolType, "fallback_host", fallbackHost)
 	return fallbackHost, nil
 }
 
@@ -959,7 +954,7 @@ func (fm *FailoverManager) MarkHostHealthy(host string) {
 			h.mu.Unlock()
 
 			if wasUnhealthy {
-				log.Printf("[DB-%s-FAILOVER] Host %s marked as healthy", fm.poolType, host)
+				logger.Info("[DB-FAILOVER] Host marked as healthy", "pool_type", fm.poolType, "host", host)
 			}
 			break
 		}
@@ -981,13 +976,11 @@ func (fm *FailoverManager) MarkHostUnhealthy(host string, err error) {
 			if fails >= fm.failureThreshold {
 				if wasHealthy {
 					h.IsHealthy.Store(false)
-					log.Printf("[DB-%s-FAILOVER] Host %s marked as unhealthy (fails: %d, error: %v)",
-						fm.poolType, host, fails, err)
+					logger.Warn("[DB-FAILOVER] Host marked as unhealthy", "pool_type", fm.poolType, "host", host, "fails", fails, "err", err)
 				}
 			} else {
 				// Still incrementing failure count but not marking unhealthy yet
-				log.Printf("[DB-%s-FAILOVER] Host %s connection failed (fails: %d/%d, error: %v)",
-					fm.poolType, host, fails, fm.failureThreshold, err)
+				logger.Warn("[DB-FAILOVER] Host connection failed", "pool_type", fm.poolType, "host", host, "fails", fails, "threshold", fm.failureThreshold, "err", err)
 			}
 			break
 		}
@@ -1051,7 +1044,7 @@ type migrationLogger struct{}
 
 func (l *migrationLogger) Printf(format string, v ...any) {
 	// Prepend a prefix to all migration logs for clarity
-	log.Printf("[DB-MIGRATE] "+format, v...)
+	logger.Info(fmt.Sprintf("[DB-MIGRATE] "+format, v...))
 }
 
 func (l *migrationLogger) Verbose() bool {

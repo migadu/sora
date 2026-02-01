@@ -3,10 +3,10 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/logger"
 )
 
 func (d *Database) FindExistingContentHashes(ctx context.Context, ids []string) ([]string, error) {
@@ -24,7 +24,7 @@ func (d *Database) FindExistingContentHashes(ctx context.Context, ids []string) 
 	for rows.Next() {
 		var chash string
 		if err := rows.Scan(&chash); err != nil {
-			log.Printf("WARNING: failed to scan content hash: %v", err)
+			logger.Warn("failed to scan content hash", "err", err)
 			continue
 		}
 		result = append(result, chash)
@@ -95,7 +95,7 @@ func (d *Database) GetCacheMetrics(ctx context.Context, instanceID string, since
 		var m CacheMetricsRecord
 		if err := rows.Scan(&m.InstanceID, &m.ServerHostname, &m.Hits, &m.Misses,
 			&m.HitRate, &m.TotalOperations, &m.UptimeSeconds, &m.RecordedAt); err != nil {
-			log.Printf("WARNING: failed to scan cache metrics record: %v", err)
+			logger.Warn("failed to scan cache metrics record", "err", err)
 			continue
 		}
 		metrics = append(metrics, &m)
@@ -126,7 +126,7 @@ func (d *Database) GetLatestCacheMetrics(ctx context.Context) ([]*CacheMetricsRe
 		var m CacheMetricsRecord
 		if err := rows.Scan(&m.InstanceID, &m.ServerHostname, &m.Hits, &m.Misses,
 			&m.HitRate, &m.TotalOperations, &m.UptimeSeconds, &m.RecordedAt); err != nil {
-			log.Printf("WARNING: failed to scan latest cache metrics record: %v", err)
+			logger.Warn("failed to scan latest cache metrics record", "err", err)
 			continue
 		}
 		metrics = append(metrics, &m)

@@ -2,11 +2,11 @@ package db
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -23,11 +23,11 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 	}()
 
 	if len(uids) == 0 {
-		log.Printf("Database: no UIDs to expunge for mailbox %d", mailboxID)
+		logger.Info("Database: no UIDs to expunge", "mailbox_id", mailboxID)
 		return 0, nil
 	}
 
-	log.Printf("Database: expunging %d messages from mailbox %d: %v", len(uids), mailboxID, uids)
+	logger.Info("Database: expunging messages", "count", len(uids), "mailbox_id", mailboxID, "uids", uids)
 
 	var currentModSeq int64
 	var rowsAffected int64
@@ -43,10 +43,10 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 	`, mailboxID, uids).Scan(&rowsAffected, &currentModSeq)
 
 	if err != nil {
-		log.Printf("Database: error executing expunge update: %v", err)
+		logger.Error("Database: error executing expunge update", "err", err)
 		return 0, err
 	}
 
-	log.Printf("Database: successfully expunged %d messages from mailbox %d, current modseq: %d", rowsAffected, mailboxID, currentModSeq)
+	logger.Info("Database: successfully expunged messages", "count", rowsAffected, "mailbox_id", mailboxID, "modseq", currentModSeq)
 	return currentModSeq, nil
 }

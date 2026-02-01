@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -92,11 +92,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		  AND message_id IN (SELECT message_id FROM messages WHERE id = ANY($2))
 	`, destMailboxID, messageIDs)
 	if err != nil {
-		log.Printf("Database: ERROR - failed to delete conflicting tombstones in destination mailbox: %v", err)
+		logger.Error("Database: failed to delete conflicting tombstones in destination mailbox", "err", err)
 		return nil, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
 	}
 	if deleteResult.RowsAffected() > 0 {
-		log.Printf("Database: deleted %d conflicting message(s) from destination mailbox before copy", deleteResult.RowsAffected())
+		logger.Info("Database: deleted conflicting message(s) from destination mailbox before copy", "count", deleteResult.RowsAffected())
 	}
 
 	// Batch insert the copied messages
@@ -171,14 +171,14 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
-		log.Printf("Database: messageID is empty after sanitization, generating a new one without modifying the message.")
+		logger.Info("Database: messageID is empty after sanitization, generating a new one without modifying the message")
 		// Generate a new message ID if not provided
 		saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), options.MailboxName)
 	}
 
 	bodyStructureData, err := helpers.SerializeBodyStructureGob(options.BodyStructure)
 	if err != nil {
-		log.Printf("Database: failed to serialize BodyStructure: %v", err)
+		logger.Error("Database: failed to serialize BodyStructure", "err", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -201,7 +201,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 				LIMIT 1
 			)`, options.MailboxID).Scan(&hasMessages)
 		if err != nil {
-			log.Printf("Database: failed to check for existing messages: %v", err)
+			logger.Error("Database: failed to check for existing messages", "err", err)
 			return 0, 0, consts.ErrDBQueryFailed
 		}
 
@@ -209,7 +209,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		var currentUIDValidity uint32
 		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
 		if err != nil {
-			log.Printf("Database: failed to query current UIDVALIDITY: %v", err)
+			logger.Error("Database: failed to query current UIDVALIDITY", "err", err)
 			return 0, 0, consts.ErrDBQueryFailed
 		}
 
@@ -219,8 +219,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 				// UIDVALIDITY changed - ignore preserved UID and deliver normally
 				// Only log once per mailbox to avoid log spam
 				if _, logged := d.uidValidityMismatchLoggedMap.LoadOrStore(options.MailboxID, true); !logged {
-					log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
-						options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+					logger.Warn("Database: UIDVALIDITY mismatch, ignoring preserved UID and delivering normally",
+						"mailbox_id", options.MailboxID, "current", currentUIDValidity, "requested", *options.PreservedUIDValidity)
 				}
 
 				// Clear preserved values to use normal auto-increment
@@ -237,11 +237,11 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 					WHERE id = $1`,
 					options.MailboxID, *options.PreservedUIDValidity)
 				if err != nil {
-					log.Printf("Database: failed to update UIDVALIDITY: %v", err)
+					logger.Error("Database: failed to update UIDVALIDITY", "err", err)
 					return 0, 0, consts.ErrDBUpdateFailed
 				}
-				log.Printf("Database: set UIDVALIDITY for mailbox %d from %d to %d (first preserved message)",
-					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				logger.Info("Database: set UIDVALIDITY for first preserved message",
+					"mailbox_id", options.MailboxID, "from", currentUIDValidity, "to", *options.PreservedUIDValidity)
 			}
 		}
 	}
@@ -258,14 +258,14 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			RETURNING highest_uid`,
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
-			log.Printf("Database: failed to update highest UID with preserved UID: %v", err)
+			logger.Error("Database: failed to update highest UID with preserved UID", "err", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
 	} else {
 		// Atomically increment and get the new highest UID for the mailbox
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
-			log.Printf("Database: failed to update highest UID: %v", err)
+			logger.Error("Database: failed to update highest UID", "err", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
 		uidToUse = highestUID
@@ -286,15 +286,13 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		// Message with same message_id exists
 		if existingContentHash == options.ContentHash {
 			// True duplicate (same Message-ID + same content_hash) - skip insert
-			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
-				saneMessageID, options.ContentHash, options.MailboxID, existingUID)
+			logger.Info("Database: duplicate message detected, skipping insert", "message_id", saneMessageID, "content_hash", options.ContentHash, "mailbox_id", options.MailboxID, "existing_uid", existingUID)
 			return 0, existingUID, consts.ErrMessageExists
 		}
 
 		// Same Message-ID but different content - this is draft replacement
 		// Delete the old message before inserting the new one
-		log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Deleting old message (UID=%d) for draft replacement.",
-			saneMessageID, truncateHash(existingContentHash), truncateHash(options.ContentHash), options.MailboxID, existingUID)
+		logger.Info("Database: message with same Message-ID but different content detected. Deleting old message for draft replacement", "message_id", saneMessageID, "existing_hash", truncateHash(existingContentHash), "new_hash", truncateHash(options.ContentHash), "mailbox_id", options.MailboxID, "existing_uid", existingUID)
 
 		deleteResult, err := tx.Exec(ctx, `
 			DELETE FROM messages
@@ -302,22 +300,22 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			  AND message_id = $2
 		`, options.MailboxID, saneMessageID)
 		if err != nil {
-			log.Printf("Database: ERROR - failed to delete conflicting message for draft replacement: %v", err)
+			logger.Error("Database: failed to delete conflicting message for draft replacement", "err", err)
 			return 0, 0, fmt.Errorf("failed to delete conflicting message: %w", err)
 		}
 		if deleteResult.RowsAffected() > 0 {
-			log.Printf("Database: deleted %d message(s) for draft replacement", deleteResult.RowsAffected())
+			logger.Info("Database: deleted message(s) for draft replacement", "count", deleteResult.RowsAffected())
 		}
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
-		log.Printf("Database: failed to check for duplicate message: %v", err)
+		logger.Error("Database: failed to check for duplicate message", "err", err)
 		return 0, 0, consts.ErrDBQueryFailed
 	}
 	// err == pgx.ErrNoRows means no existing message found, continue with insert
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {
-		log.Printf("Database: failed to marshal recipients: %v", err)
+		logger.Error("Database: failed to marshal recipients", "err", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -416,10 +414,10 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Returning error to caller.", saneMessageID, options.MailboxID)
+			logger.Error("Database: unique constraint violation, returning error to caller", "message_id", saneMessageID, "mailbox_id", options.MailboxID)
 			return 0, 0, consts.ErrDBUniqueViolation
 		}
-		log.Printf("Database: failed to insert message into database: %v", err)
+		logger.Error("Database: failed to insert message into database", "err", err)
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
@@ -438,7 +436,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		ON CONFLICT (content_hash) DO NOTHING
 	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
 	if err != nil {
-		log.Printf("Database: failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
@@ -452,7 +450,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		upload.AccountID,
 	)
 	if err != nil {
-		log.Printf("Database: failed to insert into pending_uploads for content_hash %s: %v", upload.ContentHash, err)
+		logger.Error("Database: failed to insert into pending_uploads", "content_hash", upload.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 
@@ -462,14 +460,14 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions) (messageID int64, uid int64, err error) {
 	saneMessageID := helpers.SanitizeUTF8(options.MessageID)
 	if saneMessageID == "" {
-		log.Printf("Database: messageID is empty after sanitization, generating a new one without modifying the message.")
+		logger.Info("Database: messageID is empty after sanitization, generating a new one without modifying the message")
 		// Generate a new message ID if not provided
 		saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), options.MailboxName)
 	}
 
 	bodyStructureData, err := helpers.SerializeBodyStructureGob(options.BodyStructure)
 	if err != nil {
-		log.Printf("Database: failed to serialize BodyStructure: %v", err)
+		logger.Error("Database: failed to serialize BodyStructure", "err", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -492,7 +490,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 				LIMIT 1
 			)`, options.MailboxID).Scan(&hasMessages)
 		if err != nil {
-			log.Printf("Database: failed to check for existing messages: %v", err)
+			logger.Error("Database: failed to check for existing messages", "err", err)
 			return 0, 0, consts.ErrDBQueryFailed
 		}
 
@@ -500,7 +498,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		var currentUIDValidity uint32
 		err = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, options.MailboxID).Scan(&currentUIDValidity)
 		if err != nil {
-			log.Printf("Database: failed to query current UIDVALIDITY: %v", err)
+			logger.Error("Database: failed to query current UIDVALIDITY", "err", err)
 			return 0, 0, consts.ErrDBQueryFailed
 		}
 
@@ -510,8 +508,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 				// UIDVALIDITY changed - ignore preserved UID and deliver normally
 				// Only log once per mailbox to avoid log spam
 				if _, logged := d.uidValidityMismatchLoggedMap.LoadOrStore(options.MailboxID, true); !logged {
-					log.Printf("Database: UIDVALIDITY mismatch for mailbox %d: current=%d, requested=%d. Ignoring preserved UID, delivering normally.",
-						options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+					logger.Warn("Database: UIDVALIDITY mismatch, ignoring preserved UID and delivering normally",
+						"mailbox_id", options.MailboxID, "current", currentUIDValidity, "requested", *options.PreservedUIDValidity)
 				}
 
 				// Clear preserved values to use normal auto-increment
@@ -528,11 +526,11 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 					WHERE id = $1`,
 					options.MailboxID, *options.PreservedUIDValidity)
 				if err != nil {
-					log.Printf("Database: failed to update UIDVALIDITY: %v", err)
+					logger.Error("Database: failed to update UIDVALIDITY", "err", err)
 					return 0, 0, consts.ErrDBUpdateFailed
 				}
-				log.Printf("Database: set UIDVALIDITY for mailbox %d from %d to %d (first preserved message)",
-					options.MailboxID, currentUIDValidity, *options.PreservedUIDValidity)
+				logger.Info("Database: set UIDVALIDITY for first preserved message",
+					"mailbox_id", options.MailboxID, "from", currentUIDValidity, "to", *options.PreservedUIDValidity)
 			}
 		}
 	}
@@ -549,7 +547,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			RETURNING highest_uid`,
 			options.MailboxID, uidToUse).Scan(&highestUID)
 		if err != nil {
-			log.Printf("Database: failed to update highest UID with preserved UID: %v", err)
+			logger.Error("Database: failed to update highest UID with preserved UID", "err", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
 	} else {
@@ -557,7 +555,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// The UPDATE statement implicitly locks the row, making a prior SELECT FOR UPDATE redundant
 		err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + 1 WHERE id = $1 RETURNING highest_uid`, options.MailboxID).Scan(&highestUID)
 		if err != nil {
-			log.Printf("Database: failed to update highest UID: %v", err)
+			logger.Error("Database: failed to update highest UID", "err", err)
 			return 0, 0, consts.ErrDBUpdateFailed
 		}
 		uidToUse = highestUID
@@ -579,26 +577,24 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// Message with same message_id already exists
 		if existingContentHash == options.ContentHash {
 			// True duplicate (same Message-ID + same content) - skip insert
-			log.Printf("Database: duplicate message detected (message_id=%s, content_hash=%s) in mailbox %d, skipping insert. Existing UID=%d",
-				options.MessageID, options.ContentHash, options.MailboxID, existingUID)
+			logger.Info("Database: duplicate message detected, skipping insert", "message_id", options.MessageID, "content_hash", options.ContentHash, "mailbox_id", options.MailboxID, "existing_uid", existingUID)
 		} else {
 			// Same Message-ID but different content - this shouldn't happen in normal mail flow
 			// but can occur during import if maildir has duplicates with same Message-ID header
-			log.Printf("Database: message with same Message-ID but different content detected (message_id=%s, existing_hash=%s, new_hash=%s) in mailbox %d. Skipping insert to avoid unique violation. Existing UID=%d",
-				options.MessageID, truncateHash(existingContentHash), truncateHash(options.ContentHash), options.MailboxID, existingUID)
+			logger.Info("Database: message with same Message-ID but different content detected. Skipping insert to avoid unique violation", "message_id", options.MessageID, "existing_hash", truncateHash(existingContentHash), "new_hash", truncateHash(options.ContentHash), "mailbox_id", options.MailboxID, "existing_uid", existingUID)
 		}
 		// Return unique violation error so importer can count it as skipped
 		return 0, existingUID, consts.ErrDBUniqueViolation
 	} else if err != pgx.ErrNoRows {
 		// Unexpected error
-		log.Printf("Database: failed to check for duplicate message: %v", err)
+		logger.Error("Database: failed to check for duplicate message", "err", err)
 		return 0, 0, consts.ErrDBQueryFailed
 	}
 	// err == pgx.ErrNoRows means no duplicate found, continue with insert
 
 	recipientsJSON, err := json.Marshal(options.Recipients)
 	if err != nil {
-		log.Printf("Database: failed to marshal recipients: %v", err)
+		logger.Error("Database: failed to marshal recipients", "err", err)
 		return 0, 0, consts.ErrSerializationFailed
 	}
 
@@ -697,10 +693,10 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.
-			log.Printf("Database: unique constraint violation for MessageID '%s' in MailboxID %d. Returning error to caller.", saneMessageID, options.MailboxID)
+			logger.Error("Database: unique constraint violation, returning error to caller", "message_id", saneMessageID, "mailbox_id", options.MailboxID)
 			return 0, 0, consts.ErrDBUniqueViolation
 		}
-		log.Printf("Database: failed to insert message into database: %v", err)
+		logger.Error("Database: failed to insert message into database", "err", err)
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
@@ -719,7 +715,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		ON CONFLICT (content_hash) DO NOTHING
 	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
 	if err != nil {
-		log.Printf("Database: failed to insert message content for content_hash %s: %v", options.ContentHash, err)
+		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
 	}
 

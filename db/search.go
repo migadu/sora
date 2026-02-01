@@ -3,13 +3,13 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"maps"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -500,7 +500,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	metrics.DBQueriesTotal.WithLabelValues(metricsLabel, status, "read").Inc()
 
 	if err != nil {
-		log.Printf("Database: ERROR - failed executing query: %s\nArgs: %#v\nERROR - %v", finalQueryString, whereArgs, err)
+		logger.Error("Database: failed executing query", "query", finalQueryString, "args", whereArgs, "err", err)
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
@@ -512,9 +512,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	// Log warning if we hit the result limit (may indicate client needs to refine search)
 	if len(messages) >= resultLimit {
-		log.Printf("Database: WARNING - search query hit result limit (%d) for mailbox %d. "+
-			"Client may need to use more specific search criteria. Complex: %v",
-			resultLimit, mailboxID, isComplexQuery)
+		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
 	return messages, nil

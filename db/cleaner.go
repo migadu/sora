@@ -3,11 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/logger"
 )
 
 const CLEANUP_LOCK_NAME = "cleanup_worker"
@@ -374,14 +374,14 @@ func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, tx pgx.Tx, gr
 	if err := d.HardDeleteAccounts(ctx, tx, accountsToDelete); err != nil {
 		// If the batch fails, we can't be sure which accounts were processed.
 		// Log the error and return. The next run will pick them up.
-		log.Printf("failed to hard delete account batch: %v", err)
+		logger.Error("failed to hard delete account batch", "err", err)
 		return 0, err
 	}
 
 	totalDeleted := int64(len(accountsToDelete))
 
 	if totalDeleted > 0 {
-		log.Printf("cleaned up %d soft-deleted accounts that exceeded grace period", totalDeleted)
+		logger.Info("cleaned up soft-deleted accounts that exceeded grace period", "count", totalDeleted)
 	}
 
 	return totalDeleted, nil

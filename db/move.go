@@ -3,11 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/logger"
 )
 
 func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
@@ -17,7 +17,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// Per RFC 6851, moving to the same mailbox is allowed and assigns new UIDs.
 	// This is useful for "refreshing" messages with new UIDs.
 	if srcMailboxID == destMailboxID {
-		log.Printf("Database: moving messages within the same mailbox (ID=%d), will assign new UIDs", srcMailboxID)
+		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
 	// Acquire locks on both mailboxes in a consistent order to prevent deadlocks.
@@ -38,12 +38,12 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `
-		SELECT id, uid FROM messages 
+		SELECT id, uid FROM messages
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
 		ORDER BY uid
 	`, srcMailboxID, ids)
 	if err != nil {
-		log.Printf("Database: ERROR - failed to query source messages: %v", err)
+		logger.Error("Database: failed to query source messages", "err", err)
 		return nil, consts.ErrInternalError
 	}
 	defer rows.Close()
@@ -65,7 +65,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	}
 
 	if len(messageIDs) == 0 {
-		log.Printf("Database: WARNING - no messages found to move from mailbox %d", srcMailboxID)
+		logger.Warn("Database: no messages found to move", "mailbox_id", srcMailboxID)
 		return messageUIDMap, nil
 	}
 
@@ -74,7 +74,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	numToMove := int64(len(messageIDs))
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToMove, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
-		log.Printf("Database: ERROR - failed to update highest UID: %v", err)
+		logger.Error("Database: failed to update highest UID", "err", err)
 		return nil, consts.ErrDBUpdateFailed
 	}
 
@@ -108,11 +108,11 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		  AND id != ALL($2)
 	`, destMailboxID, messageIDs)
 	if err != nil {
-		log.Printf("Database: ERROR - failed to delete conflicting tombstones in destination mailbox: %v", err)
+		logger.Error("Database: failed to delete conflicting tombstones in destination mailbox", "err", err)
 		return nil, fmt.Errorf("failed to delete conflicting tombstones: %w", err)
 	}
 	if deleteResult.RowsAffected() > 0 {
-		log.Printf("Database: deleted %d conflicting message(s) from destination mailbox before move", deleteResult.RowsAffected())
+		logger.Info("Database: deleted conflicting message(s) from destination mailbox before move", "count", deleteResult.RowsAffected())
 	}
 
 	// Batch insert the moved messages.
@@ -128,7 +128,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			WHERE mailbox_id = $1 AND id = ANY($2) AND expunged_at IS NULL
 		`, srcMailboxID, messageIDs)
 		if err != nil {
-			log.Printf("Database: ERROR - failed to mark messages as expunged for same-mailbox move: %v", err)
+			logger.Error("Database: failed to mark messages as expunged for same-mailbox move", "err", err)
 			return nil, fmt.Errorf("failed to mark messages as expunged: %w", err)
 		}
 
@@ -156,10 +156,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
 		`, srcMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
-			log.Printf("Database: ERROR - failed to insert new messages for same-mailbox move: %v", err)
+			logger.Error("Database: failed to insert new messages for same-mailbox move", "err", err)
 			return nil, fmt.Errorf("failed to move messages: %w", err)
 		}
-		log.Printf("Database: moved %d message(s) with new UIDs in same-mailbox move (old messages marked as expunged)", len(messageIDs))
+		logger.Info("Database: moved message(s) with new UIDs in same-mailbox move (old messages marked as expunged)", "count", len(messageIDs))
 	} else {
 		// Different mailbox: normal insert from existing rows
 		_, err = tx.Exec(ctx, `
@@ -184,7 +184,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
 		`, destMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
-			log.Printf("Database: ERROR - failed to batch insert messages into destination mailbox: %v", err)
+			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
 			return nil, fmt.Errorf("failed to move messages: %w", err)
 		}
 	}
@@ -199,7 +199,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		`, srcMailboxID, messageIDs)
 
 		if err != nil {
-			log.Printf("Database: ERROR - failed to mark original messages as expunged: %v", err)
+			logger.Error("Database: failed to mark original messages as expunged", "err", err)
 			return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
 		}
 	}

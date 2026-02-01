@@ -3,10 +3,10 @@ package db
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/logger"
 )
 
 // DeletedMessage represents a deleted message with its original location
@@ -291,7 +291,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 		if existingCount > 0 {
 			// A non-expunged copy already exists in the target mailbox, skip restoration
-			log.Printf("Database: skipping message restoration: message already exists in target mailbox '%s'", msg.mailboxPath)
+			logger.Info("Database: skipping message restoration: message already exists in target mailbox", "mailbox_path", msg.mailboxPath)
 			skippedCount++
 			continue
 		}
@@ -311,8 +311,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to delete conflicting messages: %w", err)
 		}
 		if deleteResult.RowsAffected() > 0 {
-			log.Printf("Database: deleted %d conflicting message(s) with message_id='%s' from mailbox '%s' before restoration",
-				deleteResult.RowsAffected(), messageIDToRestore, msg.mailboxPath)
+			logger.Info("Database: deleted conflicting message(s) before restoration", "count", deleteResult.RowsAffected(), "message_id", messageIDToRestore, "mailbox_path", msg.mailboxPath)
 		}
 
 		// Get next UID for the mailbox
@@ -349,7 +348,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	if skippedCount > 0 {
-		log.Printf("Database: skipped restoring %d messages that already exist in target mailboxes", skippedCount)
+		logger.Info("Database: skipped restoring messages that already exist in target mailboxes", "count", skippedCount)
 	}
 
 	return restoredCount, nil
