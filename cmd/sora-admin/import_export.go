@@ -234,6 +234,7 @@ Examples:
 	if err := importer.Run(); err != nil {
 		logger.Fatalf("Failed to import maildir: %v", err)
 	}
+	os.Exit(0)
 }
 
 func handleImportS3(ctx context.Context) {
@@ -303,6 +304,7 @@ func handleImportS3(ctx context.Context) {
 	if err := importer.Run(); err != nil {
 		logger.Fatalf("Failed to import from S3: %v", err)
 	}
+	os.Exit(0)
 }
 
 func handleExportCommand(ctx context.Context) {
@@ -474,6 +476,7 @@ Examples:
 	if err := exporter.Run(); err != nil {
 		logger.Fatalf("Failed to export maildir: %v", err)
 	}
+	os.Exit(0)
 }
 
 func printImportUsage() {
