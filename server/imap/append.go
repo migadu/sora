@@ -36,9 +36,10 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 		if err := helpers.ValidateBodyStructure(&bs); err != nil {
 			// Invalid structure (e.g., multipart with no children), use default
 			return &imap.BodyStructureSinglePart{
-				Type:    "text",
-				Subtype: "plain",
-				Params:  map[string]string{"charset": "utf-8"},
+				Type:     "text",
+				Subtype:  "plain",
+				Params:   map[string]string{"charset": "utf-8"},
+				Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
 			}
 		}
 		return bs
@@ -46,9 +47,10 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 
 	// Return default body structure for corrupted messages
 	return &imap.BodyStructureSinglePart{
-		Type:    "text",
-		Subtype: "plain",
-		Params:  map[string]string{"charset": "utf-8"},
+		Type:     "text",
+		Subtype:  "plain",
+		Params:   map[string]string{"charset": "utf-8"},
+		Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
 	}
 }
 

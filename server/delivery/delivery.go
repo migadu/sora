@@ -122,9 +122,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		d.Logger.Log("Invalid body structure detected, using fallback: %v", err)
 		// Create a minimal valid body structure
 		fallback := &imap.BodyStructureSinglePart{
-			Type:    "text",
-			Subtype: "plain",
-			Size:    uint32(len(messageBytes)),
+			Type:     "text",
+			Subtype:  "plain",
+			Size:     uint32(len(messageBytes)),
+			Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
 		}
 		var fallbackBS imap.BodyStructure = fallback
 		bodyStructure = &fallbackBS

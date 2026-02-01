@@ -273,18 +273,24 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		// Validate body structure from database to prevent panics on malformed data
 		if err := helpers.ValidateBodyStructure(&msg.BodyStructure); err != nil {
 			s.DebugLog("invalid body structure from database, using fallback", "uid", msg.UID, "error", err)
-			// Create fallback structure
+			// Create fallback structure (always with Extended field to match imapserver.ExtractBodyStructure behavior)
 			fallback := &imap.BodyStructureSinglePart{
-				Type:    "text",
-				Subtype: "plain",
-				Size:    uint32(msg.Size),
+				Type:     "text",
+				Subtype:  "plain",
+				Size:     uint32(msg.Size),
+				Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended
 			}
 			var fallbackBS imap.BodyStructure = fallback
 			if err := s.writeBodyStructure(m, &fallbackBS); err != nil {
 				return err
 			}
 		} else {
-			if err := s.writeBodyStructure(m, &msg.BodyStructure); err != nil {
+			// Ensure Extended field is populated if client requested extended BODYSTRUCTURE
+			bs := msg.BodyStructure
+			if options.BodyStructure.Extended {
+				bs = ensureExtendedBodyStructure(bs)
+			}
+			if err := s.writeBodyStructure(m, &bs); err != nil {
 				return err
 			}
 		}
@@ -381,6 +387,42 @@ func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUI
 	}
 	m.WriteEnvelope(envelope)
 	return nil
+}
+
+// ensureExtendedBodyStructure ensures that the Extended field is populated
+// for both single-part and multi-part body structures. This is needed because
+// older messages in the database may not have the Extended field populated,
+// but clients requesting BODYSTRUCTURE (extended) require it.
+func ensureExtendedBodyStructure(bs imap.BodyStructure) imap.BodyStructure {
+	switch v := bs.(type) {
+	case *imap.BodyStructureSinglePart:
+		if v.Extended == nil {
+			// Create a minimal extended structure
+			v.Extended = &imap.BodyStructureSinglePartExt{
+				Disposition: nil, // Unknown
+				Language:    nil, // Unknown
+				Location:    "",  // Unknown
+			}
+		}
+		return v
+	case *imap.BodyStructureMultiPart:
+		if v.Extended == nil {
+			// Create a minimal extended structure
+			v.Extended = &imap.BodyStructureMultiPartExt{
+				Params:      make(map[string]string), // Empty params
+				Disposition: nil,                     // Unknown
+				Language:    nil,                     // Unknown
+				Location:    "",                      // Unknown
+			}
+		}
+		// Recursively ensure children also have Extended fields
+		for i, child := range v.Children {
+			v.Children[i] = ensureExtendedBodyStructure(child)
+		}
+		return v
+	default:
+		return bs
+	}
 }
 
 func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, bodyStructure *imap.BodyStructure) error {
