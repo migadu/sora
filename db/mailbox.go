@@ -686,7 +686,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 	// Prevent subscription changes for default mailboxes.
 	for _, rootFolder := range consts.DefaultMailboxes {
 		if strings.EqualFold(mboxName, rootFolder) {
-			log.Printf("Database: WARNING - ignoring subscription status update for root folder %s", mboxName)
+			logger.Debug("Database: ignoring subscription status update for root folder", "mailbox", mboxName)
 			return nil
 		}
 	}
