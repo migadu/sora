@@ -770,7 +770,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 
 	w, err := message.CreateWriter(&vacationMessage, h)
 	if err != nil {
-		s.DebugLog("error creating message writer", "error", err)
+		s.WarnLog("error creating message writer", "error", err)
 		return fmt.Errorf("failed to create message writer: %w", err)
 	}
 
@@ -778,33 +778,32 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
 	textWriter, err := w.CreatePart(textHeader)
 	if err != nil {
-		s.DebugLog("error creating text part", "error", err)
+		w.Close()
+		s.WarnLog("error creating text part", "error", err)
 		return fmt.Errorf("failed to create text part: %w", err)
 	}
 
 	s.DebugLog("adding vacation message body", "body_length", len(result.VacationMsg))
 	_, err = textWriter.Write([]byte(result.VacationMsg))
 	if err != nil {
-		s.DebugLog("error writing vacation message body", "error", err)
+		textWriter.Close()
+		w.Close()
+		s.WarnLog("error writing vacation message body", "error", err)
 		return fmt.Errorf("failed to write vacation message body: %w", err)
 	}
 
 	textWriter.Close()
 	w.Close()
 
-	// Only send vacation response if relay queue is configured
-	if s.backend.relayQueue != nil {
-		sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
-		if sendErr != nil {
-			s.DebugLog("error enqueuing vacation response", "error", sendErr)
-			// The Sieve engine's policy should have already recorded the response attempt.
-			// Failure here is a delivery issue.
-		} else {
-			s.DebugLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
-		}
-	} else {
-		s.DebugLog("relay queue not configured, cannot send vacation response")
+	// Send vacation response (relay queue existence checked at start of function)
+	sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
+	if sendErr != nil {
+		s.WarnLog("error enqueuing vacation response", "error", sendErr)
+		// The Sieve engine's policy should have already recorded the response attempt.
+		// Failure here is a delivery issue.
+		return fmt.Errorf("failed to enqueue vacation response: %w", sendErr)
 	}
+	s.DebugLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
 
 	// The recording of the vacation response is now handled by SievePolicy via VacationOracle
 	return nil

@@ -132,8 +132,16 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		Size:    len(ctx.Body),
 	}
 
+	// Create a per-execution policy to ensure thread safety and isolation.
+	// The e.policy acts as a template containing configuration.
+	execPolicy := &SievePolicy{
+		AccountID:         e.policy.AccountID,
+		vacationOracle:    e.policy.vacationOracle,
+		vacationResponses: make(map[string]time.Time),
+	}
+
 	// Create runtime data
-	data := sieve.NewRuntimeData(e.script, e.policy, envelope, message) // RuntimeData holds policy
+	data := sieve.NewRuntimeData(e.script, execPolicy, envelope, message) // RuntimeData holds policy
 
 	// Execute the script
 	err := e.script.Execute(evalCtx, data) // Pass the evaluation context
@@ -149,18 +157,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	}
 
 	// Check if vacation response was triggered
-	if e.policy.vacationTriggered {
-		result.Action = ActionVacation
-		result.VacationFrom = e.policy.lastVacationFrom
-		result.VacationSubj = e.policy.lastVacationSubj
-		result.VacationMsg = e.policy.lastVacationMsg
-		result.VacationIsMime = e.policy.lastVacationIsMime
+	// The go-sieve library stores vacation responses in data.VacationResponses
+	vacationTriggered := len(data.VacationResponses) > 0
 
-		// Reset the vacation triggered flag for next evaluation
-		e.policy.vacationTriggered = false
-	}
-
-	// Handle fileinto action
+	// Handle fileinto action (takes precedence over vacation)
 	if len(data.Mailboxes) > 0 {
 		// Use the first mailbox (we could support multiple mailboxes in the future)
 		result.Action = ActionFileInto
@@ -170,10 +170,8 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// With normal fileinto (no :copy), ImplicitKeep would be false, but an explicit keep
 		// after fileinto should still save a copy to INBOX
 		result.Copy = data.ImplicitKeep || data.Keep
-	}
-
-	// Handle redirect action
-	if len(data.RedirectAddr) > 0 {
+	} else if len(data.RedirectAddr) > 0 {
+		// Handle redirect action (takes precedence over vacation)
 		// Use the first redirect address (we could support multiple redirects in the future)
 		result.Action = ActionRedirect
 		result.RedirectTo = data.RedirectAddr[0]
@@ -182,11 +180,36 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
 		// after redirect should still save a local copy
 		result.Copy = data.ImplicitKeep || data.Keep
-	}
-
-	// Handle discard action
-	if !data.Keep && !data.ImplicitKeep && len(data.Mailboxes) == 0 && len(data.RedirectAddr) == 0 {
+	} else if !data.Keep && !data.ImplicitKeep {
+		// Handle discard action
+		// This includes both explicit discard commands and scripts with no keep action
 		result.Action = ActionDiscard
+	} else if vacationTriggered {
+		// Process vacation responses
+		// Per RFC 5230, vacation is an implicit keep, so we only reach here if ImplicitKeep is still true
+		// (fileinto/redirect/discard are handled above and cancel the implicit keep)
+		// Get the first vacation response (there should only be one per evaluation)
+		for sender, vacation := range data.VacationResponses {
+			// Check with the policy/oracle if we should send this vacation response
+			duration := time.Duration(vacation.Days) * 24 * time.Hour
+			allowed, err := execPolicy.VacationResponseAllowed(evalCtx, data, sender, vacation.Handle, duration)
+			if err != nil {
+				// Log error but don't fail the message delivery
+				continue
+			}
+
+			if allowed {
+				result.Action = ActionVacation
+				result.VacationFrom = vacation.From
+				result.VacationSubj = vacation.Subject
+				result.VacationMsg = vacation.Body
+				result.VacationIsMime = vacation.IsMime
+
+				// Record that we sent the vacation response
+				_ = execPolicy.SendVacationResponse(evalCtx, data, sender, vacation.From, vacation.Subject, vacation.Body, vacation.IsMime)
+			}
+			break // Only process the first vacation response
+		}
 	}
 
 	// Handle flags
