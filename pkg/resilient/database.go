@@ -202,6 +202,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 			errors.Is(err, consts.ErrMessageNotAvailable) ||
 			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 			errors.Is(err, consts.ErrNotPermitted) ||
+			errors.Is(err, consts.ErrMessageExists) ||
 			errors.Is(err, pgx.ErrNoRows) {
 			return true // Treat as success - these are expected application errors
 		}
@@ -239,6 +240,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 			errors.Is(err, consts.ErrNotPermitted) ||
 			errors.Is(err, consts.ErrDBUniqueViolation) ||
+			errors.Is(err, consts.ErrMessageExists) ||
 			errors.Is(err, pgx.ErrNoRows) {
 			return true // Treat as success - these are expected application errors
 		}
