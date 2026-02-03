@@ -898,7 +898,6 @@ type LMTPServerConfig struct {
 	Addr                string `toml:"addr"`
 	MaxConnections      int    `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP int    `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	ExternalRelay       string `toml:"external_relay"`
 	TLS                 bool   `toml:"tls"`
 	TLSUseStartTLS      bool   `toml:"tls_use_starttls"`
 	TLSCertFile         string `toml:"tls_cert_file"`
@@ -1268,7 +1267,6 @@ type ServerConfig struct {
 	MasterSASLPassword string `toml:"master_sasl_password,omitempty"`
 
 	// LMTP specific
-	ExternalRelay  string `toml:"external_relay,omitempty"`
 	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
@@ -1515,7 +1513,6 @@ func NewDefaultConfig() Config {
 				Addr:                ":24",
 				MaxConnections:      500,
 				MaxConnectionsPerIP: 5,
-				ExternalRelay:       "",
 				TLS:                 false,
 				TLSUseStartTLS:      false,
 				TLSCertFile:         "",

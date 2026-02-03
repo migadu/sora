@@ -719,7 +719,7 @@ func (s *LMTPSession) InternalError(format string, a ...any) error {
 // by the Sieve engine's policy, using the VacationOracle.
 func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
 	if s.backend.relayQueue == nil {
-		s.DebugLog("relay queue not configured, cannot send vacation response", "sender", s.sender.FullAddress())
+		s.DebugLog("relay not configured, cannot send vacation response", "sender", s.sender.FullAddress())
 		// Do not return error, as the Sieve engine might have already recorded the attempt.
 		return nil
 	}
@@ -803,7 +803,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 		// Failure here is a delivery issue.
 		return fmt.Errorf("failed to enqueue vacation response: %w", sendErr)
 	}
-	s.DebugLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
+	s.InfoLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
 
 	// The recording of the vacation response is now handled by SievePolicy via VacationOracle
 	return nil
