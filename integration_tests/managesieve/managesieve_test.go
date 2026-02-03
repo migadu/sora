@@ -269,6 +269,98 @@ func TestManageSieveScriptOperations(t *testing.T) {
 	t.Log("Successfully completed comprehensive ManageSieve script operations test")
 }
 
+func TestManageSieveScriptDeactivation(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupManageSieveServer(t)
+	defer server.Close()
+
+	// Connect and authenticate
+	conn, err := net.Dial("tcp", server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to ManageSieve server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Read greeting and authenticate
+	authenticateManageSieve(t, reader, writer, account)
+
+	// Test 1: Create and activate a script
+	t.Log("=== Creating and activating a script ===")
+	vacationScript := `require ["vacation"]; if header :contains "subject" "vacation" { vacation "I'm on vacation"; }`
+	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"vacation\" %s", vacationScript))
+	response := readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Fatalf("PUTSCRIPT failed: %s", response)
+	}
+
+	sendCommand(t, writer, "SETACTIVE \"vacation\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Fatalf("SETACTIVE vacation failed: %s", response)
+	}
+	t.Logf("Script activated successfully")
+
+	// Test 2: Verify the script is active via LISTSCRIPTS
+	t.Log("=== Verifying script is active ===")
+	sendCommand(t, writer, "LISTSCRIPTS")
+	listResponse := readListScriptsResponse(t, reader)
+	if !strings.Contains(listResponse, "vacation") || !strings.Contains(listResponse, "ACTIVE") {
+		t.Logf("Warning: LISTSCRIPTS response may not clearly show ACTIVE status: %s", listResponse)
+	} else {
+		t.Logf("Script is active: %s", listResponse)
+	}
+
+	// Test 3: Deactivate all scripts using SETACTIVE ""
+	t.Log("=== Deactivating all scripts with SETACTIVE \"\" ===")
+	sendCommand(t, writer, "SETACTIVE \"\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("SETACTIVE \"\" should deactivate all scripts but got: %s", response)
+	} else {
+		t.Logf("Successfully deactivated all scripts")
+	}
+
+	// Test 4: Verify no script is active via LISTSCRIPTS
+	t.Log("=== Verifying no script is active ===")
+	sendCommand(t, writer, "LISTSCRIPTS")
+	listResponse = readListScriptsResponse(t, reader)
+	if strings.Contains(listResponse, "ACTIVE") {
+		t.Errorf("After SETACTIVE \"\", no script should be marked ACTIVE but got: %s", listResponse)
+	} else {
+		t.Logf("Confirmed no script is active: %s", listResponse)
+	}
+
+	// Test 5: Reactivate the script
+	t.Log("=== Reactivating the script ===")
+	sendCommand(t, writer, "SETACTIVE \"vacation\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("Re-activating script failed: %s", response)
+	} else {
+		t.Logf("Script reactivated successfully")
+	}
+
+	// Test 6: Deactivate again and delete the script
+	t.Log("=== Deactivating and deleting script ===")
+	sendCommand(t, writer, "SETACTIVE \"\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("Second SETACTIVE \"\" failed: %s", response)
+	}
+
+	sendCommand(t, writer, "DELETESCRIPT \"vacation\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("DELETESCRIPT failed: %s", response)
+	}
+
+	t.Log("Successfully completed script deactivation test")
+}
+
 // Simple response reader that just gets the first line (for commands that return simple OK/NO)
 func readSimpleResponse(t *testing.T, reader *bufio.Reader) string {
 	t.Helper()
@@ -279,6 +371,29 @@ func readSimpleResponse(t *testing.T, reader *bufio.Reader) string {
 	}
 
 	return strings.TrimSpace(response)
+}
+
+// readListScriptsResponse reads the multi-line LISTSCRIPTS response
+func readListScriptsResponse(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+
+	var fullResponse strings.Builder
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read LISTSCRIPTS response line: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		fullResponse.WriteString(line)
+		fullResponse.WriteString(" ")
+
+		// The response ends with OK
+		if strings.HasPrefix(line, "OK") {
+			break
+		}
+	}
+
+	return fullResponse.String()
 }
 
 // readGetScriptResponse handles the multi-line response from GETSCRIPT command

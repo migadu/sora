@@ -856,6 +856,28 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	useMaster := s.useMasterDB
 	release()
 
+	// RFC 5804: SETACTIVE "" deactivates all scripts
+	if name == "" {
+		err := s.server.rdb.DeactivateAllScriptsWithRetry(s.ctx, accountID)
+		if err != nil {
+			s.sendResponse("NO Internal server error\r\n")
+			return false
+		}
+
+		// Phase 3: Update session state
+		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+		if !acquired {
+			s.WarnLog("failed to acquire write lock", "command", "SETACTIVE", "purpose", "pin_session")
+		} else {
+			s.useMasterDB = true
+			release()
+		}
+
+		metrics.CriticalOperationDuration.WithLabelValues("managesieve_setactive").Observe(time.Since(start).Seconds())
+		s.sendResponse("OK\r\n")
+		return true
+	}
+
 	// Phase 2: DB operations
 	readCtx := s.ctx
 	if useMaster {

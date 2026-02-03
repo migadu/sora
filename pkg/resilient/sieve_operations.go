@@ -190,6 +190,16 @@ func (rd *ResilientDatabase) GetActiveScriptWithRetry(ctx context.Context, Accou
 	return result.(*db.SieveScript), nil
 }
 
+// DeactivateAllScriptsWithRetry deactivates all Sieve scripts for an account with retry logic
+func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, AccountID int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(true).DeactivateAllScripts(ctx, tx, AccountID)
+	}
+
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
+	return err
+}
+
 // Vacation response methods
 
 // HasRecentVacationResponseWithRetry checks if a vacation response was sent recently with retry logic

@@ -120,3 +120,9 @@ func (db *Database) SetScriptActive(ctx context.Context, tx pgx.Tx, scriptID, Ac
 	_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = $1, updated_at = now() WHERE id = $2 AND account_id = $3", active, scriptID, AccountID)
 	return err
 }
+
+func (db *Database) DeactivateAllScripts(ctx context.Context, tx pgx.Tx, AccountID int64) error {
+	// Deactivate all scripts for this account
+	_, err := tx.Exec(ctx, "UPDATE sieve_scripts SET active = false, updated_at = now() WHERE account_id = $1 AND active = true", AccountID)
+	return err
+}
