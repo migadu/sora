@@ -767,6 +767,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	h.Set("Auto-Submitted", "auto-replied")
 	h.Set("X-Auto-Response-Suppress", "All")
 	h.Set("Date", time.Now().Format(time.RFC1123Z))
+	h.Set("Content-Type", "text/plain; charset=utf-8")
 
 	w, err := message.CreateWriter(&vacationMessage, h)
 	if err != nil {
@@ -774,25 +775,14 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 		return fmt.Errorf("failed to create message writer: %w", err)
 	}
 
-	var textHeader message.Header
-	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
-	textWriter, err := w.CreatePart(textHeader)
-	if err != nil {
-		w.Close()
-		s.WarnLog("error creating text part", "error", err)
-		return fmt.Errorf("failed to create text part: %w", err)
-	}
-
 	s.DebugLog("adding vacation message body", "body_length", len(result.VacationMsg))
-	_, err = textWriter.Write([]byte(result.VacationMsg))
+	_, err = w.Write([]byte(result.VacationMsg))
 	if err != nil {
-		textWriter.Close()
 		w.Close()
 		s.WarnLog("error writing vacation message body", "error", err)
 		return fmt.Errorf("failed to write vacation message body: %w", err)
 	}
 
-	textWriter.Close()
 	w.Close()
 
 	// Send vacation response (relay queue existence checked at start of function)
